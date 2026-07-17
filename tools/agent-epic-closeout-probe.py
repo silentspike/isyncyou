@@ -30,8 +30,108 @@ from urllib.parse import urlparse
 
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-ALLOWED_ROW_STATES = {"pass", "fail", "blocked", "not_run"}
 REQUIRED_PRE_RC_ROWS = tuple("ABCDEFGHIJKLM")
+ROW_REQUIREMENTS: dict[str, tuple[str, ...]] = {
+    "A": (
+        "oauth_ready",
+        "source_resolved",
+        "transcript_rehydrated",
+        "local_cli_absent",
+        "default_harness_absent",
+    ),
+    "B": (
+        "oauth_ready",
+        "source_resolved",
+        "transcript_rehydrated",
+        "store_false_preserved",
+        "identity_envelope_preserved",
+        "local_cli_absent",
+        "default_harness_absent",
+    ),
+    "C": (
+        "default_apk",
+        "oauth_completed",
+        "network_guard_spanned_turn",
+        "source_resolved",
+        "request_not_duplicated",
+        "transcript_rehydrated",
+        "hooks_absent",
+    ),
+    "D": (
+        "default_apk",
+        "oauth_completed",
+        "network_guard_spanned_turn",
+        "source_resolved",
+        "request_not_duplicated",
+        "transcript_rehydrated",
+        "hooks_absent",
+    ),
+    "E": (
+        "retrieved_content_marked_untrusted",
+        "no_unconfirmed_mutation",
+        "no_exfiltration",
+        "pending_cancelled_or_absent",
+    ),
+    "F": (
+        "cancel_matrix_complete",
+        "one_terminal_per_case",
+        "zero_mutations",
+        "cancelled_pending_not_confirmable",
+    ),
+    "G": (
+        "confirmation_required",
+        "exactly_one_effect",
+        "graph_or_store_verified",
+        "restore_local_exactly_once",
+        "fixtures_reverted",
+    ),
+    "H": (
+        "hook_apk",
+        "network_fault_recovered",
+        "offline_unleased_absent",
+        "effect_exactly_once",
+        "hooks_present",
+        "fixtures_reverted",
+    ),
+    "I": (
+        "default_apk",
+        "device_credential_confirmed",
+        "foreground_job_visible",
+        "notification_denial_failed_closed",
+        "no_duplicate_after_restart",
+        "hooks_absent",
+        "fixtures_reverted",
+    ),
+    "J": (
+        "desktop_android_continuation",
+        "linear_manifest_head",
+        "idempotent_retry",
+        "multi_step_recovery",
+        "lease_renewed",
+        "stale_writer_blocked",
+        "offline_commit_absent",
+    ),
+    "K": (
+        "baseline_manifest_valid",
+        "stale_generation_rejected",
+        "codex_reconnect_turn",
+        "controlled_state_restored",
+    ),
+    "L": (
+        "daemon_feature_excludes_fallback",
+        "mobile_feature_excludes_fallback",
+        "runtime_ignores_local_cli",
+        "binaries_exclude_import_strings",
+        "experimental_origin_not_ready",
+    ),
+    "M": (
+        "item_list_works",
+        "item_view_works",
+        "candidate_daemon_started",
+        "non_agent_smoke_passed",
+        "post_migration_regression_absent",
+    ),
+}
 
 
 class ProbeError(RuntimeError):
@@ -73,30 +173,75 @@ def require_free_port(host: str, port: int) -> None:
             raise ProbeError("listener_already_occupied") from error
 
 
-def load_observations(path: Path | None) -> dict[str, dict[str, object]]:
+def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ProbeError("invalid_observations")
+        result[key] = value
+    return result
+
+
+def load_observations(
+    path: Path | None, implementation_commit: str
+) -> tuple[dict[str, dict[str, object]], str | None]:
     if path is None:
-        return {row: {"state": "not_run", "code": "evidence_not_supplied"} for row in REQUIRED_PRE_RC_ROWS}
+        return (
+            {
+                row: {
+                    "state": "not_run",
+                    "code": "evidence_not_supplied",
+                    "checks": {name: False for name in ROW_REQUIREMENTS[row]},
+                }
+                for row in REQUIRED_PRE_RC_ROWS
+            },
+            None,
+        )
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        raw = path.read_bytes()
+        value = json.loads(raw, object_pairs_hook=strict_object)
     except (OSError, json.JSONDecodeError) as error:
         raise ProbeError("invalid_observations") from error
-    if not isinstance(value, dict) or set(value) - set(REQUIRED_PRE_RC_ROWS):
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "implementation_commit",
+        "rows",
+    }:
+        raise ProbeError("invalid_observations")
+    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
+        raise ProbeError("invalid_observations")
+    if value["implementation_commit"] != implementation_commit:
+        raise ProbeError("observation_commit_mismatch")
+    supplied_rows = value["rows"]
+    if not isinstance(supplied_rows, dict) or set(supplied_rows) - set(REQUIRED_PRE_RC_ROWS):
         raise ProbeError("invalid_observations")
     result: dict[str, dict[str, object]] = {}
     for row in REQUIRED_PRE_RC_ROWS:
-        item = value.get(row, {"state": "not_run", "code": "evidence_not_supplied"})
-        if not isinstance(item, dict) or set(item) - {"state", "code", "cleanup_complete"}:
+        item = supplied_rows.get(row)
+        if item is None:
+            result[row] = {
+                "state": "not_run",
+                "code": "evidence_not_supplied",
+                "checks": {name: False for name in ROW_REQUIREMENTS[row]},
+            }
+            continue
+        if not isinstance(item, dict) or set(item) != {"checks"}:
             raise ProbeError("invalid_observations")
-        state = item.get("state")
-        code = item.get("code")
-        if state not in ALLOWED_ROW_STATES or not isinstance(code, str) or not re.fullmatch(r"[a-z0-9_]{1,64}", code):
+        checks = item["checks"]
+        required = ROW_REQUIREMENTS[row]
+        if (
+            not isinstance(checks, dict)
+            or set(checks) != set(required)
+            or any(type(checks[name]) is not bool for name in required)
+        ):
             raise ProbeError("invalid_observations")
+        failed = [name for name in required if not checks[name]]
         result[row] = {
-            "state": state,
-            "code": code,
-            "cleanup_complete": bool(item.get("cleanup_complete", False)),
+            "state": "pass" if not failed else "fail",
+            "code": "verified" if not failed else "required_check_failed",
+            "checks": {name: checks[name] for name in required},
         }
-    return result
+    return result, hashlib.sha256(raw).hexdigest()
 
 
 @dataclass
@@ -211,8 +356,17 @@ def run(args: argparse.Namespace) -> tuple[dict[str, object], int]:
         shell_ready, session_cookie, agent_status_ready = wait_for_runtime(
             base, daemon, args.startup_timeout
         )
-        rows = load_observations(Path(args.observations) if args.observations else None)
-        required_pass = all(item["state"] == "pass" for item in rows.values())
+        rows, observation_digest = load_observations(
+            Path(args.observations) if args.observations else None,
+            implementation,
+        )
+        required_pass = (
+            shell_ready
+            and agent_status_ready
+            and session_cookie
+            and (not args.codex_oauth_preflight or callback_port_ready is True)
+            and all(item["state"] == "pass" for item in rows.values())
+        )
         report: dict[str, object] = {
             "schema_version": 1,
             "mode": args.mode,
@@ -225,6 +379,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, object], int]:
             "agent_status_ready": agent_status_ready,
             "strict_session_cookie_observed": session_cookie,
             "codex_callback_port_free_before_oauth": callback_port_ready,
+            "observation_document_sha256": observation_digest,
             "rows": rows,
             "required_rows_pass": required_pass,
             "cleanup": {"child_stopped": True, "raw_logs_deleted": True},

@@ -42,6 +42,19 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+class WeakCookieHandler(Handler):
+    def do_GET(self):
+        if self.path == "/":
+            self.send_response(200)
+            self.send_header(
+                "Set-Cookie", "isy_session=opaque; SameSite=Lax; Path=/api/v1"
+            )
+            self.end_headers()
+            self.wfile.write(b"shell")
+            return
+        super().do_GET()
+
+
 class CloseoutProbeTest(unittest.TestCase):
     def test_rejects_non_loopback_and_invalid_commit(self):
         with self.assertRaisesRegex(MODULE.ProbeError, "endpoint_not_loopback"):
@@ -64,8 +77,21 @@ class CloseoutProbeTest(unittest.TestCase):
                 root = Path(tmp)
                 observations = root / "rows.json"
                 observations.write_text(
-                    json.dumps({row: {"state": "pass", "code": "verified", "cleanup_complete": True}
-                                for row in MODULE.REQUIRED_PRE_RC_ROWS}),
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "implementation_commit": "a" * 40,
+                            "rows": {
+                                row: {
+                                    "checks": {
+                                        check: True
+                                        for check in MODULE.ROW_REQUIREMENTS[row]
+                                    }
+                                }
+                                for row in MODULE.REQUIRED_PRE_RC_ROWS
+                            },
+                        }
+                    ),
                     encoding="utf-8",
                 )
                 args = argparse.Namespace(
@@ -89,6 +115,7 @@ class CloseoutProbeTest(unittest.TestCase):
                 self.assertTrue(report["agent_status_ready"])
                 self.assertTrue(report["strict_session_cookie_observed"])
                 self.assertTrue(report["codex_callback_port_free_before_oauth"])
+                self.assertRegex(report["observation_document_sha256"], r"^[0-9a-f]{64}$")
                 rendered = json.dumps(report)
                 self.assertNotIn("opaque", rendered)
                 self.assertFalse(report["redaction"]["tokens_included"])
@@ -98,9 +125,108 @@ class CloseoutProbeTest(unittest.TestCase):
             thread.join(timeout=2)
 
     def test_missing_rows_are_explicitly_not_run(self):
-        rows = MODULE.load_observations(None)
+        rows, digest = MODULE.load_observations(None, "a" * 40)
         self.assertEqual(set(rows), set(MODULE.REQUIRED_PRE_RC_ROWS))
         self.assertTrue(all(row["state"] == "not_run" for row in rows.values()))
+        self.assertIsNone(digest)
+
+    def test_observation_status_cannot_be_supplied_directly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rows.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "implementation_commit": "a" * 40,
+                        "rows": {"A": {"state": "pass", "code": "verified"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(MODULE.ProbeError, "invalid_observations"):
+                MODULE.load_observations(path, "a" * 40)
+
+    def test_observations_are_commit_bound_and_fail_on_false_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rows.json"
+            checks = {name: True for name in MODULE.ROW_REQUIREMENTS["A"]}
+            checks[MODULE.ROW_REQUIREMENTS["A"][0]] = False
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "implementation_commit": "a" * 40,
+                        "rows": {"A": {"checks": checks}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rows, _digest = MODULE.load_observations(path, "a" * 40)
+            self.assertEqual(rows["A"]["state"], "fail")
+            self.assertEqual(rows["A"]["code"], "required_check_failed")
+            with self.assertRaisesRegex(MODULE.ProbeError, "observation_commit_mismatch"):
+                MODULE.load_observations(path, "b" * 40)
+
+    def test_observations_reject_duplicate_json_members(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rows.json"
+            path.write_text(
+                '{"schema_version":1,"schema_version":1,'
+                '"implementation_commit":"' + "a" * 40 + '","rows":{}}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(MODULE.ProbeError, "invalid_observations"):
+                MODULE.load_observations(path, "a" * 40)
+
+    def test_non_strict_session_cookie_cannot_pass_closeout(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), WeakCookieHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                observations = root / "rows.json"
+                observations.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "implementation_commit": "a" * 40,
+                            "rows": {
+                                row: {
+                                    "checks": {
+                                        check: True
+                                        for check in MODULE.ROW_REQUIREMENTS[row]
+                                    }
+                                }
+                                for row in MODULE.REQUIRED_PRE_RC_ROWS
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                args = argparse.Namespace(
+                    mode="pre-rc",
+                    implementation_commit="a" * 40,
+                    candidate_tree=None,
+                    rc_commit=None,
+                    endpoint=f"127.0.0.1:{server.server_port}",
+                    daemon_bin=None,
+                    config=None,
+                    bind="127.0.0.1:8871",
+                    runtime_root=str(root / "runtime"),
+                    observations=str(observations),
+                    codex_oauth_preflight=False,
+                    startup_timeout=2.0,
+                    out=str(root / "out.json"),
+                )
+                report, status = MODULE.run(args)
+                self.assertEqual(status, 2)
+                self.assertFalse(report["strict_session_cookie_observed"])
+                self.assertFalse(report["required_rows_pass"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
     def test_runtime_root_must_be_empty(self):
         with tempfile.TemporaryDirectory() as tmp:
