@@ -7,6 +7,7 @@ import tempfile
 import threading
 import unittest
 import zipfile
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -414,6 +415,41 @@ class CloseoutProbeTest(unittest.TestCase):
                     RetrievalHandler.request_id,
                 ):
                     self.assertNotIn(forbidden, rendered)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_retrieval_timeout_reports_only_closed_persisted_request_state(self):
+        RetrievalHandler.request_id = None
+        RetrievalHandler.turn_posts = 0
+        server = ThreadingHTTPServer(("127.0.0.1", 0), RetrievalHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                prompt = Path(tmp) / "prompt.txt"
+                prompt.write_text("Find {fixture}.", encoding="utf-8")
+                prompt.chmod(0o600)
+                base = f"http://127.0.0.1:{server.server_port}"
+                client, _, _, _, status_document = MODULE.wait_for_runtime(base, None, 2.0)
+                with mock.patch.object(
+                    MODULE,
+                    "stream_turn",
+                    side_effect=MODULE.ProbeError("turn_stream_timed_out"),
+                ):
+                    result = MODULE.run_retrieval_turn(
+                        client, status_document, prompt, None, 2.0
+                    )
+                self.assertEqual(result["state"], "fail")
+                self.assertEqual(result["terminal_reason"], "timeout")
+                self.assertEqual(result["error_code"], "turn_stream_timed_out")
+                self.assertEqual(result["request_status_state"], "committed")
+                self.assertEqual(result["request_status_code"], "ok")
+                rendered = json.dumps(result)
+                self.assertNotIn("PRIVATE", rendered)
+                self.assertNotIn(RetrievalHandler.cap, rendered)
+                self.assertNotIn(RetrievalHandler.request_id, rendered)
         finally:
             server.shutdown()
             server.server_close()

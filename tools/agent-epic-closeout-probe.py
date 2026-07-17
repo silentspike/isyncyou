@@ -782,7 +782,44 @@ def run_retrieval_turn(
     retry_same_turn = retry.get("turn") == turn_id
     if not retry_same_turn:
         raise ProbeError("turn_retry_duplicated")
-    stream = stream_turn(client, turn_id, timeout)
+    status_query = urllib.parse.urlencode(
+        {"session_id": session_id, "route": "agent_turn", "request_id": request_id}
+    )
+    try:
+        stream = stream_turn(client, turn_id, timeout)
+    except ProbeError as error:
+        if error.code != "turn_stream_timed_out":
+            raise
+        try:
+            request_status = client.json(
+                "GET", f"/api/v1/agent/request/status?{status_query}", cap=True
+            )
+        except ProbeError as status_error:
+            raise ProbeError("retrieval_request_status_failed") from status_error
+        status_state = request_status.get("state")
+        status_code = request_status.get("code")
+        if not isinstance(status_state, str) or not SAFE_CODE_RE.fullmatch(status_state):
+            raise ProbeError("retrieval_request_status_invalid")
+        if not isinstance(status_code, str) or not SAFE_CODE_RE.fullmatch(status_code):
+            raise ProbeError("retrieval_request_status_invalid")
+        return {
+            "state": "fail",
+            "provider": provider,
+            "request_digest": opaque_digest(request_id, "issue-628-request"),
+            "turn_digest": opaque_digest(turn_id, "issue-628-turn"),
+            "fixture_digest": opaque_digest(fixture_name, "issue-628-fixture"),
+            "turn_ack_latency": latency_bucket(elapsed_ms),
+            "retry_reused_turn": retry_same_turn,
+            "ordered_event_names": [],
+            "terminal_reason": "timeout",
+            "error_code": error.code,
+            "untrusted_tool_result_observed": False,
+            "request_status_state": status_state,
+            "request_status_code": status_code,
+            "transcript_rehydrated": False,
+            "source_count": 0,
+            "all_sources_listed_and_viewable": False,
+        }
     if stream["terminal_reason"] != "complete":
         return {
             "state": "fail",
@@ -807,9 +844,6 @@ def run_retrieval_turn(
         )
     except ProbeError as error:
         raise ProbeError("retrieval_history_failed") from error
-    status_query = urllib.parse.urlencode(
-        {"session_id": session_id, "route": "agent_turn", "request_id": request_id}
-    )
     try:
         request_status = client.json(
             "GET", f"/api/v1/agent/request/status?{status_query}", cap=True
