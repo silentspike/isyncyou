@@ -867,6 +867,11 @@ async function main() {
     assert(evidence, "first token appears incrementally", firstTokenText.includes("Here is ") && !firstTokenText.includes("a source-backed answer."));
     await page.waitForFunction(() => document.body.innerText.includes("a source-backed answer."), null, { timeout: 10000 });
     await page.waitForSelector('[data-agent-citation="view"]', { timeout: 10000 });
+    const toolResultDetail = await page.locator('[data-agent-tool-row="tool_result"] .asst-tool-detail').first().innerText();
+    assert(evidence, "tool result UI exposes only source count and never raw result content",
+      toolResultDetail === "1 source"
+      && !toolResultDetail.includes("items")
+      && !toolResultDetail.includes("mail-1"));
     const citationHref = await page.locator('[data-agent-citation="view"]').first().getAttribute("href");
     assert(evidence, "citation href same-origin path", citationHref && citationHref.startsWith("/api/v1/view?"), { citationHref });
     const popupPromise = page.waitForEvent("popup");

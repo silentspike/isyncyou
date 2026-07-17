@@ -13370,7 +13370,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "return q ? \"/api/v1/view?\" + qs(q) : null;",
             "\"data-agent-citation\": \"view\"",
             "\"data-agent-citation\": \"route\"",
-            "turnState.addCitations(extractAgentSources(d));",
+            "const sources = extractAgentSources(d);",
+            "turnState.addCitations(sources);",
             "if (m.citations && m.citations.length) bubble.append(renderAgentCitationBar(m.citations));",
         ] {
             assert!(
@@ -13396,6 +13397,33 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(
             !citation_helpers.contains("token") && !citation_helpers.contains("action_hash"),
             "Assistant citation helpers must not inspect pending secrets"
+        );
+    }
+
+    #[test]
+    fn assistant_tool_result_ui_keeps_raw_content_out_of_state_and_dom() {
+        let start = APP_JS
+            .find("case \"tool_result\":")
+            .expect("tool result event branch");
+        let end = APP_JS[start..]
+            .find("case \"search_stage\":")
+            .map(|offset| start + offset)
+            .expect("tool result event branch end");
+        let branch = &APP_JS[start..end];
+        for needle in [
+            "const sources = extractAgentSources(d);",
+            "? `${sources.length} source${sources.length === 1 ? \"\" : \"s\"}`",
+            ": \"Completed\"",
+            "turnState.addCitations(sources);",
+        ] {
+            assert!(
+                branch.contains(needle),
+                "missing redacted tool result UI invariant: {needle}"
+            );
+        }
+        assert!(
+            !branch.contains("detail: agentCompactValue(d.content"),
+            "raw ToolResult content must never be copied into AssistantState.tools or the DOM"
         );
     }
 

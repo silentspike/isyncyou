@@ -6204,13 +6204,18 @@ function handleAgentEvent(message, turnState) {
       });
       break;
     case "tool_result":
-      turnState.addToolRow({
-        kind: "tool_result",
-        title: "Tool result",
-        detail: agentCompactValue(d.content, 120),
-        untrusted: !!d.untrusted,
-      });
-      turnState.addCitations(extractAgentSources(d));
+      {
+        const sources = extractAgentSources(d);
+        turnState.addToolRow({
+          kind: "tool_result",
+          title: "Tool result",
+          detail: sources.length
+            ? `${sources.length} source${sources.length === 1 ? "" : "s"}`
+            : "Completed",
+          untrusted: !!d.untrusted,
+        });
+        turnState.addCitations(sources);
+      }
       break;
     case "search_stage":
       turnState.onSearchStage(d);
