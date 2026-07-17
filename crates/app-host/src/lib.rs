@@ -14804,6 +14804,36 @@ mod tests {
         feature = "agent-subscription-experimental"
     ))]
     #[test]
+    fn agent_turn_admission_budget_finishes_only_after_accepted_publish() {
+        let source = include_str!("product_session.rs");
+        let function = source
+            .split("pub fn begin_turn(")
+            .nth(1)
+            .expect("product begin_turn implementation")
+            .split("pub(crate) fn pairing_payload(")
+            .next()
+            .expect("product begin_turn boundary");
+        let fresh_request = function
+            .split("let lease_id = new_ulid()")
+            .last()
+            .expect("fresh request branch");
+        let publish = fresh_request
+            .find("guard\n            .publish(SessionCommitV1")
+            .expect("accepted manifest publication");
+        let finish = fresh_request
+            .find("guard.finish_admission()")
+            .expect("admission budget completion");
+
+        assert!(publish < finish);
+        assert!(fresh_request[..publish].find("finish_admission").is_none());
+        assert!(fresh_request[publish..finish].contains("map_err(map_session_error)?"));
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
     fn agent_session_create_never_waits_for_graph_before_turn_reservation() {
         let source = include_str!("lib.rs");
         let function = source

@@ -237,6 +237,9 @@ pub struct GraphClient {
     /// When set, GETs send `Prefer: IdType="ImmutableId", outlook.timezone="UTC"`
     /// (the Outlook immutable-ID policy, plan §6).
     prefer_immutable_id: bool,
+    /// Optional process-local operation deadline used by short interactive
+    /// workflows. It is never serialized or derived from device wall time.
+    operation_deadline: Option<std::time::Instant>,
 }
 
 /// The `Prefer` header value for the Outlook immutable-ID policy (plan §6).
@@ -260,6 +263,7 @@ impl GraphClient {
             token: access_token.into(),
             base: GRAPH.into(),
             prefer_immutable_id: false,
+            operation_deadline: None,
         }
     }
 
@@ -274,18 +278,34 @@ impl GraphClient {
         request_timeout: Duration,
         connect_timeout: Duration,
     ) -> Result<Self, UploadError> {
-        if request_timeout.is_zero()
-            || connect_timeout.is_zero()
-            || connect_timeout > request_timeout
-        {
-            return Err(UploadError::Parse("invalid Graph timeout policy".into()));
-        }
-        let client = reqwest::blocking::Client::builder()
-            .timeout(request_timeout)
-            .connect_timeout(connect_timeout)
-            .build()
-            .map_err(UploadError::from_reqwest)?;
+        let client = bounded_client(request_timeout, connect_timeout)?;
         Ok(Self::with_client(client, access_token))
+    }
+
+    /// Clone this authenticated client while replacing only its HTTP deadlines.
+    ///
+    /// Interactive callers use this to shrink each request to the remaining
+    /// operation budget without changing the reviewed Graph origin or request
+    /// policy carried by the original client.
+    pub fn clone_with_deadline(
+        &self,
+        deadline: std::time::Instant,
+        maximum_request_timeout: Duration,
+        maximum_connect_timeout: Duration,
+    ) -> Result<Self, UploadError> {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| UploadError::Timeout("operation deadline elapsed".into()))?;
+        let request_timeout = remaining.min(maximum_request_timeout);
+        let connect_timeout = request_timeout.min(maximum_connect_timeout);
+        Ok(Self {
+            client: bounded_client(request_timeout, connect_timeout)?,
+            token: self.token.clone(),
+            base: self.base.clone(),
+            prefer_immutable_id: self.prefer_immutable_id,
+            operation_deadline: Some(deadline),
+        })
     }
 
     /// Build with a custom reqwest client (timeouts, proxy, …).
@@ -295,6 +315,7 @@ impl GraphClient {
             token: access_token.into(),
             base: GRAPH.into(),
             prefer_immutable_id: false,
+            operation_deadline: None,
         }
     }
 
@@ -315,6 +336,31 @@ impl GraphClient {
             format!("{}{url}", self.base)
         }
     }
+
+    fn remaining_operation_budget(&self) -> Result<Option<Duration>, UploadError> {
+        self.operation_deadline
+            .map(|deadline| {
+                deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or_else(|| UploadError::Timeout("operation deadline elapsed".into()))
+            })
+            .transpose()
+    }
+}
+
+fn bounded_client(
+    request_timeout: Duration,
+    connect_timeout: Duration,
+) -> Result<reqwest::blocking::Client, UploadError> {
+    if request_timeout.is_zero() || connect_timeout.is_zero() || connect_timeout > request_timeout {
+        return Err(UploadError::Parse("invalid Graph timeout policy".into()));
+    }
+    reqwest::blocking::Client::builder()
+        .timeout(request_timeout)
+        .connect_timeout(connect_timeout)
+        .build()
+        .map_err(UploadError::from_reqwest)
 }
 
 fn parse_retry_after(resp: &reqwest::blocking::Response) -> Option<Duration> {
@@ -1285,6 +1331,9 @@ impl GraphClient {
         loop {
             attempt += 1;
             let mut req = self.client.get(url).bearer_auth(&self.token);
+            if let Some(remaining) = self.remaining_operation_budget()? {
+                req = req.timeout(remaining);
+            }
             if self.prefer_immutable_id {
                 req = req.header("Prefer", PREFER_IMMUTABLE_ID);
             }
@@ -1302,6 +1351,11 @@ impl GraphClient {
                 let wait = parse_retry_after(&resp)
                     .unwrap_or_else(|| backoff_delay(attempt))
                     .min(MAX_RETRY_WAIT);
+                if let Some(remaining) = self.remaining_operation_budget()? {
+                    if wait >= remaining {
+                        return Err(UploadError::Timeout("operation deadline elapsed".into()));
+                    }
+                }
                 std::thread::sleep(wait);
                 continue;
             }
@@ -2307,6 +2361,28 @@ mod tests {
         ));
         GraphClient::with_timeouts("token", Duration::from_secs(2), Duration::from_secs(1))
             .expect("valid caller deadlines");
+    }
+
+    #[test]
+    fn graph_client_deadline_clone_preserves_origin_and_rejects_elapsed_budget() {
+        let client = GraphClient::new("token").with_base_url("http://127.0.0.1:32123");
+        let bounded = client
+            .clone_with_deadline(
+                std::time::Instant::now() + Duration::from_secs(2),
+                Duration::from_secs(8),
+                Duration::from_secs(4),
+            )
+            .expect("active operation deadline");
+        assert_eq!(bounded.base, client.base);
+        assert!(bounded.operation_deadline.is_some());
+        assert!(matches!(
+            client.clone_with_deadline(
+                std::time::Instant::now() - Duration::from_millis(1),
+                Duration::from_secs(8),
+                Duration::from_secs(4),
+            ),
+            Err(UploadError::Timeout(_))
+        ));
     }
 
     #[test]

@@ -1563,6 +1563,13 @@ impl<T: SessionV2Transport + Clone + 'static> SessionLeaseGuard<T> {
         })
     }
 
+    /// Promote the transport from its short admission budget to the normal
+    /// long-turn request policy. Call only after the accepted request state has
+    /// become authoritative through the manifest CAS.
+    pub fn finish_admission(&self) {
+        self.store.transport.finish_admission();
+    }
+
     pub fn publish(&self, commit: SessionCommitV1) -> Result<(), SessionV2Error> {
         let now = fresh_server_time(&self.store.transport)?;
         let mut state = self.state.lock().map_err(|_| SessionV2Error::LeaseLost)?;
@@ -1763,6 +1770,10 @@ pub trait SessionV2Transport: Send + Sync {
         object_class: SessionObjectClass,
         object_id: &str,
     ) -> Result<Option<Vec<u8>>, SessionV2Error>;
+    /// End the short interactive admission budget after the accepted request is
+    /// durably published. Long-turn lease renewal then uses the transport's
+    /// ordinary bounded per-request deadlines.
+    fn finish_admission(&self) {}
     fn reap_unreachable(
         &self,
         reachable: &BTreeSet<(SessionObjectClass, String)>,
@@ -2018,6 +2029,7 @@ mod onedrive_transport {
     const V2_ROOT: &str = "Apps/iSyncYou/agent/v2";
     const MAX_MANIFEST_BYTES: usize = 64 * 1024;
     const MAX_IMMUTABLE_OBJECT_BYTES: usize = 5 * 1024 * 1024;
+    const INTERACTIVE_ADMISSION_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
     const INTERACTIVE_GRAPH_REQUEST_TIMEOUT: std::time::Duration =
         std::time::Duration::from_secs(8);
     const INTERACTIVE_GRAPH_CONNECT_TIMEOUT: std::time::Duration =
@@ -2027,6 +2039,7 @@ mod onedrive_transport {
     pub struct OneDriveSessionV2Transport {
         client: GraphClient,
         session_id: String,
+        admission_deadline: Arc<Mutex<Option<std::time::Instant>>>,
     }
 
     impl OneDriveSessionV2Transport {
@@ -2040,7 +2053,11 @@ mod onedrive_transport {
                 INTERACTIVE_GRAPH_CONNECT_TIMEOUT,
             )
             .map_err(|_| SessionV2Error::TransportUnavailable)?;
-            Self::from_client(client, session_id.into())
+            Self::from_client(
+                client,
+                session_id.into(),
+                Some(std::time::Instant::now() + INTERACTIVE_ADMISSION_BUDGET),
+            )
         }
 
         #[cfg(test)]
@@ -2052,20 +2069,59 @@ mod onedrive_transport {
             Self::from_client(
                 GraphClient::new(token).with_base_url(base_url),
                 session_id.into(),
+                None,
             )
         }
 
-        fn from_client(client: GraphClient, session_id: String) -> Result<Self, SessionV2Error> {
+        fn from_client(
+            client: GraphClient,
+            session_id: String,
+            admission_deadline: Option<std::time::Instant>,
+        ) -> Result<Self, SessionV2Error> {
             validate_cloud_component(&session_id)?;
-            Ok(Self { client, session_id })
+            Ok(Self {
+                client,
+                session_id,
+                admission_deadline: Arc::new(Mutex::new(admission_deadline)),
+            })
+        }
+
+        fn check_admission_budget(&self) -> Result<(), SessionV2Error> {
+            let deadline = self
+                .admission_deadline
+                .lock()
+                .map_err(|_| SessionV2Error::TransportUnavailable)?;
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err(SessionV2Error::TransportUnavailable);
+            }
+            Ok(())
+        }
+
+        fn client_for_request(&self) -> Result<GraphClient, SessionV2Error> {
+            let deadline = *self
+                .admission_deadline
+                .lock()
+                .map_err(|_| SessionV2Error::TransportUnavailable)?;
+            let Some(deadline) = deadline else {
+                return Ok(self.client.clone());
+            };
+            self.client
+                .clone_with_deadline(
+                    deadline,
+                    INTERACTIVE_GRAPH_REQUEST_TIMEOUT,
+                    INTERACTIVE_GRAPH_CONNECT_TIMEOUT,
+                )
+                .map_err(|_| SessionV2Error::TransportUnavailable)
         }
 
         pub fn create_session(&self) -> Result<VersionedManifest, SessionV2Error> {
+            self.check_admission_budget()?;
             self.ensure_session_folders()?;
+            self.check_admission_budget()?;
             let manifest = SessionManifestV1::empty(&self.session_id);
             let bytes = manifest_bytes(&manifest)?;
             let created = self
-                .client
+                .client_for_request()?
                 .upload_content_with_conflict_behavior(
                     &self.manifest_path(),
                     &bytes,
@@ -2079,11 +2135,14 @@ mod onedrive_transport {
         }
 
         fn ensure_session_folders(&self) -> Result<(), SessionV2Error> {
+            self.check_admission_budget()?;
             let v2_id = self.ensure_v2_root()?;
+            self.check_admission_budget()?;
             let session_path = format!("{V2_ROOT}/{}", self.session_id);
             let session_id = self.create_or_get_folder(&v2_id, &self.session_id, &session_path)?;
             let staging_path = format!("{session_path}/staging");
             let staging_id = self.create_or_get_folder(&session_id, "staging", &staging_path)?;
+            self.check_admission_budget()?;
 
             // These folders are independent once staging exists. Create them concurrently so
             // first-turn admission pays one Graph round trip instead of six sequential ones.
@@ -2109,12 +2168,14 @@ mod onedrive_transport {
                     .join()
                     .map_err(|_| SessionV2Error::TransportUnavailable)??;
             }
+            self.check_admission_budget()?;
             Ok(())
         }
 
         fn ensure_v2_root(&self) -> Result<String, SessionV2Error> {
+            self.check_admission_budget()?;
             if let Some(item) = self
-                .client
+                .client_for_request()?
                 .get_drive_item_by_path(V2_ROOT, &["id", "folder"])
                 .map_err(|_| SessionV2Error::TransportUnavailable)?
             {
@@ -2124,6 +2185,7 @@ mod onedrive_transport {
             let mut parent_id = String::new();
             let mut path = String::new();
             for segment in ["Apps", "iSyncYou", "agent", "v2"] {
+                self.check_admission_budget()?;
                 if !path.is_empty() {
                     path.push('/');
                 }
@@ -2139,8 +2201,9 @@ mod onedrive_transport {
             name: &str,
             path: &str,
         ) -> Result<String, SessionV2Error> {
+            self.check_admission_budget()?;
             if let Some(item) = self
-                .client
+                .client_for_request()?
                 .get_drive_item_by_path(path, &["id", "folder"])
                 .map_err(|_| SessionV2Error::TransportUnavailable)?
             {
@@ -2155,10 +2218,11 @@ mod onedrive_transport {
             name: &str,
             path: &str,
         ) -> Result<String, SessionV2Error> {
-            match self.client.create_folder(parent_id, name) {
+            self.check_admission_budget()?;
+            match self.client_for_request()?.create_folder(parent_id, name) {
                 Ok(item) => graph_folder_id(&item),
                 Err(UploadError::Http { status: 409, .. }) => self
-                    .client
+                    .client_for_request()?
                     .get_drive_item_by_path(path, &["id", "folder"])
                     .map_err(|_| SessionV2Error::TransportUnavailable)?
                     .as_ref()
@@ -2187,13 +2251,15 @@ mod onedrive_transport {
         }
 
         fn read_path(&self, path: &str, limit: usize) -> Result<Vec<u8>, SessionV2Error> {
-            self.client
+            self.check_admission_budget()?;
+            self.client_for_request()?
                 .get_bytes_bounded(&format!("/me/drive/root:/{path}:/content"), limit)
                 .map_err(|_| SessionV2Error::TransportUnavailable)
         }
 
         fn manifest_item(&self) -> Result<serde_json::Value, SessionV2Error> {
-            self.client
+            self.check_admission_budget()?;
+            self.client_for_request()?
                 .get_drive_item_by_path(&self.manifest_path(), &["id", "eTag"])
                 .map_err(|_| SessionV2Error::TransportUnavailable)?
                 .ok_or(SessionV2Error::TransportUnavailable)
@@ -2202,8 +2268,9 @@ mod onedrive_transport {
 
     impl SessionV2Transport for OneDriveSessionV2Transport {
         fn server_time_sample(&self) -> Result<TrustedServerTimeSample, SessionV2Error> {
+            self.check_admission_budget()?;
             let sample = self
-                .client
+                .client_for_request()?
                 .server_time_sample()
                 .map_err(|_| SessionV2Error::TransportUnavailable)?;
             Ok(TrustedServerTimeSample {
@@ -2213,6 +2280,7 @@ mod onedrive_transport {
         }
 
         fn load_manifest(&self, session_id: &str) -> Result<VersionedManifest, SessionV2Error> {
+            self.check_admission_budget()?;
             if session_id != self.session_id {
                 return Err(SessionV2Error::InvalidRecord);
             }
@@ -2233,12 +2301,13 @@ mod onedrive_transport {
             object_id: &str,
             bytes: &[u8],
         ) -> Result<(), SessionV2Error> {
+            self.check_admission_budget()?;
             if bytes.len() > MAX_IMMUTABLE_OBJECT_BYTES {
                 return Err(SessionV2Error::SessionLimit);
             }
             let path = self.object_path(object_class, object_id)?;
             let created = self
-                .client
+                .client_for_request()?
                 .upload_content_with_conflict_behavior(&path, bytes, ConflictBehavior::Fail)
                 .map_err(|_| SessionV2Error::TransportUnavailable)?;
             if created.is_none() && self.read_path(&path, MAX_IMMUTABLE_OBJECT_BYTES)? != bytes {
@@ -2252,6 +2321,7 @@ mod onedrive_transport {
             object_class: SessionObjectClass,
             object_id: &str,
         ) -> Result<Vec<u8>, SessionV2Error> {
+            self.check_admission_budget()?;
             let path = self.object_path(object_class, object_id)?;
             self.read_path(&path, MAX_IMMUTABLE_OBJECT_BYTES)
         }
@@ -2261,13 +2331,20 @@ mod onedrive_transport {
             object_class: SessionObjectClass,
             object_id: &str,
         ) -> Result<Option<Vec<u8>>, SessionV2Error> {
+            self.check_admission_budget()?;
             let path = self.object_path(object_class, object_id)?;
             let item = self
-                .client
+                .client_for_request()?
                 .get_drive_item_by_path(&path, &["id", "file"])
                 .map_err(|_| SessionV2Error::TransportUnavailable)?;
             item.map(|_| self.read_path(&path, MAX_IMMUTABLE_OBJECT_BYTES))
                 .transpose()
+        }
+
+        fn finish_admission(&self) {
+            if let Ok(mut deadline) = self.admission_deadline.lock() {
+                *deadline = None;
+            }
         }
 
         fn reap_unreachable(
@@ -2294,7 +2371,7 @@ mod onedrive_transport {
                     object_class_segment(object_class)
                 );
                 let Some(folder) = self
-                    .client
+                    .client_for_request()?
                     .get_drive_item_by_path(&folder_path, &["id", "folder"])
                     .map_err(|_| SessionV2Error::TransportUnavailable)?
                 else {
@@ -2305,7 +2382,7 @@ mod onedrive_transport {
                     .and_then(serde_json::Value::as_str)
                     .ok_or(SessionV2Error::TransportUnavailable)?;
                 for item in self
-                    .client
+                    .client_for_request()?
                     .list_children(folder_id)
                     .map_err(|_| SessionV2Error::TransportUnavailable)?
                 {
@@ -2337,7 +2414,7 @@ mod onedrive_transport {
                         .and_then(serde_json::Value::as_str)
                         .filter(|value| !value.is_empty())
                         .ok_or(SessionV2Error::TransportUnavailable)?;
-                    self.client
+                    self.client_for_request()?
                         .delete_item(item_id)
                         .map_err(|_| SessionV2Error::TransportUnavailable)?;
                     reaped += 1;
@@ -2351,6 +2428,7 @@ mod onedrive_transport {
             expected_etag: &str,
             next: &SessionManifestV1,
         ) -> Result<Option<VersionedManifest>, SessionV2Error> {
+            self.check_admission_budget()?;
             next.validate()?;
             if next.session_id != self.session_id {
                 return Err(SessionV2Error::InvalidRecord);
@@ -2365,7 +2443,7 @@ mod onedrive_transport {
                 .ok_or(SessionV2Error::TransportUnavailable)?;
             let bytes = manifest_bytes(next)?;
             let Some(updated) = self
-                .client
+                .client_for_request()?
                 .replace_content_if_match(item_id, &bytes, expected_etag)
                 .map_err(|_| SessionV2Error::TransportUnavailable)?
             else {
@@ -2519,6 +2597,24 @@ mod onedrive_transport {
                 "http://127.0.0.1:1"
             )
             .is_err());
+        }
+
+        #[test]
+        fn onedrive_v2_transport_admission_budget_expires_then_clears_for_long_turn() {
+            let transport = OneDriveSessionV2Transport::with_base_url(
+                "token",
+                "session-test",
+                "http://127.0.0.1:1",
+            )
+            .unwrap();
+            *transport.admission_deadline.lock().unwrap() =
+                Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+            assert_eq!(
+                transport.check_admission_budget(),
+                Err(SessionV2Error::TransportUnavailable)
+            );
+            transport.finish_admission();
+            assert_eq!(transport.check_admission_budget(), Ok(()));
         }
 
         #[test]

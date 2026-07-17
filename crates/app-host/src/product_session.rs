@@ -1164,6 +1164,16 @@ impl<'a> ProductSessionRegistry<'a> {
         graph_token: &str,
         session_id: &str,
     ) -> Result<SessionV2Store<OneDriveSessionV2Transport>, String> {
+        let transport =
+            OneDriveSessionV2Transport::new(graph_token, session_id).map_err(map_session_error)?;
+        self.open_with_transport(session_id, transport)
+    }
+
+    fn open_with_transport(
+        &self,
+        session_id: &str,
+        transport: OneDriveSessionV2Transport,
+    ) -> Result<SessionV2Store<OneDriveSessionV2Transport>, String> {
         let index = self.load_index()?;
         if !index
             .sessions
@@ -1184,8 +1194,6 @@ impl<'a> ProductSessionRegistry<'a> {
             .store
             .domain_hmac(CURSOR_HMAC_DOMAIN, session_id.as_bytes())
             .map_err(|_| "session_store_unavailable")?;
-        let transport =
-            OneDriveSessionV2Transport::new(graph_token, session_id).map_err(map_session_error)?;
         Ok(SessionV2Store::new(transport, &cursor_key, object_crypto))
     }
 
@@ -1203,14 +1211,13 @@ impl<'a> ProductSessionRegistry<'a> {
         graph_token: &str,
         session_id: &str,
     ) -> Result<SessionV2Store<OneDriveSessionV2Transport>, String> {
-        let session = self.open(graph_token, session_id)?;
+        let transport =
+            OneDriveSessionV2Transport::new(graph_token, session_id).map_err(map_session_error)?;
+        let session = self.open_with_transport(session_id, transport.clone())?;
         if !self.remote_initialization_pending(session_id)? {
             return Ok(session);
         }
-        OneDriveSessionV2Transport::new(graph_token, session_id)
-            .map_err(map_session_error)?
-            .create_session()
-            .map_err(map_session_error)?;
+        transport.create_session().map_err(map_session_error)?;
         let mut index = self.load_index()?;
         let stored = index
             .sessions
@@ -1425,6 +1432,7 @@ impl<'a> ProductSessionRegistry<'a> {
                         error_code: None,
                     }));
                 }
+                runtime.guard.finish_admission();
                 return Ok(ProductTurnStart::Started(Box::new(runtime)));
             }
             return Ok(ProductTurnStart::Replay(ProductTurnReplay {
@@ -1485,6 +1493,7 @@ impl<'a> ProductSessionRegistry<'a> {
                 uuid_bindings: vec![request_binding.clone()],
             })
             .map_err(map_session_error)?;
+        guard.finish_admission();
         Ok(ProductTurnStart::Started(Box::new(ProductTurnRuntime {
             guard,
             session_id: session_id.to_owned(),
