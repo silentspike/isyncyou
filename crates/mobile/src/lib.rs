@@ -1586,6 +1586,21 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeDescribe
 #[no_mangle]
 pub static ISY_AGENT_NETWORK_DEVICE_HOOK_MARKER: &[u8] = b"ISY_AGENT_NETWORK_DEVICE_HOOK_V1";
 
+/// #625 mobile-job fault-injection marker. The hook remains app-private and JNI-internal;
+/// this symbol exists only so artifact scans can prove the exact hook build composition.
+#[cfg(feature = "mobile-job-device-test-hooks")]
+#[used]
+#[no_mangle]
+pub static ISY_MOBILE_JOB_DEVICE_HOOK_MARKER: &[u8] = b"ISY_MOBILE_JOB_DEVICE_HOOK_V1";
+
+/// #620 encrypted credential-store self-test marker. The feature exposes no WebView,
+/// bridge, or HTTP operation and is excluded from default product builds.
+#[cfg(feature = "agent-credential-store-self-test")]
+#[used]
+#[no_mangle]
+pub static ISY_AGENT_CREDENTIAL_STORE_SELF_TEST_MARKER: &[u8] =
+    b"ISY_AGENT_CREDENTIAL_STORE_SELF_TEST_V1";
+
 /// #645 evidence marker. The feature-enabled APK exposes only JNI-internal closed
 /// checkpoints; product WebView/HTTP/bridge code has no path to this marker or control.
 #[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
@@ -1725,6 +1740,10 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeNetworkD
     _env: jni::EnvUnowned<'local>,
     _class: jni::objects::JClass<'local>,
 ) -> jni::sys::jboolean {
+    #[cfg(feature = "mobile-job-device-test-hooks")]
+    std::hint::black_box(ISY_MOBILE_JOB_DEVICE_HOOK_MARKER);
+    #[cfg(feature = "agent-credential-store-self-test")]
+    std::hint::black_box(ISY_AGENT_CREDENTIAL_STORE_SELF_TEST_MARKER);
     #[cfg(feature = "agent-network-device-test-hooks")]
     {
         // Keep the marker referenced in the executable path so binary scans can prove the
@@ -2054,6 +2073,10 @@ mod tests {
     #[cfg(feature = "agent-credential-store-self-test")]
     #[test]
     fn agent_credential_store_self_test_json_is_structured_and_redacted() {
+        assert_eq!(
+            ISY_AGENT_CREDENTIAL_STORE_SELF_TEST_MARKER,
+            b"ISY_AGENT_CREDENTIAL_STORE_SELF_TEST_V1"
+        );
         let _guard = mobile_key_test_guard();
         reset_mobile_agent_credential_ready_for_tests();
         assert!(install_mobile_agent_credential_key(&[8u8; 32]));
@@ -2083,6 +2106,15 @@ mod tests {
         assert_eq!(
             value["wrapped_key_file"].as_str(),
             Some("agent_credential.key")
+        );
+    }
+
+    #[cfg(feature = "mobile-job-device-test-hooks")]
+    #[test]
+    fn mobile_job_hook_apk_contains_deliberate_marker() {
+        assert_eq!(
+            ISY_MOBILE_JOB_DEVICE_HOOK_MARKER,
+            b"ISY_MOBILE_JOB_DEVICE_HOOK_V1"
         );
     }
 
