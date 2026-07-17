@@ -41,6 +41,7 @@ const CODEX_REQUIRED_WIRE_HEADERS: &[&str] = &[
     "content-type",
     "originator",
     "user-agent",
+    "x-openai-internal-codex-responses-lite",
 ];
 const TRANSPORT_HEADERS: &[&str] = &["accept-encoding", "connection", "content-length", "host"];
 
