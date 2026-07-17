@@ -5305,6 +5305,7 @@ const AssistantState = {
   sessionHydrationId: null,
   sessionHydrationPromise: null,
   sessionHydrationSeq: 0,
+  sessionHistoryRefreshing: false,
 };
 
 function closeAssistantStream(_reason) {
@@ -6329,16 +6330,25 @@ async function hydrateAgentSession(sessionId) {
   const hydration = (async () => {
     let cursor = null;
     const records = [];
-    do {
+    const deadline = Date.now() + 60_000;
+    while (records.length < 10000) {
       const path = "/api/v1/agent/session/history?" + qs({
         session_id: sessionId,
         limit: 100,
         ...(cursor ? { cursor } : {}),
       });
       const page = await request("GET", path, { capToken: CAP.agent });
+      if (page && page.refreshing === true) {
+        AssistantState.sessionHistoryRefreshing = true;
+        if (Date.now() >= deadline) throw new Error("session_transport_unavailable");
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        continue;
+      }
+      AssistantState.sessionHistoryRefreshing = false;
       if (Array.isArray(page.records)) records.push(...page.records);
       cursor = page.next_cursor || null;
-    } while (cursor && records.length < 10000);
+      if (!cursor) break;
+    }
     if (AssistantState.sessionHydrationSeq !== sequence
         || AssistantState.selectedSessionId !== sessionId
         || AssistantState.busy) return;
@@ -6350,6 +6360,7 @@ async function hydrateAgentSession(sessionId) {
   try {
     await hydration;
   } finally {
+    AssistantState.sessionHistoryRefreshing = false;
     if (AssistantState.sessionHydrationSeq === sequence) {
       AssistantState.sessionHydrationId = null;
       AssistantState.sessionHydrationPromise = null;

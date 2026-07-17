@@ -530,6 +530,20 @@ const MAX_HOT_REQUEST_STATUSES: usize = 256;
     feature = "agent-subscription-experimental",
     test
 ))]
+const MAX_HOT_SESSION_HISTORY_PAGES: usize = 256;
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
+const HOT_SESSION_HISTORY_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
 #[derive(Default)]
 struct HotRequestStatusCache {
     entries: Mutex<HashMap<(String, String), (isyncyou_agent::RequestPhase, u64)>>,
@@ -567,6 +581,170 @@ impl HotRequestStatusCache {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&(session_id.to_owned(), request_id.to_owned()))
             .map(|(phase, _)| *phase)
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
+#[derive(Default)]
+struct HotAgentStatusCache {
+    entry: Mutex<Option<(u64, serde_json::Value)>>,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
+impl HotAgentStatusCache {
+    fn get(&self, revision: u64) -> Option<serde_json::Value> {
+        self.entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .filter(|(cached_revision, _)| *cached_revision == revision)
+            .map(|(_, status)| status.clone())
+    }
+
+    fn replace(&self, revision: u64, status: serde_json::Value) {
+        *self
+            .entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((revision, status));
+    }
+
+    #[cfg(test)]
+    fn invalidate(&self) {
+        *self
+            .entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
+#[derive(Clone)]
+enum HotSessionHistoryState {
+    Loading,
+    Ready(isyncyou_agent::HistoryPageV1),
+    Failed(std::time::Instant),
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
+struct HotSessionHistoryEntry {
+    state: HotSessionHistoryState,
+    sequence: u64,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
+#[derive(Debug, Clone, PartialEq)]
+enum HotSessionHistoryLookup {
+    Start,
+    Loading,
+    Ready(isyncyou_agent::HistoryPageV1),
+    Failed,
+    Busy,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
+#[derive(Default)]
+struct HotSessionHistoryCache {
+    entries: Mutex<HashMap<(String, String, usize), HotSessionHistoryEntry>>,
+    sequence: AtomicU64,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
+impl HotSessionHistoryCache {
+    fn lookup_or_start(&self, key: &(String, String, usize)) -> HotSessionHistoryLookup {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = entries.get_mut(key) {
+            return match &entry.state {
+                HotSessionHistoryState::Loading => HotSessionHistoryLookup::Loading,
+                HotSessionHistoryState::Ready(page) => HotSessionHistoryLookup::Ready(page.clone()),
+                HotSessionHistoryState::Failed(retry_at)
+                    if std::time::Instant::now() < *retry_at =>
+                {
+                    HotSessionHistoryLookup::Failed
+                }
+                HotSessionHistoryState::Failed(_) => {
+                    entry.state = HotSessionHistoryState::Loading;
+                    HotSessionHistoryLookup::Start
+                }
+            };
+        }
+        if entries.len() >= MAX_HOT_SESSION_HISTORY_PAGES {
+            let evict = entries
+                .iter()
+                .filter(|(_, entry)| !matches!(entry.state, HotSessionHistoryState::Loading))
+                .min_by_key(|(_, entry)| entry.sequence)
+                .map(|(key, _)| key.clone());
+            let Some(evict) = evict else {
+                return HotSessionHistoryLookup::Busy;
+            };
+            entries.remove(&evict);
+        }
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        entries.insert(
+            key.clone(),
+            HotSessionHistoryEntry {
+                state: HotSessionHistoryState::Loading,
+                sequence,
+            },
+        );
+        HotSessionHistoryLookup::Start
+    }
+
+    fn complete(
+        &self,
+        key: &(String, String, usize),
+        result: Result<isyncyou_agent::HistoryPageV1, String>,
+    ) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(entry) = entries.get_mut(key) else {
+            return;
+        };
+        entry.state = match result {
+            Ok(page) => HotSessionHistoryState::Ready(page),
+            Err(_) => HotSessionHistoryState::Failed(
+                std::time::Instant::now() + HOT_SESSION_HISTORY_RETRY_DELAY,
+            ),
+        };
+    }
+
+    fn invalidate(&self, session_id: &str) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|(cached_session_id, _, _), _| cached_session_id != session_id);
     }
 }
 
@@ -1730,6 +1908,18 @@ pub struct DaemonAgent {
         test
     ))]
     hot_request_statuses: Arc<HotRequestStatusCache>,
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental",
+        test
+    ))]
+    hot_agent_status: Arc<HotAgentStatusCache>,
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental",
+        test
+    ))]
+    hot_session_history: Arc<HotSessionHistoryCache>,
     #[cfg_attr(
         not(any(
             feature = "agent-oauth-providers",
@@ -1918,6 +2108,18 @@ impl DaemonAgent {
                 test
             ))]
             hot_request_statuses: Arc::new(HotRequestStatusCache::default()),
+            #[cfg(any(
+                feature = "agent-oauth-providers",
+                feature = "agent-subscription-experimental",
+                test
+            ))]
+            hot_agent_status: Arc::new(HotAgentStatusCache::default()),
+            #[cfg(any(
+                feature = "agent-oauth-providers",
+                feature = "agent-subscription-experimental",
+                test
+            ))]
+            hot_session_history: Arc::new(HotSessionHistoryCache::default()),
             last_usage: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(any(
                 feature = "agent-oauth-providers",
@@ -4872,6 +5074,34 @@ fn credential_store_error(e: impl std::fmt::Display) -> String {
 ))]
 fn agent_credential_config(oauth_dir: &Path) -> isyncyou_agent::CredentialStoreConfig {
     isyncyou_agent::CredentialStoreConfig::new(oauth_dir)
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn agent_status_store_revision(oauth_dir: &Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+
+    let store_dir = agent_credential_config(oauth_dir).store_dir().to_path_buf();
+    let mut entries = std::fs::read_dir(&store_dir)
+        .ok()?
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for entry in entries {
+        let metadata = entry.metadata().ok()?;
+        entry.file_name().hash(&mut hasher);
+        metadata.len().hash(&mut hasher);
+        metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+            .hash(&mut hasher);
+    }
+    Some(hasher.finish())
 }
 
 #[cfg(any(
@@ -7865,6 +8095,7 @@ impl DaemonAgent {
         let pending = self.pending.clone();
         let turns = Arc::clone(&self.turns);
         let hot_request_statuses = Arc::clone(&self.hot_request_statuses);
+        let hot_session_history = Arc::clone(&self.hot_session_history);
         #[cfg(any(
             feature = "agent-oauth-providers",
             feature = "agent-subscription-experimental"
@@ -7873,6 +8104,12 @@ impl DaemonAgent {
         let hot_request_binding = product_turn
             .as_ref()
             .map(product_session::ProductTurnRuntime::request_status_binding);
+        let history_session_id = hot_request_binding
+            .as_ref()
+            .map(|(session_id, _)| session_id.clone());
+        if let Some(session_id) = history_session_id.as_deref() {
+            hot_session_history.invalidate(session_id);
+        }
         let product_turn = Arc::new(Mutex::new(product_turn));
         let thread_product_turn = Arc::clone(&product_turn);
         let turn_thread = std::thread::Builder::new()
@@ -7977,6 +8214,9 @@ impl DaemonAgent {
                                 }
                                 hub.close(&tid);
                                 turns.remove(&tid);
+                                if let Some(session_id) = history_session_id.as_deref() {
+                                    hot_session_history.invalidate(session_id);
+                                }
                                 return;
                             }
                         };
@@ -8154,6 +8394,9 @@ impl DaemonAgent {
                     }
                 }
                 hub.close(&tid);
+                if let Some(session_id) = history_session_id.as_deref() {
+                    hot_session_history.invalidate(session_id);
+                }
                 if !keep_turn_authority {
                     turns.remove(&tid);
                 }
@@ -8268,6 +8511,35 @@ impl DaemonAgent {
     }
 }
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn load_product_session_history_page(
+    cfg: &Config,
+    oauth_dir: &Path,
+    session_id: &str,
+    cursor: Option<&str>,
+    limit: usize,
+) -> Result<isyncyou_agent::HistoryPageV1, String> {
+    let store =
+        agent_credential_store(oauth_dir).map_err(|_| "session_store_unavailable".to_string())?;
+    let registry = product_session::ProductSessionRegistry::new(&store);
+    let account = registry.account_for(session_id)?;
+    if registry.remote_initialization_pending(session_id)? {
+        return Ok(isyncyou_agent::HistoryPageV1 {
+            records: Vec::new(),
+            next_cursor: None,
+        });
+    }
+    let token = isyncyou_engine::auth::resolve_cached_sync_token(cfg, &account)
+        .map_err(|_| "session_transport_unavailable".to_string())?;
+    registry
+        .open(&token, session_id)?
+        .history(session_id, cursor, Some(limit))
+        .map_err(|_| "session_transport_unavailable".to_string())
+}
+
 impl isyncyou_webui::AgentHandler for DaemonAgent {
     fn session_create(
         &self,
@@ -8366,26 +8638,59 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             feature = "agent-subscription-experimental"
         ))]
         {
-            let store = agent_credential_store(&self.oauth_dir)
-                .map_err(|_| "session_store_unavailable".to_string())?;
-            let registry = product_session::ProductSessionRegistry::new(&store);
-            let account = registry.account_for(session_id)?;
-            if registry.remote_initialization_pending(session_id)? {
-                return Ok(serde_json::json!({
+            let limit = limit.unwrap_or(50);
+            if limit == 0 || limit > 100 || cursor.is_some_and(|value| value.len() > 2_048) {
+                return Err("invalid_cursor".into());
+            }
+            let key = (
+                session_id.to_owned(),
+                cursor.unwrap_or_default().to_owned(),
+                limit,
+            );
+            match self.hot_session_history.lookup_or_start(&key) {
+                HotSessionHistoryLookup::Ready(page) => Ok(serde_json::json!({
+                    "records": page.records,
+                    "next_cursor": page.next_cursor,
+                    "refreshing": false,
+                })),
+                HotSessionHistoryLookup::Start => {
+                    let cache = Arc::clone(&self.hot_session_history);
+                    let worker_key = key.clone();
+                    let cfg = self.cfg.clone();
+                    let oauth_dir = self.oauth_dir.clone();
+                    let worker_session_id = session_id.to_owned();
+                    let worker_cursor = cursor.map(str::to_owned);
+                    let spawn = std::thread::Builder::new()
+                        .name("agent-session-history".into())
+                        .spawn(move || {
+                            let result = load_product_session_history_page(
+                                &cfg,
+                                &oauth_dir,
+                                &worker_session_id,
+                                worker_cursor.as_deref(),
+                                limit,
+                            );
+                            cache.complete(&worker_key, result);
+                        });
+                    if spawn.is_err() {
+                        self.hot_session_history
+                            .complete(&key, Err("session_transport_unavailable".into()));
+                        return Err("session_transport_unavailable".into());
+                    }
+                    Ok(serde_json::json!({
+                        "records": [],
+                        "next_cursor": null,
+                        "refreshing": true,
+                    }))
+                }
+                HotSessionHistoryLookup::Loading => Ok(serde_json::json!({
                     "records": [],
                     "next_cursor": null,
-                }));
+                    "refreshing": true,
+                })),
+                HotSessionHistoryLookup::Failed => Err("session_transport_unavailable".into()),
+                HotSessionHistoryLookup::Busy => Err("session_history_busy".into()),
             }
-            let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, &account)
-                .map_err(|_| "session_transport_unavailable".to_string())?;
-            let page = registry
-                .open(&token, session_id)?
-                .history(session_id, cursor, limit)
-                .map_err(|error| error.to_string())?;
-            Ok(serde_json::json!({
-                "records": page.records,
-                "next_cursor": page.next_cursor,
-            }))
         }
         #[cfg(not(any(
             feature = "agent-oauth-providers",
@@ -10071,115 +10376,159 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         feature = "agent-subscription-experimental"
     ))]
     fn status_json(&self) -> String {
-        // #639 (F2): take the ENTIRE status snapshot — credential_state, per-provider readiness,
-        // the selected provider, and the onboarding projection — under ONE product-runtime-gate hold,
-        // so a concurrent set_model / OAuth completion / turn build can never make status report a
-        // mix of two revisions. (Readiness is host-verified: Active policy-bound bundle + matching
-        // activation + static attestation, not credential presence; experimental never qualifies.)
-        let (claude_state, codex_state, settings, claude, codex, onboarding) = {
-            match self.product_runtime_gate.lock() {
-                Ok(_gate) => match acquire_product_runtime_file_lock(&self.oauth_dir) {
-                    Ok(_file_gate) => {
-                        let claude_state = self
-                            .product_credential_status("claude")
-                            .unwrap_or("reconnect_required");
-                        let codex_state = self
-                            .product_credential_status("codex")
-                            .unwrap_or("reconnect_required");
-                        let settings = self.agent_settings();
-                        let selected = settings.as_ref().map(|settings| settings.provider);
-                        (
-                            claude_state,
-                            codex_state,
-                            settings,
-                            self.provider_ready(ProductProviderId::Claude),
-                            self.provider_ready(ProductProviderId::Codex),
-                            self.onboarding_projection(selected),
-                        )
-                    }
-                    Err(_) => failed_product_status_snapshot(),
-                },
-                Err(_) => failed_product_status_snapshot(),
-            }
-        };
-        fn failed_product_status_snapshot() -> (
-            &'static str,
-            &'static str,
-            Option<AgentSettingsSnapshot>,
-            bool,
-            bool,
-            serde_json::Value,
-        ) {
-            let failed_provider = || {
-                serde_json::json!({
-                    "state": "error_redacted",
-                    "error_code": "onboarding_failed",
-                    "steps": ONBOARDING_SUCCESS_CHAIN.iter().map(|step| {
-                        serde_json::json!({ "key": step.wire(), "complete": false })
-                    }).collect::<Vec<_>>(),
-                })
-            };
-            (
-                "reconnect_required",
-                "reconnect_required",
-                None,
-                false,
-                false,
-                serde_json::json!({
-                    "selected_provider": serde_json::Value::Null,
-                    "selected_state": "error_redacted",
-                    "providers": {
-                        "claude": failed_provider(),
-                        "codex": failed_provider(),
+        let revision = agent_status_store_revision(&self.oauth_dir);
+        let mut status = if let Some(status) =
+            revision.and_then(|revision| self.hot_agent_status.get(revision))
+        {
+            status
+        } else {
+            // #639 (F2): take the ENTIRE status snapshot — credential_state, per-provider readiness,
+            // the selected provider, and the onboarding projection — under ONE product-runtime-gate hold,
+            // so a concurrent set_model / OAuth completion / turn build can never make status report a
+            // mix of two revisions. (Readiness is host-verified: Active policy-bound bundle + matching
+            // activation + static attestation, not credential presence; experimental never qualifies.)
+            let (claude_state, codex_state, settings, claude, codex, onboarding) = {
+                match self.product_runtime_gate.lock() {
+                    Ok(_gate) => match acquire_product_runtime_file_lock(&self.oauth_dir) {
+                        Ok(_file_gate) => {
+                            let claude_state = self
+                                .product_credential_status("claude")
+                                .unwrap_or("reconnect_required");
+                            let codex_state = self
+                                .product_credential_status("codex")
+                                .unwrap_or("reconnect_required");
+                            let settings = self.agent_settings();
+                            let selected = settings.as_ref().map(|settings| settings.provider);
+                            (
+                                claude_state,
+                                codex_state,
+                                settings,
+                                self.provider_ready(ProductProviderId::Claude),
+                                self.provider_ready(ProductProviderId::Codex),
+                                self.onboarding_projection(selected),
+                            )
+                        }
+                        Err(_) => failed_product_status_snapshot(),
                     },
-                }),
-            )
+                    Err(_) => failed_product_status_snapshot(),
+                }
+            };
+            fn failed_product_status_snapshot() -> (
+                &'static str,
+                &'static str,
+                Option<AgentSettingsSnapshot>,
+                bool,
+                bool,
+                serde_json::Value,
+            ) {
+                let failed_provider = || {
+                    serde_json::json!({
+                        "state": "error_redacted",
+                        "error_code": "onboarding_failed",
+                        "steps": ONBOARDING_SUCCESS_CHAIN.iter().map(|step| {
+                            serde_json::json!({ "key": step.wire(), "complete": false })
+                        }).collect::<Vec<_>>(),
+                    })
+                };
+                (
+                    "reconnect_required",
+                    "reconnect_required",
+                    None,
+                    false,
+                    false,
+                    serde_json::json!({
+                        "selected_provider": serde_json::Value::Null,
+                        "selected_state": "error_redacted",
+                        "providers": {
+                            "claude": failed_provider(),
+                            "codex": failed_provider(),
+                        },
+                    }),
+                )
+            }
+            let reconnect_required =
+                claude_state == "reconnect_required" || codex_state == "reconnect_required";
+            // The selected provider alone drives `connected` + `provider`; there is no fall-back to
+            // the other provider, and an unparseable selection reads not-connected (fail-closed).
+            let selected_id = settings.as_ref().map(|settings| settings.provider);
+            let connected = match selected_id {
+                Some(ProductProviderId::Claude) => claude,
+                Some(ProductProviderId::Codex) => codex,
+                None => false,
+            };
+            let provider = match selected_id {
+                Some(id) => id.wire(),
+                None => "",
+            };
+            let model = settings
+                .as_ref()
+                .map(|settings| settings.model.clone())
+                .unwrap_or_default();
+            let reasoning_effort = settings
+                .as_ref()
+                .and_then(|settings| settings.reasoning_effort)
+                .map(isyncyou_agent::CodexReasoningEffort::as_str)
+                .unwrap_or("");
+            let selected_provider = selected_id.map(ProductProviderId::wire).unwrap_or("");
+            let list = |models: &[(&str, &str)]| -> serde_json::Value {
+                models
+                    .iter()
+                    .map(|(id, label)| serde_json::json!({ "id": id, "label": label }))
+                    .collect()
+            };
+            let mut status = serde_json::json!({
+                "connected": connected,
+                "enabled": true,
+                "provider": provider,
+                "selected_provider": selected_provider,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "claude": claude,
+                "codex": codex,
+                "credential_state": { "claude": claude_state, "codex": codex_state },
+                "control_store_state": self.control_store_state,
+                "reconnect_required": reconnect_required,
+                "models": { "claude": list(CLAUDE_MODELS), "codex": list(CODEX_MODELS) },
+                "reasoning_efforts": list(CODEX_REASONING_EFFORTS),
+            });
+            if let Some(usage) = selected_id.and_then(|provider| {
+                self.last_usage
+                    .lock()
+                    .ok()
+                    .and_then(|usage| usage.get(&provider).cloned())
+            }) {
+                status["usage"] = usage.to_public_json();
+            }
+            // #639 T9: the per-provider onboarding projection drives the first-run wizard. It survives
+            // journal TTL (a ready provider reports all steps complete from the durable activation).
+            status["onboarding"] = onboarding;
+            status["account_lifecycle"] = serde_json::json!({
+                "claude": account_lifecycle_projection(
+                    self,
+                    ProductProviderId::Claude,
+                    claude_state,
+                    claude,
+                ),
+                "codex": account_lifecycle_projection(
+                    self,
+                    ProductProviderId::Codex,
+                    codex_state,
+                    codex,
+                ),
+            });
+            if let Some(revision) = revision {
+                self.hot_agent_status.replace(revision, status.clone());
+            }
+            status
+        };
+
+        if let Some(object) = status.as_object_mut() {
+            object.remove("usage");
         }
-        let reconnect_required =
-            claude_state == "reconnect_required" || codex_state == "reconnect_required";
-        // The selected provider alone drives `connected` + `provider`; there is no fall-back to
-        // the other provider, and an unparseable selection reads not-connected (fail-closed).
-        let selected_id = settings.as_ref().map(|settings| settings.provider);
-        let connected = match selected_id {
-            Some(ProductProviderId::Claude) => claude,
-            Some(ProductProviderId::Codex) => codex,
-            None => false,
-        };
-        let provider = match selected_id {
-            Some(id) => id.wire(),
-            None => "",
-        };
-        let model = settings
-            .as_ref()
-            .map(|settings| settings.model.clone())
-            .unwrap_or_default();
-        let reasoning_effort = settings
-            .as_ref()
-            .and_then(|settings| settings.reasoning_effort)
-            .map(isyncyou_agent::CodexReasoningEffort::as_str)
-            .unwrap_or("");
-        let selected_provider = selected_id.map(ProductProviderId::wire).unwrap_or("");
-        let list = |models: &[(&str, &str)]| -> serde_json::Value {
-            models
-                .iter()
-                .map(|(id, label)| serde_json::json!({ "id": id, "label": label }))
-                .collect()
-        };
-        let mut status = serde_json::json!({
-            "connected": connected,
-            "enabled": true,
-            "provider": provider,
-            "selected_provider": selected_provider,
-            "model": model,
-            "reasoning_effort": reasoning_effort,
-            "claude": claude,
-            "codex": codex,
-            "credential_state": { "claude": claude_state, "codex": codex_state },
-            "control_store_state": self.control_store_state,
-            "reconnect_required": reconnect_required,
-            "models": { "claude": list(CLAUDE_MODELS), "codex": list(CODEX_MODELS) },
-            "reasoning_efforts": list(CODEX_REASONING_EFFORTS),
-        });
+        let selected_id = status
+            .get("selected_provider")
+            .and_then(serde_json::Value::as_str)
+            .and_then(ProductProviderId::parse);
         if let Some(usage) = selected_id.and_then(|provider| {
             self.last_usage
                 .lock()
@@ -10188,23 +10537,15 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         }) {
             status["usage"] = usage.to_public_json();
         }
-        // #639 T9: the per-provider onboarding projection drives the first-run wizard. It survives
-        // journal TTL (a ready provider reports all steps complete from the durable activation).
-        status["onboarding"] = onboarding;
-        status["account_lifecycle"] = serde_json::json!({
-            "claude": account_lifecycle_projection(
-                self,
-                ProductProviderId::Claude,
-                claude_state,
-                claude,
-            ),
-            "codex": account_lifecycle_projection(
-                self,
-                ProductProviderId::Codex,
-                codex_state,
-                codex,
-            ),
-        });
+        for provider in [ProductProviderId::Claude, ProductProviderId::Codex] {
+            let counts = self.provider_leases.counts(provider);
+            let node = &mut status["account_lifecycle"][provider.wire()];
+            let active_operation = node
+                .get("resume_operation_id")
+                .is_some_and(serde_json::Value::is_string);
+            node["busy"] =
+                serde_json::json!(active_operation || counts.shared > 0 || counts.exclusive > 0);
+        }
         status.to_string()
     }
 
@@ -22693,6 +23034,100 @@ fn terminal_request_status_is_cached_only_after_persistence() {
     assert_eq!(
         cache.get("session", "request"),
         Some(isyncyou_agent::RequestPhase::Committed)
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn agent_status_hot_cache_is_revision_bound_and_invalidatable() {
+    let cache = HotAgentStatusCache::default();
+    cache.replace(7, serde_json::json!({ "connected": true }));
+    assert_eq!(cache.get(7).unwrap()["connected"], true);
+    assert!(cache.get(8).is_none());
+    cache.invalidate();
+    assert!(cache.get(7).is_none());
+}
+
+#[cfg(all(
+    test,
+    any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    )
+))]
+#[test]
+fn agent_status_store_revision_changes_when_credential_records_change() {
+    let root = std::env::temp_dir().join(format!(
+        "isyncyou-status-store-revision-{}-{}",
+        std::process::id(),
+        unix_now_ms()
+    ));
+    let store_dir = agent_credential_config(&root).store_dir().to_path_buf();
+    std::fs::create_dir_all(&store_dir).unwrap();
+    let before = agent_status_store_revision(&root).unwrap();
+    std::fs::write(store_dir.join("revision-fixture.cred"), b"fixture").unwrap();
+    let after = agent_status_store_revision(&root).unwrap();
+    assert_ne!(before, after);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(test)]
+#[test]
+fn session_history_hot_cache_coalesces_completes_and_invalidates() {
+    let cache = HotSessionHistoryCache::default();
+    let key = ("session".to_string(), String::new(), 100);
+    assert_eq!(cache.lookup_or_start(&key), HotSessionHistoryLookup::Start);
+    assert_eq!(
+        cache.lookup_or_start(&key),
+        HotSessionHistoryLookup::Loading
+    );
+    let page = isyncyou_agent::HistoryPageV1 {
+        records: Vec::new(),
+        next_cursor: Some("next".into()),
+    };
+    cache.complete(&key, Ok(page.clone()));
+    assert_eq!(
+        cache.lookup_or_start(&key),
+        HotSessionHistoryLookup::Ready(page)
+    );
+    cache.invalidate("session");
+    assert_eq!(cache.lookup_or_start(&key), HotSessionHistoryLookup::Start);
+}
+
+#[cfg(test)]
+#[test]
+fn session_history_hot_cache_bounds_failures_and_worker_pressure() {
+    let cache = HotSessionHistoryCache::default();
+    let failed_key = ("failed".to_string(), String::new(), 50);
+    assert_eq!(
+        cache.lookup_or_start(&failed_key),
+        HotSessionHistoryLookup::Start
+    );
+    cache.complete(&failed_key, Err("raw transport detail".into()));
+    assert_eq!(
+        cache.lookup_or_start(&failed_key),
+        HotSessionHistoryLookup::Failed
+    );
+    {
+        let mut entries = cache.entries.lock().unwrap();
+        entries.get_mut(&failed_key).unwrap().state =
+            HotSessionHistoryState::Failed(std::time::Instant::now());
+    }
+    assert_eq!(
+        cache.lookup_or_start(&failed_key),
+        HotSessionHistoryLookup::Start
+    );
+
+    let pressure = HotSessionHistoryCache::default();
+    for index in 0..MAX_HOT_SESSION_HISTORY_PAGES {
+        assert_eq!(
+            pressure.lookup_or_start(&(format!("session-{index}"), String::new(), 50)),
+            HotSessionHistoryLookup::Start
+        );
+    }
+    assert_eq!(
+        pressure.lookup_or_start(&("overflow".into(), String::new(), 50)),
+        HotSessionHistoryLookup::Busy
     );
 }
 

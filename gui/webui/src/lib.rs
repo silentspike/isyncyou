@@ -10711,6 +10711,21 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn assistant_session_history_refreshes_asynchronously_without_bridge_timeout() {
+        let hydrate = APP_JS
+            .split("async function hydrateAgentSession(sessionId)")
+            .nth(1)
+            .unwrap()
+            .split("async function loadSelectedAgentSession()")
+            .next()
+            .unwrap();
+        assert!(hydrate.contains("page && page.refreshing === true"));
+        assert!(hydrate.contains("await new Promise((resolve) => setTimeout(resolve, 500))"));
+        assert!(hydrate.contains("const deadline = Date.now() + 60_000"));
+        assert!(hydrate.contains("throw new Error(\"session_transport_unavailable\")"));
+    }
+
+    #[test]
     fn agent_oauth_poll_keeps_loopback_alive_for_full_host_attempt_window() {
         assert!(APP_JS.contains("const AGENT_OAUTH_POLL_INTERVAL_MS = 2_000"));
         assert!(APP_JS.contains("const AGENT_OAUTH_POLL_LIMIT = 240"));
