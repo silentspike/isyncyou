@@ -2944,7 +2944,9 @@ mod tests {
         assert!(!text.contains("raw-body-sentinel"));
         assert!(!text.contains("recipient@example.com"));
         assert!(!text.contains("private subject"));
-        assert!(text.contains("<redacted-email>"));
+        for internal in ["live-write", "create_draft", "owner@example.com"] {
+            assert!(!preview.text.contains(internal));
+        }
     }
 
     #[test]

@@ -13978,8 +13978,14 @@ mod tests {
         }
 
         assert_eq!(agent.pending.len(), 1);
-        assert!(preview.contains("Invite 1 recipient"));
+        assert_eq!(
+            preview,
+            "Give 1 recipient view access to this OneDrive item"
+        );
         assert!(!preview.contains("recipient@example.com"));
+        for internal in ["share", "account", "file-1"] {
+            assert!(!preview.contains(internal));
+        }
         assert_eq!(tool_call_input["redacted"], true);
         assert_eq!(tool_call_input["recipient_count"], 1);
         assert!(!tool_call_input
@@ -15035,7 +15041,13 @@ mod tests {
                     assert_eq!(action_hash.len(), 64);
                     assert_eq!(event["risk"], "destructive");
                     assert!(event["expires_at_ms"].as_u64().unwrap() > 0);
-                    assert!(event["preview"].as_str().unwrap().contains("backup"));
+                    assert_eq!(
+                        event["preview"],
+                        "Back up 1 selected category of Microsoft 365 data"
+                    );
+                    for internal in ["backup", "account", "services", "mail"] {
+                        assert!(!event["preview"].as_str().unwrap().contains(internal));
+                    }
                 }
                 Some("done") => {
                     assert_eq!(event["reason"], "pending_confirmation");
