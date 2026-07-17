@@ -682,7 +682,12 @@ fn agent_session_error_status(error: &str) -> u16 {
         "session_account_selection_required" => 409,
         "session_account_unavailable"
         | "session_store_unavailable"
-        | "session_transport_unavailable" => 503,
+        | "session_transport_unavailable"
+        | "session_transport_timed_out" => 503,
+        "session_writer_reconnect_required"
+        | "session_storage_permission_denied"
+        | "session_storage_request_rejected"
+        | "session_storage_response_invalid" => 409,
         _ => 500,
     }
 }
@@ -10808,6 +10813,23 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(hydrate.contains("await new Promise((resolve) => setTimeout(resolve, 500))"));
         assert!(hydrate.contains("const deadline = Date.now() + 60_000"));
         assert!(hydrate.contains("throw new Error(\"session_transport_unavailable\")"));
+    }
+
+    #[test]
+    fn assistant_shared_session_errors_use_actionable_closed_copy() {
+        for code in [
+            "session_busy",
+            "session_writer_reconnect_required",
+            "session_storage_permission_denied",
+            "session_storage_request_rejected",
+            "session_transport_timed_out",
+            "session_storage_response_invalid",
+        ] {
+            assert!(APP_JS.contains(&format!("{code}:")));
+        }
+        assert!(!APP_JS.contains("private authentication response"));
+        assert!(!APP_JS.contains("private permission response"));
+        assert!(!APP_JS.contains("private request response"));
     }
 
     #[test]

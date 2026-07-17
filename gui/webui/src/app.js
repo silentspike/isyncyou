@@ -6261,8 +6261,14 @@ function agentSafeErrorCopy(code) {
     provider_response_read_failed: "The provider response could not be read.",
     provider_transport_failed: "The provider connection failed.",
     confirmation_unavailable: "Confirmation is temporarily unavailable.",
+    session_busy: "This shared session is still in use. Try again shortly.",
     session_store_unavailable: "Shared session state is temporarily unavailable. Try again.",
     session_transport_unavailable: "Shared session storage is unavailable. Check your Microsoft 365 connection and try again.",
+    session_transport_timed_out: "Shared session storage did not respond in time. Try again.",
+    session_storage_response_invalid: "Shared session storage returned an invalid response. Update iSyncYou and try again.",
+    session_writer_reconnect_required: "iSyncYou Writer needs to be reconnected before shared sessions can be updated.",
+    session_storage_permission_denied: "iSyncYou Writer does not have permission to update shared sessions.",
+    session_storage_request_rejected: "Shared session storage rejected this request. Update iSyncYou and try again.",
   };
   return known[code] || "The assistant could not complete this request.";
 }

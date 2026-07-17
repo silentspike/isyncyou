@@ -407,6 +407,11 @@ fn agent_safe_turn_error(error: &isyncyou_agent::AgentError) -> &'static str {
             "archive_body_unavailable" => "assistant_archive_body_unavailable",
             "session_store_unavailable" => "session_store_unavailable",
             "session_transport_unavailable" => "session_transport_unavailable",
+            "session_transport_timed_out" => "session_transport_timed_out",
+            "session_storage_response_invalid" => "session_storage_response_invalid",
+            "session_writer_reconnect_required" => "session_writer_reconnect_required",
+            "session_storage_permission_denied" => "session_storage_permission_denied",
+            "session_storage_request_rejected" => "session_storage_request_rejected",
             "manifest_conflict" | "lease_lost" => "lease_lost",
             "turn_outcome_unknown" => "turn_outcome_unknown",
             "request_id_conflict" => "request_id_conflict",
@@ -460,9 +465,15 @@ fn agent_safe_turn_start_error(error: &str) -> &'static str {
         "request_id_conflict" => "request_id_conflict",
         "session_account_mismatch" => "session_account_mismatch",
         "session_busy" => "session_busy",
+        "manifest_conflict" => "session_busy",
         "session_not_found" => "session_not_found",
         "session_store_unavailable" => "session_store_unavailable",
         "session_transport_unavailable" => "session_transport_unavailable",
+        "session_transport_timed_out" => "session_transport_timed_out",
+        "session_storage_response_invalid" => "session_storage_response_invalid",
+        "session_writer_reconnect_required" => "session_writer_reconnect_required",
+        "session_storage_permission_denied" => "session_storage_permission_denied",
+        "session_storage_request_rejected" => "session_storage_request_rejected",
         _ => "turn_start_failed",
     }
 }
@@ -8795,6 +8806,21 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     isyncyou_agent::SessionV2Error::TransportUnavailable => {
                         "session_transport_unavailable".to_string()
                     }
+                    isyncyou_agent::SessionV2Error::TransportTimedOut => {
+                        "session_transport_timed_out".to_string()
+                    }
+                    isyncyou_agent::SessionV2Error::TransportResponseInvalid => {
+                        "session_storage_response_invalid".to_string()
+                    }
+                    isyncyou_agent::SessionV2Error::TransportAuthenticationRequired => {
+                        "session_writer_reconnect_required".to_string()
+                    }
+                    isyncyou_agent::SessionV2Error::TransportPermissionDenied => {
+                        "session_storage_permission_denied".to_string()
+                    }
+                    isyncyou_agent::SessionV2Error::TransportRequestRejected => {
+                        "session_storage_request_rejected".to_string()
+                    }
                     _ => "session_store_unavailable".to_string(),
                 })?
                 .ok_or_else(|| "request_not_found".to_string())?;
@@ -9630,7 +9656,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                         &worker.cfg,
                         &request.account,
                     )
-                    .map_err(|_| "session_transport_unavailable".to_string())?;
+                    .map_err(|_| "session_writer_reconnect_required".to_string())?;
                     ensure_active()?;
                     let store = agent_credential_store(&worker.oauth_dir)
                         .map_err(|_| "session_store_unavailable".to_string())?;
@@ -12796,6 +12822,23 @@ mod tests {
                 "session_transport_unavailable",
                 "session_transport_unavailable",
             ),
+            ("session_transport_timed_out", "session_transport_timed_out"),
+            (
+                "session_storage_response_invalid",
+                "session_storage_response_invalid",
+            ),
+            (
+                "session_writer_reconnect_required",
+                "session_writer_reconnect_required",
+            ),
+            (
+                "session_storage_permission_denied",
+                "session_storage_permission_denied",
+            ),
+            (
+                "session_storage_request_rejected",
+                "session_storage_request_rejected",
+            ),
             ("manifest_conflict", "lease_lost"),
             ("lease_lost", "lease_lost"),
             ("turn_outcome_unknown", "turn_outcome_unknown"),
@@ -12810,6 +12853,10 @@ mod tests {
             let error = isyncyou_agent::AgentError::Provider(internal.into());
             assert_eq!(agent_safe_turn_error(&error), public);
         }
+        assert_eq!(
+            agent_safe_turn_start_error("manifest_conflict"),
+            "session_busy"
+        );
 
         let raw = isyncyou_agent::AgentError::Provider("private session detail".into());
         assert_eq!(agent_safe_turn_error(&raw), "provider_request_failed");

@@ -85,6 +85,16 @@ pub enum SessionV2Error {
     HistoryPageTooLarge,
     #[error("session_transport_unavailable")]
     TransportUnavailable,
+    #[error("session_transport_timed_out")]
+    TransportTimedOut,
+    #[error("session_storage_response_invalid")]
+    TransportResponseInvalid,
+    #[error("session_writer_reconnect_required")]
+    TransportAuthenticationRequired,
+    #[error("session_storage_permission_denied")]
+    TransportPermissionDenied,
+    #[error("session_storage_request_rejected")]
+    TransportRequestRejected,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2029,11 +2039,35 @@ mod onedrive_transport {
     const V2_ROOT: &str = "Apps/iSyncYou/agent/v2";
     const MAX_MANIFEST_BYTES: usize = 64 * 1024;
     const MAX_IMMUTABLE_OBJECT_BYTES: usize = 5 * 1024 * 1024;
-    const INTERACTIVE_ADMISSION_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+    // Turn acknowledgement happens before this background preparation starts. The first
+    // session may require several dependency-ordered folder operations, so bound the whole
+    // one-time preparation independently from the short per-request deadlines below.
+    const INTERACTIVE_ADMISSION_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
     const INTERACTIVE_GRAPH_REQUEST_TIMEOUT: std::time::Duration =
         std::time::Duration::from_secs(8);
     const INTERACTIVE_GRAPH_CONNECT_TIMEOUT: std::time::Duration =
         std::time::Duration::from_secs(4);
+
+    fn map_upload_error(error: UploadError) -> SessionV2Error {
+        match error {
+            UploadError::Http { status: 401, .. } => {
+                SessionV2Error::TransportAuthenticationRequired
+            }
+            UploadError::Http { status: 403, .. } => SessionV2Error::TransportPermissionDenied,
+            UploadError::Http { status, .. }
+                if (400..500).contains(&status) && !matches!(status, 408 | 425 | 429) =>
+            {
+                SessionV2Error::TransportRequestRejected
+            }
+            UploadError::Timeout(_) => SessionV2Error::TransportTimedOut,
+            UploadError::Parse(_) | UploadError::TooLarge | UploadError::Incomplete => {
+                SessionV2Error::TransportResponseInvalid
+            }
+            UploadError::Transport(_) | UploadError::Http { .. } => {
+                SessionV2Error::TransportUnavailable
+            }
+        }
+    }
 
     #[derive(Clone)]
     pub struct OneDriveSessionV2Transport {
@@ -2092,7 +2126,7 @@ mod onedrive_transport {
                 .lock()
                 .map_err(|_| SessionV2Error::TransportUnavailable)?;
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-                return Err(SessionV2Error::TransportUnavailable);
+                return Err(SessionV2Error::TransportTimedOut);
             }
             Ok(())
         }
@@ -2111,7 +2145,7 @@ mod onedrive_transport {
                     INTERACTIVE_GRAPH_REQUEST_TIMEOUT,
                     INTERACTIVE_GRAPH_CONNECT_TIMEOUT,
                 )
-                .map_err(|_| SessionV2Error::TransportUnavailable)
+                .map_err(|_| SessionV2Error::TransportTimedOut)
         }
 
         pub fn create_session(&self) -> Result<VersionedManifest, SessionV2Error> {
@@ -2127,7 +2161,7 @@ mod onedrive_transport {
                     &bytes,
                     ConflictBehavior::Fail,
                 )
-                .map_err(|_| SessionV2Error::TransportUnavailable)?;
+                .map_err(map_upload_error)?;
             if let Some(item) = created {
                 return versioned_manifest(item, manifest);
             }
@@ -2177,7 +2211,7 @@ mod onedrive_transport {
             if let Some(item) = self
                 .client_for_request()?
                 .get_drive_item_by_path(V2_ROOT, &["id", "folder"])
-                .map_err(|_| SessionV2Error::TransportUnavailable)?
+                .map_err(map_upload_error)?
             {
                 return graph_folder_id(&item);
             }
@@ -2205,7 +2239,7 @@ mod onedrive_transport {
             if let Some(item) = self
                 .client_for_request()?
                 .get_drive_item_by_path(path, &["id", "folder"])
-                .map_err(|_| SessionV2Error::TransportUnavailable)?
+                .map_err(map_upload_error)?
             {
                 return graph_folder_id(&item);
             }
@@ -2224,11 +2258,11 @@ mod onedrive_transport {
                 Err(UploadError::Http { status: 409, .. }) => self
                     .client_for_request()?
                     .get_drive_item_by_path(path, &["id", "folder"])
-                    .map_err(|_| SessionV2Error::TransportUnavailable)?
+                    .map_err(map_upload_error)?
                     .as_ref()
                     .ok_or(SessionV2Error::TransportUnavailable)
                     .and_then(graph_folder_id),
-                Err(_) => Err(SessionV2Error::TransportUnavailable),
+                Err(error) => Err(map_upload_error(error)),
             }
         }
 
@@ -2254,14 +2288,14 @@ mod onedrive_transport {
             self.check_admission_budget()?;
             self.client_for_request()?
                 .get_bytes_bounded(&format!("/me/drive/root:/{path}:/content"), limit)
-                .map_err(|_| SessionV2Error::TransportUnavailable)
+                .map_err(map_upload_error)
         }
 
         fn manifest_item(&self) -> Result<serde_json::Value, SessionV2Error> {
             self.check_admission_budget()?;
             self.client_for_request()?
                 .get_drive_item_by_path(&self.manifest_path(), &["id", "eTag"])
-                .map_err(|_| SessionV2Error::TransportUnavailable)?
+                .map_err(map_upload_error)?
                 .ok_or(SessionV2Error::TransportUnavailable)
         }
     }
@@ -2272,7 +2306,7 @@ mod onedrive_transport {
             let sample = self
                 .client_for_request()?
                 .server_time_sample()
-                .map_err(|_| SessionV2Error::TransportUnavailable)?;
+                .map_err(map_upload_error)?;
             Ok(TrustedServerTimeSample {
                 server_unix_ms: sample.server_unix_ms,
                 received_at_monotonic: sample.received_at_monotonic,
@@ -2309,7 +2343,7 @@ mod onedrive_transport {
             let created = self
                 .client_for_request()?
                 .upload_content_with_conflict_behavior(&path, bytes, ConflictBehavior::Fail)
-                .map_err(|_| SessionV2Error::TransportUnavailable)?;
+                .map_err(map_upload_error)?;
             if created.is_none() && self.read_path(&path, MAX_IMMUTABLE_OBJECT_BYTES)? != bytes {
                 return Err(SessionV2Error::ManifestConflict);
             }
@@ -2336,7 +2370,7 @@ mod onedrive_transport {
             let item = self
                 .client_for_request()?
                 .get_drive_item_by_path(&path, &["id", "file"])
-                .map_err(|_| SessionV2Error::TransportUnavailable)?;
+                .map_err(map_upload_error)?;
             item.map(|_| self.read_path(&path, MAX_IMMUTABLE_OBJECT_BYTES))
                 .transpose()
         }
@@ -2373,7 +2407,7 @@ mod onedrive_transport {
                 let Some(folder) = self
                     .client_for_request()?
                     .get_drive_item_by_path(&folder_path, &["id", "folder"])
-                    .map_err(|_| SessionV2Error::TransportUnavailable)?
+                    .map_err(map_upload_error)?
                 else {
                     continue;
                 };
@@ -2384,7 +2418,7 @@ mod onedrive_transport {
                 for item in self
                     .client_for_request()?
                     .list_children(folder_id)
-                    .map_err(|_| SessionV2Error::TransportUnavailable)?
+                    .map_err(map_upload_error)?
                 {
                     if reaped >= limit {
                         break;
@@ -2416,7 +2450,7 @@ mod onedrive_transport {
                         .ok_or(SessionV2Error::TransportUnavailable)?;
                     self.client_for_request()?
                         .delete_item(item_id)
-                        .map_err(|_| SessionV2Error::TransportUnavailable)?;
+                        .map_err(map_upload_error)?;
                     reaped += 1;
                 }
             }
@@ -2445,7 +2479,7 @@ mod onedrive_transport {
             let Some(updated) = self
                 .client_for_request()?
                 .replace_content_if_match(item_id, &bytes, expected_etag)
-                .map_err(|_| SessionV2Error::TransportUnavailable)?
+                .map_err(map_upload_error)?
             else {
                 return Ok(None);
             };
@@ -2611,10 +2645,48 @@ mod onedrive_transport {
                 Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
             assert_eq!(
                 transport.check_admission_budget(),
-                Err(SessionV2Error::TransportUnavailable)
+                Err(SessionV2Error::TransportTimedOut)
             );
             transport.finish_admission();
             assert_eq!(transport.check_admission_budget(), Ok(()));
+        }
+
+        #[test]
+        fn onedrive_v2_transport_redacts_graph_failure_details_into_closed_codes() {
+            let cases = [
+                (
+                    UploadError::Http {
+                        status: 401,
+                        body: "private authentication response".into(),
+                    },
+                    SessionV2Error::TransportAuthenticationRequired,
+                ),
+                (
+                    UploadError::Http {
+                        status: 403,
+                        body: "private permission response".into(),
+                    },
+                    SessionV2Error::TransportPermissionDenied,
+                ),
+                (
+                    UploadError::Http {
+                        status: 400,
+                        body: "private request response".into(),
+                    },
+                    SessionV2Error::TransportRequestRejected,
+                ),
+                (
+                    UploadError::Timeout("private timeout detail".into()),
+                    SessionV2Error::TransportTimedOut,
+                ),
+                (
+                    UploadError::Parse("private parser detail".into()),
+                    SessionV2Error::TransportResponseInvalid,
+                ),
+            ];
+            for (error, expected) in cases {
+                assert_eq!(map_upload_error(error), expected);
+            }
         }
 
         #[test]
