@@ -1392,6 +1392,7 @@ fn run_account_maintenance_once(
     let _ = context.oauth.reap_expired();
     if let Some(store) = &context.control_store {
         let _ = store.reap_expired(unix_now_ms(), 256);
+        reconcile_pending_cancel_projections(&context.cfg, &context.oauth_dir, store, 8);
     }
     if let Ok(mut attempts) = context.oauth_attempts.lock() {
         let expired = reap_oauth_attempts(&mut attempts, &context.oauth_dir);
@@ -1411,6 +1412,55 @@ fn run_account_maintenance_once(
         now_ms(),
         recover_interrupted_exchange,
     );
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn reconcile_pending_cancel_projections(
+    cfg: &Config,
+    oauth_dir: &Path,
+    store: &agent_control_store::AgentControlStore,
+    limit: usize,
+) {
+    let Ok(projections) = store.pending_cancel_projections(limit) else {
+        return;
+    };
+    for projection in projections {
+        if project_pending_cancel(cfg, oauth_dir, &projection).is_ok() {
+            let _ = store.complete_pending_cancel_projection(&projection.pending_id);
+        }
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn project_pending_cancel(
+    cfg: &Config,
+    oauth_dir: &Path,
+    projection: &agent_control_store::PendingCancelProjection,
+) -> Result<(), String> {
+    if projection.owner.session_id == "legacy-local" {
+        return Ok(());
+    }
+    let token = isyncyou_engine::auth::resolve_cached_sync_token(cfg, &projection.owner.account)
+        .map_err(|_| "session_transport_unavailable".to_string())?;
+    let credential_store =
+        agent_credential_store(oauth_dir).map_err(|_| "session_store_unavailable".to_string())?;
+    let repository = account_lifecycle_repository(oauth_dir)?;
+    let installation = repository
+        .load_existing()
+        .map_err(|_| "session_store_unavailable".to_string())?
+        .ok_or_else(|| "session_store_unavailable".to_string())?;
+    product_session::ProductSessionRegistry::new(&credential_store).append_pending_cancelled(
+        &token,
+        &projection.owner,
+        installation.principal(),
+        projection.created_at_ms,
+    )
 }
 
 #[cfg(any(
@@ -9717,22 +9767,18 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             feature = "agent-subscription-experimental"
         ))]
         if owner.session_id != "legacy-local" {
-            let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, &owner.account)
-                .map_err(|_| "session_transport_unavailable".to_string())?;
-            let credential_store = agent_credential_store(&self.oauth_dir)
-                .map_err(|_| "session_store_unavailable".to_string())?;
-            let repository = account_lifecycle_repository(&self.oauth_dir)?;
-            let installation = repository
-                .load_existing()
-                .map_err(|_| "session_store_unavailable".to_string())?
-                .ok_or_else(|| "session_store_unavailable".to_string())?;
-            product_session::ProductSessionRegistry::new(&credential_store)
-                .append_pending_cancelled(
-                    &token,
-                    &owner,
-                    installation.principal(),
-                    unix_now_ms(),
-                )?;
+            let cfg = self.cfg.clone();
+            let oauth_dir = self.oauth_dir.clone();
+            if let Some(store) = self.control_store.clone() {
+                // Authority reduction is already durable in AgentControlStore. Session projection
+                // may require slow Graph manifest I/O, so it runs outside the bridge response and
+                // is retried by lifecycle maintenance after a transport failure or process crash.
+                let _ = std::thread::Builder::new()
+                    .name("agent-pending-cancel-projection".into())
+                    .spawn(move || {
+                        reconcile_pending_cancel_projections(&cfg, &oauth_dir, &store, 8);
+                    });
+            }
         }
         #[cfg(not(any(
             feature = "agent-oauth-providers",
@@ -23293,6 +23339,59 @@ fn turn_cancel_with_existing_pending_requires_explicit_pending_cancel() {
         cancel_turn_with_pending_guard(&turns, &pending, &hub, "turn", 2_001),
         Err("turn_not_found".into())
     );
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[test]
+fn pending_cancel_returns_before_session_projection_and_retries_from_durable_queue() {
+    let root = std::env::temp_dir().join(format!(
+        "isyncyou-pending-cancel-async-projection-{}",
+        unix_now_ms()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let agent = DaemonAgent::new(Config::default(), root.clone());
+    let action = isyncyou_agent::parse_action(&serde_json::json!({
+        "op": "backup",
+        "account": "missing-account",
+        "services": ["mail"]
+    }))
+    .unwrap();
+    let (pending, token) = agent
+        .pending
+        .register_bound(
+            action,
+            "backup",
+            unix_now_ms(),
+            60_000,
+            isyncyou_agent::PendingOwnerBinding {
+                account: "missing-account".into(),
+                session_id: "session-v2".into(),
+                request_id: "019f0000-0000-4000-8000-000000000001".into(),
+                turn_id: "turn-v2".into(),
+            },
+        )
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    isyncyou_webui::AgentHandler::cancel_pending(&agent, &pending.id, &pending.action_hash)
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(
+        agent
+            .pending
+            .confirm(&pending.id, &token, &pending.action_hash, unix_now_ms()),
+        Err(isyncyou_agent::ConfirmError::NotFound)
+    );
+    let store = agent.control_store.as_ref().unwrap();
+    let projections = store.pending_cancel_projections(8).unwrap();
+    assert_eq!(projections.len(), 1);
+    assert_eq!(projections[0].pending_id, pending.id);
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const CONTROL_KEY_DOMAIN: &[u8] = b"isyncyou-agent-control-store-root/v1";
 const CONTROL_SUBKEY_SALT: &[u8] = b"isyncyou-agent-control-store-subkeys/v1";
 const SQLCIPHER_KEY_INFO: &[u8] = b"isyncyou-agent-control-sqlcipher/v1";
@@ -41,6 +41,13 @@ type MutationCommitRow = (
 );
 type UserPresenceRow = (String, String, i64, Option<Vec<u8>>, Option<Vec<u8>>);
 type PendingRow = (String, u64, String, Option<Vec<u8>>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingCancelProjection {
+    pub pending_id: String,
+    pub owner: PendingOwnerBinding,
+    pub created_at_ms: u64,
+}
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum MutationCommitStart {
@@ -337,6 +344,29 @@ impl AgentControlStore {
                  );
                  CREATE INDEX IF NOT EXISTS confirmation_expiry
                    ON confirmation_intents(state, expires_at_ms);
+                 CREATE TABLE IF NOT EXISTS pending_cancel_projections (
+                   pending_id TEXT PRIMARY KEY NOT NULL,
+                   account_id TEXT NOT NULL,
+                   session_id TEXT NOT NULL,
+                   request_id TEXT NOT NULL,
+                   turn_id TEXT NOT NULL,
+                   owner_binding TEXT NOT NULL,
+                   created_at_ms INTEGER NOT NULL,
+                   logical_bytes INTEGER NOT NULL,
+                   FOREIGN KEY(pending_id) REFERENCES confirmation_intents(intent_id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX IF NOT EXISTS pending_cancel_projection_created
+                   ON pending_cancel_projections(created_at_ms);
+                 INSERT OR IGNORE INTO pending_cancel_projections(
+                   pending_id,account_id,session_id,request_id,turn_id,owner_binding,
+                   created_at_ms,logical_bytes
+                 )
+                 SELECT intent_id,account_id,session_id,request_id,turn_id,owner_binding,
+                   CAST(strftime('%s','now') AS INTEGER) * 1000,
+                   length(intent_id) + length(account_id) + length(session_id) +
+                   length(request_id) + length(turn_id) + length(owner_binding) + 128
+                 FROM confirmation_intents
+                 WHERE state='cancelled' AND session_id!='legacy-local';
                  CREATE TABLE IF NOT EXISTS user_presence_intents (
                    operation_id TEXT PRIMARY KEY NOT NULL,
                    intent_id TEXT UNIQUE NOT NULL,
@@ -507,6 +537,70 @@ impl AgentControlStore {
             .saturating_add(reveal_responses)
             .saturating_add(claims)
             .saturating_add(expired_intents))
+    }
+
+    pub(crate) fn pending_cancel_projections(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<PendingCancelProjection>, String> {
+        let limit = i64::try_from(limit.min(32)).map_err(|_| "control_store_unavailable")?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "control_store_unavailable")?;
+        let mut statement = connection
+            .prepare(
+                "SELECT pending_id,account_id,session_id,request_id,turn_id,created_at_ms
+                 FROM pending_cancel_projections
+                 WHERE owner_binding=?1
+                 ORDER BY created_at_ms,pending_id
+                 LIMIT ?2",
+            )
+            .map_err(|_| "control_store_unavailable")?;
+        let rows = statement
+            .query_map(params![self.installation_binding, limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    PendingOwnerBinding {
+                        account: row.get(1)?,
+                        session_id: row.get(2)?,
+                        request_id: row.get(3)?,
+                        turn_id: row.get(4)?,
+                    },
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(|_| "control_store_unavailable")?;
+        let mut projections = Vec::new();
+        for row in rows {
+            let (pending_id, owner, created_at_ms) =
+                row.map_err(|_| "control_store_unavailable")?;
+            projections.push(PendingCancelProjection {
+                pending_id,
+                owner,
+                created_at_ms: u64::try_from(created_at_ms)
+                    .map_err(|_| "control_store_unavailable")?,
+            });
+        }
+        Ok(projections)
+    }
+
+    pub(crate) fn complete_pending_cancel_projection(
+        &self,
+        pending_id: &str,
+    ) -> Result<(), String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "control_store_unavailable")?;
+        connection
+            .execute(
+                "DELETE FROM pending_cancel_projections
+                 WHERE pending_id=?1 AND owner_binding=?2",
+                params![pending_id, self.installation_binding],
+            )
+            .map_err(|_| "control_store_unavailable")?;
+        Ok(())
     }
 
     fn mutation_owner_binding(&self, owner: &str) -> Result<String, String> {
@@ -2017,30 +2111,6 @@ impl AgentControlStore {
             .ok_or(ConfirmError::Unavailable)
     }
 
-    fn pending_owner(&self, intent_id: &str) -> Result<Option<PendingOwnerBinding>, ConfirmError> {
-        let connection = self
-            .connection
-            .lock()
-            .map_err(|_| ConfirmError::Unavailable)?;
-        connection
-            .query_row(
-                "SELECT account_id,session_id,request_id,turn_id
-                 FROM confirmation_intents
-                 WHERE intent_id=?1 AND owner_binding=?2",
-                params![intent_id, self.installation_binding],
-                |row| {
-                    Ok(PendingOwnerBinding {
-                        account: row.get(0)?,
-                        session_id: row.get(1)?,
-                        request_id: row.get(2)?,
-                        turn_id: row.get(3)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(|_| ConfirmError::Unavailable)
-    }
-
     fn erase_with_state(&self, intent_id: &str, state: &str) -> Result<(), ConfirmError> {
         let connection = self
             .connection
@@ -2221,25 +2291,111 @@ impl PendingPersistence for AgentControlStore {
         action_hash: &str,
         now_ms: u64,
     ) -> Result<PendingOwnerBinding, ConfirmError> {
-        let Some((state, expires, expected_action_hash, _)) = self.load_pending(pending_id)? else {
+        let now = u64_to_i64(now_ms).map_err(|_| ConfirmError::Unavailable)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| ConfirmError::Unavailable)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| ConfirmError::Unavailable)?;
+        let row: Option<(String, i64, String, String, String, String, String)> = transaction
+            .query_row(
+                "SELECT state,expires_at_ms,action_hash,account_id,session_id,request_id,turn_id
+                 FROM confirmation_intents
+                 WHERE intent_id=?1 AND owner_binding=?2",
+                params![pending_id, self.installation_binding],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| ConfirmError::Unavailable)?;
+        let Some((state, expires, expected_action_hash, account, session_id, request_id, turn_id)) =
+            row
+        else {
             return Err(ConfirmError::NotFound);
         };
         if state != "pending" && state != "cancelled" {
             return Err(ConfirmError::NotFound);
         }
-        if state == "pending" && now_ms > expires {
-            self.erase_with_state(pending_id, "expired")?;
+        if state == "pending" && now > expires {
+            transaction
+                .execute(
+                    "UPDATE confirmation_intents
+                     SET state='expired',sealed_payload=NULL,logical_bytes=0
+                     WHERE intent_id=?1 AND owner_binding=?2 AND state='pending'",
+                    params![pending_id, self.installation_binding],
+                )
+                .map_err(|_| ConfirmError::Unavailable)?;
+            transaction
+                .commit()
+                .map_err(|_| ConfirmError::Unavailable)?;
             return Err(ConfirmError::Expired);
         }
         if !constant_time_eq(action_hash.as_bytes(), expected_action_hash.as_bytes()) {
             return Err(ConfirmError::ActionMismatch);
         }
-        let owner = self
-            .pending_owner(pending_id)?
-            .ok_or(ConfirmError::NotFound)?;
         if state == "pending" {
-            self.erase_with_state(pending_id, "cancelled")?;
+            let changed = transaction
+                .execute(
+                    "UPDATE confirmation_intents
+                     SET state='cancelled',sealed_payload=NULL,logical_bytes=0
+                     WHERE intent_id=?1 AND owner_binding=?2 AND state='pending'",
+                    params![pending_id, self.installation_binding],
+                )
+                .map_err(|_| ConfirmError::Unavailable)?;
+            if changed != 1 {
+                return Err(ConfirmError::Unavailable);
+            }
         }
+        let logical_bytes = i64::try_from(
+            pending_id
+                .len()
+                .saturating_add(account.len())
+                .saturating_add(session_id.len())
+                .saturating_add(request_id.len())
+                .saturating_add(turn_id.len())
+                .saturating_add(self.installation_binding.len())
+                .saturating_add(128),
+        )
+        .map_err(|_| ConfirmError::Unavailable)?;
+        transaction
+            .execute(
+                "INSERT INTO pending_cancel_projections(
+                   pending_id,account_id,session_id,request_id,turn_id,owner_binding,
+                   created_at_ms,logical_bytes
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+                 ON CONFLICT(pending_id) DO NOTHING",
+                params![
+                    pending_id,
+                    account,
+                    session_id,
+                    request_id,
+                    turn_id,
+                    self.installation_binding,
+                    now,
+                    logical_bytes,
+                ],
+            )
+            .map_err(|_| ConfirmError::Unavailable)?;
+        transaction
+            .commit()
+            .map_err(|_| ConfirmError::Unavailable)?;
+        let owner = PendingOwnerBinding {
+            account,
+            session_id,
+            request_id,
+            turn_id,
+        };
         Ok(owner)
     }
 
@@ -2292,9 +2448,20 @@ fn initialize_metadata(
             .map_err(|_| "control_store_unavailable")?;
         if !constant_time_eq(binding.as_bytes(), installation_binding.as_bytes())
             || version != key_version.to_string()
-            || schema != SCHEMA_VERSION.to_string()
         {
             return Err("control_store_identity_mismatch".into());
+        }
+        match schema.parse::<i64>() {
+            Ok(SCHEMA_VERSION) => {}
+            Ok(1) if SCHEMA_VERSION == 2 => {
+                connection
+                    .execute(
+                        "UPDATE control_metadata SET value=?1 WHERE key='schema_version'",
+                        params![SCHEMA_VERSION.to_string()],
+                    )
+                    .map_err(|_| "control_store_unavailable")?;
+            }
+            _ => return Err("control_store_identity_mismatch".into()),
         }
         return Ok(());
     }
@@ -2377,6 +2544,7 @@ fn enforce_control_quota(connection: &Connection, additional_bytes: i64) -> Resu
         .query_row(
             "SELECT
                COALESCE((SELECT SUM(logical_bytes) FROM confirmation_intents),0) +
+               COALESCE((SELECT SUM(logical_bytes) FROM pending_cancel_projections),0) +
                COALESCE((SELECT SUM(logical_bytes) FROM user_presence_intents),0) +
                COALESCE((SELECT SUM(logical_bytes) FROM pairing_sources),0) +
                COALESCE((SELECT SUM(logical_bytes) FROM pairing_claims),0) +
@@ -2939,6 +3107,30 @@ mod tests {
     }
 
     #[test]
+    fn agent_control_store_migrates_v1_metadata_to_v2_transactionally() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE control_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO control_metadata VALUES('installation_binding','expected');
+                 INSERT INTO control_metadata VALUES('key_version','1');
+                 INSERT INTO control_metadata VALUES('schema_version','1');",
+            )
+            .unwrap();
+        let migration = connection.unchecked_transaction().unwrap();
+        initialize_metadata(&migration, "expected", 1).unwrap();
+        migration.commit().unwrap();
+        let schema: String = connection
+            .query_row(
+                "SELECT value FROM control_metadata WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema, "2");
+    }
+
+    #[test]
     fn confirmation_reaper_erases_sensitive_fields_and_keeps_only_bounded_tombstone() {
         let root = temp_root("reaper");
         let store = credential_store(&root);
@@ -3013,8 +3205,61 @@ mod tests {
         assert!(payload.is_none());
         assert_eq!(bytes, 0);
         drop(connection);
+        let projections = persistence.pending_cancel_projections(8).unwrap();
+        assert_eq!(projections.len(), 1);
+        assert_eq!(projections[0].pending_id, pending.id);
+        assert_eq!(projections[0].owner, expected_owner);
+        assert_eq!(projections[0].created_at_ms, 2_000);
         drop(registry);
         drop(persistence);
+
+        let reopened = AgentControlStore::open(&root, &store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let projections = reopened.pending_cancel_projections(8).unwrap();
+        assert_eq!(projections.len(), 1);
+        reopened
+            .complete_pending_cancel_projection(&pending.id)
+            .unwrap();
+        assert!(reopened.pending_cancel_projections(8).unwrap().is_empty());
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_cancel_v1_migration_backfills_unprojected_cancelled_authority() {
+        let root = temp_root("pending-cancel-v1-backfill");
+        let credential_store = credential_store(&root);
+        let persistence = Arc::new(
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap(),
+        );
+        let registry = PendingRegistry::with_persistence(persistence.clone());
+        let (pending, _) = registry
+            .register_bound(backup_action(), "backup", 1_000, 60_000, owner())
+            .unwrap();
+        registry
+            .cancel(&pending.id, &pending.action_hash, 2_000)
+            .unwrap();
+        {
+            let connection = persistence.connection.lock().unwrap();
+            connection
+                .execute("DELETE FROM pending_cancel_projections", [])
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE control_metadata SET value='1' WHERE key='schema_version'",
+                    [],
+                )
+                .unwrap();
+        }
+        drop(registry);
+        drop(persistence);
+
+        let reopened =
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let projections = reopened.pending_cancel_projections(8).unwrap();
+        assert_eq!(projections.len(), 1);
+        assert_eq!(projections[0].pending_id, pending.id);
+        assert_eq!(projections[0].owner, owner());
+        drop(reopened);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3956,6 +4201,7 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE confirmation_intents(logical_bytes INTEGER NOT NULL);
+                 CREATE TABLE pending_cancel_projections(logical_bytes INTEGER NOT NULL);
                  CREATE TABLE user_presence_intents(logical_bytes INTEGER NOT NULL);
                  CREATE TABLE pairing_sources(logical_bytes INTEGER NOT NULL);
                  CREATE TABLE pairing_claims(logical_bytes INTEGER NOT NULL);
