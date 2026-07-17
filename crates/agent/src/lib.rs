@@ -66,7 +66,9 @@ pub use pairing_v2::{
     PairingSourceSecretV2, PairingV2Error,
 };
 pub use product_provider::ProductProviderId;
-pub use provider::{AssistantBlock, DoneReason, FakeProvider, LlmProvider, StreamEvent, Usage};
+pub use provider::{
+    AssistantBlock, DoneReason, FakeProvider, LlmProvider, ProgressPhase, StreamEvent, Usage,
+};
 pub use retrieval::RetrievalExecutor;
 pub use runtime_lock::FileLock;
 pub use secrets::{

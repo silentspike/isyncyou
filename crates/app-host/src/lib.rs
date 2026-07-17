@@ -429,6 +429,7 @@ fn agent_safe_turn_error(error: &isyncyou_agent::AgentError) -> &'static str {
             "codex_safe:http_rate_limited" => "provider_rate_limited",
             "codex_safe:http_server_failure" => "provider_service_unavailable",
             "codex_safe:parse_failure" => "provider_response_invalid",
+            "codex_safe:incomplete_response" => "provider_response_incomplete",
             "codex_safe:stream_failure" => "provider_stream_failed",
             "codex_safe:http_bad_request" | "codex_safe:http_request_rejected" => {
                 "provider_request_rejected"
@@ -756,6 +757,49 @@ impl HotSessionHistoryCache {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .retain(|(cached_session_id, _, _), _| cached_session_id != session_id);
+    }
+
+    fn context_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Option<product_session::ProductSessionContextSnapshot> {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let limit = entries
+            .keys()
+            .filter(|(candidate_session, cursor, _)| {
+                candidate_session == session_id && cursor.is_empty()
+            })
+            .map(|(_, _, limit)| *limit)
+            .max()?;
+        let mut cursor = String::new();
+        let mut records = Vec::new();
+        let mut manifest_generation = None;
+        loop {
+            let entry = entries.get(&(session_id.to_owned(), cursor.clone(), limit))?;
+            let HotSessionHistoryState::Ready(page) = &entry.state else {
+                return None;
+            };
+            match manifest_generation {
+                Some(generation) if generation != page.manifest_generation => return None,
+                None => manifest_generation = Some(page.manifest_generation),
+                _ => {}
+            }
+            records.extend(page.records.iter().cloned());
+            let Some(next) = page.next_cursor.as_ref() else {
+                break;
+            };
+            cursor.clone_from(next);
+        }
+        if records.len() > 128 {
+            records.drain(..records.len() - 128);
+        }
+        Some(product_session::ProductSessionContextSnapshot {
+            manifest_generation: manifest_generation?,
+            records,
+        })
     }
 }
 
@@ -8194,6 +8238,12 @@ impl DaemonAgent {
                     Ok(vec![isyncyou_agent::Message::user(prompt)])
                 };
                 let outcome = history.and_then(|mut history| {
+                    let _ = hub.emit(
+                        &tid,
+                        isyncyou_agent::StreamEvent::Progress {
+                            phase: isyncyou_agent::ProgressPhase::ProviderStarted,
+                        },
+                    );
                     if let Some(observer) = product_turn.as_mut() {
                         isyncyou_agent::run_turn_cancellable(
                             provider.as_mut(),
@@ -8589,6 +8639,7 @@ fn load_product_session_history_page(
     let account = registry.account_for(session_id)?;
     if registry.remote_initialization_pending(session_id)? {
         return Ok(isyncyou_agent::HistoryPageV1 {
+            manifest_generation: 0,
             records: Vec::new(),
             next_cursor: None,
         });
@@ -9622,6 +9673,9 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             let selected_provider = self.agent_settings().map(|settings| settings.provider);
             let reserved =
                 self.reserve_agent_turn(turn_id.clone(), selected_provider, admission)?;
+            let cached_context = self
+                .hot_session_history
+                .context_snapshot(&request.session_id);
             let worker = Arc::clone(&self);
             let worker_turn_id = turn_id.clone();
             let admission_cancellation = reserved.cancellation.clone();
@@ -9673,6 +9727,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                             provider_binding,
                             installation_principal: installation.principal(),
                             created_at_ms: unix_now_ms(),
+                            cached_context,
                         })?;
                     match product_turn {
                         product_session::ProductTurnStart::Started(product_turn) => {
@@ -14865,14 +14920,15 @@ mod tests {
             .last()
             .expect("fresh request branch");
         let publish = fresh_request
-            .find("guard\n            .publish(SessionCommitV1")
-            .expect("accepted manifest publication");
+            .find(".acquire_lease_and_publish_from_manifest_at(")
+            .expect("atomic accepted manifest publication");
         let finish = fresh_request
             .find("guard.finish_admission()")
             .expect("admission budget completion");
 
         assert!(publish < finish);
         assert!(fresh_request[..publish].find("finish_admission").is_none());
+        assert!(fresh_request[publish..finish].contains("SessionCommitV1"));
         assert!(fresh_request[publish..finish].contains("map_err(map_session_error)?"));
     }
 
@@ -23217,6 +23273,7 @@ fn session_history_hot_cache_coalesces_completes_and_invalidates() {
         HotSessionHistoryLookup::Loading
     );
     let page = isyncyou_agent::HistoryPageV1 {
+        manifest_generation: 7,
         records: Vec::new(),
         next_cursor: Some("next".into()),
     };
@@ -23225,6 +23282,23 @@ fn session_history_hot_cache_coalesces_completes_and_invalidates() {
         cache.lookup_or_start(&key),
         HotSessionHistoryLookup::Ready(page)
     );
+    assert!(cache.context_snapshot("session").is_none());
+    let next_key = ("session".to_string(), "next".to_string(), 100);
+    assert_eq!(
+        cache.lookup_or_start(&next_key),
+        HotSessionHistoryLookup::Start
+    );
+    cache.complete(
+        &next_key,
+        Ok(isyncyou_agent::HistoryPageV1 {
+            manifest_generation: 7,
+            records: Vec::new(),
+            next_cursor: None,
+        }),
+    );
+    let snapshot = cache.context_snapshot("session").unwrap();
+    assert_eq!(snapshot.manifest_generation, 7);
+    assert!(snapshot.records.is_empty());
     cache.invalidate("session");
     assert_eq!(cache.lookup_or_start(&key), HotSessionHistoryLookup::Start);
 }

@@ -404,7 +404,7 @@ function makeFixtureServer(evidence) {
           });
           res.write(": ready\n\n");
           activeTurnStreams.set(turn, res);
-          req.on("close", () => activeTurnStreams.delete(turn));
+          res.on("close", () => activeTurnStreams.delete(turn));
         } else {
           await sendStream(res, scenario, turn);
         }

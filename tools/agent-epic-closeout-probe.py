@@ -164,10 +164,14 @@ def latency_bucket(elapsed_ms: int) -> str:
         return "under_250ms"
     if elapsed_ms < 1_000:
         return "250ms_to_1s"
+    if elapsed_ms < 2_000:
+        return "1s_to_2s"
     if elapsed_ms < 5_000:
-        return "1s_to_5s"
+        return "2s_to_5s"
+    if elapsed_ms < 10_000:
+        return "5s_to_10s"
     if elapsed_ms < 15_000:
-        return "5s_to_15s"
+        return "10s_to_15s"
     return "15s_or_more"
 
 
@@ -579,9 +583,13 @@ def stream_turn(client: RuntimeClient, turn_id: str, timeout: float) -> dict[str
     terminal_reason = None
     error_code = None
     deadline = time.monotonic() + timeout
+    stream_started = time.monotonic()
+    first_event_ms: int | None = None
+    first_output_ms: int | None = None
     idle_timeout = min(timeout, CONTROL_REQUEST_TIMEOUT_SECONDS)
     total_bytes = 0
     allowed = {
+        "progress",
         "token",
         "tool_call",
         "tool_result",
@@ -617,6 +625,10 @@ def stream_turn(client: RuntimeClient, turn_id: str, timeout: float) -> dict[str
                 name = event["event"]
                 if name not in allowed or terminal_reason is not None:
                     raise ProbeError("turn_stream_invalid")
+                if first_event_ms is None:
+                    first_event_ms = int((time.monotonic() - stream_started) * 1000)
+                if first_output_ms is None and name != "progress":
+                    first_output_ms = int((time.monotonic() - stream_started) * 1000)
                 names.append(name)
                 if name == "tool_result" and event.get("untrusted") is True:
                     untrusted_result = True
@@ -647,18 +659,17 @@ def stream_turn(client: RuntimeClient, turn_id: str, timeout: float) -> dict[str
         "terminal_reason": terminal_reason,
         "error_code": error_code,
         "untrusted_tool_result_observed": untrusted_result,
+        "first_event_latency": latency_bucket(first_event_ms or 0),
+        "first_output_latency": latency_bucket(first_output_ms or first_event_ms or 0),
     }
 
 
-def load_turn_records(
-    client: RuntimeClient,
-    session_id: str,
-    request_id: str,
-    turn_id: str,
-) -> tuple[bool, bool, bool, list[dict[str, object]]]:
+def load_session_records(client: RuntimeClient, session_id: str) -> list[dict[str, object]]:
     cursor = None
-    matching: list[dict[str, object]] = []
-    for _ in range(100):
+    records: list[dict[str, object]] = []
+    deadline = time.monotonic() + 60
+    pages = 0
+    while pages < 100:
         query: dict[str, object] = {"session_id": session_id, "limit": 100}
         if cursor is not None:
             query["cursor"] = cursor
@@ -667,16 +678,18 @@ def load_turn_records(
             "/api/v1/agent/session/history?" + urllib.parse.urlencode(query),
             cap=True,
         )
-        records = page.get("records")
-        if not isinstance(records, list):
+        if page.get("refreshing") is True:
+            if time.monotonic() >= deadline:
+                raise ProbeError("turn_history_timed_out")
+            time.sleep(0.5)
+            continue
+        page_records = page.get("records")
+        if not isinstance(page_records, list):
             raise ProbeError("turn_history_invalid")
-        for record in records:
-            if (
-                isinstance(record, dict)
-                and record.get("request_id") == request_id
-                and record.get("turn_id") == turn_id
-            ):
-                matching.append(record)
+        if not all(isinstance(record, dict) for record in page_records):
+            raise ProbeError("turn_history_invalid")
+        records.extend(page_records)
+        pages += 1
         cursor = page.get("next_cursor")
         if cursor is None:
             break
@@ -684,6 +697,20 @@ def load_turn_records(
             raise ProbeError("turn_history_invalid")
     else:
         raise ProbeError("turn_history_too_many_pages")
+    return records
+
+
+def load_turn_records(
+    client: RuntimeClient,
+    session_id: str,
+    request_id: str,
+    turn_id: str,
+) -> tuple[bool, bool, bool, list[dict[str, object]]]:
+    matching = [
+        record
+        for record in load_session_records(client, session_id)
+        if record.get("request_id") == request_id and record.get("turn_id") == turn_id
+    ]
     intent = False
     assistant = False
     terminal = False
@@ -753,6 +780,10 @@ def run_retrieval_turn(
     client.load_agent_capability()
     account = select_runtime_account(client, account_file)
     session_id = select_or_create_session(client)
+    # Model the real Assistant screen: opening it hydrates the selected session before
+    # the user submits a prompt. The measured turn latency therefore exercises the hot
+    # session path rather than charging an unrelated initial history load to the click.
+    load_session_records(client, session_id)
     fixture_name = f"isy628-{uuid.uuid4().hex[:12]}"
     prompt_template = read_private_text(prompt_file, "invalid_prompt_file", 32 * 1024)
     if "{fixture}" not in prompt_template:
@@ -830,6 +861,8 @@ def run_retrieval_turn(
             "turn_ack_latency": latency_bucket(elapsed_ms),
             "retry_reused_turn": retry_same_turn,
             "ordered_event_names": stream["ordered_event_names"],
+            "first_event_latency": stream["first_event_latency"],
+            "first_output_latency": stream["first_output_latency"],
             "terminal_reason": stream["terminal_reason"],
             "error_code": stream["error_code"],
             "untrusted_tool_result_observed": stream["untrusted_tool_result_observed"],
@@ -890,6 +923,8 @@ def run_retrieval_turn(
         "turn_ack_latency": latency_bucket(elapsed_ms),
         "retry_reused_turn": retry_same_turn,
         "ordered_event_names": stream["ordered_event_names"],
+        "first_event_latency": stream["first_event_latency"],
+        "first_output_latency": stream["first_output_latency"],
         "terminal_reason": stream["terminal_reason"],
         "untrusted_tool_result_observed": stream["untrusted_tool_result_observed"],
         "request_status_state": request_status.get("state"),

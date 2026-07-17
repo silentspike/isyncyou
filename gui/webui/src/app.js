@@ -5670,6 +5670,7 @@ function renderAssistantComposer(_st) {
   input.value = AssistantState.draft || "";
   const send = el("button", { class: "btn primary", title: disabledReason || "Send", onclick: agentSendFromInput, "data-testid": "agent-send" },
     icon("send", "icon-sm"));
+  const active = AssistantState.busy && !!AssistantState.activeTurnId;
   const stop = el("button", {
     class: "btn danger icon-only",
     type: "button",
@@ -5678,7 +5679,8 @@ function renderAssistantComposer(_st) {
     onclick: () => cancelAgentTurn(AssistantState.activeTurnId),
     "data-testid": "agent-stop",
   }, icon("square", "icon-sm"));
-  stop.hidden = !(AssistantState.busy && AssistantState.activeTurnId);
+  send.hidden = active;
+  stop.hidden = !active;
   stop.disabled = AssistantState.turnCancelPending;
   if (disabledReason) {
     input.setAttribute("disabled", "disabled");
@@ -6259,6 +6261,7 @@ function agentSafeErrorCopy(code) {
     provider_stream_read_failed: "The provider stream ended unexpectedly.",
     provider_stream_ended_without_event: "The provider returned no usable response.",
     provider_response_read_failed: "The provider response could not be read.",
+    provider_response_incomplete: "The AI account stopped before finishing. Try again.",
     provider_transport_failed: "The provider connection failed.",
     confirmation_unavailable: "Confirmation is temporarily unavailable.",
     session_busy: "This shared session is still in use. Try again shortly.",
@@ -6276,6 +6279,9 @@ function agentSafeErrorCopy(code) {
 function handleAgentEvent(message, turnState) {
   const d = message || {};
   switch (d.event) {
+    case "progress":
+      turnState.setProgress(d.phase);
+      break;
     case "token":
       turnState.setText(turnState.message.text + (d.text || ""));
       break;
@@ -6688,10 +6694,16 @@ async function agentSend(text) {
   textEl.textContent = "";
   const thinkingEl = el("div", { class: "asst-thinking" },
     el("span", { class: "asst-thinking-dot" }), el("span", { class: "asst-thinking-dot" }), el("span", { class: "asst-thinking-dot" }),
-    el("span", { class: "asst-thinking-label dim", text: "Searching your Microsoft 365…" }));
+    el("span", { class: "asst-thinking-label dim", text: "Preparing secure session…" }));
   bubble.insertBefore(thinkingEl, textEl);
   let thinkingDone = false;
   const clearThinking = () => { if (!thinkingDone) { thinkingDone = true; thinkingEl.remove(); } };
+  const setProgress = (phase) => {
+    if (thinkingDone) return;
+    const label = thinkingEl.querySelector(".asst-thinking-label");
+    if (label && phase === "provider_started") label.textContent = "Thinking…";
+    scrollAssistantToEnd();
+  };
   scrollAssistantToEnd();
   const setText = (t) => { if (t) clearThinking(); asst.text = t; textEl.textContent = t || ""; scrollAssistantToEnd(); };
   const addToolRow = (row) => {
@@ -6857,6 +6869,7 @@ async function agentSend(text) {
   };
   const turnState = {
     message: asst,
+    setProgress,
     setText,
     addToolRow,
     addError,

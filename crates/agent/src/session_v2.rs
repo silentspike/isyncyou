@@ -44,6 +44,7 @@ const ORPHAN_REAP_BATCH: usize = 128;
 const MAX_INDEX_PAGE_ENTRIES: usize = 256;
 const MAX_INDEX_PAGE_COALESCE_READS: usize = 1;
 const MAX_RECENT_INDEX_PAGE_READS: usize = 4;
+const MAX_PARALLEL_OBJECT_READS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionWritePolicy {
@@ -344,6 +345,7 @@ pub struct ManifestDelta {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionedManifest {
     pub etag: String,
+    pub storage_id: Option<String>,
     pub manifest: SessionManifestV1,
 }
 
@@ -430,6 +432,7 @@ pub struct SessionCommitV1 {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistoryPageV1 {
+    pub manifest_generation: u64,
     pub records: Vec<SessionRecordV2>,
     pub next_cursor: Option<String>,
 }
@@ -531,7 +534,7 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
             return Err(SessionV2Error::InvalidRecord);
         }
 
-        let mut visible_entries = Vec::with_capacity(commit.visible_records.len());
+        let mut visible_objects = Vec::with_capacity(commit.visible_records.len());
         for record in &commit.visible_records {
             record.validate()?;
             if record.session_id != current.manifest.session_id {
@@ -539,60 +542,100 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
             }
             let plaintext =
                 serde_json::to_vec(record).map_err(|_| SessionV2Error::InvalidRecord)?;
-            visible_entries.push(self.stage_sealed(
-                &current.manifest.session_id,
-                SessionObjectClass::VisibleRecord,
-                &record.record_id,
-                &plaintext,
-            )?);
+            visible_objects.push((record.record_id.clone(), plaintext));
         }
 
-        let mut request_entries = Vec::with_capacity(commit.request_objects.len());
+        let mut request_objects = Vec::with_capacity(commit.request_objects.len());
         for (object_id, bytes) in &commit.request_objects {
             if !valid_ulid(object_id) || bytes.len() > MAX_REQUEST_OUTCOME_BYTES as usize {
                 return Err(SessionV2Error::InvalidJournal);
             }
-            request_entries.push(self.stage_sealed(
-                &current.manifest.session_id,
-                SessionObjectClass::RequestState,
-                object_id,
-                bytes,
-            )?);
+            request_objects.push((object_id.clone(), bytes.clone()));
         }
 
-        let mut binding_entries = Vec::with_capacity(commit.uuid_bindings.len());
+        let mut binding_objects = Vec::with_capacity(commit.uuid_bindings.len());
         for binding in &commit.uuid_bindings {
             if binding.binding_version != 1 || !valid_uuid_v4(&binding.request_id) {
                 return Err(SessionV2Error::InvalidRequestId);
             }
             let plaintext =
                 serde_json::to_vec(binding).map_err(|_| SessionV2Error::InvalidRecord)?;
-            binding_entries.push(self.stage_sealed(
-                &current.manifest.session_id,
-                SessionObjectClass::UuidBinding,
-                &binding.request_key,
-                &plaintext,
-            )?);
+            binding_objects.push((binding.request_key.clone(), plaintext));
         }
 
-        let visible_page = self.stage_index_page(
-            &current.manifest.session_id,
-            SessionObjectClass::VisibleIndex,
-            current.manifest.visible_index_head.clone(),
-            visible_entries.clone(),
-        )?;
-        let request_page = self.stage_index_page(
-            &current.manifest.session_id,
-            SessionObjectClass::RequestIndex,
-            current.manifest.request_index_head.clone(),
-            request_entries.clone(),
-        )?;
-        let binding_page = self.stage_index_page(
-            &current.manifest.session_id,
-            SessionObjectClass::UuidBindingIndex,
-            current.manifest.uuid_binding_index_head.clone(),
-            binding_entries.clone(),
-        )?;
+        let session_id = &current.manifest.session_id;
+        let (visible_entries, request_entries, binding_entries) = std::thread::scope(|scope| {
+            let visible = scope.spawn(|| {
+                self.stage_sealed_batch(
+                    session_id,
+                    SessionObjectClass::VisibleRecord,
+                    &visible_objects,
+                )
+            });
+            let request = scope.spawn(|| {
+                self.stage_sealed_batch(
+                    session_id,
+                    SessionObjectClass::RequestState,
+                    &request_objects,
+                )
+            });
+            let binding = scope.spawn(|| {
+                self.stage_sealed_batch(
+                    session_id,
+                    SessionObjectClass::UuidBinding,
+                    &binding_objects,
+                )
+            });
+            Ok::<_, SessionV2Error>((
+                visible
+                    .join()
+                    .map_err(|_| SessionV2Error::TransportUnavailable)??,
+                request
+                    .join()
+                    .map_err(|_| SessionV2Error::TransportUnavailable)??,
+                binding
+                    .join()
+                    .map_err(|_| SessionV2Error::TransportUnavailable)??,
+            ))
+        })?;
+
+        let (visible_page, request_page, binding_page) = std::thread::scope(|scope| {
+            let visible = scope.spawn(|| {
+                self.stage_index_page(
+                    session_id,
+                    SessionObjectClass::VisibleIndex,
+                    current.manifest.visible_index_head.clone(),
+                    visible_entries.clone(),
+                )
+            });
+            let request = scope.spawn(|| {
+                self.stage_index_page(
+                    session_id,
+                    SessionObjectClass::RequestIndex,
+                    current.manifest.request_index_head.clone(),
+                    request_entries.clone(),
+                )
+            });
+            let binding = scope.spawn(|| {
+                self.stage_index_page(
+                    session_id,
+                    SessionObjectClass::UuidBindingIndex,
+                    current.manifest.uuid_binding_index_head.clone(),
+                    binding_entries.clone(),
+                )
+            });
+            Ok::<_, SessionV2Error>((
+                visible
+                    .join()
+                    .map_err(|_| SessionV2Error::TransportUnavailable)??,
+                request
+                    .join()
+                    .map_err(|_| SessionV2Error::TransportUnavailable)??,
+                binding
+                    .join()
+                    .map_err(|_| SessionV2Error::TransportUnavailable)??,
+            ))
+        })?;
 
         let visible_bytes =
             staged_index_delta(&visible_page, request_entries_bytes(&visible_entries)?)?;
@@ -617,7 +660,7 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
             uuid_binding_index_head: binding_page.head.clone().map(Some),
         })?;
         self.transport
-            .compare_and_swap_manifest(&current.etag, &next)?
+            .compare_and_swap_manifest(current, &next)?
             .ok_or(SessionV2Error::ManifestConflict)
     }
 
@@ -748,12 +791,19 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
             uuid_binding_index_head: None,
         })?;
         self.transport
-            .compare_and_swap_manifest(&current.etag, &next)?
+            .compare_and_swap_manifest(current, &next)?
             .ok_or(SessionV2Error::ManifestConflict)
     }
 
     pub fn current_manifest(&self, session_id: &str) -> Result<VersionedManifest, SessionV2Error> {
         self.transport.load_manifest(session_id)
+    }
+
+    pub fn current_manifest_with_server_time(
+        &self,
+        session_id: &str,
+    ) -> Result<(VersionedManifest, TrustedServerTimeSample), SessionV2Error> {
+        self.transport.load_manifest_and_server_time(session_id)
     }
 
     pub fn history(
@@ -829,6 +879,7 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
             None
         };
         Ok(HistoryPageV1 {
+            manifest_generation: current.manifest.generation,
             records,
             next_cursor,
         })
@@ -842,34 +893,33 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
         session_id: &str,
         limit: usize,
     ) -> Result<Vec<SessionRecordV2>, SessionV2Error> {
+        let current = self.transport.load_manifest(session_id)?;
+        self.recent_visible_records_from_manifest(&current, limit)
+    }
+
+    pub fn recent_visible_records_from_manifest(
+        &self,
+        current: &VersionedManifest,
+        limit: usize,
+    ) -> Result<Vec<SessionRecordV2>, SessionV2Error> {
         if limit == 0 || limit > MAX_CONTEXT_MESSAGES.saturating_mul(2) {
             return Err(SessionV2Error::HistoryPageTooLarge);
         }
-        let current = self.transport.load_manifest(session_id)?;
+        let session_id = &current.manifest.session_id;
         let entries = self.load_recent_index_entries(
             session_id,
             SessionObjectClass::VisibleIndex,
             current.manifest.visible_index_head.as_ref(),
             limit,
         )?;
-        let mut records = Vec::with_capacity(entries.len());
+        let objects = self.load_indexed_objects_bounded(
+            session_id,
+            SessionObjectClass::VisibleRecord,
+            &entries,
+        )?;
+        let mut records = Vec::with_capacity(objects.len());
         let mut response_bytes = 0usize;
-        for entry in &entries {
-            let sealed = self
-                .transport
-                .load_immutable(SessionObjectClass::VisibleRecord, &entry.object_id)?;
-            if bytes_digest(&sealed) != entry.object_sha256 {
-                return Err(SessionV2Error::InvalidRecord);
-            }
-            let bytes = self
-                .object_crypto
-                .open(
-                    session_id,
-                    SessionObjectClass::VisibleRecord,
-                    &entry.object_id,
-                    &sealed,
-                )
-                .map_err(|_| SessionV2Error::InvalidRecord)?;
+        for bytes in objects {
             response_bytes = response_bytes
                 .checked_add(bytes.len())
                 .ok_or(SessionV2Error::HistoryPageTooLarge)?;
@@ -909,6 +959,15 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
         candidate: &RequestUuidBindingV1,
     ) -> Result<Option<RequestReplayV1>, SessionV2Error> {
         let current = self.transport.load_manifest(session_id)?;
+        self.request_replay_from_manifest(&current, candidate)
+    }
+
+    pub fn request_replay_from_manifest(
+        &self,
+        current: &VersionedManifest,
+        candidate: &RequestUuidBindingV1,
+    ) -> Result<Option<RequestReplayV1>, SessionV2Error> {
+        let session_id = &current.manifest.session_id;
         let Some(direct_binding) = self
             .transport
             .load_immutable_optional(SessionObjectClass::UuidBinding, &candidate.request_key)?
@@ -986,7 +1045,7 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
             let Ok(candidate_journal) = serde_json::from_slice::<RequestJournalV1>(&bytes) else {
                 continue;
             };
-            if candidate_journal.session_id == session_id
+            if candidate_journal.session_id == session_id.as_str()
                 && candidate_journal.request_id == candidate.request_id
             {
                 self.load_request_chain(&candidate_journal)?;
@@ -1405,6 +1464,47 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
             .map_err(|_| SessionV2Error::InvalidRecord)
     }
 
+    fn load_indexed_objects_bounded(
+        &self,
+        session_id: &str,
+        object_class: SessionObjectClass,
+        entries: &[ImmutableIndexEntryV1],
+    ) -> Result<Vec<Vec<u8>>, SessionV2Error> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let worker_count = entries.len().min(MAX_PARALLEL_OBJECT_READS);
+        let chunk_size = entries.len().div_ceil(worker_count);
+        let mut loaded = std::thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(worker_count);
+            for (chunk_index, chunk) in entries.chunks(chunk_size).enumerate() {
+                workers.push(scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .enumerate()
+                        .map(|(entry_index, entry)| {
+                            self.load_indexed_object(session_id, object_class, entry)
+                                .map(|bytes| (chunk_index * chunk_size + entry_index, bytes))
+                        })
+                        .collect::<Result<Vec<_>, SessionV2Error>>()
+                }));
+            }
+            workers
+                .into_iter()
+                .map(|worker| {
+                    worker
+                        .join()
+                        .map_err(|_| SessionV2Error::TransportUnavailable)?
+                })
+                .collect::<Result<Vec<_>, SessionV2Error>>()
+        })?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        loaded.sort_by_key(|(index, _)| *index);
+        Ok(loaded.into_iter().map(|(_, bytes)| bytes).collect())
+    }
+
     fn stage_sealed(
         &self,
         session_id: &str,
@@ -1419,6 +1519,20 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
         self.transport
             .stage_immutable(object_class, object_id, &sealed)?;
         Ok(index_entry(object_id, &sealed))
+    }
+
+    fn stage_sealed_batch(
+        &self,
+        session_id: &str,
+        object_class: SessionObjectClass,
+        objects: &[(String, Vec<u8>)],
+    ) -> Result<Vec<ImmutableIndexEntryV1>, SessionV2Error> {
+        objects
+            .iter()
+            .map(|(object_id, plaintext)| {
+                self.stage_sealed(session_id, object_class, object_id, plaintext)
+            })
+            .collect()
     }
 }
 
@@ -1460,7 +1574,7 @@ impl<T: SessionV2Transport + Clone + 'static> SessionV2Store<T> {
         next.archived = true;
         next.validate()?;
         self.transport
-            .compare_and_swap_manifest(&current.etag, &next)?
+            .compare_and_swap_manifest(&current, &next)?
             .ok_or(SessionV2Error::ManifestConflict)?;
         Ok(())
     }
@@ -1479,6 +1593,91 @@ impl<T: SessionV2Transport + Clone + 'static> SessionV2Store<T> {
         )
     }
 
+    pub fn acquire_lease_from_manifest(
+        &self,
+        current: VersionedManifest,
+        lease_id: &str,
+        holder_binding: &str,
+    ) -> Result<SessionLeaseGuard<T>, SessionV2Error> {
+        self.acquire_lease_from_manifest_with_interval(
+            current,
+            lease_id,
+            holder_binding,
+            SESSION_LEASE_RENEW_INTERVAL,
+        )
+    }
+
+    pub fn acquire_lease_and_publish_from_manifest<F>(
+        &self,
+        current: VersionedManifest,
+        lease_id: &str,
+        holder_binding: &str,
+        build_commit: F,
+    ) -> Result<SessionLeaseGuard<T>, SessionV2Error>
+    where
+        F: FnOnce(&PersistedLeaseBinding) -> Result<SessionCommitV1, SessionV2Error>,
+    {
+        let sample = self.transport.server_time_sample()?;
+        self.acquire_lease_and_publish_from_manifest_at(
+            current,
+            sample,
+            lease_id,
+            holder_binding,
+            build_commit,
+        )
+    }
+
+    pub fn acquire_lease_and_publish_from_manifest_at<F>(
+        &self,
+        current: VersionedManifest,
+        sample: TrustedServerTimeSample,
+        lease_id: &str,
+        holder_binding: &str,
+        build_commit: F,
+    ) -> Result<SessionLeaseGuard<T>, SessionV2Error>
+    where
+        F: FnOnce(&PersistedLeaseBinding) -> Result<SessionCommitV1, SessionV2Error>,
+    {
+        if lease_id.is_empty() || holder_binding.is_empty() {
+            return Err(SessionV2Error::LeaseLost);
+        }
+        let now = checked_server_time(sample)?;
+        if current.manifest.active_lease.as_ref().is_some_and(|lease| {
+            now <= lease
+                .expires_at_server_ms
+                .saturating_add(SESSION_LEASE_TAKEOVER_MARGIN_MS)
+        }) {
+            return Err(SessionV2Error::ManifestConflict);
+        }
+        let fence = current
+            .manifest
+            .generation
+            .checked_add(1)
+            .ok_or(SessionV2Error::SessionLimit)?;
+        if fence == u64::MAX {
+            return Err(SessionV2Error::SessionLimit);
+        }
+        let lease = ManifestLease {
+            lease_id: lease_id.to_owned(),
+            holder_binding: holder_binding.to_owned(),
+            fence,
+            expires_at_server_ms: now
+                .checked_add(SESSION_LEASE_TTL_MS)
+                .ok_or(SessionV2Error::SessionLimit)?,
+        };
+        let binding = PersistedLeaseBinding {
+            lease_id: lease.lease_id.clone(),
+            holder_binding: lease.holder_binding.clone(),
+            fence: lease.fence,
+            expires_at_server_ms: lease.expires_at_server_ms,
+        };
+        let commit = build_commit(&binding)?;
+        let mut leased_current = current;
+        leased_current.manifest.active_lease = Some(lease.clone());
+        let current = self.publish(&leased_current, commit)?;
+        self.start_lease_guard(current, lease, now, SESSION_LEASE_RENEW_INTERVAL)
+    }
+
     fn acquire_lease_with_interval(
         &self,
         session_id: &str,
@@ -1486,10 +1685,25 @@ impl<T: SessionV2Transport + Clone + 'static> SessionV2Store<T> {
         holder_binding: &str,
         renewal_interval: std::time::Duration,
     ) -> Result<SessionLeaseGuard<T>, SessionV2Error> {
+        let current = self.transport.load_manifest(session_id)?;
+        self.acquire_lease_from_manifest_with_interval(
+            current,
+            lease_id,
+            holder_binding,
+            renewal_interval,
+        )
+    }
+
+    fn acquire_lease_from_manifest_with_interval(
+        &self,
+        current: VersionedManifest,
+        lease_id: &str,
+        holder_binding: &str,
+        renewal_interval: std::time::Duration,
+    ) -> Result<SessionLeaseGuard<T>, SessionV2Error> {
         if lease_id.is_empty() || holder_binding.is_empty() {
             return Err(SessionV2Error::LeaseLost);
         }
-        let current = self.transport.load_manifest(session_id)?;
         let now = fresh_server_time(&self.transport)?;
         if current.manifest.active_lease.as_ref().is_some_and(|lease| {
             now <= lease
@@ -1523,8 +1737,18 @@ impl<T: SessionV2Transport + Clone + 'static> SessionV2Store<T> {
         next.validate()?;
         let current = self
             .transport
-            .compare_and_swap_manifest(&current.etag, &next)?
+            .compare_and_swap_manifest(&current, &next)?
             .ok_or(SessionV2Error::ManifestConflict)?;
+        self.start_lease_guard(current, lease, now, renewal_interval)
+    }
+
+    fn start_lease_guard(
+        &self,
+        current: VersionedManifest,
+        lease: ManifestLease,
+        now: u64,
+        renewal_interval: std::time::Duration,
+    ) -> Result<SessionLeaseGuard<T>, SessionV2Error> {
         let state = Arc::new(Mutex::new(LeaseGuardState {
             current,
             lease,
@@ -1671,6 +1895,24 @@ impl<T: SessionV2Transport + Clone + 'static> SessionLeaseGuard<T> {
         request_id: &str,
         tombstone: IdempotencyTombstoneV1,
     ) -> Result<(), SessionV2Error> {
+        self.publish_terminal_with_request_objects(
+            visible_records,
+            request_id,
+            tombstone,
+            Vec::new(),
+        )
+    }
+
+    /// Publish staged step outcomes together with the visible terminal state. This keeps the
+    /// provider-start marker authoritative while avoiding a separate manifest round trip between
+    /// receiving the final provider response and publishing the terminal result.
+    pub fn publish_terminal_with_request_objects(
+        &self,
+        visible_records: Vec<SessionRecordV2>,
+        request_id: &str,
+        tombstone: IdempotencyTombstoneV1,
+        mut request_objects: Vec<(String, Vec<u8>)>,
+    ) -> Result<(), SessionV2Error> {
         if visible_records.is_empty()
             || !valid_uuid_v4(request_id)
             || tombstone.tombstone_version != 1
@@ -1691,9 +1933,10 @@ impl<T: SessionV2Transport + Clone + 'static> SessionLeaseGuard<T> {
         let tombstone_id = crate::session::new_ulid().map_err(|_| SessionV2Error::InvalidRecord)?;
         let tombstone_bytes =
             serde_json::to_vec(&tombstone).map_err(|_| SessionV2Error::InvalidRecord)?;
+        request_objects.push((tombstone_id, tombstone_bytes));
         self.publish(SessionCommitV1 {
             visible_records,
-            request_objects: vec![(tombstone_id, tombstone_bytes)],
+            request_objects,
             uuid_bindings: vec![],
         })
     }
@@ -1745,7 +1988,7 @@ impl<T: SessionV2Transport + Clone + 'static> Drop for SessionLeaseGuard<T> {
         if let Ok(Some(current)) = self
             .store
             .transport
-            .compare_and_swap_manifest(&state.current.etag, &next)
+            .compare_and_swap_manifest(&state.current, &next)
         {
             state.current = current;
         }
@@ -1753,7 +1996,10 @@ impl<T: SessionV2Transport + Clone + 'static> Drop for SessionLeaseGuard<T> {
 }
 
 fn fresh_server_time<T: SessionV2Transport>(transport: &T) -> Result<u64, SessionV2Error> {
-    let sample = transport.server_time_sample()?;
+    checked_server_time(transport.server_time_sample()?)
+}
+
+fn checked_server_time(sample: TrustedServerTimeSample) -> Result<u64, SessionV2Error> {
     if sample.received_at_monotonic.elapsed() > MAX_SERVER_TIME_SAMPLE_AGE {
         return Err(SessionV2Error::TransportUnavailable);
     }
@@ -1791,7 +2037,7 @@ fn renew_lease<T: SessionV2Transport + Clone>(
     next.active_lease = Some(lease.clone());
     let current = store
         .transport
-        .compare_and_swap_manifest(&state.current.etag, &next)?
+        .compare_and_swap_manifest(&state.current, &next)?
         .ok_or(SessionV2Error::LeaseLost)?;
     state.current = current;
     state.lease = lease;
@@ -1801,6 +2047,14 @@ fn renew_lease<T: SessionV2Transport + Clone>(
 pub trait SessionV2Transport: Send + Sync {
     fn server_time_sample(&self) -> Result<TrustedServerTimeSample, SessionV2Error>;
     fn load_manifest(&self, session_id: &str) -> Result<VersionedManifest, SessionV2Error>;
+    fn load_manifest_and_server_time(
+        &self,
+        session_id: &str,
+    ) -> Result<(VersionedManifest, TrustedServerTimeSample), SessionV2Error> {
+        let manifest = self.load_manifest(session_id)?;
+        let server_time = self.server_time_sample()?;
+        Ok((manifest, server_time))
+    }
     fn stage_immutable(
         &self,
         object_class: SessionObjectClass,
@@ -1829,7 +2083,7 @@ pub trait SessionV2Transport: Send + Sync {
     ) -> Result<usize, SessionV2Error>;
     fn compare_and_swap_manifest(
         &self,
-        expected_etag: &str,
+        current: &VersionedManifest,
         next: &SessionManifestV1,
     ) -> Result<Option<VersionedManifest>, SessionV2Error>;
 }
@@ -1867,6 +2121,7 @@ impl InMemorySessionV2Transport {
             .ok_or(SessionV2Error::SessionLimit)?;
         let value = VersionedManifest {
             etag: format!("etag-{}", state.next_etag),
+            storage_id: None,
             manifest: SessionManifestV1::empty(session_id),
         };
         state.manifests.insert(session_id.to_owned(), value.clone());
@@ -2039,7 +2294,7 @@ impl SessionV2Transport for InMemorySessionV2Transport {
 
     fn compare_and_swap_manifest(
         &self,
-        expected_etag: &str,
+        expected: &VersionedManifest,
         next: &SessionManifestV1,
     ) -> Result<Option<VersionedManifest>, SessionV2Error> {
         next.validate()?;
@@ -2050,7 +2305,7 @@ impl SessionV2Transport for InMemorySessionV2Transport {
         let Some(current) = state.manifests.get(&next.session_id) else {
             return Ok(None);
         };
-        if current.etag != expected_etag || next.generation != current.manifest.generation + 1 {
+        if current.etag != expected.etag || next.generation != current.manifest.generation + 1 {
             return Ok(None);
         }
         state.next_etag = state
@@ -2059,6 +2314,7 @@ impl SessionV2Transport for InMemorySessionV2Transport {
             .ok_or(SessionV2Error::SessionLimit)?;
         let updated = VersionedManifest {
             etag: format!("etag-{}", state.next_etag),
+            storage_id: None,
             manifest: next.clone(),
         };
         state
@@ -2335,6 +2591,21 @@ mod onedrive_transport {
                 .map_err(map_upload_error)?
                 .ok_or(SessionV2Error::TransportUnavailable)
         }
+
+        fn load_manifest_parts(&self) -> Result<(serde_json::Value, Vec<u8>), SessionV2Error> {
+            std::thread::scope(|scope| {
+                let item = scope.spawn(|| self.manifest_item());
+                let bytes =
+                    scope.spawn(|| self.read_path(&self.manifest_path(), MAX_MANIFEST_BYTES));
+                Ok((
+                    item.join()
+                        .map_err(|_| SessionV2Error::TransportUnavailable)??,
+                    bytes
+                        .join()
+                        .map_err(|_| SessionV2Error::TransportUnavailable)??,
+                ))
+            })
+        }
     }
 
     impl SessionV2Transport for OneDriveSessionV2Transport {
@@ -2355,8 +2626,7 @@ mod onedrive_transport {
             if session_id != self.session_id {
                 return Err(SessionV2Error::InvalidRecord);
             }
-            let item = self.manifest_item()?;
-            let bytes = self.read_path(&self.manifest_path(), MAX_MANIFEST_BYTES)?;
+            let (item, bytes) = self.load_manifest_parts()?;
             let manifest: SessionManifestV1 =
                 serde_json::from_slice(&bytes).map_err(|_| SessionV2Error::InvalidRecord)?;
             manifest.validate()?;
@@ -2364,6 +2634,36 @@ mod onedrive_transport {
                 return Err(SessionV2Error::InvalidRecord);
             }
             versioned_manifest(item, manifest)
+        }
+
+        fn load_manifest_and_server_time(
+            &self,
+            session_id: &str,
+        ) -> Result<(VersionedManifest, TrustedServerTimeSample), SessionV2Error> {
+            self.check_admission_budget()?;
+            if session_id != self.session_id {
+                return Err(SessionV2Error::InvalidRecord);
+            }
+            let (parts, sample) = std::thread::scope(|scope| {
+                let parts = scope.spawn(|| self.load_manifest_parts());
+                let sample = scope.spawn(|| self.server_time_sample());
+                Ok::<_, SessionV2Error>((
+                    parts
+                        .join()
+                        .map_err(|_| SessionV2Error::TransportUnavailable)??,
+                    sample
+                        .join()
+                        .map_err(|_| SessionV2Error::TransportUnavailable)??,
+                ))
+            })?;
+            let (item, bytes) = parts;
+            let manifest: SessionManifestV1 =
+                serde_json::from_slice(&bytes).map_err(|_| SessionV2Error::InvalidRecord)?;
+            manifest.validate()?;
+            if manifest.session_id != self.session_id {
+                return Err(SessionV2Error::InvalidRecord);
+            }
+            Ok((versioned_manifest(item, manifest)?, sample))
         }
 
         fn stage_immutable(
@@ -2496,7 +2796,7 @@ mod onedrive_transport {
 
         fn compare_and_swap_manifest(
             &self,
-            expected_etag: &str,
+            current: &VersionedManifest,
             next: &SessionManifestV1,
         ) -> Result<Option<VersionedManifest>, SessionV2Error> {
             self.check_admission_budget()?;
@@ -2504,18 +2804,14 @@ mod onedrive_transport {
             if next.session_id != self.session_id {
                 return Err(SessionV2Error::InvalidRecord);
             }
-            let item = self.manifest_item()?;
-            if item_etag(&item)? != expected_etag {
-                return Ok(None);
-            }
-            let item_id = item
-                .get("id")
-                .and_then(serde_json::Value::as_str)
+            let item_id = current
+                .storage_id
+                .as_deref()
                 .ok_or(SessionV2Error::TransportUnavailable)?;
             let bytes = manifest_bytes(next)?;
             let Some(updated) = self
                 .client_for_request()?
-                .replace_content_if_match(item_id, &bytes, expected_etag)
+                .replace_content_if_match(item_id, &bytes, &current.etag)
                 .map_err(map_upload_error)?
             else {
                 return Ok(None);
@@ -2538,6 +2834,7 @@ mod onedrive_transport {
     ) -> Result<VersionedManifest, SessionV2Error> {
         Ok(VersionedManifest {
             etag: item_etag(&item)?.to_owned(),
+            storage_id: Some(graph_item_id(&item)?),
             manifest,
         })
     }
@@ -2554,6 +2851,14 @@ mod onedrive_transport {
         if !item.get("folder").is_some_and(serde_json::Value::is_object) {
             return Err(SessionV2Error::TransportUnavailable);
         }
+        item.get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 512)
+            .map(str::to_owned)
+            .ok_or(SessionV2Error::TransportUnavailable)
+    }
+
+    fn graph_item_id(item: &serde_json::Value) -> Result<String, SessionV2Error> {
         item.get("id")
             .and_then(serde_json::Value::as_str)
             .filter(|value| !value.is_empty() && value.len() <= 512)
@@ -2752,6 +3057,54 @@ mod onedrive_transport {
                 8
             );
             assert!(requests.last().unwrap().starts_with("PUT "));
+        }
+
+        #[test]
+        fn onedrive_v2_transport_cas_uses_loaded_manifest_identity_without_lookup() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let read = stream.read(&mut chunk).unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let headers = String::from_utf8_lossy(&request);
+                assert!(headers.starts_with("PUT /me/drive/items/manifest-id/content "));
+                assert!(headers
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("if-match: etag-1")));
+                let body = r#"{"id":"manifest-id","eTag":"etag-2"}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            });
+            let transport =
+                OneDriveSessionV2Transport::with_base_url("token", "session-test", &base).unwrap();
+            let current = VersionedManifest {
+                etag: "etag-1".into(),
+                storage_id: Some("manifest-id".into()),
+                manifest: SessionManifestV1::empty("session-test"),
+            };
+            let mut next = current.manifest.clone();
+            next.generation = 1;
+
+            let updated = transport
+                .compare_and_swap_manifest(&current, &next)
+                .unwrap()
+                .unwrap();
+            server.join().unwrap();
+            assert_eq!(updated.etag, "etag-2");
+            assert_eq!(updated.storage_id.as_deref(), Some("manifest-id"));
         }
     }
 }
@@ -3778,7 +4131,7 @@ mod tests {
             })
             .unwrap();
         let updated = transport
-            .compare_and_swap_manifest(&current.etag, &next)
+            .compare_and_swap_manifest(&current, &next)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -3793,6 +4146,48 @@ mod tests {
             updated.manifest.uuid_binding_index_head.unwrap().page_id,
             "uuid"
         );
+    }
+
+    #[test]
+    fn turn_admission_cas_atomically_publishes_lease_intent_and_provider_start() {
+        let transport = InMemorySessionV2Transport::default();
+        transport.set_server_time_ms(10_000);
+        let current = transport.create_session("s").unwrap();
+        let store = SessionV2Store::new(transport, &[7; 32], object_crypto());
+        let request_binding = RequestUuidBindingV1::new(
+            RequestRouteDomain::AgentTurn,
+            "s",
+            RID,
+            payload_digest(&"prompt").unwrap(),
+        )
+        .unwrap();
+        let guard = store
+            .acquire_lease_and_publish_from_manifest(
+                current,
+                "lease-a",
+                "session-holder",
+                |binding| {
+                    let mut intent = record(ULID_A, ULID_A, RID, "prompt");
+                    intent.lease = binding.clone();
+                    Ok(SessionCommitV1 {
+                        visible_records: vec![intent],
+                        request_objects: vec![(ULID_B.into(), b"provider_step_started".to_vec())],
+                        uuid_bindings: vec![request_binding],
+                    })
+                },
+            )
+            .unwrap();
+        let state = guard.state.lock().unwrap();
+        assert_eq!(state.current.manifest.generation, 1);
+        assert_eq!(
+            state.current.manifest.active_lease.as_ref(),
+            Some(&state.lease)
+        );
+        assert_eq!(state.current.manifest.visible_record_count, 1);
+        assert_eq!(state.current.manifest.internal_record_count, 2);
+        assert!(state.current.manifest.visible_index_head.is_some());
+        assert!(state.current.manifest.request_index_head.is_some());
+        assert!(state.current.manifest.uuid_binding_index_head.is_some());
     }
 
     #[test]
@@ -3854,11 +4249,11 @@ mod tests {
             .apply_delta(&ManifestDelta::default())
             .unwrap();
         transport
-            .compare_and_swap_manifest(&stale.etag, &first)
+            .compare_and_swap_manifest(&stale, &first)
             .unwrap()
             .unwrap();
         assert!(transport
-            .compare_and_swap_manifest(&stale.etag, &first)
+            .compare_and_swap_manifest(&stale, &first)
             .unwrap()
             .is_none());
     }
@@ -4222,7 +4617,7 @@ mod tests {
             .apply_delta(&ManifestDelta::default())
             .unwrap();
         transport
-            .compare_and_swap_manifest(&current.etag, &next)
+            .compare_and_swap_manifest(&current, &next)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -4499,7 +4894,7 @@ mod tests {
         manifest.visible_record_count = record_ids.len() as u64;
         manifest.visible_encrypted_bytes = encrypted_bytes;
         transport
-            .compare_and_swap_manifest(&current.etag, &manifest)
+            .compare_and_swap_manifest(&current, &manifest)
             .unwrap()
             .unwrap();
 

@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 /// Verified Codex-CLI mimicry recipe.
 pub(crate) const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 pub(super) const ORIGINATOR: &str = crate::oauth::CODEX_OAUTH_ORIGINATOR;
-pub(crate) const DEFAULT_CLI_VERSION: &str = "0.144.4";
+pub(crate) const DEFAULT_CLI_VERSION: &str = "0.144.5";
 const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 const MAX_REASONING_CONTEXT_BYTES: usize = 1024 * 1024;
 const MAX_REASONING_SUMMARY_BYTES: usize = 64 * 1024;
@@ -100,15 +100,34 @@ pub(crate) fn build_input(history: &[Message]) -> Vec<Value> {
     build_input_with_reasoning(history, &[], 0)
 }
 
-pub(super) fn tool_choice_for_input(input: &[Value]) -> &'static str {
-    if input
-        .iter()
-        .any(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
-    {
-        "auto"
-    } else {
-        "required"
+pub(super) fn tool_choice_for_input(_input: &[Value]) -> &'static str {
+    // Match the current Codex client contract. The model can answer ordinary chat
+    // directly and selects the sole iSyncYou tool only when the request needs data.
+    "auto"
+}
+
+pub(super) fn uses_responses_lite(model: &str) -> bool {
+    matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna")
+}
+
+fn prepare_input(model: &str, instructions: &str, mut input: Vec<Value>) -> Vec<Value> {
+    if !uses_responses_lite(model) {
+        return input;
     }
+    let mut prefix = vec![json!({
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": responses_tools(),
+    })];
+    if !instructions.is_empty() {
+        prefix.push(json!({
+            "type": "message",
+            "role": "developer",
+            "content": [{ "type": "input_text", "text": instructions }],
+        }));
+    }
+    input.splice(0..0, prefix);
+    input
 }
 
 #[derive(Clone)]
@@ -211,8 +230,23 @@ pub(crate) fn build_request(
     instructions: &str,
     history: &[Message],
 ) -> Value {
-    let input = build_input(history);
+    let input = prepare_input(model, instructions, build_input(history));
     let tool_choice = tool_choice_for_input(&input);
+    if uses_responses_lite(model) {
+        return json!({
+            "model": model,
+            "reasoning": {
+                "effort": reasoning_effort.as_str(),
+                "context": "all_turns",
+            },
+            "input": input,
+            "tool_choice": tool_choice,
+            "parallel_tool_calls": false,
+            "stream": true,
+            "store": false,
+            "include": ["reasoning.encrypted_content"],
+        });
+    }
     json!({
         "model": model,
         "reasoning": { "effort": reasoning_effort.as_str() },
@@ -340,22 +374,13 @@ fn apply_sse_event(
             }
         }
         Some("response.failed") => {
-            *failure = Some(
-                v.get("response")
-                    .and_then(|r| r.get("error"))
-                    .and_then(|e| e.get("message"))
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("response failed")
-                    .to_string(),
-            );
+            *failure = Some(closed_sse_failure_code(&v).to_owned());
+        }
+        Some("response.incomplete") => {
+            *failure = Some("incomplete_response".to_owned());
         }
         Some("error") => {
-            *failure = Some(
-                v.get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("stream error")
-                    .to_string(),
-            );
+            *failure = Some("stream_failure".to_owned());
         }
         _ => {}
     }
@@ -373,9 +398,25 @@ fn sse_event_advances_turn(data: &str) -> bool {
                     | "response.output_item.done"
                     | "response.completed"
                     | "response.failed"
+                    | "response.incomplete"
                     | "error"
             )
         })
+}
+
+fn closed_sse_failure_code(event: &Value) -> &'static str {
+    match event
+        .get("response")
+        .and_then(|response| response.get("error"))
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+    {
+        Some("rate_limit_exceeded") => "http_rate_limited",
+        Some("context_length_exceeded") => "context_limit",
+        Some("server_is_overloaded" | "slow_down") => "http_server_failure",
+        Some("invalid_prompt" | "bio_policy") => "http_request_rejected",
+        _ => "stream_failure",
+    }
 }
 
 #[cfg(feature = "http")]
@@ -409,8 +450,8 @@ fn finish_sse_blocks(
     usage: Usage,
     failure: Option<String>,
 ) -> Result<(Vec<AssistantBlock>, Usage), AgentError> {
-    if let Some(e) = failure {
-        return Err(AgentError::Provider(format!("codex: {e}")));
+    if let Some(code) = failure {
+        return Err(AgentError::Provider(format!("codex_safe:{code}")));
     }
     let mut blocks = Vec::new();
     if !text.is_empty() {
@@ -491,7 +532,7 @@ mod live {
 
         /// The Codex-CLI identity headers + Bearer (the legitimately-obtained token).
         pub(crate) fn request_headers(&self) -> Vec<(String, String)> {
-            vec![
+            let mut headers = vec![
                 (
                     "authorization".to_string(),
                     format!("Bearer {}", self.access_token),
@@ -508,7 +549,14 @@ mod live {
                 // NB: do NOT set content-type here — post_json's `.json()` already sets it
                 // once; a duplicate content-type header makes the ChatGPT backend 400.
                 ("accept".to_string(), "text/event-stream".to_string()),
-            ]
+            ];
+            if uses_responses_lite(&self.cfg.model) {
+                headers.push((
+                    "x-openai-internal-codex-responses-lite".to_string(),
+                    "true".to_string(),
+                ));
+            }
+            headers
         }
     }
 
@@ -555,10 +603,10 @@ mod live {
                         &self.instructions,
                         history,
                     );
-                    body["input"] = Value::Array(build_input_with_reasoning(
-                        history,
-                        &self.reasoning_rounds,
-                        assistant_base,
+                    body["input"] = Value::Array(prepare_input(
+                        &self.cfg.model,
+                        &self.instructions,
+                        build_input_with_reasoning(history, &self.reasoning_rounds, assistant_base),
                     ));
                     body
                 },
@@ -605,8 +653,13 @@ mod live {
             if parse_error.is_some() {
                 return Err(closed_provider_failure("parse_failure"));
             }
-            let (blocks, usage) = finish_sse_blocks(text, tools, usage, failure)
-                .map_err(|_| closed_provider_failure("stream_failure"))?;
+            let (blocks, usage) =
+                finish_sse_blocks(text, tools, usage, failure).map_err(|error| match error {
+                    AgentError::Provider(code) if code.starts_with("codex_safe:") => {
+                        AgentError::Provider(code)
+                    }
+                    _ => closed_provider_failure("stream_failure"),
+                })?;
             self.reasoning_rounds.push(reasoning);
             let usage = usage.with_provider_response("codex", &self.cfg.model, &response.headers);
             self.last_usage = usage;
@@ -636,29 +689,49 @@ mod tests {
         );
         assert_eq!(c.model, "gpt-5.6-sol");
         assert_eq!(c.reasoning_effort, CodexReasoningEffort::Medium);
-        assert_eq!(c.cli_version, "0.144.4");
+        assert_eq!(c.cli_version, "0.144.5");
     }
 
     #[test]
-    fn build_request_uses_responses_shape_with_instructions_and_tool() {
+    fn build_request_uses_responses_lite_shape_for_current_models() {
         let h = vec![Message::user("find the spotify invoice")];
         let body = build_request("gpt-5.6-terra", CodexReasoningEffort::High, "be terse", &h);
         assert_eq!(body["model"], "gpt-5.6-terra");
         assert_eq!(body["reasoning"]["effort"], "high");
-        assert_eq!(body["instructions"], "be terse");
+        assert_eq!(body["reasoning"]["context"], "all_turns");
+        assert!(body.get("instructions").is_none());
+        assert!(body.get("tools").is_none());
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
-        assert_eq!(body["tool_choice"], "required");
+        assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
-        assert_eq!(body["tools"][0]["type"], "function");
-        assert_eq!(body["tools"][0]["name"], "isyncyou");
-        assert_eq!(body["input"][0]["role"], "user");
-        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][0]["type"], "additional_tools");
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][0]["tools"][0]["type"], "function");
+        assert_eq!(body["input"][0]["tools"][0]["name"], "isyncyou");
+        assert_eq!(body["input"][1]["role"], "developer");
+        assert_eq!(body["input"][1]["content"][0]["text"], "be terse");
+        assert_eq!(body["input"][2]["role"], "user");
+        assert_eq!(body["input"][2]["content"][0]["type"], "input_text");
     }
 
     #[test]
-    fn build_request_allows_final_text_only_after_a_tool_result() {
+    fn build_request_keeps_classic_shape_for_non_lite_models() {
+        let body = build_request(
+            "gpt-5.5",
+            CodexReasoningEffort::Low,
+            "be terse",
+            &[Message::user("hello")],
+        );
+        assert_eq!(body["instructions"], "be terse");
+        assert_eq!(body["tools"][0]["name"], "isyncyou");
+        assert!(body["reasoning"].get("context").is_none());
+        assert_eq!(body["input"][0]["role"], "user");
+    }
+
+    #[test]
+    fn build_request_keeps_auto_tool_choice_after_a_tool_result() {
         let history = vec![
             Message::user("find one archived item"),
             Message::assistant(
@@ -702,14 +775,19 @@ mod tests {
                 "originator",
                 "user-agent",
                 "accept",
+                "x-openai-internal-codex-responses-lite",
             ]
         );
 
         assert_eq!(get("authorization").unwrap(), "Bearer tok123");
         assert_eq!(get("chatgpt-account-id").unwrap(), "acct_123");
         assert_eq!(get("originator").unwrap(), "codex_cli_rs");
-        assert_eq!(get("user-agent").unwrap(), "codex_cli_rs/0.144.4");
+        assert_eq!(get("user-agent").unwrap(), "codex_cli_rs/0.144.5");
         assert_eq!(get("accept").unwrap(), "text/event-stream");
+        assert_eq!(
+            get("x-openai-internal-codex-responses-lite").unwrap(),
+            "true"
+        );
         assert!(get("content-type").is_none());
     }
 
@@ -949,5 +1027,18 @@ data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\"
     fn parse_sse_surfaces_failure() {
         let sse = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"nope\"}}}\n";
         assert!(parse_sse(sse).unwrap_err().to_string().contains("codex"));
+    }
+
+    #[test]
+    fn parse_sse_classifies_closed_failure_and_incomplete_codes() {
+        let limited = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"private detail\"}}}\n";
+        let error = parse_sse(limited).unwrap_err().to_string();
+        assert!(error.contains("codex_safe:http_rate_limited"));
+        assert!(!error.contains("private detail"));
+
+        let incomplete = "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"private detail\"}}}\n";
+        let error = parse_sse(incomplete).unwrap_err().to_string();
+        assert!(error.contains("codex_safe:incomplete_response"));
+        assert!(!error.contains("private detail"));
     }
 }
