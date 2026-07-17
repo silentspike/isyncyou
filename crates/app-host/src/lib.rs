@@ -7747,6 +7747,8 @@ impl DaemonAgent {
             feature = "agent-subscription-experimental"
         ))]
         let last_usage = Arc::clone(&self.last_usage);
+        let product_turn = Arc::new(Mutex::new(product_turn));
+        let thread_product_turn = Arc::clone(&product_turn);
         let turn_thread = std::thread::Builder::new()
             .name(format!("agent-turn-{n}"))
             .spawn(move || {
@@ -7758,7 +7760,10 @@ impl DaemonAgent {
                 ))]
                 let _operation_lease = operation_lease;
                 let exec = make_executor(&account_id, archive_root);
-                let mut product_turn = product_turn;
+                let mut product_turn = thread_product_turn
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
                 let history = if let Some(runtime) = product_turn.as_mut() {
                     runtime.provider_history(&prompt, exec.as_ref())
                 } else {
@@ -7992,6 +7997,18 @@ impl DaemonAgent {
                 }
             });
         if turn_thread.is_err() {
+            let product_turn = product_turn
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            let _ = product_turn.map_or(Ok(()), |runtime| {
+                runtime.finish_terminal(
+                    isyncyou_agent::TurnTerminalStatus::Error,
+                    Some("turn_spawn_failed".into()),
+                    isyncyou_agent::RequestPhase::Failed,
+                    unix_now_ms(),
+                )
+            });
             self.streams.lock().unwrap().remove(&turn_id);
             self.hub.close(&turn_id);
             self.turns.remove(&turn_id);
