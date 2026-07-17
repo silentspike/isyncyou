@@ -3,11 +3,12 @@ use isyncyou_agent::{
     new_ulid, parse_action, payload_digest, request_object_digest, select_provider_context,
     tool_result_digest, AgentCredentialStore, AssistantBlock, IdempotencyTombstoneV1,
     LocalEffectCheckpointV1, NormalizedAssistantBlock, OneDriveSessionV2Transport, PairingPayload,
-    ProviderAttemptBindingV1, ReadToolCheckpointV1, RequestJournalV1, RequestPhase,
-    RequestRouteDomain, RequestStepOutcomeV1, RequestStepRef, RequestUuidBindingV1, SanitizedUsage,
-    Secret, SecretClass, SessionCommitV1, SessionId, SessionLeaseGuard, SessionObjectCrypto,
-    SessionRecordKind, SessionRecordV2, SessionV2Error, SessionV2Store, SourceRef, ToolAction,
-    TurnObserver, TurnTerminalStatus, REQUEST_JOURNAL_VERSION, SESSION_RECORD_VERSION,
+    PendingOwnerBinding, ProviderAttemptBindingV1, ReadToolCheckpointV1, RequestJournalV1,
+    RequestPhase, RequestRouteDomain, RequestStepOutcomeV1, RequestStepRef, RequestUuidBindingV1,
+    SanitizedUsage, Secret, SecretClass, SessionCommitV1, SessionId, SessionLeaseGuard,
+    SessionObjectCrypto, SessionRecordKind, SessionRecordV2, SessionV2Error, SessionV2Store,
+    SourceRef, ToolAction, TurnObserver, TurnTerminalStatus, REQUEST_JOURNAL_VERSION,
+    SESSION_RECORD_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1221,6 +1222,69 @@ impl<'a> ProductSessionRegistry<'a> {
         Ok(session)
     }
 
+    pub fn append_pending_cancelled(
+        &self,
+        graph_token: &str,
+        owner: &PendingOwnerBinding,
+        installation_principal: &str,
+        created_at_ms: u64,
+    ) -> Result<(), String> {
+        if owner.session_id == "legacy-local" {
+            return Ok(());
+        }
+        let store = self.open(graph_token, &owner.session_id)?;
+        let records = store
+            .recent_visible_records(&owner.session_id, 128)
+            .map_err(map_session_error)?;
+        if records.iter().any(|record| {
+            record.request_id == owner.request_id
+                && record.turn_id == owner.turn_id
+                && matches!(
+                    &record.kind,
+                    SessionRecordKind::OperationState { code } if code == "cancelled"
+                )
+        }) {
+            return Ok(());
+        }
+        let pending_record_id = records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.request_id == owner.request_id
+                    && record.turn_id == owner.turn_id
+                    && matches!(&record.kind, SessionRecordKind::PendingOperation { .. })
+            })
+            .map(|record| record.record_id.clone())
+            .ok_or_else(|| "session_state_invalid".to_string())?;
+        let lease_id = new_ulid().map_err(|_| "session_store_unavailable")?;
+        let holder_binding = self
+            .store
+            .domain_hmac(
+                TURN_HOLDER_DOMAIN,
+                format!("{installation_principal}:{}", owner.session_id).as_bytes(),
+            )
+            .map(|bytes| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+            .map_err(|_| "session_store_unavailable")?;
+        let guard = store
+            .acquire_lease(&owner.session_id, &lease_id, &holder_binding)
+            .map_err(map_session_error)?;
+        let record_id = new_ulid().map_err(|_| "session_store_unavailable")?;
+        let lease = guard.binding().map_err(map_session_error)?;
+        guard
+            .publish(SessionCommitV1 {
+                visible_records: vec![pending_cancelled_record(
+                    owner,
+                    record_id,
+                    pending_record_id,
+                    lease,
+                    created_at_ms,
+                )],
+                request_objects: vec![],
+                uuid_bindings: vec![],
+            })
+            .map_err(map_session_error)
+    }
+
     pub fn begin_turn(&self, request: ProductTurnRequest<'_>) -> Result<ProductTurnStart, String> {
         let ProductTurnRequest {
             graph_token,
@@ -1520,6 +1584,29 @@ impl<'a> ProductSessionRegistry<'a> {
     }
 }
 
+fn pending_cancelled_record(
+    owner: &PendingOwnerBinding,
+    record_id: String,
+    pending_record_id: String,
+    lease: isyncyou_agent::PersistedLeaseBinding,
+    created_at_ms: u64,
+) -> SessionRecordV2 {
+    SessionRecordV2 {
+        record_version: SESSION_RECORD_VERSION,
+        record_id,
+        session_id: owner.session_id.clone(),
+        request_id: owner.request_id.clone(),
+        turn_id: owner.turn_id.clone(),
+        kind: SessionRecordKind::OperationState {
+            code: "cancelled".into(),
+        },
+        parent_record_ids: vec![pending_record_id.clone()],
+        observed_head: Some(pending_record_id),
+        lease,
+        created_at_ms,
+    }
+}
+
 fn collect_source_refs(result: &str, output: &mut Vec<SourceRef>) {
     fn visit(value: &serde_json::Value, output: &mut Vec<SourceRef>) {
         if output.len() >= 64 {
@@ -1779,6 +1866,37 @@ mod tests {
             Some(session.session_id)
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_cancel_transcript_record_is_redacted_and_owner_bound() {
+        let owner = PendingOwnerBinding {
+            account: "private-account-alias".into(),
+            session_id: "01J00000000000000000000000".into(),
+            request_id: "123e4567-e89b-42d3-a456-426614174000".into(),
+            turn_id: "01J00000000000000000000001".into(),
+        };
+        let record = pending_cancelled_record(
+            &owner,
+            "01J00000000000000000000002".into(),
+            "01J00000000000000000000003".into(),
+            isyncyou_agent::PersistedLeaseBinding {
+                lease_id: "lease".into(),
+                fence: 7,
+                holder_binding: "holder".into(),
+                expires_at_server_ms: 120_000,
+            },
+            10,
+        );
+        let encoded = serde_json::to_string(&record).unwrap();
+        assert!(matches!(
+            record.kind,
+            SessionRecordKind::OperationState { ref code } if code == "cancelled"
+        ));
+        assert!(!encoded.contains("private-account-alias"));
+        for forbidden in ["token", "action_hash", "payload", "ToolAction"] {
+            assert!(!encoded.contains(forbidden), "record leaked {forbidden}");
+        }
     }
 
     #[test]

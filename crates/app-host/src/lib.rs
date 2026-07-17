@@ -9268,10 +9268,38 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
     }
 
     fn cancel_pending(&self, pending_id: &str, action_hash: &str) -> Result<(), String> {
-        self.pending
+        let owner = self
+            .pending
             .cancel(pending_id, action_hash, unix_now_ms())
             .map_err(|error| format!("{error:?}"))?;
         self.turns.remove_pending(pending_id);
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        if owner.session_id != "legacy-local" {
+            let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, &owner.account)
+                .map_err(|_| "session_transport_unavailable".to_string())?;
+            let credential_store = agent_credential_store(&self.oauth_dir)
+                .map_err(|_| "session_store_unavailable".to_string())?;
+            let repository = account_lifecycle_repository(&self.oauth_dir)?;
+            let installation = repository
+                .load_existing()
+                .map_err(|_| "session_store_unavailable".to_string())?
+                .ok_or_else(|| "session_store_unavailable".to_string())?;
+            product_session::ProductSessionRegistry::new(&credential_store)
+                .append_pending_cancelled(
+                    &token,
+                    &owner,
+                    installation.principal(),
+                    unix_now_ms(),
+                )?;
+        }
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
+        let _ = owner;
         Ok(())
     }
 

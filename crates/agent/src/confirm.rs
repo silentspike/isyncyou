@@ -87,7 +87,12 @@ pub trait PendingPersistence: Send + Sync {
         action_hash: &str,
         now_ms: u64,
     ) -> Result<PendingActionBinding, ConfirmError>;
-    fn cancel(&self, pending_id: &str, action_hash: &str, now_ms: u64) -> Result<(), ConfirmError>;
+    fn cancel(
+        &self,
+        pending_id: &str,
+        action_hash: &str,
+        now_ms: u64,
+    ) -> Result<PendingOwnerBinding, ConfirmError>;
     fn has_pending_for_turn(&self, turn_id: &str, now_ms: u64) -> Result<bool, ConfirmError>;
 }
 
@@ -340,7 +345,7 @@ impl PendingRegistry {
         pending_id: &str,
         action_hash: &str,
         now_ms: u64,
-    ) -> Result<(), ConfirmError> {
+    ) -> Result<PendingOwnerBinding, ConfirmError> {
         if let Some(persistence) = &self.persistence {
             return persistence.cancel(pending_id, action_hash, now_ms);
         }
@@ -353,8 +358,7 @@ impl PendingRegistry {
         if !ct_eq(action_hash.as_bytes(), pending.action_hash.as_bytes()) {
             return Err(ConfirmError::ActionMismatch);
         }
-        map.remove(pending_id);
-        Ok(())
+        Ok(map.remove(pending_id).expect("present").owner)
     }
 
     pub fn has_pending_for_turn(&self, turn_id: &str, now_ms: u64) -> Result<bool, ConfirmError> {
@@ -543,8 +547,12 @@ mod tests {
             )
             .unwrap();
         assert!(reg.has_pending_for_turn("turn", 2_000).unwrap());
-        reg.cancel(&pending.id, &pending.action_hash, 2_000)
+        let owner = reg
+            .cancel(&pending.id, &pending.action_hash, 2_000)
             .unwrap();
+        assert_eq!(owner.session_id, "session");
+        assert_eq!(owner.request_id, "request");
+        assert_eq!(owner.turn_id, "turn");
         assert!(!reg.has_pending_for_turn("turn", 2_001).unwrap());
         assert_eq!(
             reg.binding(&pending.id, &pending.action_hash, 2_001),

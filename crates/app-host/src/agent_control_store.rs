@@ -2,7 +2,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use isyncyou_agent::{
     AgentCredentialStore, ConfirmError, FileLock, PairingClaimV2, PairingCodeV2,
     PairingDescriptorV2, PairingPayload, PairingSourceSecretV2, PendingActionBinding,
-    PendingPersistence, PersistedPendingAction, ToolAction,
+    PendingOwnerBinding, PendingPersistence, PersistedPendingAction, ToolAction,
 };
 use ring::{aead, hkdf, rand::SecureRandom as _};
 use rusqlite::{
@@ -2017,6 +2017,30 @@ impl AgentControlStore {
             .ok_or(ConfirmError::Unavailable)
     }
 
+    fn pending_owner(&self, intent_id: &str) -> Result<Option<PendingOwnerBinding>, ConfirmError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ConfirmError::Unavailable)?;
+        connection
+            .query_row(
+                "SELECT account_id,session_id,request_id,turn_id
+                 FROM confirmation_intents
+                 WHERE intent_id=?1 AND owner_binding=?2",
+                params![intent_id, self.installation_binding],
+                |row| {
+                    Ok(PendingOwnerBinding {
+                        account: row.get(0)?,
+                        session_id: row.get(1)?,
+                        request_id: row.get(2)?,
+                        turn_id: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|_| ConfirmError::Unavailable)
+    }
+
     fn erase_with_state(&self, intent_id: &str, state: &str) -> Result<(), ConfirmError> {
         let connection = self
             .connection
@@ -2191,21 +2215,32 @@ impl PendingPersistence for AgentControlStore {
         })
     }
 
-    fn cancel(&self, pending_id: &str, action_hash: &str, now_ms: u64) -> Result<(), ConfirmError> {
+    fn cancel(
+        &self,
+        pending_id: &str,
+        action_hash: &str,
+        now_ms: u64,
+    ) -> Result<PendingOwnerBinding, ConfirmError> {
         let Some((state, expires, expected_action_hash, _)) = self.load_pending(pending_id)? else {
             return Err(ConfirmError::NotFound);
         };
-        if state != "pending" {
+        if state != "pending" && state != "cancelled" {
             return Err(ConfirmError::NotFound);
         }
-        if now_ms > expires {
+        if state == "pending" && now_ms > expires {
             self.erase_with_state(pending_id, "expired")?;
             return Err(ConfirmError::Expired);
         }
         if !constant_time_eq(action_hash.as_bytes(), expected_action_hash.as_bytes()) {
             return Err(ConfirmError::ActionMismatch);
         }
-        self.erase_with_state(pending_id, "cancelled")
+        let owner = self
+            .pending_owner(pending_id)?
+            .ok_or(ConfirmError::NotFound)?;
+        if state == "pending" {
+            self.erase_with_state(pending_id, "cancelled")?;
+        }
+        Ok(owner)
     }
 
     fn has_pending_for_turn(&self, turn_id: &str, now_ms: u64) -> Result<bool, ConfirmError> {
@@ -2929,6 +2964,58 @@ mod tests {
         assert_eq!(state, "expired");
         assert!(payload.is_none());
         assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn pending_cancel_retry_returns_same_owner_without_restoring_authority() {
+        let root = temp_root("pending-cancel-retry");
+        let store = credential_store(&root);
+        let persistence =
+            Arc::new(AgentControlStore::open(&root, &store, INSTALLATION_PRINCIPAL, 1).unwrap());
+        let registry = PendingRegistry::with_persistence(persistence.clone());
+        let expected_owner = owner();
+        let (pending, token) = registry
+            .register_bound(
+                backup_action(),
+                "backup",
+                1_000,
+                60_000,
+                expected_owner.clone(),
+            )
+            .unwrap();
+
+        let first = registry
+            .cancel(&pending.id, &pending.action_hash, 2_000)
+            .unwrap();
+        let retry = registry
+            .cancel(&pending.id, &pending.action_hash, 2_001)
+            .unwrap();
+        assert_eq!(first, expected_owner);
+        assert_eq!(retry, expected_owner);
+        assert_eq!(
+            registry.confirm(&pending.id, &token, &pending.action_hash, 2_001),
+            Err(ConfirmError::NotFound)
+        );
+        assert_eq!(
+            registry.binding(&pending.id, &pending.action_hash, 2_001),
+            Err(ConfirmError::NotFound)
+        );
+
+        let connection = persistence.connection.lock().unwrap();
+        let (state, payload, bytes): (String, Option<Vec<u8>>, i64) = connection
+            .query_row(
+                "SELECT state,sealed_payload,logical_bytes FROM confirmation_intents WHERE intent_id=?1",
+                params![pending.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "cancelled");
+        assert!(payload.is_none());
+        assert_eq!(bytes, 0);
+        drop(connection);
+        drop(registry);
+        drop(persistence);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
