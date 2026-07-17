@@ -36,6 +36,7 @@ const MAX_REQUEST_HEAD: usize = 64 * 1024;
 const MAX_REQUEST_TARGET: usize = 8 * 1024;
 const MAX_HEADER_LINE: usize = 8 * 1024;
 const MAX_HEADER_FIELDS: usize = 128;
+const AGENT_SSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Decrements the live-connection counter when a connection thread ends.
 struct ConnGuard;
@@ -965,11 +966,19 @@ fn handle_sse<S: Conn>(stream: &mut S, bus: &EventBus) -> std::io::Result<()> {
 
 /// Stream one agent turn's pre-serialized events as SSE until the turn ends or the peer
 /// disconnects. Each `Receiver<String>` item is a single-line JSON `data:` payload; a
-/// 15 s timeout emits a heartbeat; `Disconnected` (the turn closed its sender) ends the
+/// 5 s timeout emits a heartbeat; `Disconnected` (the turn closed its sender) ends the
 /// stream cleanly with a `done` event.
 fn handle_agent_sse<S: Conn>(
     stream: &mut S,
     rx: std::sync::mpsc::Receiver<String>,
+) -> std::io::Result<()> {
+    handle_agent_sse_with_interval(stream, rx, AGENT_SSE_HEARTBEAT_INTERVAL)
+}
+
+fn handle_agent_sse_with_interval<S: Conn>(
+    stream: &mut S,
+    rx: std::sync::mpsc::Receiver<String>,
+    heartbeat_interval: Duration,
 ) -> std::io::Result<()> {
     use std::sync::mpsc::RecvTimeoutError;
     let head = "HTTP/1.1 200 OK\r\n\
@@ -981,7 +990,7 @@ fn handle_agent_sse<S: Conn>(
     stream.write_all(b": connected\n\n")?;
     stream.flush()?;
     loop {
-        match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+        match rx.recv_timeout(heartbeat_interval) {
             Ok(data) => stream.write_all(format!("data: {data}\n\n").as_bytes())?,
             Err(RecvTimeoutError::Timeout) => stream.write_all(b": keep-alive\n\n")?,
             Err(RecvTimeoutError::Disconnected) => {
@@ -1099,6 +1108,40 @@ mod tests {
         );
         assert_eq!(parse_request_line(""), None);
         assert_eq!(parse_request_line("GET"), None);
+    }
+
+    #[test]
+    fn agent_sse_heartbeat_arrives_before_idle_client_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            handle_agent_sse_with_interval(&mut stream, receiver, Duration::from_millis(20))
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 512];
+        while !response
+            .windows(b": keep-alive\n\n".len())
+            .any(|window| window == b": keep-alive\n\n")
+        {
+            let read = client.read(&mut chunk).unwrap();
+            assert!(read > 0);
+            response.extend_from_slice(&chunk[..read]);
+        }
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains(": connected\n\n"));
+        assert!(response.contains(": keep-alive\n\n"));
+
+        drop(sender);
+        server.join().unwrap();
     }
 
     #[test]

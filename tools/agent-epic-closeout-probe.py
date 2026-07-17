@@ -33,6 +33,7 @@ from urllib.parse import urlparse
 
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+SAFE_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 AGENT_CAP_RE = re.compile(r'\bagent:\s*"([^"\\]{16,512})"')
 MAX_JSON_BYTES = 1024 * 1024
 MAX_SSE_BYTES = 1024 * 1024
@@ -576,6 +577,7 @@ def stream_turn(client: RuntimeClient, turn_id: str, timeout: float) -> dict[str
     names: list[str] = []
     untrusted_result = False
     terminal_reason = None
+    error_code = None
     deadline = time.monotonic() + timeout
     idle_timeout = min(timeout, CONTROL_REQUEST_TIMEOUT_SECONDS)
     total_bytes = 0
@@ -618,6 +620,11 @@ def stream_turn(client: RuntimeClient, turn_id: str, timeout: float) -> dict[str
                 names.append(name)
                 if name == "tool_result" and event.get("untrusted") is True:
                     untrusted_result = True
+                if name == "error":
+                    candidate = event.get("message")
+                    if not isinstance(candidate, str) or not SAFE_CODE_RE.fullmatch(candidate):
+                        raise ProbeError("turn_stream_invalid")
+                    error_code = candidate
                 if name == "done":
                     reason = event.get("reason")
                     if reason not in {"complete", "error", "cancelled", "pending_confirmation"}:
@@ -638,6 +645,7 @@ def stream_turn(client: RuntimeClient, turn_id: str, timeout: float) -> dict[str
     return {
         "ordered_event_names": names,
         "terminal_reason": terminal_reason,
+        "error_code": error_code,
         "untrusted_tool_result_observed": untrusted_result,
     }
 
@@ -775,6 +783,24 @@ def run_retrieval_turn(
     if not retry_same_turn:
         raise ProbeError("turn_retry_duplicated")
     stream = stream_turn(client, turn_id, timeout)
+    if stream["terminal_reason"] != "complete":
+        return {
+            "state": "fail",
+            "provider": provider,
+            "request_digest": opaque_digest(request_id, "issue-628-request"),
+            "turn_digest": opaque_digest(turn_id, "issue-628-turn"),
+            "fixture_digest": opaque_digest(fixture_name, "issue-628-fixture"),
+            "turn_ack_latency": latency_bucket(elapsed_ms),
+            "retry_reused_turn": retry_same_turn,
+            "ordered_event_names": stream["ordered_event_names"],
+            "terminal_reason": stream["terminal_reason"],
+            "error_code": stream["error_code"],
+            "untrusted_tool_result_observed": stream["untrusted_tool_result_observed"],
+            "request_status_state": "not_checked_after_terminal_failure",
+            "transcript_rehydrated": False,
+            "source_count": 0,
+            "all_sources_listed_and_viewable": False,
+        }
     try:
         intent, assistant, terminal, sources = load_turn_records(
             client, session_id, request_id, turn_id

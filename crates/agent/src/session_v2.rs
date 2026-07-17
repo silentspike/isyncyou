@@ -41,6 +41,9 @@ const SESSION_LEASE_TAKEOVER_MARGIN_MS: u64 = 5_000;
 const MAX_SERVER_TIME_SAMPLE_AGE: std::time::Duration = std::time::Duration::from_secs(10);
 const ORPHAN_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 const ORPHAN_REAP_BATCH: usize = 128;
+const MAX_INDEX_PAGE_ENTRIES: usize = 256;
+const MAX_INDEX_PAGE_COALESCE_READS: usize = 1;
+const MAX_RECENT_INDEX_PAGE_READS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionWritePolicy {
@@ -482,6 +485,11 @@ pub struct SessionV2Store<T: SessionV2Transport> {
     object_crypto: SessionObjectCrypto,
 }
 
+struct StagedIndexPage {
+    head: Option<IndexPageRef>,
+    replaced_page_bytes: u64,
+}
+
 impl<T: SessionV2Transport + Clone> Clone for SessionV2Store<T> {
     fn clone(&self) -> Self {
         Self {
@@ -576,36 +584,27 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
             binding_entries.clone(),
         )?;
 
-        let visible_bytes = page_delta_bytes(&visible_page)
-            .checked_add(request_entries_bytes(&visible_entries)?)
-            .ok_or(SessionV2Error::SessionLimit)?;
-        let internal_bytes = page_delta_bytes(&request_page)
-            .checked_add(page_delta_bytes(&binding_page))
-            .and_then(|value| {
-                request_entries_bytes(&request_entries)
-                    .ok()
-                    .and_then(|bytes| value.checked_add(bytes))
-            })
-            .and_then(|value| {
-                request_entries_bytes(&binding_entries)
-                    .ok()
-                    .and_then(|bytes| value.checked_add(bytes))
-            })
-            .ok_or(SessionV2Error::SessionLimit)?;
+        let visible_bytes =
+            staged_index_delta(&visible_page, request_entries_bytes(&visible_entries)?)?;
+        let internal_bytes =
+            staged_index_delta(&request_page, request_entries_bytes(&request_entries)?)?
+                .checked_add(staged_index_delta(
+                    &binding_page,
+                    request_entries_bytes(&binding_entries)?,
+                )?)
+                .ok_or(SessionV2Error::SessionLimit)?;
         let next = current.manifest.apply_delta(&ManifestDelta {
             visible_records: commit.visible_records.len() as i64,
             internal_records: (commit.request_objects.len() + commit.uuid_bindings.len()) as i64,
-            visible_bytes: i64::try_from(visible_bytes)
-                .map_err(|_| SessionV2Error::SessionLimit)?,
-            internal_bytes: i64::try_from(internal_bytes)
-                .map_err(|_| SessionV2Error::SessionLimit)?,
-            visible_index_head: visible_page.clone().map(Some),
+            visible_bytes,
+            internal_bytes,
+            visible_index_head: visible_page.head.clone().map(Some),
             visible_record_head: commit
                 .visible_records
                 .last()
                 .map(|record| Some(record.record_id.clone())),
-            request_index_head: request_page.clone().map(Some),
-            uuid_binding_index_head: binding_page.clone().map(Some),
+            request_index_head: request_page.head.clone().map(Some),
+            uuid_binding_index_head: binding_page.head.clone().map(Some),
         })?;
         self.transport
             .compare_and_swap_manifest(&current.etag, &next)?
@@ -716,28 +715,26 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
         let old_request_bytes = old_page_bytes
             .checked_add(request_entries_bytes(&old_entries)?)
             .ok_or(SessionV2Error::SessionLimit)?;
-        let new_request_bytes = page_delta_bytes(&request_page)
+        let new_request_bytes = page_delta_bytes(&request_page.head)
             .checked_add(request_entries_bytes(&retained)?)
             .ok_or(SessionV2Error::SessionLimit)?;
-        let visible_bytes = page_delta_bytes(&visible_page)
-            .checked_add(request_entries_bytes(&visible_entries)?)
-            .ok_or(SessionV2Error::SessionLimit)?;
+        let visible_bytes =
+            staged_index_delta(&visible_page, request_entries_bytes(&visible_entries)?)?;
         let next = current.manifest.apply_delta(&ManifestDelta {
             visible_records: visible_records.len() as i64,
             internal_records: i64::try_from(retained.len())
                 .and_then(|new| i64::try_from(old_entries.len()).map(|old| new - old))
                 .map_err(|_| SessionV2Error::SessionLimit)?,
-            visible_bytes: i64::try_from(visible_bytes)
-                .map_err(|_| SessionV2Error::SessionLimit)?,
+            visible_bytes,
             internal_bytes: i64::try_from(
                 i128::from(new_request_bytes) - i128::from(old_request_bytes),
             )
             .map_err(|_| SessionV2Error::SessionLimit)?,
-            visible_index_head: visible_page.map(Some),
+            visible_index_head: visible_page.head.map(Some),
             visible_record_head: visible_records
                 .last()
                 .map(|record| Some(record.record_id.clone())),
-            request_index_head: request_page.map(Some),
+            request_index_head: request_page.head.map(Some),
             uuid_binding_index_head: None,
         })?;
         self.transport
@@ -839,15 +836,15 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
             return Err(SessionV2Error::HistoryPageTooLarge);
         }
         let current = self.transport.load_manifest(session_id)?;
-        let entries = self.load_index_entries(
+        let entries = self.load_recent_index_entries(
             session_id,
             SessionObjectClass::VisibleIndex,
             current.manifest.visible_index_head.as_ref(),
+            limit,
         )?;
-        let start = entries.len().saturating_sub(limit);
-        let mut records = Vec::with_capacity(entries.len() - start);
+        let mut records = Vec::with_capacity(entries.len());
         let mut response_bytes = 0usize;
-        for entry in &entries[start..] {
+        for entry in &entries {
             let sealed = self
                 .transport
                 .load_immutable(SessionObjectClass::VisibleRecord, &entry.object_id)?;
@@ -902,6 +899,34 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
         candidate: &RequestUuidBindingV1,
     ) -> Result<Option<RequestReplayV1>, SessionV2Error> {
         let current = self.transport.load_manifest(session_id)?;
+        let Some(direct_binding) = self
+            .transport
+            .load_immutable_optional(SessionObjectClass::UuidBinding, &candidate.request_key)?
+        else {
+            return Ok(None);
+        };
+        let direct_binding = self
+            .object_crypto
+            .open(
+                session_id,
+                SessionObjectClass::UuidBinding,
+                &candidate.request_key,
+                &direct_binding,
+            )
+            .map_err(|_| SessionV2Error::InvalidRecord)?;
+        let direct_binding: RequestUuidBindingV1 =
+            serde_json::from_slice(&direct_binding).map_err(|_| SessionV2Error::InvalidRecord)?;
+        if direct_binding.binding_version != 1
+            || direct_binding.request_key != candidate.request_key
+            || !valid_uuid_v4(&direct_binding.request_id)
+        {
+            return Err(SessionV2Error::InvalidRecord);
+        }
+        direct_binding.permits_replay(candidate)?;
+
+        // The deterministic object lookup is a fast negative check for new UUIDs.
+        // Existing objects still need an index proof because an immutable object
+        // staged before a failed manifest CAS is not authoritative.
         let binding_entries = self.load_index_entries(
             session_id,
             SessionObjectClass::UuidBindingIndex,
@@ -1073,11 +1098,61 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
         &self,
         session_id: &str,
         object_class: SessionObjectClass,
-        previous: Option<IndexPageRef>,
-        entries: Vec<ImmutableIndexEntryV1>,
-    ) -> Result<Option<IndexPageRef>, SessionV2Error> {
+        mut previous: Option<IndexPageRef>,
+        mut entries: Vec<ImmutableIndexEntryV1>,
+    ) -> Result<StagedIndexPage, SessionV2Error> {
         if entries.is_empty() {
-            return Ok(None);
+            return Ok(StagedIndexPage {
+                head: None,
+                replaced_page_bytes: 0,
+            });
+        }
+        if entries.len() > MAX_INDEX_PAGE_ENTRIES {
+            return Err(SessionV2Error::SessionLimit);
+        }
+
+        // Fold the newest immutable pages into one bounded head. Without this,
+        // one small page per turn makes every replay/status lookup perform one
+        // sequential OneDrive request for every historical turn. Reading only
+        // the current head keeps publication latency independent of legacy depth;
+        // repeated writes compact older one-entry heads incrementally.
+        let mut replaced_page_bytes = 0u64;
+        let mut coalesced_pages = 0usize;
+        while let Some(reference) = previous.clone() {
+            if coalesced_pages >= MAX_INDEX_PAGE_COALESCE_READS {
+                break;
+            }
+            let sealed = self
+                .transport
+                .load_immutable(object_class, &reference.page_id)?;
+            if bytes_digest(&sealed) != reference.sha256
+                || sealed.len() as u64 != reference.encrypted_bytes
+            {
+                return Err(SessionV2Error::InvalidRecord);
+            }
+            let bytes = self
+                .object_crypto
+                .open(session_id, object_class, &reference.page_id, &sealed)
+                .map_err(|_| SessionV2Error::InvalidRecord)?;
+            let page: ImmutableIndexPageV1 =
+                serde_json::from_slice(&bytes).map_err(|_| SessionV2Error::InvalidRecord)?;
+            if page.index_version != 1
+                || page.page_id != reference.page_id
+                || page.entries.len() > MAX_INDEX_PAGE_ENTRIES
+            {
+                return Err(SessionV2Error::InvalidRecord);
+            }
+            if page.entries.len().saturating_add(entries.len()) > MAX_INDEX_PAGE_ENTRIES {
+                break;
+            }
+            let mut merged = page.entries;
+            merged.append(&mut entries);
+            entries = merged;
+            replaced_page_bytes = replaced_page_bytes
+                .checked_add(reference.encrypted_bytes)
+                .ok_or(SessionV2Error::SessionLimit)?;
+            previous = page.previous;
+            coalesced_pages += 1;
         }
         let page_id = deterministic_page_id(previous.as_ref(), &entries)?;
         let page = ImmutableIndexPageV1 {
@@ -1093,11 +1168,14 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
             .map_err(|_| SessionV2Error::InvalidRecord)?;
         self.transport
             .stage_immutable(object_class, &page_id, &sealed)?;
-        Ok(Some(IndexPageRef {
-            page_id,
-            sha256: bytes_digest(&sealed),
-            encrypted_bytes: sealed.len() as u64,
-        }))
+        Ok(StagedIndexPage {
+            head: Some(IndexPageRef {
+                page_id,
+                sha256: bytes_digest(&sealed),
+                encrypted_bytes: sealed.len() as u64,
+            }),
+            replaced_page_bytes,
+        })
     }
 
     fn load_index_entries(
@@ -1136,6 +1214,54 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
         }
         pages.reverse();
         Ok(pages.into_iter().flatten().collect())
+    }
+
+    fn load_recent_index_entries(
+        &self,
+        session_id: &str,
+        object_class: SessionObjectClass,
+        head: Option<&IndexPageRef>,
+        limit: usize,
+    ) -> Result<Vec<ImmutableIndexEntryV1>, SessionV2Error> {
+        let mut chunks = Vec::new();
+        let mut cursor = head.cloned();
+        let mut seen = BTreeSet::new();
+        let mut remaining = limit;
+        while remaining > 0 && chunks.len() < MAX_RECENT_INDEX_PAGE_READS {
+            let Some(reference) = cursor else {
+                break;
+            };
+            if !seen.insert(reference.page_id.clone()) {
+                return Err(SessionV2Error::InvalidRecord);
+            }
+            let sealed = self
+                .transport
+                .load_immutable(object_class, &reference.page_id)?;
+            if bytes_digest(&sealed) != reference.sha256
+                || sealed.len() as u64 != reference.encrypted_bytes
+            {
+                return Err(SessionV2Error::InvalidRecord);
+            }
+            let bytes = self
+                .object_crypto
+                .open(session_id, object_class, &reference.page_id, &sealed)
+                .map_err(|_| SessionV2Error::InvalidRecord)?;
+            let page: ImmutableIndexPageV1 =
+                serde_json::from_slice(&bytes).map_err(|_| SessionV2Error::InvalidRecord)?;
+            if page.index_version != 1
+                || page.page_id != reference.page_id
+                || page.entries.len() > MAX_INDEX_PAGE_ENTRIES
+            {
+                return Err(SessionV2Error::InvalidRecord);
+            }
+            let start = page.entries.len().saturating_sub(remaining);
+            let selected = page.entries[start..].to_vec();
+            remaining = remaining.saturating_sub(selected.len());
+            cursor = page.previous;
+            chunks.push(selected);
+        }
+        chunks.reverse();
+        Ok(chunks.into_iter().flatten().collect())
     }
 
     fn load_index_entries_with_page_bytes(
@@ -1632,6 +1758,11 @@ pub trait SessionV2Transport: Send + Sync {
         object_class: SessionObjectClass,
         object_id: &str,
     ) -> Result<Vec<u8>, SessionV2Error>;
+    fn load_immutable_optional(
+        &self,
+        object_class: SessionObjectClass,
+        object_id: &str,
+    ) -> Result<Option<Vec<u8>>, SessionV2Error>;
     fn reap_unreachable(
         &self,
         reachable: &BTreeSet<(SessionObjectClass, String)>,
@@ -1659,6 +1790,8 @@ struct MemoryV2State {
     server_unix_ms: u64,
     server_sample_age: std::time::Duration,
     server_time_unavailable: bool,
+    #[cfg(test)]
+    immutable_load_counts: BTreeMap<SessionObjectClass, usize>,
 }
 
 impl InMemorySessionV2Transport {
@@ -1707,6 +1840,22 @@ impl InMemorySessionV2Transport {
         if let Ok(mut state) = self.inner.lock() {
             state.server_time_unavailable = unavailable;
         }
+    }
+
+    #[cfg(test)]
+    fn reset_immutable_load_counts(&self) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.immutable_load_counts.clear();
+        }
+    }
+
+    #[cfg(test)]
+    fn immutable_load_count(&self, object_class: SessionObjectClass) -> usize {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|state| state.immutable_load_counts.get(&object_class).copied())
+            .unwrap_or_default()
     }
 }
 
@@ -1766,13 +1915,42 @@ impl SessionV2Transport for InMemorySessionV2Transport {
         object_class: SessionObjectClass,
         object_id: &str,
     ) -> Result<Vec<u8>, SessionV2Error> {
-        self.inner
+        let state = self
+            .inner
             .lock()
-            .map_err(|_| SessionV2Error::ManifestConflict)?
+            .map_err(|_| SessionV2Error::ManifestConflict)?;
+        #[cfg(test)]
+        let mut state = state;
+        #[cfg(test)]
+        {
+            *state.immutable_load_counts.entry(object_class).or_default() += 1;
+        }
+        state
             .objects
             .get(&(object_class, object_id.to_owned()))
             .cloned()
             .ok_or(SessionV2Error::InvalidJournal)
+    }
+
+    fn load_immutable_optional(
+        &self,
+        object_class: SessionObjectClass,
+        object_id: &str,
+    ) -> Result<Option<Vec<u8>>, SessionV2Error> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| SessionV2Error::ManifestConflict)?;
+        #[cfg(test)]
+        let mut state = state;
+        #[cfg(test)]
+        {
+            *state.immutable_load_counts.entry(object_class).or_default() += 1;
+        }
+        Ok(state
+            .objects
+            .get(&(object_class, object_id.to_owned()))
+            .cloned())
     }
 
     fn reap_unreachable(
@@ -1835,7 +2013,7 @@ impl SessionV2Transport for InMemorySessionV2Transport {
 #[cfg(feature = "onedrive")]
 mod onedrive_transport {
     use super::*;
-    use isyncyou_graph::http::{ConflictBehavior, GraphClient};
+    use isyncyou_graph::http::{ConflictBehavior, GraphClient, UploadError};
 
     const V2_ROOT: &str = "Apps/iSyncYou/agent/v2";
     const MAX_MANIFEST_BYTES: usize = 64 * 1024;
@@ -1873,6 +2051,7 @@ mod onedrive_transport {
         }
 
         pub fn create_session(&self) -> Result<VersionedManifest, SessionV2Error> {
+            self.ensure_session_folders()?;
             let manifest = SessionManifestV1::empty(&self.session_id);
             let bytes = manifest_bytes(&manifest)?;
             let created = self
@@ -1887,6 +2066,96 @@ mod onedrive_transport {
                 return versioned_manifest(item, manifest);
             }
             self.load_manifest(&self.session_id)
+        }
+
+        fn ensure_session_folders(&self) -> Result<(), SessionV2Error> {
+            let v2_id = self.ensure_v2_root()?;
+            let session_path = format!("{V2_ROOT}/{}", self.session_id);
+            let session_id = self.create_or_get_folder(&v2_id, &self.session_id, &session_path)?;
+            let staging_path = format!("{session_path}/staging");
+            let staging_id = self.create_or_get_folder(&session_id, "staging", &staging_path)?;
+
+            // These folders are independent once staging exists. Create them concurrently so
+            // first-turn admission pays one Graph round trip instead of six sequential ones.
+            let mut workers = Vec::new();
+            for object_class in [
+                SessionObjectClass::VisibleRecord,
+                SessionObjectClass::VisibleIndex,
+                SessionObjectClass::RequestState,
+                SessionObjectClass::RequestIndex,
+                SessionObjectClass::UuidBinding,
+                SessionObjectClass::UuidBindingIndex,
+            ] {
+                let segment = object_class_segment(object_class);
+                let child_path = format!("{staging_path}/{segment}");
+                let transport = self.clone();
+                let parent_id = staging_id.clone();
+                workers.push(std::thread::spawn(move || {
+                    transport.create_or_get_folder(&parent_id, segment, &child_path)
+                }));
+            }
+            for worker in workers {
+                worker
+                    .join()
+                    .map_err(|_| SessionV2Error::TransportUnavailable)??;
+            }
+            Ok(())
+        }
+
+        fn ensure_v2_root(&self) -> Result<String, SessionV2Error> {
+            if let Some(item) = self
+                .client
+                .get_drive_item_by_path(V2_ROOT, &["id", "folder"])
+                .map_err(|_| SessionV2Error::TransportUnavailable)?
+            {
+                return graph_folder_id(&item);
+            }
+
+            let mut parent_id = String::new();
+            let mut path = String::new();
+            for segment in ["Apps", "iSyncYou", "agent", "v2"] {
+                if !path.is_empty() {
+                    path.push('/');
+                }
+                path.push_str(segment);
+                parent_id = self.ensure_folder(&parent_id, segment, &path)?;
+            }
+            Ok(parent_id)
+        }
+
+        fn ensure_folder(
+            &self,
+            parent_id: &str,
+            name: &str,
+            path: &str,
+        ) -> Result<String, SessionV2Error> {
+            if let Some(item) = self
+                .client
+                .get_drive_item_by_path(path, &["id", "folder"])
+                .map_err(|_| SessionV2Error::TransportUnavailable)?
+            {
+                return graph_folder_id(&item);
+            }
+            self.create_or_get_folder(parent_id, name, path)
+        }
+
+        fn create_or_get_folder(
+            &self,
+            parent_id: &str,
+            name: &str,
+            path: &str,
+        ) -> Result<String, SessionV2Error> {
+            match self.client.create_folder(parent_id, name) {
+                Ok(item) => graph_folder_id(&item),
+                Err(UploadError::Http { status: 409, .. }) => self
+                    .client
+                    .get_drive_item_by_path(path, &["id", "folder"])
+                    .map_err(|_| SessionV2Error::TransportUnavailable)?
+                    .as_ref()
+                    .ok_or(SessionV2Error::TransportUnavailable)
+                    .and_then(graph_folder_id),
+                Err(_) => Err(SessionV2Error::TransportUnavailable),
+            }
         }
 
         fn manifest_path(&self) -> String {
@@ -1975,6 +2244,20 @@ mod onedrive_transport {
         ) -> Result<Vec<u8>, SessionV2Error> {
             let path = self.object_path(object_class, object_id)?;
             self.read_path(&path, MAX_IMMUTABLE_OBJECT_BYTES)
+        }
+
+        fn load_immutable_optional(
+            &self,
+            object_class: SessionObjectClass,
+            object_id: &str,
+        ) -> Result<Option<Vec<u8>>, SessionV2Error> {
+            let path = self.object_path(object_class, object_id)?;
+            let item = self
+                .client
+                .get_drive_item_by_path(&path, &["id", "file"])
+                .map_err(|_| SessionV2Error::TransportUnavailable)?;
+            item.map(|_| self.read_path(&path, MAX_IMMUTABLE_OBJECT_BYTES))
+                .transpose()
         }
 
         fn reap_unreachable(
@@ -2108,6 +2391,17 @@ mod onedrive_transport {
             .ok_or(SessionV2Error::TransportUnavailable)
     }
 
+    fn graph_folder_id(item: &serde_json::Value) -> Result<String, SessionV2Error> {
+        if !item.get("folder").is_some_and(serde_json::Value::is_object) {
+            return Err(SessionV2Error::TransportUnavailable);
+        }
+        item.get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 512)
+            .map(str::to_owned)
+            .ok_or(SessionV2Error::TransportUnavailable)
+    }
+
     fn parse_graph_timestamp_ms(value: &str) -> Option<u64> {
         let parsed =
             time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
@@ -2141,6 +2435,71 @@ mod onedrive_transport {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        fn spawn_folder_creation_server(
+        ) -> (String, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let captured = Arc::clone(&requests);
+            let handle = std::thread::spawn(move || {
+                for index in 0..10 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let header_end = loop {
+                        let read = stream.read(&mut chunk).unwrap();
+                        assert!(read > 0);
+                        request.extend_from_slice(&chunk[..read]);
+                        if let Some(end) =
+                            request.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            break end + 4;
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':').and_then(|(name, value)| {
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                        })
+                        .unwrap_or(0);
+                    while request.len() < header_end + content_length {
+                        let read = stream.read(&mut chunk).unwrap();
+                        assert!(read > 0);
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    let request_line = headers.lines().next().unwrap().to_owned();
+                    captured.lock().unwrap().push(request_line.clone());
+                    let (status, body) = if request_line.starts_with("GET ") {
+                        ("200 OK", r#"{"id":"v2-root","folder":{}}"#.to_owned())
+                    } else if request_line.starts_with("POST ") {
+                        (
+                            "201 Created",
+                            format!(r#"{{"id":"folder-{index}","folder":{{}}}}"#),
+                        )
+                    } else {
+                        (
+                            "201 Created",
+                            r#"{"id":"manifest","eTag":"etag-1"}"#.to_owned(),
+                        )
+                    };
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                }
+            });
+            (base, requests, handle)
+        }
 
         #[test]
         fn onedrive_v2_transport_rejects_untrusted_path_components() {
@@ -2150,6 +2509,34 @@ mod onedrive_transport {
                 "http://127.0.0.1:1"
             )
             .is_err());
+        }
+
+        #[test]
+        fn onedrive_v2_transport_creates_session_and_staging_folders_before_manifest() {
+            let (base, requests, server) = spawn_folder_creation_server();
+            let transport =
+                OneDriveSessionV2Transport::with_base_url("token", "session-test", &base).unwrap();
+            let manifest = transport.create_session().unwrap();
+            server.join().unwrap();
+
+            assert_eq!(manifest.manifest.session_id, "session-test");
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 10);
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.starts_with("GET "))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.starts_with("POST "))
+                    .count(),
+                8
+            );
+            assert!(requests.last().unwrap().starts_with("PUT "));
         }
     }
 }
@@ -2725,6 +3112,17 @@ fn index_entry(object_id: &str, bytes: &[u8]) -> ImmutableIndexEntryV1 {
 
 fn page_delta_bytes(page: &Option<IndexPageRef>) -> u64 {
     page.as_ref().map_or(0, |page| page.encrypted_bytes)
+}
+
+fn staged_index_delta(
+    page: &StagedIndexPage,
+    new_object_bytes: u64,
+) -> Result<i64, SessionV2Error> {
+    let added = page_delta_bytes(&page.head)
+        .checked_add(new_object_bytes)
+        .ok_or(SessionV2Error::SessionLimit)?;
+    i64::try_from(i128::from(added) - i128::from(page.replaced_page_bytes))
+        .map_err(|_| SessionV2Error::SessionLimit)
 }
 
 fn request_entries_bytes(entries: &[ImmutableIndexEntryV1]) -> Result<u64, SessionV2Error> {
@@ -3623,6 +4021,258 @@ mod tests {
         assert_eq!(
             updated.manifest.visible_encrypted_bytes,
             page_bytes + record_bytes
+        );
+    }
+
+    #[test]
+    fn index_head_coalesces_entries_and_replaces_page_bytes() {
+        const RID_TWO: &str = "00000000-0000-4000-8000-000000000002";
+        const ULID_C: &str = "0000000000000000000000000C";
+
+        let transport = InMemorySessionV2Transport::default();
+        let current = transport.create_session("s").unwrap();
+        let store = SessionV2Store::new(transport.clone(), &[5; 32], object_crypto());
+        let first = store
+            .publish(
+                &current,
+                SessionCommitV1 {
+                    visible_records: vec![record(ULID_A, ULID_A, RID, "first")],
+                    request_objects: vec![],
+                    uuid_bindings: vec![],
+                },
+            )
+            .unwrap();
+        transport.reset_immutable_load_counts();
+        let second = store
+            .publish(
+                &first,
+                SessionCommitV1 {
+                    visible_records: vec![record(ULID_C, ULID_C, RID_TWO, "second")],
+                    request_objects: vec![],
+                    uuid_bindings: vec![],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            transport.immutable_load_count(SessionObjectClass::VisibleIndex),
+            1
+        );
+
+        let head = second.manifest.visible_index_head.as_ref().unwrap();
+        let sealed_page = transport
+            .load_immutable(SessionObjectClass::VisibleIndex, &head.page_id)
+            .unwrap();
+        let page_bytes = object_crypto()
+            .open(
+                "s",
+                SessionObjectClass::VisibleIndex,
+                &head.page_id,
+                &sealed_page,
+            )
+            .unwrap();
+        let page: ImmutableIndexPageV1 = serde_json::from_slice(&page_bytes).unwrap();
+        assert!(page.previous.is_none());
+        assert_eq!(page.entries.len(), 2);
+
+        let record_bytes = [ULID_A, ULID_C]
+            .into_iter()
+            .map(|record_id| {
+                transport
+                    .load_immutable(SessionObjectClass::VisibleRecord, record_id)
+                    .unwrap()
+                    .len() as u64
+            })
+            .sum::<u64>();
+        assert_eq!(second.manifest.visible_record_count, 2);
+        assert_eq!(
+            second.manifest.visible_encrypted_bytes,
+            head.encrypted_bytes + record_bytes
+        );
+    }
+
+    #[test]
+    fn recent_visible_records_reads_only_newest_bounded_index_pages() {
+        let transport = InMemorySessionV2Transport::default();
+        let mut current = transport.create_session("s").unwrap();
+        let store = SessionV2Store::new(transport.clone(), &[5; 32], object_crypto());
+        let mut newest_id = String::new();
+        for index in 0..=MAX_INDEX_PAGE_ENTRIES {
+            let record_id = crate::session::new_ulid().unwrap();
+            newest_id.clone_from(&record_id);
+            current = store
+                .publish(
+                    &current,
+                    SessionCommitV1 {
+                        visible_records: vec![record(
+                            &record_id,
+                            &record_id,
+                            RID,
+                            &format!("record-{index}"),
+                        )],
+                        request_objects: vec![],
+                        uuid_bindings: vec![],
+                    },
+                )
+                .unwrap();
+        }
+        assert!(current
+            .manifest
+            .visible_index_head
+            .as_ref()
+            .is_some_and(|head| head.encrypted_bytes > 0));
+
+        transport.reset_immutable_load_counts();
+        let recent = store.recent_visible_records("s", 1).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].record_id, newest_id);
+        assert_eq!(
+            transport.immutable_load_count(SessionObjectClass::VisibleIndex),
+            1
+        );
+        assert_eq!(
+            transport.immutable_load_count(SessionObjectClass::VisibleRecord),
+            1
+        );
+    }
+
+    #[test]
+    fn recent_visible_records_caps_legacy_one_entry_page_reads() {
+        let transport = InMemorySessionV2Transport::default();
+        let current = transport.create_session("s").unwrap();
+        let crypto = object_crypto();
+        let store = SessionV2Store::new(transport.clone(), &[5; 32], crypto.clone());
+        let mut previous = None;
+        let mut record_ids = Vec::new();
+        let mut encrypted_bytes = 0u64;
+        for index in 0..10 {
+            let record_id = crate::session::new_ulid().unwrap();
+            let record_bytes = serde_json::to_vec(&record(
+                &record_id,
+                &record_id,
+                RID,
+                &format!("legacy-{index}"),
+            ))
+            .unwrap();
+            let sealed_record = crypto
+                .seal(
+                    "s",
+                    SessionObjectClass::VisibleRecord,
+                    &record_id,
+                    &record_bytes,
+                )
+                .unwrap();
+            transport
+                .stage_immutable(
+                    SessionObjectClass::VisibleRecord,
+                    &record_id,
+                    &sealed_record,
+                )
+                .unwrap();
+            encrypted_bytes += sealed_record.len() as u64;
+            let page_id = crate::session::new_ulid().unwrap();
+            let page = ImmutableIndexPageV1 {
+                index_version: 1,
+                page_id: page_id.clone(),
+                previous,
+                entries: vec![ImmutableIndexEntryV1 {
+                    object_id: record_id.clone(),
+                    object_sha256: bytes_digest(&sealed_record),
+                    encrypted_bytes: sealed_record.len() as u64,
+                }],
+            };
+            let page_bytes = serde_json::to_vec(&page).unwrap();
+            let sealed_page = crypto
+                .seal("s", SessionObjectClass::VisibleIndex, &page_id, &page_bytes)
+                .unwrap();
+            transport
+                .stage_immutable(SessionObjectClass::VisibleIndex, &page_id, &sealed_page)
+                .unwrap();
+            encrypted_bytes += sealed_page.len() as u64;
+            previous = Some(IndexPageRef {
+                page_id,
+                sha256: bytes_digest(&sealed_page),
+                encrypted_bytes: sealed_page.len() as u64,
+            });
+            record_ids.push(record_id);
+        }
+        let mut manifest = current.manifest.clone();
+        manifest.generation += 1;
+        manifest.visible_index_head = previous;
+        manifest.visible_record_head = record_ids.last().cloned();
+        manifest.visible_record_count = record_ids.len() as u64;
+        manifest.visible_encrypted_bytes = encrypted_bytes;
+        transport
+            .compare_and_swap_manifest(&current.etag, &manifest)
+            .unwrap()
+            .unwrap();
+
+        transport.reset_immutable_load_counts();
+        let recent = store.recent_visible_records("s", 128).unwrap();
+        assert_eq!(recent.len(), MAX_RECENT_INDEX_PAGE_READS);
+        assert_eq!(
+            recent
+                .iter()
+                .map(|record| record.record_id.as_str())
+                .collect::<Vec<_>>(),
+            record_ids[record_ids.len() - MAX_RECENT_INDEX_PAGE_READS..]
+        );
+        assert_eq!(
+            transport.immutable_load_count(SessionObjectClass::VisibleIndex),
+            MAX_RECENT_INDEX_PAGE_READS
+        );
+        assert_eq!(
+            transport.immutable_load_count(SessionObjectClass::VisibleRecord),
+            MAX_RECENT_INDEX_PAGE_READS
+        );
+    }
+
+    #[test]
+    fn new_request_replay_checks_direct_binding_without_scanning_index_history() {
+        let transport = InMemorySessionV2Transport::default();
+        let current = transport.create_session("s").unwrap();
+        let store = SessionV2Store::new(transport.clone(), &[6; 32], object_crypto());
+        let existing = RequestUuidBindingV1::new(
+            RequestRouteDomain::AgentTurn,
+            "s",
+            RID,
+            payload_digest(&"existing").unwrap(),
+        )
+        .unwrap();
+        store
+            .publish(
+                &current,
+                SessionCommitV1 {
+                    visible_records: vec![],
+                    request_objects: vec![],
+                    uuid_bindings: vec![existing],
+                },
+            )
+            .unwrap();
+        let fresh = RequestUuidBindingV1::new(
+            RequestRouteDomain::AgentTurn,
+            "s",
+            "00000000-0000-4000-8000-000000000002",
+            payload_digest(&"fresh").unwrap(),
+        )
+        .unwrap();
+
+        transport.reset_immutable_load_counts();
+        assert!(store.request_replay("s", &fresh).unwrap().is_none());
+        assert_eq!(
+            transport.immutable_load_count(SessionObjectClass::UuidBinding),
+            1
+        );
+        assert_eq!(
+            transport.immutable_load_count(SessionObjectClass::UuidBindingIndex),
+            0
+        );
+        assert_eq!(
+            transport.immutable_load_count(SessionObjectClass::RequestIndex),
+            0
+        );
+        assert_eq!(
+            transport.immutable_load_count(SessionObjectClass::VisibleIndex),
+            0
         );
     }
 
