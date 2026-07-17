@@ -1137,6 +1137,7 @@ impl AgentControlStore {
         payload: &PairingPayload,
         now_ms: u64,
     ) -> Result<PairingSourceRecord, String> {
+        self.reap_expired(now_ms, 256)?;
         if request_id.is_empty()
             || request_id.len() > 64
             || session_id.is_empty()
@@ -1746,6 +1747,7 @@ impl AgentControlStore {
         binding: UserPresenceBinding,
         now_ms: u64,
     ) -> Result<UserPresenceChallenge, String> {
+        self.reap_expired(now_ms, 256)?;
         if request_id.is_empty() || request_id.len() > 64 {
             return Err("presence_invalid_request".into());
         }
@@ -2050,6 +2052,8 @@ fn derive_control_subkeys(control_root: &[u8; 32]) -> Result<([u8; 32], [u8; 32]
 
 impl PendingPersistence for AgentControlStore {
     fn insert(&self, pending: PersistedPendingAction) -> Result<(), ConfirmError> {
+        self.reap_expired(crate::unix_now_ms(), 256)
+            .map_err(|_| ConfirmError::Unavailable)?;
         if pending.id.is_empty()
             || pending.action_hash.len() != 64
             || pending.owner.account.is_empty()
@@ -2925,6 +2929,45 @@ mod tests {
         assert_eq!(state, "expired");
         assert!(payload.is_none());
         assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn control_store_create_paths_reap_expired_sensitive_rows() {
+        let root = temp_root("create-path-reaper");
+        let credential_store = credential_store(&root);
+        let persistence = Arc::new(
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap(),
+        );
+        let registry = PendingRegistry::with_persistence(persistence.clone());
+        let (pending, _) = registry
+            .register_bound(backup_action(), "backup", 1_000, 10, owner())
+            .unwrap();
+
+        persistence
+            .start_user_presence(
+                "019f0000-0000-4000-8000-000000000001",
+                UserPresenceBinding::Archive {
+                    session_id: "session-v2".into(),
+                },
+                1_011,
+            )
+            .unwrap();
+
+        let connection = persistence.connection.lock().unwrap();
+        let (state, payload, bytes): (String, Option<Vec<u8>>, i64) = connection
+            .query_row(
+                "SELECT state,sealed_payload,logical_bytes FROM confirmation_intents WHERE intent_id=?1",
+                params![pending.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "expired");
+        assert!(payload.is_none());
+        assert_eq!(bytes, 0);
+        drop(connection);
+        drop(registry);
+        drop(persistence);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

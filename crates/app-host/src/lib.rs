@@ -1053,6 +1053,7 @@ struct LifecycleMaintenanceRuntime {
 struct LifecycleMaintenanceContext {
     cfg: Config,
     oauth_dir: PathBuf,
+    control_store: Option<Arc<agent_control_store::AgentControlStore>>,
     provider_leases: Arc<account_lifecycle::ProviderLeaseRegistry>,
     product_runtime_gate: Arc<Mutex<()>>,
     last_usage: Arc<Mutex<BTreeMap<ProductProviderId, isyncyou_agent::Usage>>>,
@@ -1106,6 +1107,9 @@ fn run_account_maintenance_once(
     recover_interrupted_exchange: bool,
 ) {
     let _ = context.oauth.reap_expired();
+    if let Some(store) = &context.control_store {
+        let _ = store.reap_expired(unix_now_ms(), 256);
+    }
     if let Ok(mut attempts) = context.oauth_attempts.lock() {
         let expired = reap_oauth_attempts(&mut attempts, &context.oauth_dir);
         if let Ok(mut bindings) = context.oauth_lifecycle_bindings.lock() {
@@ -1870,6 +1874,7 @@ impl DaemonAgent {
         LifecycleMaintenanceContext {
             cfg: self.cfg.clone(),
             oauth_dir: self.oauth_dir.clone(),
+            control_store: self.control_store.clone(),
             provider_leases: Arc::clone(&self.provider_leases),
             product_runtime_gate: Arc::clone(&self.product_runtime_gate),
             last_usage: Arc::clone(&self.last_usage),
@@ -20506,6 +20511,16 @@ mod tests {
                 3_000,
             )
             .unwrap();
+        let control_store = agent.control_store.as_ref().unwrap();
+        let expired_presence = control_store
+            .start_user_presence(
+                "019f0000-0000-4000-8000-000000000118",
+                agent_control_store::UserPresenceBinding::Archive {
+                    session_id: "session-v2".into(),
+                },
+                1,
+            )
+            .unwrap();
         let runtime = LifecycleMaintenanceRuntime::spawn_with_interval(
             agent.lifecycle_maintenance_context(),
             std::time::Duration::from_millis(5),
@@ -20523,6 +20538,16 @@ mod tests {
             load_agent_credential_blob(&root, SUBSCRIPTION_CREDENTIAL_ID)
                 .unwrap()
                 .is_none()
+        );
+        assert_eq!(
+            control_store.confirm_user_presence(
+                &expired_presence.operation_id,
+                &expired_presence.intent_id,
+                &expired_presence.token,
+                &expired_presence.action_hash,
+                unix_now_ms(),
+            ),
+            Err("presence_not_found".into())
         );
         drop(runtime);
         drop(agent);
