@@ -1559,6 +1559,8 @@ a.note-meta-chip:hover { color: var(--accent); }
   text-align: left;
 }
 .assistant-toolbar {
+  position: relative;
+  z-index: 2;
   display: flex;
   align-items: center;
   flex-wrap: wrap;

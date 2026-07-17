@@ -13418,6 +13418,18 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 "app.js missing #622 model/usage invariant: {needle}"
             );
         }
+
+        let toolbar_css = APP_CSS
+            .split(".assistant-toolbar {")
+            .nth(1)
+            .expect("assistant toolbar CSS")
+            .split('}')
+            .next()
+            .expect("assistant toolbar CSS block");
+        assert!(
+            toolbar_css.contains("position: relative;") && toolbar_css.contains("z-index: 2;"),
+            "model picker toolbar must stack above the transcript"
+        );
         let usage_renderer = APP_JS
             .split("function renderAssistantUsageChip(st)")
             .nth(1)
