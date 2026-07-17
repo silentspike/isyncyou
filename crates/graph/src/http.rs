@@ -263,6 +263,31 @@ impl GraphClient {
         }
     }
 
+    /// Build a Graph client with caller-owned request and connect deadlines.
+    ///
+    /// Interactive product flows use a substantially shorter budget than bulk
+    /// sync jobs. Keeping that distinction in the client construction prevents
+    /// one stalled Graph request from inheriting the sync worker's 60-second
+    /// deadline while preserving the same authentication and response handling.
+    pub fn with_timeouts(
+        access_token: impl Into<String>,
+        request_timeout: Duration,
+        connect_timeout: Duration,
+    ) -> Result<Self, UploadError> {
+        if request_timeout.is_zero()
+            || connect_timeout.is_zero()
+            || connect_timeout > request_timeout
+        {
+            return Err(UploadError::Parse("invalid Graph timeout policy".into()));
+        }
+        let client = reqwest::blocking::Client::builder()
+            .timeout(request_timeout)
+            .connect_timeout(connect_timeout)
+            .build()
+            .map_err(UploadError::from_reqwest)?;
+        Ok(Self::with_client(client, access_token))
+    }
+
     /// Build with a custom reqwest client (timeouts, proxy, …).
     pub fn with_client(client: reqwest::blocking::Client, access_token: impl Into<String>) -> Self {
         GraphClient {
@@ -2269,6 +2294,20 @@ fn enc_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_client_rejects_invalid_caller_timeout_policy() {
+        assert!(matches!(
+            GraphClient::with_timeouts("token", Duration::ZERO, Duration::from_secs(1)),
+            Err(UploadError::Parse(_))
+        ));
+        assert!(matches!(
+            GraphClient::with_timeouts("token", Duration::from_secs(1), Duration::from_secs(2)),
+            Err(UploadError::Parse(_))
+        ));
+        GraphClient::with_timeouts("token", Duration::from_secs(2), Duration::from_secs(1))
+            .expect("valid caller deadlines");
+    }
 
     #[test]
     fn graph_transient_failure_is_structured_without_message_matching() {

@@ -2018,6 +2018,10 @@ mod onedrive_transport {
     const V2_ROOT: &str = "Apps/iSyncYou/agent/v2";
     const MAX_MANIFEST_BYTES: usize = 64 * 1024;
     const MAX_IMMUTABLE_OBJECT_BYTES: usize = 5 * 1024 * 1024;
+    const INTERACTIVE_GRAPH_REQUEST_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(8);
+    const INTERACTIVE_GRAPH_CONNECT_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(4);
 
     #[derive(Clone)]
     pub struct OneDriveSessionV2Transport {
@@ -2030,7 +2034,13 @@ mod onedrive_transport {
             token: impl Into<String>,
             session_id: impl Into<String>,
         ) -> Result<Self, SessionV2Error> {
-            Self::from_client(GraphClient::new(token), session_id.into())
+            let client = GraphClient::with_timeouts(
+                token,
+                INTERACTIVE_GRAPH_REQUEST_TIMEOUT,
+                INTERACTIVE_GRAPH_CONNECT_TIMEOUT,
+            )
+            .map_err(|_| SessionV2Error::TransportUnavailable)?;
+            Self::from_client(client, session_id.into())
         }
 
         #[cfg(test)]
