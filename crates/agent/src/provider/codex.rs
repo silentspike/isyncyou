@@ -100,6 +100,17 @@ pub(crate) fn build_input(history: &[Message]) -> Vec<Value> {
     build_input_with_reasoning(history, &[], 0)
 }
 
+pub(super) fn tool_choice_for_input(input: &[Value]) -> &'static str {
+    if input
+        .iter()
+        .any(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+    {
+        "auto"
+    } else {
+        "required"
+    }
+}
+
 #[derive(Clone)]
 struct CodexReasoningContext {
     summary: Value,
@@ -200,13 +211,15 @@ pub(crate) fn build_request(
     instructions: &str,
     history: &[Message],
 ) -> Value {
+    let input = build_input(history);
+    let tool_choice = tool_choice_for_input(&input);
     json!({
         "model": model,
         "reasoning": { "effort": reasoning_effort.as_str() },
         "instructions": instructions,
-        "input": build_input(history),
+        "input": input,
         "tools": responses_tools(),
-        "tool_choice": "auto",
+        "tool_choice": tool_choice,
         "parallel_tool_calls": false,
         "stream": true,
         "store": false,
@@ -635,13 +648,35 @@ mod tests {
         assert_eq!(body["instructions"], "be terse");
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
-        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["tool_choice"], "required");
         assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "isyncyou");
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+    }
+
+    #[test]
+    fn build_request_allows_final_text_only_after_a_tool_result() {
+        let history = vec![
+            Message::user("find one archived item"),
+            Message::assistant(
+                "",
+                vec![crate::turn::ToolUseRef {
+                    id: "call_1".into(),
+                    input: json!({"op":"search","account":"me","query":"archive"}),
+                }],
+            ),
+            Message::tool("call_1", "no matching items"),
+        ];
+        let body = build_request(
+            "gpt-5.6-sol",
+            CodexReasoningEffort::Medium,
+            "read before answering",
+            &history,
+        );
+        assert_eq!(body["tool_choice"], "auto");
     }
 
     #[cfg(feature = "http")]

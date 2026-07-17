@@ -683,14 +683,18 @@ fn attest_product_harness(
                 .and_then(|value| value.as_object())
                 .filter(|value| value.len() == 1)
                 .ok_or_else(|| harness_violation("codex reasoning shape is invalid"))?;
+            let input = obj
+                .get("input")
+                .and_then(|value| value.as_array())
+                .ok_or_else(|| harness_violation("codex input shape is invalid"))?;
+            let expected_tool_choice = codex::tool_choice_for_input(input);
             if obj.get("model").and_then(|v| v.as_str()) != Some(*model)
                 || obj.get("instructions").and_then(|v| v.as_str()) != Some(*instructions)
                 || reasoning.get("effort").and_then(|v| v.as_str())
                     != Some(reasoning_effort.as_str())
                 || obj.get("include") != Some(&serde_json::json!(["reasoning.encrypted_content"]))
-                || !obj.get("input").is_some_and(|v| v.is_array())
                 || obj.get("parallel_tool_calls") != Some(&serde_json::Value::Bool(false))
-                || obj.get("tool_choice").and_then(|v| v.as_str()) != Some("auto")
+                || obj.get("tool_choice").and_then(|v| v.as_str()) != Some(expected_tool_choice)
             {
                 return Err(harness_violation(
                     "codex protocol fields differ from the request binding",
@@ -1408,6 +1412,13 @@ mod tests {
         let (_, h, mut b) = base();
         b["tools"][0]["parameters"]["additionalProperties"] = json!(true);
         assert!(attest(h, b).is_err(), "changed tool schema must fail");
+
+        let (_, h, mut b) = base();
+        b["tool_choice"] = json!("auto");
+        assert!(
+            attest(h, b).is_err(),
+            "initial turn must not bypass the required archive read"
+        );
 
         let (_, h, mut b) = base();
         b["instructions"] = json!("different instructions");
