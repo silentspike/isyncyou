@@ -176,6 +176,20 @@ impl TurnObserver for NoopTurnObserver {}
 
 const MAX_STEPS: usize = 16;
 
+fn recoverable_read_error_result(error: &crate::AgentError) -> Option<String> {
+    match error {
+        crate::AgentError::Provider(code) if code == "archive_body_unavailable" => Some(
+            serde_json::json!({
+                "status": "unavailable",
+                "code": "archive_body_unavailable",
+                "retryable": false,
+            })
+            .to_string(),
+        ),
+        _ => None,
+    }
+}
+
 /// Drive one user turn. `history` must already contain the user's message; the loop
 /// appends assistant/tool messages as it runs and streams events via `emit`.
 pub fn run_turn(
@@ -288,10 +302,17 @@ pub fn run_turn_cancellable(
                     // Streamed read: a progressive search emits its stage/partial-result
                     // events via `emit` before returning the final JSON (S-AG.18/#643);
                     // all other reads delegate to the plain path (default impl).
-                    let result = if let Some(binding) = binding {
-                        executor.execute_read_prepared(&action, &binding, local_effect.as_ref())?
+                    let read_result = if let Some(binding) = binding {
+                        executor.execute_read_prepared(&action, &binding, local_effect.as_ref())
                     } else {
-                        executor.execute_read_streamed(&action, emit)?
+                        executor.execute_read_streamed(&action, emit)
+                    };
+                    let (result, untrusted) = match read_result {
+                        Ok(result) => (result, true),
+                        Err(error) => match recoverable_read_error_result(&error) {
+                            Some(result) => (result, false),
+                            None => return Err(error),
+                        },
                     };
                     check_cancelled()?;
                     observer.read_tool_completed(step_seq, &tu.id, &action, &result)?;
@@ -300,7 +321,7 @@ pub fn run_turn_cancellable(
                     emit(StreamEvent::ToolResult {
                         id: tu.id.clone(),
                         content: result.clone(),
-                        untrusted: true,
+                        untrusted,
                     });
                     history.push(Message::tool(tu.id, result));
                 }
@@ -368,6 +389,26 @@ mod tests {
         fn execute_read(&self, _action: &ToolAction) -> Result<String, crate::AgentError> {
             self.reads.set(self.reads.get() + 1);
             Ok(self.reply.clone())
+        }
+    }
+
+    struct MissingArchiveBodyExecutor;
+
+    impl ToolExecutor for MissingArchiveBodyExecutor {
+        fn execute_read(&self, _action: &ToolAction) -> Result<String, crate::AgentError> {
+            Err(crate::AgentError::Provider(
+                "archive_body_unavailable".into(),
+            ))
+        }
+    }
+
+    struct UnavailableArchiveStoreExecutor;
+
+    impl ToolExecutor for UnavailableArchiveStoreExecutor {
+        fn execute_read(&self, _action: &ToolAction) -> Result<String, crate::AgentError> {
+            Err(crate::AgentError::Provider(
+                "archive_store_unavailable".into(),
+            ))
         }
     }
 
@@ -467,6 +508,72 @@ mod tests {
             .expect("a tool-result turn");
         assert_eq!(tool.tool_use_id.as_deref(), Some("t1"));
         assert!(tool.content.contains("item-42"));
+    }
+
+    #[test]
+    fn missing_archive_body_returns_stable_tool_result_and_turn_can_continue() {
+        let mut provider = FakeProvider::new(vec![
+            vec![tool_use(
+                "t1",
+                json!({"op": "read", "account": "me", "service": "mail", "id": "missing"}),
+            )],
+            vec![AssistantBlock::Text(
+                "The archived body is unavailable.".into(),
+            )],
+        ]);
+        let mut history = vec![Message::user("read the item")];
+        let mut events = Vec::new();
+
+        let outcome = run_turn(
+            &mut provider,
+            &MissingArchiveBodyExecutor,
+            &mut history,
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, TurnOutcome::Final { .. }));
+        let tool_result = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::ToolResult {
+                    content, untrusted, ..
+                } => Some((content, untrusted)),
+                _ => None,
+            })
+            .expect("stable tool result");
+        assert!(!tool_result.1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(tool_result.0).unwrap(),
+            json!({
+                "status": "unavailable",
+                "code": "archive_body_unavailable",
+                "retryable": false,
+            })
+        );
+        assert!(!tool_result.0.contains("missing"));
+    }
+
+    #[test]
+    fn unavailable_archive_store_remains_fail_closed() {
+        let mut provider = FakeProvider::new(vec![vec![tool_use(
+            "t1",
+            json!({"op": "search", "account": "me", "query": "fixture"}),
+        )]]);
+        let mut history = vec![Message::user("find the fixture")];
+
+        let error = run_turn(
+            &mut provider,
+            &UnavailableArchiveStoreExecutor,
+            &mut history,
+            &mut |_| {},
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::AgentError::Provider(code) if code == "archive_store_unavailable"
+        ));
     }
 
     #[test]
