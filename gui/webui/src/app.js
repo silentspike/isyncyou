@@ -5295,6 +5295,7 @@ const AssistantState = {
   model: null,
   draft: "",
   busy: false,
+  turnCancelPending: false,
   activeMessage: null,
   connectivityIssue: null,
   pendingConnectProvider: null,
@@ -5317,10 +5318,12 @@ function closeAssistantStream(_reason) {
   AssistantState.activeTurnId = null;
   AssistantState.activeMessage = null;
   AssistantState.busy = false;
+  AssistantState.turnCancelPending = false;
   if (stream) {
     try { stream.close(); } catch (_) {}
   }
   if (turn) void finishTurnGuard(turn);
+  syncAssistantComposerControls();
 }
 
 function rememberAssistantStatus(st) {
@@ -5667,13 +5670,44 @@ function renderAssistantComposer(_st) {
   input.value = AssistantState.draft || "";
   const send = el("button", { class: "btn primary", title: disabledReason || "Send", onclick: agentSendFromInput, "data-testid": "agent-send" },
     icon("send", "icon-sm"));
+  const stop = el("button", {
+    class: "btn danger icon-only",
+    type: "button",
+    title: "Stop response",
+    "aria-label": "Stop response",
+    onclick: () => cancelAgentTurn(AssistantState.activeTurnId),
+    "data-testid": "agent-stop",
+  }, icon("square", "icon-sm"));
+  stop.hidden = !(AssistantState.busy && AssistantState.activeTurnId);
+  stop.disabled = AssistantState.turnCancelPending;
   if (disabledReason) {
     input.setAttribute("disabled", "disabled");
     send.setAttribute("disabled", "disabled");
   }
   return el("div", { class: "assistant-composer", "data-agent-composer": "1", "data-testid": "agent-composer" },
-    el("div", { class: "asst-inputrow" }, input, send),
+    el("div", { class: "asst-inputrow" }, input, send, stop),
     disabledReason ? el("div", { class: "dim assistant-composer-note", text: disabledReason }) : null);
+}
+
+function syncAssistantComposerControls() {
+  const input = $("#asst-input");
+  const send = $('[data-testid="agent-send"]');
+  const stop = $('[data-testid="agent-stop"]');
+  const active = AssistantState.busy && !!AssistantState.activeTurnId;
+  if (input) {
+    input.disabled = AssistantState.busy;
+    input.placeholder = AssistantState.busy ? "Wait for the active turn" : "Ask about your mail, files, calendar…";
+  }
+  if (send) {
+    send.disabled = AssistantState.busy;
+    send.hidden = active;
+  }
+  if (stop) {
+    stop.hidden = !active;
+    stop.disabled = AssistantState.turnCancelPending;
+    stop.title = AssistantState.turnCancelPending ? "Stopping response" : "Stop response";
+    stop.setAttribute("aria-label", stop.title);
+  }
 }
 
 function formatAssistantRateLimit(rateLimit) {
@@ -6123,11 +6157,19 @@ async function cancelAgentPending(pendingId) {
 }
 
 async function cancelAgentTurn(turnId) {
-  if (!turnId) return;
-  await postJson("/api/v1/agent/turn/cancel", CAP.agent, {
-    request_id: crypto.randomUUID(),
-    turn_id: turnId,
-  });
+  if (!turnId || AssistantState.turnCancelPending) return;
+  AssistantState.turnCancelPending = true;
+  syncAssistantComposerControls();
+  try {
+    await postJson("/api/v1/agent/turn/cancel", CAP.agent, {
+      request_id: crypto.randomUUID(),
+      turn_id: turnId,
+    });
+  } catch (error) {
+    AssistantState.turnCancelPending = false;
+    syncAssistantComposerControls();
+    toast(agentSafeErrorCopy(error && error.message), "err");
+  }
 }
 
 function renderAgentPendingCard(pending, trackNode = true) {
@@ -6627,8 +6669,10 @@ async function agentSend(text) {
   const asst = { role: "assistant", text: "", chips: [], stages: [], results: [], tools: [], errors: [], citations: [], pending: null, doneReason: null };
   AssistantState.transcript.push(asst);
   AssistantState.busy = true;
+  AssistantState.turnCancelPending = false;
   AssistantState.draft = "";
   AssistantState.activeMessage = asst;
+  syncAssistantComposerControls();
   const asstEl = renderAssistantMessage(asst);
   log.append(asstEl);
   const textEl = asstEl.querySelector(".asst-text");
@@ -6753,7 +6797,9 @@ async function agentSend(text) {
       await endNetworkGuard(startingGuardId);
     }
     AssistantState.busy = false;
+    AssistantState.turnCancelPending = false;
     AssistantState.activeMessage = null;
+    syncAssistantComposerControls();
     if (e && e.connectivity) {
       rememberConnectivityIssue(e, () => agentSend(text));
       setText(CONNECTIVITY_COPY[AssistantState.connectivityIssue.code]);
@@ -6769,11 +6815,14 @@ async function agentSend(text) {
   if (!turn) {
     await endNetworkGuard(startingGuardId);
     AssistantState.busy = false;
+    AssistantState.turnCancelPending = false;
     AssistantState.activeMessage = null;
+    syncAssistantComposerControls();
     setText("Error: could not start the turn");
     return;
   }
   AssistantState.activeTurnId = turn;
+  syncAssistantComposerControls();
   if (BRIDGE && startingGuardId) {
     // Own the starting lease immediately. Even an ambiguous native bind response must be released
     // on terminal/error/route teardown rather than lingering until its deadline.

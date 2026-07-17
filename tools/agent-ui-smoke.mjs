@@ -158,6 +158,7 @@ function makeFixtureServer(evidence) {
   let failNextSessionCreate = false;
   const sessions = new Map();
   const turns = new Map();
+  const activeTurnStreams = new Map();
   const requestScenarios = new Map();
   const state = {
     accountLoginStarts: [],
@@ -167,6 +168,7 @@ function makeFixtureServer(evidence) {
     modelPosts: [],
     confirmPosts: [],
     cancelPosts: [],
+    turnCancelPosts: [],
     viewHits: [],
     streamScenarios: [],
     requestStatusReads: [],
@@ -382,7 +384,8 @@ function makeFixtureServer(evidence) {
         const prompt = body.prompt || "";
         const turn = `turn-${++turnSeq}`;
         const lower = prompt.toLowerCase();
-        const scenario = lower.includes("error") ? "error"
+        const scenario = lower.includes("slow cancellation") ? "slow-cancel"
+          : lower.includes("error") ? "error"
           : lower.includes("cancel") ? "pending-cancel"
             : lower.includes("delete") || lower.includes("confirm") ? "pending-confirm"
               : "normal";
@@ -393,7 +396,29 @@ function makeFixtureServer(evidence) {
         const turn = url.searchParams.get("turn") || "";
         const scenario = turns.get(turn) || "normal";
         state.streamScenarios.push({ turn, scenario });
-        await sendStream(res, scenario, turn);
+        if (scenario === "slow-cancel") {
+          res.writeHead(200, {
+            "content-type": "text/event-stream; charset=utf-8",
+            "cache-control": "no-cache, no-transform",
+            connection: "keep-alive",
+          });
+          res.write(": ready\n\n");
+          activeTurnStreams.set(turn, res);
+          req.on("close", () => activeTurnStreams.delete(turn));
+        } else {
+          await sendStream(res, scenario, turn);
+        }
+      } else if (req.method === "POST" && url.pathname === "/api/v1/agent/turn/cancel") {
+        if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
+        const body = await readJson(req);
+        state.turnCancelPosts.push(body);
+        json(res, 200, { ok: true });
+        const stream = activeTurnStreams.get(body.turn_id);
+        if (stream) {
+          sendSseMessage(stream, { event: "done", reason: "cancelled" });
+          stream.end();
+          activeTurnStreams.delete(body.turn_id);
+        }
       } else if (req.method === "POST" && url.pathname === "/api/v1/agent/confirm") {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
         state.confirmPosts.push(await readJson(req));
@@ -546,6 +571,7 @@ function evidenceForWrite(evidence, state) {
       reasoning_efforts: closedEfforts,
       confirm_post_count: state.confirmPosts.length,
       cancel_post_count: state.cancelPosts.length,
+      turn_cancel_post_count: state.turnCancelPosts.length,
       account_login_start_count: state.accountLoginStarts.length,
       account_login_cancel_count: state.accountLoginCancels.length,
       view_hit_count: state.viewHits.length,
@@ -908,6 +934,28 @@ async function main() {
     assert(evidence, "model picker posts model change", fixture.state.modelPosts.length === 1 && fixture.state.modelPosts[0].model === "claude-opus-4", fixture.state.modelPosts);
     assert(evidence, "usage chip shows unavailable state", (await page.locator('[data-testid="agent-usage"]').innerText()).includes("Usage unavailable"));
 
+    await page.locator('[data-testid="agent-input"]').fill("Run slow cancellation fixture");
+    await page.locator('[data-testid="agent-send"]').click();
+    const stopButton = page.locator('[data-testid="agent-stop"]');
+    await stopButton.waitFor({ state: "visible", timeout: 10000 });
+    const activeTurnControls = {
+      stop_enabled: await stopButton.isEnabled(),
+      input_disabled: await page.locator('[data-testid="agent-input"]').isDisabled(),
+      send_hidden: await page.locator('[data-testid="agent-send"]').isHidden(),
+    };
+    assert(evidence, "active turn exposes one stop command and locks the composer",
+      activeTurnControls.stop_enabled
+      && activeTurnControls.input_disabled
+      && activeTurnControls.send_hidden,
+      activeTurnControls);
+    await stopButton.click();
+    await page.waitForFunction(() => document.body.innerText.includes("Cancelled"), null, { timeout: 10000 });
+    assert(evidence, "turn stop posts once and restores the composer only after terminal cancellation",
+      fixture.state.turnCancelPosts.length === 1
+      && fixture.state.turnCancelPosts[0].turn_id?.startsWith("turn-")
+      && await stopButton.isHidden()
+      && await page.locator('[data-testid="agent-input"]').isEnabled());
+
     fixture.setAgent("codex", "gpt-5.6-sol", "medium");
     await page.goto(`${origin}/?codex-model-smoke=1#/assistant`, { waitUntil: "domcontentloaded" });
     await page.waitForSelector('[data-testid="agent-transcript"]', { timeout: 10000 });
@@ -1061,7 +1109,7 @@ async function main() {
     assert(evidence, "no page errors", evidence.page_errors.length === 0, evidence.page_errors);
     assert(evidence, "no non-fixture-origin WebView requests", evidence.non_fixture_origin_requests.length === 0, evidence.non_fixture_origin_requests);
     assert(evidence, "fixture routes complete", evidence.fixture404.length === 0 && evidence.fixtureErrors.length === 0, { fixture404: evidence.fixture404, fixtureErrors: evidence.fixtureErrors });
-    assert(evidence, "normal pending error streams exercised", ["normal", "pending-confirm", "pending-cancel", "error"].every((s) => fixture.state.streamScenarios.some((row) => row.scenario === s)), fixture.state.streamScenarios);
+    assert(evidence, "normal pending error and cancellation streams exercised", ["normal", "slow-cancel", "pending-confirm", "pending-cancel", "error"].every((s) => fixture.state.streamScenarios.some((row) => row.scenario === s)), fixture.state.streamScenarios);
 
     evidence.fixture_state = fixture.state;
     evidence.ok = true;

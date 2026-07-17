@@ -1718,6 +1718,7 @@ a.note-meta-chip:hover { color: var(--accent); }
   padding: var(--sp-2) 0 0;
   background: linear-gradient(180deg, transparent, var(--bg-0) 32%);
 }
+.assistant-composer [hidden] { display: none !important; }
 .asst-inputrow {
   display: flex;
   gap: var(--sp-2);
