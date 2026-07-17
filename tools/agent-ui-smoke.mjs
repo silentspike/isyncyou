@@ -131,7 +131,7 @@ async function sendStream(res, scenario, turn) {
       pending_id: `pending-${turn}`,
       token: `fixture-token-${turn}`,
       action_hash: `fixture-hash-${turn}`,
-      preview: "Delete archived fixture item",
+      preview: "Delete this archived item",
       risk: "destructive",
       expires_at_ms: Date.now() + 600000,
     });
@@ -397,7 +397,9 @@ function makeFixtureServer(evidence) {
       } else if (req.method === "POST" && url.pathname === "/api/v1/agent/confirm") {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
         state.confirmPosts.push(await readJson(req));
-        json(res, 200, { result: "Confirmed by fixture" });
+        json(res, 200, {
+          result: '{"status":"ok","op":"live-write","account":"me","service":"mail","verb":"set_read"}',
+        });
       } else if (req.method === "POST" && url.pathname === "/api/v1/agent/pending/cancel") {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
         state.cancelPosts.push(await readJson(req));
@@ -867,9 +869,18 @@ async function main() {
     assert(evidence, "first token appears incrementally", firstTokenText.includes("Here is ") && !firstTokenText.includes("a source-backed answer."));
     await page.waitForFunction(() => document.body.innerText.includes("a source-backed answer."), null, { timeout: 10000 });
     await page.waitForSelector('[data-agent-citation="view"]', { timeout: 10000 });
+    const toolCallText = await page.locator('[data-agent-tool-row="tool_call"]').first().innerText();
+    assert(evidence, "tool call UI uses product copy and hides internal operation fields",
+      toolCallText === "Searching your Microsoft 365 archive"
+      && !toolCallText.includes("archive.search")
+      && !toolCallText.includes("quarterly brief")
+      && !toolCallText.includes("limit")
+      && !toolCallText.includes("Tool call"));
+    const toolResultTitle = await page.locator('[data-agent-tool-row="tool_result"] .asst-tool-title').first().innerText();
     const toolResultDetail = await page.locator('[data-agent-tool-row="tool_result"] .asst-tool-detail').first().innerText();
     assert(evidence, "tool result UI exposes only source count and never raw result content",
-      toolResultDetail === "1 source"
+      toolResultTitle === "Sources checked"
+      && toolResultDetail === "1 source"
       && !toolResultDetail.includes("items")
       && !toolResultDetail.includes("mail-1"));
     const citationHref = await page.locator('[data-agent-citation="view"]').first().getAttribute("href");
@@ -930,11 +941,20 @@ async function main() {
       && !pendingHtml.includes("pending-turn-2"));
     evidence.screenshots.pending_confirm = await screenshot(page, "pending-confirm.png");
     await confirmCard.getByRole("button", { name: "Confirm" }).click();
-    await page.waitForFunction(() => document.body.innerText.includes("Confirmed by fixture"), null, { timeout: 10000 });
+    await page.waitForFunction(() => document.body.innerText.includes("Completed successfully."), null, { timeout: 10000 });
     assert(evidence, "confirm posts once with pending token action_hash", fixture.state.confirmPosts.length === 1
       && fixture.state.confirmPosts[0].pending
       && fixture.state.confirmPosts[0].token?.startsWith("fixture-token-")
       && fixture.state.confirmPosts[0].action_hash?.startsWith("fixture-hash-"), fixture.state.confirmPosts);
+    assert(evidence, "confirmed action is terminal and exposes no stale controls",
+      (await confirmCard.getByRole("button").count()) === 0
+      && (await confirmCard.innerText()).includes("Action confirmed")
+      && (await confirmCard.innerText()).includes("Completed successfully.")
+      && !(await confirmCard.innerText()).includes("live-write")
+      && !(await confirmCard.innerText()).includes("set_read")
+      && !(await confirmCard.innerText()).includes("account")
+      && !(await confirmCard.innerText()).includes("Risk:")
+      && !(await confirmCard.innerText()).includes("Expires"));
 
     await page.locator('[data-testid="agent-input"]').fill("Please cancel the delete fixture item");
     await page.locator('[data-testid="agent-send"]').click();
@@ -944,6 +964,12 @@ async function main() {
     await page.waitForFunction(() => Array.from(document.querySelectorAll('[data-agent-pending-card="1"]')).at(-1)?.classList.contains("cancelled"), null, { timeout: 10000 });
     assert(evidence, "pending cancel posts once for separate turn", fixture.state.cancelPosts.length === 1
       && fixture.state.cancelPosts[0].pending?.startsWith("pending-turn-"), fixture.state.cancelPosts);
+    assert(evidence, "cancelled action is terminal and exposes no stale controls",
+      (await cancelCard.getByRole("button").count()) === 0
+      && (await cancelCard.innerText()).includes("Action cancelled")
+      && (await cancelCard.innerText()).includes("No changes were made.")
+      && !(await cancelCard.innerText()).includes("Risk:")
+      && !(await cancelCard.innerText()).includes("Expires"));
     evidence.screenshots.pending_cancel = await screenshot(page, "pending-cancel.png");
 
     await page.locator('[data-testid="agent-input"]').fill("trigger error");

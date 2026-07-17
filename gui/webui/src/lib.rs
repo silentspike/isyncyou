@@ -6397,9 +6397,10 @@ impl Router {
             }
         }
         match handler.confirm(&request.pending, &request.token, &request.action_hash) {
-            Ok(summary) => {
-                ApiResponse::ok_json(&json!({ "confirmed": request.pending, "result": summary }))
-            }
+            Ok(_internal_summary) => ApiResponse::ok_json(&json!({
+                "confirmed": request.pending,
+                "result": "Completed successfully."
+            })),
             Err(e) => ApiResponse::error(agent_confirm_error_status(&e), &e),
         }
     }
@@ -10211,6 +10212,30 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 .status,
             400
         );
+    }
+
+    #[test]
+    fn agent_confirm_response_hides_internal_executor_summary() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let response = router.route(&strict_json_post(
+            "/api/v1/agent/confirm",
+            json!({
+                "request_id": "550e8400-e29b-41d4-a716-446655440005",
+                "pending": "p1",
+                "token": "right",
+                "action_hash": "hash",
+            }),
+            Some("agentsecret"),
+        ));
+
+        assert_eq!(response.status, 200);
+        let body = body_json(&response);
+        assert_eq!(body["result"], "Completed successfully.");
+        let encoded = String::from_utf8_lossy(&response.body);
+        assert!(!encoded.contains("ran p1"));
+        assert!(!encoded.contains("live-write"));
+        assert!(!encoded.contains("set_read"));
     }
 
     #[test]

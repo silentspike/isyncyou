@@ -628,6 +628,48 @@ impl AgentLiveWriteIntent {
             _ => "existing item",
         }
     }
+
+    fn confirmation_copy(&self) -> &'static str {
+        match self {
+            Self::Mail(MailLiveWrite::SetRead { is_read: true, .. }) => "Mark this email as read",
+            Self::Mail(MailLiveWrite::SetRead { is_read: false, .. }) => {
+                "Mark this email as unread"
+            }
+            Self::Mail(MailLiveWrite::SetFlag { .. }) => "Update the follow-up flag on this email",
+            Self::Mail(MailLiveWrite::SetCategories { .. }) => {
+                "Update the categories on this email"
+            }
+            Self::Mail(MailLiveWrite::Move { .. }) => "Move this email",
+            Self::Mail(MailLiveWrite::CreateDraft { .. }) => "Create an email draft",
+            Self::Mail(MailLiveWrite::SendDraft { .. }) => "Send this email draft",
+            Self::Calendar(CalendarLiveWrite::Create { .. }) => "Create a calendar event",
+            Self::Calendar(CalendarLiveWrite::Update { .. }) => "Update this calendar event",
+            Self::Calendar(CalendarLiveWrite::Delete { .. }) => "Delete this calendar event",
+            Self::Calendar(CalendarLiveWrite::Respond { .. }) => {
+                "Respond to this calendar invitation"
+            }
+            Self::Contacts(ContactLiveWrite::Create { .. }) => "Create a contact",
+            Self::Contacts(ContactLiveWrite::Update { .. }) => "Update this contact",
+            Self::Contacts(ContactLiveWrite::Delete { .. }) => "Delete this contact",
+            Self::Todo(TodoLiveWrite::Create { .. }) => "Create a task",
+            Self::Todo(TodoLiveWrite::Update { .. }) => "Update this task",
+            Self::Todo(TodoLiveWrite::Complete { .. }) => "Mark this task as complete",
+            Self::Todo(TodoLiveWrite::Delete { .. }) => "Delete this task",
+            Self::Todo(TodoLiveWrite::ChecklistAdd { .. }) => "Add a checklist item to this task",
+            Self::Todo(TodoLiveWrite::ChecklistToggle { checked: true, .. }) => {
+                "Mark this checklist item as complete"
+            }
+            Self::Todo(TodoLiveWrite::ChecklistToggle { checked: false, .. }) => {
+                "Mark this checklist item as incomplete"
+            }
+            Self::Todo(TodoLiveWrite::ChecklistDelete { .. }) => "Delete this checklist item",
+            Self::Todo(TodoLiveWrite::ListCreate { .. }) => "Create a task list",
+            Self::Todo(TodoLiveWrite::ListDelete { .. }) => "Delete this task list",
+            Self::OneNote(OneNoteLiveWrite::Create { .. }) => "Create a OneNote page",
+            Self::OneNote(OneNoteLiveWrite::Delete { .. }) => "Delete this OneNote page",
+            Self::OneNote(OneNoteLiveWrite::Append { .. }) => "Add content to this OneNote page",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1417,52 +1459,74 @@ pub(crate) fn preview_for_pending_action(
         return Err(format!("not_confirmable: {}", action.op()));
     }
     match action {
-        isyncyou_agent::ToolAction::Backup { account, services } => {
+        isyncyou_agent::ToolAction::Backup { services, .. } => {
             validate_services("backup", services, BACKUP_SERVICES)?;
-            let scope = if services.is_empty() {
-                "all supported services".to_string()
+            let copy = if services.is_empty() {
+                "Back up all supported Microsoft 365 data".to_string()
             } else {
-                format!("{} selected service(s)", services.len())
+                let count = services.len();
+                format!(
+                    "Back up {count} selected {} of Microsoft 365 data",
+                    if count == 1 { "category" } else { "categories" }
+                )
+            };
+            Ok(PendingOperationPreview::destructive(copy))
+        }
+        isyncyou_agent::ToolAction::RestoreCloud { service, .. } => {
+            validate_service("restore-cloud", service, RESTORE_CLOUD_SERVICES)?;
+            let item = match service.as_str() {
+                "mail" => "email",
+                "calendar" => "calendar event",
+                "contacts" => "contact",
+                "todo" => "task",
+                "onenote" => "OneNote page",
+                _ => "item",
             };
             Ok(PendingOperationPreview::destructive(format!(
-                "Run backup for account {account} ({scope})"
+                "Restore this archived {item} to Microsoft 365"
             )))
         }
-        isyncyou_agent::ToolAction::RestoreCloud {
-            account,
-            service,
-            id,
-        } => {
-            validate_service("restore-cloud", service, RESTORE_CLOUD_SERVICES)?;
-            Ok(PendingOperationPreview::destructive(format!(
-                "Restore archived {service} item {id} to Microsoft 365 for account {account}"
-            )))
-        }
-        isyncyou_agent::ToolAction::LiveWrite {
-            account, service, ..
-        } => {
+        isyncyou_agent::ToolAction::LiveWrite { .. } => {
             let intent = validate_live_write_action(action)?;
-            let verb = intent.verb();
-            let target = intent.target_label();
-            Ok(PendingOperationPreview::destructive(format!(
-                "Apply {service} {verb} to {target} for account {}",
-                redact_agent_operation_text(account)
-            )))
+            Ok(PendingOperationPreview::destructive(
+                intent.confirmation_copy().to_string(),
+            ))
         }
-        isyncyou_agent::ToolAction::Share { account, id, .. } => {
+        isyncyou_agent::ToolAction::Share { .. } => {
             let intent = validate_share_action(action)?;
             match intent {
-                AgentShareIntent::Invite { recipients, .. } => Ok(
-                    PendingOperationPreview::destructive(format!(
-                        "Invite {} recipient(s) to OneDrive item {id} for account {account}",
-                        recipients.len()
-                    )),
-                ),
-                AgentShareIntent::Link { link_type, scope } => Ok(
-                    PendingOperationPreview::destructive(format!(
-                        "Create {scope} {link_type} sharing link for OneDrive item {id} for account {account}"
-                    )),
-                ),
+                AgentShareIntent::Invite { recipients, role } => {
+                    let count = recipients.len();
+                    let access = if role == "write" { "edit" } else { "view" };
+                    Ok(PendingOperationPreview::destructive(format!(
+                        "Give {count} {} {access} access to this OneDrive item",
+                        if count == 1 {
+                            "recipient"
+                        } else {
+                            "recipients"
+                        }
+                    )))
+                }
+                AgentShareIntent::Link { link_type, scope } => {
+                    let access = match link_type.as_str() {
+                        "edit" => "edit",
+                        "embed" => "embedded-view",
+                        _ => "view-only",
+                    };
+                    let copy = match scope.as_str() {
+                        "anonymous" => {
+                            format!("Create a public {access} link for this OneDrive item")
+                        }
+                        "organization" => format!(
+                            "Create an organization-wide {access} link for this OneDrive item"
+                        ),
+                        "users" => format!(
+                            "Create a {access} link for specific people to this OneDrive item"
+                        ),
+                        _ => format!("Create a restricted {access} link for this OneDrive item"),
+                    };
+                    Ok(PendingOperationPreview::destructive(copy))
+                }
             }
         }
         isyncyou_agent::ToolAction::Search { .. }
@@ -2873,11 +2937,38 @@ mod tests {
         let run = run_recorded_live_write(&action, &runtime);
         let text = format!("{} {}", preview.text, run.summary);
 
-        assert!(preview.text.contains("create_draft"));
+        assert_eq!(preview.text, "Create an email draft");
+        assert!(!preview.text.contains("owner@example.com"));
+        assert!(!preview.text.contains("live-write"));
+        assert!(!preview.text.contains("create_draft"));
         assert!(!text.contains("raw-body-sentinel"));
         assert!(!text.contains("recipient@example.com"));
         assert!(!text.contains("private subject"));
         assert!(text.contains("<redacted-email>"));
+    }
+
+    #[test]
+    fn agent_live_write_confirmation_uses_plain_language_without_internal_fields() {
+        for (is_read, expected) in [
+            (true, "Mark this email as read"),
+            (false, "Mark this email as unread"),
+        ] {
+            let action = isyncyou_agent::parse_action(&json!({
+                "op": "live-write",
+                "account": "me",
+                "service": "mail",
+                "target": "private-item-id",
+                "change": { "verb": "set_read", "is_read": is_read }
+            }))
+            .unwrap();
+
+            let preview = preview_for_pending_action(&action).unwrap();
+
+            assert_eq!(preview.text, expected);
+            for internal in ["live-write", "set_read", "account", "private-item-id"] {
+                assert!(!preview.text.contains(internal));
+            }
+        }
     }
 
     #[test]
@@ -2909,8 +3000,13 @@ mod tests {
 
         let preview = preview_for_pending_action(&action).unwrap();
 
-        assert!(preview.text.contains("Invite 1 recipient"));
+        assert_eq!(
+            preview.text,
+            "Give 1 recipient view access to this OneDrive item"
+        );
         assert!(!preview.text.contains("recipient@example.com"));
+        assert!(!preview.text.contains("file-1"));
+        assert!(!preview.text.contains("account"));
         assert_eq!(preview.risk, "destructive");
     }
 
@@ -2965,7 +3061,12 @@ mod tests {
 
         let preview = preview_for_pending_action(&action).unwrap();
 
-        assert!(preview.text.contains("organization edit sharing link"));
+        assert_eq!(
+            preview.text,
+            "Create an organization-wide edit link for this OneDrive item"
+        );
+        assert!(!preview.text.contains("item-1"));
+        assert!(!preview.text.contains("account"));
         assert_eq!(preview.risk, "destructive");
     }
 
@@ -3064,7 +3165,10 @@ mod tests {
         let gate = Arc::new(Mutex::new(()));
         let run = run_share_with_runtime(&Config::default(), &action, &gate, &runtime).unwrap();
 
-        assert!(preview.text.contains("Invite 1 recipient"));
+        assert_eq!(
+            preview.text,
+            "Give 1 recipient view access to this OneDrive item"
+        );
         assert!(!preview.text.contains("recipient@example.com"));
         assert_eq!(run.recipient_count, 1);
         assert!(!run.summary.contains("recipient@example.com"));

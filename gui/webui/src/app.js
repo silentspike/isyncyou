@@ -72,6 +72,8 @@ const ICONS = {
   building: "M6 22V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v18M6 22H2M18 22h4M9 6h.01M15 6h.01M9 10h.01M15 10h.01M9 14h.01M15 14h.01M10 22v-4h4v4",
   flag: "M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1zM4 22v-7",
   circle: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20",
+  "circle-check": "M22 11.08V12a10 10 0 1 1-5.93-9.14M22 4L12 14.01l-3-3",
+  "circle-x": "M15 9l-6 6M9 9l6 6M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20",
   check: "M20 6L9 17l-5-5",
   settings: "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z",
   shield: "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z",
@@ -6001,16 +6003,29 @@ function agentCompactValue(v, max = 140) {
   return s.length > max ? s.slice(0, max - 1) + "…" : s;
 }
 
-function summarizeAgentToolInput(input) {
-  if (!input || typeof input !== "object") return "";
-  const deny = new Set(["token", "session", "session_token", "capability", "capability_token", "action_hash"]);
-  const bits = [];
-  Object.entries(input).forEach(([k, v]) => {
-    if (bits.length >= 4 || deny.has(String(k).toLowerCase())) return;
-    if (v == null || typeof v === "object") return;
-    bits.push(`${k}: ${agentCompactValue(v, 42)}`);
-  });
-  return bits.join(" · ");
+function agentToolCallCopy(name, input) {
+  const op = String(input && input.op ? input.op : name || "").toLowerCase();
+  if (op === "search" || op === "archive.search") return "Searching your Microsoft 365 archive";
+  if (op === "deep-search") return "Searching more broadly in your archive";
+  if (op === "read" || op === "archive.read") return "Reading an archived item";
+  if (op === "list" || op === "archive.list") return "Listing archived items";
+  if (op === "export") return "Preparing an archive export";
+  if (op === "restore-local") return "Restoring an archived item to this device";
+  if (op === "backup") return "Preparing a Microsoft 365 backup";
+  if (op === "restore-cloud") return "Preparing a Microsoft 365 restore";
+  if (op === "share") return "Preparing a OneDrive sharing action";
+  if (op === "live-write") {
+    const service = String(input && input.service ? input.service : "").toLowerCase();
+    const labels = {
+      mail: "Preparing an email update",
+      calendar: "Preparing a calendar update",
+      contacts: "Preparing a contact update",
+      todo: "Preparing a task update",
+      onenote: "Preparing a OneNote update",
+    };
+    return labels[service] || "Preparing a Microsoft 365 update";
+  }
+  return "Working with Microsoft 365";
 }
 
 function renderAgentToolRow(row) {
@@ -6067,7 +6082,7 @@ async function confirmAgentPending(pendingId) {
       token: record.token, action_hash: record.action_hash,
     });
     record.status = "confirmed";
-    record.result = d && d.result ? d.result : "Confirmed";
+    record.result = "Completed successfully.";
     record.token = "";
     record.action_hash = "";
   } catch (e) {
@@ -6128,18 +6143,23 @@ function renderAgentPendingCard(pending, trackNode = true) {
     icon("x", "icon-sm"), status === "cancelling" ? "Cancelling…" : "Cancel");
   if (confirmDisabled) confirm.setAttribute("disabled", "disabled");
   if (cancelDisabled) cancel.setAttribute("disabled", "disabled");
+  const title = status === "confirmed" ? "Action confirmed"
+    : status === "cancelled" ? "Action cancelled"
+      : pending.preview || "Action requires confirmation";
+  const terminalResult = pending.result
+    || (status === "cancelled" ? "No changes were made." : "");
   const card = el("div", {
     class: "asst-pending-card " + status,
     "data-agent-pending-card": "1",
   },
     el("div", { class: "asst-pending-head" },
-      icon("shield-check", "icon-sm"),
-      el("span", { class: "asst-pending-title", text: pending.preview || "Action requires confirmation" })),
-    el("div", { class: "dim asst-pending-meta", text: risk }),
-    pending.expires_at_ms ? el("div", { class: "dim asst-pending-meta", text: status === "expired" ? "Expired" : "Expires " + fmtDate(pending.expires_at_ms) }) : null,
-    pending.result ? el("div", { class: "asst-pending-result", text: pending.result }) : null,
+      icon(status === "confirmed" ? "circle-check" : status === "cancelled" ? "circle-x" : "shield-check", "icon-sm"),
+      el("span", { class: "asst-pending-title", text: title })),
+    done ? null : el("div", { class: "dim asst-pending-meta", text: risk }),
+    !done && pending.expires_at_ms ? el("div", { class: "dim asst-pending-meta", text: status === "expired" ? "Expired" : "Expires " + fmtDate(pending.expires_at_ms) }) : null,
+    terminalResult ? el("div", { class: "asst-pending-result", text: terminalResult }) : null,
     pending.error ? el("div", { class: "asst-pending-error", text: pending.error }) : null,
-    el("div", { class: "asst-pending-actions" }, confirm, cancel));
+    done ? null : el("div", { class: "asst-pending-actions" }, confirm, cancel));
   if (trackNode && pending.pending_id) {
     const nodes = AssistantState.pendingCardNodesById.get(pending.pending_id) || new Set();
     nodes.add(card);
@@ -6214,8 +6234,7 @@ function handleAgentEvent(message, turnState) {
     case "tool_call":
       turnState.addToolRow({
         kind: "tool_call",
-        title: d.name || "Tool call",
-        detail: summarizeAgentToolInput(d.input),
+        title: agentToolCallCopy(d.name, d.input),
       });
       break;
     case "tool_result":
@@ -6223,7 +6242,7 @@ function handleAgentEvent(message, turnState) {
         const sources = extractAgentSources(d);
         turnState.addToolRow({
           kind: "tool_result",
-          title: "Tool result",
+          title: sources.length ? "Sources checked" : "Step completed",
           detail: sources.length
             ? `${sources.length} source${sources.length === 1 ? "" : "s"}`
             : "Completed",
