@@ -5317,7 +5317,14 @@ fn parse_codex_callback_query(query: &str, want_state: &str) -> ParsedCodexCallb
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-const CODEX_OK_HTML: &str = "<!doctype html><meta charset=utf-8><title>ChatGPT connected</title>\
+const CODEX_CALLBACK_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-lOIPptD5XGa13rYTcNSaRf4lhCC/sKuBnqOtMWDq8M4='";
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+const CODEX_OK_HTML: &str = "<!doctype html><meta charset=utf-8><meta name=referrer content=no-referrer><title>ChatGPT connected</title>\
+<script>history.replaceState(null,\"\",\"/auth/complete\");</script>\
 <body style=\"font-family:system-ui;background:#0b0d12;color:#e8eaf0;display:flex;min-height:100vh;\
 align-items:center;justify-content:center;margin:0\"><div style=text-align:center><h1>Connected</h1>\
 <p style=color:#9aa3b2>ChatGPT is now linked. Close this tab and return to iSyncYou.</p></div>";
@@ -5326,10 +5333,23 @@ align-items:center;justify-content:center;margin:0\"><div style=text-align:cente
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-const CODEX_ERR_HTML: &str = "<!doctype html><meta charset=utf-8><title>Sign-in failed</title>\
+const CODEX_ERR_HTML: &str = "<!doctype html><meta charset=utf-8><meta name=referrer content=no-referrer><title>Sign-in failed</title>\
+<script>history.replaceState(null,\"\",\"/auth/complete\");</script>\
 <body style=\"font-family:system-ui;background:#0b0d12;color:#e8eaf0;display:flex;min-height:100vh;\
 align-items:center;justify-content:center;margin:0\"><div style=text-align:center><h1>Sign-in failed</h1>\
 <p style=color:#9aa3b2>Please return to iSyncYou and try connecting ChatGPT again.</p></div>";
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn codex_callback_response(body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Security-Policy: {CODEX_CALLBACK_CSP}\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
 
 #[cfg(any(
     feature = "agent-oauth-providers",
@@ -5826,11 +5846,7 @@ fn codex_callback_serve_until(
             let code = match parse_codex_callback_query(query, &want_state) {
                 ParsedCodexCallback::AuthorizationCode(code) => code,
                 ParsedCodexCallback::UnboundCallback => {
-                    let body = CODEX_ERR_HTML;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(), body
-                    );
+                    let response = codex_callback_response(CODEX_ERR_HTML);
                     let _ = stream.write_all(response.as_bytes());
                     continue;
                 }
@@ -5846,22 +5862,14 @@ fn codex_callback_serve_until(
                             },
                         );
                     }
-                    let body = CODEX_ERR_HTML;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(), body
-                    );
+                    let response = codex_callback_response(CODEX_ERR_HTML);
                     let _ = stream.write_all(response.as_bytes());
                     break;
                 }
             };
 
             if !claim_codex_callback_attempt(&attempts, &attempt_id, &cancelled) {
-                let body = CODEX_ERR_HTML;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(), body
-                );
+                let response = codex_callback_response(CODEX_ERR_HTML);
                 let _ = stream.write_all(response.as_bytes());
                 break;
             }
@@ -5943,10 +5951,7 @@ fn codex_callback_serve_until(
                 }
             };
             let body = if ok { CODEX_OK_HTML } else { CODEX_ERR_HTML };
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(), body
-            );
+            let response = codex_callback_response(body);
             let _ = stream.write_all(response.as_bytes());
             break;
         }
@@ -10409,8 +10414,10 @@ const MICROSOFT_CALLBACK_PATH: &str = "/";
 const MICROSOFT_LOGIN_TTL: Duration = Duration::from_secs(10 * 60);
 const MICROSOFT_CALLBACK_HEAD_LIMIT: usize = 8 * 1024;
 const MICROSOFT_LOGIN_LIMIT: usize = 8;
-const MICROSOFT_SUCCESS_HTML: &str = "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'><title>iSyncYou</title><p>Sign-in complete. Return to iSyncYou.</p>";
-const MICROSOFT_ERROR_HTML: &str = "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'><title>iSyncYou</title><p>Sign-in could not be completed. Return to iSyncYou and try again.</p>";
+const MICROSOFT_CALLBACK_CSP: &str =
+    "default-src 'none'; script-src 'sha256-6WBFjYLCKl4KY1+Jlv3zS070QLtF9Gt4OU5pdzNkjXk='";
+const MICROSOFT_SUCCESS_HTML: &str = "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'><meta name=referrer content=no-referrer><title>iSyncYou</title><script>history.replaceState(null,\"\",\"/\");</script><p>Sign-in complete. Return to iSyncYou.</p>";
+const MICROSOFT_ERROR_HTML: &str = "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'><meta name=referrer content=no-referrer><title>iSyncYou</title><script>history.replaceState(null,\"\",\"/\");</script><p>Sign-in could not be completed. Return to iSyncYou and try again.</p>";
 
 /// Per-login progress shared between the loopback callback and UI polling.
 pub struct LoginState {
@@ -11027,7 +11034,7 @@ fn microsoft_callback_serve(
 fn write_microsoft_callback_page(stream: &mut std::net::TcpStream, body: &str) {
     use std::io::Write;
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\nX-Content-Type-Options: nosniff\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Security-Policy: {MICROSOFT_CALLBACK_CSP}\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(), body
     );
     let _ = stream.write_all(response.as_bytes());
@@ -16745,6 +16752,29 @@ mod tests {
 
         assert!(!legacy.exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn codex_callback_pages_are_fixed_csp_no_store_and_sanitize_address_bar() {
+        for body in [CODEX_OK_HTML, CODEX_ERR_HTML] {
+            assert!(body
+                .contains("<script>history.replaceState(null,\"\",\"/auth/complete\");</script>"));
+            assert!(body.contains("<meta name=referrer content=no-referrer>"));
+            assert!(!body.contains("code="));
+            assert!(!body.contains("state="));
+
+            let response = codex_callback_response(body);
+            assert!(response.contains("Cache-Control: no-store\r\n"));
+            assert!(response.contains(&format!(
+                "Content-Security-Policy: {CODEX_CALLBACK_CSP}\r\n"
+            )));
+            assert!(response.contains("Referrer-Policy: no-referrer\r\n"));
+            assert!(!response.contains("script-src 'unsafe-inline'"));
+        }
     }
 
     #[cfg(any(
@@ -22663,6 +22693,21 @@ fn microsoft_callback_headers_require_one_exact_host_and_no_body_framing() {
             "localhost:43123"
         ));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn microsoft_callback_pages_are_no_store_and_sanitize_address_bar() {
+    for body in [MICROSOFT_SUCCESS_HTML, MICROSOFT_ERROR_HTML] {
+        assert!(body.contains("<script>history.replaceState(null,\"\",\"/\");</script>"));
+        assert!(body.contains("<meta name=referrer content=no-referrer>"));
+        assert!(!body.contains("code="));
+        assert!(!body.contains("state="));
+    }
+    assert_eq!(
+        MICROSOFT_CALLBACK_CSP,
+        "default-src 'none'; script-src 'sha256-6WBFjYLCKl4KY1+Jlv3zS070QLtF9Gt4OU5pdzNkjXk='"
+    );
 }
 
 #[cfg(test)]
