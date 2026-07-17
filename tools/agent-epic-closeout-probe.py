@@ -38,6 +38,7 @@ MAX_JSON_BYTES = 1024 * 1024
 MAX_SSE_BYTES = 1024 * 1024
 MAX_SSE_LINE_BYTES = 256 * 1024
 MAX_SSE_EVENTS = 4096
+CONTROL_REQUEST_TIMEOUT_SECONDS = 10.0
 HOOK_MARKERS = (
     b"ISY_MOBILE_JOB_DEVICE_HOOK_V1",
     b"ISY_AGENT_NETWORK_DEVICE_HOOK_V1",
@@ -575,6 +576,8 @@ def stream_turn(client: RuntimeClient, turn_id: str, timeout: float) -> dict[str
     names: list[str] = []
     untrusted_result = False
     terminal_reason = None
+    deadline = time.monotonic() + timeout
+    idle_timeout = min(timeout, CONTROL_REQUEST_TIMEOUT_SECONDS)
     total_bytes = 0
     allowed = {
         "token",
@@ -587,10 +590,12 @@ def stream_turn(client: RuntimeClient, turn_id: str, timeout: float) -> dict[str
         "done",
     }
     try:
-        with client.opener.open(request, timeout=timeout) as response:
+        with client.opener.open(request, timeout=idle_timeout) as response:
             if response.status != 200 or response.headers.get_content_type() != "text/event-stream":
                 raise ProbeError("turn_stream_unavailable")
             while True:
+                if time.monotonic() >= deadline:
+                    raise ProbeError("turn_stream_timed_out")
                 line = response.readline(MAX_SSE_LINE_BYTES + 1)
                 if not line:
                     break
@@ -618,6 +623,11 @@ def stream_turn(client: RuntimeClient, turn_id: str, timeout: float) -> dict[str
                     if reason not in {"complete", "error", "cancelled", "pending_confirmation"}:
                         raise ProbeError("turn_stream_invalid")
                     terminal_reason = reason
+                    # The HTTP adapter emits a separate named SSE `done` frame with an empty
+                    # payload after the agent sender closes. The typed agent `done` event above
+                    # is authoritative, so stop before that transport-only frame is read as a
+                    # second agent event.
+                    break
     except urllib.error.HTTPError as error:
         error.close()
         raise ProbeError("turn_stream_unavailable") from error
@@ -633,7 +643,10 @@ def stream_turn(client: RuntimeClient, turn_id: str, timeout: float) -> dict[str
 
 
 def load_turn_records(
-    client: RuntimeClient, session_id: str, request_id: str, turn_id: str
+    client: RuntimeClient,
+    session_id: str,
+    request_id: str,
+    turn_id: str,
 ) -> tuple[bool, bool, bool, list[dict[str, object]]]:
     cursor = None
     matching: list[dict[str, object]] = []
@@ -747,12 +760,13 @@ def run_retrieval_turn(
         "prompt": prompt,
     }
     started = time.monotonic()
+    control_timeout = min(timeout, CONTROL_REQUEST_TIMEOUT_SECONDS)
     first = client.json(
-        "POST", "/api/v1/agent/turn", cap=True, value=turn_body, timeout=timeout
+        "POST", "/api/v1/agent/turn", cap=True, value=turn_body, timeout=control_timeout
     )
     elapsed_ms = int((time.monotonic() - started) * 1000)
     retry = client.json(
-        "POST", "/api/v1/agent/turn", cap=True, value=turn_body, timeout=timeout
+        "POST", "/api/v1/agent/turn", cap=True, value=turn_body, timeout=control_timeout
     )
     turn_id = first.get("turn")
     if not isinstance(turn_id, str) or not turn_id or len(turn_id) > 128:
@@ -761,15 +775,21 @@ def run_retrieval_turn(
     if not retry_same_turn:
         raise ProbeError("turn_retry_duplicated")
     stream = stream_turn(client, turn_id, timeout)
-    intent, assistant, terminal, sources = load_turn_records(
-        client, session_id, request_id, turn_id
-    )
+    try:
+        intent, assistant, terminal, sources = load_turn_records(
+            client, session_id, request_id, turn_id
+        )
+    except ProbeError as error:
+        raise ProbeError("retrieval_history_failed") from error
     status_query = urllib.parse.urlencode(
         {"session_id": session_id, "route": "agent_turn", "request_id": request_id}
     )
-    request_status = client.json(
-        "GET", f"/api/v1/agent/request/status?{status_query}", cap=True
-    )
+    try:
+        request_status = client.json(
+            "GET", f"/api/v1/agent/request/status?{status_query}", cap=True
+        )
+    except ProbeError as error:
+        raise ProbeError("retrieval_request_status_failed") from error
     source_results = []
     for source in sources[:64]:
         service = source.get("service")
@@ -783,10 +803,15 @@ def run_retrieval_turn(
             or len(item_id) > 512
         ):
             raise ProbeError("source_reference_invalid")
-        source_results.append(
-            source_is_listed(client, account, service, item_id)
-            and source_view_resolves(client, account, service, item_id)
-        )
+        try:
+            listed = source_is_listed(client, account, service, item_id)
+        except ProbeError as error:
+            raise ProbeError("retrieval_source_list_failed") from error
+        try:
+            viewable = source_view_resolves(client, account, service, item_id)
+        except ProbeError as error:
+            raise ProbeError("retrieval_source_view_failed") from error
+        source_results.append(listed and viewable)
     sources_resolved = bool(source_results) and all(source_results)
     transcript_rehydrated = intent and assistant and terminal
     return {

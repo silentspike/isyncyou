@@ -193,6 +193,10 @@ fn validate_provider_recovery_binding(
 }
 
 impl ProductTurnRuntime {
+    pub fn request_status_binding(&self) -> (String, String) {
+        (self.session_id.clone(), self.request_id.clone())
+    }
+
     pub fn provider_history(
         &mut self,
         prompt: &str,

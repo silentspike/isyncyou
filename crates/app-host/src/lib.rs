@@ -523,6 +523,111 @@ const MAX_ACTIVE_TURN_ADMISSIONS: usize = 256;
     feature = "agent-subscription-experimental",
     test
 ))]
+const MAX_HOT_REQUEST_STATUSES: usize = 256;
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
+#[derive(Default)]
+struct HotRequestStatusCache {
+    entries: Mutex<HashMap<(String, String), (isyncyou_agent::RequestPhase, u64)>>,
+    sequence: AtomicU64,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
+impl HotRequestStatusCache {
+    fn insert(&self, session_id: &str, request_id: &str, phase: isyncyou_agent::RequestPhase) {
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (session_id.to_owned(), request_id.to_owned());
+        if entries.len() >= MAX_HOT_REQUEST_STATUSES && !entries.contains_key(&key) {
+            if let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, (_, inserted))| *inserted)
+                .map(|(key, _)| key.clone())
+            {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(key, (phase, sequence));
+    }
+
+    fn get(&self, session_id: &str, request_id: &str) -> Option<isyncyou_agent::RequestPhase> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(session_id.to_owned(), request_id.to_owned()))
+            .map(|(phase, _)| *phase)
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
+fn cache_persisted_request_phase(
+    cache: &HotRequestStatusCache,
+    binding: Option<&(String, String)>,
+    persisted: &Result<(), String>,
+    phase: isyncyou_agent::RequestPhase,
+) {
+    if persisted.is_ok() {
+        if let Some((session_id, request_id)) = binding {
+            cache.insert(session_id, request_id, phase);
+        }
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
+fn request_status_json(phase: isyncyou_agent::RequestPhase) -> serde_json::Value {
+    let (state, code, terminal, resume_allowed) = match phase {
+        isyncyou_agent::RequestPhase::Accepted => {
+            ("accepted", "request_resume_required", false, true)
+        }
+        isyncyou_agent::RequestPhase::ProviderStepStarted
+        | isyncyou_agent::RequestPhase::OutcomeUnknown => {
+            ("outcome_unknown", "turn_outcome_unknown", true, false)
+        }
+        isyncyou_agent::RequestPhase::ProviderStepCompleted => (
+            "provider_step_completed",
+            "request_resume_required",
+            false,
+            true,
+        ),
+        isyncyou_agent::RequestPhase::PendingConfirmation => {
+            ("pending_confirmation", "pending_confirmation", true, false)
+        }
+        isyncyou_agent::RequestPhase::Committed => ("committed", "ok", true, false),
+        isyncyou_agent::RequestPhase::Failed => ("failed", "turn_failed", true, false),
+        isyncyou_agent::RequestPhase::Cancelled => ("cancelled", "turn_cancelled", true, false),
+    };
+    serde_json::json!({
+        "state": state,
+        "code": code,
+        "terminal": terminal,
+        "resume_allowed": resume_allowed,
+    })
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
 #[derive(Default)]
 struct TurnAdmissionRegistry {
     bindings: Mutex<HashMap<String, [u8; 32]>>,
@@ -1619,6 +1724,12 @@ pub struct DaemonAgent {
         test
     ))]
     turn_admissions: Arc<TurnAdmissionRegistry>,
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental",
+        test
+    ))]
+    hot_request_statuses: Arc<HotRequestStatusCache>,
     #[cfg_attr(
         not(any(
             feature = "agent-oauth-providers",
@@ -1801,6 +1912,12 @@ impl DaemonAgent {
                 test
             ))]
             turn_admissions: Arc::new(TurnAdmissionRegistry::default()),
+            #[cfg(any(
+                feature = "agent-oauth-providers",
+                feature = "agent-subscription-experimental",
+                test
+            ))]
+            hot_request_statuses: Arc::new(HotRequestStatusCache::default()),
             last_usage: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(any(
                 feature = "agent-oauth-providers",
@@ -7747,11 +7864,15 @@ impl DaemonAgent {
         let archive_root = self.archive_root_for(&account_id);
         let pending = self.pending.clone();
         let turns = Arc::clone(&self.turns);
+        let hot_request_statuses = Arc::clone(&self.hot_request_statuses);
         #[cfg(any(
             feature = "agent-oauth-providers",
             feature = "agent-subscription-experimental"
         ))]
         let last_usage = Arc::clone(&self.last_usage);
+        let hot_request_binding = product_turn
+            .as_ref()
+            .map(product_session::ProductTurnRuntime::request_status_binding);
         let product_turn = Arc::new(Mutex::new(product_turn));
         let thread_product_turn = Arc::clone(&product_turn);
         let turn_thread = std::thread::Builder::new()
@@ -7822,6 +7943,12 @@ impl DaemonAgent {
                                 unix_now_ms(),
                             )
                         });
+                        cache_persisted_request_phase(
+                            &hot_request_statuses,
+                            hot_request_binding.as_ref(),
+                            &persisted,
+                            isyncyou_agent::RequestPhase::Committed,
+                        );
                         for event in terminal_events_after_persistence(
                             persisted,
                             isyncyou_agent::DoneReason::Complete,
@@ -7883,6 +8010,12 @@ impl DaemonAgent {
                                 );
                                 return Err(error);
                             }
+                            cache_persisted_request_phase(
+                                &hot_request_statuses,
+                                hot_request_binding.as_ref(),
+                                &Ok(()),
+                                isyncyou_agent::RequestPhase::PendingConfirmation,
+                            );
                             Ok((pending_action.id.clone(), (pending_action, token)))
                         });
                         match transition {
@@ -7916,6 +8049,12 @@ impl DaemonAgent {
                                         unix_now_ms(),
                                     )
                                 });
+                                cache_persisted_request_phase(
+                                    &hot_request_statuses,
+                                    hot_request_binding.as_ref(),
+                                    &persisted,
+                                    isyncyou_agent::RequestPhase::Cancelled,
+                                );
                                 for event in terminal_events_after_persistence(
                                     persisted,
                                     isyncyou_agent::DoneReason::Cancelled,
@@ -7936,6 +8075,12 @@ impl DaemonAgent {
                                         )
                                     })
                                 };
+                                cache_persisted_request_phase(
+                                    &hot_request_statuses,
+                                    hot_request_binding.as_ref(),
+                                    &persisted,
+                                    isyncyou_agent::RequestPhase::Failed,
+                                );
                                 for event in terminal_error_events_after_persistence(
                                     persisted,
                                     "confirmation_unavailable",
@@ -7954,6 +8099,12 @@ impl DaemonAgent {
                                 unix_now_ms(),
                             )
                         });
+                        cache_persisted_request_phase(
+                            &hot_request_statuses,
+                            hot_request_binding.as_ref(),
+                            &persisted,
+                            isyncyou_agent::RequestPhase::Cancelled,
+                        );
                         if persisted.is_ok() {
                             let _ = hub.emit(
                                 &tid,
@@ -7984,6 +8135,12 @@ impl DaemonAgent {
                                 unix_now_ms(),
                             )
                         });
+                        cache_persisted_request_phase(
+                            &hot_request_statuses,
+                            hot_request_binding.as_ref(),
+                            &persisted,
+                            isyncyou_agent::RequestPhase::Failed,
+                        );
                         let code = if persisted.is_ok() {
                             safe_error
                         } else {
@@ -8254,6 +8411,9 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             if route != "agent_turn" {
                 return Err("invalid_request_route".into());
             }
+            if let Some(phase) = self.hot_request_statuses.get(session_id, request_id) {
+                return Ok(request_status_json(phase));
+            }
             let store = agent_credential_store(&self.oauth_dir)
                 .map_err(|_| "session_store_unavailable".to_string())?;
             let registry = product_session::ProductSessionRegistry::new(&store);
@@ -8283,35 +8443,9 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     _ => "session_store_unavailable".to_string(),
                 })?
                 .ok_or_else(|| "request_not_found".to_string())?;
-            let (state, code, terminal, resume_allowed) = match phase {
-                isyncyou_agent::RequestPhase::Accepted => {
-                    ("accepted", "request_resume_required", false, true)
-                }
-                isyncyou_agent::RequestPhase::ProviderStepStarted
-                | isyncyou_agent::RequestPhase::OutcomeUnknown => {
-                    ("outcome_unknown", "turn_outcome_unknown", true, false)
-                }
-                isyncyou_agent::RequestPhase::ProviderStepCompleted => (
-                    "provider_step_completed",
-                    "request_resume_required",
-                    false,
-                    true,
-                ),
-                isyncyou_agent::RequestPhase::PendingConfirmation => {
-                    ("pending_confirmation", "pending_confirmation", true, false)
-                }
-                isyncyou_agent::RequestPhase::Committed => ("committed", "ok", true, false),
-                isyncyou_agent::RequestPhase::Failed => ("failed", "turn_failed", true, false),
-                isyncyou_agent::RequestPhase::Cancelled => {
-                    ("cancelled", "turn_cancelled", true, false)
-                }
-            };
-            Ok(serde_json::json!({
-                "state": state,
-                "code": code,
-                "terminal": terminal,
-                "resume_allowed": resume_allowed,
-            }))
+            self.hot_request_statuses
+                .insert(session_id, request_id, phase);
+            Ok(request_status_json(phase))
         }
         #[cfg(not(any(
             feature = "agent-oauth-providers",
@@ -22510,6 +22644,58 @@ mod tests {
         turn_revalidates_generation_and_journal_then_builds_without_refresh_under_shared_lease();
     }
 }
+#[cfg(test)]
+#[test]
+fn agent_request_status_prefers_bounded_hot_terminal_state() {
+    let cache = HotRequestStatusCache::default();
+    for index in 0..=MAX_HOT_REQUEST_STATUSES {
+        cache.insert(
+            "session",
+            &format!("request-{index}"),
+            isyncyou_agent::RequestPhase::Committed,
+        );
+    }
+    assert!(cache.get("session", "request-0").is_none());
+    assert_eq!(
+        cache.get("session", &format!("request-{MAX_HOT_REQUEST_STATUSES}")),
+        Some(isyncyou_agent::RequestPhase::Committed)
+    );
+    assert_eq!(
+        request_status_json(isyncyou_agent::RequestPhase::Committed),
+        serde_json::json!({
+            "state": "committed",
+            "code": "ok",
+            "terminal": true,
+            "resume_allowed": false,
+        })
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn terminal_request_status_is_cached_only_after_persistence() {
+    let cache = HotRequestStatusCache::default();
+    let binding = ("session".to_string(), "request".to_string());
+    cache_persisted_request_phase(
+        &cache,
+        Some(&binding),
+        &Err("lease_lost".into()),
+        isyncyou_agent::RequestPhase::Committed,
+    );
+    assert!(cache.get("session", "request").is_none());
+
+    cache_persisted_request_phase(
+        &cache,
+        Some(&binding),
+        &Ok(()),
+        isyncyou_agent::RequestPhase::Committed,
+    );
+    assert_eq!(
+        cache.get("session", "request"),
+        Some(isyncyou_agent::RequestPhase::Committed)
+    );
+}
+
 #[cfg(test)]
 #[test]
 fn done_complete_is_emitted_only_after_terminal_record_commit() {

@@ -119,6 +119,7 @@ class RetrievalHandler(BaseHTTPRequestHandler):
                 b'data: {"event":"tool_result","id":"private-id",'
                 b'"content":"PRIVATE TOOL RESULT","untrusted":true}\n\n'
                 b'data: {"event":"done","reason":"complete"}\n\n'
+                b'event: done\ndata: {}\n\n'
             )
             self.send_bytes("text/event-stream", body)
         elif parsed.path == "/api/v1/agent/session/history" and self.cap_ready():
@@ -375,6 +376,7 @@ class CloseoutProbeTest(unittest.TestCase):
             thread.join(timeout=2)
 
     def test_retrieval_turn_retries_once_and_reports_only_redacted_facts(self):
+        self.assertEqual(MODULE.CONTROL_REQUEST_TIMEOUT_SECONDS, 10.0)
         RetrievalHandler.request_id = None
         RetrievalHandler.turn_posts = 0
         server = ThreadingHTTPServer(("127.0.0.1", 0), RetrievalHandler)
