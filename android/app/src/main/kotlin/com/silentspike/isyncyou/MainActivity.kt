@@ -72,6 +72,14 @@ class MainActivity : FragmentActivity() {
      *  blocking `nativeStreamNext` never stalls the UI thread or another request. */
     private val bridgeExecutor = Executors.newCachedThreadPool()
 
+    private fun dispatchBridge(block: () -> Unit): Boolean {
+        val accepted = BridgeDispatch.execute(bridgeExecutor, block)
+        if (!accepted) {
+            android.util.Log.i(TAG, "bridge dispatch ignored after Activity teardown")
+        }
+        return accepted
+    }
+
     /** JS stream id -> native stream id, for `unsub`/teardown (#0A). */
     private val bridgeStreams = ConcurrentHashMap<String, Long>()
 
@@ -245,7 +253,7 @@ class MainActivity : FragmentActivity() {
         android.util.Log.i(TAG, "engine ready (in-process), loading $APP_ORIGIN")
         pushDeviceState()
         if (MobileJobWakeupPolicy.shouldReconcileAfterEngineReady(sessionToken)) {
-            bridgeExecutor.execute { MobileJobScheduler.reconcile(this) }
+            dispatchBridge { MobileJobScheduler.reconcile(this) }
         }
         web.loadUrl("$APP_ORIGIN/")
     }
@@ -281,7 +289,7 @@ class MainActivity : FragmentActivity() {
         } catch (_: UnsatisfiedLinkError) {
             // The default product library intentionally omits the refresh evidence hook.
         }
-        if (sessionToken.isNotEmpty()) bridgeExecutor.execute { MobileJobScheduler.reconcile(this) }
+        if (sessionToken.isNotEmpty()) dispatchBridge { MobileJobScheduler.reconcile(this) }
     }
 
     override fun onRequestPermissionsResult(
@@ -293,7 +301,7 @@ class MainActivity : FragmentActivity() {
         if (requestCode == 1 && sessionToken.isNotEmpty()) {
             // Notification denial leaves jobs queued; a later permission callback is
             // an explicit reconciliation point, not an automatic retry loop.
-            bridgeExecutor.execute { MobileJobScheduler.reconcile(this) }
+            dispatchBridge { MobileJobScheduler.reconcile(this) }
         }
     }
 
@@ -409,10 +417,10 @@ class MainActivity : FragmentActivity() {
             android.util.Log.i(TAG, "bridge active: first message t=$t")
         }
         when (t) {
-            "req" -> bridgeExecutor.execute {
+            "req" -> dispatchBridge {
                 if (sessionToken.isBlank()) {
                     postBridgeError(reply, validation.id, 503, "session_not_ready", "session_not_ready")
-                    return@execute
+                    return@dispatchBridge
                 }
                 val requestJson = sanitizedBridgeRequest(obj)
                 val resp = try {
@@ -431,7 +439,7 @@ class MainActivity : FragmentActivity() {
             "sub" -> {
                 val jsId = validation.id
                 val path = obj.optString("path")
-                bridgeExecutor.execute { runBridgeStream(jsId, path, reply) }
+                dispatchBridge { runBridgeStream(jsId, path, reply) }
             }
             "unsub" -> {
                 bridgeStreams.remove(validation.id)?.let { NativeEngine.nativeStreamClose(it) }
@@ -499,7 +507,7 @@ class MainActivity : FragmentActivity() {
                 JSONObject().put("token", currentPushToken()),
             )
             "beginNetworkGuard" -> {
-                bridgeExecutor.execute {
+                dispatchBridge {
                     val reason = NetworkGuardReason.fromWire(payload.optString("reason", ""))
                     val result = if (reason == null) {
                         NetworkGuardBeginResult(null, "invalid_reason")
@@ -536,17 +544,17 @@ class MainActivity : FragmentActivity() {
                 postBridgeResponse(reply, id, if (bound) 200 else 409, JSONObject().put("ok", bound))
             }
             "captureNetworkSnapshot" -> {
-                bridgeExecutor.execute {
+                dispatchBridge {
                     val guardId = payload.optString("guard_id", "")
                     val lease = NetworkCriticalGuardRuntime.activeLease(guardId)
                     if (lease == null) {
                         postBridgeError(reply, id, 409, "unavailable", "network_guard_unavailable")
-                        return@execute
+                        return@dispatchBridge
                     }
                     val hook = NetworkDeviceTestHook.take(applicationContext)
                     if (hook == NetworkDeviceTestHook.ForegroundGuardUnavailable) {
                         postBridgeError(reply, id, 503, "unavailable", "network_guard_unavailable")
-                        return@execute
+                        return@dispatchBridge
                     }
                     val captured = NetworkSnapshotProvider.capture(applicationContext)
                     val snapshot = if (hook == NetworkDeviceTestHook.NoValidatedNetwork) {
