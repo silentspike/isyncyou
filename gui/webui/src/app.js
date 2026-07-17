@@ -5435,6 +5435,21 @@ function renderAssistantConsentPanel(providers) {
         icon("x", "icon-sm"), "Reset")));
 }
 
+let ASSISTANT_SCROLL_FRAME = 0;
+function scrollAssistantToEnd() {
+  if (ASSISTANT_SCROLL_FRAME) cancelAnimationFrame(ASSISTANT_SCROLL_FRAME);
+  ASSISTANT_SCROLL_FRAME = requestAnimationFrame(() => {
+    ASSISTANT_SCROLL_FRAME = 0;
+    const transcript = $("#asst-log");
+    const view = $("#view");
+    const transcriptScrolls = transcript
+      && getComputedStyle(transcript).overflowY !== "visible"
+      && transcript.scrollHeight > transcript.clientHeight + 1;
+    const scroller = transcriptScrolls ? transcript : view;
+    if (scroller) scroller.scrollTop = scroller.scrollHeight;
+  });
+}
+
 let ASSISTANT_RENDER_SEQUENCE = 0;
 async function renderAssistantView(view) {
   const renderSequence = ++ASSISTANT_RENDER_SEQUENCE;
@@ -5626,7 +5641,7 @@ function renderAssistantChat(body, st) {
     log.append(el("div", { class: "dim", style: "text-align:center;padding:2.5rem 1rem", text: "Ask me anything about your Microsoft 365 — I'll read your archive and answer with sources." }));
   } else {
     AssistantState.transcript.forEach(m => log.append(renderAssistantMessage(m)));
-    requestAnimationFrame(() => { log.scrollTop = log.scrollHeight; });
+    scrollAssistantToEnd();
   }
 }
 
@@ -6608,19 +6623,19 @@ async function agentSend(text) {
   bubble.insertBefore(thinkingEl, textEl);
   let thinkingDone = false;
   const clearThinking = () => { if (!thinkingDone) { thinkingDone = true; thinkingEl.remove(); } };
-  log.scrollTop = log.scrollHeight;
-  const setText = (t) => { if (t) clearThinking(); asst.text = t; textEl.textContent = t || ""; log.scrollTop = log.scrollHeight; };
+  scrollAssistantToEnd();
+  const setText = (t) => { if (t) clearThinking(); asst.text = t; textEl.textContent = t || ""; scrollAssistantToEnd(); };
   const addToolRow = (row) => {
     clearThinking();
     asst.tools.push(row);
     bubble.append(renderAgentToolRow(row));
-    log.scrollTop = log.scrollHeight;
+    scrollAssistantToEnd();
   };
   const addError = (message) => {
     clearThinking();
     asst.errors.push(message);
     bubble.append(renderAgentError(message));
-    log.scrollTop = log.scrollHeight;
+    scrollAssistantToEnd();
   };
   const setPending = (pending) => {
     clearThinking();
@@ -6628,7 +6643,7 @@ async function agentSend(text) {
     const old = bubble.querySelector("[data-agent-pending-card]");
     if (old) old.remove();
     bubble.append(renderAgentPendingCard(pending));
-    log.scrollTop = log.scrollHeight;
+    scrollAssistantToEnd();
   };
   let citationsBox = null;
   const addCitations = (sources) => {
@@ -6638,7 +6653,7 @@ async function agentSend(text) {
     if (citationsBox) citationsBox.remove();
     citationsBox = renderAgentCitationBar(asst.citations);
     bubble.append(citationsBox);
-    log.scrollTop = log.scrollHeight;
+    scrollAssistantToEnd();
   };
 
   // Progressive-search UI (S-AG.18/#643): a small plan with a live checkmark per stage
@@ -6651,7 +6666,7 @@ async function agentSend(text) {
     searchBox = el("div", { class: "asst-search" });
     resultsBox = el("div", { class: "asst-results" });
     bubble.append(searchBox, resultsBox);
-    log.scrollTop = log.scrollHeight;
+    scrollAssistantToEnd();
   };
   const onSearchStage = (d) => {
     ensureSearchUI();
@@ -6668,7 +6683,7 @@ async function agentSend(text) {
       const e = asst.stages.find(s => s.stage === d.stage);   // persist final stage state
       if (e) e.hits = d.hits; else asst.stages.push({ stage: d.stage, hits: d.hits });
     }
-    log.scrollTop = log.scrollHeight;
+    scrollAssistantToEnd();
   };
   const onPartialResult = (d) => {
     ensureSearchUI();
@@ -6676,7 +6691,7 @@ async function agentSend(text) {
       asst.results.push(it);                 // persist so the cards survive a view switch
       resultsBox.append(asstResultCard(it));  // module-level builder (shared with re-render)
     });
-    log.scrollTop = log.scrollHeight;
+    scrollAssistantToEnd();
   };
 
   let turn;

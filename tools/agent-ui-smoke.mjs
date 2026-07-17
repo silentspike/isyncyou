@@ -956,6 +956,28 @@ async function main() {
       && fixture.state.requestStatusReads.every((entry) => entry.matched === true)
       && !errorText.includes("raw-fixture-provider-error"));
 
+    const desktopScroll = await page.evaluate(async () => {
+      const transcript = document.querySelector("#asst-log");
+      const view = document.querySelector("#view");
+      const probe = document.createElement("div");
+      probe.style.cssText = "height:2000px;flex:none";
+      transcript.append(probe);
+      transcript.scrollTop = 0;
+      view.scrollTop = 0;
+      scrollAssistantToEnd();
+      await new Promise(requestAnimationFrame);
+      await new Promise(requestAnimationFrame);
+      const result = {
+        transcript_overflow: getComputedStyle(transcript).overflowY,
+        transcript_at_end: Math.abs(transcript.scrollHeight - transcript.clientHeight - transcript.scrollTop) <= 2,
+      };
+      probe.remove();
+      return result;
+    });
+    assert(evidence, "desktop Assistant auto-scrolls its transcript container",
+      desktopScroll.transcript_overflow !== "visible" && desktopScroll.transcript_at_end,
+      desktopScroll);
+
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto(`${origin}/?mobile-smoke=1#/assistant`, { waitUntil: "domcontentloaded" });
     await page.waitForSelector('[data-testid="agent-transcript"]', { timeout: 10000 });
@@ -967,6 +989,30 @@ async function main() {
       scrollWidth: document.documentElement.scrollWidth,
       clientWidth: document.documentElement.clientWidth,
     })));
+    const mobileScroll = await page.evaluate(async () => {
+      const transcript = document.querySelector("#asst-log");
+      const view = document.querySelector("#view");
+      const probe = document.createElement("div");
+      probe.style.cssText = "height:2000px;flex:none";
+      transcript.append(probe);
+      transcript.scrollTop = 0;
+      view.scrollTop = 0;
+      scrollAssistantToEnd();
+      await new Promise(requestAnimationFrame);
+      await new Promise(requestAnimationFrame);
+      const result = {
+        transcript_overflow: getComputedStyle(transcript).overflowY,
+        view_scrollable: view.scrollHeight > view.clientHeight,
+        view_at_end: Math.abs(view.scrollHeight - view.clientHeight - view.scrollTop) <= 2,
+      };
+      probe.remove();
+      return result;
+    });
+    assert(evidence, "mobile Assistant auto-scrolls the view container",
+      mobileScroll.transcript_overflow === "visible"
+      && mobileScroll.view_scrollable
+      && mobileScroll.view_at_end,
+      mobileScroll);
     evidence.screenshots.mobile_assistant = await screenshot(page, "mobile-assistant.png");
 
     evidence.runtime_transports = await page.evaluate(() => window.__agentSmokeTransport || []);
