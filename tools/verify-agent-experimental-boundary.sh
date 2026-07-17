@@ -65,6 +65,7 @@ verify_release_exclusion() {
   [[ -x target/release/isyncyoud ]] || die "release daemon is unavailable"
   scan_binary target/release/isyncyoud
 
+  env -u ISY_CARGO_FEATURES tools/build-android-native.sh
   (cd android && env -u ISY_CARGO_FEATURES ./gradlew clean :app:assembleDebug)
   local apk=android/app/build/outputs/apk/debug/app-debug.apk
   [[ -f "$apk" ]] || die "default debug APK is unavailable"

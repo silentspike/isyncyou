@@ -7,21 +7,26 @@ loopback; the WebView loads `http://127.0.0.1:<port>/`. No desktop daemon and no
 data (the laptop remains the backup-of-record). A thin shell — all features live in the
 web UI (`gui/webui/`), so the Kotlin stays small.
 
-## Build (Gradle + Kotlin + cargo-ndk)
+## Build (remote Rust + local Gradle/Kotlin)
 
 Standard Gradle project (migrated from the old manual `build.sh`, #573). Needs a
-JDK (17+), an Android SDK with `build-tools;34.0.0` + `platforms;android-34` + an NDK,
-the `aarch64-linux-android` Rust target and `cargo-ndk`. Point the SDK via
+JDK (17+) and an Android SDK with `build-tools;34.0.0` + `platforms;android-34`.
+Point the SDK via
 `local.properties` (`sdk.dir=…`, gitignored) or `ANDROID_HOME`.
 
 ```sh
+../tools/build-android-native.sh # cargo remote; never starts local Rust
 ./gradlew :app:assembleDebug      # -> app/build/outputs/apk/debug/app-debug.apk
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-The `cargoNdkBuild` Gradle task cross-compiles the embedded engine into
-`app/src/main/jniLibs/arm64-v8a/libisyncyou_mobile.so` before assembling (arm64 only for
-now; multi-arch is deferred). On launch, `MainActivity` calls `NativeEngine.nativeStart`,
+The remote step cross-compiles the embedded engine into
+`app/src/main/jniLibs/arm64-v8a/libisyncyou_mobile.so` and writes a binding manifest.
+Gradle never invokes `cargo` or `rustc`; `preBuild` validates the source commit, ABI,
+feature set, NDK version, and library hash before packaging. Missing or stale native
+output fails closed. The designated remote builder needs Rust 1.95.0, the requested
+Android targets, and NDK r27d at `/opt/android-ndk-r27d` (overridable with
+`ISY_REMOTE_ANDROID_NDK_HOME`). On launch, `MainActivity` calls `NativeEngine.nativeStart`,
 gets the loopback port + session token, and loads the local UI:
 
 ```sh

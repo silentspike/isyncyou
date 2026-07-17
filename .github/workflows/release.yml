@@ -471,6 +471,7 @@ jobs:
       - name: Build the signed release APK, versioned from the RC (REQ-AND-002)
         if: needs.preflight.outputs.mode == 'rc'
         env:
+          ISY_ANDROID_NATIVE_BUILDER: github-actions
           ISY_REQUIRE_RELEASE_SIGNING: "1"
           ISY_VERSION_CODE: ${{ github.run_number }}
         run: |
@@ -478,6 +479,7 @@ jobs:
           # monotonic CI run number. No literal "1"/"0.1" reaches the manifest.
           ver=$(awk '/^\[workspace\.package\]/{f=1} f&&/^version[[:space:]]*=/{gsub(/[" ]/,"",$3); print $3; exit}' Cargo.toml)
           echo "workspace version: $ver  versionCode: $ISY_VERSION_CODE"
+          tools/build-android-native.sh
           (cd android && ISY_VERSION_NAME="$ver" ./gradlew :app:assembleRelease)
       - name: Verify the APK is signed with the release key (REQ-AND-003)
         if: needs.preflight.outputs.mode == 'rc'
