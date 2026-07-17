@@ -631,6 +631,28 @@ fn terminal_events_after_persistence(
     )),
     allow(dead_code)
 )]
+fn terminal_error_events_after_persistence(
+    persisted: Result<(), String>,
+    safe_code: &str,
+) -> Vec<isyncyou_agent::StreamEvent> {
+    match persisted {
+        Ok(()) => vec![
+            isyncyou_agent::StreamEvent::Error(safe_code.into()),
+            isyncyou_agent::StreamEvent::done(isyncyou_agent::DoneReason::Error),
+        ],
+        Err(error) => {
+            terminal_events_after_persistence(Err(error), isyncyou_agent::DoneReason::Error)
+        }
+    }
+}
+
+#[cfg_attr(
+    not(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    )),
+    allow(dead_code)
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TurnAuthorityState {
     Running,
@@ -7796,19 +7818,21 @@ impl DaemonAgent {
                         let action = *action;
                         let preview = match agent_ops::preview_for_pending_action(&action) {
                             Ok(preview) => preview,
-                            Err(error) => {
-                                let _ = hub.emit(
-                                    &tid,
-                                    isyncyou_agent::StreamEvent::Error(
-                                        agent_ops::redact_agent_operation_text(&error),
-                                    ),
-                                );
-                                let _ = hub.emit(
-                                    &tid,
-                                    isyncyou_agent::StreamEvent::done(
-                                        isyncyou_agent::DoneReason::Error,
-                                    ),
-                                );
+                            Err(_) => {
+                                let persisted = product_turn.take().map_or(Ok(()), |runtime| {
+                                    runtime.finish_terminal(
+                                        isyncyou_agent::TurnTerminalStatus::Error,
+                                        Some("confirmation_unavailable".into()),
+                                        isyncyou_agent::RequestPhase::Failed,
+                                        unix_now_ms(),
+                                    )
+                                });
+                                for event in terminal_error_events_after_persistence(
+                                    persisted,
+                                    "confirmation_unavailable",
+                                ) {
+                                    let _ = hub.emit(&tid, event);
+                                }
                                 hub.close(&tid);
                                 turns.remove(&tid);
                                 return;
@@ -7885,30 +7909,23 @@ impl DaemonAgent {
                                 }
                             }
                             Err(error) => {
-                                if error == "lease_lost" {
-                                    let _ = hub.emit(
-                                        &tid,
-                                        isyncyou_agent::StreamEvent::Error("lease_lost".into()),
-                                    );
-                                    let _ = hub.emit(
-                                        &tid,
-                                        isyncyou_agent::StreamEvent::done(
-                                            isyncyou_agent::DoneReason::Error,
-                                        ),
-                                    );
+                                let persisted = if error == "lease_lost" {
+                                    Err(error)
                                 } else {
-                                    let _ = hub.emit(
-                                        &tid,
-                                        isyncyou_agent::StreamEvent::Error(
-                                            "confirmation_unavailable".into(),
-                                        ),
-                                    );
-                                    let _ = hub.emit(
-                                        &tid,
-                                        isyncyou_agent::StreamEvent::done(
-                                            isyncyou_agent::DoneReason::Error,
-                                        ),
-                                    );
+                                    product_turn.take().map_or(Ok(()), |runtime| {
+                                        runtime.finish_terminal(
+                                            isyncyou_agent::TurnTerminalStatus::Error,
+                                            Some("confirmation_unavailable".into()),
+                                            isyncyou_agent::RequestPhase::Failed,
+                                            unix_now_ms(),
+                                        )
+                                    })
+                                };
+                                for event in terminal_error_events_after_persistence(
+                                    persisted,
+                                    "confirmation_unavailable",
+                                ) {
+                                    let _ = hub.emit(&tid, event);
                                 }
                             }
                         }
@@ -22418,6 +22435,35 @@ fn persist_failure_emits_error_and_done_error_not_complete() {
         isyncyou_agent::StreamEvent::Done {
             reason: isyncyou_agent::DoneReason::Error
         }
+    ));
+}
+
+#[cfg(test)]
+#[test]
+fn pending_setup_error_is_emitted_only_after_terminal_persistence() {
+    let persisted = terminal_error_events_after_persistence(Ok(()), "confirmation_unavailable");
+    assert!(matches!(
+        &persisted[..],
+        [
+            isyncyou_agent::StreamEvent::Error(code),
+            isyncyou_agent::StreamEvent::Done {
+                reason: isyncyou_agent::DoneReason::Error
+            }
+        ] if code == "confirmation_unavailable"
+    ));
+
+    let failed = terminal_error_events_after_persistence(
+        Err("manifest_conflict".into()),
+        "confirmation_unavailable",
+    );
+    assert!(matches!(
+        &failed[..],
+        [
+            isyncyou_agent::StreamEvent::Error(code),
+            isyncyou_agent::StreamEvent::Done {
+                reason: isyncyou_agent::DoneReason::Error
+            }
+        ] if code == "lease_lost"
     ));
 }
 
