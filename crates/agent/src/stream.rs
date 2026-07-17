@@ -106,6 +106,39 @@ impl AgentStreamHub {
         }
     }
 
+    /// Emit a host-owned terminal event after durable terminal persistence.
+    ///
+    /// Cancellation blocks normal events immediately, but the receiver still needs one truthful
+    /// terminal result. Only `error` and `done` can use this path, and the bounded queue timeout is
+    /// retained.
+    pub fn emit_terminal(&self, turn_id: &str, event: StreamEvent) -> bool {
+        if !matches!(event, StreamEvent::Error(_) | StreamEvent::Done { .. }) {
+            return false;
+        }
+        let tx = {
+            let turns = self.turns.lock().unwrap();
+            match turns.get(turn_id) {
+                Some(sink) => sink.tx.clone(),
+                None => return false,
+            }
+        };
+        let deadline = Instant::now() + DEFAULT_EMIT_TIMEOUT;
+        let mut event = event;
+        loop {
+            match tx.try_send(event) {
+                Ok(()) => return true,
+                Err(TrySendError::Disconnected(_event)) => return false,
+                Err(TrySendError::Full(returned)) => {
+                    event = returned;
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(EMIT_RETRY_SLEEP);
+                }
+            }
+        }
+    }
+
     /// Mark a turn cancelled. The host persists the cancelled terminal state before
     /// emitting `done(cancelled)`; this method deliberately emits no event itself.
     pub fn cancel(&self, turn_id: &str) -> bool {
@@ -196,6 +229,21 @@ mod tests {
             !hub.emit("t1", StreamEvent::Token("x".into())),
             "no emit after cancel"
         );
+    }
+
+    #[test]
+    fn cancelled_turn_accepts_only_host_terminal_events() {
+        let hub = AgentStreamHub::new();
+        let rx = hub.open("cancel-terminal", 4);
+        assert!(hub.cancel("cancel-terminal"));
+        assert!(!hub.emit_terminal("cancel-terminal", StreamEvent::Token("late".into())));
+        assert!(hub.emit_terminal("cancel-terminal", StreamEvent::done(DoneReason::Cancelled)));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            StreamEvent::Done {
+                reason: DoneReason::Cancelled
+            }
+        ));
     }
 
     #[test]

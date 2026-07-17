@@ -8349,7 +8349,7 @@ impl DaemonAgent {
                                     persisted,
                                     isyncyou_agent::DoneReason::Cancelled,
                                 ) {
-                                    let _ = hub.emit(&tid, event);
+                                    let _ = hub.emit_terminal(&tid, event);
                                 }
                             }
                             Err(error) => {
@@ -8396,18 +8396,18 @@ impl DaemonAgent {
                             isyncyou_agent::RequestPhase::Cancelled,
                         );
                         if persisted.is_ok() {
-                            let _ = hub.emit(
+                            let _ = hub.emit_terminal(
                                 &tid,
                                 isyncyou_agent::StreamEvent::done(
                                     isyncyou_agent::DoneReason::Cancelled,
                                 ),
                             );
                         } else {
-                            let _ = hub.emit(
+                            let _ = hub.emit_terminal(
                                 &tid,
                                 isyncyou_agent::StreamEvent::Error("lease_lost".into()),
                             );
-                            let _ = hub.emit(
+                            let _ = hub.emit_terminal(
                                 &tid,
                                 isyncyou_agent::StreamEvent::done(
                                     isyncyou_agent::DoneReason::Error,
