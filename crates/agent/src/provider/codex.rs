@@ -216,6 +216,66 @@ pub(crate) fn build_request(
 
 type CodexToolArgs = (String, String);
 
+fn apply_output_message(item: &Value, text: &mut String) -> Result<Option<String>, AgentError> {
+    let complete = item
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|content| content.get("type").and_then(Value::as_str) == Some("output_text"))
+        .filter_map(|content| content.get("text").and_then(Value::as_str))
+        .collect::<String>();
+    if complete.is_empty() || complete == *text {
+        return Ok(None);
+    }
+    if text.is_empty() {
+        text.push_str(&complete);
+        return Ok(Some(complete));
+    }
+    if let Some(suffix) = complete.strip_prefix(text.as_str()) {
+        text.push_str(suffix);
+        return Ok((!suffix.is_empty()).then(|| suffix.to_owned()));
+    }
+    Err(AgentError::Provider(
+        "codex: completed message differs from streamed text".into(),
+    ))
+}
+
+fn apply_output_item(
+    item: &Value,
+    text: &mut String,
+    tools: &mut Vec<CodexToolArgs>,
+    reasoning: &mut Vec<CodexReasoningContext>,
+) -> Result<Option<String>, AgentError> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("message") => apply_output_message(item, text),
+        Some("function_call") => {
+            let id = item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let args = item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("{}")
+                .to_string();
+            tools.push((id, args));
+            Ok(None)
+        }
+        Some("reasoning") => {
+            if reasoning.len() >= MAX_REASONING_ITEMS_PER_ROUND {
+                return Err(AgentError::Provider(
+                    "codex: too many reasoning items".into(),
+                ));
+            }
+            reasoning.push(replayable_reasoning_context(item)?);
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
 fn apply_sse_event(
     data: &str,
     text: &mut String,
@@ -239,37 +299,31 @@ fn apply_sse_event(
         }
         Some("response.output_item.done") => {
             if let Some(item) = v.get("item") {
-                match item.get("type").and_then(Value::as_str) {
-                    Some("function_call") => {
-                        let id = item
-                            .get("call_id")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        let args = item
-                            .get("arguments")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("{}")
-                            .to_string();
-                        tools.push((id, args));
-                    }
-                    Some("reasoning") => {
-                        if reasoning.len() >= MAX_REASONING_ITEMS_PER_ROUND {
-                            return Err(AgentError::Provider(
-                                "codex: too many reasoning items".into(),
-                            ));
-                        }
-                        reasoning.push(replayable_reasoning_context(item)?);
-                    }
-                    _ => {}
-                }
+                return apply_output_item(item, text, tools, reasoning);
             }
         }
         Some("response.completed") => {
-            if let Some(u) = v.get("response").and_then(|r| r.get("usage")) {
+            let response = v.get("response");
+            let mut completed_delta = String::new();
+            if text.is_empty() && tools.is_empty() {
+                if let Some(output) = response
+                    .and_then(|response| response.get("output"))
+                    .and_then(Value::as_array)
+                {
+                    for item in output {
+                        if let Some(delta) = apply_output_item(item, text, tools, reasoning)? {
+                            completed_delta.push_str(&delta);
+                        }
+                    }
+                }
+            }
+            if let Some(u) = response.and_then(|r| r.get("usage")) {
                 let g = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
                 usage.input_tokens = g("input_tokens");
                 usage.output_tokens = g("output_tokens");
+            }
+            if !completed_delta.is_empty() {
+                return Ok(Some(completed_delta));
             }
         }
         Some("response.failed") => {
@@ -352,6 +406,11 @@ fn finish_sse_blocks(
     for (id, args) in tools {
         let input: Value = serde_json::from_str(&args).unwrap_or(Value::Null);
         blocks.push(AssistantBlock::ToolUse { id, input });
+    }
+    if blocks.is_empty() {
+        return Err(AgentError::Provider(
+            "codex: response completed without assistant output".into(),
+        ));
     }
     Ok((blocks, usage))
 }
@@ -738,6 +797,37 @@ data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\"
         assert!(matches!(&blocks[0], AssistantBlock::Text(t) if t == "hello codex"));
         assert_eq!(usage.input_tokens, 22);
         assert_eq!(usage.output_tokens, 8);
+    }
+
+    #[test]
+    fn parse_sse_recovers_completed_message_when_text_deltas_are_absent() {
+        let sse = "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"fallback text\"}]}}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":3}}}\n";
+
+        let (blocks, usage) = parse_sse(sse).unwrap();
+
+        assert!(matches!(&blocks[0], AssistantBlock::Text(text) if text == "fallback text"));
+        assert_eq!(usage.output_tokens, 3);
+    }
+
+    #[test]
+    fn parse_sse_recovers_output_from_completed_response_and_deduplicates_deltas() {
+        let fallback = "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"completed text\"}]}]}}\n";
+        let (blocks, _) = parse_sse(fallback).unwrap();
+        assert!(matches!(&blocks[0], AssistantBlock::Text(text) if text == "completed text"));
+
+        let streamed = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"completed text\"}\n\n\
+data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"completed text\"}]}}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{}}\n";
+        let (blocks, _) = parse_sse(streamed).unwrap();
+        assert!(matches!(&blocks[0], AssistantBlock::Text(text) if text == "completed text"));
+    }
+
+    #[test]
+    fn parse_sse_rejects_completed_response_without_assistant_output() {
+        let error =
+            parse_sse("data: {\"type\":\"response.completed\",\"response\":{}}\n").unwrap_err();
+        assert!(error.to_string().contains("without assistant output"));
     }
 
     #[test]
