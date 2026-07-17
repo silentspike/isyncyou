@@ -23,6 +23,14 @@ class AndroidNativeBuildBoundaryTests(unittest.TestCase):
         self.assertIn("source_commit=", source)
         self.assertIn("sha256.%s=", source)
 
+    def test_native_builder_requires_16k_elf_alignment(self) -> None:
+        source = (ROOT / "tools/build-android-native.sh").read_text(encoding="utf-8")
+        self.assertIn("max-page-size=16384", source)
+        self.assertIn("common-page-size=16384", source)
+        self.assertIn('RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$ANDROID_PAGE_RUSTFLAGS"', source)
+        self.assertIn('verify_elf_page_alignment "$source_library"', source)
+        self.assertIn("alignment >= 0x4000", source)
+
 
 if __name__ == "__main__":
     unittest.main()

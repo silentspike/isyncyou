@@ -10,6 +10,7 @@ REMOTE_NDK=${ISY_REMOTE_ANDROID_NDK_HOME:-/opt/android-ndk-r27d}
 BUILDER=${ISY_ANDROID_NATIVE_BUILDER:-remote}
 ABIS=${ISY_ANDROID_ABIS:-arm64-v8a}
 FEATURES=${ISY_CARGO_FEATURES:-}
+ANDROID_PAGE_RUSTFLAGS='-Clink-arg=-Wl,-z,max-page-size=16384 -Clink-arg=-Wl,-z,common-page-size=16384'
 
 die() {
   printf 'android native build failed: %s\n' "$1" >&2
@@ -24,6 +25,27 @@ contains() {
     [[ $value == "$needle" ]] && return 0
   done
   return 1
+}
+
+verify_elf_page_alignment() {
+  local library=$1
+  local readelf_bin
+  if command -v llvm-readelf >/dev/null 2>&1; then
+    readelf_bin=llvm-readelf
+  elif command -v readelf >/dev/null 2>&1; then
+    readelf_bin=readelf
+  else
+    die "llvm-readelf or readelf is required to verify 16 KiB ELF alignment"
+  fi
+
+  local alignments=()
+  mapfile -t alignments < <("$readelf_bin" -lW "$library" | awk '$1 == "LOAD" { print $NF }')
+  (( ${#alignments[@]} > 0 )) || die "native library has no ELF LOAD segments"
+  local alignment
+  for alignment in "${alignments[@]}"; do
+    (( alignment >= 0x4000 )) || \
+      die "native library LOAD segment is not 16 KiB aligned"
+  done
 }
 
 allowed_features=(
@@ -89,8 +111,9 @@ for abi in "${canonical_abis[@]}"; do
     remote)
       remote_bin="$REMOTE_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
       mkdir -p "$ROOT/target/$target/release"
-      target_env=$(printf 'RUST_BACKTRACE=1 RUSTUP_TOOLCHAIN=%s CARGO_TARGET_%s_LINKER=%s/%s CC_%s=%s/%s AR_%s=%s/llvm-ar' \
-        "$RUST_TOOLCHAIN" "$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')" \
+      target_env=$(printf 'RUST_BACKTRACE=1 RUSTUP_TOOLCHAIN=%s RUSTFLAGS=%q CARGO_TARGET_%s_LINKER=%s/%s CC_%s=%s/%s AR_%s=%s/llvm-ar' \
+        "$RUST_TOOLCHAIN" "$ANDROID_PAGE_RUSTFLAGS" \
+        "$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')" \
         "$remote_bin" "${linkers[$abi]}" \
         "$(printf '%s' "$target" | tr '-' '_')" "$remote_bin" "${linkers[$abi]}" \
         "$(printf '%s' "$target" | tr '-' '_')" "$remote_bin")
@@ -104,7 +127,8 @@ for abi in "${canonical_abis[@]}"; do
         die "the github-actions backend is forbidden outside GitHub Actions"
       local_ndk=${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-${ANDROID_HOME:-}/ndk/$NDK_VERSION}}
       [[ -n $local_ndk ]] || die "ANDROID_NDK_HOME is required on the GitHub runner"
-      cargo "+$RUST_TOOLCHAIN" ndk -t "$abi" -o "$stage" \
+      env RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$ANDROID_PAGE_RUSTFLAGS" \
+        cargo "+$RUST_TOOLCHAIN" ndk -t "$abi" -o "$stage" \
         build --locked --release -p isyncyou-mobile "${feature_args[@]}"
       source_library="$stage/$abi/libisyncyou_mobile.so"
       ;;
@@ -114,6 +138,7 @@ for abi in "${canonical_abis[@]}"; do
   esac
 
   [[ -s $source_library ]] || die "native library was not produced for '$abi'"
+  verify_elf_page_alignment "$source_library"
   if [[ $source_library != "$stage/$abi/libisyncyou_mobile.so" ]]; then
     cp -- "$source_library" "$stage/$abi/libisyncyou_mobile.so"
   fi
