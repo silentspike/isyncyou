@@ -13419,15 +13419,12 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             );
         }
 
-        let toolbar_css = APP_CSS
-            .split(".assistant-toolbar {")
-            .nth(1)
-            .expect("assistant toolbar CSS")
-            .split('}')
-            .next()
-            .expect("assistant toolbar CSS block");
         assert!(
-            toolbar_css.contains("position: relative;") && toolbar_css.contains("z-index: 2;"),
+            APP_CSS
+                .split(".assistant-toolbar {")
+                .skip(1)
+                .filter_map(|css| css.split('}').next())
+                .any(|css| css.contains("position: relative;") && css.contains("z-index: 2;")),
             "model picker toolbar must stack above the transcript"
         );
         let usage_renderer = APP_JS
