@@ -11250,15 +11250,25 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
             if logins.len() >= MICROSOFT_LOGIN_LIMIT {
                 return Err("account_login_busy".into());
             }
-            if logins.values().any(|login| {
-                login.lock().is_ok_and(|state| {
-                    state.account == account
-                        && state.role == role
-                        && !state.done
-                        && state.error_code.is_none()
-                })
-            }) {
-                return Err("account_login_in_progress".into());
+            let mut replace = Vec::new();
+            for (existing_id, login) in logins.iter() {
+                let mut existing = login
+                    .lock()
+                    .map_err(|_| "account_login_unavailable".to_string())?;
+                if existing.account == account
+                    && existing.role == role
+                    && !existing.done
+                    && existing.error_code.is_none()
+                {
+                    if existing.exchange_in_flight {
+                        return Err("account_login_in_progress".into());
+                    }
+                    existing.error_code = Some("account_login_cancelled");
+                    replace.push(*existing_id);
+                }
+            }
+            for existing_id in replace {
+                logins.remove(&existing_id);
             }
             logins.insert(id, Arc::clone(&state));
         }
@@ -23801,6 +23811,76 @@ fn microsoft_account_login_start_uses_picker_and_cancel_closes_attempt() {
     assert!(!isyncyou_webui::AccountAuthHandler::cancel_login(
         &auth,
         &exchange_id.to_string()
+    ));
+    std::thread::sleep(Duration::from_millis(100));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(test)]
+#[test]
+fn microsoft_account_login_start_replaces_only_orphaned_idle_attempt() {
+    let root = std::env::temp_dir().join(format!(
+        "isyncyou-account-login-replace-{}-{}",
+        std::process::id(),
+        LOGIN_SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    let archive = root.join("archive");
+    std::fs::create_dir_all(&archive).unwrap();
+    let auth = DaemonAccountAuth {
+        cfg: Config {
+            accounts: vec![isyncyou_core::AccountConfig {
+                id: "account-slot".into(),
+                username: "account-slot".into(),
+                sync_root: root.join("sync"),
+                archive_root: archive,
+                cache_root: root.join("cache"),
+                mount_point: None,
+            }],
+            ..Default::default()
+        },
+        logins: Mutex::new(std::collections::HashMap::new()),
+    };
+
+    let first = isyncyou_webui::AccountAuthHandler::start_login(
+        &auth,
+        "account-slot",
+        isyncyou_webui::AccountAuthRole::Writer,
+    )
+    .unwrap();
+    let first_id = first["login_id"].as_str().unwrap().to_string();
+    let second = isyncyou_webui::AccountAuthHandler::start_login(
+        &auth,
+        "account-slot",
+        isyncyou_webui::AccountAuthRole::Writer,
+    )
+    .unwrap();
+    let second_id = second["login_id"].as_str().unwrap().to_string();
+    assert_ne!(first_id, second_id);
+    assert_eq!(
+        isyncyou_webui::AccountAuthHandler::poll_login(&auth, &first_id)["code"],
+        "account_login_not_found"
+    );
+
+    let second_state = auth
+        .logins
+        .lock()
+        .unwrap()
+        .get(&second_id.parse::<u64>().unwrap())
+        .cloned()
+        .unwrap();
+    second_state.lock().unwrap().exchange_in_flight = true;
+    assert_eq!(
+        isyncyou_webui::AccountAuthHandler::start_login(
+            &auth,
+            "account-slot",
+            isyncyou_webui::AccountAuthRole::Writer,
+        )
+        .unwrap_err(),
+        "account_login_in_progress"
+    );
+    second_state.lock().unwrap().exchange_in_flight = false;
+    assert!(isyncyou_webui::AccountAuthHandler::cancel_login(
+        &auth, &second_id
     ));
     std::thread::sleep(Duration::from_millis(100));
     let _ = std::fs::remove_dir_all(root);
