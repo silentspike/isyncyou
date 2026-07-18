@@ -556,6 +556,13 @@ const HOT_SESSION_HISTORY_RETRY_DELAY: Duration = Duration::from_secs(5);
     feature = "agent-subscription-experimental",
     test
 ))]
+const HOT_SESSION_HISTORY_READY_TTL: Duration = Duration::from_secs(5);
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
 #[derive(Default)]
 struct HotRequestStatusCache {
     entries: Mutex<HashMap<(String, String), (isyncyou_agent::RequestPhase, u64)>>,
@@ -645,7 +652,10 @@ impl HotAgentStatusCache {
 #[derive(Clone)]
 enum HotSessionHistoryState {
     Loading,
-    Ready(isyncyou_agent::HistoryPageV1),
+    Ready {
+        page: isyncyou_agent::HistoryPageV1,
+        revalidate_at: std::time::Instant,
+    },
     Failed(std::time::Instant),
 }
 
@@ -698,7 +708,16 @@ impl HotSessionHistoryCache {
         if let Some(entry) = entries.get_mut(key) {
             return match &entry.state {
                 HotSessionHistoryState::Loading => HotSessionHistoryLookup::Loading,
-                HotSessionHistoryState::Ready(page) => HotSessionHistoryLookup::Ready(page.clone()),
+                HotSessionHistoryState::Ready {
+                    page,
+                    revalidate_at,
+                } if std::time::Instant::now() < *revalidate_at => {
+                    HotSessionHistoryLookup::Ready(page.clone())
+                }
+                HotSessionHistoryState::Ready { .. } => {
+                    entry.state = HotSessionHistoryState::Loading;
+                    HotSessionHistoryLookup::Start
+                }
                 HotSessionHistoryState::Failed(retry_at)
                     if std::time::Instant::now() < *retry_at =>
                 {
@@ -745,7 +764,10 @@ impl HotSessionHistoryCache {
             return;
         };
         entry.state = match result {
-            Ok(page) => HotSessionHistoryState::Ready(page),
+            Ok(page) => HotSessionHistoryState::Ready {
+                page,
+                revalidate_at: std::time::Instant::now() + HOT_SESSION_HISTORY_READY_TTL,
+            },
             Err(_) => HotSessionHistoryState::Failed(
                 std::time::Instant::now() + HOT_SESSION_HISTORY_RETRY_DELAY,
             ),
@@ -779,7 +801,7 @@ impl HotSessionHistoryCache {
         let mut manifest_generation = None;
         loop {
             let entry = entries.get(&(session_id.to_owned(), cursor.clone(), limit))?;
-            let HotSessionHistoryState::Ready(page) = &entry.state else {
+            let HotSessionHistoryState::Ready { page, .. } = &entry.state else {
                 return None;
             };
             match manifest_generation {
@@ -23330,6 +23352,38 @@ fn session_history_hot_cache_coalesces_completes_and_invalidates() {
     assert!(snapshot.records.is_empty());
     cache.invalidate("session");
     assert_eq!(cache.lookup_or_start(&key), HotSessionHistoryLookup::Start);
+}
+
+#[cfg(test)]
+#[test]
+fn session_history_hot_cache_revalidates_ready_pages_after_ttl() {
+    let cache = HotSessionHistoryCache::default();
+    let key = ("session".to_string(), String::new(), 100);
+    assert_eq!(cache.lookup_or_start(&key), HotSessionHistoryLookup::Start);
+    let page = isyncyou_agent::HistoryPageV1 {
+        manifest_generation: 7,
+        records: Vec::new(),
+        next_cursor: None,
+    };
+    cache.complete(&key, Ok(page.clone()));
+    assert_eq!(
+        cache.lookup_or_start(&key),
+        HotSessionHistoryLookup::Ready(page)
+    );
+    {
+        let mut entries = cache.entries.lock().unwrap();
+        let HotSessionHistoryState::Ready { revalidate_at, .. } =
+            &mut entries.get_mut(&key).unwrap().state
+        else {
+            panic!("history page was not ready");
+        };
+        *revalidate_at = std::time::Instant::now();
+    }
+    assert_eq!(cache.lookup_or_start(&key), HotSessionHistoryLookup::Start);
+    assert_eq!(
+        cache.lookup_or_start(&key),
+        HotSessionHistoryLookup::Loading
+    );
 }
 
 #[cfg(test)]
