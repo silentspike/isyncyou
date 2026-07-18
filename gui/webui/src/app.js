@@ -516,7 +516,6 @@ function openEventStream(path, onEvent, onError) {
   const es = new EventSource(path);
   es.onmessage = (e) => onEvent("message", e.data);
   es.addEventListener("change", () => onEvent("change", ""));
-  es.addEventListener("done", () => onEvent("done", ""));
   es.onerror = () => { if (onError) onError(); };
   return { close() { try { es.close(); } catch (_) {} } };
 }
@@ -6867,8 +6866,8 @@ async function agentSend(text) {
 
   const url = "/api/v1/agent/stream?" + qs({ turn });
   // Transport-abstracted (#0A): the native bridge push channel on the phone, EventSource on
-  // desktop. The agent's events arrive as `message` (a data line to JSON-parse); a `done`
-  // event or a stream drop ends the turn.
+  // desktop. The agent's events arrive as `message` (a data line to JSON-parse). Only a
+  // host-emitted JSON terminal event completes the turn; a transport drop is reconciled.
   let stream;
   const finish = (msg, terminalReason) => {
     clearThinking();
@@ -6894,7 +6893,6 @@ async function agentSend(text) {
     reconcileRequestStatus,
   };
   stream = openEventStream(url, (name, data) => {
-    if (name === "done") { handleAgentEvent({ event: "done", reason: "complete" }, turnState); return; }
     if (name !== "message") return; // ignore ping heartbeats
     let d;
     try { d = JSON.parse(data); }

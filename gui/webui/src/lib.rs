@@ -2740,7 +2740,8 @@ impl Router {
                 std::thread::spawn(move || {
                     // Each inner item is one pre-serialized agent event (a JSON string);
                     // carry it as the `data` field so app.js JSON-parses it as it does the
-                    // EventSource `data:` line. Terminate with a `done` event.
+                    // EventSource `data:` line. A closed source ends the transport; only
+                    // the app-host payload is allowed to declare a terminal outcome.
                     for line in inner.iter() {
                         let msg =
                             serde_json::json!({ "event": "message", "data": line }).to_string();
@@ -2748,7 +2749,6 @@ impl Router {
                             return;
                         }
                     }
-                    let _ = tx.send(r#"{"event":"done","data":""}"#.to_string());
                 });
                 Some(rx)
             }
@@ -10327,6 +10327,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             first.contains("\"message\"") && first.contains("token"),
             "agent line wrapped as data: {first}"
         );
+        assert_eq!(
+            arx.recv_timeout(Duration::from_secs(2)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            "a dropped host stream must not synthesize terminal success"
+        );
         // Unknown path → None.
         assert!(router
             .open_bridge_stream("/api/v1/nope", Some("s"))
@@ -13372,7 +13377,6 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "renderAgentError(message)",
             "Invalid stream payload",
             "handleAgentEvent(d, turnState);",
-            "handleAgentEvent({ event: \"done\", reason: \"complete\" }, turnState)",
             "reason === \"pending_confirmation\"",
         ] {
             assert!(
@@ -13387,6 +13391,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(
             !APP_JS.contains("case \"confirmation_required\": addChip"),
             "confirmation_required must render/store a PendingAction placeholder, not a text chip"
+        );
+        assert!(
+            !APP_JS
+                .contains("handleAgentEvent({ event: \"done\", reason: \"complete\" }, turnState)"),
+            "transport closure must not be converted into a successful host terminal event"
         );
         let start = APP_JS
             .find("function agentCompactValue")

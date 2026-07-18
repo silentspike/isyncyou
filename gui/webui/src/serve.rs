@@ -967,7 +967,8 @@ fn handle_sse<S: Conn>(stream: &mut S, bus: &EventBus) -> std::io::Result<()> {
 /// Stream one agent turn's pre-serialized events as SSE until the turn ends or the peer
 /// disconnects. Each `Receiver<String>` item is a single-line JSON `data:` payload; a
 /// 5 s timeout emits a heartbeat; `Disconnected` (the turn closed its sender) ends the
-/// stream cleanly with a `done` event.
+/// transport without inventing a terminal event. Only app-host may emit a truthful
+/// persisted `done` payload.
 fn handle_agent_sse<S: Conn>(
     stream: &mut S,
     rx: std::sync::mpsc::Receiver<String>,
@@ -993,10 +994,7 @@ fn handle_agent_sse_with_interval<S: Conn>(
         match rx.recv_timeout(heartbeat_interval) {
             Ok(data) => stream.write_all(format!("data: {data}\n\n").as_bytes())?,
             Err(RecvTimeoutError::Timeout) => stream.write_all(b": keep-alive\n\n")?,
-            Err(RecvTimeoutError::Disconnected) => {
-                stream.write_all(b"event: done\ndata: {}\n\n")?;
-                return stream.flush();
-            }
+            Err(RecvTimeoutError::Disconnected) => return stream.flush(),
         }
         stream.flush()?; // Err when the peer closed -> end the stream
     }
@@ -1142,6 +1140,28 @@ mod tests {
 
         drop(sender);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn agent_sse_disconnect_never_synthesizes_terminal_success() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(sender);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            handle_agent_sse_with_interval(&mut stream, receiver, Duration::from_millis(20))
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        server.join().unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains(": connected\n\n"));
+        assert!(!response.contains("event: done"));
     }
 
     #[test]
