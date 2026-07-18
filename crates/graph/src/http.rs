@@ -494,12 +494,7 @@ impl GraphClient {
             url.push_str("?$select=");
             url.push_str(&select.join(","));
         }
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(&self.token)
-            .send()
-            .map_err(UploadError::from_reqwest)?;
+        let resp = self.get_with_retry(&url)?;
         match resp.status().as_u16() {
             200 => Ok(Some(
                 resp.json::<serde_json::Value>()
@@ -517,12 +512,7 @@ impl GraphClient {
     /// process-local monotonic receipt instant only to reject stale samples; it is never persisted.
     pub fn server_time_sample(&self) -> Result<ServerTimeSample, UploadError> {
         let url = format!("{}/me/drive/root?$select=id", self.base);
-        let response = self
-            .client
-            .get(url)
-            .bearer_auth(&self.token)
-            .send()
-            .map_err(UploadError::from_reqwest)?;
+        let response = self.get_with_retry(&url)?;
         if !response.status().is_success() {
             return Err(UploadError::Http {
                 status: response.status().as_u16(),
@@ -3043,6 +3033,32 @@ mod tests {
             "unexpected request: {}",
             seen[0]
         );
+    }
+
+    #[test]
+    fn session_manifest_reads_and_server_time_use_bounded_get_retry() {
+        let (base, server) = serve(vec![
+            http_response(503, "Service Unavailable", "Retry-After: 0\r\n", "{}"),
+            http_response(200, "OK", "", "{\"id\":\"manifest\"}"),
+        ]);
+        let item = GraphClient::new("tok")
+            .with_base_url(&base)
+            .get_drive_item_by_path("Apps/iSyncYou/agent/v2/session/manifest.json", &["id"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(item["id"], "manifest");
+        assert_eq!(server.join().unwrap().len(), 2);
+
+        let (base, server) = serve(vec![
+            http_response(503, "Service Unavailable", "Retry-After: 0\r\n", "{}"),
+            http_response(200, "OK", "Date: Wed, 01 Jan 2025 00:00:00 GMT\r\n", "{}"),
+        ]);
+        let sample = GraphClient::new("tok")
+            .with_base_url(&base)
+            .server_time_sample()
+            .unwrap();
+        assert!(sample.server_unix_ms > 0);
+        assert_eq!(server.join().unwrap().len(), 2);
     }
 
     #[test]

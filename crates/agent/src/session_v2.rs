@@ -45,6 +45,7 @@ const MAX_INDEX_PAGE_ENTRIES: usize = 256;
 const MAX_INDEX_PAGE_COALESCE_READS: usize = 1;
 const MAX_RECENT_INDEX_PAGE_READS: usize = 4;
 const MAX_PARALLEL_OBJECT_READS: usize = 8;
+const MAX_PRE_CAS_PUBLISH_ATTEMPTS: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionWritePolicy {
@@ -660,7 +661,8 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
             uuid_binding_index_head: binding_page.head.clone().map(Some),
         })?;
         self.transport
-            .compare_and_swap_manifest(current, &next)?
+            .compare_and_swap_manifest(current, &next)
+            .map_err(|_| SessionV2Error::LeaseLost)?
             .ok_or(SessionV2Error::ManifestConflict)
     }
 
@@ -1776,7 +1778,7 @@ impl<T: SessionV2Transport + Clone + 'static> SessionV2Store<T> {
                             let Ok(mut state) = worker_state.lock() else {
                                 break;
                             };
-                            if state.lost || !transient_renewal_error(&error) {
+                            if state.lost || !transient_transport_error(&error) {
                                 state.lost = true;
                                 break;
                             }
@@ -1816,7 +1818,7 @@ impl<T: SessionV2Transport + Clone + 'static> SessionLeaseGuard<T> {
     }
 
     pub fn publish(&self, commit: SessionCommitV1) -> Result<(), SessionV2Error> {
-        let now = fresh_server_time(&self.store.transport)?;
+        let now = fresh_server_time_with_retry(&self.store.transport)?;
         let mut state = self.state.lock().map_err(|_| SessionV2Error::LeaseLost)?;
         observe_server_time(&mut state, now)?;
         if state.lost
@@ -1839,16 +1841,27 @@ impl<T: SessionV2Transport + Clone + 'static> SessionLeaseGuard<T> {
         {
             return Err(SessionV2Error::LeaseLost);
         }
-        match self.store.publish(&state.current, commit) {
-            Ok(current) => {
-                state.current = current;
-                Ok(())
-            }
-            Err(error) => {
-                state.lost = true;
+        for attempt in 0..MAX_PRE_CAS_PUBLISH_ATTEMPTS {
+            match self.store.publish(&state.current, commit.clone()) {
+                Ok(current) => {
+                    state.current = current;
+                    return Ok(());
+                }
                 Err(error)
+                    if attempt + 1 < MAX_PRE_CAS_PUBLISH_ATTEMPTS
+                        && transient_transport_error(&error) => {}
+                Err(error) => {
+                    if matches!(
+                        error,
+                        SessionV2Error::LeaseLost | SessionV2Error::ManifestConflict
+                    ) {
+                        state.lost = true;
+                    }
+                    return Err(error);
+                }
             }
         }
+        Err(SessionV2Error::TransportUnavailable)
     }
 
     pub fn publish_terminal_compacted(
@@ -2010,6 +2023,21 @@ fn fresh_server_time<T: SessionV2Transport>(transport: &T) -> Result<u64, Sessio
     checked_server_time(transport.server_time_sample()?)
 }
 
+fn fresh_server_time_with_retry<T: SessionV2Transport>(
+    transport: &T,
+) -> Result<u64, SessionV2Error> {
+    for attempt in 0..MAX_PRE_CAS_PUBLISH_ATTEMPTS {
+        match fresh_server_time(transport) {
+            Ok(now) => return Ok(now),
+            Err(error)
+                if attempt + 1 < MAX_PRE_CAS_PUBLISH_ATTEMPTS
+                    && transient_transport_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(SessionV2Error::TransportUnavailable)
+}
+
 fn checked_server_time(sample: TrustedServerTimeSample) -> Result<u64, SessionV2Error> {
     if sample.received_at_monotonic.elapsed() > MAX_SERVER_TIME_SAMPLE_AGE {
         return Err(SessionV2Error::TransportUnavailable);
@@ -2026,7 +2054,7 @@ fn observe_server_time(state: &mut LeaseGuardState, now: u64) -> Result<(), Sess
     Ok(())
 }
 
-fn transient_renewal_error(error: &SessionV2Error) -> bool {
+fn transient_transport_error(error: &SessionV2Error) -> bool {
     matches!(
         error,
         SessionV2Error::TransportUnavailable
@@ -2134,6 +2162,12 @@ struct MemoryV2State {
     server_time_unavailable: bool,
     #[cfg(test)]
     immutable_load_counts: BTreeMap<SessionObjectClass, usize>,
+    #[cfg(test)]
+    stage_transient_failures: usize,
+    #[cfg(test)]
+    cas_transient_failures: usize,
+    #[cfg(test)]
+    cas_calls: usize,
 }
 
 impl InMemorySessionV2Transport {
@@ -2183,6 +2217,28 @@ impl InMemorySessionV2Transport {
         if let Ok(mut state) = self.inner.lock() {
             state.server_time_unavailable = unavailable;
         }
+    }
+
+    #[cfg(test)]
+    fn fail_next_stage_transiently(&self) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.stage_transient_failures = 1;
+        }
+    }
+
+    #[cfg(test)]
+    fn fail_next_cas_transiently(&self) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.cas_transient_failures = 1;
+        }
+    }
+
+    #[cfg(test)]
+    fn cas_calls(&self) -> usize {
+        self.inner
+            .lock()
+            .map(|state| state.cas_calls)
+            .unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -2237,6 +2293,11 @@ impl SessionV2Transport for InMemorySessionV2Transport {
             .inner
             .lock()
             .map_err(|_| SessionV2Error::ManifestConflict)?;
+        #[cfg(test)]
+        if state.stage_transient_failures > 0 {
+            state.stage_transient_failures -= 1;
+            return Err(SessionV2Error::TransportUnavailable);
+        }
         let key = (object_class, object_id.to_owned());
         if let Some(existing) = state.objects.get(&key) {
             return if existing == bytes {
@@ -2332,6 +2393,14 @@ impl SessionV2Transport for InMemorySessionV2Transport {
             .inner
             .lock()
             .map_err(|_| SessionV2Error::ManifestConflict)?;
+        #[cfg(test)]
+        {
+            state.cas_calls += 1;
+            if state.cas_transient_failures > 0 {
+                state.cas_transient_failures -= 1;
+                return Err(SessionV2Error::TransportUnavailable);
+            }
+        }
         let Some(current) = state.manifests.get(&next.session_id) else {
             return Ok(None);
         };
@@ -4024,6 +4093,58 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(12));
         assert!(!guard.is_lost());
         assert!(store.current_manifest("s").unwrap().manifest.generation >= 2);
+    }
+
+    #[test]
+    fn transient_pre_cas_stage_failure_retries_same_commit_without_losing_lease() {
+        let transport = InMemorySessionV2Transport::default();
+        transport.set_server_time_ms(10_000);
+        transport.create_session("s").unwrap();
+        let store = SessionV2Store::new(transport.clone(), &[32; 32], object_crypto());
+        let guard = store
+            .acquire_lease("s", "lease-a", "session-holder")
+            .unwrap();
+        let mut value = record(ULID_A, ULID_B, RID, "question");
+        value.lease = guard.binding().unwrap();
+
+        transport.fail_next_stage_transiently();
+        guard
+            .publish(SessionCommitV1 {
+                visible_records: vec![value],
+                request_objects: vec![],
+                uuid_bindings: vec![],
+            })
+            .unwrap();
+
+        assert!(!guard.is_lost());
+        assert_eq!(store.recent_visible_records("s", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ambiguous_manifest_transport_failure_is_not_retried_and_loses_lease() {
+        let transport = InMemorySessionV2Transport::default();
+        transport.set_server_time_ms(10_000);
+        transport.create_session("s").unwrap();
+        let store = SessionV2Store::new(transport.clone(), &[33; 32], object_crypto());
+        let guard = store
+            .acquire_lease("s", "lease-a", "session-holder")
+            .unwrap();
+        let calls_before_publish = transport.cas_calls();
+        let mut value = record(ULID_A, ULID_B, RID, "question");
+        value.lease = guard.binding().unwrap();
+
+        transport.fail_next_cas_transiently();
+        assert_eq!(
+            guard.publish(SessionCommitV1 {
+                visible_records: vec![value],
+                request_objects: vec![],
+                uuid_bindings: vec![],
+            }),
+            Err(SessionV2Error::LeaseLost)
+        );
+
+        assert!(guard.is_lost());
+        assert_eq!(transport.cas_calls(), calls_before_publish + 1);
     }
 
     #[test]
