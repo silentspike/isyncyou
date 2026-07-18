@@ -1735,7 +1735,7 @@ fn session_secret_id(session_id: &str) -> String {
     format!("{SESSION_SECRET_PREFIX}{session_id}")
 }
 
-fn map_session_error(error: SessionV2Error) -> String {
+pub(crate) fn map_session_error(error: SessionV2Error) -> String {
     error.to_string()
 }
 

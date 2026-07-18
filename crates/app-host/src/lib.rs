@@ -484,6 +484,26 @@ fn agent_safe_turn_start_error(error: &str) -> &'static str {
     feature = "agent-subscription-experimental",
     test
 ))]
+fn safe_session_history_error(error: &str) -> &'static str {
+    match error {
+        "session_store_unavailable" => "session_store_unavailable",
+        "session_transport_unavailable" => "session_transport_unavailable",
+        "session_transport_timed_out" => "session_transport_timed_out",
+        "session_storage_response_invalid" => "session_storage_response_invalid",
+        "session_writer_reconnect_required" => "session_writer_reconnect_required",
+        "session_storage_permission_denied" => "session_storage_permission_denied",
+        "session_storage_request_rejected" => "session_storage_request_rejected",
+        "invalid_session_record" | "invalid_request_journal" => "session_state_invalid",
+        "invalid_cursor" | "history_page_too_large" => "invalid_cursor",
+        _ => "session_transport_unavailable",
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
 fn turn_id_from_request_id(request_id: &str) -> Result<String, String> {
     const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
     let compact = request_id.replace('-', "");
@@ -550,6 +570,12 @@ const MAX_HOT_SESSION_HISTORY_PAGES: usize = 256;
     test
 ))]
 const HOT_SESSION_HISTORY_RETRY_DELAY: Duration = Duration::from_secs(5);
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
+const HOT_SESSION_HISTORY_LOAD_TIMEOUT: Duration = Duration::from_secs(65);
 
 #[cfg(any(
     feature = "agent-oauth-providers",
@@ -651,12 +677,18 @@ impl HotAgentStatusCache {
 ))]
 #[derive(Clone)]
 enum HotSessionHistoryState {
-    Loading,
+    Loading {
+        attempt: u64,
+        deadline: std::time::Instant,
+    },
     Ready {
         page: isyncyou_agent::HistoryPageV1,
         revalidate_at: std::time::Instant,
     },
-    Failed(std::time::Instant),
+    Failed {
+        retry_at: std::time::Instant,
+        code: String,
+    },
 }
 
 #[cfg(any(
@@ -676,10 +708,10 @@ struct HotSessionHistoryEntry {
 ))]
 #[derive(Debug, Clone, PartialEq)]
 enum HotSessionHistoryLookup {
-    Start,
+    Start(u64),
     Loading,
     Ready(isyncyou_agent::HistoryPageV1),
-    Failed,
+    Failed(String),
     Busy,
 }
 
@@ -700,6 +732,13 @@ struct HotSessionHistoryCache {
     test
 ))]
 impl HotSessionHistoryCache {
+    fn loading_state(&self) -> HotSessionHistoryState {
+        HotSessionHistoryState::Loading {
+            attempt: self.sequence.fetch_add(1, Ordering::Relaxed),
+            deadline: std::time::Instant::now() + HOT_SESSION_HISTORY_LOAD_TIMEOUT,
+        }
+    }
+
     fn lookup_or_start(&self, key: &(String, String, usize)) -> HotSessionHistoryLookup {
         let mut entries = self
             .entries
@@ -707,7 +746,19 @@ impl HotSessionHistoryCache {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(entry) = entries.get_mut(key) {
             return match &entry.state {
-                HotSessionHistoryState::Loading => HotSessionHistoryLookup::Loading,
+                HotSessionHistoryState::Loading { deadline, .. }
+                    if std::time::Instant::now() < *deadline =>
+                {
+                    HotSessionHistoryLookup::Loading
+                }
+                HotSessionHistoryState::Loading { .. } => {
+                    let code = "session_transport_timed_out".to_string();
+                    entry.state = HotSessionHistoryState::Failed {
+                        retry_at: std::time::Instant::now() + HOT_SESSION_HISTORY_RETRY_DELAY,
+                        code: code.clone(),
+                    };
+                    HotSessionHistoryLookup::Failed(code)
+                }
                 HotSessionHistoryState::Ready {
                     page,
                     revalidate_at,
@@ -715,24 +766,30 @@ impl HotSessionHistoryCache {
                     HotSessionHistoryLookup::Ready(page.clone())
                 }
                 HotSessionHistoryState::Ready { .. } => {
-                    entry.state = HotSessionHistoryState::Loading;
-                    HotSessionHistoryLookup::Start
+                    entry.state = self.loading_state();
+                    let HotSessionHistoryState::Loading { attempt, .. } = &entry.state else {
+                        unreachable!();
+                    };
+                    HotSessionHistoryLookup::Start(*attempt)
                 }
-                HotSessionHistoryState::Failed(retry_at)
+                HotSessionHistoryState::Failed { retry_at, code }
                     if std::time::Instant::now() < *retry_at =>
                 {
-                    HotSessionHistoryLookup::Failed
+                    HotSessionHistoryLookup::Failed(code.clone())
                 }
-                HotSessionHistoryState::Failed(_) => {
-                    entry.state = HotSessionHistoryState::Loading;
-                    HotSessionHistoryLookup::Start
+                HotSessionHistoryState::Failed { .. } => {
+                    entry.state = self.loading_state();
+                    let HotSessionHistoryState::Loading { attempt, .. } = &entry.state else {
+                        unreachable!();
+                    };
+                    HotSessionHistoryLookup::Start(*attempt)
                 }
             };
         }
         if entries.len() >= MAX_HOT_SESSION_HISTORY_PAGES {
             let evict = entries
                 .iter()
-                .filter(|(_, entry)| !matches!(entry.state, HotSessionHistoryState::Loading))
+                .filter(|(_, entry)| !matches!(entry.state, HotSessionHistoryState::Loading { .. }))
                 .min_by_key(|(_, entry)| entry.sequence)
                 .map(|(key, _)| key.clone());
             let Some(evict) = evict else {
@@ -740,20 +797,25 @@ impl HotSessionHistoryCache {
             };
             entries.remove(&evict);
         }
-        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let state = self.loading_state();
+        let HotSessionHistoryState::Loading { attempt, .. } = &state else {
+            unreachable!();
+        };
+        let attempt = *attempt;
         entries.insert(
             key.clone(),
             HotSessionHistoryEntry {
-                state: HotSessionHistoryState::Loading,
-                sequence,
+                state,
+                sequence: attempt,
             },
         );
-        HotSessionHistoryLookup::Start
+        HotSessionHistoryLookup::Start(attempt)
     }
 
     fn complete(
         &self,
         key: &(String, String, usize),
+        attempt: u64,
         result: Result<isyncyou_agent::HistoryPageV1, String>,
     ) {
         let mut entries = self
@@ -763,14 +825,24 @@ impl HotSessionHistoryCache {
         let Some(entry) = entries.get_mut(key) else {
             return;
         };
+        if !matches!(
+            entry.state,
+            HotSessionHistoryState::Loading {
+                attempt: active_attempt,
+                ..
+            } if active_attempt == attempt
+        ) {
+            return;
+        }
         entry.state = match result {
             Ok(page) => HotSessionHistoryState::Ready {
                 page,
                 revalidate_at: std::time::Instant::now() + HOT_SESSION_HISTORY_READY_TTL,
             },
-            Err(_) => HotSessionHistoryState::Failed(
-                std::time::Instant::now() + HOT_SESSION_HISTORY_RETRY_DELAY,
-            ),
+            Err(error) => HotSessionHistoryState::Failed {
+                retry_at: std::time::Instant::now() + HOT_SESSION_HISTORY_RETRY_DELAY,
+                code: safe_session_history_error(&error).to_string(),
+            },
         };
     }
 
@@ -8687,11 +8759,11 @@ fn load_product_session_history_page(
         });
     }
     let token = isyncyou_engine::auth::resolve_cached_sync_token(cfg, &account)
-        .map_err(|_| "session_transport_unavailable".to_string())?;
+        .map_err(|_| "session_writer_reconnect_required".to_string())?;
     registry
         .open(&token, session_id)?
         .history(session_id, cursor, Some(limit))
-        .map_err(|_| "session_transport_unavailable".to_string())
+        .map_err(product_session::map_session_error)
 }
 
 impl isyncyou_webui::AgentHandler for DaemonAgent {
@@ -8807,7 +8879,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     "next_cursor": page.next_cursor,
                     "refreshing": false,
                 })),
-                HotSessionHistoryLookup::Start => {
+                HotSessionHistoryLookup::Start(attempt) => {
                     let cache = Arc::clone(&self.hot_session_history);
                     let worker_key = key.clone();
                     let cfg = self.cfg.clone();
@@ -8817,18 +8889,24 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     let spawn = std::thread::Builder::new()
                         .name("agent-session-history".into())
                         .spawn(move || {
-                            let result = load_product_session_history_page(
-                                &cfg,
-                                &oauth_dir,
-                                &worker_session_id,
-                                worker_cursor.as_deref(),
-                                limit,
-                            );
-                            cache.complete(&worker_key, result);
+                            let result = std::panic::catch_unwind(|| {
+                                load_product_session_history_page(
+                                    &cfg,
+                                    &oauth_dir,
+                                    &worker_session_id,
+                                    worker_cursor.as_deref(),
+                                    limit,
+                                )
+                            })
+                            .unwrap_or_else(|_| Err("session_transport_unavailable".into()));
+                            cache.complete(&worker_key, attempt, result);
                         });
                     if spawn.is_err() {
-                        self.hot_session_history
-                            .complete(&key, Err("session_transport_unavailable".into()));
+                        self.hot_session_history.complete(
+                            &key,
+                            attempt,
+                            Err("session_transport_unavailable".into()),
+                        );
                         return Err("session_transport_unavailable".into());
                     }
                     Ok(serde_json::json!({
@@ -8842,7 +8920,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     "next_cursor": null,
                     "refreshing": true,
                 })),
-                HotSessionHistoryLookup::Failed => Err("session_transport_unavailable".into()),
+                HotSessionHistoryLookup::Failed(code) => Err(code),
                 HotSessionHistoryLookup::Busy => Err("session_history_busy".into()),
             }
         }
@@ -23331,11 +23409,19 @@ fn agent_status_store_revision_changes_when_credential_records_change() {
 }
 
 #[cfg(test)]
+fn start_history_load(cache: &HotSessionHistoryCache, key: &(String, String, usize)) -> u64 {
+    let HotSessionHistoryLookup::Start(attempt) = cache.lookup_or_start(key) else {
+        panic!("history load did not start");
+    };
+    attempt
+}
+
+#[cfg(test)]
 #[test]
 fn session_history_hot_cache_coalesces_completes_and_invalidates() {
     let cache = HotSessionHistoryCache::default();
     let key = ("session".to_string(), String::new(), 100);
-    assert_eq!(cache.lookup_or_start(&key), HotSessionHistoryLookup::Start);
+    let attempt = start_history_load(&cache, &key);
     assert_eq!(
         cache.lookup_or_start(&key),
         HotSessionHistoryLookup::Loading
@@ -23345,19 +23431,17 @@ fn session_history_hot_cache_coalesces_completes_and_invalidates() {
         records: Vec::new(),
         next_cursor: Some("next".into()),
     };
-    cache.complete(&key, Ok(page.clone()));
+    cache.complete(&key, attempt, Ok(page.clone()));
     assert_eq!(
         cache.lookup_or_start(&key),
         HotSessionHistoryLookup::Ready(page)
     );
     assert!(cache.context_snapshot("session").is_none());
     let next_key = ("session".to_string(), "next".to_string(), 100);
-    assert_eq!(
-        cache.lookup_or_start(&next_key),
-        HotSessionHistoryLookup::Start
-    );
+    let next_attempt = start_history_load(&cache, &next_key);
     cache.complete(
         &next_key,
+        next_attempt,
         Ok(isyncyou_agent::HistoryPageV1 {
             manifest_generation: 7,
             records: Vec::new(),
@@ -23368,7 +23452,7 @@ fn session_history_hot_cache_coalesces_completes_and_invalidates() {
     assert_eq!(snapshot.manifest_generation, 7);
     assert!(snapshot.records.is_empty());
     cache.invalidate("session");
-    assert_eq!(cache.lookup_or_start(&key), HotSessionHistoryLookup::Start);
+    start_history_load(&cache, &key);
 }
 
 #[cfg(test)]
@@ -23376,13 +23460,13 @@ fn session_history_hot_cache_coalesces_completes_and_invalidates() {
 fn session_history_hot_cache_revalidates_ready_pages_after_ttl() {
     let cache = HotSessionHistoryCache::default();
     let key = ("session".to_string(), String::new(), 100);
-    assert_eq!(cache.lookup_or_start(&key), HotSessionHistoryLookup::Start);
+    let attempt = start_history_load(&cache, &key);
     let page = isyncyou_agent::HistoryPageV1 {
         manifest_generation: 7,
         records: Vec::new(),
         next_cursor: None,
     };
-    cache.complete(&key, Ok(page.clone()));
+    cache.complete(&key, attempt, Ok(page.clone()));
     assert_eq!(
         cache.lookup_or_start(&key),
         HotSessionHistoryLookup::Ready(page)
@@ -23396,7 +23480,7 @@ fn session_history_hot_cache_revalidates_ready_pages_after_ttl() {
         };
         *revalidate_at = std::time::Instant::now();
     }
-    assert_eq!(cache.lookup_or_start(&key), HotSessionHistoryLookup::Start);
+    start_history_load(&cache, &key);
     assert_eq!(
         cache.lookup_or_start(&key),
         HotSessionHistoryLookup::Loading
@@ -23408,35 +23492,77 @@ fn session_history_hot_cache_revalidates_ready_pages_after_ttl() {
 fn session_history_hot_cache_bounds_failures_and_worker_pressure() {
     let cache = HotSessionHistoryCache::default();
     let failed_key = ("failed".to_string(), String::new(), 50);
-    assert_eq!(
-        cache.lookup_or_start(&failed_key),
-        HotSessionHistoryLookup::Start
+    let failed_attempt = start_history_load(&cache, &failed_key);
+    cache.complete(
+        &failed_key,
+        failed_attempt,
+        Err("raw transport detail".into()),
     );
-    cache.complete(&failed_key, Err("raw transport detail".into()));
     assert_eq!(
         cache.lookup_or_start(&failed_key),
-        HotSessionHistoryLookup::Failed
+        HotSessionHistoryLookup::Failed("session_transport_unavailable".into())
     );
     {
         let mut entries = cache.entries.lock().unwrap();
-        entries.get_mut(&failed_key).unwrap().state =
-            HotSessionHistoryState::Failed(std::time::Instant::now());
+        entries.get_mut(&failed_key).unwrap().state = HotSessionHistoryState::Failed {
+            retry_at: std::time::Instant::now(),
+            code: "session_transport_unavailable".into(),
+        };
     }
-    assert_eq!(
-        cache.lookup_or_start(&failed_key),
-        HotSessionHistoryLookup::Start
-    );
+    start_history_load(&cache, &failed_key);
 
     let pressure = HotSessionHistoryCache::default();
     for index in 0..MAX_HOT_SESSION_HISTORY_PAGES {
-        assert_eq!(
-            pressure.lookup_or_start(&(format!("session-{index}"), String::new(), 50)),
-            HotSessionHistoryLookup::Start
-        );
+        start_history_load(&pressure, &(format!("session-{index}"), String::new(), 50));
     }
     assert_eq!(
         pressure.lookup_or_start(&("overflow".into(), String::new(), 50)),
         HotSessionHistoryLookup::Busy
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn session_history_hot_cache_times_out_and_ignores_stale_worker_completion() {
+    let cache = HotSessionHistoryCache::default();
+    let key = ("session".to_string(), String::new(), 50);
+    let stale_attempt = start_history_load(&cache, &key);
+    {
+        let mut entries = cache.entries.lock().unwrap();
+        let HotSessionHistoryState::Loading { deadline, .. } =
+            &mut entries.get_mut(&key).unwrap().state
+        else {
+            panic!("history page was not loading");
+        };
+        *deadline = std::time::Instant::now();
+    }
+    assert_eq!(
+        cache.lookup_or_start(&key),
+        HotSessionHistoryLookup::Failed("session_transport_timed_out".into())
+    );
+    {
+        let mut entries = cache.entries.lock().unwrap();
+        let HotSessionHistoryState::Failed { retry_at, .. } =
+            &mut entries.get_mut(&key).unwrap().state
+        else {
+            panic!("history page was not failed");
+        };
+        *retry_at = std::time::Instant::now();
+    }
+    let active_attempt = start_history_load(&cache, &key);
+    assert_ne!(stale_attempt, active_attempt);
+    cache.complete(
+        &key,
+        stale_attempt,
+        Ok(isyncyou_agent::HistoryPageV1 {
+            manifest_generation: 1,
+            records: Vec::new(),
+            next_cursor: None,
+        }),
+    );
+    assert_eq!(
+        cache.lookup_or_start(&key),
+        HotSessionHistoryLookup::Loading
     );
 }
 
