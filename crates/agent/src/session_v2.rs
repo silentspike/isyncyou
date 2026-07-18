@@ -838,12 +838,20 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
         if offset > entries.len() {
             return Err(SessionV2Error::InvalidCursor);
         }
+        let selected_entries = entries.iter().skip(offset).take(limit).collect::<Vec<_>>();
+        let object_ids = selected_entries
+            .iter()
+            .map(|entry| entry.object_id.clone())
+            .collect::<Vec<_>>();
+        let sealed_records = self
+            .transport
+            .load_immutable_batch(SessionObjectClass::VisibleRecord, &object_ids)?;
+        if sealed_records.len() != selected_entries.len() {
+            return Err(SessionV2Error::InvalidRecord);
+        }
         let mut records = Vec::new();
         let mut response_bytes = 0usize;
-        for entry in entries.iter().skip(offset).take(limit) {
-            let sealed = self
-                .transport
-                .load_immutable(SessionObjectClass::VisibleRecord, &entry.object_id)?;
+        for (entry, sealed) in selected_entries.into_iter().zip(sealed_records) {
             if bytes_digest(&sealed) != entry.object_sha256 {
                 return Err(SessionV2Error::InvalidRecord);
             }
@@ -2066,6 +2074,16 @@ pub trait SessionV2Transport: Send + Sync {
         object_class: SessionObjectClass,
         object_id: &str,
     ) -> Result<Vec<u8>, SessionV2Error>;
+    fn load_immutable_batch(
+        &self,
+        object_class: SessionObjectClass,
+        object_ids: &[String],
+    ) -> Result<Vec<Vec<u8>>, SessionV2Error> {
+        object_ids
+            .iter()
+            .map(|object_id| self.load_immutable(object_class, object_id))
+            .collect()
+    }
     fn load_immutable_optional(
         &self,
         object_class: SessionObjectClass,
@@ -2340,6 +2358,7 @@ mod onedrive_transport {
         std::time::Duration::from_secs(8);
     const INTERACTIVE_GRAPH_CONNECT_TIMEOUT: std::time::Duration =
         std::time::Duration::from_secs(4);
+    const HISTORY_OBJECT_LOAD_CONCURRENCY: usize = 8;
 
     fn map_upload_error(error: UploadError) -> SessionV2Error {
         match error {
@@ -2697,6 +2716,34 @@ mod onedrive_transport {
             self.read_path(&path, MAX_IMMUTABLE_OBJECT_BYTES)
         }
 
+        fn load_immutable_batch(
+            &self,
+            object_class: SessionObjectClass,
+            object_ids: &[String],
+        ) -> Result<Vec<Vec<u8>>, SessionV2Error> {
+            let mut loaded = Vec::with_capacity(object_ids.len());
+            for batch in object_ids.chunks(HISTORY_OBJECT_LOAD_CONCURRENCY) {
+                let results = std::thread::scope(|scope| {
+                    let workers = batch
+                        .iter()
+                        .map(|object_id| {
+                            scope.spawn(move || self.load_immutable(object_class, object_id))
+                        })
+                        .collect::<Vec<_>>();
+                    workers
+                        .into_iter()
+                        .map(|worker| {
+                            worker
+                                .join()
+                                .map_err(|_| SessionV2Error::TransportUnavailable)?
+                        })
+                        .collect::<Result<Vec<_>, SessionV2Error>>()
+                })?;
+                loaded.extend(results);
+            }
+            Ok(loaded)
+        }
+
         fn load_immutable_optional(
             &self,
             object_class: SessionObjectClass,
@@ -2901,7 +2948,7 @@ mod onedrive_transport {
         use super::*;
         use std::io::{Read, Write};
         use std::net::TcpListener;
-        use std::sync::{Arc, Mutex};
+        use std::sync::{Arc, Condvar, Mutex};
 
         fn spawn_folder_creation_server(
         ) -> (String, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
@@ -2965,6 +3012,58 @@ mod onedrive_transport {
             (base, requests, handle)
         }
 
+        fn spawn_parallel_read_server(
+            request_count: usize,
+        ) -> (String, std::thread::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let arrivals = Arc::new((Mutex::new(0usize), Condvar::new()));
+            let handle = std::thread::spawn(move || {
+                let mut workers = Vec::new();
+                for _ in 0..request_count {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let arrivals = Arc::clone(&arrivals);
+                    workers.push(std::thread::spawn(move || {
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            let read = stream.read(&mut chunk).unwrap();
+                            assert!(read > 0);
+                            request.extend_from_slice(&chunk[..read]);
+                        }
+                        let (arrived, wake) = &*arrivals;
+                        let mut count = arrived.lock().unwrap();
+                        *count += 1;
+                        if *count == request_count {
+                            wake.notify_all();
+                        }
+                        let (count, timeout) = wake
+                            .wait_timeout_while(count, std::time::Duration::from_secs(2), |count| {
+                                *count < request_count
+                            })
+                            .unwrap();
+                        let concurrent = !timeout.timed_out() && *count == request_count;
+                        drop(count);
+                        let (status, body) = if concurrent {
+                            ("200 OK", "sealed")
+                        } else {
+                            ("503 Service Unavailable", "serial")
+                        };
+                        write!(
+                            stream,
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .unwrap();
+                    }));
+                }
+                for worker in workers {
+                    worker.join().unwrap();
+                }
+            });
+            (base, handle)
+        }
+
         #[test]
         fn onedrive_v2_transport_rejects_untrusted_path_components() {
             assert!(OneDriveSessionV2Transport::with_base_url(
@@ -2991,6 +3090,24 @@ mod onedrive_transport {
             );
             transport.finish_admission();
             assert_eq!(transport.check_admission_budget(), Ok(()));
+        }
+
+        #[test]
+        fn onedrive_history_objects_load_in_bounded_parallel_batches() {
+            let request_count = 4;
+            let (base, server) = spawn_parallel_read_server(request_count);
+            let transport =
+                OneDriveSessionV2Transport::with_base_url("token", "session-test", &base).unwrap();
+            let object_ids = (0..request_count)
+                .map(|index| format!("record-{index}"))
+                .collect::<Vec<_>>();
+
+            let loaded = transport
+                .load_immutable_batch(SessionObjectClass::VisibleRecord, &object_ids)
+                .unwrap();
+            server.join().unwrap();
+
+            assert_eq!(loaded, vec![b"sealed".to_vec(); request_count]);
         }
 
         #[test]
