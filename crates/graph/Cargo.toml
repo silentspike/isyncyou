@@ -15,6 +15,7 @@ serde_json = { workspace = true }
 keyring-core = { version = "1", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"], optional = true }
 httpdate = { version = "1", optional = true }
+rustls = { version = "0.23", default-features = false, optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 zbus-secret-service-keyring-store = { version = "1", features = ["rt-tokio-crypto-rust"], optional = true }
@@ -22,5 +23,5 @@ zbus-secret-service-keyring-store = { version = "1", features = ["rt-tokio-crypt
 [features]
 # Live HTTP transport (reqwest + rustls). Off by default so the pure-logic build
 # stays fast and dependency-light; enable for live tests / the daemon.
-http = ["dep:reqwest", "dep:httpdate"]
+http = ["dep:reqwest", "dep:httpdate", "dep:rustls"]
 desktop-keyring = ["dep:keyring-core", "dep:zbus-secret-service-keyring-store"]

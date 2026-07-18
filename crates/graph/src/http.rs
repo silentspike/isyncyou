@@ -169,13 +169,24 @@ fn push_unique_nonempty(out: &mut Vec<String>, value: &str) {
 }
 
 /// Errors from the live upload/delete path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphTransportFailure {
+    NameResolution,
+    Tls,
+    Connect,
+    Other,
+}
+
 #[derive(Debug)]
 pub enum UploadError {
     Http {
         status: u16,
         body: String,
     },
-    Transport(String),
+    Transport {
+        failure: GraphTransportFailure,
+        detail: String,
+    },
     Timeout(String),
     Parse(String),
     /// The response exceeded the caller's explicit body limit.
@@ -188,7 +199,7 @@ impl std::fmt::Display for UploadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             UploadError::Http { status, body } => write!(f, "HTTP {status}: {body}"),
-            UploadError::Transport(e) => write!(f, "transport error: {e}"),
+            UploadError::Transport { detail, .. } => write!(f, "transport error: {detail}"),
             UploadError::Timeout(e) => write!(f, "timeout: {e}"),
             UploadError::Parse(e) => write!(f, "parse error: {e}"),
             UploadError::TooLarge => write!(f, "response body exceeded limit"),
@@ -210,20 +221,73 @@ impl UploadError {
         if error.is_timeout() {
             Self::Timeout(error.to_string())
         } else {
-            Self::Transport(error.to_string())
+            Self::Transport {
+                failure: classify_reqwest_transport_failure(&error),
+                detail: error.to_string(),
+            }
+        }
+    }
+
+    fn transport(detail: impl Into<String>) -> Self {
+        Self::Transport {
+            failure: GraphTransportFailure::Other,
+            detail: detail.into(),
         }
     }
 
     pub fn transient_failure(&self) -> Option<GraphTransientFailure> {
         match self {
             Self::Timeout(_) => Some(GraphTransientFailure::Timeout),
-            Self::Transport(_) => Some(GraphTransientFailure::Network),
+            Self::Transport { .. } => Some(GraphTransientFailure::Network),
             Self::Http { status, .. } if matches!(*status, 408 | 425 | 429 | 500..=599) => {
                 Some(GraphTransientFailure::Http(*status))
             }
             Self::Http { .. } | Self::Parse(_) | Self::TooLarge | Self::Incomplete => None,
         }
     }
+}
+
+fn error_source_is_tls(error: &(dyn std::error::Error + 'static)) -> bool {
+    if error.is::<rustls::Error>() {
+        return true;
+    }
+    if let Some(io) = error.downcast_ref::<std::io::Error>() {
+        if io
+            .get_ref()
+            .is_some_and(|inner| inner.is::<rustls::Error>())
+        {
+            return true;
+        }
+    }
+    error.source().is_some_and(error_source_is_tls)
+}
+
+fn error_source_is_dns(error: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(io) = error.downcast_ref::<std::io::Error>() {
+        if matches!(
+            io.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::AddrNotAvailable
+        ) {
+            return true;
+        }
+    }
+    error.source().is_some_and(error_source_is_dns)
+}
+
+fn classify_transport_failure_source(
+    error: &(dyn std::error::Error + 'static),
+) -> GraphTransportFailure {
+    if error_source_is_tls(error) {
+        GraphTransportFailure::Tls
+    } else if error_source_is_dns(error) {
+        GraphTransportFailure::NameResolution
+    } else {
+        GraphTransportFailure::Connect
+    }
+}
+
+fn classify_reqwest_transport_failure(error: &reqwest::Error) -> GraphTransportFailure {
+    classify_transport_failure_source(error)
 }
 
 /// A Microsoft Graph HTTP client carrying a bearer access token.
@@ -1331,7 +1395,8 @@ impl GraphClient {
                 Ok(resp) => resp,
                 Err(error) => {
                     let error = UploadError::from_reqwest(error);
-                    if matches!(error, UploadError::Transport(_)) && attempt < MAX_GET_ATTEMPTS {
+                    if matches!(error, UploadError::Transport { .. }) && attempt < MAX_GET_ATTEMPTS
+                    {
                         self.sleep_for_get_retry(backoff_delay(attempt))?;
                         continue;
                     }
@@ -1381,7 +1446,7 @@ impl GraphClient {
         }
         resp.bytes()
             .map(|b| b.to_vec())
-            .map_err(|e| UploadError::Transport(e.to_string()))
+            .map_err(|e| UploadError::transport(e.to_string()))
     }
 
     /// Reads a response body up to an explicit caller-owned limit. The limit is
@@ -1414,7 +1479,7 @@ impl GraphClient {
         loop {
             let read = resp
                 .read(&mut chunk)
-                .map_err(|error| UploadError::Transport(error.to_string()))?;
+                .map_err(|error| UploadError::transport(error.to_string()))?;
             if read == 0 {
                 break;
             }
@@ -1450,7 +1515,7 @@ impl GraphClient {
         loop {
             let n = resp
                 .read(&mut buf)
-                .map_err(|e| UploadError::Transport(e.to_string()))?;
+                .map_err(|e| UploadError::transport(e.to_string()))?;
             if n == 0 {
                 break;
             }
@@ -1694,7 +1759,7 @@ impl GraphClient {
     ) -> Result<(), UploadError> {
         let url = format!("{}/me/onenote/pages/{page_id}/content", self.base);
         let body =
-            serde_json::to_vec(commands).map_err(|e| UploadError::Transport(e.to_string()))?;
+            serde_json::to_vec(commands).map_err(|e| UploadError::transport(e.to_string()))?;
         let resp = self
             .client
             .patch(&url)
@@ -2394,7 +2459,7 @@ mod tests {
     #[test]
     fn graph_transient_failure_is_structured_without_message_matching() {
         assert_eq!(
-            UploadError::Transport("arbitrary".into()).transient_failure(),
+            UploadError::transport("arbitrary").transient_failure(),
             Some(GraphTransientFailure::Network)
         );
         assert_eq!(
@@ -2618,6 +2683,28 @@ mod tests {
             "transport failure must map to retryable 503"
         );
         assert!(resp.body.is_none());
+    }
+
+    #[test]
+    fn graph_transport_classifies_dns_tls_and_connect_without_error_text() {
+        let dns = std::io::Error::new(std::io::ErrorKind::NotFound, "private dns detail");
+        assert_eq!(
+            classify_transport_failure_source(&dns),
+            GraphTransportFailure::NameResolution
+        );
+        let tls = rustls::Error::General("private certificate detail".into());
+        assert_eq!(
+            classify_transport_failure_source(&tls),
+            GraphTransportFailure::Tls
+        );
+        let connect = std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "private connection detail",
+        );
+        assert_eq!(
+            classify_transport_failure_source(&connect),
+            GraphTransportFailure::Connect
+        );
     }
 
     #[test]

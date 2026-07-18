@@ -87,6 +87,12 @@ pub enum SessionV2Error {
     HistoryPageTooLarge,
     #[error("session_transport_unavailable")]
     TransportUnavailable,
+    #[error("session_name_resolution_failed")]
+    TransportNameResolutionFailed,
+    #[error("session_tls_failed")]
+    TransportTlsFailed,
+    #[error("session_connect_failed")]
+    TransportConnectFailed,
     #[error("session_transport_timed_out")]
     TransportTimedOut,
     #[error("session_storage_response_invalid")]
@@ -2456,9 +2462,21 @@ mod onedrive_transport {
             UploadError::Parse(_) | UploadError::TooLarge | UploadError::Incomplete => {
                 SessionV2Error::TransportResponseInvalid
             }
-            UploadError::Transport(_) | UploadError::Http { .. } => {
-                SessionV2Error::TransportUnavailable
-            }
+            UploadError::Transport { failure, .. } => match failure {
+                isyncyou_graph::http::GraphTransportFailure::NameResolution => {
+                    SessionV2Error::TransportNameResolutionFailed
+                }
+                isyncyou_graph::http::GraphTransportFailure::Tls => {
+                    SessionV2Error::TransportTlsFailed
+                }
+                isyncyou_graph::http::GraphTransportFailure::Connect => {
+                    SessionV2Error::TransportConnectFailed
+                }
+                isyncyou_graph::http::GraphTransportFailure::Other => {
+                    SessionV2Error::TransportUnavailable
+                }
+            },
+            UploadError::Http { .. } => SessionV2Error::TransportUnavailable,
         }
     }
 
@@ -3222,6 +3240,27 @@ mod onedrive_transport {
                 (
                     UploadError::Parse("private parser detail".into()),
                     SessionV2Error::TransportResponseInvalid,
+                ),
+                (
+                    UploadError::Transport {
+                        failure: isyncyou_graph::http::GraphTransportFailure::NameResolution,
+                        detail: "private dns detail".into(),
+                    },
+                    SessionV2Error::TransportNameResolutionFailed,
+                ),
+                (
+                    UploadError::Transport {
+                        failure: isyncyou_graph::http::GraphTransportFailure::Tls,
+                        detail: "private tls detail".into(),
+                    },
+                    SessionV2Error::TransportTlsFailed,
+                ),
+                (
+                    UploadError::Transport {
+                        failure: isyncyou_graph::http::GraphTransportFailure::Connect,
+                        detail: "private connect detail".into(),
+                    },
+                    SessionV2Error::TransportConnectFailed,
                 ),
             ];
             for (error, expected) in cases {
