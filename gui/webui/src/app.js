@@ -6573,9 +6573,9 @@ function showPairingCodeDialog(pairingCode, operationId, parentOverlay) {
     class: "input assistant-pairing-code",
     readOnly: "readonly",
     rows: "3",
-    value: pairingCode,
     "aria-label": "One-time session transfer code",
   });
+  code.value = pairingCode;
   const revoke = async () => {
     try {
       await postJson("/api/v1/agent/session/pairing/revoke", CAP.agent, {

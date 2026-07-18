@@ -17025,4 +17025,11 @@ Content-Type: text/html; charset=utf-8\r\n\
             assert!(!valid_client_request_id(invalid));
         }
     }
+
+    #[test]
+    fn assistant_pairing_dialog_assigns_textarea_value_property() {
+        let source = include_str!("app.js");
+        assert!(source.contains("code.value = pairingCode;"));
+        assert!(!source.contains("value: pairingCode,"));
+    }
 }
