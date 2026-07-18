@@ -369,25 +369,25 @@ impl ProductTurnRuntime {
         Ok(())
     }
 
-    pub fn finish_pending(self, created_at_ms: u64) -> Result<(), String> {
+    pub fn finish_pending(&mut self, created_at_ms: u64) -> Result<(), String> {
         let pending_id = new_ulid().map_err(|_| "session_store_unavailable")?;
         let lease = self.guard.binding().map_err(map_session_error)?;
         let journal = self.terminal_journal(RequestPhase::PendingConfirmation)?;
-        let mut request_objects = self.pending_request_objects;
+        let mut request_objects = self.pending_request_objects.clone();
         request_objects.push(journal);
         self.guard
             .publish(SessionCommitV1 {
                 visible_records: vec![SessionRecordV2 {
                     record_version: SESSION_RECORD_VERSION,
                     record_id: pending_id,
-                    session_id: self.session_id,
-                    request_id: self.request_id,
-                    turn_id: self.turn_id,
+                    session_id: self.session_id.clone(),
+                    request_id: self.request_id.clone(),
+                    turn_id: self.turn_id.clone(),
                     kind: SessionRecordKind::PendingOperation {
                         code: "confirmation_required".into(),
                     },
                     parent_record_ids: vec![self.intent_record_id.clone()],
-                    observed_head: Some(self.intent_record_id),
+                    observed_head: Some(self.intent_record_id.clone()),
                     lease,
                     created_at_ms,
                 }],

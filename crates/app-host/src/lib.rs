@@ -1013,6 +1013,26 @@ fn terminal_error_events_after_persistence(
     )),
     allow(dead_code)
 )]
+fn pending_setup_error_code(error: &str) -> &'static str {
+    match error {
+        "lease_lost" | "manifest_conflict" => "lease_lost",
+        "session_transport_unavailable" => "session_transport_unavailable",
+        "session_transport_timed_out" => "session_transport_timed_out",
+        "session_storage_response_invalid" => "session_storage_response_invalid",
+        "session_writer_reconnect_required" => "session_writer_reconnect_required",
+        "session_storage_permission_denied" => "session_storage_permission_denied",
+        "session_storage_request_rejected" => "session_storage_request_rejected",
+        _ => "confirmation_unavailable",
+    }
+}
+
+#[cfg_attr(
+    not(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    )),
+    allow(dead_code)
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TurnAuthorityState {
     Running,
@@ -8376,7 +8396,7 @@ impl DaemonAgent {
                                 )
                                 .map_err(|_| "confirmation_unavailable".to_string())?;
                             let persisted = product_turn
-                                .take()
+                                .as_mut()
                                 .map_or(Ok(()), |runtime| runtime.finish_pending(unix_now_ms()));
                             if let Err(error) = persisted {
                                 let _ = pending.cancel(
@@ -8386,6 +8406,7 @@ impl DaemonAgent {
                                 );
                                 return Err(error);
                             }
+                            product_turn.take();
                             cache_persisted_request_phase(
                                 &hot_request_statuses,
                                 hot_request_binding.as_ref(),
@@ -8439,28 +8460,24 @@ impl DaemonAgent {
                                 }
                             }
                             Err(error) => {
-                                let persisted = if error == "lease_lost" {
-                                    Err(error)
-                                } else {
-                                    product_turn.take().map_or(Ok(()), |runtime| {
-                                        runtime.finish_terminal(
-                                            isyncyou_agent::TurnTerminalStatus::Error,
-                                            Some("confirmation_unavailable".into()),
-                                            isyncyou_agent::RequestPhase::Failed,
-                                            unix_now_ms(),
-                                        )
-                                    })
-                                };
+                                let safe_code = pending_setup_error_code(&error);
+                                let persisted = product_turn.take().map_or(Ok(()), |runtime| {
+                                    runtime.finish_terminal(
+                                        isyncyou_agent::TurnTerminalStatus::Error,
+                                        Some(safe_code.into()),
+                                        isyncyou_agent::RequestPhase::Failed,
+                                        unix_now_ms(),
+                                    )
+                                });
                                 cache_persisted_request_phase(
                                     &hot_request_statuses,
                                     hot_request_binding.as_ref(),
                                     &persisted,
                                     isyncyou_agent::RequestPhase::Failed,
                                 );
-                                for event in terminal_error_events_after_persistence(
-                                    persisted,
-                                    "confirmation_unavailable",
-                                ) {
+                                for event in
+                                    terminal_error_events_after_persistence(persisted, safe_code)
+                                {
                                     let _ = hub.emit(&tid, event);
                                 }
                             }
@@ -23504,6 +23521,20 @@ fn pending_setup_error_is_emitted_only_after_terminal_persistence() {
             }
         ] if code == "lease_lost"
     ));
+}
+
+#[cfg(test)]
+#[test]
+fn pending_setup_preserves_closed_session_failure_codes() {
+    assert_eq!(pending_setup_error_code("lease_lost"), "lease_lost");
+    assert_eq!(
+        pending_setup_error_code("session_transport_timed_out"),
+        "session_transport_timed_out"
+    );
+    assert_eq!(
+        pending_setup_error_code("raw sqlite or graph detail"),
+        "confirmation_unavailable"
+    );
 }
 
 #[cfg(test)]

@@ -1772,11 +1772,14 @@ impl<T: SessionV2Transport + Clone + 'static> SessionV2Store<T> {
                 match stop_rx.recv_timeout(renewal_interval) {
                     Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        if renew_lease(&worker_store, &worker_state).is_err() {
-                            if let Ok(mut state) = worker_state.lock() {
+                        if let Err(error) = renew_lease(&worker_store, &worker_state) {
+                            let Ok(mut state) = worker_state.lock() else {
+                                break;
+                            };
+                            if state.lost || !transient_renewal_error(&error) {
                                 state.lost = true;
+                                break;
                             }
-                            break;
                         }
                     }
                 }
@@ -2021,6 +2024,15 @@ fn observe_server_time(state: &mut LeaseGuardState, now: u64) -> Result<(), Sess
     }
     state.last_server_time_ms = now;
     Ok(())
+}
+
+fn transient_renewal_error(error: &SessionV2Error) -> bool {
+    matches!(
+        error,
+        SessionV2Error::TransportUnavailable
+            | SessionV2Error::TransportTimedOut
+            | SessionV2Error::TransportResponseInvalid
+    )
 }
 
 fn renew_lease<T: SessionV2Transport + Clone>(
@@ -3986,6 +3998,32 @@ mod tests {
         let later = store.current_manifest("s").unwrap();
         assert_eq!(later.manifest.generation, released_generation);
         assert!(later.manifest.active_lease.is_none());
+    }
+
+    #[test]
+    fn transient_lease_renewal_failure_retries_without_forfeiting_authority() {
+        let transport = InMemorySessionV2Transport::default();
+        transport.set_server_time_ms(10_000);
+        transport.create_session("s").unwrap();
+        let store = SessionV2Store::new(transport.clone(), &[31; 32], object_crypto());
+        let guard = store
+            .acquire_lease_with_interval(
+                "s",
+                "lease-a",
+                "session-holder",
+                std::time::Duration::from_millis(5),
+            )
+            .unwrap();
+
+        transport.set_server_time_unavailable(true);
+        std::thread::sleep(std::time::Duration::from_millis(12));
+        assert!(!guard.is_lost());
+
+        transport.set_server_time_unavailable(false);
+        transport.set_server_time_ms(10_010);
+        std::thread::sleep(std::time::Duration::from_millis(12));
+        assert!(!guard.is_lost());
+        assert!(store.current_manifest("s").unwrap().manifest.generation >= 2);
     }
 
     #[test]
