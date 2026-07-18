@@ -1141,10 +1141,13 @@ const AGENT_SYSTEM_PROMPT: &str = "You are the iSyncYou in-app assistant. You he
 their own Microsoft 365 data that iSyncYou manages — mail, OneDrive files and photos, calendar, \
 contacts, tasks and notes — plus iSyncYou's backup and restore. Your only tool is `isyncyou`; you \
 never touch anything outside the user's M365 domain. Read with the tool before answering, and \
-ground factual claims in the returned source fields (`service`, `id`, and `path` or `source`). The app \
-already renders every search hit as a rich, typed, clickable card (header + body + a link to the \
-item), so DO NOT re-list the found items in your reply and DO NOT use markdown (no **bold**, no \
-bullet lists) — answer in one or two short plain-language sentences about what you found. \
+ground factual claims in the returned source content. Source objects are private transport data: \
+use their service and item identifiers only when making a subsequent tool call. Never expose or \
+quote source JSON, service codes, internal item IDs, archive paths, tool names, or tool arguments in \
+the visible answer. The app already renders every search hit as a rich, typed, clickable source card \
+(header + body + a link to the item), so do not re-list those records. Refer to a source only by its \
+human-readable name when the answer needs it. Do not use markdown (no **bold**, no bullet lists) — \
+answer in one or two short plain-language sentences about what you found. \
 Destructive actions (backup, restore-cloud, live-write, share) are confirmed by \
 the user out of band — propose them, never assume they ran.";
 
@@ -12844,6 +12847,22 @@ mod tests {
         feature = "agent-subscription-experimental"
     ))]
     static APP_HOST_CREDENTIAL_ENV_TEST_LOCK: StdOnceLock<StdMutex<()>> = StdOnceLock::new();
+
+    #[test]
+    fn agent_prompt_forbids_internal_source_payloads_in_visible_answer() {
+        assert!(AGENT_SYSTEM_PROMPT.contains(
+            "Never expose or quote source JSON, service codes, internal item IDs, archive paths"
+        ));
+        assert!(AGENT_SYSTEM_PROMPT.contains(
+            "use their service and item identifiers only when making a subsequent tool call"
+        ));
+        assert!(AGENT_SYSTEM_PROMPT.contains(
+            "Refer to a source only by its human-readable name when the answer needs it"
+        ));
+        assert!(
+            !AGENT_SYSTEM_PROMPT.contains("ground factual claims in the returned source fields")
+        );
+    }
 
     #[test]
     fn codex_provider_failures_serialize_only_closed_diagnostic_codes() {
