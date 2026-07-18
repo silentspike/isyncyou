@@ -13807,6 +13807,24 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn app_js_native_confirmation_uses_only_closed_actionable_codes() {
+        for expected in [
+            "function nativeConfirmationMessage(code)",
+            "Keep iSyncYou open and try again",
+            "Set up a device screen lock and try again",
+            "Device confirmation is temporarily locked",
+            "Another confirmation is already open",
+        ] {
+            assert!(
+                APP_JS.contains(expected),
+                "missing confirmation contract: {expected}"
+            );
+        }
+        assert!(APP_JS.contains("nativeConfirmationMessage(confirmation.code)"));
+        assert!(!APP_JS.contains("throw new Error(m.code)"));
+    }
+
+    #[test]
     fn bridge_isolation_app_js_has_no_legacy_mobile_session_path() {
         for needle in [
             "AndroidSession",

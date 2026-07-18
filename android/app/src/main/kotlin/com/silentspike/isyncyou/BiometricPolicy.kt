@@ -35,6 +35,25 @@ internal class BiometricPendingRegistry<T : Any> {
 
 /** Pure policy decisions kept outside MainActivity so API-level behavior is unit-testable. */
 object BiometricPolicy {
+    fun chooseForOperation(
+        operation: String,
+        strongAvailable: Boolean,
+        cryptoAvailable: Boolean,
+        credentialAvailable: Boolean,
+    ): BiometricDecision? {
+        if (operation == "user-presence") {
+            return if (credentialAvailable) {
+                BiometricDecision(
+                    BiometricMode.DeviceCredential,
+                    BiometricManager.Authenticators.DEVICE_CREDENTIAL,
+                )
+            } else {
+                null
+            }
+        }
+        return choose(strongAvailable, cryptoAvailable, credentialAvailable)
+    }
+
     fun choose(
         strongAvailable: Boolean,
         cryptoAvailable: Boolean,
@@ -91,6 +110,24 @@ object BiometricPolicy {
             builder.setNegativeButtonText("Cancel")
         }
         return builder.build()
+    }
+}
+
+object BiometricErrorPolicy {
+    fun closedCode(errorCode: Int): String = when (errorCode) {
+        BiometricPrompt.ERROR_USER_CANCELED,
+        BiometricPrompt.ERROR_NEGATIVE_BUTTON,
+        BiometricPrompt.ERROR_CANCELED,
+        -> "cancelled"
+        BiometricPrompt.ERROR_LOCKOUT,
+        BiometricPrompt.ERROR_LOCKOUT_PERMANENT,
+        -> "lockout"
+        BiometricPrompt.ERROR_TIMEOUT -> "timeout"
+        BiometricPrompt.ERROR_HW_NOT_PRESENT,
+        BiometricPrompt.ERROR_HW_UNAVAILABLE,
+        BiometricPrompt.ERROR_NO_BIOMETRICS,
+        -> "not_available"
+        else -> "authentication_failed"
     }
 }
 

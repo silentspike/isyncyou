@@ -351,9 +351,13 @@ if (BRIDGE) {
       const p = _bridgePending.get(m.id);
       if (p) { _bridgePending.delete(m.id); clearTimeout(p.timer); p.resolve({ status: m.status, body: m.body }); }
     } else if (m.t === "bio") {
-      // Native BiometricPrompt result (#0.6): {ok} tells us whether the human confirmed.
+      // Native confirmation returns only a boolean plus a closed diagnostic code.
       const p = _bioPending.get(m.id);
-      if (p) { _bioPending.delete(m.id); clearTimeout(p.timer); p.resolve(!!m.ok); }
+      if (p) {
+        _bioPending.delete(m.id);
+        clearTimeout(p.timer);
+        p.resolve({ ok: !!m.ok, code: typeof m.code === "string" ? m.code : "authentication_failed" });
+      }
     } else if (m.t === "evt") {
       const h = _bridgeStreams.get(m.id);
       _bridgeStats.events++;
@@ -430,12 +434,12 @@ async function registerPushToken() {
    per-action token for `pat`. Resolves true only if the human authenticated. Without the
    native bridge there is no biometric path, so a destructive op cannot be confirmed. */
 function runBiometricConfirm(pat) {
-  if (!BRIDGE) return Promise.resolve(false);
+  if (!BRIDGE) return Promise.resolve({ ok: false, code: "not_available" });
   return new Promise((resolve) => {
     const id = "b" + (++_bridgeSeq);
     const timer = setTimeout(() => {
       _bioPending.delete(id);
-      resolve(false);
+      resolve({ ok: false, code: "timeout" });
     }, BIO_TIMEOUT_MS);
     _bioPending.set(id, { resolve, timer });
     _bridgeStats.bio++;
@@ -444,9 +448,18 @@ function runBiometricConfirm(pat) {
     } catch (_) {
       clearTimeout(timer);
       _bioPending.delete(id);
-      resolve(false);
+      resolve({ ok: false, code: "start_failed" });
     }
   });
+}
+function nativeConfirmationMessage(code) {
+  if (code === "cancelled") return "Confirmation cancelled";
+  if (code === "not_foreground") return "Keep iSyncYou open and try again";
+  if (code === "not_available") return "Set up a device screen lock and try again";
+  if (code === "lockout") return "Device confirmation is temporarily locked";
+  if (code === "timeout") return "Confirmation timed out";
+  if (code === "busy") return "Another confirmation is already open";
+  return "Could not confirm this action";
 }
 /* A short human label for the biometric sheet from the challenge payload (#0.6). */
 function biometricServiceLabel(service) {
@@ -537,8 +550,8 @@ async function request(method, path, opts) {
   // a request that already carries the public per-action handle is never re-challenged.
   if (status >= 200 && status < 300 && d && d.status === "confirmation_required"
       && d.pending_action_id && !o.perActionToken) {
-    const ok = await runBiometricConfirm(d.pending_action_id);
-    if (!ok) throw new Error("Confirmation cancelled");
+    const confirmation = await runBiometricConfirm(d.pending_action_id);
+    if (!confirmation.ok) throw new Error(nativeConfirmationMessage(confirmation.code));
     return request(method, path, { ...o, perActionToken: d.pending_action_id });
   }
   if (!Number.isFinite(status) || status < 200 || status >= 300) {
