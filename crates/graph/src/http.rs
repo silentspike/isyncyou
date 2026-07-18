@@ -1327,7 +1327,17 @@ impl GraphClient {
             if self.prefer_immutable_id {
                 req = req.header("Prefer", PREFER_IMMUTABLE_ID);
             }
-            let resp = req.send().map_err(UploadError::from_reqwest)?;
+            let resp = match req.send() {
+                Ok(resp) => resp,
+                Err(error) => {
+                    let error = UploadError::from_reqwest(error);
+                    if matches!(error, UploadError::Transport(_)) && attempt < MAX_GET_ATTEMPTS {
+                        self.sleep_for_get_retry(backoff_delay(attempt))?;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
             let status = resp.status().as_u16();
             if let Some(rid) = resp
                 .headers()
@@ -1341,16 +1351,22 @@ impl GraphClient {
                 let wait = parse_retry_after(&resp)
                     .unwrap_or_else(|| backoff_delay(attempt))
                     .min(MAX_RETRY_WAIT);
-                if let Some(remaining) = self.remaining_operation_budget()? {
-                    if wait >= remaining {
-                        return Err(UploadError::Timeout("operation deadline elapsed".into()));
-                    }
-                }
-                std::thread::sleep(wait);
+                self.sleep_for_get_retry(wait)?;
                 continue;
             }
             return Ok(resp);
         }
+    }
+
+    fn sleep_for_get_retry(&self, wait: Duration) -> Result<(), UploadError> {
+        let wait = wait.min(MAX_RETRY_WAIT);
+        if let Some(remaining) = self.remaining_operation_budget()? {
+            if wait >= remaining {
+                return Err(UploadError::Timeout("operation deadline elapsed".into()));
+            }
+        }
+        std::thread::sleep(wait);
+        Ok(())
     }
 
     pub fn get_bytes(&self, url: &str) -> Result<Vec<u8>, UploadError> {
@@ -2616,6 +2632,18 @@ mod tests {
         assert_eq!(v["ok"], true);
         let seen = server.join().unwrap();
         assert_eq!(seen.len(), 2, "must have retried the 429 exactly once");
+    }
+
+    #[test]
+    fn get_json_retries_transport_failure_then_succeeds() {
+        let (base, server) = serve(vec![
+            String::new(),
+            http_response(200, "OK", "", r#"{"ok":true}"#),
+        ]);
+        let client = GraphClient::new("tok");
+        let value = client.get_json(&base).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(server.join().unwrap().len(), 2);
     }
 
     #[test]
