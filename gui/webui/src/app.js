@@ -5412,6 +5412,7 @@ const AssistantState = {
   draft: "",
   busy: false,
   turnCancelPending: false,
+  turnStreamReady: false,
   activeMessage: null,
   connectivityIssue: null,
   pendingConnectProvider: null,
@@ -5435,6 +5436,7 @@ function closeAssistantStream(_reason) {
   AssistantState.activeMessage = null;
   AssistantState.busy = false;
   AssistantState.turnCancelPending = false;
+  AssistantState.turnStreamReady = false;
   if (stream) {
     try { stream.close(); } catch (_) {}
   }
@@ -5786,7 +5788,7 @@ function renderAssistantComposer(_st) {
   input.value = AssistantState.draft || "";
   const send = el("button", { class: "btn primary", title: disabledReason || "Send", onclick: agentSendFromInput, "data-testid": "agent-send" },
     icon("send", "icon-sm"));
-  const active = AssistantState.busy && !!AssistantState.activeTurnId;
+  const active = AssistantState.busy && !!AssistantState.activeTurnId && AssistantState.turnStreamReady;
   const stop = el("button", {
     class: "btn danger icon-only",
     type: "button",
@@ -5811,7 +5813,7 @@ function syncAssistantComposerControls() {
   const input = $("#asst-input");
   const send = $('[data-testid="agent-send"]');
   const stop = $('[data-testid="agent-stop"]');
-  const active = AssistantState.busy && !!AssistantState.activeTurnId;
+  const active = AssistantState.busy && !!AssistantState.activeTurnId && AssistantState.turnStreamReady;
   if (input) {
     input.disabled = AssistantState.busy;
     input.placeholder = AssistantState.busy ? "Wait for the active turn" : "Ask about your mail, files, calendar…";
@@ -6275,7 +6277,7 @@ async function cancelAgentPending(pendingId) {
 }
 
 async function cancelAgentTurn(turnId) {
-  if (!turnId || AssistantState.turnCancelPending) return;
+  if (!turnId || !AssistantState.turnStreamReady || AssistantState.turnCancelPending) return;
   AssistantState.turnCancelPending = true;
   syncAssistantComposerControls();
   try {
@@ -6801,6 +6803,7 @@ async function agentSend(text) {
   AssistantState.transcript.push(asst);
   AssistantState.busy = true;
   AssistantState.turnCancelPending = false;
+  AssistantState.turnStreamReady = false;
   AssistantState.draft = "";
   AssistantState.activeMessage = asst;
   syncAssistantComposerControls();
@@ -6935,6 +6938,7 @@ async function agentSend(text) {
     }
     AssistantState.busy = false;
     AssistantState.turnCancelPending = false;
+    AssistantState.turnStreamReady = false;
     AssistantState.activeMessage = null;
     syncAssistantComposerControls();
     if (e && e.connectivity) {
@@ -6953,6 +6957,7 @@ async function agentSend(text) {
     await endNetworkGuard(startingGuardId);
     AssistantState.busy = false;
     AssistantState.turnCancelPending = false;
+    AssistantState.turnStreamReady = false;
     AssistantState.activeMessage = null;
     syncAssistantComposerControls();
     setText("Error: could not start the turn");
@@ -7014,6 +7019,8 @@ async function agentSend(text) {
     finish("⚠ connection lost");
   });
   AssistantState.activeStream = stream;
+  AssistantState.turnStreamReady = true;
+  syncAssistantComposerControls();
 }
 
 const ACCOUNT_ROLE_META = Object.freeze({

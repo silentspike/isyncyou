@@ -9378,6 +9378,26 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(send.contains("!turnStartPosted || (e && e.responseReceived === true)"));
     }
 
+    #[test]
+    fn assistant_stop_is_hidden_until_stream_is_ready() {
+        assert!(APP_JS.contains("turnStreamReady: false"));
+        assert!(APP_JS.contains(
+            "AssistantState.busy && !!AssistantState.activeTurnId && AssistantState.turnStreamReady"
+        ));
+        assert!(APP_JS.contains(
+            "if (!turnId || !AssistantState.turnStreamReady || AssistantState.turnCancelPending) return;"
+        ));
+
+        let open = APP_JS
+            .find("stream = openEventStream(url")
+            .expect("assistant stream open");
+        let ready = APP_JS[open..]
+            .find("AssistantState.turnStreamReady = true;")
+            .map(|offset| open + offset)
+            .expect("assistant stream ready transition");
+        assert!(ready > open);
+    }
+
     // #639 T9 AC3: the status response carries Cache-Control: no-store and never leaks a secret.
     #[test]
     fn status_carries_no_store_and_no_secrets() {
