@@ -764,6 +764,15 @@ async function main() {
     assert(evidence, "connect disabled before consent", await page.locator('[data-testid="agent-connect-codex"]').isDisabled());
     assert(evidence, "BYO key row absent", await page.locator('[data-agent-byo-key="unavailable"]').count() === 0);
     assert(evidence, "no editable secret input in setup", await page.locator('input[type="password"], input[name*="key" i], textarea[name*="key" i]').count() === 0);
+    const setupSessions = page.locator('[data-testid="agent-setup"] [data-agent-sessions="1"]');
+    assert(evidence, "session import remains available before provider sign-in", await setupSessions.isVisible());
+    await setupSessions.click();
+    const setupSessionDialog = page.getByRole("dialog", { name: "Assistant sessions" });
+    await setupSessionDialog.waitFor({ state: "visible", timeout: 10000 });
+    assert(evidence, "pre-sign-in session command opens the import dialog",
+      await setupSessionDialog.isVisible()
+      && await page.getByRole("textbox", { name: "Session transfer code" }).isVisible());
+    await setupSessionDialog.getByRole("button", { name: "Close" }).click();
     // #639 T10: the first-run handoff wizard renders the ordered official-sign-in -> ready steps.
     const wizardStepCount = await page.locator('[data-testid="agent-wizard-steps"] [data-agent-wizard-step]').count();
     assert(evidence, "handoff wizard renders 8 ordered steps", wizardStepCount === 8, { wizardStepCount });
