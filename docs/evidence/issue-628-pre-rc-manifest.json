@@ -1,0 +1,207 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-07-19T13:12:48Z",
+  "commit": "4deb1d91cb906e0d2e3527c8c3cba2bc583fae42",
+  "entries": [
+    {
+      "id": "EV-001",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Session V2 persists only the bounded visible user, assistant, source, and terminal record contract.",
+      "method": "test",
+      "command": "tools/run-nonempty-cargo-filter.sh -p isyncyou-agent --features agent-oauth-providers,onedrive --filter session_v2_",
+      "test": "session_v2_round_trips_user_assistant_sources_and_terminal_state",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/host-gates.txt"
+    },
+    {
+      "id": "EV-002",
+      "requirement": "REQ-AGENT-016",
+      "claim": "One manifest CAS advances visible, request, and UUID-binding heads under the active fence.",
+      "method": "test",
+      "command": "tools/run-nonempty-cargo-filter.sh -p isyncyou-agent --features agent-oauth-providers,onedrive --filter manifest_cas_",
+      "test": "manifest_cas_atomically_advances_visible_request_and_uuid_binding_heads",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json"
+    },
+    {
+      "id": "EV-003",
+      "requirement": "REQ-AGENT-016",
+      "claim": "The durable request journal reconstructs all sixteen bounded provider steps and rejects incomplete or tampered chains.",
+      "method": "test",
+      "command": "tools/run-nonempty-cargo-filter.sh -p isyncyou-agent --features agent-oauth-providers,onedrive --filter request_journal_",
+      "test": "request_journal_recovers_all_sixteen_provider_steps_in_order",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json"
+    },
+    {
+      "id": "EV-004",
+      "requirement": "REQ-AGENT-016",
+      "claim": "A quiet provider turn renews its shared-session lease without relying on stream events.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features agent-oauth-providers,onedrive lease_renews_while_provider_emits_no_events -- --nocapture",
+      "test": "lease_renews_while_provider_emits_no_events",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json"
+    },
+    {
+      "id": "EV-005",
+      "requirement": "REQ-AGENT-016",
+      "claim": "A completed turn is announced only after durable terminal publication.",
+      "method": "test",
+      "command": "tools/run-nonempty-cargo-filter.sh -p isyncyou-app-host --features agent-oauth-providers --filter done_complete_",
+      "test": "done_complete_is_emitted_only_after_terminal_record_commit",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/host-gates.txt"
+    },
+    {
+      "id": "EV-006",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Turn cancellation before persistence discards late provider output and cannot publish completion.",
+      "method": "test",
+      "command": "tools/run-nonempty-cargo-filter.sh -p isyncyou-agent --features agent-oauth-providers,onedrive --filter turn_cancel_",
+      "test": "turn_cancel_before_persist_ignores_late_provider_result",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/confirmation-and-operations.json"
+    },
+    {
+      "id": "EV-007",
+      "requirement": "REQ-AGENT-016",
+      "claim": "The same terminal request identity replays its stored result without a second provider call.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features agent-oauth-providers,onedrive same_request_id_same_terminal_result_does_not_call_provider_twice -- --nocapture",
+      "test": "same_request_id_same_terminal_result_does_not_call_provider_twice",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/managed-health.json"
+    },
+    {
+      "id": "EV-008",
+      "requirement": "REQ-AGENT-016",
+      "claim": "A recovered request cannot continue after provider credential, policy, harness, installation, provider, or model authority changes.",
+      "method": "test",
+      "command": "tools/run-nonempty-cargo-filter.sh -p isyncyou-app-host --features agent-oauth-providers --filter provider_generation_",
+      "test": "provider_generation_recovery_rejects_every_authority_binding_change",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/account-lifecycle.json"
+    },
+    {
+      "id": "EV-009",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Pairing claim, local seed installation, and remote finalization resume idempotently across restart boundaries.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers pairing_claim_install_and_finalize_are_restart_safe_and_idempotent -- --nocapture",
+      "test": "pairing_claim_install_and_finalize_are_restart_safe_and_idempotent",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json"
+    },
+    {
+      "id": "EV-010",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Strict Agent JSON rejects recursive duplicate keys and trailing input.",
+      "method": "test",
+      "command": "tools/run-nonempty-cargo-filter.sh -p isyncyou-webui --filter strict_json_",
+      "test": "strict_json_rejects_recursive_duplicate_keys_and_trailing_data",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/security-scan.txt"
+    },
+    {
+      "id": "EV-011",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Chunked mutation commit validates total length, digest, expiry, and authenticated binding before effect execution.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers mutation_intent_commit_verifies_total_hash_length_expiry_and_binding -- --nocapture",
+      "test": "mutation_intent_commit_verifies_total_hash_length_expiry_and_binding",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/security-scan.txt"
+    },
+    {
+      "id": "EV-012",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Product feature graphs enable OneDrive session transport while excluding experimental local authentication and all default-off device hooks.",
+      "method": "command",
+      "command": "cargo remote -c -- tree -e features -p isyncyou-daemon && cargo remote -c -- tree -e features -p isyncyou-mobile",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/feature-graphs.json"
+    },
+    {
+      "id": "EV-013",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Real Claude and Codex product turns admitted promptly, reused the same request on retry, committed one terminal, rehydrated history, and resolved bounded sources.",
+      "method": "probe",
+      "command": "python3 tools/agent-epic-closeout-probe.py pre-rc --implementation-commit 4deb1d91cb906e0d2e3527c8c3cba2bc583fae42 --daemon-bin target/release/isyncyoud --config OWNER_ONLY_CONFIG --bind LOOPBACK --out OWNER_ONLY_TEMP",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/managed-health.json"
+    },
+    {
+      "id": "EV-014",
+      "requirement": "REQ-AGENT-016",
+      "claim": "The default Android product runtime completed real cited turns for both providers and a long turn without lease loss.",
+      "method": "probe",
+      "command": "jq -e '.real_claude_cited_turn == \"pass_on_current_implementation_commit\" and .real_codex_cited_turn == \"pass_on_current_implementation_commit\" and .current_long_turn_observation.terminal == \"complete\"' docs/evidence/artifacts/issue-628/pre-rc/default-apk-matrix.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/default-apk-matrix.json"
+    },
+    {
+      "id": "EV-015",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Desktop-to-Android Pairing V2 and cross-device transcript continuation completed with a linear shared-session history.",
+      "method": "probe",
+      "command": "jq -e '(.desktop_to_android_pairing | startswith(\"pass_\")) and .cross_device_continuation.result == \"pass\" and .result == \"pass\"' docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json"
+    },
+    {
+      "id": "EV-016",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Confirmation negatives created no mutation, while four controlled confirmed effects were independently read back and reverted.",
+      "method": "probe",
+      "command": "jq -e '.negative_confirmation_matrix.mutation_count == 0 and .controlled_effects_created == 4 and .controlled_effects_reverted == 4 and .unreverted_effects == 0' docs/evidence/artifacts/issue-628/pre-rc/confirmation-and-operations.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/graph-revert-summary.json"
+    },
+    {
+      "id": "EV-017",
+      "requirement": "REQ-AGENT-016",
+      "claim": "The separate hook APK passed only its bounded Keystore, worker, and network instrumentation and the clean default APK was restored afterward.",
+      "method": "command",
+      "command": "adb shell am instrument -w -r -e class BOUNDED_ISSUE_628_HOOK_CLASSES com.silentspike.isyncyou.debug.test/androidx.test.runner.AndroidJUnitRunner",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/hook-apk-matrix.json"
+    },
+    {
+      "id": "EV-018",
+      "requirement": "REQ-AGENT-016",
+      "claim": "The exact-head default APK passed its bounded guard and lifecycle instrumentation and contains no Agent test-hook marker.",
+      "method": "command",
+      "command": "adb shell am instrument -w -r -e class BOUNDED_ISSUE_628_DEFAULT_CLASSES com.silentspike.isyncyou.debug.test/androidx.test.runner.AndroidJUnitRunner",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/default-apk-matrix.json"
+    },
+    {
+      "id": "EV-019",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Pinned local static analysis and product boundary scanners reported no production boundary violation.",
+      "method": "command",
+      "command": "docker run --rm -v $PWD:/src -w /src semgrep/semgrep@sha256:a265d09a9ca712e6624aca09056304ce4314a695b7028d65c041dd53fd44c700 semgrep scan --config p/javascript --config p/kotlin --config p/secrets --config p/security-audit --error --metrics=off gui/webui android",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/security-scan.txt"
+    },
+    {
+      "id": "EV-020",
+      "requirement": "REQ-AGENT-016",
+      "claim": "All release-blocking live pre-RC rows A through M have closed PASS observations without secret or identity material.",
+      "method": "probe",
+      "command": "jq -e '[.A,.B,.C,.D,.E,.F,.G,.H,.I,.J,.K,.L,.M] | all(.state == \"pass\")' docs/evidence/artifacts/issue-628/pre-rc/observations.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/observations.json"
+    },
+    {
+      "id": "EV-021",
+      "requirement": "REQ-AGENT-016",
+      "claim": "The desktop and mobile Assistant surfaces preserve safe setup, model, citation, cancellation, confirmation, and autoscroll behavior without exposing internal payloads.",
+      "method": "command",
+      "command": "node tools/agent-ui-smoke.mjs --out docs/evidence/artifacts/issue-628/pre-rc/ui-smoke",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/ui-smoke/agent-ui-smoke.json"
+    }
+  ]
+}

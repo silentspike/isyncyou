@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-07-17T07:35:49Z",
+  "workflow_state_refreshed_at": "2026-07-19T13:12:48Z",
+  "dev_required_checks": [
+    "Gitleaks",
+    "cargo-deny",
+    "conventional",
+    "dev-checks",
+    "language-check",
+    "requirements + evidence",
+    "semgrep"
+  ],
+  "staging_required_checks": [
+    "Analyze (java-kotlin)",
+    "Analyze (javascript-typescript)",
+    "Analyze (rust)",
+    "Gitleaks",
+    "conventional",
+    "language-check",
+    "staging-pass"
+  ],
+  "main_required_checks": [
+    "Analyze (java-kotlin)",
+    "Analyze (javascript-typescript)",
+    "Analyze (rust)",
+    "Gitleaks",
+    "conventional",
+    "language-check",
+    "main-pass",
+    "vuln-scan"
+  ],
+  "promote_state": "disabled_manually",
+  "promote_watchdog_state": "disabled_manually",
+  "open_pull_requests": 0,
+  "active_or_queued_runs": 0,
+  "result": "pass"
+}

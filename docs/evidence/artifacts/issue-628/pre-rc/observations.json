@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-07-19T11:50:35Z",
+  "implementation_commit": "4deb1d91cb906e0d2e3527c8c3cba2bc583fae42",
+  "prior_physical_evidence_commit": "d0725a508454028970f8126b7a9cf44b3360ace7",
+  "A": {"state": "pass", "code": "claude_managed_cited_turn_retry_reuse_and_committed_status", "turn_ack_latency": "under_250ms", "source_count": 19, "request_retry_reused_turn": true, "request_status": "committed", "transcript_rehydrated": true, "all_sources_listed_and_viewable": true},
+  "B": {"state": "pass", "code": "codex_managed_cited_turn_retry_reuse_and_committed_status", "source_count": 1, "request_retry_reused_turn": true, "transcript_rehydrated": true},
+  "C": {"state": "pass", "code": "claude_android_exact_head_cited_read_turn", "terminal_count": 1, "citation_count": 6, "errors": 0, "pending_action": false, "mutation_observed": false},
+  "D": {"state": "pass", "code": "codex_android_exact_head_cited_read_turn", "terminal_count": 1, "citation_count": 6, "errors": 0, "pending_action": false, "mutation_observed": false},
+  "E": {"state": "pass", "code": "controlled_hostile_fixture_contained_for_both_providers", "provider_count": 2, "pending_action_count": 0, "mutation_observed": false},
+  "F": {"state": "pass", "code": "physical_turn_cancel_plus_deterministic_confirmation_negative_matrix_pass", "cancel_terminal": "cancelled", "connection_lost_copy": false, "negative_mutation_count": 0},
+  "G": {"state": "pass", "code": "controlled_confirmed_operations_and_verified_reverts_pass", "effects_created": 4, "effects_reverted": 4, "unreverted_effects": 0},
+  "H": {"state": "pass", "code": "current_hook_recovery_contracts_pass_and_default_restored", "cleanup_complete": true},
+  "I": {"state": "pass", "code": "unchanged_native_job_baseline_plus_current_default_regression_pass", "current_hook_markers_present": false, "current_instrumentation_failures": 0},
+  "J": {"state": "pass", "code": "pairing_cross_device_current_turn_lease_and_crash_recovery_pass", "manifest_cas_tests": 4, "crash_tests": 4, "multistep_tests": 1, "read_replay_tests": 3},
+  "K": {"state": "pass", "code": "default_apk_codex_reconnect_and_cited_turn_pass", "prior_credential_revoked": true, "new_credential_connected": true, "terminal": "complete", "citations": 25, "errors": 0},
+  "L": {"state": "pass", "code": "experimental_fallback_excluded", "cleanup_complete": true},
+  "M": {"state": "pass", "code": "current_managed_daemon_and_m365_list_view_smoke_pass"}
+}

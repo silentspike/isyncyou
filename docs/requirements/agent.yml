@@ -468,7 +468,7 @@ requirements:
       generation and product harness, and publish completion only after durable terminal
       state. Cross-device transfer uses a confirmed, one-time, five-minute pairing
       protocol with encrypted crash recovery. (S-AG.16, #628)
-    status: planned
+    status: implemented
     design: docs/adr/007-agent-architecture.md
     acceptance:
       - V2 sessions publish visible transcript, request state, and UUID bindings through one fenced manifest CAS and enforce combined record and encrypted-byte budgets.
@@ -479,12 +479,19 @@ requirements:
     verified_by:
       - test: session_v2_round_trips_user_assistant_sources_and_terminal_state
       - test: manifest_cas_atomically_advances_visible_request_and_uuid_binding_heads
-      - test: request_journal_recovers_all_completed_provider_steps_in_order
+      - test: request_journal_recovers_all_sixteen_provider_steps_in_order
       - test: rejected_tool_help_digest_or_unknown_version_fails_closed
       - test: duplicate_tool_use_ids_fail_closed_before_execution
-      - test: lease_renews_while_provider_emits_no_events_and_stops_on_drop
+      - test: lease_renews_while_provider_emits_no_events
+      - test: same_request_id_same_terminal_result_does_not_call_provider_twice
+      - test: provider_generation_recovery_rejects_every_authority_binding_change
+      - test: turn_cancel_before_persist_ignores_late_provider_result
+      - test: done_complete_is_emitted_only_after_terminal_record_commit
+      - test: pairing_claim_install_and_finalize_are_restart_safe_and_idempotent
+      - test: strict_json_rejects_recursive_duplicate_keys_and_trailing_data
+      - test: mutation_intent_commit_verifies_total_hash_length_expiry_and_binding
+      - file: docs/evidence/issue-628-pre-rc-manifest.json
       - test: lost_lease_rejects_late_append_and_finalization
       - test: turn_cancel_stops_before_read_tool_execution
-      - test: provider_generation_recovery_rejects_every_authority_binding_change
       - test: user_presence_and_agent_session_routes_require_session_cap_strict_json_and_no_store
       - file: tools/agent-epic-closeout-probe.py
