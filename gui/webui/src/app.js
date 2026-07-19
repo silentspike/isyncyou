@@ -6943,7 +6943,8 @@ async function agentSend(text) {
     // A bridge timeout after dispatch is ambiguous: the host may have committed a turn and merely
     // lost the response. Abandon JS ownership and let the native starting deadline reap the lease.
     // A preflight failure or an HTTP response is unambiguous and releases immediately.
-    if (!turnStartPosted || (e && e.responseReceived === true)) {
+    const ambiguousStart = turnStartPosted && (!e || e.responseReceived !== true);
+    if (!ambiguousStart) {
       await endNetworkGuard(startingGuardId);
     }
     AssistantState.busy = false;
@@ -6951,14 +6952,15 @@ async function agentSend(text) {
     AssistantState.turnStreamReady = false;
     AssistantState.activeMessage = null;
     syncAssistantComposerControls();
+    asst.doneReason = "error";
     if (e && e.connectivity) {
       rememberConnectivityIssue(e, () => agentSend(text));
       setText(CONNECTIVITY_COPY[AssistantState.connectivityIssue.code]);
       renderAssistantView($("#view"));
     } else {
-      setText(agentSafeErrorCopy(e && e.message));
+      setText(agentSafeErrorCopy(ambiguousStart ? "turn_outcome_unknown" : (e && e.message)));
     }
-    if (turnStartPosted && (!e || e.responseReceived !== true)) {
+    if (ambiguousStart) {
       void reconcileRequestStatus();
     }
     return;

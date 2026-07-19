@@ -9609,7 +9609,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let send = &APP_JS[start..end];
         assert!(send.contains("let turnStartPosted = false;"));
         assert!(send.contains("turnStartPosted = true;"));
-        assert!(send.contains("!turnStartPosted || (e && e.responseReceived === true)"));
+        assert!(send.contains(
+            "const ambiguousStart = turnStartPosted && (!e || e.responseReceived !== true);"
+        ));
+        assert!(send.contains("agentSafeErrorCopy(ambiguousStart ? \"turn_outcome_unknown\""));
+        assert!(send.contains("asst.doneReason = \"error\";"));
     }
 
     #[test]
