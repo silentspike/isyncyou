@@ -9582,13 +9582,11 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 ))]
                 {
                     let observation = forced_observation.unwrap_or_else(|| {
-                        isyncyou_agent::http::HttpTransport::shared()
-                            .ok()
-                            .and_then(|http| {
-                                http.probe(isyncyou_agent::target_for(provider, purpose))
-                                    .ok()
-                            })
-                            .unwrap_or(isyncyou_agent::ProbeObservation::ConnectFailed)
+                        isyncyou_agent::http::HttpTransport::probe_shared(
+                            isyncyou_agent::target_for(provider, purpose),
+                        )
+                        .ok()
+                        .unwrap_or(isyncyou_agent::ProbeObservation::ConnectFailed)
                     });
                     isyncyou_agent::classify(snapshot, Some(observation))
                 }

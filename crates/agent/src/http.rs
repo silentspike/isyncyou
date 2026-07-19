@@ -319,6 +319,8 @@ mod live {
     pub const PROVIDER_STREAM_START_TIMEOUT: Duration = Duration::from_secs(180);
     pub const PROVIDER_SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(240);
     pub const PROVIDER_TURN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+    pub const PREFLIGHT_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+    pub const PREFLIGHT_NETWORK_TIMEOUT: Duration = Duration::from_secs(10);
     pub const PREFLIGHT_TOTAL_TIMEOUT: Duration = Duration::from_secs(12);
 
     /// A minimal blocking JSON-over-HTTPS client (reqwest + rustls). Providers build
@@ -340,8 +342,8 @@ mod live {
                     AgentError::Transport("provider_transport_initialization_failed".into())
                 })?;
             let probe_client = reqwest::blocking::Client::builder()
-                .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
-                .timeout(PREFLIGHT_TOTAL_TIMEOUT)
+                .connect_timeout(PREFLIGHT_CONNECT_TIMEOUT)
+                .timeout(PREFLIGHT_NETWORK_TIMEOUT)
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|_| {
@@ -389,8 +391,33 @@ mod live {
         /// Run one unauthenticated, no-redirect provider reachability probe. The target
         /// table is closed and neither the URL nor raw reqwest error leaves this module.
         pub fn probe(&self, target: ProbeTarget) -> Result<ProbeObservation, AgentError> {
+            self.probe_with_timeout(target, PREFLIGHT_NETWORK_TIMEOUT)
+        }
+
+        /// Include one-time transport initialization in the public preflight budget.
+        /// The shorter network deadline leaves room for routing and bridge framing.
+        pub fn probe_shared(target: ProbeTarget) -> Result<ProbeObservation, AgentError> {
+            let started = std::time::Instant::now();
+            let transport = Self::shared()?;
+            let Some(remaining) = PREFLIGHT_TOTAL_TIMEOUT.checked_sub(started.elapsed()) else {
+                return Ok(ProbeObservation::ConnectTimedOut);
+            };
+            transport.probe_with_timeout(target, remaining.min(PREFLIGHT_NETWORK_TIMEOUT))
+        }
+
+        fn probe_with_timeout(
+            &self,
+            target: ProbeTarget,
+            timeout: Duration,
+        ) -> Result<ProbeObservation, AgentError> {
             Self::ensure_test_network_allowed()?;
-            let mut request = self.probe_client.get(probe_target_url(target));
+            if timeout.is_zero() {
+                return Ok(ProbeObservation::ConnectTimedOut);
+            }
+            let mut request = self
+                .probe_client
+                .request(probe_request_method(), probe_target_url(target))
+                .timeout(timeout);
             for (name, value) in probe_request_headers() {
                 request = request.header(name, value);
             }
@@ -670,6 +697,10 @@ mod live {
 
     pub(super) fn probe_request_headers() -> [(&'static str, &'static str); 1] {
         [("accept", "application/json")]
+    }
+
+    pub(super) fn probe_request_method() -> reqwest::Method {
+        reqwest::Method::HEAD
     }
 
     fn async_sse_client_builder() -> reqwest::ClientBuilder {
@@ -1157,6 +1188,15 @@ mod tests {
             assert_ne!(name, "authorization");
             assert_ne!(name, "cookie");
         }
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn connectivity_preflight_reserves_bridge_budget_and_uses_head() {
+        assert_eq!(live::probe_request_method(), reqwest::Method::HEAD);
+        assert!(live::PREFLIGHT_CONNECT_TIMEOUT < live::PREFLIGHT_NETWORK_TIMEOUT);
+        assert!(live::PREFLIGHT_NETWORK_TIMEOUT < live::PREFLIGHT_TOTAL_TIMEOUT);
+        assert!(live::PREFLIGHT_TOTAL_TIMEOUT < std::time::Duration::from_secs(15));
     }
 
     #[cfg(feature = "http")]
