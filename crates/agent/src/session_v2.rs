@@ -4213,8 +4213,18 @@ mod tests {
                 std::time::Duration::from_millis(5),
             )
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let renewed = store.current_manifest("s").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let renewed = loop {
+            let current = store.current_manifest("s").unwrap();
+            if current.manifest.generation >= 2 {
+                break current;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "lease renewal worker did not advance the manifest"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
         assert!(renewed.manifest.generation >= 2);
         assert_eq!(
             renewed
