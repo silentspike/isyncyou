@@ -1804,6 +1804,15 @@ impl<T: SessionV2Transport + Clone + 'static> SessionV2Store<T> {
 }
 
 impl<T: SessionV2Transport + Clone + 'static> SessionLeaseGuard<T> {
+    fn stop_renewal(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(renewal) = self.renewal.take() {
+            let _ = renewal.join();
+        }
+    }
+
     pub fn binding(&self) -> Result<PersistedLeaseBinding, SessionV2Error> {
         let state = self.state.lock().map_err(|_| SessionV2Error::LeaseLost)?;
         if state.lost {
@@ -1822,6 +1831,40 @@ impl<T: SessionV2Transport + Clone + 'static> SessionLeaseGuard<T> {
         if state.lost {
             return Err(SessionV2Error::LeaseLost);
         }
+        Ok(state.current.manifest.generation)
+    }
+
+    /// Release the owned lease and return the authoritative post-release
+    /// manifest generation. Callers that retain a verified manifest snapshot
+    /// must use this generation rather than the pre-release generation.
+    pub fn release(&mut self) -> Result<u64, SessionV2Error> {
+        self.stop_renewal();
+        let mut state = self.state.lock().map_err(|_| SessionV2Error::LeaseLost)?;
+        if state.lost {
+            return Err(SessionV2Error::LeaseLost);
+        }
+        if state.current.manifest.active_lease.is_none() {
+            return Ok(state.current.manifest.generation);
+        }
+        if state.current.manifest.active_lease.as_ref() != Some(&state.lease) {
+            state.lost = true;
+            return Err(SessionV2Error::LeaseLost);
+        }
+        let mut next = state.current.manifest.clone();
+        next.generation = next
+            .generation
+            .checked_add(1)
+            .ok_or(SessionV2Error::SessionLimit)?;
+        next.active_lease = None;
+        let Some(current) = self
+            .store
+            .transport
+            .compare_and_swap_manifest(&state.current, &next)?
+        else {
+            state.lost = true;
+            return Err(SessionV2Error::ManifestConflict);
+        };
+        state.current = current;
         Ok(state.current.manifest.generation)
     }
 
@@ -2006,31 +2049,7 @@ impl<T: SessionV2Transport + Clone + 'static> SessionLeaseGuard<T> {
 
 impl<T: SessionV2Transport + Clone + 'static> Drop for SessionLeaseGuard<T> {
     fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(renewal) = self.renewal.take() {
-            let _ = renewal.join();
-        }
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
-        if state.lost || state.current.manifest.active_lease.as_ref() != Some(&state.lease) {
-            return;
-        }
-        let mut next = state.current.manifest.clone();
-        let Some(generation) = next.generation.checked_add(1) else {
-            return;
-        };
-        next.generation = generation;
-        next.active_lease = None;
-        if let Ok(Some(current)) = self
-            .store
-            .transport
-            .compare_and_swap_manifest(&state.current, &next)
-        {
-            state.current = current;
-        }
+        let _ = self.release();
     }
 }
 
@@ -4173,6 +4192,35 @@ mod tests {
         let later = store.current_manifest("s").unwrap();
         assert_eq!(later.manifest.generation, released_generation);
         assert!(later.manifest.active_lease.is_none());
+    }
+
+    #[test]
+    fn explicit_lease_release_returns_authoritative_manifest_generation() {
+        let transport = InMemorySessionV2Transport::default();
+        transport.set_server_time_ms(10_000);
+        transport.create_session("s").unwrap();
+        let store = SessionV2Store::new(transport, &[28; 32], object_crypto());
+        let mut guard = store
+            .acquire_lease_with_interval(
+                "s",
+                "lease-a",
+                "session-holder",
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        let leased_generation = guard.manifest_generation().unwrap();
+
+        let released_generation = guard.release().unwrap();
+        let released = store.current_manifest("s").unwrap();
+
+        assert_eq!(released_generation, leased_generation + 1);
+        assert_eq!(released.manifest.generation, released_generation);
+        assert!(released.manifest.active_lease.is_none());
+        drop(guard);
+        assert_eq!(
+            store.current_manifest("s").unwrap().manifest.generation,
+            released_generation
+        );
     }
 
     #[test]

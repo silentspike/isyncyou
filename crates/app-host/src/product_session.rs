@@ -372,13 +372,13 @@ impl ProductTurnRuntime {
     }
 
     fn context_snapshot_after_publish(
-        self,
+        mut self,
         terminal_records: Vec<SessionRecordV2>,
     ) -> Result<ProductSessionContextSnapshot, String> {
-        let manifest_generation = self
-            .guard
-            .manifest_generation()
-            .map_err(map_session_error)?;
+        // Releasing the lease increments the manifest generation. A snapshot
+        // tagged with the pre-release value is stale immediately and forces the
+        // next turn to re-read all visible records from OneDrive.
+        let manifest_generation = self.guard.release().unwrap_or(u64::MAX);
         let mut records = self.context_records;
         records.push(self.intent_record);
         records.extend(terminal_records);
