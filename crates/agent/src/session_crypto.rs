@@ -72,6 +72,7 @@ pub struct SessionObjectCrypto {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionObjectClass {
+    Manifest,
     VisibleRecord,
     VisibleIndex,
     RequestState,
@@ -293,6 +294,7 @@ fn validate_object_identity(session_id: &str, object_id: &str) -> Result<(), Age
 
 fn object_aad(session_id: &str, object_class: SessionObjectClass, object_id: &str) -> Vec<u8> {
     let class = match object_class {
+        SessionObjectClass::Manifest => b"manifest".as_slice(),
         SessionObjectClass::VisibleRecord => b"visible_record".as_slice(),
         SessionObjectClass::VisibleIndex => b"visible_index".as_slice(),
         SessionObjectClass::RequestState => b"request_state".as_slice(),

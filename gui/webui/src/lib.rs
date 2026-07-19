@@ -723,6 +723,38 @@ pub struct ApiResponse {
     pub headers: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurableRequestBegin {
+    Execute,
+    Replay(ApiResponse),
+    Conflict,
+    OutcomeUnknown,
+}
+
+/// Persistent request receipts for ordinary product mutations. Agent session and
+/// mutation-intent routes retain their richer purpose-built journals.
+pub trait DurableRequestStore: Send + Sync {
+    fn begin(
+        &self,
+        request_id: &str,
+        route_domain: &str,
+        payload_digest: &str,
+    ) -> Result<DurableRequestBegin, String>;
+    fn complete(
+        &self,
+        request_id: &str,
+        route_domain: &str,
+        payload_digest: &str,
+        response: &ApiResponse,
+    ) -> Result<(), String>;
+    fn abort(
+        &self,
+        request_id: &str,
+        route_domain: &str,
+        payload_digest: &str,
+    ) -> Result<(), String>;
+}
+
 impl ApiResponse {
     fn json(status: u16, v: &Value) -> Self {
         ApiResponse {
@@ -898,6 +930,7 @@ pub struct AgentConnectivityPreflightResponse {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentCredentialRefreshRequest {
+    pub request_id: String,
     pub provider: String,
 }
 
@@ -1088,6 +1121,7 @@ pub struct AgentAccountLifecycleResponse {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentOAuthCancelRequest {
+    pub request_id: String,
     pub provider: String,
     pub attempt_id: String,
 }
@@ -1098,6 +1132,7 @@ pub struct AgentOAuthCancelRequest {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentOAuthCompleteRequest {
+    pub request_id: String,
     pub provider: String,
     pub attempt_id: String,
     pub pasted_code: String,
@@ -2156,6 +2191,7 @@ pub struct Router {
     onedrive_write_cap_token: Option<String>,
     mutation_intents: Option<std::sync::Arc<dyn MutationIntentHandler>>,
     mutation_intent_cap_token: Option<String>,
+    durable_requests: Option<std::sync::Arc<dyn DurableRequestStore>>,
     /// Optional OneDrive per-folder mode handler (#651): fresh mode reads + persisted
     /// set/clear. `None` => the mode POST is refused (read-only CLI `serve`); the GET
     /// then falls back to the static config.
@@ -2259,6 +2295,7 @@ impl Router {
             onedrive_write_cap_token: None,
             mutation_intents: None,
             mutation_intent_cap_token: None,
+            durable_requests: None,
             onedrive_mode: None,
             onedrive_mode_cap_token: None,
             onedrive_risk: None,
@@ -2317,6 +2354,7 @@ impl Router {
             onedrive_write_cap_token: None,
             mutation_intents: None,
             mutation_intent_cap_token: None,
+            durable_requests: None,
             onedrive_mode: None,
             onedrive_mode_cap_token: None,
             onedrive_risk: None,
@@ -2664,6 +2702,11 @@ impl Router {
         self
     }
 
+    pub fn with_durable_requests(mut self, store: std::sync::Arc<dyn DurableRequestStore>) -> Self {
+        self.durable_requests = Some(store);
+        self
+    }
+
     /// Enable the OneDrive local-body management POSTs/GET (free-up / download-now / conflict
     /// list+resolve / offline→online cleanup), guarded by `cap_token` (builder style, #659).
     pub fn with_onedrive_manage(
@@ -2793,6 +2836,145 @@ impl Router {
         ct_eq(w.as_bytes(), g.as_bytes())
     }
 
+    fn ordinary_post_cap(&self, path: &str) -> Option<&Option<String>> {
+        match path {
+            "/api/v1/restore" => Some(&self.restore_cap_token),
+            "/api/v1/backup" => Some(&self.backup_cap_token),
+            "/api/v1/jobs/cancel" => Some(&self.mobile_job_cap_token),
+            "/api/v1/share" => Some(&self.share_cap_token),
+            "/api/v1/sync/pause" | "/api/v1/sync/resume" | "/api/v1/sync/now" => {
+                Some(&self.sync_cap_token)
+            }
+            "/api/v1/verify" => Some(&self.verify_cap_token),
+            "/api/v1/settings" => Some(&self.settings_cap_token),
+            "/api/v1/mail/send"
+            | "/api/v1/mail/reply"
+            | "/api/v1/mail/forward"
+            | "/api/v1/mail/move"
+            | "/api/v1/mail/read"
+            | "/api/v1/mail/flag"
+            | "/api/v1/mail/categories"
+            | "/api/v1/mail/draft" => Some(&self.mail_write_cap_token),
+            "/api/v1/calendar/create"
+            | "/api/v1/calendar/update"
+            | "/api/v1/calendar/delete"
+            | "/api/v1/calendar/respond" => Some(&self.calendar_write_cap_token),
+            "/api/v1/contact/create" | "/api/v1/contact/update" | "/api/v1/contact/delete" => {
+                Some(&self.contact_write_cap_token)
+            }
+            "/api/v1/todo/create"
+            | "/api/v1/todo/update"
+            | "/api/v1/todo/complete"
+            | "/api/v1/todo/delete"
+            | "/api/v1/todo/checklist-add"
+            | "/api/v1/todo/checklist-toggle"
+            | "/api/v1/todo/checklist-delete"
+            | "/api/v1/todo/list-create"
+            | "/api/v1/todo/list-delete" => Some(&self.task_write_cap_token),
+            "/api/v1/onenote/create" | "/api/v1/onenote/delete" | "/api/v1/onenote/append" => {
+                Some(&self.onenote_write_cap_token)
+            }
+            "/api/v1/onedrive/transfers/cancel"
+            | "/api/v1/onedrive/transfers/pause"
+            | "/api/v1/onedrive/transfers/retry" => Some(&self.transfer_cap_token),
+            "/api/v1/onedrive/create"
+            | "/api/v1/onedrive/rename"
+            | "/api/v1/onedrive/move"
+            | "/api/v1/onedrive/delete" => Some(&self.onedrive_write_cap_token),
+            "/api/v1/onedrive/mode" => Some(&self.onedrive_mode_cap_token),
+            "/api/v1/onedrive/free-up"
+            | "/api/v1/onedrive/download-now"
+            | "/api/v1/onedrive/conflict/resolve"
+            | "/api/v1/onedrive/cleanup" => Some(&self.onedrive_manage_cap_token),
+            "/api/v1/account/login/start"
+            | "/api/v1/account/login/poll"
+            | "/api/v1/account/login/cancel"
+            | "/api/v1/account/signout" => Some(&self.account_cap_token),
+            "/api/v1/push/register" | "/api/v1/push/test" => Some(&self.push_cap_token),
+            "/api/v1/agent/credential/refresh"
+            | "/api/v1/agent/oauth/start"
+            | "/api/v1/agent/oauth/logout"
+            | "/api/v1/agent/oauth/lifecycle/resume"
+            | "/api/v1/agent/oauth/cancel"
+            | "/api/v1/agent/oauth/complete"
+            | "/api/v1/agent/model" => Some(&self.agent_cap_token),
+            _ => None,
+        }
+    }
+
+    fn execute_ordinary_post<F>(&self, req: &ApiRequest, execute: F) -> ApiResponse
+    where
+        F: FnOnce() -> ApiResponse,
+    {
+        let Some(store) = self.durable_requests.as_ref() else {
+            return execute();
+        };
+        let Some(expected_cap) = self.ordinary_post_cap(&req.path) else {
+            return execute();
+        };
+        // Preserve each route's existing handler-present error, and never create a
+        // durable receipt before the capability gate succeeds.
+        if !Self::cap_ok(expected_cap, req) {
+            return execute();
+        }
+        let mut payload: Value = match serde_json::from_slice(&req.body) {
+            Ok(payload) => payload,
+            Err(_) => return execute(),
+        };
+        let Some(object) = payload.as_object_mut() else {
+            return execute();
+        };
+        let Some(request_id) = object.remove("request_id").and_then(|value| {
+            value
+                .as_str()
+                .filter(|value| valid_client_request_id(value))
+                .map(str::to_owned)
+        }) else {
+            return ApiResponse::error(400, "invalid request_id");
+        };
+        let payload_bytes = match serde_json::to_vec(&payload) {
+            Ok(bytes) => bytes,
+            Err(_) => return ApiResponse::error(400, "invalid json body"),
+        };
+        let payload_digest = {
+            let digest = ring::digest::digest(&ring::digest::SHA256, &payload_bytes);
+            digest
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let route_domain = format!("post:{}", req.path);
+        match store.begin(&request_id, &route_domain, &payload_digest) {
+            Ok(DurableRequestBegin::Replay(response)) => return response,
+            Ok(DurableRequestBegin::Conflict) => {
+                return ApiResponse::error(409, "request_id_conflict")
+            }
+            Ok(DurableRequestBegin::OutcomeUnknown) => {
+                return ApiResponse::error(409, "request_outcome_unknown")
+            }
+            Ok(DurableRequestBegin::Execute) => {}
+            Err(_) => return ApiResponse::error(503, "request_store_unavailable"),
+        }
+
+        let response = execute();
+        if response.status < 400 {
+            if store
+                .complete(&request_id, &route_domain, &payload_digest, &response)
+                .is_err()
+            {
+                return ApiResponse::error(503, "request_outcome_unknown");
+            }
+        } else if response.status < 500
+            && store
+                .abort(&request_id, &route_domain, &payload_digest)
+                .is_err()
+        {
+            return ApiResponse::error(503, "request_store_unavailable");
+        }
+        response
+    }
+
     /// Append a durable audit entry to the account activity log. Destructive
     /// actions call this before invoking the injected handler so the intent is
     /// recorded even if the process dies after the remote mutation starts.
@@ -2915,7 +3097,7 @@ impl Router {
                 .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()))
         };
         if req.method == "POST" {
-            return match req.path.as_str() {
+            let execute = || match req.path.as_str() {
                 "/api/v1/restore" => self.restore(req),
                 "/api/v1/backup" => self.backup(req),
                 "/api/v1/jobs/cancel" => self.mobile_job_cancel(req),
@@ -3000,6 +3182,7 @@ impl Router {
                 "/api/v1/agent/model" => self.agent_set_model(req),
                 _ => ApiResponse::error(405, "method not allowed"),
             };
+            return self.execute_ordinary_post(req, execute);
         }
         if req.method != "GET" {
             return ApiResponse::error(405, "method not allowed");
@@ -6574,6 +6757,9 @@ impl Router {
             Ok(request) => request,
             Err(_) => return no_store_json_error(400, "invalid credential refresh request"),
         };
+        if !valid_client_request_id(&request.request_id) {
+            return no_store_json_error(400, "invalid credential refresh request");
+        }
         let state = match handler.credential_refresh(&request.provider) {
             Ok(state) => state,
             Err(_) => return no_store_json_error(409, "reconnect_required"),
@@ -6713,7 +6899,10 @@ impl Router {
             Ok(provider) => provider,
             Err(e) => return no_store_json_error(400, e),
         };
-        if request.attempt_id.is_empty() || request.attempt_id.len() > 128 {
+        if !valid_client_request_id(&request.request_id)
+            || request.attempt_id.is_empty()
+            || request.attempt_id.len() > 128
+        {
             return no_store_json_error(400, "invalid oauth cancel request");
         }
         match handler.oauth_cancel(provider, &request.attempt_id) {
@@ -6755,7 +6944,8 @@ impl Router {
         if request.provider != "claude" {
             return no_store_json_error(400, "oauth complete is claude-only");
         }
-        if request.attempt_id.is_empty()
+        if !valid_client_request_id(&request.request_id)
+            || request.attempt_id.is_empty()
             || request.attempt_id.len() > 128
             || request.pasted_code.is_empty()
             || request.pasted_code.len() > AGENT_STRICT_JSON_MAX_BYTES
@@ -9247,7 +9437,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(
             router
                 .route(&json_post(
-                    r#"{"provider":"codex","attempt_id":"a","pasted_code":"c#s"}"#
+                    r#"{"request_id":"550e8400-e29b-41d4-a716-446655440000","provider":"codex","attempt_id":"a","pasted_code":"c#s"}"#
                 ))
                 .status,
             400
@@ -9256,7 +9446,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(
             router
                 .route(&json_post(
-                    r#"{"provider":"claude","attempt_id":"a","pasted_code":"c#s","x":1}"#
+                    r#"{"request_id":"550e8400-e29b-41d4-a716-446655440000","provider":"claude","attempt_id":"a","pasted_code":"c#s","x":1}"#
                 ))
                 .status,
             400
@@ -9265,14 +9455,14 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(
             router
                 .route(&json_post(
-                    r#"{"provider":"claude","attempt_id":"a","attempt_id":"b","pasted_code":"c#s"}"#
+                    r#"{"request_id":"550e8400-e29b-41d4-a716-446655440000","provider":"claude","attempt_id":"a","attempt_id":"b","pasted_code":"c#s"}"#
                 ))
                 .status,
             400
         );
         // A well-formed claude request reaches the handler and the response carries no-store.
         let resp = router.route(&json_post(
-            r#"{"provider":"claude","attempt_id":"a","pasted_code":"c#s"}"#,
+            r#"{"request_id":"550e8400-e29b-41d4-a716-446655440000","provider":"claude","attempt_id":"a","pasted_code":"c#s"}"#,
         ));
         assert!(resp
             .headers
@@ -10073,7 +10263,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             ApiRequest::new("POST", "/api/v1/agent/credential/refresh")
                 .with_cap_token(Some("agentsecret".into()))
                 .with_content_type(Some("application/json".into()))
-                .with_body(b"{\"provider\":\"claude\"}".to_vec())
+                .with_body(
+                    b"{\"request_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"provider\":\"claude\"}"
+                        .to_vec(),
+                )
         };
 
         assert_eq!(
@@ -10093,7 +10286,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let malformed = ApiRequest::new("POST", "/api/v1/agent/credential/refresh")
             .with_cap_token(Some("agentsecret".into()))
             .with_content_type(Some("application/json".into()))
-            .with_body(b"{\"provider\":\"claude\",\"extra\":true}".to_vec());
+            .with_body(
+                b"{\"request_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"provider\":\"claude\",\"extra\":true}"
+                    .to_vec(),
+            );
         assert_eq!(router.route(&malformed).status, 400);
     }
 
@@ -11067,7 +11263,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let request = || {
             ApiRequest::new("POST", "/api/v1/agent/oauth/cancel")
                 .with_content_type(Some("application/json".into()))
-                .with_body(br#"{"provider":"claude","attempt_id":"attempt-1"}"#.to_vec())
+                .with_body(
+                    br#"{"request_id":"550e8400-e29b-41d4-a716-446655440000","provider":"claude","attempt_id":"attempt-1"}"#
+                        .to_vec(),
+                )
         };
 
         assert_eq!(router.route(&request()).status, 401);
@@ -11091,7 +11290,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let unknown_field = ApiRequest::new("POST", "/api/v1/agent/oauth/cancel")
             .with_content_type(Some("application/json".into()))
             .with_body(
-                br#"{"provider":"claude","attempt_id":"attempt-1","url":"forbidden"}"#.to_vec(),
+                br#"{"request_id":"550e8400-e29b-41d4-a716-446655440000","provider":"claude","attempt_id":"attempt-1","url":"forbidden"}"#.to_vec(),
             )
             .with_session_token(Some("sess".into()))
             .with_cap_token(Some("agentsecret".into()));
@@ -11099,7 +11298,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
         let wrong_attempt = ApiRequest::new("POST", "/api/v1/agent/oauth/cancel")
             .with_content_type(Some("application/json".into()))
-            .with_body(br#"{"provider":"claude","attempt_id":"other"}"#.to_vec())
+            .with_body(
+                br#"{"request_id":"550e8400-e29b-41d4-a716-446655440001","provider":"claude","attempt_id":"other"}"#
+                    .to_vec(),
+            )
             .with_session_token(Some("sess".into()))
             .with_cap_token(Some("agentsecret".into()));
         assert_eq!(router.route(&wrong_attempt).status, 409);
@@ -11197,6 +11399,98 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     impl RecordMailWrite {
         fn last(&self) -> String {
             self.0.lock().unwrap().last().cloned().unwrap_or_default()
+        }
+    }
+
+    type DurableReceipt = (String, String, Option<ApiResponse>);
+
+    #[derive(Default)]
+    struct MemoryDurableRequests(
+        std::sync::Mutex<std::collections::HashMap<String, DurableReceipt>>,
+    );
+
+    impl DurableRequestStore for MemoryDurableRequests {
+        fn begin(
+            &self,
+            request_id: &str,
+            route_domain: &str,
+            payload_digest: &str,
+        ) -> Result<DurableRequestBegin, String> {
+            let mut receipts = self.0.lock().unwrap();
+            match receipts.get(request_id) {
+                Some((route, digest, _)) if route != route_domain || digest != payload_digest => {
+                    Ok(DurableRequestBegin::Conflict)
+                }
+                Some((_, _, Some(response))) => Ok(DurableRequestBegin::Replay(response.clone())),
+                Some(_) => Ok(DurableRequestBegin::OutcomeUnknown),
+                None => {
+                    receipts.insert(
+                        request_id.into(),
+                        (route_domain.into(), payload_digest.into(), None),
+                    );
+                    Ok(DurableRequestBegin::Execute)
+                }
+            }
+        }
+
+        fn complete(
+            &self,
+            request_id: &str,
+            route_domain: &str,
+            payload_digest: &str,
+            response: &ApiResponse,
+        ) -> Result<(), String> {
+            self.0.lock().unwrap().insert(
+                request_id.into(),
+                (
+                    route_domain.into(),
+                    payload_digest.into(),
+                    Some(response.clone()),
+                ),
+            );
+            Ok(())
+        }
+
+        fn abort(
+            &self,
+            request_id: &str,
+            _route_domain: &str,
+            _payload_digest: &str,
+        ) -> Result<(), String> {
+            self.0.lock().unwrap().remove(request_id);
+            Ok(())
+        }
+    }
+
+    struct UnavailableDurableRequests;
+
+    impl DurableRequestStore for UnavailableDurableRequests {
+        fn begin(
+            &self,
+            _request_id: &str,
+            _route_domain: &str,
+            _payload_digest: &str,
+        ) -> Result<DurableRequestBegin, String> {
+            Err("unavailable".into())
+        }
+
+        fn complete(
+            &self,
+            _request_id: &str,
+            _route_domain: &str,
+            _payload_digest: &str,
+            _response: &ApiResponse,
+        ) -> Result<(), String> {
+            Err("unavailable".into())
+        }
+
+        fn abort(
+            &self,
+            _request_id: &str,
+            _route_domain: &str,
+            _payload_digest: &str,
+        ) -> Result<(), String> {
+            Err("unavailable".into())
         }
     }
     impl MailWriteHandler for RecordMailWrite {
@@ -12008,6 +12302,164 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 .status,
             400
         );
+    }
+
+    #[test]
+    fn ordinary_product_post_replays_durable_response_without_second_mail_effect() {
+        let (_dir, router) = setup();
+        let mail = std::sync::Arc::new(RecordMailWrite::default());
+        let router = router
+            .with_mail_write(mail.clone(), "secret".into())
+            .with_durable_requests(std::sync::Arc::new(MemoryDurableRequests::default()));
+        let body = json!({
+            "request_id": "123e4567-e89b-42d3-a456-426614174100",
+            "account": "a",
+            "subject": "Exactly once",
+            "body": "body",
+            "to": ["x@example.invalid"],
+            "cc": [],
+            "bcc": [],
+            "importance": null,
+            "read_receipt": false
+        });
+        let first = router.route(&strict_json_post(
+            "/api/v1/mail/send",
+            body.clone(),
+            Some("secret"),
+        ));
+        let replay = router.route(&strict_json_post(
+            "/api/v1/mail/send",
+            body.clone(),
+            Some("secret"),
+        ));
+        assert_eq!(first, replay);
+        assert_eq!(mail.0.lock().unwrap().len(), 1);
+
+        let mut changed = body;
+        changed["subject"] = Value::String("Changed".into());
+        let conflict = router.route(&strict_json_post(
+            "/api/v1/mail/send",
+            changed,
+            Some("secret"),
+        ));
+        assert_eq!(conflict.status, 409);
+        assert_eq!(body_json(&conflict)["error"], "request_id_conflict");
+        assert_eq!(mail.0.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn calendar_and_onedrive_create_replay_without_duplicate_effect() {
+        let (_dir, router) = setup();
+        let calendar = std::sync::Arc::new(RecCalWrite::default());
+        let onedrive = std::sync::Arc::new(FakeOneDriveWrite::default());
+        let router = router
+            .with_calendar_write(calendar.clone(), "calendar-secret".into())
+            .with_onedrive_write(onedrive.clone(), "onedrive-secret".into())
+            .with_durable_requests(std::sync::Arc::new(MemoryDurableRequests::default()));
+
+        let calendar_body = json!({
+            "request_id": "123e4567-e89b-42d3-a456-426614174103",
+            "account": "a",
+            "subject": "Durable event",
+            "start": "2026-07-19T16:00:00Z"
+        });
+        let first_calendar = router.route(&strict_json_post(
+            "/api/v1/calendar/create",
+            calendar_body.clone(),
+            Some("calendar-secret"),
+        ));
+        let replayed_calendar = router.route(&strict_json_post(
+            "/api/v1/calendar/create",
+            calendar_body,
+            Some("calendar-secret"),
+        ));
+        assert_eq!(first_calendar, replayed_calendar);
+        assert_eq!(calendar.0.lock().unwrap().len(), 1);
+
+        let onedrive_body = json!({
+            "request_id": "123e4567-e89b-42d3-a456-426614174104",
+            "account": "a",
+            "parent": "root",
+            "name": "Durable folder"
+        });
+        let first_onedrive = router.route(&strict_json_post(
+            "/api/v1/onedrive/create",
+            onedrive_body.clone(),
+            Some("onedrive-secret"),
+        ));
+        let replayed_onedrive = router.route(&strict_json_post(
+            "/api/v1/onedrive/create",
+            onedrive_body,
+            Some("onedrive-secret"),
+        ));
+        assert_eq!(first_onedrive, replayed_onedrive);
+        assert_eq!(onedrive.creates.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ordinary_product_post_fails_closed_when_receipt_store_is_unavailable() {
+        let (_dir, router) = setup();
+        let mail = std::sync::Arc::new(RecordMailWrite::default());
+        let router = router
+            .with_mail_write(mail.clone(), "secret".into())
+            .with_durable_requests(std::sync::Arc::new(UnavailableDurableRequests));
+        let response = router.route(&strict_json_post(
+            "/api/v1/mail/send",
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174101",
+                "account": "a",
+                "subject": "Do not send",
+                "body": "body",
+                "to": ["x@example.invalid"],
+                "cc": [],
+                "bcc": [],
+                "importance": null,
+                "read_receipt": false
+            }),
+            Some("secret"),
+        ));
+
+        assert_eq!(response.status, 503);
+        assert_eq!(body_json(&response)["error"], "request_store_unavailable");
+        assert!(mail.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_product_mutation_replays_durable_response_without_second_effect() {
+        let (_directory, router) = setup();
+        let agent = std::sync::Arc::new(RecordingModelAgent::default());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_durable_requests(std::sync::Arc::new(MemoryDurableRequests::default()));
+        let body = json!({
+            "request_id": "123e4567-e89b-42d3-a456-426614174102",
+            "provider": "codex",
+            "model": "gpt-5.6-terra",
+            "reasoning_effort": "high"
+        });
+        let first = router.route(&strict_json_post(
+            "/api/v1/agent/model",
+            body.clone(),
+            Some("agentsecret"),
+        ));
+        let replay = router.route(&strict_json_post(
+            "/api/v1/agent/model",
+            body.clone(),
+            Some("agentsecret"),
+        ));
+        assert_eq!(first, replay);
+        assert_eq!(agent.selections.lock().unwrap().len(), 1);
+
+        let mut changed = body;
+        changed["reasoning_effort"] = Value::String("low".into());
+        let conflict = router.route(&strict_json_post(
+            "/api/v1/agent/model",
+            changed,
+            Some("agentsecret"),
+        ));
+        assert_eq!(conflict.status, 409);
+        assert_eq!(body_json(&conflict)["error"], "request_id_conflict");
+        assert_eq!(agent.selections.lock().unwrap().len(), 1);
     }
 
     #[test]

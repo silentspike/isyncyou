@@ -308,6 +308,15 @@ pub enum AgentCredentialStore {
 }
 
 impl AgentCredentialStore {
+    /// Canonical private directory that owns this store's encrypted records and
+    /// transaction lock files.
+    pub fn store_dir(&self) -> &Path {
+        match self {
+            AgentCredentialStore::Provided(store) => store.store_dir(),
+            AgentCredentialStore::Local(store) => store.store_dir(),
+        }
+    }
+
     pub fn put(&self, class: SecretClass, id: &str, secret: &Secret) -> Result<(), AgentError> {
         match self {
             AgentCredentialStore::Provided(store) => store.put(class, id, secret),
@@ -674,6 +683,10 @@ impl<K: AtRestKey> CredentialStore<K> {
             dir: dir.into(),
             key,
         }
+    }
+
+    pub fn store_dir(&self) -> &Path {
+        &self.dir
     }
 
     fn path(&self, class: &SecretClass, id: &str) -> PathBuf {

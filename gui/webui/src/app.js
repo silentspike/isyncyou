@@ -4927,6 +4927,7 @@ async function cancelOAuthAttempt(provider) {
   if (!attemptId) return;
   try {
     await postJson("/api/v1/agent/oauth/cancel", CAP.agent, {
+      request_id: crypto.randomUUID(),
       provider,
       attempt_id: attemptId,
     });
@@ -5230,7 +5231,10 @@ async function refreshAssistantCredentialIfRequired(st) {
     guardId = await beginNetworkGuard("credential_refresh");
     if (BRIDGE && !guardId) throw new Error("network_guard_unavailable");
     await runConnectivityPreflight(provider, "refresh", guardId);
-    await postJson("/api/v1/agent/credential/refresh", CAP.agent, { provider });
+    await postJson("/api/v1/agent/credential/refresh", CAP.agent, {
+      request_id: crypto.randomUUID(),
+      provider,
+    });
     return await api("/api/v1/agent/status");
   } catch (error) {
     if (error && error.connectivity) {
@@ -5381,6 +5385,7 @@ async function completeAiLogin() {
   if (inp) inp.value = "";
   try {
     await postJson("/api/v1/agent/oauth/complete", CAP.agent, {
+      request_id: crypto.randomUUID(),
       provider: "claude",
       attempt_id: attemptId,
       pasted_code: code,

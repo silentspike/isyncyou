@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const CONTROL_KEY_DOMAIN: &[u8] = b"isyncyou-agent-control-store-root/v1";
 const CONTROL_SUBKEY_SALT: &[u8] = b"isyncyou-agent-control-store-subkeys/v1";
 const SQLCIPHER_KEY_INFO: &[u8] = b"isyncyou-agent-control-sqlcipher/v1";
@@ -29,6 +29,7 @@ const MAX_MUTATION_INTENTS_PROCESS: i64 = 8;
 const MAX_MUTATION_STAGED_BYTES: i64 = 256 * 1024 * 1024;
 const MAX_MUTATION_CHUNKS: u32 = 8_192;
 const MUTATION_FREE_SPACE_RESERVE: u64 = 128 * 1024 * 1024;
+const PRODUCT_REQUEST_RECEIPT_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
 type MutationCommitRow = (
     Vec<u8>,
@@ -41,6 +42,22 @@ type MutationCommitRow = (
 );
 type UserPresenceRow = (String, String, i64, Option<Vec<u8>>, Option<Vec<u8>>);
 type PendingRow = (String, u64, String, Option<Vec<u8>>);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StoredProductResponseV1 {
+    pub status: u16,
+    pub content_type: String,
+    pub body: Vec<u8>,
+    pub headers: Vec<(String, String)>,
+}
+
+pub(crate) enum ProductRequestBegin {
+    Execute,
+    Replay(StoredProductResponseV1),
+    Conflict,
+    OutcomeUnknown,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingCancelProjection {
@@ -435,6 +452,17 @@ impl AgentControlStore {
                    payload_digest TEXT NOT NULL,
                    logical_bytes INTEGER NOT NULL
                  );
+                 CREATE TABLE IF NOT EXISTS product_request_receipts (
+                   request_id TEXT PRIMARY KEY NOT NULL,
+                   route_domain TEXT NOT NULL,
+                   payload_digest TEXT NOT NULL,
+                   state TEXT NOT NULL CHECK(state IN ('started','completed')),
+                   sealed_response BLOB,
+                   expires_at_ms INTEGER NOT NULL,
+                   logical_bytes INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS product_request_receipt_expiry
+                   ON product_request_receipts(expires_at_ms);
                  CREATE TABLE IF NOT EXISTS mutation_chunks (
                    intent_id TEXT NOT NULL,
                    chunk_index INTEGER NOT NULL,
@@ -531,12 +559,23 @@ impl AgentControlStore {
             )
             .map_err(|_| "control_store_unavailable")?;
         let expired_intents = self.reap_mutation_intents_locked(&connection, now_ms, limit)?;
+        let product_receipts = connection
+            .execute(
+                "DELETE FROM product_request_receipts
+                 WHERE request_id IN (
+                   SELECT request_id FROM product_request_receipts
+                   WHERE expires_at_ms < ?1 LIMIT ?2
+                 )",
+                params![u64_to_i64(now_ms)?, limit],
+            )
+            .map_err(|_| "control_store_unavailable")?;
         Ok(confirmations
             .saturating_add(presence)
             .saturating_add(pairing)
             .saturating_add(reveal_responses)
             .saturating_add(claims)
-            .saturating_add(expired_intents))
+            .saturating_add(expired_intents)
+            .saturating_add(product_receipts))
     }
 
     pub(crate) fn pending_cancel_projections(
@@ -2127,6 +2166,158 @@ impl AgentControlStore {
             .map_err(|_| ConfirmError::Unavailable)?;
         (changed == 1).then_some(()).ok_or(ConfirmError::NotFound)
     }
+
+    pub(crate) fn begin_product_request(
+        &self,
+        request_id: &str,
+        route_domain: &str,
+        payload_digest: &str,
+    ) -> Result<ProductRequestBegin, String> {
+        if request_id.len() > 64 || route_domain.len() > 160 || !valid_sha256(payload_digest) {
+            return Err("request_store_unavailable".into());
+        }
+        let now_ms = crate::unix_now_ms();
+        self.reap_expired(now_ms, 256)?;
+        let expires_at_ms = now_ms
+            .checked_add(PRODUCT_REQUEST_RECEIPT_TTL_MS)
+            .ok_or_else(|| "request_store_unavailable".to_string())?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| "request_store_unavailable")?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| "request_store_unavailable")?;
+        let existing: Option<(String, String, String, Option<Vec<u8>>)> = transaction
+            .query_row(
+                "SELECT route_domain,payload_digest,state,sealed_response
+                 FROM product_request_receipts WHERE request_id=?1",
+                params![request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|_| "request_store_unavailable")?;
+        if let Some((stored_route, stored_digest, state, sealed_response)) = existing {
+            if stored_route != route_domain || stored_digest != payload_digest {
+                return Ok(ProductRequestBegin::Conflict);
+            }
+            if state == "started" {
+                return Ok(ProductRequestBegin::OutcomeUnknown);
+            }
+            let sealed = sealed_response.ok_or("request_store_unavailable")?;
+            let plaintext = open_row(
+                &self.row_wrap_key,
+                "product-request-response",
+                request_id,
+                &sealed,
+            )?;
+            let response: StoredProductResponseV1 =
+                serde_json::from_slice(&plaintext).map_err(|_| "request_store_unavailable")?;
+            return Ok(ProductRequestBegin::Replay(response));
+        }
+        let logical_bytes = i64::try_from(
+            request_id
+                .len()
+                .saturating_add(route_domain.len())
+                .saturating_add(payload_digest.len())
+                .saturating_add(128),
+        )
+        .map_err(|_| "request_store_unavailable")?;
+        enforce_control_quota(&transaction, logical_bytes)?;
+        transaction
+            .execute(
+                "INSERT INTO product_request_receipts(
+                   request_id,route_domain,payload_digest,state,sealed_response,
+                   expires_at_ms,logical_bytes
+                 ) VALUES(?1,?2,?3,'started',NULL,?4,?5)",
+                params![
+                    request_id,
+                    route_domain,
+                    payload_digest,
+                    u64_to_i64(expires_at_ms)?,
+                    logical_bytes
+                ],
+            )
+            .map_err(|_| "request_store_unavailable")?;
+        transaction
+            .commit()
+            .map_err(|_| "request_store_unavailable")?;
+        Ok(ProductRequestBegin::Execute)
+    }
+
+    pub(crate) fn complete_product_request(
+        &self,
+        request_id: &str,
+        route_domain: &str,
+        payload_digest: &str,
+        response: &StoredProductResponseV1,
+    ) -> Result<(), String> {
+        let plaintext = serde_json::to_vec(response).map_err(|_| "request_store_unavailable")?;
+        if plaintext.len() > 1024 * 1024 || response.headers.len() > 32 {
+            return Err("request_store_unavailable".into());
+        }
+        let sealed = seal_row(
+            &self.row_wrap_key,
+            "product-request-response",
+            request_id,
+            &plaintext,
+        )?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| "request_store_unavailable")?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| "request_store_unavailable")?;
+        let previous_bytes: i64 = transaction
+            .query_row(
+                "SELECT logical_bytes FROM product_request_receipts
+                 WHERE request_id=?1 AND route_domain=?2 AND payload_digest=?3
+                   AND state='started'",
+                params![request_id, route_domain, payload_digest],
+                |row| row.get(0),
+            )
+            .map_err(|_| "request_store_unavailable")?;
+        let next_bytes = i64::try_from(sealed.len().saturating_add(256))
+            .map_err(|_| "request_store_unavailable")?;
+        enforce_control_quota(&transaction, next_bytes.saturating_sub(previous_bytes))?;
+        let changed = transaction
+            .execute(
+                "UPDATE product_request_receipts
+                 SET state='completed',sealed_response=?1,logical_bytes=?2
+                 WHERE request_id=?3 AND route_domain=?4 AND payload_digest=?5
+                   AND state='started'",
+                params![sealed, next_bytes, request_id, route_domain, payload_digest],
+            )
+            .map_err(|_| "request_store_unavailable")?;
+        if changed != 1 {
+            return Err("request_store_unavailable".into());
+        }
+        transaction
+            .commit()
+            .map_err(|_| "request_store_unavailable".to_string())
+    }
+
+    pub(crate) fn abort_product_request(
+        &self,
+        request_id: &str,
+        route_domain: &str,
+        payload_digest: &str,
+    ) -> Result<(), String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "request_store_unavailable")?;
+        connection
+            .execute(
+                "DELETE FROM product_request_receipts
+                 WHERE request_id=?1 AND route_domain=?2 AND payload_digest=?3
+                   AND state='started'",
+                params![request_id, route_domain, payload_digest],
+            )
+            .map(|_| ())
+            .map_err(|_| "request_store_unavailable".into())
+    }
 }
 
 fn derive_control_subkeys(control_root: &[u8; 32]) -> Result<([u8; 32], [u8; 32]), String> {
@@ -2454,7 +2645,7 @@ fn initialize_metadata(
         }
         match schema.parse::<i64>() {
             Ok(SCHEMA_VERSION) => {}
-            Ok(1) if SCHEMA_VERSION == 2 => {
+            Ok(1 | 2) if SCHEMA_VERSION == 3 => {
                 connection
                     .execute(
                         "UPDATE control_metadata SET value=?1 WHERE key='schema_version'",
@@ -2551,6 +2742,7 @@ fn enforce_control_quota(connection: &Connection, additional_bytes: i64) -> Resu
                COALESCE((SELECT SUM(logical_bytes) FROM pairing_claims),0) +
                COALESCE((SELECT SUM(logical_bytes) FROM pairing_revocations),0) +
                COALESCE((SELECT SUM(logical_bytes) FROM mutation_request_bindings),0) +
+               COALESCE((SELECT SUM(logical_bytes) FROM product_request_receipts),0) +
                COALESCE((SELECT SUM(logical_bytes) FROM mutation_intents),0)",
             [],
             |row| row.get(0),
@@ -2890,6 +3082,116 @@ mod tests {
     }
 
     #[test]
+    fn product_request_receipt_survives_restart_replays_and_rejects_uuid_reuse() {
+        let root = temp_root("product-request-receipt");
+        let credential_store = credential_store(&root);
+        let request_id = "019f0000-0000-4000-8000-000000000301";
+        let route = "post:/api/v1/mail/send";
+        let digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let response = StoredProductResponseV1 {
+            status: 200,
+            content_type: "application/json".into(),
+            body: br#"{"ok":true}"#.to_vec(),
+            headers: vec![("Cache-Control".into(), "no-store".into())],
+        };
+        {
+            let control =
+                AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1)
+                    .unwrap();
+            assert!(matches!(
+                control
+                    .begin_product_request(request_id, route, digest)
+                    .unwrap(),
+                ProductRequestBegin::Execute
+            ));
+            assert!(matches!(
+                control
+                    .begin_product_request(request_id, route, digest)
+                    .unwrap(),
+                ProductRequestBegin::OutcomeUnknown
+            ));
+            control
+                .complete_product_request(request_id, route, digest, &response)
+                .unwrap();
+        }
+        let control =
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        match control
+            .begin_product_request(request_id, route, digest)
+            .unwrap()
+        {
+            ProductRequestBegin::Replay(stored) => assert_eq!(stored, response),
+            _ => panic!("completed receipt must replay"),
+        }
+        assert!(matches!(
+            control
+                .begin_product_request(request_id, "post:/api/v1/calendar/create", digest,)
+                .unwrap(),
+            ProductRequestBegin::Conflict
+        ));
+    }
+
+    #[test]
+    fn product_request_validation_abort_allows_corrected_retry() {
+        let root = temp_root("product-request-abort");
+        let credential_store = credential_store(&root);
+        let control =
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let request_id = "019f0000-0000-4000-8000-000000000302";
+        let route = "post:/api/v1/onedrive/create";
+        let digest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        assert!(matches!(
+            control
+                .begin_product_request(request_id, route, digest)
+                .unwrap(),
+            ProductRequestBegin::Execute
+        ));
+        control
+            .abort_product_request(request_id, route, digest)
+            .unwrap();
+        assert!(matches!(
+            control
+                .begin_product_request(request_id, route, digest)
+                .unwrap(),
+            ProductRequestBegin::Execute
+        ));
+    }
+
+    #[test]
+    fn product_request_receipt_reaper_applies_bounded_thirty_day_retention() {
+        let root = temp_root("product-request-retention");
+        let credential_store = credential_store(&root);
+        let control =
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let request_id = "019f0000-0000-4000-8000-000000000303";
+        let route = "post:/api/v1/calendar/create";
+        let digest = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        assert!(matches!(
+            control
+                .begin_product_request(request_id, route, digest)
+                .unwrap(),
+            ProductRequestBegin::Execute
+        ));
+        control
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE product_request_receipts SET expires_at_ms=1 WHERE request_id=?1",
+                params![request_id],
+            )
+            .unwrap();
+
+        assert_eq!(control.reap_expired(2, 1).unwrap(), 1);
+        assert!(matches!(
+            control
+                .begin_product_request(request_id, route, digest)
+                .unwrap(),
+            ProductRequestBegin::Execute
+        ));
+    }
+
+    #[test]
     fn confirmation_store_survives_restart_and_consumes_exactly_once() {
         let root = temp_root("restart");
         let store = credential_store(&root);
@@ -3128,7 +3430,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema, "2");
+        assert_eq!(schema, "3");
     }
 
     #[test]
@@ -4208,7 +4510,8 @@ mod tests {
                  CREATE TABLE pairing_claims(logical_bytes INTEGER NOT NULL);
                  CREATE TABLE pairing_revocations(logical_bytes INTEGER NOT NULL);
                  CREATE TABLE mutation_request_bindings(logical_bytes INTEGER NOT NULL);
-                 CREATE TABLE mutation_intents(logical_bytes INTEGER NOT NULL);",
+                 CREATE TABLE mutation_intents(logical_bytes INTEGER NOT NULL);
+                 CREATE TABLE product_request_receipts(logical_bytes INTEGER NOT NULL);",
             )
             .unwrap();
         connection

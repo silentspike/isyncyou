@@ -984,34 +984,9 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
         candidate: &RequestUuidBindingV1,
     ) -> Result<Option<RequestReplayV1>, SessionV2Error> {
         let session_id = &current.manifest.session_id;
-        let Some(direct_binding) = self
-            .transport
-            .load_immutable_optional(SessionObjectClass::UuidBinding, &candidate.request_key)?
-        else {
-            return Ok(None);
-        };
-        let direct_binding = self
-            .object_crypto
-            .open(
-                session_id,
-                SessionObjectClass::UuidBinding,
-                &candidate.request_key,
-                &direct_binding,
-            )
-            .map_err(|_| SessionV2Error::InvalidRecord)?;
-        let direct_binding: RequestUuidBindingV1 =
-            serde_json::from_slice(&direct_binding).map_err(|_| SessionV2Error::InvalidRecord)?;
-        if direct_binding.binding_version != 1
-            || direct_binding.request_key != candidate.request_key
-            || !valid_uuid_v4(&direct_binding.request_id)
-        {
-            return Err(SessionV2Error::InvalidRecord);
-        }
-        direct_binding.permits_replay(candidate)?;
-
-        // The deterministic object lookup is a fast negative check for new UUIDs.
-        // Existing objects still need an index proof because an immutable object
-        // staged before a failed manifest CAS is not authoritative.
+        // The request key includes route and session scope, so a direct-key miss
+        // cannot prove that this UUID is new. The manifest-reachable UUID index is
+        // authoritative for cross-route, cross-session, and changed-payload reuse.
         let binding_entries = self.load_index_entries(
             session_id,
             SessionObjectClass::UuidBindingIndex,
@@ -2493,6 +2468,10 @@ mod onedrive_transport {
 
     const V2_ROOT: &str = "Apps/iSyncYou/agent/v2";
     const MAX_MANIFEST_BYTES: usize = 64 * 1024;
+    // AES-GCM adds a 16-byte tag and the JSON envelope base64-encodes ciphertext.
+    // Keep a fixed transport cap above the exact maximum rather than applying the
+    // plaintext limit to the sealed representation.
+    const MAX_MANIFEST_ENVELOPE_BYTES: usize = 96 * 1024;
     const MAX_IMMUTABLE_OBJECT_BYTES: usize = 5 * 1024 * 1024;
     // Turn acknowledgement happens before this background preparation starts. The first
     // session may require several dependency-ordered folder operations, so bound the whole
@@ -2542,6 +2521,7 @@ mod onedrive_transport {
         client: GraphClient,
         session_id: String,
         admission_deadline: Arc<Mutex<Option<std::time::Instant>>>,
+        manifest_crypto: Arc<Mutex<Option<SessionObjectCrypto>>>,
     }
 
     impl OneDriveSessionV2Transport {
@@ -2585,7 +2565,68 @@ mod onedrive_transport {
                 client,
                 session_id,
                 admission_deadline: Arc::new(Mutex::new(admission_deadline)),
+                manifest_crypto: Arc::new(Mutex::new(None)),
             })
+        }
+
+        pub fn bind_manifest_crypto(
+            &self,
+            object_crypto: SessionObjectCrypto,
+        ) -> Result<(), SessionV2Error> {
+            let mut bound = self
+                .manifest_crypto
+                .lock()
+                .map_err(|_| SessionV2Error::TransportUnavailable)?;
+            if bound.is_none() {
+                *bound = Some(object_crypto);
+            }
+            Ok(())
+        }
+
+        fn seal_manifest(&self, manifest: &SessionManifestV1) -> Result<Vec<u8>, SessionV2Error> {
+            let plaintext = manifest_bytes(manifest)?;
+            let crypto = self
+                .manifest_crypto
+                .lock()
+                .map_err(|_| SessionV2Error::TransportUnavailable)?
+                .clone()
+                .ok_or(SessionV2Error::InvalidRecord)?;
+            let sealed = crypto
+                .seal(
+                    &self.session_id,
+                    SessionObjectClass::Manifest,
+                    "manifest",
+                    &plaintext,
+                )
+                .map_err(|_| SessionV2Error::InvalidRecord)?;
+            if sealed.len() > MAX_MANIFEST_ENVELOPE_BYTES {
+                return Err(SessionV2Error::SessionLimit);
+            }
+            Ok(sealed)
+        }
+
+        fn open_manifest(&self, sealed: &[u8]) -> Result<SessionManifestV1, SessionV2Error> {
+            let crypto = self
+                .manifest_crypto
+                .lock()
+                .map_err(|_| SessionV2Error::TransportUnavailable)?
+                .clone()
+                .ok_or(SessionV2Error::InvalidRecord)?;
+            let plaintext = crypto
+                .open(
+                    &self.session_id,
+                    SessionObjectClass::Manifest,
+                    "manifest",
+                    sealed,
+                )
+                .map_err(|_| SessionV2Error::InvalidRecord)?;
+            let manifest: SessionManifestV1 =
+                serde_json::from_slice(&plaintext).map_err(|_| SessionV2Error::InvalidRecord)?;
+            manifest.validate()?;
+            if manifest.session_id != self.session_id {
+                return Err(SessionV2Error::InvalidRecord);
+            }
+            Ok(manifest)
         }
 
         fn check_admission_budget(&self) -> Result<(), SessionV2Error> {
@@ -2621,7 +2662,7 @@ mod onedrive_transport {
             self.ensure_session_folders()?;
             self.check_admission_budget()?;
             let manifest = SessionManifestV1::empty(&self.session_id);
-            let bytes = manifest_bytes(&manifest)?;
+            let bytes = self.seal_manifest(&manifest)?;
             let created = self
                 .client_for_request()?
                 .upload_content_with_conflict_behavior(
@@ -2770,8 +2811,8 @@ mod onedrive_transport {
         fn load_manifest_parts(&self) -> Result<(serde_json::Value, Vec<u8>), SessionV2Error> {
             std::thread::scope(|scope| {
                 let item = scope.spawn(|| self.manifest_item());
-                let bytes =
-                    scope.spawn(|| self.read_path(&self.manifest_path(), MAX_MANIFEST_BYTES));
+                let bytes = scope
+                    .spawn(|| self.read_path(&self.manifest_path(), MAX_MANIFEST_ENVELOPE_BYTES));
                 Ok((
                     item.join()
                         .map_err(|_| SessionV2Error::TransportUnavailable)??,
@@ -2811,12 +2852,7 @@ mod onedrive_transport {
                 return Err(SessionV2Error::InvalidRecord);
             }
             let (item, bytes) = self.load_manifest_parts()?;
-            let manifest: SessionManifestV1 =
-                serde_json::from_slice(&bytes).map_err(|_| SessionV2Error::InvalidRecord)?;
-            manifest.validate()?;
-            if manifest.session_id != self.session_id {
-                return Err(SessionV2Error::InvalidRecord);
-            }
+            let manifest = self.open_manifest(&bytes)?;
             versioned_manifest(item, manifest)
         }
 
@@ -2841,12 +2877,7 @@ mod onedrive_transport {
                 ))
             })?;
             let (item, bytes) = parts;
-            let manifest: SessionManifestV1 =
-                serde_json::from_slice(&bytes).map_err(|_| SessionV2Error::InvalidRecord)?;
-            manifest.validate()?;
-            if manifest.session_id != self.session_id {
-                return Err(SessionV2Error::InvalidRecord);
-            }
+            let manifest = self.open_manifest(&bytes)?;
             Ok((versioned_manifest(item, manifest)?, sample))
         }
 
@@ -3020,7 +3051,7 @@ mod onedrive_transport {
                 .storage_id
                 .as_deref()
                 .ok_or(SessionV2Error::TransportUnavailable)?;
-            let bytes = manifest_bytes(next)?;
+            let bytes = self.seal_manifest(next)?;
             let Some(updated) = self
                 .client_for_request()?
                 .replace_content_if_match(item_id, &bytes, &current.etag)
@@ -3099,6 +3130,7 @@ mod onedrive_transport {
 
     const fn object_class_segment(object_class: SessionObjectClass) -> &'static str {
         match object_class {
+            SessionObjectClass::Manifest => "manifest",
             SessionObjectClass::VisibleRecord => "visible-record",
             SessionObjectClass::VisibleIndex => "visible-index",
             SessionObjectClass::RequestState => "request-state",
@@ -3114,6 +3146,14 @@ mod onedrive_transport {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::sync::{Arc, Condvar, Mutex};
+
+        fn manifest_crypto() -> SessionObjectCrypto {
+            SessionObjectCrypto::new(
+                b"01234567890123456789012345678901",
+                crate::SessionCryptoConfig::new(crate::KdfProfile::production([9; 16])).unwrap(),
+            )
+            .unwrap()
+        }
 
         fn spawn_folder_creation_server(
         ) -> (String, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
@@ -3339,6 +3379,7 @@ mod onedrive_transport {
             let (base, requests, server) = spawn_folder_creation_server();
             let transport =
                 OneDriveSessionV2Transport::with_base_url("token", "session-test", &base).unwrap();
+            transport.bind_manifest_crypto(manifest_crypto()).unwrap();
             let manifest = transport.create_session().unwrap();
             server.join().unwrap();
 
@@ -3393,6 +3434,7 @@ mod onedrive_transport {
             });
             let transport =
                 OneDriveSessionV2Transport::with_base_url("token", "session-test", &base).unwrap();
+            transport.bind_manifest_crypto(manifest_crypto()).unwrap();
             let current = VersionedManifest {
                 etag: "etag-1".into(),
                 storage_id: Some("manifest-id".into()),
@@ -3408,6 +3450,31 @@ mod onedrive_transport {
             server.join().unwrap();
             assert_eq!(updated.etag, "etag-2");
             assert_eq!(updated.storage_id.as_deref(), Some("manifest-id"));
+        }
+
+        #[test]
+        fn onedrive_authoritative_manifest_is_encrypted_and_authenticated() {
+            let transport = OneDriveSessionV2Transport::with_base_url(
+                "token",
+                "session-test",
+                "http://127.0.0.1:1",
+            )
+            .unwrap();
+            transport.bind_manifest_crypto(manifest_crypto()).unwrap();
+            let manifest = SessionManifestV1::empty("session-test");
+            let mut sealed = transport.seal_manifest(&manifest).unwrap();
+
+            assert!(!sealed
+                .windows(b"\"manifest_version\"".len())
+                .any(|window| window == b"\"manifest_version\""));
+            assert_eq!(transport.open_manifest(&sealed).unwrap(), manifest);
+
+            let last = sealed.last_mut().unwrap();
+            *last ^= 1;
+            assert_eq!(
+                transport.open_manifest(&sealed),
+                Err(SessionV2Error::InvalidRecord)
+            );
         }
     }
 }
@@ -5350,7 +5417,7 @@ mod tests {
     }
 
     #[test]
-    fn new_request_replay_checks_direct_binding_without_scanning_index_history() {
+    fn new_request_replay_checks_authoritative_uuid_index_after_direct_key_miss() {
         let transport = InMemorySessionV2Transport::default();
         let current = transport.create_session("s").unwrap();
         let store = SessionV2Store::new(transport.clone(), &[6; 32], object_crypto());
@@ -5387,7 +5454,7 @@ mod tests {
         );
         assert_eq!(
             transport.immutable_load_count(SessionObjectClass::UuidBindingIndex),
-            0
+            1
         );
         assert_eq!(
             transport.immutable_load_count(SessionObjectClass::RequestIndex),
@@ -5396,6 +5463,42 @@ mod tests {
         assert_eq!(
             transport.immutable_load_count(SessionObjectClass::VisibleIndex),
             0
+        );
+    }
+
+    #[test]
+    fn same_request_uuid_reused_for_different_route_is_rejected_from_manifest_index() {
+        let transport = InMemorySessionV2Transport::default();
+        let current = transport.create_session("s").unwrap();
+        let store = SessionV2Store::new(transport.clone(), &[6; 32], object_crypto());
+        let existing = RequestUuidBindingV1::new(
+            RequestRouteDomain::AgentTurn,
+            "s",
+            RID,
+            payload_digest(&"existing").unwrap(),
+        )
+        .unwrap();
+        store
+            .publish(
+                &current,
+                SessionCommitV1 {
+                    visible_records: vec![],
+                    request_objects: vec![],
+                    uuid_bindings: vec![existing],
+                },
+            )
+            .unwrap();
+        let conflicting = RequestUuidBindingV1::new(
+            RequestRouteDomain::SessionArchive,
+            "s",
+            RID,
+            payload_digest(&"existing").unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.request_replay("s", &conflicting),
+            Err(SessionV2Error::RequestConflict)
         );
     }
 

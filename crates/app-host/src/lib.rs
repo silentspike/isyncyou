@@ -12095,6 +12095,119 @@ impl isyncyou_webui::OneDriveWriteHandler for DaemonOneDriveWrite {
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
+struct DaemonDurableRequests {
+    store: Arc<agent_control_store::AgentControlStore>,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+struct UnavailableDurableRequests;
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+impl isyncyou_webui::DurableRequestStore for UnavailableDurableRequests {
+    fn begin(
+        &self,
+        _request_id: &str,
+        _route_domain: &str,
+        _payload_digest: &str,
+    ) -> Result<isyncyou_webui::DurableRequestBegin, String> {
+        Err("request_store_unavailable".into())
+    }
+
+    fn complete(
+        &self,
+        _request_id: &str,
+        _route_domain: &str,
+        _payload_digest: &str,
+        _response: &isyncyou_webui::ApiResponse,
+    ) -> Result<(), String> {
+        Err("request_store_unavailable".into())
+    }
+
+    fn abort(
+        &self,
+        _request_id: &str,
+        _route_domain: &str,
+        _payload_digest: &str,
+    ) -> Result<(), String> {
+        Err("request_store_unavailable".into())
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+impl isyncyou_webui::DurableRequestStore for DaemonDurableRequests {
+    fn begin(
+        &self,
+        request_id: &str,
+        route_domain: &str,
+        payload_digest: &str,
+    ) -> Result<isyncyou_webui::DurableRequestBegin, String> {
+        self.store
+            .begin_product_request(request_id, route_domain, payload_digest)
+            .map(|result| match result {
+                agent_control_store::ProductRequestBegin::Execute => {
+                    isyncyou_webui::DurableRequestBegin::Execute
+                }
+                agent_control_store::ProductRequestBegin::Conflict => {
+                    isyncyou_webui::DurableRequestBegin::Conflict
+                }
+                agent_control_store::ProductRequestBegin::OutcomeUnknown => {
+                    isyncyou_webui::DurableRequestBegin::OutcomeUnknown
+                }
+                agent_control_store::ProductRequestBegin::Replay(response) => {
+                    isyncyou_webui::DurableRequestBegin::Replay(isyncyou_webui::ApiResponse {
+                        status: response.status,
+                        content_type: response.content_type,
+                        body: response.body,
+                        headers: response.headers,
+                    })
+                }
+            })
+    }
+
+    fn complete(
+        &self,
+        request_id: &str,
+        route_domain: &str,
+        payload_digest: &str,
+        response: &isyncyou_webui::ApiResponse,
+    ) -> Result<(), String> {
+        self.store.complete_product_request(
+            request_id,
+            route_domain,
+            payload_digest,
+            &agent_control_store::StoredProductResponseV1 {
+                status: response.status,
+                content_type: response.content_type.clone(),
+                body: response.body.clone(),
+                headers: response.headers.clone(),
+            },
+        )
+    }
+
+    fn abort(
+        &self,
+        request_id: &str,
+        route_domain: &str,
+        payload_digest: &str,
+    ) -> Result<(), String> {
+        self.store
+            .abort_product_request(request_id, route_domain, payload_digest)
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 struct DaemonMutationIntents {
     store: Arc<agent_control_store::AgentControlStore>,
     onedrive: DaemonOneDriveWrite,
@@ -13196,17 +13309,21 @@ fn with_mutation_intents_if_available(
     cfg: Config,
 ) -> isyncyou_webui::Router {
     match agent.shared_control_store() {
-        Some(store) => router.with_mutation_intents(
-            Arc::new(DaemonMutationIntents {
-                store,
-                onedrive: DaemonOneDriveWrite::new(cfg.clone()),
-                mail: DaemonMailWrite { cfg: cfg.clone() },
-                onenote: DaemonOneNoteWrite { cfg: cfg.clone() },
-                todo: DaemonTaskWrite { cfg },
-            }),
-            mint_cap_token(),
-        ),
-        None => router,
+        Some(store) => router
+            .with_durable_requests(Arc::new(DaemonDurableRequests {
+                store: Arc::clone(&store),
+            }))
+            .with_mutation_intents(
+                Arc::new(DaemonMutationIntents {
+                    store,
+                    onedrive: DaemonOneDriveWrite::new(cfg.clone()),
+                    mail: DaemonMailWrite { cfg: cfg.clone() },
+                    onenote: DaemonOneNoteWrite { cfg: cfg.clone() },
+                    todo: DaemonTaskWrite { cfg },
+                }),
+                mint_cap_token(),
+            ),
+        None => router.with_durable_requests(Arc::new(UnavailableDurableRequests)),
     }
 }
 

@@ -147,6 +147,11 @@ pub struct ProductSessionRegistry<'a> {
     store: &'a AgentCredentialStore,
 }
 
+fn product_session_index_gate() -> &'static std::sync::Mutex<()> {
+    static GATE: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 pub struct ProductTurnRuntime {
     guard: SessionLeaseGuard<OneDriveSessionV2Transport>,
     session_id: String,
@@ -877,6 +882,20 @@ impl<'a> ProductSessionRegistry<'a> {
         Self { store }
     }
 
+    fn lock_index_rmw(
+        &self,
+    ) -> Result<(std::sync::MutexGuard<'static, ()>, isyncyou_agent::FileLock), String> {
+        let process_guard = product_session_index_gate()
+            .lock()
+            .map_err(|_| "session_store_unavailable".to_string())?;
+        let file_guard = isyncyou_agent::FileLock::try_acquire_exclusive(
+            &self.store.store_dir().join(".product-session-index.lock"),
+        )
+        .map_err(|_| "session_store_unavailable".to_string())?
+        .ok_or_else(|| "session_store_busy".to_string())?;
+        Ok((process_guard, file_guard))
+    }
+
     pub fn create(
         &self,
         local_account: &str,
@@ -884,6 +903,7 @@ impl<'a> ProductSessionRegistry<'a> {
         display_name: Option<&str>,
         created_at_ms: u64,
     ) -> Result<ProductSessionSummaryV1, String> {
+        let _index_guard = self.lock_index_rmw()?;
         let display_name = normalize_display_name(display_name)?;
         let mut index = self.load_index()?;
         let digest =
@@ -1001,6 +1021,7 @@ impl<'a> ProductSessionRegistry<'a> {
     }
 
     pub fn select(&self, request_id: &str, session_id: &str) -> Result<(), String> {
+        let _index_guard = self.lock_index_rmw()?;
         let mut index = self.load_index()?;
         let digest = payload_digest(&session_id).map_err(map_session_error)?;
         if let Some(receipt) = index
@@ -1048,6 +1069,7 @@ impl<'a> ProductSessionRegistry<'a> {
         request_id: &str,
         session_id: &str,
     ) -> Result<ProductSessionSummaryV1, String> {
+        let _index_guard = self.lock_index_rmw()?;
         let mut index = self.load_index()?;
         let digest = payload_digest(&session_id).map_err(map_session_error)?;
         if let Some(receipt) = index
@@ -1107,6 +1129,7 @@ impl<'a> ProductSessionRegistry<'a> {
         payload: &PairingPayload,
         created_at_ms: u64,
     ) -> Result<ProductSessionSummaryV1, String> {
+        let _index_guard = self.lock_index_rmw()?;
         let session_id = payload.session_id.as_str();
         let mut index = self.load_index()?;
         let digest = payload_digest(&(local_account, session_id)).map_err(map_session_error)?;
@@ -1236,6 +1259,9 @@ impl<'a> ProductSessionRegistry<'a> {
                 .map_err(|_| "session_store_unavailable")?,
         )
         .map_err(|_| "session_store_unavailable")?;
+        transport
+            .bind_manifest_crypto(object_crypto.clone())
+            .map_err(map_session_error)?;
         let cursor_key = self
             .store
             .domain_hmac(CURSOR_HMAC_DOMAIN, session_id.as_bytes())
@@ -1289,6 +1315,7 @@ impl<'a> ProductSessionRegistry<'a> {
             return Ok(session);
         }
         transport.create_session().map_err(map_session_error)?;
+        let _index_guard = self.lock_index_rmw()?;
         let mut index = self.load_index()?;
         let stored = index
             .sessions
@@ -1945,6 +1972,45 @@ mod tests {
         index.selected_session_id = Some(session_id.into());
         index.generation += 1;
         registry.save_index(&index).unwrap();
+    }
+
+    #[test]
+    fn product_session_index_rmw_serializes_concurrent_creates_without_lost_update() {
+        let root = temp_root("concurrent-create");
+        let store = credential_store(&root);
+        let first_registry = ProductSessionRegistry::new(&store);
+        let second_registry = ProductSessionRegistry::new(&store);
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                first_registry
+                    .create(
+                        "controlled",
+                        "019f0000-0000-4000-8000-000000000401",
+                        Some("First"),
+                        1,
+                    )
+                    .unwrap()
+            });
+            let second = scope.spawn(|| {
+                second_registry
+                    .create(
+                        "controlled",
+                        "019f0000-0000-4000-8000-000000000402",
+                        Some("Second"),
+                        2,
+                    )
+                    .unwrap()
+            });
+            assert_ne!(
+                first.join().unwrap().session_id,
+                second.join().unwrap().session_id
+            );
+        });
+        let registry = ProductSessionRegistry::new(&store);
+        let index = registry.load_index().unwrap();
+        assert_eq!(index.sessions.len(), 2);
+        assert_eq!(index.request_receipts.len(), 2);
+        assert_eq!(index.generation, 2);
     }
 
     #[test]
