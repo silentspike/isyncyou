@@ -1765,6 +1765,7 @@ impl<T: SessionV2Transport + Clone + 'static> SessionV2Store<T> {
         now: u64,
         renewal_interval: std::time::Duration,
     ) -> Result<SessionLeaseGuard<T>, SessionV2Error> {
+        self.transport.complete_interactive_admission()?;
         let state = Arc::new(Mutex::new(LeaseGuardState {
             current,
             lease,
@@ -2099,6 +2100,13 @@ fn renew_lease<T: SessionV2Transport + Clone>(
 }
 
 pub trait SessionV2Transport: Send + Sync {
+    /// End the short pre-turn admission budget after the lease and initial request state
+    /// are durable. Long-lived renewal and terminal publication retain their own per-request
+    /// transport deadlines, but must not inherit the admission deadline.
+    fn complete_interactive_admission(&self) -> Result<(), SessionV2Error> {
+        Ok(())
+    }
+
     fn server_time_sample(&self) -> Result<TrustedServerTimeSample, SessionV2Error>;
     fn load_manifest(&self, session_id: &str) -> Result<VersionedManifest, SessionV2Error>;
     fn load_manifest_and_server_time(
@@ -2174,6 +2182,8 @@ struct MemoryV2State {
     cas_transient_failures: usize,
     #[cfg(test)]
     cas_calls: usize,
+    #[cfg(test)]
+    admission_complete_calls: usize,
 }
 
 impl InMemorySessionV2Transport {
@@ -2248,6 +2258,14 @@ impl InMemorySessionV2Transport {
     }
 
     #[cfg(test)]
+    fn admission_complete_calls(&self) -> usize {
+        self.inner
+            .lock()
+            .map(|state| state.admission_complete_calls)
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
     fn reset_immutable_load_counts(&self) {
         if let Ok(mut state) = self.inner.lock() {
             state.immutable_load_counts.clear();
@@ -2265,6 +2283,18 @@ impl InMemorySessionV2Transport {
 }
 
 impl SessionV2Transport for InMemorySessionV2Transport {
+    fn complete_interactive_admission(&self) -> Result<(), SessionV2Error> {
+        #[cfg(test)]
+        {
+            let mut state = self
+                .inner
+                .lock()
+                .map_err(|_| SessionV2Error::TransportUnavailable)?;
+            state.admission_complete_calls += 1;
+        }
+        Ok(())
+    }
+
     fn server_time_sample(&self) -> Result<TrustedServerTimeSample, SessionV2Error> {
         let state = self
             .inner
@@ -2727,6 +2757,15 @@ mod onedrive_transport {
     }
 
     impl SessionV2Transport for OneDriveSessionV2Transport {
+        fn complete_interactive_admission(&self) -> Result<(), SessionV2Error> {
+            let mut deadline = self
+                .admission_deadline
+                .lock()
+                .map_err(|_| SessionV2Error::TransportUnavailable)?;
+            *deadline = None;
+            Ok(())
+        }
+
         fn server_time_sample(&self) -> Result<TrustedServerTimeSample, SessionV2Error> {
             self.check_admission_budget()?;
             let sample = self
@@ -4044,6 +4083,26 @@ mod tests {
             usage: None,
         };
         value
+    }
+
+    #[test]
+    fn lease_guard_ends_interactive_admission_before_long_lived_operations() {
+        let transport = InMemorySessionV2Transport::default();
+        transport.set_server_time_ms(10_000);
+        transport.create_session("s").unwrap();
+        let store = SessionV2Store::new(transport.clone(), &[6; 32], object_crypto());
+
+        let guard = store
+            .acquire_lease_with_interval(
+                "s",
+                "lease-a",
+                "session-holder",
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+
+        assert_eq!(transport.admission_complete_calls(), 1);
+        assert!(!guard.is_lost());
     }
 
     #[test]
