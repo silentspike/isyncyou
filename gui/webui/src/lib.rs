@@ -2892,6 +2892,7 @@ impl Router {
             | "/api/v1/account/signout" => Some(&self.account_cap_token),
             "/api/v1/push/register" | "/api/v1/push/test" => Some(&self.push_cap_token),
             "/api/v1/agent/credential/refresh"
+            | "/api/v1/agent/turn"
             | "/api/v1/agent/oauth/start"
             | "/api/v1/agent/oauth/logout"
             | "/api/v1/agent/oauth/lifecycle/resume"
@@ -9376,11 +9377,20 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     #[derive(Default)]
     struct RecordingModelAgent {
         selections: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
+        turns: std::sync::Mutex<Vec<AgentTurnRequest>>,
     }
 
     impl AgentHandler for RecordingModelAgent {
         fn start_turn(&self, _account: &str, _prompt: &str) -> Result<String, String> {
             Err("not enabled".into())
+        }
+
+        fn start_turn_request(
+            self: std::sync::Arc<Self>,
+            request: AgentTurnRequest,
+        ) -> Result<String, String> {
+            self.turns.lock().unwrap().push(request);
+            Ok("01ARZ3NDEKTSV4RRFFQ69G5FAW".into())
         }
 
         fn confirm(
@@ -12494,6 +12504,59 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(conflict.status, 409);
         assert_eq!(body_json(&conflict)["error"], "request_id_conflict");
         assert_eq!(agent.selections.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn agent_turn_request_id_rejects_route_session_and_payload_reuse_before_second_start() {
+        let (_directory, router) = setup();
+        let agent = std::sync::Arc::new(RecordingModelAgent::default());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_durable_requests(std::sync::Arc::new(MemoryDurableRequests::default()));
+        let request_id = "123e4567-e89b-42d3-a456-426614174105";
+        let body = json!({
+            "request_id": request_id,
+            "session_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "account": "a",
+            "prompt": "Read one item"
+        });
+        let first = router.route(&strict_json_post(
+            "/api/v1/agent/turn",
+            body.clone(),
+            Some("agentsecret"),
+        ));
+        let replay = router.route(&strict_json_post(
+            "/api/v1/agent/turn",
+            body.clone(),
+            Some("agentsecret"),
+        ));
+        assert_eq!(first, replay);
+        assert_eq!(agent.turns.lock().unwrap().len(), 1);
+
+        let mut changed_session = body.clone();
+        changed_session["session_id"] = Value::String("01ARZ3NDEKTSV4RRFFQ69G5FAX".into());
+        let conflict = router.route(&strict_json_post(
+            "/api/v1/agent/turn",
+            changed_session,
+            Some("agentsecret"),
+        ));
+        assert_eq!(conflict.status, 409);
+        assert_eq!(body_json(&conflict)["error"], "request_id_conflict");
+
+        let route_conflict = router.route(&strict_json_post(
+            "/api/v1/agent/model",
+            json!({
+                "request_id": request_id,
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "medium"
+            }),
+            Some("agentsecret"),
+        ));
+        assert_eq!(route_conflict.status, 409);
+        assert_eq!(body_json(&route_conflict)["error"], "request_id_conflict");
+        assert_eq!(agent.turns.lock().unwrap().len(), 1);
+        assert!(agent.selections.lock().unwrap().is_empty());
     }
 
     #[test]

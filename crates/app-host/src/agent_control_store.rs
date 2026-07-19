@@ -30,6 +30,7 @@ const MAX_MUTATION_STAGED_BYTES: i64 = 256 * 1024 * 1024;
 const MAX_MUTATION_CHUNKS: u32 = 8_192;
 const MUTATION_FREE_SPACE_RESERVE: u64 = 128 * 1024 * 1024;
 const PRODUCT_REQUEST_RECEIPT_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+const AGENT_TURN_ROUTE_DOMAIN: &str = "post:/api/v1/agent/turn";
 
 type MutationCommitRow = (
     Vec<u8>,
@@ -2178,9 +2179,19 @@ impl AgentControlStore {
         }
         let now_ms = crate::unix_now_ms();
         self.reap_expired(now_ms, 256)?;
-        let expires_at_ms = now_ms
-            .checked_add(PRODUCT_REQUEST_RECEIPT_TTL_MS)
-            .ok_or_else(|| "request_store_unavailable".to_string())?;
+        // A turn UUID is scoped to an encrypted session and must remain bound for
+        // that session's lifetime. Ordinary app-wide mutation receipts retain the
+        // bounded 30-day policy; turn bindings are quota-bounded and survive until
+        // the app profile is explicitly reset.
+        let expires_at_ms = if route_domain == AGENT_TURN_ROUTE_DOMAIN {
+            i64::MAX
+        } else {
+            u64_to_i64(
+                now_ms
+                    .checked_add(PRODUCT_REQUEST_RECEIPT_TTL_MS)
+                    .ok_or_else(|| "request_store_unavailable".to_string())?,
+            )?
+        };
         let mut connection = self
             .connection
             .lock()
@@ -2234,7 +2245,7 @@ impl AgentControlStore {
                     request_id,
                     route_domain,
                     payload_digest,
-                    u64_to_i64(expires_at_ms)?,
+                    expires_at_ms,
                     logical_bytes
                 ],
             )
@@ -3188,6 +3199,40 @@ mod tests {
                 .begin_product_request(request_id, route, digest)
                 .unwrap(),
             ProductRequestBegin::Execute
+        ));
+    }
+
+    #[test]
+    fn agent_turn_request_binding_is_not_removed_by_time_based_reaping() {
+        let root = temp_root("agent-turn-request-retention");
+        let credential_store = credential_store(&root);
+        let control =
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let request_id = "019f0000-0000-4000-8000-000000000304";
+        let digest = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        assert!(matches!(
+            control
+                .begin_product_request(request_id, AGENT_TURN_ROUTE_DOMAIN, digest)
+                .unwrap(),
+            ProductRequestBegin::Execute
+        ));
+
+        control.reap_expired(i64::MAX as u64 - 1, 256).unwrap();
+        assert!(matches!(
+            control
+                .begin_product_request(request_id, AGENT_TURN_ROUTE_DOMAIN, digest)
+                .unwrap(),
+            ProductRequestBegin::OutcomeUnknown
+        ));
+        assert!(matches!(
+            control
+                .begin_product_request(
+                    request_id,
+                    AGENT_TURN_ROUTE_DOMAIN,
+                    "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                )
+                .unwrap(),
+            ProductRequestBegin::Conflict
         ));
     }
 
