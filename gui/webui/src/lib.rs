@@ -2958,7 +2958,24 @@ impl Router {
         }
 
         let response = execute();
-        if response.status < 400 {
+        let confirmation_required = response.status == 200
+            && response.content_type == "application/json"
+            && serde_json::from_slice::<Value>(&response.body)
+                .ok()
+                .is_some_and(|value| {
+                    value.get("status").and_then(Value::as_str) == Some("confirmation_required")
+                });
+        if confirmation_required {
+            // Native user presence is an intermediate state. The retry carrying
+            // the confirmed public handle must reach the handler, after which its
+            // terminal result becomes the replayable receipt.
+            if store
+                .abort(&request_id, &route_domain, &payload_digest)
+                .is_err()
+            {
+                return ApiResponse::error(503, "request_store_unavailable");
+            }
+        } else if response.status < 400 {
             if store
                 .complete(&request_id, &route_domain, &payload_digest, &response)
                 .is_err()
@@ -9100,10 +9117,12 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     fn mobile_restore_route_is_biometric_token_gated_before_enqueue() {
         let (_d, router) = setup();
         let restore = std::sync::Arc::new(QueuedRestore::default());
+        let receipts = std::sync::Arc::new(MemoryDurableRequests::default());
         let mobile = router
             .with_restore(restore.clone(), "cap".into())
             .with_session_token("sess".into())
-            .with_biometric_gate();
+            .with_biometric_gate()
+            .with_durable_requests(receipts.clone());
         let post = |path: &str| {
             strict_scalar_post_from_target(path, "cap").with_session_token(Some("sess".into()))
         };
@@ -9136,10 +9155,12 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     fn mobile_restore_route_enqueues_job_after_biometric_token() {
         let (_d, router) = setup();
         let restore = std::sync::Arc::new(QueuedRestore::default());
+        let receipts = std::sync::Arc::new(MemoryDurableRequests::default());
         let mobile = router
             .with_restore(restore.clone(), "cap".into())
             .with_session_token("sess".into())
-            .with_biometric_gate();
+            .with_biometric_gate()
+            .with_durable_requests(receipts.clone());
         let post = |path: &str| {
             strict_scalar_post_from_target(path, "cap").with_session_token(Some("sess".into()))
         };
@@ -9151,14 +9172,27 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .to_string();
         assert!(mobile.confirm_biometric(&pat));
 
-        let ok = mobile.route(
-            &post("/api/v1/restore?account=a&service=mail&id=x").with_per_action_token(Some(pat)),
-        );
+        let confirmed_request =
+            post("/api/v1/restore?account=a&service=mail&id=x").with_per_action_token(Some(pat));
+        let ok = mobile.route(&confirmed_request);
 
         assert_eq!(ok.status, 200);
         let body = body_json(&ok);
         assert_eq!(body["queued"], true);
         assert_eq!(body["job_id"], "job-restore-1");
+        assert!(receipts
+            .0
+            .lock()
+            .unwrap()
+            .values()
+            .any(|(_, _, response)| response.is_some()));
+        let replay = mobile.route(&confirmed_request);
+        assert_eq!(replay.status, ok.status);
+        assert_eq!(replay.content_type, ok.content_type);
+        assert_eq!(replay.body, ok.body);
+        assert!(replay.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("cache-control") && value == "no-store"
+        }));
         assert_eq!(
             restore.calls.lock().unwrap().as_slice(),
             &[("a".to_string(), "mail".to_string(), "x".to_string())]

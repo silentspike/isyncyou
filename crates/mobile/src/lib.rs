@@ -2793,7 +2793,11 @@ mod tests {
                     .with_per_action_token(Some(restore_pat.to_owned())),
             ),
         );
-        assert_eq!(restore_ok["queued"].as_bool(), Some(true));
+        assert_eq!(
+            restore_ok["queued"].as_bool(),
+            Some(true),
+            "restore response: {restore_ok}"
+        );
         assert_eq!(restore_ok["kind"].as_str(), Some("restore-cloud"));
         assert_eq!(restore_ok["state"].as_str(), Some("queued"));
 
