@@ -6902,12 +6902,14 @@ async function agentSend(text) {
   const requestId = crypto.randomUUID();
   let startingGuardId = null;
   let turnStartPosted = false;
+  let finish = null;
   const reconcileRequestStatus = async () => {
     if (!sessionId) return null;
     try {
       const status = await loadAgentRequestStatus(sessionId, requestId);
       asst.requestStatus = status;
-      if (status && status.terminal && status.code && status.code !== "ok") {
+      if (status && status.terminal && status.code
+          && status.code !== "ok" && status.code !== "turn_cancelled") {
         const copy = agentSafeErrorCopy(status.code);
         if (!asst.errors.includes(copy)) addError(copy);
       }
@@ -6981,7 +6983,7 @@ async function agentSend(text) {
   // desktop. The agent's events arrive as `message` (a data line to JSON-parse). Only a
   // host-emitted JSON terminal event completes the turn; a transport drop is reconciled.
   let stream;
-  const finish = (msg, terminalReason) => {
+  finish = (msg, terminalReason) => {
     clearThinking();
     if (AssistantState.activeStream === stream) closeAssistantStream("turn-finish");
     else {
@@ -6990,6 +6992,25 @@ async function agentSend(text) {
     }
     void terminalReason;
     if (!asst.text && msg) setText(msg);
+  };
+  const finishFromRequestStatus = (status) => {
+    if (!status || !status.terminal || AssistantState.activeMessage !== asst
+        || AssistantState.activeTurnId !== turn) return false;
+    let reason = "error";
+    let fallback = "Turn ended with an error";
+    if (status.state === "cancelled" || status.code === "turn_cancelled") {
+      reason = "cancelled";
+      fallback = "Cancelled";
+    } else if (status.state === "committed" && status.code === "ok") {
+      reason = "complete";
+      fallback = "Completed";
+    } else if (status.state === "pending_confirmation") {
+      reason = "pending_confirmation";
+      fallback = "Waiting for confirmation";
+    }
+    asst.doneReason = reason;
+    finish(fallback, reason);
+    return true;
   };
   const turnState = {
     message: asst,
@@ -7015,8 +7036,12 @@ async function agentSend(text) {
     }
     handleAgentEvent(d, turnState);
   }, () => {
-    void reconcileRequestStatus();
-    finish("⚠ connection lost");
+    void (async () => {
+      const status = await reconcileRequestStatus();
+      if (finishFromRequestStatus(status)) return;
+      if (AssistantState.activeMessage !== asst || AssistantState.activeTurnId !== turn) return;
+      finish("⚠ connection lost");
+    })();
   });
   AssistantState.activeStream = stream;
   AssistantState.turnStreamReady = true;

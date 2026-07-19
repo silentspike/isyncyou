@@ -9398,6 +9398,16 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(ready > open);
     }
 
+    #[test]
+    fn assistant_stream_loss_reconciles_cancelled_terminal_state() {
+        assert!(APP_JS.contains("status.code !== \"turn_cancelled\""));
+        assert!(
+            APP_JS.contains("status.state === \"cancelled\" || status.code === \"turn_cancelled\"")
+        );
+        assert!(APP_JS.contains("const status = await reconcileRequestStatus();"));
+        assert!(APP_JS.contains("if (finishFromRequestStatus(status)) return;"));
+    }
+
     // #639 T9 AC3: the status response carries Cache-Control: no-store and never leaks a secret.
     #[test]
     fn status_carries_no_store_and_no_secrets() {

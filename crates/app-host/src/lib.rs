@@ -8788,16 +8788,16 @@ impl DaemonAgent {
     ))]
     fn fail_reserved_turn(&self, reserved_turn_id: &str, error: &str) {
         if error == "turn_cancelled" {
-            let _ = self.hub.emit(
+            let _ = self.hub.emit_terminal(
                 reserved_turn_id,
                 isyncyou_agent::StreamEvent::done(isyncyou_agent::DoneReason::Cancelled),
             );
         } else {
-            let _ = self.hub.emit(
+            let _ = self.hub.emit_terminal(
                 reserved_turn_id,
                 isyncyou_agent::StreamEvent::Error(agent_safe_turn_start_error(error).into()),
             );
-            let _ = self.hub.emit(
+            let _ = self.hub.emit_terminal(
                 reserved_turn_id,
                 isyncyou_agent::StreamEvent::done(isyncyou_agent::DoneReason::Error),
             );
@@ -15332,6 +15332,38 @@ mod tests {
         assert!(spawn < manifest);
         assert!(manifest < response);
         assert!(function[..spawn].find("begin_turn").is_none());
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn turn_cancel_during_admission_emits_done_cancelled() {
+        let root = temp_agent_root("admission-cancel-terminal");
+        let agent = DaemonAgent::with_test_provider_script_and_confirm_components(
+            Config::default(),
+            root.clone(),
+            vec![],
+            Arc::new(RecordingConfirmedExecutor::ok(
+                "unused",
+                Arc::new(StdMutex::new(Vec::new())),
+            )),
+            Arc::new(RecordingAuditSink::new(Arc::new(StdMutex::new(Vec::new())))),
+        );
+        let receiver = agent.hub.open("turn-admission-cancel", 4);
+        agent.turns.register("turn-admission-cancel").unwrap();
+        assert!(agent.hub.cancel("turn-admission-cancel"));
+
+        agent.fail_reserved_turn("turn-admission-cancel", "turn_cancelled");
+
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(100)),
+            Ok(isyncyou_agent::StreamEvent::Done {
+                reason: isyncyou_agent::DoneReason::Cancelled
+            })
+        ));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(any(
