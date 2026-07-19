@@ -15129,7 +15129,7 @@ mod tests {
         feature = "agent-subscription-experimental"
     ))]
     #[test]
-    fn agent_turn_admission_budget_finishes_only_after_accepted_publish() {
+    fn agent_turn_background_admission_does_not_inherit_interactive_deadline() {
         let source = include_str!("product_session.rs");
         let function = source
             .split("pub fn begin_turn(")
@@ -15138,21 +15138,22 @@ mod tests {
             .split("pub(crate) fn pairing_payload(")
             .next()
             .expect("product begin_turn boundary");
-        let fresh_request = function
-            .split("let lease_id = new_ulid()")
-            .last()
-            .expect("fresh request branch");
-        let publish = fresh_request
-            .find(".acquire_lease_and_publish_from_manifest_at(")
-            .expect("atomic accepted manifest publication");
-        let finish = fresh_request
-            .find("guard.finish_admission()")
-            .expect("admission budget completion");
+        assert!(function.contains("ensure_remote_session_for_background_turn"));
 
-        assert!(publish < finish);
-        assert!(fresh_request[..publish].find("finish_admission").is_none());
-        assert!(fresh_request[publish..finish].contains("SessionCommitV1"));
-        assert!(fresh_request[publish..finish].contains("map_err(map_session_error)?"));
+        let helper = source
+            .split("fn ensure_remote_session_for_background_turn(")
+            .nth(1)
+            .expect("background turn session helper")
+            .split("fn ensure_remote_session_with_transport(")
+            .next()
+            .expect("background helper boundary");
+        let clear = helper
+            .find(".complete_interactive_admission()")
+            .expect("interactive deadline clear");
+        let remote = helper
+            .find("ensure_remote_session_with_transport")
+            .expect("remote session work");
+        assert!(clear < remote);
     }
 
     #[cfg(any(

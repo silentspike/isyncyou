@@ -7,7 +7,7 @@ use isyncyou_agent::{
     RequestJournalV1, RequestPhase, RequestRouteDomain, RequestStepOutcomeV1, RequestStepRef,
     RequestUuidBindingV1, SanitizedUsage, Secret, SecretClass, SessionCommitV1, SessionId,
     SessionLeaseGuard, SessionObjectCrypto, SessionRecordKind, SessionRecordV2, SessionV2Error,
-    SessionV2Store, SourceRef, ToolAction, TurnObserver, TurnTerminalStatus,
+    SessionV2Store, SessionV2Transport, SourceRef, ToolAction, TurnObserver, TurnTerminalStatus,
     REQUEST_JOURNAL_VERSION, SESSION_RECORD_VERSION,
 };
 use serde::{Deserialize, Serialize};
@@ -1259,6 +1259,31 @@ impl<'a> ProductSessionRegistry<'a> {
     ) -> Result<SessionV2Store<OneDriveSessionV2Transport>, String> {
         let transport =
             OneDriveSessionV2Transport::new(graph_token, session_id).map_err(map_session_error)?;
+        self.ensure_remote_session_with_transport(session_id, transport)
+    }
+
+    fn ensure_remote_session_for_background_turn(
+        &self,
+        graph_token: &str,
+        session_id: &str,
+    ) -> Result<SessionV2Store<OneDriveSessionV2Transport>, String> {
+        let transport =
+            OneDriveSessionV2Transport::new(graph_token, session_id).map_err(map_session_error)?;
+        // The route has already reserved the deterministic turn ID and detached
+        // this worker from the synchronous response path. Keep the normal bounded
+        // Graph request timeouts, but do not apply one aggregate interactive
+        // deadline across manifest, history, and CAS work.
+        transport
+            .complete_interactive_admission()
+            .map_err(map_session_error)?;
+        self.ensure_remote_session_with_transport(session_id, transport)
+    }
+
+    fn ensure_remote_session_with_transport(
+        &self,
+        session_id: &str,
+        transport: OneDriveSessionV2Transport,
+    ) -> Result<SessionV2Store<OneDriveSessionV2Transport>, String> {
         let session = self.open_with_transport(session_id, transport.clone())?;
         if !self.remote_initialization_pending(session_id)? {
             return Ok(session);
@@ -1358,7 +1383,7 @@ impl<'a> ProductSessionRegistry<'a> {
         // This runs only in the admission worker. The route has already returned
         // the deterministic turn ID, so Graph manifest creation cannot delay the
         // user's acknowledgement of the turn.
-        let store = self.ensure_remote_session(graph_token, session_id)?;
+        let store = self.ensure_remote_session_for_background_turn(graph_token, session_id)?;
         let (current, admission_time) = store
             .current_manifest_with_server_time(session_id)
             .map_err(map_session_error)?;
