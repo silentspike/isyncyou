@@ -3,12 +3,12 @@ use isyncyou_agent::{
     new_ulid, parse_action, payload_digest, request_object_digest, select_provider_context,
     tool_result_digest, AgentCredentialStore, AssistantBlock, IdempotencyTombstoneV1,
     LocalEffectCheckpointV1, NormalizedAssistantBlock, OneDriveSessionV2Transport, PairingPayload,
-    PendingOwnerBinding, ProviderAttemptBindingV1, ReadToolCheckpointV1, RequestJournalV1,
-    RequestPhase, RequestRouteDomain, RequestStepOutcomeV1, RequestStepRef, RequestUuidBindingV1,
-    SanitizedUsage, Secret, SecretClass, SessionCommitV1, SessionId, SessionLeaseGuard,
-    SessionObjectCrypto, SessionRecordKind, SessionRecordV2, SessionV2Error, SessionV2Store,
-    SourceRef, ToolAction, TurnObserver, TurnTerminalStatus, REQUEST_JOURNAL_VERSION,
-    SESSION_RECORD_VERSION,
+    PendingOwnerBinding, PersistedLeaseBinding, ProviderAttemptBindingV1, ReadToolCheckpointV1,
+    RequestJournalV1, RequestPhase, RequestRouteDomain, RequestStepOutcomeV1, RequestStepRef,
+    RequestUuidBindingV1, SanitizedUsage, Secret, SecretClass, SessionCommitV1, SessionId,
+    SessionLeaseGuard, SessionObjectCrypto, SessionRecordKind, SessionRecordV2, SessionV2Error,
+    SessionV2Store, SourceRef, ToolAction, TurnObserver, TurnTerminalStatus,
+    REQUEST_JOURNAL_VERSION, SESSION_RECORD_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -155,6 +155,8 @@ pub struct ProductTurnRuntime {
     turn_id: String,
     provider_binding: ProviderAttemptBindingV1,
     intent_record_id: String,
+    intent_record: SessionRecordV2,
+    context_records: Vec<SessionRecordV2>,
     journal: RequestJournalV1,
     pending_request_objects: Vec<(String, Vec<u8>)>,
     prepublished_provider_step: Option<u8>,
@@ -182,7 +184,7 @@ pub struct ProductTurnRequest<'a> {
     pub cached_context: Option<ProductSessionContextSnapshot>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProductSessionContextSnapshot {
     pub manifest_generation: u64,
     pub records: Vec<SessionRecordV2>,
@@ -283,11 +285,11 @@ impl ProductTurnRuntime {
     }
 
     pub fn finish_final(
-        self,
+        mut self,
         text: String,
         usage: Option<SanitizedUsage>,
         created_at_ms: u64,
-    ) -> Result<(), String> {
+    ) -> Result<ProductSessionContextSnapshot, String> {
         let assistant_id = new_ulid().map_err(|_| "session_store_unavailable")?;
         let terminal_id = new_ulid().map_err(|_| "session_store_unavailable")?;
         let lease = self.guard.binding().map_err(map_session_error)?;
@@ -327,22 +329,22 @@ impl ProductTurnRuntime {
         let tombstone = self.terminal_tombstone(TurnTerminalStatus::Complete, &visible_records)?;
         self.guard
             .publish_terminal_with_request_objects(
-                visible_records,
+                visible_records.clone(),
                 &self.request_id,
                 tombstone,
-                self.pending_request_objects,
+                std::mem::take(&mut self.pending_request_objects),
             )
             .map_err(map_session_error)?;
-        Ok(())
+        self.context_snapshot_after_publish(visible_records)
     }
 
     pub fn finish_terminal(
-        self,
+        mut self,
         status: TurnTerminalStatus,
         error_code: Option<String>,
         _phase: RequestPhase,
         created_at_ms: u64,
-    ) -> Result<(), String> {
+    ) -> Result<ProductSessionContextSnapshot, String> {
         let terminal_id = new_ulid().map_err(|_| "session_store_unavailable")?;
         let lease = self.guard.binding().map_err(map_session_error)?;
         let visible_records = vec![SessionRecordV2 {
@@ -360,42 +362,66 @@ impl ProductTurnRuntime {
         let tombstone = self.terminal_tombstone(status, &visible_records)?;
         self.guard
             .publish_terminal_with_request_objects(
-                visible_records,
+                visible_records.clone(),
                 &self.request_id,
                 tombstone,
-                self.pending_request_objects,
+                std::mem::take(&mut self.pending_request_objects),
             )
             .map_err(map_session_error)?;
-        Ok(())
+        self.context_snapshot_after_publish(visible_records)
     }
 
-    pub fn finish_pending(&mut self, created_at_ms: u64) -> Result<(), String> {
+    fn context_snapshot_after_publish(
+        self,
+        terminal_records: Vec<SessionRecordV2>,
+    ) -> Result<ProductSessionContextSnapshot, String> {
+        let manifest_generation = self
+            .guard
+            .manifest_generation()
+            .map_err(map_session_error)?;
+        let mut records = self.context_records;
+        records.push(self.intent_record);
+        records.extend(terminal_records);
+        if records.len() > 128 {
+            records.drain(..records.len() - 128);
+        }
+        Ok(ProductSessionContextSnapshot {
+            manifest_generation,
+            records,
+        })
+    }
+
+    pub fn finish_pending(
+        mut self,
+        created_at_ms: u64,
+    ) -> Result<ProductSessionContextSnapshot, String> {
         let pending_id = new_ulid().map_err(|_| "session_store_unavailable")?;
         let lease = self.guard.binding().map_err(map_session_error)?;
         let journal = self.terminal_journal(RequestPhase::PendingConfirmation)?;
-        let mut request_objects = self.pending_request_objects.clone();
+        let mut request_objects = std::mem::take(&mut self.pending_request_objects);
         request_objects.push(journal);
+        let pending_record = SessionRecordV2 {
+            record_version: SESSION_RECORD_VERSION,
+            record_id: pending_id,
+            session_id: self.session_id.clone(),
+            request_id: self.request_id.clone(),
+            turn_id: self.turn_id.clone(),
+            kind: SessionRecordKind::PendingOperation {
+                code: "confirmation_required".into(),
+            },
+            parent_record_ids: vec![self.intent_record_id.clone()],
+            observed_head: Some(self.intent_record_id.clone()),
+            lease,
+            created_at_ms,
+        };
         self.guard
             .publish(SessionCommitV1 {
-                visible_records: vec![SessionRecordV2 {
-                    record_version: SESSION_RECORD_VERSION,
-                    record_id: pending_id,
-                    session_id: self.session_id.clone(),
-                    request_id: self.request_id.clone(),
-                    turn_id: self.turn_id.clone(),
-                    kind: SessionRecordKind::PendingOperation {
-                        code: "confirmation_required".into(),
-                    },
-                    parent_record_ids: vec![self.intent_record_id.clone()],
-                    observed_head: Some(self.intent_record_id.clone()),
-                    lease,
-                    created_at_ms,
-                }],
+                visible_records: vec![pending_record.clone()],
                 request_objects,
                 uuid_bindings: vec![],
             })
             .map_err(map_session_error)?;
-        Ok(())
+        self.context_snapshot_after_publish(vec![pending_record])
     }
 
     fn terminal_journal(&self, phase: RequestPhase) -> Result<(String, Vec<u8>), String> {
@@ -1371,16 +1397,16 @@ impl<'a> ProductSessionRegistry<'a> {
         {
             let mut final_text = None;
             let mut error_code = None;
-            let mut intent_record_id = None;
+            let mut intent_record = None;
             for record in replay.visible_records {
-                match record.kind {
-                    SessionRecordKind::TurnIntent { .. } => {
-                        intent_record_id = Some(record.record_id)
+                match &record.kind {
+                    SessionRecordKind::TurnIntent { .. } => intent_record = Some(record.clone()),
+                    SessionRecordKind::AssistantResult { text, .. } => {
+                        final_text = Some(text.clone())
                     }
-                    SessionRecordKind::AssistantResult { text, .. } => final_text = Some(text),
                     SessionRecordKind::TurnTerminal {
                         error_code: code, ..
-                    } => error_code = code,
+                    } => error_code.clone_from(code),
                     _ => {}
                 }
             }
@@ -1415,6 +1441,8 @@ impl<'a> ProductSessionRegistry<'a> {
                 let guard = store
                     .acquire_lease_from_manifest(current.clone(), &lease_id, &holder_binding)
                     .map_err(map_session_error)?;
+                let intent_record =
+                    intent_record.ok_or_else(|| "session_store_unavailable".to_string())?;
                 let runtime = ProductTurnRuntime {
                     guard,
                     session_id: session_id.to_owned(),
@@ -1422,8 +1450,9 @@ impl<'a> ProductSessionRegistry<'a> {
                     turn_id: journal.turn_id.clone(),
                     request_binding: request_binding.clone(),
                     provider_binding,
-                    intent_record_id: intent_record_id
-                        .ok_or_else(|| "session_store_unavailable".to_string())?,
+                    intent_record_id: intent_record.record_id.clone(),
+                    intent_record,
+                    context_records: context_records.clone(),
                     journal: journal.clone(),
                     pending_request_objects: Vec::new(),
                     prepublished_provider_step: None,
@@ -1503,6 +1532,25 @@ impl<'a> ProductSessionRegistry<'a> {
         };
         let journal_bytes =
             serde_json::to_vec(&journal).map_err(|_| "session_store_unavailable")?;
+        let intent_record = SessionRecordV2 {
+            record_version: SESSION_RECORD_VERSION,
+            record_id: intent_record_id.clone(),
+            session_id: session_id.to_owned(),
+            request_id: request_id.to_owned(),
+            turn_id: turn_id.clone(),
+            kind: SessionRecordKind::TurnIntent {
+                user_text: prompt.to_owned(),
+            },
+            parent_record_ids: vec![],
+            observed_head: None,
+            lease: PersistedLeaseBinding {
+                lease_id: String::new(),
+                holder_binding: String::new(),
+                fence: 0,
+                expires_at_server_ms: 0,
+            },
+            created_at_ms,
+        };
         let guard = store
             .acquire_lease_and_publish_from_manifest_at(
                 current,
@@ -1510,27 +1558,18 @@ impl<'a> ProductSessionRegistry<'a> {
                 &lease_id,
                 &holder_binding,
                 |lease| {
+                    let mut intent_record = intent_record.clone();
+                    intent_record.lease = lease.clone();
                     Ok(SessionCommitV1 {
-                        visible_records: vec![SessionRecordV2 {
-                            record_version: SESSION_RECORD_VERSION,
-                            record_id: intent_record_id.clone(),
-                            session_id: session_id.to_owned(),
-                            request_id: request_id.to_owned(),
-                            turn_id: turn_id.clone(),
-                            kind: SessionRecordKind::TurnIntent {
-                                user_text: prompt.to_owned(),
-                            },
-                            parent_record_ids: vec![],
-                            observed_head: None,
-                            lease: lease.clone(),
-                            created_at_ms,
-                        }],
+                        visible_records: vec![intent_record],
                         request_objects: vec![(journal_id, journal_bytes)],
                         uuid_bindings: vec![request_binding.clone()],
                     })
                 },
             )
             .map_err(map_session_error)?;
+        let mut intent_record = intent_record;
+        intent_record.lease = guard.binding().map_err(map_session_error)?;
         guard.finish_admission();
         Ok(ProductTurnStart::Started(Box::new(ProductTurnRuntime {
             guard,
@@ -1540,6 +1579,8 @@ impl<'a> ProductSessionRegistry<'a> {
             turn_id,
             provider_binding,
             intent_record_id,
+            intent_record,
+            context_records,
             journal,
             pending_request_objects: Vec::new(),
             prepublished_provider_step: Some(0),

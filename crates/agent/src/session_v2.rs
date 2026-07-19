@@ -1817,6 +1817,14 @@ impl<T: SessionV2Transport + Clone + 'static> SessionLeaseGuard<T> {
         })
     }
 
+    pub fn manifest_generation(&self) -> Result<u64, SessionV2Error> {
+        let state = self.state.lock().map_err(|_| SessionV2Error::LeaseLost)?;
+        if state.lost {
+            return Err(SessionV2Error::LeaseLost);
+        }
+        Ok(state.current.manifest.generation)
+    }
+
     /// Promote the transport from its short admission budget to the normal
     /// long-turn request policy. Call only after the accepted request state has
     /// become authoritative through the manifest CAS.
@@ -4551,6 +4559,7 @@ mod tests {
                 },
             )
             .unwrap();
+        assert_eq!(guard.manifest_generation().unwrap(), 1);
         let state = guard.state.lock().unwrap();
         assert_eq!(state.current.manifest.generation, 1);
         assert_eq!(

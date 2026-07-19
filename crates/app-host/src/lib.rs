@@ -732,6 +732,7 @@ enum HotSessionHistoryLookup {
 #[derive(Default)]
 struct HotSessionHistoryCache {
     entries: Mutex<HashMap<(String, String, usize), HotSessionHistoryEntry>>,
+    contexts: Mutex<HashMap<String, product_session::ProductSessionContextSnapshot>>,
     sequence: AtomicU64,
 }
 
@@ -866,6 +867,15 @@ impl HotSessionHistoryCache {
         &self,
         session_id: &str,
     ) -> Option<product_session::ProductSessionContextSnapshot> {
+        if let Some(snapshot) = self
+            .contexts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(session_id)
+            .cloned()
+        {
+            return Some(snapshot);
+        }
         let entries = self
             .entries
             .lock()
@@ -904,6 +914,32 @@ impl HotSessionHistoryCache {
             records,
         })
     }
+
+    fn replace_context(&self, snapshot: product_session::ProductSessionContextSnapshot) {
+        let Some(session_id) = snapshot
+            .records
+            .first()
+            .map(|record| record.session_id.clone())
+        else {
+            return;
+        };
+        self.contexts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(session_id, snapshot);
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
+fn cache_product_session_context(
+    cache: &HotSessionHistoryCache,
+    result: Result<product_session::ProductSessionContextSnapshot, String>,
+) -> Result<(), String> {
+    result.map(|snapshot| cache.replace_context(snapshot))
 }
 
 #[cfg(any(
@@ -8411,13 +8447,16 @@ impl DaemonAgent {
                 match outcome {
                     Ok(isyncyou_agent::TurnOutcome::Final { text }) => {
                         let persisted = product_turn.map_or(Ok(()), |runtime| {
-                            runtime.finish_final(
-                                text,
-                                usage.map(|usage| isyncyou_agent::SanitizedUsage {
-                                    input_tokens: usage.input_tokens,
-                                    output_tokens: usage.output_tokens,
-                                }),
-                                unix_now_ms(),
+                            cache_product_session_context(
+                                &hot_session_history,
+                                runtime.finish_final(
+                                    text,
+                                    usage.map(|usage| isyncyou_agent::SanitizedUsage {
+                                        input_tokens: usage.input_tokens,
+                                        output_tokens: usage.output_tokens,
+                                    }),
+                                    unix_now_ms(),
+                                ),
                             )
                         });
                         cache_persisted_request_phase(
@@ -8439,11 +8478,14 @@ impl DaemonAgent {
                             Ok(preview) => preview,
                             Err(_) => {
                                 let persisted = product_turn.take().map_or(Ok(()), |runtime| {
-                                    runtime.finish_terminal(
-                                        isyncyou_agent::TurnTerminalStatus::Error,
-                                        Some("confirmation_unavailable".into()),
-                                        isyncyou_agent::RequestPhase::Failed,
-                                        unix_now_ms(),
+                                    cache_product_session_context(
+                                        &hot_session_history,
+                                        runtime.finish_terminal(
+                                            isyncyou_agent::TurnTerminalStatus::Error,
+                                            Some("confirmation_unavailable".into()),
+                                            isyncyou_agent::RequestPhase::Failed,
+                                            unix_now_ms(),
+                                        ),
                                     )
                                 });
                                 for event in terminal_error_events_after_persistence(
@@ -8479,9 +8521,12 @@ impl DaemonAgent {
                                     owner,
                                 )
                                 .map_err(|_| "confirmation_unavailable".to_string())?;
-                            let persisted = product_turn
-                                .as_mut()
-                                .map_or(Ok(()), |runtime| runtime.finish_pending(unix_now_ms()));
+                            let persisted = product_turn.take().map_or(Ok(()), |runtime| {
+                                cache_product_session_context(
+                                    &hot_session_history,
+                                    runtime.finish_pending(unix_now_ms()),
+                                )
+                            });
                             if let Err(error) = persisted {
                                 let _ = pending.cancel(
                                     &pending_action.id,
@@ -8490,7 +8535,6 @@ impl DaemonAgent {
                                 );
                                 return Err(error);
                             }
-                            product_turn.take();
                             cache_persisted_request_phase(
                                 &hot_request_statuses,
                                 hot_request_binding.as_ref(),
@@ -8523,11 +8567,14 @@ impl DaemonAgent {
                             }
                             Ok(PendingTransition::Cancelled) => {
                                 let persisted = product_turn.take().map_or(Ok(()), |runtime| {
-                                    runtime.finish_terminal(
-                                        isyncyou_agent::TurnTerminalStatus::Cancelled,
-                                        None,
-                                        isyncyou_agent::RequestPhase::Cancelled,
-                                        unix_now_ms(),
+                                    cache_product_session_context(
+                                        &hot_session_history,
+                                        runtime.finish_terminal(
+                                            isyncyou_agent::TurnTerminalStatus::Cancelled,
+                                            None,
+                                            isyncyou_agent::RequestPhase::Cancelled,
+                                            unix_now_ms(),
+                                        ),
                                     )
                                 });
                                 cache_persisted_request_phase(
@@ -8546,11 +8593,14 @@ impl DaemonAgent {
                             Err(error) => {
                                 let safe_code = pending_setup_error_code(&error);
                                 let persisted = product_turn.take().map_or(Ok(()), |runtime| {
-                                    runtime.finish_terminal(
-                                        isyncyou_agent::TurnTerminalStatus::Error,
-                                        Some(safe_code.into()),
-                                        isyncyou_agent::RequestPhase::Failed,
-                                        unix_now_ms(),
+                                    cache_product_session_context(
+                                        &hot_session_history,
+                                        runtime.finish_terminal(
+                                            isyncyou_agent::TurnTerminalStatus::Error,
+                                            Some(safe_code.into()),
+                                            isyncyou_agent::RequestPhase::Failed,
+                                            unix_now_ms(),
+                                        ),
                                     )
                                 });
                                 cache_persisted_request_phase(
@@ -8569,11 +8619,14 @@ impl DaemonAgent {
                     }
                     Err(isyncyou_agent::AgentError::Cancelled) => {
                         let persisted = product_turn.map_or(Ok(()), |runtime| {
-                            runtime.finish_terminal(
-                                isyncyou_agent::TurnTerminalStatus::Cancelled,
-                                None,
-                                isyncyou_agent::RequestPhase::Cancelled,
-                                unix_now_ms(),
+                            cache_product_session_context(
+                                &hot_session_history,
+                                runtime.finish_terminal(
+                                    isyncyou_agent::TurnTerminalStatus::Cancelled,
+                                    None,
+                                    isyncyou_agent::RequestPhase::Cancelled,
+                                    unix_now_ms(),
+                                ),
                             )
                         });
                         cache_persisted_request_phase(
@@ -8605,11 +8658,14 @@ impl DaemonAgent {
                     Err(error) => {
                         let safe_error = agent_safe_turn_error(&error).to_owned();
                         let persisted = product_turn.map_or(Ok(()), |runtime| {
-                            runtime.finish_terminal(
-                                isyncyou_agent::TurnTerminalStatus::Error,
-                                Some(safe_error.clone()),
-                                isyncyou_agent::RequestPhase::Failed,
-                                unix_now_ms(),
+                            cache_product_session_context(
+                                &hot_session_history,
+                                runtime.finish_terminal(
+                                    isyncyou_agent::TurnTerminalStatus::Error,
+                                    Some(safe_error.clone()),
+                                    isyncyou_agent::RequestPhase::Failed,
+                                    unix_now_ms(),
+                                ),
                             )
                         });
                         cache_persisted_request_phase(
@@ -8644,11 +8700,14 @@ impl DaemonAgent {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take();
             let _ = product_turn.map_or(Ok(()), |runtime| {
-                runtime.finish_terminal(
-                    isyncyou_agent::TurnTerminalStatus::Error,
-                    Some("turn_spawn_failed".into()),
-                    isyncyou_agent::RequestPhase::Failed,
-                    unix_now_ms(),
+                cache_product_session_context(
+                    &self.hot_session_history,
+                    runtime.finish_terminal(
+                        isyncyou_agent::TurnTerminalStatus::Error,
+                        Some("turn_spawn_failed".into()),
+                        isyncyou_agent::RequestPhase::Failed,
+                        unix_now_ms(),
+                    ),
                 )
             });
             self.streams.lock().unwrap().remove(&turn_id);
@@ -23471,6 +23530,38 @@ fn session_history_hot_cache_coalesces_completes_and_invalidates() {
     assert!(snapshot.records.is_empty());
     cache.invalidate("session");
     start_history_load(&cache, &key);
+}
+
+#[cfg(test)]
+#[test]
+fn session_history_hot_cache_retains_persisted_context_when_pages_invalidate() {
+    let cache = HotSessionHistoryCache::default();
+    let snapshot = product_session::ProductSessionContextSnapshot {
+        manifest_generation: 9,
+        records: vec![isyncyou_agent::SessionRecordV2 {
+            record_version: isyncyou_agent::SESSION_RECORD_VERSION,
+            record_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+            session_id: "session".into(),
+            request_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            turn_id: "turn".into(),
+            kind: isyncyou_agent::SessionRecordKind::TurnTerminal {
+                status: isyncyou_agent::TurnTerminalStatus::Complete,
+                error_code: None,
+            },
+            parent_record_ids: Vec::new(),
+            observed_head: None,
+            lease: isyncyou_agent::PersistedLeaseBinding {
+                lease_id: "lease".into(),
+                holder_binding: "holder".into(),
+                fence: 1,
+                expires_at_server_ms: 10_000,
+            },
+            created_at_ms: 1,
+        }],
+    };
+    cache.replace_context(snapshot.clone());
+    cache.invalidate("session");
+    assert_eq!(cache.context_snapshot("session"), Some(snapshot));
 }
 
 #[cfg(test)]
