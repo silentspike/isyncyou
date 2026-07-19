@@ -624,6 +624,7 @@ impl AgentControlStore {
             | isyncyou_webui::MutationPurpose::OnedriveReplace { .. } => 64 * 1024 * 1024,
             isyncyou_webui::MutationPurpose::MailBody { .. }
             | isyncyou_webui::MutationPurpose::OnenoteBody { .. } => 2 * 1024 * 1024,
+            isyncyou_webui::MutationPurpose::TodoDeleteBatch { .. } => 512 * 1024,
         };
         if request.total_bytes > max_bytes || !valid_sha256(&request.sha256) {
             return Err("mutation_intent_invalid".into());

@@ -832,7 +832,8 @@ a:hover { text-decoration: underline; }
    .view (OneDrive/Calendar/ToDo) so it drops its own side padding + divider. */
 .con-metrics-row.inset { padding: 0; border-bottom: 0; margin-bottom: var(--sp-5); }
 /* thin right-aligned action strip for views without a toolbar (ToDo/OneNote) */
-.view-actions { display: flex; justify-content: flex-end; margin-bottom: var(--sp-4); }
+.view-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: var(--sp-2); margin-bottom: var(--sp-4); }
+.view-actions [hidden] { display: none !important; }
 /* KPI cards in the top band are glassy → the constellation shimmers through them */
 .con-metrics-row .con-metric.card { background: color-mix(in oklab, var(--bg-1) 62%, transparent); backdrop-filter: blur(7px); -webkit-backdrop-filter: blur(7px); }
 .con-metric { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-3) var(--sp-4); flex: 1 1 150px; min-width: 0; }
@@ -963,6 +964,8 @@ a:hover { text-decoration: underline; }
   background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r-md); padding: var(--sp-2) var(--sp-3);
   color: var(--text-hi); margin-bottom: 6px; transition: border-color var(--t-fast) var(--ease); }
 .todo-task:hover { border-color: var(--line-2); background: var(--bg-hover); }
+.todo-task.selected { border-color: var(--accent); background: var(--accent-soft); }
+.todo-task.selected .todo-check { color: var(--accent); }
 .todo-check { flex: none; color: var(--text-lo); margin-top: 1px; }
 .todo-check.prog { color: var(--warn); }
 .todo-check.done { color: var(--ok); }

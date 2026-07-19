@@ -153,8 +153,11 @@ impl ConfirmationOperation {
             | Self::Replace
             | Self::MoveOutOfProtected
             | Self::ModeSwitchOfflineLarge
-            | Self::ConflictKeepMine
-            | Self::Bulk => service == ConfirmationService::Onedrive,
+            | Self::ConflictKeepMine => service == ConfirmationService::Onedrive,
+            Self::Bulk => matches!(
+                service,
+                ConfirmationService::Onedrive | ConfirmationService::Todo
+            ),
             Self::UserPresence => service == ConfirmationService::Agent,
         }
     }
@@ -521,6 +524,7 @@ mod tests {
             ("mode-switch-offline-large", "onedrive"),
             ("conflict-keep-mine", "onedrive"),
             ("bulk", "onedrive"),
+            ("bulk", "todo"),
             ("user-presence", "agent"),
         ];
         for op in ConfirmationOperation::ALL {

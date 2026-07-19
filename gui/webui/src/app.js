@@ -335,6 +335,7 @@ let _bridgeSeq = 0;
 const BRIDGE_TIMEOUT_MS = 15000;
 const NATIVE_TIMEOUT_MS = 5000;
 const BIO_TIMEOUT_MS = 120000;
+const MUTATION_COMMIT_TIMEOUT_MS = 125000;
 // Provider transport permits 60s to first response and 120s of SSE read idleness.
 // Keep the bridge watchdog just beyond that policy; the native stream also emits
 // 20-second pings, so a healthy long turn remains observable while backgrounded.
@@ -394,10 +395,10 @@ function bridgeRoundTrip(msg, timeoutMs) {
     }
   });
 }
-function bridgeSend(method, path, headers, body) {
+function bridgeSend(method, path, headers, body, timeoutMs) {
   const id = "r" + (++_bridgeSeq);
   _bridgeStats.requests++;
-  return bridgeRoundTrip({ t: "req", id, method, path, headers, body: body ?? null }, BRIDGE_TIMEOUT_MS);
+  return bridgeRoundTrip({ t: "req", id, method, path, headers, body: body ?? null }, timeoutMs || BRIDGE_TIMEOUT_MS);
 }
 async function nativeCall(op, payload, timeoutMs) {
   const id = "n" + (++_bridgeSeq);
@@ -479,6 +480,7 @@ function biometricLabel(d) {
     : d.op === "live-write" ? "Run Agent write"
     : d.op === "move-out-of-protected" ? "Move out of offline folder"
     : d.op === "mode-switch-offline-large" ? "Make folder offline"
+    : d.op === "bulk" && d.service === "todo" ? "Delete selected tasks"
     : d.op === "bulk" ? "Bulk OneDrive change"
     : d.op ? d.op.charAt(0).toUpperCase() + d.op.slice(1) : "Confirm";
   const service = biometricServiceLabel(d.service);
@@ -533,7 +535,7 @@ async function request(method, path, opts) {
   } // #657: e.g. X-Body-Encoding: base64
   let status, d;
   if (BRIDGE) {
-    const res = await bridgeSend(method, path, headers, o.body);
+    const res = await bridgeSend(method, path, headers, o.body, o.timeoutMs);
     status = Number(res.status);
     d = {}; try { d = res.body ? JSON.parse(res.body) : {}; } catch (_) { d = {}; }
   } else {
@@ -682,9 +684,14 @@ async function stageMutation(purpose, metadata, input) {
         chunk_sha256: await sha256Hex(chunk),
       });
     }
-    return await postJson("/api/v1/mutation-intent/commit", CAP.mutationIntent, {
-      request_id: crypto.randomUUID(), intent_id: created.intent_id,
-      total_bytes: source.length, sha256: totalHash,
+    return await request("POST", "/api/v1/mutation-intent/commit", {
+      capToken: CAP.mutationIntent,
+      timeoutMs: MUTATION_COMMIT_TIMEOUT_MS,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        request_id: crypto.randomUUID(), intent_id: created.intent_id,
+        total_bytes: source.length, sha256: totalHash,
+      }),
     });
   } catch (error) {
     if (error && error.responseReceived) {
@@ -694,6 +701,24 @@ async function stageMutation(purpose, metadata, input) {
     }
     throw error;
   }
+}
+
+async function deleteTodoBatch(items) {
+  if (!Array.isArray(items) || !items.length || items.length > 1000) {
+    throw new Error("Select between 1 and 1000 tasks");
+  }
+  const normalized = items.map((item) => ({
+    list: String(item.list || ""),
+    id: String(item.id || ""),
+  }));
+  if (normalized.some((item) => !item.list || !item.id)) {
+    throw new Error("Invalid task selection");
+  }
+  const payload = new TextEncoder().encode(JSON.stringify({ items: normalized }));
+  return stageMutation("todo_delete_batch", {
+    account: App.account,
+    item_count: normalized.length,
+  }, payload);
 }
 /* Confirm a destructive action before it is sent (#0.6). On the standalone phone the
    native biometric per-action gate IS the confirmation — a strictly stronger one shown
@@ -3948,14 +3973,17 @@ async function renderContactDetail(it) {
 
 
 /* ---------------------------------------------------------------- todo (lists + checklists) */
-const Todo = { lists: [], tasks: [], stateFilter: "all" };
+const Todo = { lists: [], tasks: [], stateFilter: "all", selecting: false, selected: new Set() };
 const TODO_STATUS = { notStarted: { icon: "circle", cls: "" }, inProgress: { icon: "clock", cls: "prog" }, completed: { icon: "check-square", cls: "done" } };
 async function renderTodoView(view) {
   clear(view).append(el("div", { id: "todo-metrics-row", class: "con-metrics-row inset" }));
   const acts = el("div", { class: "view-actions" });
   if (CAP.todowrite) acts.append(
     el("button", { class: "btn sm primary", title: "Create a new task", onclick: () => openComposeTask() }, icon("check-square", "icon-sm"), "New task"),
-    el("button", { class: "btn sm", title: "Create a new list", onclick: () => newTodoList() }, icon("notebook", "icon-sm"), "New list"));
+    el("button", { class: "btn sm", title: "Create a new list", onclick: () => newTodoList() }, icon("notebook", "icon-sm"), "New list"),
+    el("button", { id: "todo-select-toggle", class: "btn sm", title: "Select tasks", onclick: toggleTodoSelection }, icon("list-checks", "icon-sm"), "Select"),
+    el("button", { id: "todo-select-all", class: "btn sm", title: "Select all visible tasks", hidden: "hidden", onclick: selectAllVisibleTodoTasks }, icon("check-check", "icon-sm"), "Select all"),
+    el("button", { id: "todo-delete-selected", class: "btn sm danger", title: "Delete selected tasks", hidden: "hidden", disabled: "disabled", onclick: deleteSelectedTodoTasks }, icon("trash-2", "icon-sm"), el("span", { id: "todo-selected-count", text: "Delete" })));
   if (CAP.verify) acts.append(verifyButton(() => renderTodoView(view)));
   if (acts.childElementCount) view.append(acts);
   const board = el("div", { id: "todo-board", class: "todo-board" });
@@ -3978,14 +4006,80 @@ async function renderTodoView(view) {
       lastActivityMetric(act.runs || []),
     ]);
     todoRender();
+    syncTodoSelectionActions();
   } catch (e) { clear(board).append(el("div", { class: "empty" }, el("h3", { text: "Could not load ToDo" }), el("p", { text: e.message }))); }
+}
+function visibleTodoTasks() {
+  return Todo.tasks.filter(t => todoTaskCanBeDeleted(t) && stateMatch(t, Todo.stateFilter));
+}
+function todoTaskCanBeDeleted(t) {
+  return !!(t && t.parent_remote_id && t.remote_id && stateKey(t) !== "backup_only");
+}
+function syncTodoSelectionActions() {
+  const toggle = $("#todo-select-toggle");
+  const all = $("#todo-select-all");
+  const remove = $("#todo-delete-selected");
+  const count = $("#todo-selected-count");
+  if (toggle) {
+    toggle.classList.toggle("active", Todo.selecting);
+    toggle.lastChild.textContent = Todo.selecting ? "Done" : "Select";
+  }
+  if (all) all.hidden = !Todo.selecting;
+  if (remove) {
+    remove.hidden = !Todo.selecting;
+    remove.disabled = Todo.selected.size === 0;
+  }
+  if (count) count.textContent = Todo.selected.size ? `Delete ${Todo.selected.size}` : "Delete";
+}
+function toggleTodoSelection() {
+  Todo.selecting = !Todo.selecting;
+  if (!Todo.selecting) Todo.selected.clear();
+  todoRender();
+  syncTodoSelectionActions();
+}
+function selectAllVisibleTodoTasks() {
+  const visible = visibleTodoTasks();
+  const allSelected = visible.length > 0 && visible.every(t => Todo.selected.has(t.remote_id));
+  visible.forEach(t => allSelected ? Todo.selected.delete(t.remote_id) : Todo.selected.add(t.remote_id));
+  todoRender();
+  syncTodoSelectionActions();
+}
+function toggleTodoTaskSelection(t) {
+  if (!todoTaskCanBeDeleted(t)) return;
+  if (Todo.selected.has(t.remote_id)) Todo.selected.delete(t.remote_id);
+  else Todo.selected.add(t.remote_id);
+  todoRender();
+  syncTodoSelectionActions();
+}
+async function deleteSelectedTodoTasks() {
+  const selected = Todo.tasks.filter(t => Todo.selected.has(t.remote_id) && todoTaskCanBeDeleted(t));
+  if (!selected.length) return;
+  if (!confirmDestructive(`Delete ${selected.length} selected task${selected.length === 1 ? "" : "s"} from your Microsoft 365 account?`)) return;
+  const button = $("#todo-delete-selected");
+  if (button) button.disabled = true;
+  try {
+    const result = await deleteTodoBatch(selected.map(t => ({ list: t.parent_remote_id, id: t.remote_id })));
+    const deleted = Number(result && result.deleted) || selected.length;
+    toast(`${deleted} task${deleted === 1 ? "" : "s"} deleted`);
+    Todo.selecting = false;
+    Todo.selected.clear();
+    await todoReload();
+  } catch (e) {
+    toast("Could not delete the selected tasks", "err");
+    if (button) button.disabled = false;
+  }
 }
 function todoRender() {
   const board = clear($("#todo-board"));
   // refresh the 4-state filter bar as a sibling just above the board
   const old = $("#todo-statebar"); if (old) old.remove();
   if (Todo.tasks.length) {
-    const bar = stateFilterBar(Todo.tasks, Todo.stateFilter, k => { Todo.stateFilter = k; todoRender(); });
+    const bar = stateFilterBar(Todo.tasks, Todo.stateFilter, k => {
+      Todo.stateFilter = k;
+      Todo.selected.clear();
+      todoRender();
+      syncTodoSelectionActions();
+    });
     bar.id = "todo-statebar"; board.parentNode.insertBefore(bar, board);
   }
   if (!Todo.lists.length && !Todo.tasks.length) { board.append(el("div", { class: "empty" }, emptyArt("empty-tasks"), el("h3", { text: "No tasks" }), el("p", { text: "Run a backup to populate your task lists." }))); return; }
@@ -4019,8 +4113,15 @@ function taskRow(t) {
   const p = t.preview || {};
   const st = TODO_STATUS[p.status] || TODO_STATUS.notStarted;
   const hasMeta = p.due || p.importance === "high" || p.steps_total > 0 || p.has_attachments;
-  return el("button", { class: "todo-task" + (p.status === "completed" ? " done" : ""), onclick: () => openTaskSheet(t) },
-    el("span", { class: "todo-check " + st.cls }, icon(st.icon, "icon-sm")),
+  const selectable = Todo.selecting && todoTaskCanBeDeleted(t);
+  const selected = selectable && Todo.selected.has(t.remote_id);
+  return el("button", {
+    class: "todo-task" + (p.status === "completed" ? " done" : "") + (selected ? " selected" : ""),
+    onclick: () => Todo.selecting ? toggleTodoTaskSelection(t) : openTaskSheet(t),
+    role: selectable ? "checkbox" : null,
+    "aria-checked": selectable ? String(selected) : null,
+  },
+    el("span", { class: "todo-check " + (selectable ? (selected ? "selected" : "") : st.cls) }, icon(selectable ? (selected ? "check-square" : "square") : st.icon, "icon-sm")),
     el("div", { class: "grow", style: "min-width:0" },
       el("div", { class: "todo-title truncate", text: t.name || "(untitled)" }),
       hasMeta ? el("div", { class: "todo-meta dim" },
@@ -4237,8 +4338,11 @@ async function todoReload() {
     const items = d.items || [];
     Todo.lists = items.filter(it => it.item_type === "list");
     Todo.tasks = items.filter(it => it.item_type === "task");
+    const liveIds = new Set(Todo.tasks.filter(todoTaskCanBeDeleted).map(t => t.remote_id));
+    Todo.selected = new Set([...Todo.selected].filter(id => liveIds.has(id)));
     App.counts.todo = d.total ?? items.length; updateNavCounts();
     todoRender();
+    syncTodoSelectionActions();
   } catch (e) { toast("Reload failed: " + e.message, "err"); }
 }
 

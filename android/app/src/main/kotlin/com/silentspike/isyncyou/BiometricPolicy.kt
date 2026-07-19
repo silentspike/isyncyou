@@ -41,7 +41,7 @@ object BiometricPolicy {
         cryptoAvailable: Boolean,
         credentialAvailable: Boolean,
     ): BiometricDecision? {
-        if (operation == "user-presence") {
+        if (operation == "user-presence" || operation == "bulk") {
             return if (credentialAvailable) {
                 BiometricDecision(
                     BiometricMode.DeviceCredential,
@@ -159,6 +159,7 @@ object BiometricLabelPolicy {
     )
 
     fun label(op: String, service: String): String? {
+        if (op == "bulk" && service == "todo") return "Delete selected tasks in To Do"
         val verb = verbs[op] ?: return null
         val serviceName = services[service] ?: return null
         return "$verb in $serviceName"

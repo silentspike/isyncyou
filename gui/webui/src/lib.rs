@@ -1663,6 +1663,12 @@ pub trait TaskWriteHandler: Send + Sync {
     ) -> Result<(), String>;
     fn complete(&self, account: &str, list_id: &str, task_id: &str) -> Result<(), String>;
     fn delete(&self, account: &str, list_id: &str, task_id: &str) -> Result<(), String>;
+    fn delete_batch(&self, account: &str, items: &[(String, String)]) -> Result<(), String> {
+        for (list_id, task_id) in items {
+            self.delete(account, list_id, task_id)?;
+        }
+        Ok(())
+    }
     fn checklist_add(
         &self,
         account: &str,
@@ -1764,6 +1770,10 @@ pub enum MutationPurpose {
         section_or_page: String,
         title: String,
     },
+    TodoDeleteBatch {
+        account: String,
+        item_count: u32,
+    },
 }
 
 impl MutationPurpose {
@@ -1800,15 +1810,28 @@ impl MutationPurpose {
                     && !section_or_page.is_empty()
                     && matches!(operation.as_str(), "create" | "append")
             }
+            Self::TodoDeleteBatch {
+                account,
+                item_count,
+            } => !account.is_empty() && (1..=1_000).contains(item_count),
         }
     }
 
-    fn confirmation_binding(&self) -> (&'static str, &str, &'static str, String) {
+    fn confirmation_binding(
+        &self,
+        total_bytes: u64,
+        content_sha256: &str,
+    ) -> (&'static str, &str, &'static str, String) {
         use base64::Engine as _;
-        use ring::digest::{digest, SHA256};
+        use ring::digest::{Context, SHA256};
         let canonical = serde_json::to_vec(self).unwrap_or_default();
-        let binding = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(digest(&SHA256, &canonical).as_ref());
+        let mut digest = Context::new(&SHA256);
+        digest.update(b"isyncyou-mutation-confirmation-v1\0");
+        digest.update(&canonical);
+        digest.update(&total_bytes.to_be_bytes());
+        digest.update(content_sha256.as_bytes());
+        let binding =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.finish().as_ref());
         match self {
             Self::OnedriveUpload { account, name, .. } => {
                 ("upload", account, "onedrive", format!("{name}#{binding}"))
@@ -1832,6 +1855,10 @@ impl MutationPurpose {
                 "onenote",
                 format!("{operation}#{binding}"),
             ),
+            Self::TodoDeleteBatch {
+                account,
+                item_count,
+            } => ("bulk", account, "todo", format!("{item_count}#{binding}")),
         }
     }
 }
@@ -4259,7 +4286,9 @@ impl Router {
         if self.biometric_gate && req.storage_not_low != Some(true) {
             return ApiResponse::error(507, "mutation_intent_insufficient_storage");
         }
-        let (op, account, service, item) = request.purpose.confirmation_binding();
+        let (op, account, service, item) = request
+            .purpose
+            .confirmation_binding(request.total_bytes, &request.sha256);
         if let Some(response) = self.biometric_challenge(op, account, service, &item, req) {
             return response;
         }
@@ -16920,6 +16949,101 @@ Content-Type: text/html; charset=utf-8\r\n\
         );
         assert_eq!(response.status, 200);
         assert_eq!(handler.creates.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn todo_delete_batch_uses_one_content_bound_mobile_confirmation() {
+        let handler = std::sync::Arc::new(RecordingMutationIntents::default());
+        let router = Router::new(Config::default())
+            .with_session_token("session".into())
+            .with_mutation_intents(handler.clone(), "mutation-cap".into())
+            .with_biometric_gate();
+        let body = json!({
+            "request_id": "019f0000-0000-4000-8000-000000000245",
+            "purpose": "todo_delete_batch",
+            "metadata": {"account": "controlled", "item_count": 1000},
+            "total_bytes": 131072,
+            "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        });
+        let challenge = router.route(
+            &mutation_request("/api/v1/mutation-intent/create", body.clone())
+                .with_storage_not_low(Some(true)),
+        );
+        assert_eq!(challenge.status, 200);
+        let pending = body_json(&challenge)["pending_action_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            router.describe_biometric(&pending).unwrap(),
+            isyncyou_core::pending::PendingActionDescriptor {
+                op: isyncyou_core::pending::ConfirmationOperation::Bulk,
+                service: isyncyou_core::pending::ConfirmationService::Todo,
+            }
+        );
+        assert!(router.confirm_biometric(&pending));
+
+        let mut changed = body.clone();
+        changed["sha256"] =
+            json!("2222222222222222222222222222222222222222222222222222222222222222");
+        assert_eq!(
+            router
+                .route(
+                    &mutation_request("/api/v1/mutation-intent/create", changed)
+                        .with_storage_not_low(Some(true))
+                        .with_per_action_token(Some(pending.clone()))
+                )
+                .status,
+            403
+        );
+        assert_eq!(handler.creates.lock().unwrap().len(), 0);
+
+        assert_eq!(
+            router
+                .route(
+                    &mutation_request("/api/v1/mutation-intent/create", body)
+                        .with_storage_not_low(Some(true))
+                        .with_per_action_token(Some(pending.clone()))
+                )
+                .status,
+            200
+        );
+        assert_eq!(handler.creates.lock().unwrap().len(), 1);
+        assert_eq!(
+            router
+                .route(
+                    &mutation_request(
+                        "/api/v1/mutation-intent/create",
+                        json!({
+                            "request_id": "019f0000-0000-4000-8000-000000000246",
+                            "purpose": "todo_delete_batch",
+                            "metadata": {"account": "controlled", "item_count": 1001},
+                            "total_bytes": 1,
+                            "sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+                        })
+                    )
+                    .with_storage_not_low(Some(true))
+                )
+                .status,
+            400
+        );
+    }
+
+    #[test]
+    fn todo_batch_helper_chunks_ids_and_requests_one_intent_confirmation() {
+        let source = include_str!("app.js");
+        assert!(source.contains("async function deleteTodoBatch(items)"));
+        assert!(source.contains("return stageMutation(\"todo_delete_batch\""));
+        assert!(source.contains("const MUTATION_COMMIT_TIMEOUT_MS = 125000"));
+        assert!(source.contains("timeoutMs: MUTATION_COMMIT_TIMEOUT_MS"));
+        assert!(source.contains("function selectAllVisibleTodoTasks()"));
+        assert!(source.contains("function todoTaskCanBeDeleted(t)"));
+        assert!(source.contains("stateKey(t) !== \"backup_only\""));
+        assert!(source.contains("async function deleteSelectedTodoTasks()"));
+        assert!(source.contains("Delete ${selected.length} selected task"));
+        assert!(
+            !source.contains("for (const item of items) await postJson(\"/api/v1/todo/delete\"")
+        );
     }
 
     #[test]

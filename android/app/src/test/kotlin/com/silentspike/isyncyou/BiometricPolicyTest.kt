@@ -45,6 +45,18 @@ class BiometricPolicyTest {
     }
 
     @Test
+    fun bulkOperationUsesOneDeviceCredentialPromptWhenAvailable() {
+        val decision = BiometricPolicy.chooseForOperation(
+            operation = "bulk",
+            strongAvailable = true,
+            cryptoAvailable = true,
+            credentialAvailable = true,
+        )
+        assertEquals(BiometricMode.DeviceCredential, decision?.mode)
+        assertEquals(BiometricManager.Authenticators.DEVICE_CREDENTIAL, decision?.authenticators)
+    }
+
+    @Test
     fun destructiveOperationRetainsStrongCryptoPreference() {
         val decision = BiometricPolicy.chooseForOperation(
             operation = "delete",
@@ -98,6 +110,7 @@ class BiometricPolicyTest {
     fun labelsComeOnlyFromKnownRustEnums() {
         assertEquals("Delete in OneDrive", BiometricLabelPolicy.label("delete", "onedrive"))
         assertEquals("Make folder offline in OneDrive", BiometricLabelPolicy.label("mode-switch-offline-large", "onedrive"))
+        assertEquals("Delete selected tasks in To Do", BiometricLabelPolicy.label("bulk", "todo"))
         assertNull(BiometricLabelPolicy.label("unknown", "unknown"))
         assertNull(BiometricLabelPolicy.label("delete", "unknown"))
     }

@@ -11171,6 +11171,10 @@ impl isyncyou_webui::TaskWriteHandler for DaemonTaskWrite {
         let w = isyncyou_engine::task_writer(&self.cfg, account)?;
         isyncyou_engine::TaskWriter::delete(&w, list_id, task_id)
     }
+    fn delete_batch(&self, account: &str, items: &[(String, String)]) -> Result<(), String> {
+        let writer = isyncyou_engine::task_writer(&self.cfg, account)?;
+        isyncyou_engine::TaskWriter::delete_batch(&writer, items)
+    }
     fn checklist_add(
         &self,
         account: &str,
@@ -12096,6 +12100,200 @@ struct DaemonMutationIntents {
     onedrive: DaemonOneDriveWrite,
     mail: DaemonMailWrite,
     onenote: DaemonOneNoteWrite,
+    todo: DaemonTaskWrite,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TodoDeleteBatchItem {
+    list: String,
+    id: String,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TodoDeleteBatchPayload {
+    items: Vec<TodoDeleteBatchItem>,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn execute_todo_delete_batch(
+    handler: &dyn isyncyou_webui::TaskWriteHandler,
+    account: &str,
+    expected: usize,
+    bytes: &[u8],
+) -> Result<serde_json::Value, String> {
+    let payload: TodoDeleteBatchPayload =
+        serde_json::from_slice(bytes).map_err(|_| "mutation_intent_invalid".to_string())?;
+    if payload.items.len() != expected || expected == 0 || expected > 1_000 {
+        return Err("mutation_intent_invalid".into());
+    }
+    let mut unique = std::collections::HashSet::with_capacity(expected);
+    for item in &payload.items {
+        if item.list.is_empty()
+            || item.list.len() > 512
+            || item.id.is_empty()
+            || item.id.len() > 512
+            || !unique.insert((item.list.as_str(), item.id.as_str()))
+        {
+            return Err("mutation_intent_invalid".into());
+        }
+    }
+    let items = payload
+        .items
+        .into_iter()
+        .map(|item| (item.list, item.id))
+        .collect::<Vec<_>>();
+    handler.delete_batch(account, &items)?;
+    Ok(serde_json::json!({ "ok": true, "deleted": expected }))
+}
+
+#[cfg(all(
+    test,
+    any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    )
+))]
+mod todo_delete_batch_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingTaskWrite {
+        items: std::sync::Mutex<Vec<(String, String, String)>>,
+        batch_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl isyncyou_webui::TaskWriteHandler for RecordingTaskWrite {
+        fn create(
+            &self,
+            _account: &str,
+            _list_id: &str,
+            _task: &serde_json::Value,
+        ) -> Result<String, String> {
+            unreachable!()
+        }
+
+        fn update(
+            &self,
+            _account: &str,
+            _list_id: &str,
+            _task_id: &str,
+            _task: &serde_json::Value,
+        ) -> Result<(), String> {
+            unreachable!()
+        }
+
+        fn complete(&self, _account: &str, _list_id: &str, _task_id: &str) -> Result<(), String> {
+            unreachable!()
+        }
+
+        fn delete(&self, account: &str, list_id: &str, task_id: &str) -> Result<(), String> {
+            self.items.lock().unwrap().push((
+                account.to_string(),
+                list_id.to_string(),
+                task_id.to_string(),
+            ));
+            Ok(())
+        }
+
+        fn delete_batch(&self, account: &str, items: &[(String, String)]) -> Result<(), String> {
+            self.batch_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.items.lock().unwrap().extend(
+                items
+                    .iter()
+                    .map(|(list, task)| (account.to_string(), list.clone(), task.clone())),
+            );
+            Ok(())
+        }
+
+        fn checklist_add(
+            &self,
+            _account: &str,
+            _list_id: &str,
+            _task_id: &str,
+            _title: &str,
+        ) -> Result<String, String> {
+            unreachable!()
+        }
+
+        fn checklist_toggle(
+            &self,
+            _account: &str,
+            _list_id: &str,
+            _task_id: &str,
+            _item_id: &str,
+            _checked: bool,
+        ) -> Result<(), String> {
+            unreachable!()
+        }
+
+        fn checklist_delete(
+            &self,
+            _account: &str,
+            _list_id: &str,
+            _task_id: &str,
+            _item_id: &str,
+        ) -> Result<(), String> {
+            unreachable!()
+        }
+
+        fn list_create(&self, _account: &str, _name: &str) -> Result<String, String> {
+            unreachable!()
+        }
+
+        fn list_delete(&self, _account: &str, _list_id: &str) -> Result<(), String> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn todo_delete_batch_validates_all_items_before_executing_once() {
+        let handler = RecordingTaskWrite::default();
+        let payload =
+            br#"{"items":[{"list":"list-a","id":"task-1"},{"list":"list-a","id":"task-2"}]}"#;
+        assert_eq!(
+            execute_todo_delete_batch(&handler, "controlled", 2, payload).unwrap(),
+            serde_json::json!({ "ok": true, "deleted": 2 })
+        );
+        assert_eq!(handler.items.lock().unwrap().len(), 2);
+        assert_eq!(
+            handler
+                .batch_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        let duplicate =
+            br#"{"items":[{"list":"list-a","id":"task-1"},{"list":"list-a","id":"task-1"}]}"#;
+        assert_eq!(
+            execute_todo_delete_batch(&handler, "controlled", 2, duplicate),
+            Err("mutation_intent_invalid".into())
+        );
+        assert_eq!(
+            execute_todo_delete_batch(&handler, "controlled", 3, payload),
+            Err("mutation_intent_invalid".into())
+        );
+        assert_eq!(handler.items.lock().unwrap().len(), 2);
+        assert_eq!(
+            handler
+                .batch_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
 }
 
 #[cfg(any(
@@ -12235,6 +12433,19 @@ impl isyncyou_webui::MutationIntentHandler for DaemonMutationIntents {
                         .map(|()| serde_json::json!({ "ok": true })),
                     _ => Err("mutation_intent_invalid".into()),
                 }
+            }
+            isyncyou_webui::MutationPurpose::TodoDeleteBatch {
+                account,
+                item_count,
+            } => {
+                let bytes = source.read_range(
+                    0,
+                    usize::try_from(source.len())
+                        .map_err(|_| "mutation_intent_invalid".to_string())?,
+                )?;
+                let expected = usize::try_from(item_count)
+                    .map_err(|_| "mutation_intent_invalid".to_string())?;
+                execute_todo_delete_batch(&self.todo, &account, expected, &bytes)
             }
         }
         .map_err(|_| "mutation_intent_outcome_unknown".to_string())?;
@@ -12990,7 +13201,8 @@ fn with_mutation_intents_if_available(
                 store,
                 onedrive: DaemonOneDriveWrite::new(cfg.clone()),
                 mail: DaemonMailWrite { cfg: cfg.clone() },
-                onenote: DaemonOneNoteWrite { cfg },
+                onenote: DaemonOneNoteWrite { cfg: cfg.clone() },
+                todo: DaemonTaskWrite { cfg },
             }),
             mint_cap_token(),
         ),

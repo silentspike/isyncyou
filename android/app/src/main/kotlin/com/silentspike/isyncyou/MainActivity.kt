@@ -1,6 +1,7 @@
 package com.silentspike.isyncyou
 
 import android.Manifest
+import android.app.Activity
 import android.app.KeyguardManager
 import android.content.Intent
 import android.content.IntentFilter
@@ -49,6 +50,7 @@ class MainActivity : FragmentActivity() {
     private companion object {
         const val TAG = "iSyncYou"
         const val BIO_TIMEOUT_MS = 120_000L
+        const val DEVICE_CREDENTIAL_REQUEST_CODE = 640
 
         /** The stable app origin the WebView loads from (#0A) — WebView's reserved
          *  virtual host. GET assets/subresources are served in-process via
@@ -89,8 +91,9 @@ class MainActivity : FragmentActivity() {
 
     private data class PendingBio(
         val requestId: String,
-        val prompt: BiometricPrompt,
+        val prompt: BiometricPrompt?,
         val timeout: Runnable,
+        val reply: JavaScriptReplyProxy,
     )
 
     private data class PendingPromptDescriptor(
@@ -100,6 +103,9 @@ class MainActivity : FragmentActivity() {
 
     /** One active native prompt per opaque PendingAction handle. */
     private val bioPending = BiometricPendingRegistry<PendingBio>()
+
+    /** The system lock-screen confirmation supports only one foreground request. */
+    private var activeDeviceCredential: Pair<String, String>? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -755,10 +761,14 @@ class MainActivity : FragmentActivity() {
             reply.postMessage(bioReplyJson(reqId, false, "not_available"))
             return
         }
+        if (decision.mode == BiometricMode.DeviceCredential) {
+            runDeviceCredential(reqId, pat, descriptor.label, reply)
+            return
+        }
         lateinit var prompt: BiometricPrompt
         val timeout = Runnable {
             takePendingBiometric(pat, reqId)?.let { pending ->
-                pending.prompt.cancelAuthentication()
+                pending.prompt?.cancelAuthentication()
                 reply.postMessage(bioReplyJson(reqId, false, "timeout"))
             }
         }
@@ -796,7 +806,7 @@ class MainActivity : FragmentActivity() {
                 override fun onAuthenticationFailed() {}
             },
         )
-        val pending = PendingBio(reqId, prompt, timeout)
+        val pending = PendingBio(reqId, prompt, timeout, reply)
         if (!bioPending.register(pat, pending)) {
             reply.postMessage(bioReplyJson(reqId, false, "busy"))
             return
@@ -818,6 +828,71 @@ class MainActivity : FragmentActivity() {
             android.util.Log.w(TAG, "biometric prompt failed to start", e)
             completeBiometric(pat, reqId, reply, false, "start_failed")
         }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun runDeviceCredential(
+        reqId: String,
+        pat: String,
+        label: String,
+        reply: JavaScriptReplyProxy,
+    ) {
+        if (activeDeviceCredential != null) {
+            reply.postMessage(bioReplyJson(reqId, false, "busy"))
+            return
+        }
+        val intent = getSystemService(KeyguardManager::class.java)
+            ?.createConfirmDeviceCredentialIntent("Confirm action", label)
+        if (intent == null) {
+            reply.postMessage(bioReplyJson(reqId, false, "not_available"))
+            return
+        }
+        val key = pat to reqId
+        val timeout = Runnable {
+            if (activeDeviceCredential != key) return@Runnable
+            activeDeviceCredential = null
+            runCatching { finishActivity(DEVICE_CREDENTIAL_REQUEST_CODE) }
+            completeBiometric(pat, reqId, reply, false, "timeout")
+        }
+        val pending = PendingBio(reqId, null, timeout, reply)
+        if (!bioPending.register(pat, pending)) {
+            reply.postMessage(bioReplyJson(reqId, false, "busy"))
+            return
+        }
+        activeDeviceCredential = key
+        mainHandler.postDelayed(timeout, BIO_TIMEOUT_MS)
+        try {
+            startActivityForResult(intent, DEVICE_CREDENTIAL_REQUEST_CODE)
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "device credential prompt failed to start", e)
+            activeDeviceCredential = null
+            completeBiometric(pat, reqId, reply, false, "start_failed")
+        }
+    }
+
+    @Deprecated("Android activity-result callback required by the system credential intent")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != DEVICE_CREDENTIAL_REQUEST_CODE) return
+        val (pat, reqId) = activeDeviceCredential ?: return
+        activeDeviceCredential = null
+        val pending = takePendingBiometric(pat, reqId) ?: return
+        mainHandler.removeCallbacks(pending.timeout)
+        val armed = if (resultCode == Activity.RESULT_OK) {
+            runCatching { NativeEngine.nativeConfirmAction(pat) }.getOrElse {
+                android.util.Log.w(TAG, "device credential arming failed", it)
+                false
+            }
+        } else {
+            false
+        }
+        pending.reply.postMessage(
+            bioReplyJson(
+                reqId,
+                armed,
+                if (armed) "confirmed" else if (resultCode == Activity.RESULT_OK) "arming_failed" else "cancelled",
+            ),
+        )
     }
 
     private fun completeBiometric(
@@ -845,9 +920,11 @@ class MainActivity : FragmentActivity() {
             .toString()
 
     private fun cancelPendingBiometrics() {
+        activeDeviceCredential = null
+        runCatching { finishActivity(DEVICE_CREDENTIAL_REQUEST_CODE) }
         bioPending.drain().forEach {
             mainHandler.removeCallbacks(it.timeout)
-            it.prompt.cancelAuthentication()
+            it.prompt?.cancelAuthentication()
         }
     }
 

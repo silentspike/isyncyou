@@ -309,6 +309,9 @@ pub struct GraphClient {
 /// The `Prefer` header value for the Outlook immutable-ID policy (plan §6).
 const PREFER_IMMUTABLE_ID: &str = r#"IdType="ImmutableId", outlook.timezone="UTC""#;
 
+const GRAPH_BATCH_REQUEST_LIMIT: usize = 20;
+const TODO_DELETE_BATCH_PARALLELISM: usize = 4;
+
 /// The default HTTP client for Graph calls (#0.4): a request timeout so a hung
 /// connection can never wedge a sync/read pass, plus a connect timeout. Falls back to
 /// a plain client if the builder ever fails (it doesn't in practice).
@@ -2113,6 +2116,101 @@ impl GraphClient {
         ))
     }
 
+    /// Delete tasks through bounded Microsoft Graph JSON batches.
+    ///
+    /// Graph accepts at most 20 subrequests in one batch. Large user-confirmed
+    /// selections are sent in bounded parallel waves so the mobile bridge does
+    /// not serialize hundreds of HTTP round trips. DELETE and 404 are both
+    /// successful outcomes, making a whole-batch retry idempotent.
+    pub fn delete_tasks_batch(&self, items: &[(String, String)]) -> Result<(), UploadError> {
+        for wave in items.chunks(GRAPH_BATCH_REQUEST_LIMIT * TODO_DELETE_BATCH_PARALLELISM) {
+            std::thread::scope(|scope| {
+                let handles = wave
+                    .chunks(GRAPH_BATCH_REQUEST_LIMIT)
+                    .map(|chunk| {
+                        let client = self.clone();
+                        scope.spawn(move || client.delete_tasks_batch_chunk(chunk))
+                    })
+                    .collect::<Vec<_>>();
+                for handle in handles {
+                    handle.join().map_err(|_| UploadError::Transport {
+                        failure: GraphTransportFailure::Other,
+                        detail: "batch worker failed".into(),
+                    })??;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn delete_tasks_batch_chunk(&self, items: &[(String, String)]) -> Result<(), UploadError> {
+        if items.is_empty() || items.len() > GRAPH_BATCH_REQUEST_LIMIT {
+            return Err(UploadError::Parse("invalid Graph batch size".into()));
+        }
+        let requests = items
+            .iter()
+            .enumerate()
+            .map(|(index, (list_id, task_id))| {
+                serde_json::json!({
+                    "id": index.to_string(),
+                    "method": "DELETE",
+                    "url": format!(
+                        "/me/todo/lists/{}/tasks/{}",
+                        encode_id(list_id),
+                        encode_id(task_id)
+                    ),
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = self
+            .client
+            .post(format!("{}/$batch", self.base))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "requests": requests }))
+            .send()
+            .map_err(UploadError::from_reqwest)?;
+        let value = json_or_err(response)?;
+        let responses = value
+            .get("responses")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| UploadError::Parse("Graph batch response missing responses".into()))?;
+        if responses.len() != items.len() {
+            return Err(UploadError::Parse(
+                "Graph batch response count mismatch".into(),
+            ));
+        }
+        let mut seen = vec![false; items.len()];
+        for response in responses {
+            let index = response
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|index| *index < items.len())
+                .ok_or_else(|| UploadError::Parse("invalid Graph batch response id".into()))?;
+            if std::mem::replace(&mut seen[index], true) {
+                return Err(UploadError::Parse(
+                    "duplicate Graph batch response id".into(),
+                ));
+            }
+            let status = response
+                .get("status")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|status| u16::try_from(status).ok())
+                .ok_or_else(|| UploadError::Parse("invalid Graph batch response status".into()))?;
+            if !(200..300).contains(&status) && status != 404 {
+                return Err(UploadError::Http {
+                    status,
+                    body: String::new(),
+                });
+            }
+        }
+        if seen.iter().any(|value| !value) {
+            return Err(UploadError::Parse("incomplete Graph batch response".into()));
+        }
+        Ok(())
+    }
+
     /// Add a checklist item to a task (`POST .../tasks/{id}/checklistItems`).
     pub fn create_checklist_item(
         &self,
@@ -3871,6 +3969,42 @@ mod tests {
         assert!(seen[5].starts_with("DELETE /me/todo/lists/L1/tasks/t1"));
         assert!(seen[6].starts_with("POST /me/todo/lists"));
         assert!(seen[7].starts_with("DELETE /me/todo/lists/L9"));
+    }
+
+    #[test]
+    fn todo_delete_batch_uses_graph_batch_and_accepts_not_found() {
+        let (base, server) = serve(vec![http_response(
+            200,
+            "OK",
+            "",
+            r#"{"responses":[{"id":"1","status":404},{"id":"0","status":204}]}"#,
+        )]);
+        GraphClient::new("tok")
+            .with_base_url(&base)
+            .delete_tasks_batch(&[
+                ("list+/=".into(), "task-1".into()),
+                ("list-2".into(), "task+/=".into()),
+            ])
+            .unwrap();
+        let seen = server.join().unwrap();
+        assert!(seen[0].starts_with("POST /$batch"));
+        assert!(seen[0].contains("/me/todo/lists/list%2B%2F%3D/tasks/task-1"));
+        assert!(seen[0].contains("/me/todo/lists/list-2/tasks/task%2B%2F%3D"));
+    }
+
+    #[test]
+    fn todo_delete_batch_rejects_failed_subrequest() {
+        let (base, _server) = serve(vec![http_response(
+            200,
+            "OK",
+            "",
+            r#"{"responses":[{"id":"0","status":403}]}"#,
+        )]);
+        let error = GraphClient::new("tok")
+            .with_base_url(&base)
+            .delete_tasks_batch(&[("list".into(), "task".into())])
+            .unwrap_err();
+        assert!(matches!(error, UploadError::Http { status: 403, .. }));
     }
 
     #[test]
