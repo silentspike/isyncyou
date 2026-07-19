@@ -39,6 +39,7 @@ MAX_JSON_BYTES = 1024 * 1024
 MAX_SSE_BYTES = 1024 * 1024
 MAX_SSE_LINE_BYTES = 256 * 1024
 MAX_SSE_EVENTS = 4096
+MAX_CDP_TARGET_BYTES = 64 * 1024
 CONTROL_REQUEST_TIMEOUT_SECONDS = 10.0
 HOOK_MARKERS = (
     b"ISY_MOBILE_JOB_DEVICE_HOOK_V1",
@@ -267,6 +268,25 @@ def validate_commit(value: str, label: str) -> str:
     return value
 
 
+def validate_git_object(value: str, expected_type: str, label: str) -> str:
+    validated = validate_commit(value, label)
+    try:
+        result = subprocess.run(
+            ["git", "cat-file", "-t", validated],
+            cwd=Path(__file__).resolve().parents[1],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise ProbeError(f"unknown_{label}") from error
+    if result.stdout.strip() != expected_type:
+        raise ProbeError(f"invalid_{label}_type")
+    return validated
+
+
 def loopback_endpoint(value: str) -> tuple[str, int, str]:
     parsed = urlparse(value if "://" in value else f"http://{value}")
     if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
@@ -284,6 +304,41 @@ def require_free_port(host: str, port: int) -> None:
             listener.bind((host, port))
         except OSError as error:
             raise ProbeError("listener_already_occupied") from error
+
+
+def inspect_android_bridge(target: str | None) -> dict[str, object]:
+    if target is None:
+        return {"state": "not_run", "code": "android_bridge_target_not_supplied"}
+    _, _, base = loopback_endpoint(target)
+    request = urllib.request.Request(f"{base}/json", headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=CONTROL_REQUEST_TIMEOUT_SECONDS) as response:
+            if response.status != 200 or response.headers.get_content_type() != "application/json":
+                raise ProbeError("android_bridge_target_unavailable")
+            raw = response.read(MAX_CDP_TARGET_BYTES + 1)
+    except urllib.error.HTTPError as error:
+        error.close()
+        raise ProbeError("android_bridge_target_unavailable") from error
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        raise ProbeError("android_bridge_target_unavailable") from error
+    if len(raw) > MAX_CDP_TARGET_BYTES:
+        raise ProbeError("android_bridge_target_too_large")
+    try:
+        targets = json.loads(raw, object_pairs_hook=strict_object)
+    except (json.JSONDecodeError, UnicodeDecodeError, ProbeError) as error:
+        raise ProbeError("android_bridge_target_invalid") from error
+    if not isinstance(targets, list) or len(targets) > 32:
+        raise ProbeError("android_bridge_target_invalid")
+    page_ready = any(
+        isinstance(item, dict)
+        and item.get("type") == "page"
+        and isinstance(item.get("webSocketDebuggerUrl"), str)
+        and str(item["webSocketDebuggerUrl"]).startswith(("ws://127.0.0.1:", "ws://localhost:"))
+        for item in targets
+    )
+    if not page_ready:
+        raise ProbeError("android_bridge_page_unavailable")
+    return {"state": "pass", "code": "verified", "page_target_ready": True}
 
 
 def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -732,6 +787,29 @@ def load_turn_records(
     return intent, assistant, terminal, sources
 
 
+def read_request_status(
+    client: RuntimeClient, status_query: str
+) -> tuple[str, str, bool]:
+    try:
+        document = client.json(
+            "GET", f"/api/v1/agent/request/status?{status_query}", cap=True
+        )
+    except ProbeError:
+        return "unavailable", "request_status_unavailable", False
+    state = document.get("state")
+    code = document.get("code")
+    terminal = document.get("terminal")
+    if (
+        not isinstance(state, str)
+        or not SAFE_CODE_RE.fullmatch(state)
+        or not isinstance(code, str)
+        or not SAFE_CODE_RE.fullmatch(code)
+        or type(terminal) is not bool
+    ):
+        raise ProbeError("retrieval_request_status_invalid")
+    return state, code, terminal
+
+
 def source_is_listed(client: RuntimeClient, account: str, service: str, item_id: str) -> bool:
     for offset in range(0, 10_000, 1_000):
         query = urllib.parse.urlencode(
@@ -821,18 +899,7 @@ def run_retrieval_turn(
     except ProbeError as error:
         if error.code != "turn_stream_timed_out":
             raise
-        try:
-            request_status = client.json(
-                "GET", f"/api/v1/agent/request/status?{status_query}", cap=True
-            )
-        except ProbeError as status_error:
-            raise ProbeError("retrieval_request_status_failed") from status_error
-        status_state = request_status.get("state")
-        status_code = request_status.get("code")
-        if not isinstance(status_state, str) or not SAFE_CODE_RE.fullmatch(status_state):
-            raise ProbeError("retrieval_request_status_invalid")
-        if not isinstance(status_code, str) or not SAFE_CODE_RE.fullmatch(status_code):
-            raise ProbeError("retrieval_request_status_invalid")
+        status_state, status_code, status_terminal = read_request_status(client, status_query)
         return {
             "state": "fail",
             "provider": provider,
@@ -847,11 +914,13 @@ def run_retrieval_turn(
             "untrusted_tool_result_observed": False,
             "request_status_state": status_state,
             "request_status_code": status_code,
+            "request_status_terminal": status_terminal,
             "transcript_rehydrated": False,
             "source_count": 0,
             "all_sources_listed_and_viewable": False,
         }
     if stream["terminal_reason"] != "complete":
+        status_state, status_code, status_terminal = read_request_status(client, status_query)
         return {
             "state": "fail",
             "provider": provider,
@@ -866,7 +935,9 @@ def run_retrieval_turn(
             "terminal_reason": stream["terminal_reason"],
             "error_code": stream["error_code"],
             "untrusted_tool_result_observed": stream["untrusted_tool_result_observed"],
-            "request_status_state": "not_checked_after_terminal_failure",
+            "request_status_state": status_state,
+            "request_status_code": status_code,
+            "request_status_terminal": status_terminal,
             "transcript_rehydrated": False,
             "source_count": 0,
             "all_sources_listed_and_viewable": False,
@@ -877,12 +948,7 @@ def run_retrieval_turn(
         )
     except ProbeError as error:
         raise ProbeError("retrieval_history_failed") from error
-    try:
-        request_status = client.json(
-            "GET", f"/api/v1/agent/request/status?{status_query}", cap=True
-        )
-    except ProbeError as error:
-        raise ProbeError("retrieval_request_status_failed") from error
+    status_state, status_code, status_terminal = read_request_status(client, status_query)
     source_results = []
     for source in sources[:64]:
         service = source.get("service")
@@ -910,8 +976,8 @@ def run_retrieval_turn(
     return {
         "state": "pass"
         if stream["terminal_reason"] == "complete"
-        and request_status.get("state") == "committed"
-        and request_status.get("terminal") is True
+        and status_state == "committed"
+        and status_terminal is True
         and retry_same_turn
         and transcript_rehydrated
         and sources_resolved
@@ -927,7 +993,9 @@ def run_retrieval_turn(
         "first_output_latency": stream["first_output_latency"],
         "terminal_reason": stream["terminal_reason"],
         "untrusted_tool_result_observed": stream["untrusted_tool_result_observed"],
-        "request_status_state": request_status.get("state"),
+        "request_status_state": status_state,
+        "request_status_code": status_code,
+        "request_status_terminal": status_terminal,
         "transcript_rehydrated": transcript_rehydrated,
         "source_count": len(sources),
         "all_sources_listed_and_viewable": sources_resolved,
@@ -972,12 +1040,14 @@ def bind_retrieval_facts(
 
 
 def run(args: argparse.Namespace) -> tuple[dict[str, object], int]:
-    implementation = validate_commit(args.implementation_commit, "implementation_commit")
+    implementation = validate_git_object(
+        args.implementation_commit, "commit", "implementation_commit"
+    )
     candidate_tree = None
     rc_commit = None
     if args.mode == "final":
-        candidate_tree = validate_commit(args.candidate_tree, "candidate_tree")
-        rc_commit = validate_commit(args.rc_commit, "rc_commit")
+        candidate_tree = validate_git_object(args.candidate_tree, "tree", "candidate_tree")
+        rc_commit = validate_git_object(args.rc_commit, "commit", "rc_commit")
     host, port, base = loopback_endpoint(args.endpoint or args.bind)
     runtime, remove_runtime = private_runtime_root(Path(args.runtime_root) if args.runtime_root else None)
     daemon: ManagedDaemon | None = None
@@ -1024,6 +1094,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, object], int]:
             Path(default_apk) if default_apk else None,
             Path(published_apk) if published_apk else None,
         )
+        android_bridge = inspect_android_bridge(getattr(args, "android_bridge_target", None))
         required_pass = (
             shell_ready
             and agent_status_ready
@@ -1034,6 +1105,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 not any((hook_apk, default_apk, published_apk))
                 or apk_matrix["state"] == "pass"
             )
+            and android_bridge["state"] in {"not_run", "pass"}
             and all(item["state"] == "pass" for item in rows.values())
         )
         report: dict[str, object] = {
@@ -1050,6 +1122,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, object], int]:
             "codex_callback_port_free_before_oauth": callback_port_ready,
             "observation_document_sha256": observation_digest,
             "retrieval_turn": retrieval,
+            "android_bridge": android_bridge,
             "apk_matrix": apk_matrix,
             "rows": rows,
             "required_rows_pass": required_pass,
@@ -1088,6 +1161,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--bind", default="127.0.0.1:8871")
     parser.add_argument("--runtime-root")
     parser.add_argument("--observations")
+    parser.add_argument(
+        "--android-bridge-target",
+        help="loopback WebView CDP target forwarded through ADB, for example 127.0.0.1:9222",
+    )
     parser.add_argument(
         "--retrieval-prompt-file",
         help="owner-only UTF-8 prompt template containing the literal {fixture}",

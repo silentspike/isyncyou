@@ -58,6 +58,31 @@ class WeakCookieHandler(Handler):
         super().do_GET()
 
 
+class AndroidBridgeHandler(BaseHTTPRequestHandler):
+    target_document = [
+        {
+            "type": "page",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/opaque",
+            "url": "https://appassets.androidplatform.net/",
+        }
+    ]
+
+    def do_GET(self):
+        if self.path != "/json":
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = json.dumps(type(self).target_document).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args):
+        pass
+
+
 class RetrievalHandler(BaseHTTPRequestHandler):
     request_id = None
     turn_posts = 0
@@ -209,12 +234,80 @@ class CloseoutProbeTest(unittest.TestCase):
             MODULE.loopback_endpoint("https://example.com:443")
         with self.assertRaisesRegex(MODULE.ProbeError, "invalid_implementation_commit"):
             MODULE.validate_commit("short", "implementation_commit")
+        with self.assertRaisesRegex(MODULE.ProbeError, "unknown_implementation_commit"):
+            MODULE.validate_git_object("0" * 40, "commit", "implementation_commit")
 
     def test_occupied_listener_fails_closed(self):
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
             with self.assertRaisesRegex(MODULE.ProbeError, "listener_already_occupied"):
                 MODULE.require_free_port("127.0.0.1", listener.getsockname()[1])
+
+    def test_android_bridge_target_is_loopback_bounded_and_redacted(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), AndroidBridgeHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            result = MODULE.inspect_android_bridge(f"127.0.0.1:{server.server_port}")
+            self.assertEqual(
+                result,
+                {"state": "pass", "code": "verified", "page_target_ready": True},
+            )
+            self.assertNotIn("appassets", json.dumps(result))
+            self.assertNotIn("devtools", json.dumps(result))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        with self.assertRaisesRegex(MODULE.ProbeError, "endpoint_not_loopback"):
+            MODULE.inspect_android_bridge("example.com:9222")
+
+    def test_android_bridge_rejects_missing_page_and_oversize_response(self):
+        class MissingPageHandler(AndroidBridgeHandler):
+            target_document = [{"type": "worker"}]
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), MissingPageHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with self.assertRaisesRegex(MODULE.ProbeError, "android_bridge_page_unavailable"):
+                MODULE.inspect_android_bridge(f"127.0.0.1:{server.server_port}")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_request_status_readback_is_closed_and_validated(self):
+        client = mock.Mock()
+        client.json.return_value = {"state": "committed", "code": "ok", "terminal": True}
+        self.assertEqual(
+            MODULE.read_request_status(client, "opaque=query"),
+            ("committed", "ok", True),
+        )
+        client.json.side_effect = MODULE.ProbeError("request_status_failed")
+        self.assertEqual(
+            MODULE.read_request_status(client, "opaque=query"),
+            ("unavailable", "request_status_unavailable", False),
+        )
+        client.json.side_effect = None
+        client.json.return_value = {"state": "PRIVATE STATE", "code": "ok", "terminal": True}
+        with self.assertRaisesRegex(MODULE.ProbeError, "retrieval_request_status_invalid"):
+            MODULE.read_request_status(client, "opaque=query")
+
+        class OversizeHandler(AndroidBridgeHandler):
+            target_document = [{"type": "page", "padding": "x" * 70000}]
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), OversizeHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with self.assertRaisesRegex(MODULE.ProbeError, "android_bridge_target_too_large"):
+                MODULE.inspect_android_bridge(f"127.0.0.1:{server.server_port}")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
     def test_external_endpoint_report_is_redacted_and_requires_all_rows(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -257,7 +350,10 @@ class CloseoutProbeTest(unittest.TestCase):
                     startup_timeout=2.0,
                     out=str(root / "out.json"),
                 )
-                report, status = MODULE.run(args)
+                with mock.patch.object(
+                    MODULE, "validate_git_object", side_effect=lambda value, *_args: value
+                ):
+                    report, status = MODULE.run(args)
                 self.assertEqual(status, 0)
                 self.assertTrue(report["required_rows_pass"])
                 self.assertTrue(report["agent_status_ready"])
@@ -367,7 +463,10 @@ class CloseoutProbeTest(unittest.TestCase):
                     startup_timeout=2.0,
                     out=str(root / "out.json"),
                 )
-                report, status = MODULE.run(args)
+                with mock.patch.object(
+                    MODULE, "validate_git_object", side_effect=lambda value, *_args: value
+                ):
+                    report, status = MODULE.run(args)
                 self.assertEqual(status, 2)
                 self.assertFalse(report["strict_session_cookie_observed"])
                 self.assertFalse(report["required_rows_pass"])
