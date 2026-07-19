@@ -14600,10 +14600,20 @@ mod tests {
                 return Some(token);
             }
         }
-        std::env::var("ISY624_M365_WRITE_TOKEN")
+        if let Some(token) = std::env::var("ISY624_M365_WRITE_TOKEN")
             .ok()
             .map(|token| token.trim().to_string())
             .filter(|token| !token.is_empty())
+        {
+            return Some(token);
+        }
+        let config_path = std::env::var("ISY628_CONTROLLED_CONFIG").ok()?;
+        let config = Config::load(config_path).ok()?;
+        let account = config.accounts.first()?;
+        if config.accounts.len() != 1 {
+            return None;
+        }
+        isyncyou_engine::auth::resolve_cached_restore_token(&config, &account.id).ok()
     }
 
     fn issue_624_live_config(root: &std::path::Path, access_token: &str) -> Config {
@@ -14704,6 +14714,20 @@ mod tests {
         fn set(&mut self, draft_id: String) {
             self.draft_id = Some(draft_id);
         }
+
+        fn cleanup(&mut self) {
+            let Some(id) = self.draft_id.as_deref() else {
+                return;
+            };
+            let graph = isyncyou_graph::GraphClient::new(self.token.clone());
+            graph.delete_message(id).expect("delete controlled message");
+            let path = format!("/me/messages/{}", issue_624_url_segment(id));
+            assert!(matches!(
+                graph.get_json(&path),
+                Err(isyncyou_graph::UploadError::Http { status: 404, .. })
+            ));
+            self.draft_id = None;
+        }
     }
 
     impl Drop for Issue624DraftCleanup {
@@ -14716,10 +14740,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a live Microsoft 365 write token via ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN"]
+    #[ignore = "requires a live Microsoft 365 writer credential through an explicit test environment"]
     fn live_issue_624_agent_confirm_create_draft_and_cleanup() {
         let access_token = issue_624_live_write_token()
-            .expect("set ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN");
+            .expect("configure an explicit Microsoft 365 writer test environment");
         let root = temp_agent_root("live-issue-624-confirm-draft");
         let cfg = issue_624_live_config(&root, &access_token);
         let gate = Arc::new(Mutex::new(()));
@@ -14815,6 +14839,7 @@ mod tests {
             .map(String::from)
             .expect("confirmed create_draft returns a draft id");
         cleanup.set(draft_id);
+        cleanup.cleanup();
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -14832,6 +14857,32 @@ mod tests {
         fn add_permission(&mut self, permission_id: String) {
             self.permission_ids.push(permission_id);
         }
+
+        fn cleanup(&mut self) {
+            let graph = isyncyou_graph::GraphClient::new(self.token.clone());
+            if let Some(item_id) = self.item_id.as_deref() {
+                for permission_id in &self.permission_ids {
+                    graph
+                        .delete_permission(item_id, permission_id)
+                        .expect("delete controlled permission");
+                }
+                let permissions = graph
+                    .list_permissions_detailed(item_id)
+                    .expect("read permissions after controlled revoke");
+                assert!(self
+                    .permission_ids
+                    .iter()
+                    .all(|id| permissions.iter().all(|permission| permission.id != *id)));
+                graph.delete_item(item_id).expect("delete controlled item");
+                let path = format!("/me/drive/items/{}", issue_624_url_segment(item_id));
+                assert!(matches!(
+                    graph.get_json(&path),
+                    Err(isyncyou_graph::UploadError::Http { status: 404, .. })
+                ));
+            }
+            self.permission_ids.clear();
+            self.item_id = None;
+        }
     }
 
     impl Drop for Issue624DriveCleanup {
@@ -14847,10 +14898,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a live Microsoft 365 write token with Files.ReadWrite via ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN"]
+    #[ignore = "requires a live Microsoft 365 writer credential through an explicit test environment"]
     fn live_issue_624_agent_confirm_share_link_and_cleanup() {
         let access_token = issue_624_live_write_token()
-            .expect("set ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN");
+            .expect("configure an explicit Microsoft 365 writer test environment");
         let root = temp_agent_root("live-issue-624-confirm-share");
         let cfg = issue_624_live_config(&root, &access_token);
         let graph = isyncyou_graph::GraphClient::new(access_token.clone());
@@ -14955,14 +15006,15 @@ mod tests {
             })
             .expect("confirmed share creates a direct anonymous view link");
         cleanup.add_permission(created.id.clone());
+        cleanup.cleanup();
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    #[ignore = "requires a live Microsoft 365 token with Mail.Read via ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN"]
+    #[ignore = "requires a live Microsoft 365 writer credential through an explicit test environment"]
     fn live_issue_624_agent_confirm_backup_mail_records_run() {
         let access_token = issue_624_live_write_token()
-            .expect("set ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN");
+            .expect("configure an explicit Microsoft 365 writer test environment");
         let root = temp_agent_root("live-issue-624-confirm-backup");
         let cfg = issue_624_live_config(&root, &access_token);
         let gate = Arc::new(Mutex::new(()));
@@ -15019,10 +15071,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a live Microsoft 365 token with Mail.ReadWrite via ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN"]
+    #[ignore = "requires a live Microsoft 365 writer credential through an explicit test environment"]
     fn live_issue_624_agent_confirm_restore_cloud_mail_and_cleanup() {
         let access_token = issue_624_live_write_token()
-            .expect("set ISY624_M365_WRITE_TOKEN_FILE or ISY624_M365_WRITE_TOKEN");
+            .expect("configure an explicit Microsoft 365 writer test environment");
         let root = temp_agent_root("live-issue-624-confirm-restore-cloud");
         let mut cfg = issue_624_live_config(&root, &access_token);
         cfg.restore.cloud_restore_enabled = true;
@@ -15128,6 +15180,7 @@ mod tests {
             .expect("restore-cloud records a ledger operation");
         assert_eq!(op.state, isyncyou_store::RestoreState::Committed);
         assert_eq!(op.new_cloud_id.as_deref(), Some(new_id.as_str()));
+        cleanup.cleanup();
         let _ = std::fs::remove_dir_all(root);
     }
 
