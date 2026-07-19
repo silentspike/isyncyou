@@ -6027,19 +6027,21 @@ function normalizeAgentSource(value) {
   const raw = value.source && typeof value.source === "object" ? value.source : value;
   const service = String(raw.service || value.service || "").trim();
   if (!service || !archiveServices().some(s => s.id === service)) return null;
-  const id = String(raw.id || raw.remote_id || value.id || value.remote_id || "").trim();
+  const id = String(raw.id || raw.item_id || raw.remote_id
+    || value.id || value.item_id || value.remote_id || "").trim();
   const path = raw.path || value.path || "";
   if (!id && !path) return null;
   return {
     service,
     id,
     path: path ? String(path) : "",
-    name: String(raw.name || value.name || value.displayName || id || service),
+    name: String(raw.name || raw.label || value.name || value.label
+      || value.displayName || id || service),
     item_type: String(raw.item_type || value.item_type || value.type || service),
   };
 }
 function sourceViewQuery(source) {
-  if (!source || !App.account || !source.service || !source.id || !source.path) return null;
+  if (!source || !App.account || !source.service || !source.id) return null;
   return { account: App.account, service: source.service, id: source.id };
 }
 function sourceViewHref(source) {
@@ -6052,7 +6054,8 @@ function agentSourceKey(source) {
 function dedupeAgentSources(sources) {
   const seen = new Set();
   const out = [];
-  (sources || []).forEach((s) => {
+  (sources || []).forEach((value) => {
+    const s = normalizeAgentSource(value);
     if (!s) return;
     const key = agentSourceKey(s);
     if (seen.has(key)) return;

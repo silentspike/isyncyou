@@ -480,11 +480,8 @@ function makeFixtureServer(evidence) {
             text: "Persisted fixture answer",
             sources: [{
               service: "mail",
-              id: "mail-1",
               item_id: "mail-1",
-              path: "/Inbox/quarterly-brief.eml",
-              name: "Quarterly brief",
-              item_type: "message",
+              label: "Quarterly brief",
             }],
             usage: null,
           },

@@ -10880,7 +10880,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         // turn build never observes a selection that is inconsistent with the readiness it just read.
         let _gate = self
             .product_runtime_gate
-            .lock()
+            .try_lock()
             .map_err(|_| "product_busy".to_string())?;
         let _file_gate = acquire_product_runtime_file_lock(&self.oauth_dir)?;
         self.set_agent_settings_with_effort(provider, model, reasoning_effort)
@@ -18738,6 +18738,28 @@ mod tests {
 
         drop(held);
         isyncyou_webui::AgentHandler::set_model(&agent, "claude", DEFAULT_MODEL, None).unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn in_process_product_lock_makes_model_write_fail_fast() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("in-process-model-gate");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let held = agent.product_runtime_gate.lock().unwrap();
+
+        assert_eq!(
+            isyncyou_webui::AgentHandler::set_model(&agent, "claude", DEFAULT_MODEL, None,)
+                .unwrap_err(),
+            "product_busy"
+        );
+
+        drop(held);
         let _ = std::fs::remove_dir_all(root);
     }
 
