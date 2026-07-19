@@ -1815,17 +1815,45 @@ impl<T: SessionV2Transport + Clone + 'static> SessionLeaseGuard<T> {
     pub fn release(&mut self) -> Result<u64, SessionV2Error> {
         self.stop_renewal();
         let mut state = self.state.lock().map_err(|_| SessionV2Error::LeaseLost)?;
-        if state.lost {
-            return Err(SessionV2Error::LeaseLost);
-        }
-        if state.current.manifest.active_lease.is_none() {
+        if !state.lost && state.current.manifest.active_lease.is_none() {
             return Ok(state.current.manifest.generation);
         }
-        if state.current.manifest.active_lease.as_ref() != Some(&state.lease) {
+
+        if !state.lost && state.current.manifest.active_lease.as_ref() == Some(&state.lease) {
+            let mut next = state.current.manifest.clone();
+            next.generation = next
+                .generation
+                .checked_add(1)
+                .ok_or(SessionV2Error::SessionLimit)?;
+            next.active_lease = None;
+            if let Some(current) = self
+                .store
+                .transport
+                .compare_and_swap_manifest(&state.current, &next)?
+            {
+                state.current = current;
+                return Ok(state.current.manifest.generation);
+            }
+            state.lost = true;
+        }
+
+        // A failed publication/CAS makes the cached manifest untrustworthy, but it does not
+        // necessarily mean another writer owns the lease. Re-read and clear only the exact lease
+        // this guard acquired. This reduces stale authority without risking another holder's lease.
+        let current = self
+            .store
+            .transport
+            .load_manifest(&state.current.manifest.session_id)?;
+        if current.manifest.active_lease.is_none() {
+            state.current = current;
+            state.lost = false;
+            return Ok(state.current.manifest.generation);
+        }
+        if current.manifest.active_lease.as_ref() != Some(&state.lease) {
             state.lost = true;
             return Err(SessionV2Error::LeaseLost);
         }
-        let mut next = state.current.manifest.clone();
+        let mut next = current.manifest.clone();
         next.generation = next
             .generation
             .checked_add(1)
@@ -1834,12 +1862,13 @@ impl<T: SessionV2Transport + Clone + 'static> SessionLeaseGuard<T> {
         let Some(current) = self
             .store
             .transport
-            .compare_and_swap_manifest(&state.current, &next)?
+            .compare_and_swap_manifest(&current, &next)?
         else {
             state.lost = true;
             return Err(SessionV2Error::ManifestConflict);
         };
         state.current = current;
+        state.lost = false;
         Ok(state.current.manifest.generation)
     }
 
@@ -4297,6 +4326,81 @@ mod tests {
         assert_eq!(
             store.current_manifest("s").unwrap().manifest.generation,
             released_generation
+        );
+    }
+
+    #[test]
+    fn lost_guard_release_clears_exact_authoritative_owned_lease_after_conflict() {
+        let transport = InMemorySessionV2Transport::default();
+        transport.set_server_time_ms(10_000);
+        transport.create_session("s").unwrap();
+        let store = SessionV2Store::new(transport.clone(), &[33; 32], object_crypto());
+        let mut guard = store
+            .acquire_lease_with_interval(
+                "s",
+                "lease-a",
+                "session-holder",
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+
+        let conflicted_generation = {
+            let mut state = transport.inner.lock().unwrap();
+            let mut current = state.manifests.get("s").unwrap().clone();
+            current.manifest.generation += 1;
+            state.next_etag += 1;
+            current.etag = format!("etag-{}", state.next_etag);
+            let generation = current.manifest.generation;
+            state.manifests.insert("s".into(), current);
+            generation
+        };
+
+        let released_generation = guard.release().unwrap();
+        let released = store.current_manifest("s").unwrap();
+        assert_eq!(released_generation, conflicted_generation + 1);
+        assert!(released.manifest.active_lease.is_none());
+    }
+
+    #[test]
+    fn lost_guard_release_never_clears_replacement_lease() {
+        let transport = InMemorySessionV2Transport::default();
+        transport.set_server_time_ms(10_000);
+        transport.create_session("s").unwrap();
+        let store = SessionV2Store::new(transport.clone(), &[34; 32], object_crypto());
+        let mut guard = store
+            .acquire_lease_with_interval(
+                "s",
+                "lease-a",
+                "session-holder",
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+
+        {
+            let mut state = transport.inner.lock().unwrap();
+            let mut current = state.manifests.get("s").unwrap().clone();
+            let mut replacement = current.manifest.active_lease.clone().unwrap();
+            replacement.lease_id = "lease-b".into();
+            replacement.holder_binding = "replacement-holder".into();
+            replacement.fence += 1;
+            current.manifest.generation += 1;
+            current.manifest.active_lease = Some(replacement);
+            state.next_etag += 1;
+            current.etag = format!("etag-{}", state.next_etag);
+            state.manifests.insert("s".into(), current);
+        }
+
+        assert_eq!(guard.release(), Err(SessionV2Error::LeaseLost));
+        drop(guard);
+        assert_eq!(
+            store
+                .current_manifest("s")
+                .unwrap()
+                .manifest
+                .active_lease
+                .unwrap()
+                .lease_id,
+            "lease-b"
         );
     }
 
