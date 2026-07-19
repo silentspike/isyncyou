@@ -468,7 +468,7 @@ requirements:
       generation and product harness, and publish completion only after durable terminal
       state. Cross-device transfer uses a confirmed, one-time, five-minute pairing
       protocol with encrypted crash recovery. (S-AG.16, #628)
-    status: planned
+    status: implemented
     design: docs/adr/007-agent-architecture.md
     acceptance:
       - V2 sessions publish visible transcript, request state, and UUID bindings through one fenced manifest CAS and enforce combined record and encrypted-byte budgets.
@@ -494,3 +494,4 @@ requirements:
       - test: turn_cancel_stops_before_read_tool_execution
       - test: user_presence_and_agent_session_routes_require_session_cap_strict_json_and_no_store
       - file: tools/agent-epic-closeout-probe.py
+      - file: docs/evidence/issue-628-pre-rc-manifest.json

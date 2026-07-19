@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-07-19T21:17:11Z",
+  "branches": {
+    "dev": { "required_status_checks": 7, "force_pushes": false, "deletions": false },
+    "staging": { "required_status_checks": 7, "force_pushes": false, "deletions": false },
+    "main": { "required_status_checks": 8, "enforce_admins": true, "force_pushes": false, "deletions": false }
+  },
+  "merge_policy": {
+    "default_branch": "dev",
+    "squash": true,
+    "merge_commit": false,
+    "rebase": false
+  },
+  "promotion_workflows": "disabled_manually"
+}

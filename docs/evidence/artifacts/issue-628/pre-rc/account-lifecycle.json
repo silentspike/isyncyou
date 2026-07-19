@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "result": "pass",
+  "baseline_manifest": "docs/evidence/issue-645-manifest.json",
+  "baseline_entries": 28,
+  "baseline_manifest_valid": true,
+  "merge_commit_ancestor": true,
+  "candidate_generation_recovery_rejected": true,
+  "disconnect_reconnect_post_turn_regression": "pass",
+  "full_physical_switch_rerun_required": false,
+  "reason": "Issue 628 consumes the merged shared provider lease API without changing the Issue 645 identity validation or lifecycle state machine.",
+  "identity_included": false,
+  "token_included": false
+}

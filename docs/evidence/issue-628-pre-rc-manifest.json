@@ -1,0 +1,241 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-07-19T21:24:12Z",
+  "commit": "4df8d89ec2d71c838e234b2a0d9388eb4412c59c",
+  "entries": [
+    {
+      "id": "EV-001",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Session V2 round-trips only bounded visible user, assistant, source, and terminal records.",
+      "method": "test",
+      "command": "cargo remote -c -- test --workspace --no-fail-fast",
+      "test": "session_v2_round_trips_user_assistant_sources_and_terminal_state",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/host-gates.txt"
+    },
+    {
+      "id": "EV-002",
+      "requirement": "REQ-AGENT-016",
+      "claim": "The authoritative OneDrive manifest is encrypted and authenticated rather than uploaded as plaintext JSON.",
+      "method": "test",
+      "command": "cargo remote -c -- test --workspace --no-fail-fast",
+      "test": "onedrive_authoritative_manifest_is_encrypted_and_authenticated",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json"
+    },
+    {
+      "id": "EV-003",
+      "requirement": "REQ-AGENT-016",
+      "claim": "One fenced manifest CAS advances visible, request, and UUID-binding heads together.",
+      "method": "test",
+      "command": "cargo remote -c -- test --workspace --no-fail-fast",
+      "test": "manifest_cas_atomically_advances_visible_request_and_uuid_binding_heads",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json"
+    },
+    {
+      "id": "EV-004",
+      "requirement": "REQ-AGENT-016",
+      "claim": "A direct request-key miss still consults the authoritative UUID index before accepting a new request.",
+      "method": "test",
+      "command": "cargo remote -c -- test --workspace --no-fail-fast",
+      "test": "new_request_replay_checks_authoritative_uuid_index_after_direct_key_miss",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json"
+    },
+    {
+      "id": "EV-005",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Reusing one request UUID for another route is rejected from the durable manifest index.",
+      "method": "test",
+      "command": "cargo remote -c -- test --workspace --no-fail-fast",
+      "test": "same_request_uuid_reused_for_different_route_is_rejected_from_manifest_index",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json"
+    },
+    {
+      "id": "EV-006",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Concurrent product-session index updates are serialized as one read-modify-write operation without lost entries.",
+      "method": "test",
+      "command": "cargo remote -c -- test --workspace --no-fail-fast",
+      "test": "product_session_index_rmw_serializes_concurrent_creates_without_lost_update",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json"
+    },
+    {
+      "id": "EV-007",
+      "requirement": "REQ-AGENT-016",
+      "claim": "A mutable product request persists its receipt across restart, replays one response, and rejects semantic UUID reuse.",
+      "method": "test",
+      "command": "cargo remote -c -- test --workspace --no-fail-fast",
+      "test": "product_request_receipt_survives_restart_replays_and_rejects_uuid_reuse",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/confirmation-and-operations.json"
+    },
+    {
+      "id": "EV-008",
+      "requirement": "REQ-AGENT-016",
+      "claim": "A quiet provider turn renews its authoritative session lease without waiting for stream events.",
+      "method": "test",
+      "command": "cargo remote -c -- test --workspace --no-fail-fast",
+      "test": "lease_renews_while_provider_emits_no_events",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json"
+    },
+    {
+      "id": "EV-009",
+      "requirement": "REQ-AGENT-016",
+      "claim": "A conflicted lease guard reloads and clears only its exact authoritative lease.",
+      "method": "test",
+      "command": "cargo remote -c -- test --workspace --no-fail-fast",
+      "test": "lost_guard_release_clears_exact_authoritative_owned_lease_after_conflict",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json"
+    },
+    {
+      "id": "EV-010",
+      "requirement": "REQ-AGENT-016",
+      "claim": "A stale guard release cannot clear a replacement holder's lease.",
+      "method": "test",
+      "command": "cargo remote -c -- test --workspace --no-fail-fast",
+      "test": "lost_guard_release_never_clears_replacement_lease",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json"
+    },
+    {
+      "id": "EV-011",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Recovery rejects every provider generation, policy, harness, installation, provider, or model authority change.",
+      "method": "test",
+      "command": "cargo remote -c -- test --workspace --no-fail-fast",
+      "test": "provider_generation_recovery_rejects_every_authority_binding_change",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/account-lifecycle.json"
+    },
+    {
+      "id": "EV-012",
+      "requirement": "REQ-AGENT-016",
+      "claim": "The host emits done complete only after durable terminal publication.",
+      "method": "test",
+      "command": "cargo remote -c -- test --workspace --no-fail-fast",
+      "test": "done_complete_is_emitted_only_after_terminal_record_commit",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/host-gates.txt"
+    },
+    {
+      "id": "EV-013",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Turn cancellation before persistence discards late provider output.",
+      "method": "test",
+      "command": "cargo remote -c -- test --workspace --no-fail-fast",
+      "test": "turn_cancel_before_persist_ignores_late_provider_result",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/confirmation-and-operations.json"
+    },
+    {
+      "id": "EV-014",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Pairing claim, local installation, and remote finalization resume idempotently across restart boundaries.",
+      "method": "test",
+      "command": "cargo remote -c -- test --workspace --no-fail-fast",
+      "test": "pairing_claim_install_and_finalize_are_restart_safe_and_idempotent",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json"
+    },
+    {
+      "id": "EV-015",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Strict JSON rejects recursive duplicate members and trailing input.",
+      "method": "test",
+      "command": "cargo remote -c -- test --workspace --no-fail-fast",
+      "test": "strict_json_rejects_recursive_duplicate_keys_and_trailing_data",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/security-scan.txt"
+    },
+    {
+      "id": "EV-016",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Mutation-intent commit verifies total length, digest, expiry, and binding before an effect.",
+      "method": "test",
+      "command": "cargo remote -c -- test --workspace --no-fail-fast",
+      "test": "mutation_intent_commit_verifies_total_hash_length_expiry_and_binding",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/confirmation-and-operations.json"
+    },
+    {
+      "id": "EV-017",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Session and user-presence routes require trusted session, Agent capability, strict JSON, and no-store responses.",
+      "method": "test",
+      "command": "cargo remote -c -- test --workspace --no-fail-fast",
+      "test": "user_presence_and_agent_session_routes_require_session_cap_strict_json_and_no_store",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/security-scan.txt"
+    },
+    {
+      "id": "EV-018",
+      "requirement": "REQ-AGENT-016",
+      "claim": "The desktop and mobile Assistant surfaces pass 61 setup, model, source, confirmation, cancellation, autoscroll, and redaction assertions.",
+      "method": "command",
+      "command": "node tools/agent-ui-smoke.mjs --out /tmp/issue-628-ui-smoke",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/ui-smoke.json"
+    },
+    {
+      "id": "EV-019",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Real Claude and ChatGPT product OAuth each completed a read-only StoreArchive turn with at least one source and no local-CLI fallback.",
+      "method": "probe",
+      "command": "jq -e '.result == \"pass\" and .claude.read_only_storearchive_turn == \"complete\" and .codex.read_only_storearchive_turn == \"complete\" and .runtime_to_implementation_diff_is_cfg_test_only == true and .local_cli_origin_used == false' docs/evidence/artifacts/issue-628/pre-rc/provider-harness-matrix.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/provider-harness-matrix.json",
+      "notes": "The live turns ran at 018dfa5255271f802d3ea05b96b396bec2662c66. The only later change in the pinned implementation commit is a cfg(test)-only mutex in crates/core/src/envelope.rs; the exact implementation APK was rebuilt and installed afterward."
+    },
+    {
+      "id": "EV-020",
+      "requirement": "REQ-AGENT-016",
+      "claim": "The exact implementation commit produced a clean default APK, excluded hook and experimental markers, installed successfully, and retained connected product state.",
+      "method": "probe",
+      "command": "jq -e '.result == \"pass\" and .implementation_commit == \"4df8d89ec2d71c838e234b2a0d9388eb4412c59c\" and .connected == true and .failed_runs == 0 and .network_hook_marker == false and .experimental_subscription_marker == false' docs/evidence/artifacts/issue-628/pre-rc/default-apk-matrix.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/default-apk-matrix.json"
+    },
+    {
+      "id": "EV-021",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Product feature graphs include OneDrive session transport while excluding experimental authentication and default-off device hooks.",
+      "method": "command",
+      "command": "jq -e '.result == \"pass\" and .product_agent_onedrive_transport == true and .default_daemon_experimental_subscription == false and .default_mobile_test_hooks == false' docs/evidence/artifacts/issue-628/pre-rc/feature-graphs.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/feature-graphs.json"
+    },
+    {
+      "id": "EV-022",
+      "requirement": "REQ-AGENT-016",
+      "claim": "The exact implementation commit passes workspace tests, workspace Clippy, format, dependency policy, workflow lint, probe tests, UI smoke, traceability, and boundary scans.",
+      "method": "command",
+      "command": "cargo remote -c -- test --workspace --no-fail-fast && cargo remote -c -- clippy --workspace --all-targets -- -D warnings && cargo-remote-fmt --check && cargo deny check && actionlint",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/host-gates.txt"
+    },
+    {
+      "id": "EV-023",
+      "requirement": "REQ-AGENT-016",
+      "claim": "The merged account-lifecycle baseline remains valid and current recovery rejects stale credential generations.",
+      "method": "command",
+      "command": "python3 tools/check_evidence.py --manifest docs/evidence/issue-645-manifest.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/account-lifecycle.json"
+    },
+    {
+      "id": "EV-024",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Controlled confirmation and cleanup evidence records zero unconfirmed, duplicate, or unreverted cloud effects and no identity data.",
+      "method": "probe",
+      "command": "jq -e '.unconfirmed_cloud_mutations == 0 and .duplicate_cloud_effects == 0' docs/evidence/artifacts/issue-628/pre-rc/confirmation-and-operations.json && jq -e '.unreverted_controlled_fixtures == 0 and .account_identity_included == false' docs/evidence/artifacts/issue-628/pre-rc/graph-revert-summary.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/graph-revert-summary.json"
+    }
+  ]
+}

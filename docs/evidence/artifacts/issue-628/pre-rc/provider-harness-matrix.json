@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "result": "pass",
+  "runtime_commit": "018dfa5255271f802d3ea05b96b396bec2662c66",
+  "runtime_to_implementation_diff_is_cfg_test_only": true,
+  "claude": {
+    "product_oauth_connected": true,
+    "read_only_storearchive_turn": "complete",
+    "source_count_at_least": 1,
+    "lease_lost_after_fix": false
+  },
+  "codex": {
+    "product_oauth_connected": true,
+    "read_only_storearchive_turn": "complete",
+    "source_count_at_least": 1,
+    "selected_model": "gpt-5.6-sol",
+    "reasoning_effort": "medium"
+  },
+  "exact_implementation_apk_installed_after_probe": true,
+  "default_harness_components_present": false,
+  "local_cli_origin_used": false,
+  "raw_provider_frames_included": false,
+  "source_titles_or_content_included": false,
+  "account_identity_included": false,
+  "oauth_values_included": false
+}

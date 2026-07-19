@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "result": "pass",
+  "controlled_mutations_only": true,
+  "revert_attempted_for_every_mutation": true,
+  "unreverted_controlled_fixtures": 0,
+  "opaque_identifiers_included": false,
+  "account_identity_included": false,
+  "personal_content_included": false
+}

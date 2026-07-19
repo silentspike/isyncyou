@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "result": "pass",
+  "implementation_commit": "4df8d89ec2d71c838e234b2a0d9388eb4412c59c",
+  "apk_sha256": "fa99023039f834eb8e27b2dbd4175cedb77d8e13f2f7eaed1d233ad6db6f22b8",
+  "build": "clean_default_debug",
+  "installed_with_data_preserved": true,
+  "connected": true,
+  "connected_services": 5,
+  "failed_runs": 0,
+  "cached_items_present": true,
+  "network_hook_marker": false,
+  "job_hook_marker": false,
+  "credential_self_test_marker": false,
+  "experimental_subscription_marker": false,
+  "raw_screenshot_committed": false,
+  "device_serial_included": false
+}

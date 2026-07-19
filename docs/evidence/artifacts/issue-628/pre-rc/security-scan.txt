@@ -1,0 +1,14 @@
+issue=628
+implementation_commit=4df8d89ec2d71c838e234b2a0d9388eb4412c59c
+semgrep_pinned_rules=PASS
+gitleaks_staged=PASS
+agent_network_boundary=PASS
+default_apk_hook_scan=PASS
+experimental_subscription_default_artifact_scan=PASS
+api_url_secret_scan=PASS
+release_workflow_contract_tests=PASS
+raw_logs_included=false
+tokens_included=false
+oauth_values_included=false
+account_identity_included=false
+device_serial_included=false
