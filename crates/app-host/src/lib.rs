@@ -557,18 +557,6 @@ fn turn_admission_digest(request: &isyncyou_webui::AgentTurnRequest) -> [u8; 32]
     feature = "agent-subscription-experimental",
     test
 ))]
-fn turn_admission_digest_hex(request: &isyncyou_webui::AgentTurnRequest) -> String {
-    turn_admission_digest(request)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-#[cfg(any(
-    feature = "agent-oauth-providers",
-    feature = "agent-subscription-experimental",
-    test
-))]
 const MAX_ACTIVE_TURN_ADMISSIONS: usize = 256;
 
 #[cfg(any(
@@ -1084,15 +1072,20 @@ impl Drop for TurnAdmissionLease {
 struct DurableTurnAdmissionLease {
     store: Arc<agent_control_store::AgentControlStore>,
     request_id: String,
+    completed: bool,
 }
 
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-impl Drop for DurableTurnAdmissionLease {
-    fn drop(&mut self) {
-        let _ = self.store.complete_agent_turn_admission(&self.request_id);
+impl DurableTurnAdmissionLease {
+    fn complete(&mut self) -> Result<(), String> {
+        if !self.completed {
+            self.store.complete_agent_turn_admission(&self.request_id)?;
+            self.completed = true;
+        }
+        Ok(())
     }
 }
 
@@ -2206,6 +2199,11 @@ pub struct DaemonAgent {
     turn_admissions: Arc<TurnAdmissionRegistry>,
     #[cfg(any(
         feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    turn_recovery_error: Mutex<Option<String>>,
+    #[cfg(any(
+        feature = "agent-oauth-providers",
         feature = "agent-subscription-experimental",
         test
     ))]
@@ -2404,6 +2402,11 @@ impl DaemonAgent {
                 test
             ))]
             turn_admissions: Arc::new(TurnAdmissionRegistry::default()),
+            #[cfg(any(
+                feature = "agent-oauth-providers",
+                feature = "agent-subscription-experimental"
+            ))]
+            turn_recovery_error: Mutex::new(None),
             #[cfg(any(
                 feature = "agent-oauth-providers",
                 feature = "agent-subscription-experimental",
@@ -8856,7 +8859,11 @@ impl DaemonAgent {
             if turn_id_from_request_id(&admission.request.request_id)? != admission.turn_id {
                 return Err("turn_admission_unavailable".into());
             }
-            isyncyou_webui::AgentHandler::start_turn_request(Arc::clone(self), admission.request)?;
+            isyncyou_webui::AgentHandler::start_turn_request(
+                Arc::clone(self),
+                admission.request,
+                admission.identity,
+            )?;
             started = started.saturating_add(1);
         }
         Ok(started)
@@ -8965,6 +8972,14 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             feature = "agent-subscription-experimental"
         ))]
         {
+            if self
+                .turn_recovery_error
+                .lock()
+                .map_err(|_| "turn_admission_unavailable".to_string())?
+                .is_some()
+            {
+                return Err("turn_admission_unavailable".into());
+            }
             let store = agent_credential_store(&self.oauth_dir)
                 .map_err(|_| "session_store_unavailable".to_string())?;
             product_session::ProductSessionRegistry::new(&store).select(request_id, session_id)?;
@@ -9894,12 +9909,21 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
     fn start_turn_request(
         self: Arc<Self>,
         request: isyncyou_webui::AgentTurnRequest,
+        identity: isyncyou_webui::ProductRequestIdentity,
     ) -> Result<String, String> {
         #[cfg(any(
             feature = "agent-oauth-providers",
             feature = "agent-subscription-experimental"
         ))]
         {
+            if self
+                .turn_recovery_error
+                .lock()
+                .map_err(|_| "turn_admission_unavailable".to_string())?
+                .is_some()
+            {
+                return Err("turn_admission_unavailable".into());
+            }
             let store = agent_credential_store(&self.oauth_dir)
                 .map_err(|_| "session_store_unavailable".to_string())?;
             let registry = product_session::ProductSessionRegistry::new(&store);
@@ -9909,27 +9933,21 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             }
             let turn_id = turn_id_from_request_id(&request.request_id)?;
             let digest = turn_admission_digest(&request);
-            let digest_hex = turn_admission_digest_hex(&request);
             let control_store = self
                 .control_store
                 .as_ref()
                 .cloned()
                 .ok_or_else(|| "session_store_unavailable".to_string())?;
-            let durable_begin =
-                control_store.begin_agent_turn_admission(&request, &turn_id, &digest_hex)?;
+            control_store.begin_agent_turn_admission_identity(&request, &turn_id, &identity)?;
             let admission = match self.turn_admissions.reserve(&turn_id, digest) {
                 Ok(Some(admission)) => admission,
                 Ok(None) => return Ok(turn_id),
-                Err(error) => {
-                    if durable_begin == agent_control_store::AgentTurnAdmissionBegin::Inserted {
-                        let _ = control_store.complete_agent_turn_admission(&request.request_id);
-                    }
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             };
             let durable_admission = DurableTurnAdmissionLease {
                 store: Arc::clone(&control_store),
                 request_id: request.request_id.clone(),
+                completed: false,
             };
             let selected_provider = self.agent_settings().map(|settings| settings.provider);
             let reserved = self.reserve_agent_turn(
@@ -9994,6 +10012,8 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                             created_at_ms: unix_now_ms(),
                             cached_context,
                         })?;
+                    let mut reserved = reserved;
+                    reserved.durable_admission.complete()?;
                     match product_turn {
                         product_session::ProductTurnStart::Started(product_turn) => {
                             worker.launch_prepared_turn(
@@ -12186,31 +12206,29 @@ struct UnavailableDurableRequests;
     feature = "agent-subscription-experimental"
 ))]
 impl isyncyou_webui::DurableRequestStore for UnavailableDurableRequests {
+    fn bind(
+        &self,
+        _identity: &isyncyou_webui::ProductRequestIdentity,
+    ) -> Result<isyncyou_webui::DurableRequestBinding, String> {
+        Err("request_store_unavailable".into())
+    }
+
     fn begin(
         &self,
-        _request_id: &str,
-        _route_domain: &str,
-        _payload_digest: &str,
+        _identity: &isyncyou_webui::ProductRequestIdentity,
     ) -> Result<isyncyou_webui::DurableRequestBegin, String> {
         Err("request_store_unavailable".into())
     }
 
     fn complete(
         &self,
-        _request_id: &str,
-        _route_domain: &str,
-        _payload_digest: &str,
+        _identity: &isyncyou_webui::ProductRequestIdentity,
         _response: &isyncyou_webui::ApiResponse,
     ) -> Result<(), String> {
         Err("request_store_unavailable".into())
     }
 
-    fn abort(
-        &self,
-        _request_id: &str,
-        _route_domain: &str,
-        _payload_digest: &str,
-    ) -> Result<(), String> {
+    fn abort(&self, _identity: &isyncyou_webui::ProductRequestIdentity) -> Result<(), String> {
         Err("request_store_unavailable".into())
     }
 }
@@ -12220,14 +12238,31 @@ impl isyncyou_webui::DurableRequestStore for UnavailableDurableRequests {
     feature = "agent-subscription-experimental"
 ))]
 impl isyncyou_webui::DurableRequestStore for DaemonDurableRequests {
+    fn bind(
+        &self,
+        identity: &isyncyou_webui::ProductRequestIdentity,
+    ) -> Result<isyncyou_webui::DurableRequestBinding, String> {
+        self.store
+            .bind_product_request(identity)
+            .map(|result| match result {
+                agent_control_store::ProductRequestBinding::Inserted => {
+                    isyncyou_webui::DurableRequestBinding::Inserted
+                }
+                agent_control_store::ProductRequestBinding::Existing => {
+                    isyncyou_webui::DurableRequestBinding::Existing
+                }
+                agent_control_store::ProductRequestBinding::Conflict => {
+                    isyncyou_webui::DurableRequestBinding::Conflict
+                }
+            })
+    }
+
     fn begin(
         &self,
-        request_id: &str,
-        route_domain: &str,
-        payload_digest: &str,
+        identity: &isyncyou_webui::ProductRequestIdentity,
     ) -> Result<isyncyou_webui::DurableRequestBegin, String> {
         self.store
-            .begin_product_request(request_id, route_domain, payload_digest)
+            .begin_product_request_identity(identity)
             .map(|result| match result {
                 agent_control_store::ProductRequestBegin::Execute => {
                     isyncyou_webui::DurableRequestBegin::Execute
@@ -12251,15 +12286,11 @@ impl isyncyou_webui::DurableRequestStore for DaemonDurableRequests {
 
     fn complete(
         &self,
-        request_id: &str,
-        route_domain: &str,
-        payload_digest: &str,
+        identity: &isyncyou_webui::ProductRequestIdentity,
         response: &isyncyou_webui::ApiResponse,
     ) -> Result<(), String> {
-        self.store.complete_product_request(
-            request_id,
-            route_domain,
-            payload_digest,
+        self.store.complete_product_request_identity(
+            identity,
             &agent_control_store::StoredProductResponseV1 {
                 status: response.status,
                 content_type: response.content_type.clone(),
@@ -12269,14 +12300,8 @@ impl isyncyou_webui::DurableRequestStore for DaemonDurableRequests {
         )
     }
 
-    fn abort(
-        &self,
-        request_id: &str,
-        route_domain: &str,
-        payload_digest: &str,
-    ) -> Result<(), String> {
-        self.store
-            .abort_product_request(request_id, route_domain, payload_digest)
+    fn abort(&self, identity: &isyncyou_webui::ProductRequestIdentity) -> Result<(), String> {
+        self.store.abort_product_request_identity(identity)
     }
 }
 
@@ -13282,7 +13307,11 @@ pub fn build_live_router(
         feature = "agent-oauth-providers",
         feature = "agent-subscription-experimental"
     ))]
-    let _ = agent.recover_durable_turn_admissions();
+    if let Err(error) = agent.recover_durable_turn_admissions() {
+        if let Ok(mut recovery_error) = agent.turn_recovery_error.lock() {
+            *recovery_error = Some(agent_safe_turn_start_error(&error).into());
+        }
+    }
     let router = base
         .with_onedrive_info(Arc::new(DaemonOneDriveInfo { cfg: cfg.clone() }))
         .with_onedrive_list(Arc::new(DaemonOneDriveList { cfg: cfg.clone() }))
@@ -15605,9 +15634,42 @@ mod tests {
             .expect("live router boundary");
         let construct = builder.find("DaemonAgent::new_with_policy").unwrap();
         let recovery = builder.find("recover_durable_turn_admissions").unwrap();
+        let recovery_error = builder.find("turn_recovery_error").unwrap();
         let route_wiring = builder.find("let router = base").unwrap();
         assert!(construct < recovery);
         assert!(recovery < route_wiring);
+        assert!(recovery < recovery_error);
+        assert!(recovery_error < route_wiring);
+        assert!(!builder.contains("let _ = agent.recover_durable_turn_admissions"));
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn startup_turn_recovery_error_blocks_new_turn_before_session_or_provider_work() {
+        let root = temp_agent_root("turn-recovery-error-gate");
+        let agent = Arc::new(DaemonAgent::new(Config::default(), root.clone()));
+        *agent.turn_recovery_error.lock().unwrap() = Some("turn_admission_unavailable".into());
+        let request = isyncyou_webui::AgentTurnRequest {
+            request_id: "019f0000-0000-4000-8000-000000000307".into(),
+            session_id: "01JSESSION00000000000000003".into(),
+            account: "controlled".into(),
+            prompt: "Read one controlled item".into(),
+        };
+        let identity = isyncyou_webui::ProductRequestIdentity {
+            request_id: request.request_id.clone(),
+            route_domain: "post:/api/v1/agent/turn",
+            request_scope: format!("session_id:{}", request.session_id),
+            payload_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+        };
+        assert_eq!(
+            isyncyou_webui::AgentHandler::start_turn_request(agent, request, identity).unwrap_err(),
+            "turn_admission_unavailable"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(any(
@@ -20945,6 +21007,7 @@ mod tests {
         let result = isyncyou_webui::AgentHandler::connectivity_preflight_with_session(
             &agent,
             isyncyou_webui::AgentConnectivityPreflightRequest {
+                request_id: "550e8400-e29b-41d4-a716-446655440000".into(),
                 provider: "claude".into(),
                 purpose: "oauth_start".into(),
                 snapshot_id: None,
@@ -20962,6 +21025,7 @@ mod tests {
     #[test]
     fn connectivity_preflight_desktop_cookie_session_does_not_require_mobile_snapshot() {
         let request = isyncyou_webui::AgentConnectivityPreflightRequest {
+            request_id: "550e8400-e29b-41d4-a716-446655440001".into(),
             provider: "codex".into(),
             purpose: "oauth_start".into(),
             snapshot_id: None,
@@ -20977,6 +21041,7 @@ mod tests {
     #[test]
     fn connectivity_preflight_desktop_rejects_android_snapshot_handle() {
         let request = isyncyou_webui::AgentConnectivityPreflightRequest {
+            request_id: "550e8400-e29b-41d4-a716-446655440002".into(),
             provider: "codex".into(),
             purpose: "oauth_start".into(),
             snapshot_id: Some("opaque-mobile-handle".into()),
@@ -21061,6 +21126,7 @@ mod tests {
         let response = agent
             .connectivity_preflight_with_session(
                 isyncyou_webui::AgentConnectivityPreflightRequest {
+                    request_id: "550e8400-e29b-41d4-a716-446655440003".into(),
                     provider: "claude".into(),
                     purpose: "oauth_start".into(),
                     snapshot_id: Some(id),

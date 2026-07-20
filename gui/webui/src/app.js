@@ -4833,7 +4833,7 @@ async function captureNetworkSnapshot(guardId) {
   return d && d.snapshot_id ? d.snapshot_id : null;
 }
 async function runConnectivityPreflight(provider, purpose, guardId) {
-  const body = { provider, purpose };
+  const body = { request_id: crypto.randomUUID(), provider, purpose };
   if (BRIDGE) {
     const snapshotId = await captureNetworkSnapshot(guardId);
     if (!snapshotId) throw new Error("network_guard_unavailable");
