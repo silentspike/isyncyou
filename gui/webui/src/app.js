@@ -532,7 +532,7 @@ async function request(method, path, opts) {
       if (BRIDGE && k.toLowerCase() === "x-session-token") return;
       headers[k] = v;
     });
-  } // #657: e.g. X-Body-Encoding: base64
+  }
   let status, d;
   if (BRIDGE) {
     const res = await bridgeSend(method, path, headers, o.body, o.timeoutMs);
@@ -570,8 +570,7 @@ async function postJson(path, capToken, value) {
     headers: { "Content-Type": "application/json" },
   });
 }
-/* Base64-encode raw bytes (Uint8Array) in fromCharCode-safe chunks (#657). The mobile bridge
-   body is text-only, so a binary upload rides base64; serve.rs decodes on X-Body-Encoding. */
+/* Base64-encode one bounded mutation-intent chunk for its strict JSON data_base64 field. */
 function bytesToBase64(bytes) {
   let bin = "";
   const chunk = 0x8000;
@@ -666,35 +665,46 @@ async function hashMutationSource(source) {
   }
   return hash.hex();
 }
+async function mutationPostWithTransportRetry(path, value, timeoutMs) {
+  const send = () => request("POST", path, {
+    capToken: CAP.mutationIntent,
+    timeoutMs,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(value),
+  });
+  try {
+    return await send();
+  } catch (error) {
+    if (error && error.responseReceived) throw error;
+    return send();
+  }
+}
 async function stageMutation(purpose, metadata, input) {
   const source = await mutationSource(input);
   const totalHash = await hashMutationSource(source);
-  const created = await postJson("/api/v1/mutation-intent/create", CAP.mutationIntent, {
+  const created = await mutationPostWithTransportRetry("/api/v1/mutation-intent/create", {
     request_id: crypto.randomUUID(), purpose, metadata,
     total_bytes: source.length, sha256: totalHash,
   });
   const chunkBytes = Number(created.chunk_bytes);
   if (!created.intent_id || chunkBytes !== 8192) throw new Error("Invalid upload contract");
+  let commitAttempted = false;
   try {
     for (let offset = 0, index = 0; offset < source.length; offset += chunkBytes, index++) {
       const chunk = await source.read(offset, Math.min(offset + chunkBytes, source.length));
-      await postJson("/api/v1/mutation-intent/chunk", CAP.mutationIntent, {
+      await mutationPostWithTransportRetry("/api/v1/mutation-intent/chunk", {
         request_id: crypto.randomUUID(), intent_id: created.intent_id,
         index, offset, data_base64: bytesToBase64(chunk),
         chunk_sha256: await sha256Hex(chunk),
       });
     }
-    return await request("POST", "/api/v1/mutation-intent/commit", {
-      capToken: CAP.mutationIntent,
-      timeoutMs: MUTATION_COMMIT_TIMEOUT_MS,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        request_id: crypto.randomUUID(), intent_id: created.intent_id,
-        total_bytes: source.length, sha256: totalHash,
-      }),
-    });
+    commitAttempted = true;
+    return await mutationPostWithTransportRetry("/api/v1/mutation-intent/commit", {
+      request_id: crypto.randomUUID(), intent_id: created.intent_id,
+      total_bytes: source.length, sha256: totalHash,
+    }, MUTATION_COMMIT_TIMEOUT_MS);
   } catch (error) {
-    if (error && error.responseReceived) {
+    if (!commitAttempted && error && error.responseReceived) {
       await postJson("/api/v1/mutation-intent/cancel", CAP.mutationIntent, {
         request_id: crypto.randomUUID(), intent_id: created.intent_id,
       }).catch(() => {});
@@ -1661,7 +1671,7 @@ async function renderMailView(view) {
           el("option", { value: "sender", text: "Sender A–Z" }))),
       el("button", { id: "mail-thread-toggle", class: "btn sm" + (Mail.threaded ? " active" : ""), title: "Group messages into conversations", onclick: (e) => { Mail.threaded = !Mail.threaded; e.currentTarget.classList.toggle("active", Mail.threaded); mailRender(); } }, icon("mail-open", "icon-sm"), "Conversations"),
       verifyButton(() => renderMailView(view)),
-      CAP.mailwrite ? el("button", { class: "btn sm primary", title: "Compose a new message", onclick: () => openCompose() }, icon("send", "icon-sm"), "Compose") : null,
+      CAP.mailwrite && CAP.mutationIntent ? el("button", { class: "btn sm primary", title: "Compose a new message", onclick: () => openCompose() }, icon("send", "icon-sm"), "Compose") : null,
       el("button", { class: "btn sm", title: "View sync log", onclick: () => go("overview") }, icon("clock", "icon-sm"), "Sync log")),
     // 2-pane: list | reader (filters live in the left sidebar under "Mail")
     el("div", { id: "mail-layout", class: "mail-layout" },
@@ -1845,7 +1855,7 @@ function mailBack() { Mail.selected = null; $("#mail-layout")?.classList.remove(
 // contenteditable the user authors and which is sent to Graph — it is never
 // rendered as untrusted, so editing HTML here carries no XSS risk.
 function openCompose(opts = {}) {
-  if (!CAP.mailwrite) return;
+  if (!CAP.mailwrite || !CAP.mutationIntent) return;
   const o = opts || {};
   const field = (label, input) => el("label", { class: "cmp-field" }, el("span", { class: "cmp-label", text: label }), input);
   const toIn = el("input", { class: "input", id: "cmp-to", placeholder: "name@example.com, …", value: (o.to || []).join(", ") });
@@ -1888,21 +1898,18 @@ async function composeSubmit(btn, asDraft) {
   btn.disabled = true;
   try {
     if (asDraft) {
-      await postJson("/api/v1/mail/draft", CAP.mailwrite, {
-        request_id: crypto.randomUUID(), account: App.account, id: null,
-        to: splitEmails(to), subject, body,
-      });
+      await stageMutation("mail_body", {
+        account: App.account, operation: "draft", target: "",
+        recipients: splitEmails(to), cc: [], bcc: [], subject,
+        importance: null, read_receipt: false, all: false,
+      }, new TextEncoder().encode(body));
       toast("Draft saved");
     } else {
-      const params = { account: App.account, to, cc, bcc, subject, body };
-      if (importance && importance !== "normal") params.importance = importance;
-      if (rr) params.read_receipt = "1";
-      await postJson("/api/v1/mail/send", CAP.mailwrite, {
-        request_id: crypto.randomUUID(), account: App.account,
-        to: splitEmails(to), cc: splitEmails(cc), bcc: splitEmails(bcc),
-        subject, body, importance: params.importance || null,
-        read_receipt: params.read_receipt === "1",
-      });
+      await stageMutation("mail_body", {
+        account: App.account, operation: "send", target: "",
+        recipients: splitEmails(to), cc: splitEmails(cc), bcc: splitEmails(bcc),
+        subject, importance: importance || null, read_receipt: rr, all: false,
+      }, new TextEncoder().encode(body));
       toast("Message sent");
     }
     closeSheet();
@@ -1920,7 +1927,7 @@ async function composeSubmit(btn, asDraft) {
 // content is sent; the daemon prepends it above the quoted original (Mail-1), so
 // the URL stays small and the full original is preserved + threaded.
 function openInlineComposer(it, mode) {
-  if (!CAP.mailwrite) return;
+  if (!CAP.mailwrite || !CAP.mutationIntent) return;
   const box = $("#mail-reader"); if (!box) return;
   const p = it.preview || {};
   const isFwd = mode === "forward";
@@ -1958,18 +1965,20 @@ function openInlineComposer(it, mode) {
 async function inlineComposerSend(btn, it, mode) {
   const editor = $("#cmp-editor"); if (!editor) return;
   const body = (editor.innerHTML || "").trim();
-  const params = { request_id: crypto.randomUUID(), account: App.account, id: it.remote_id, body, comment: "" };
-  let path = "/api/v1/mail/reply";
+  let recipients = [];
+  let operation = "reply";
   if (mode === "forward") {
     const to = ($("#cmp-fwd-to").value || "").trim();
     if (!to) { toast("Add at least one recipient", "err"); return; }
-    params.to = splitEmails(to); path = "/api/v1/mail/forward";
-  } else {
-    params.all = mode === "replyAll";
+    recipients = splitEmails(to); operation = "forward";
   }
   btn.disabled = true;
   try {
-    await postJson(path, CAP.mailwrite, params);
+    await stageMutation("mail_body", {
+      account: App.account, operation, target: it.remote_id,
+      recipients, cc: [], bcc: [], subject: "", importance: null,
+      read_receipt: false, all: mode === "replyAll",
+    }, new TextEncoder().encode(body));
     toast(mode === "forward" ? "Forwarded" : "Reply sent");
     renderMailReader(it);
   } catch (e) { toast("Send failed: " + e.message, "err"); btn.disabled = false; }
@@ -4355,7 +4364,7 @@ async function renderOnenoteView(view) {
   const tree = el("div", { id: "note-tree", class: "note-tree" });
   const reader = el("div", { id: "note-reader", class: "note-reader" });
   const acts = el("div", { class: "view-actions" });
-  if (CAP.onenotewrite) acts.append(el("button", { class: "btn sm primary", title: "Create a new page", onclick: () => openComposePage() }, icon("notebook", "icon-sm"), "New page"));
+  if (CAP.onenotewrite && CAP.mutationIntent) acts.append(el("button", { class: "btn sm primary", title: "Create a new page", onclick: () => openComposePage() }, icon("notebook", "icon-sm"), "New page"));
   if (CAP.verify) acts.append(verifyButton(() => renderOnenoteView(view)));
   view.append(el("div", { class: "note-page" },
     el("div", { id: "note-metrics-row", class: "con-metrics-row top" }),
@@ -4450,8 +4459,10 @@ function renderNoteReader(it) {
   const p = it.preview || {};
   const actions = el("div", { class: "note-reader-actions" },
     el("a", { class: "btn ghost sm", href: `/api/v1/view?${qs(q)}`, target: "_blank", rel: "noopener", title: "Open in new tab" }, icon("external-link", "icon-sm")));
-  if (CAP.onenotewrite) {
+  if (CAP.onenotewrite && CAP.mutationIntent) {
     actions.append(el("button", { class: "btn ghost sm", title: "Append a paragraph (best-effort)", onclick: () => appendPage(it) }, icon("plus", "icon-sm"), "Append"));
+  }
+  if (CAP.onenotewrite) {
     actions.append(el("button", { class: "btn ghost sm", style: "color:var(--danger,#f87171)", title: "Delete this page", onclick: () => deletePage(it) }, icon("trash-2", "icon-sm"), "Delete"));
   }
   // metadata strip from the page preview (created / section / notebook / tags / link)
@@ -4503,7 +4514,7 @@ function renderNoteReader(it) {
 }
 // #568: live OneNote write — create page (section picker) / delete / best-effort append, cap-gated
 async function openComposePage(presetSection) {
-  if (!CAP.onenotewrite) return;
+  if (!CAP.onenotewrite || !CAP.mutationIntent) return;
   const sections = Note.items.filter(it => it.item_type === "section");
   if (!sections.length) { toast("No section available — back up a notebook first", "err"); return; }
   const field = (label, input) => el("label", { class: "cmp-field" }, el("span", { class: "cmp-label", text: label }), input);
@@ -4526,10 +4537,9 @@ async function composePageSubmit(btn) {
   if (!title) { toast("Add a title", "err"); return; }
   btn.disabled = true;
   try {
-    await postJson("/api/v1/onenote/create", CAP.onenotewrite, {
-      request_id: crypto.randomUUID(), account: App.account,
-      section, title, body: v("cpage-body"),
-    });
+    await stageMutation("onenote_body", {
+      account: App.account, operation: "create", section_or_page: section, title,
+    }, new TextEncoder().encode(v("cpage-body")));
     toast("Page created"); closeSheet(); noteReload();
   } catch (e) { toast("Failed: " + e.message, "err"); btn.disabled = false; }
 }
@@ -4555,10 +4565,9 @@ function appendPage(it) {
     if (!text) { ta.focus(); return; }
     btn.disabled = true; status.textContent = "Appending…";
     try {
-      await postJson("/api/v1/onenote/append", CAP.onenotewrite, {
-        request_id: crypto.randomUUID(), account: App.account,
-        id: it.remote_id, text,
-      });
+      await stageMutation("onenote_body", {
+        account: App.account, operation: "append", section_or_page: it.remote_id, title: "",
+      }, new TextEncoder().encode(text));
       toast("Appended — OneNote may take a moment to reflect it");
       panel.remove();
     } catch (e) { status.textContent = ""; btn.disabled = false; toast("Append failed: " + e.message, "err"); }

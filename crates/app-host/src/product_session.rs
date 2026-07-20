@@ -8,7 +8,7 @@ use isyncyou_agent::{
     RequestUuidBindingV1, SanitizedUsage, Secret, SecretClass, SessionCommitV1, SessionId,
     SessionLeaseGuard, SessionObjectCrypto, SessionRecordKind, SessionRecordV2, SessionV2Error,
     SessionV2Store, SessionV2Transport, SourceRef, ToolAction, TurnObserver, TurnTerminalStatus,
-    REQUEST_JOURNAL_VERSION, SESSION_RECORD_VERSION,
+    VersionedManifest, REQUEST_JOURNAL_VERSION, SESSION_RECORD_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +24,8 @@ const CURSOR_HMAC_DOMAIN: &[u8] = b"isyncyou-product-session-cursor-v1";
 const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_PAGE_SIZE: usize = 100;
 const TURN_HOLDER_DOMAIN: &[u8] = b"isyncyou-session-holder-v1";
+const MAINTENANCE_HOLDER_DOMAIN: &[u8] = b"isyncyou-session-maintenance-holder-v1";
+const OUTCOME_UNKNOWN_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -147,6 +149,12 @@ pub struct ProductSessionRegistry<'a> {
     store: &'a AgentCredentialStore,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProductSessionMaintenanceTarget {
+    pub session_id: String,
+    pub local_account: String,
+}
+
 fn product_session_index_gate() -> &'static std::sync::Mutex<()> {
     static GATE: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     GATE.get_or_init(|| std::sync::Mutex::new(()))
@@ -164,7 +172,6 @@ pub struct ProductTurnRuntime {
     context_records: Vec<SessionRecordV2>,
     journal: RequestJournalV1,
     pending_request_objects: Vec<(String, Vec<u8>)>,
-    prepublished_provider_step: Option<u8>,
     seen_tool_use_ids: std::collections::BTreeSet<String>,
     provider_history: Vec<isyncyou_agent::Message>,
     recovery_outcomes: Vec<RequestStepOutcomeV1>,
@@ -187,6 +194,7 @@ pub struct ProductTurnRequest<'a> {
     pub installation_principal: &'a str,
     pub created_at_ms: u64,
     pub cached_context: Option<ProductSessionContextSnapshot>,
+    pub context_budget: isyncyou_agent::ContextBudget,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -201,6 +209,42 @@ pub struct ProductTurnReplay {
     pub error_code: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum CompletedRecoveryDisposition {
+    Final {
+        text: String,
+        usage: Option<SanitizedUsage>,
+    },
+    Failed {
+        code: &'static str,
+    },
+    Continue,
+}
+
+fn classify_completed_recovery(outcomes: &[RequestStepOutcomeV1]) -> CompletedRecoveryDisposition {
+    let Some(outcome) = outcomes.last() else {
+        return CompletedRecoveryDisposition::Continue;
+    };
+    if outcome.terminal_validation_error.as_deref()
+        == Some(isyncyou_agent::DUPLICATE_TOOL_USE_ID_CODE)
+    {
+        return CompletedRecoveryDisposition::Failed {
+            code: "assistant_tool_response_invalid",
+        };
+    }
+    if outcome
+        .normalized_blocks
+        .iter()
+        .all(|block| matches!(block, NormalizedAssistantBlock::Text { .. }))
+    {
+        return CompletedRecoveryDisposition::Final {
+            text: outcome.final_text.clone().unwrap_or_default(),
+            usage: outcome.sanitized_usage.clone(),
+        };
+    }
+    CompletedRecoveryDisposition::Continue
+}
+
 fn validate_provider_recovery_binding(
     recorded: &ProviderAttemptBindingV1,
     current: &ProviderAttemptBindingV1,
@@ -208,9 +252,118 @@ fn validate_provider_recovery_binding(
     recorded.revalidate(current).map_err(map_session_error)
 }
 
+fn sanitize_provider_usage(usage: Option<&isyncyou_agent::Usage>) -> Option<SanitizedUsage> {
+    usage.map(|usage| SanitizedUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+    })
+}
+
+fn terminal_replay_phase(status: &TurnTerminalStatus) -> RequestPhase {
+    match status {
+        TurnTerminalStatus::Complete => RequestPhase::Committed,
+        TurnTerminalStatus::PendingConfirmation => RequestPhase::PendingConfirmation,
+        TurnTerminalStatus::Cancelled => RequestPhase::Cancelled,
+        TurnTerminalStatus::Error => RequestPhase::Failed,
+        TurnTerminalStatus::OutcomeUnknown => RequestPhase::OutcomeUnknown,
+    }
+}
+
+fn terminal_compaction_due(
+    tombstone: &IdempotencyTombstoneV1,
+    visible_records: &[SessionRecordV2],
+    server_now_ms: u64,
+) -> bool {
+    let terminal_created_at_ms = visible_records
+        .iter()
+        .filter(|record| tombstone.visible_record_ids.contains(&record.record_id))
+        .map(|record| record.created_at_ms)
+        .max();
+    terminal_created_at_ms.is_some_and(|created_at_ms| {
+        terminal_compaction_due_at(tombstone, created_at_ms, server_now_ms)
+    })
+}
+
+fn terminal_compaction_due_at(
+    tombstone: &IdempotencyTombstoneV1,
+    terminal_created_at_ms: u64,
+    server_now_ms: u64,
+) -> bool {
+    tombstone.terminal_status != TurnTerminalStatus::OutcomeUnknown
+        || terminal_created_at_ms
+            .checked_add(OUTCOME_UNKNOWN_RETENTION_MS)
+            .is_some_and(|eligible_at_ms| server_now_ms >= eligible_at_ms)
+}
+
+fn record_ambiguous_provider_step<T>(
+    store: &SessionV2Store<T>,
+    current: VersionedManifest,
+    holder_binding: &str,
+    request_binding: &RequestUuidBindingV1,
+    intent_record: &SessionRecordV2,
+    journal: &RequestJournalV1,
+    created_at_ms: u64,
+) -> Result<(), String>
+where
+    T: SessionV2Transport + Clone + 'static,
+{
+    if journal.phase != RequestPhase::ProviderStepStarted
+        || journal.request_id != request_binding.request_id
+        || journal.turn_id != intent_record.turn_id
+        || intent_record.request_id != request_binding.request_id
+    {
+        return Err("session_store_unavailable".into());
+    }
+    let lease_id = new_ulid().map_err(|_| "session_store_unavailable")?;
+    let mut guard = store
+        .acquire_lease_from_manifest(current, &lease_id, holder_binding)
+        .map_err(map_session_error)?;
+    let observed_head = guard.visible_record_head().map_err(map_session_error)?;
+    let terminal_record = SessionRecordV2 {
+        record_version: SESSION_RECORD_VERSION,
+        record_id: new_ulid().map_err(|_| "session_store_unavailable")?,
+        session_id: journal.session_id.clone(),
+        request_id: journal.request_id.clone(),
+        turn_id: journal.turn_id.clone(),
+        kind: SessionRecordKind::TurnTerminal {
+            status: TurnTerminalStatus::OutcomeUnknown,
+            error_code: Some("turn_outcome_unknown".into()),
+        },
+        parent_record_ids: visible_parent_ids(&[intent_record.record_id.clone()], &observed_head),
+        observed_head,
+        lease: guard.binding().map_err(map_session_error)?,
+        created_at_ms,
+    };
+    let visible_records = vec![terminal_record];
+    let tombstone = IdempotencyTombstoneV1 {
+        tombstone_version: 1,
+        route_domain: request_binding.route_domain.clone(),
+        session_scope: request_binding.session_scope.clone(),
+        request_key: request_binding.request_key.clone(),
+        payload_digest: request_binding.payload_digest.clone(),
+        terminal_status: TurnTerminalStatus::OutcomeUnknown,
+        public_result_digest: request_object_digest(
+            &serde_json::to_vec(&visible_records).map_err(|_| "session_store_unavailable")?,
+        ),
+        visible_record_ids: visible_records
+            .iter()
+            .map(|record| record.record_id.clone())
+            .collect(),
+    };
+    guard
+        .publish_terminal(visible_records, &journal.request_id, tombstone)
+        .map_err(map_session_error)?;
+    guard.release().map_err(map_session_error)?;
+    Ok(())
+}
+
 impl ProductTurnRuntime {
     pub fn request_status_binding(&self) -> (String, String) {
         (self.session_id.clone(), self.request_id.clone())
+    }
+
+    pub fn provider_outcome_is_ambiguous(&self) -> bool {
+        self.journal.phase == RequestPhase::ProviderStepStarted
     }
 
     pub fn provider_history(
@@ -239,6 +392,7 @@ impl ProductTurnRuntime {
         step_seq: u8,
         normalized_blocks: Vec<NormalizedAssistantBlock>,
         final_text: Option<String>,
+        sanitized_usage: Option<SanitizedUsage>,
         terminal_validation_error: Option<String>,
     ) -> Result<(), isyncyou_agent::AgentError> {
         let outcome_id = new_ulid().map_err(|_| {
@@ -257,7 +411,7 @@ impl ProductTurnRuntime {
             model: self.provider_binding.model.clone(),
             normalized_blocks,
             final_text,
-            sanitized_usage: None,
+            sanitized_usage,
             terminal_validation_error,
             outcome_digest: String::new(),
         }
@@ -286,7 +440,8 @@ impl ProductTurnRuntime {
                 isyncyou_agent::AgentError::Provider("session_store_unavailable".into())
             })?,
         ));
-        Ok(())
+        self.publish_pending_request_objects()
+            .map_err(isyncyou_agent::AgentError::Provider)
     }
 
     pub fn finish_final(
@@ -298,6 +453,10 @@ impl ProductTurnRuntime {
         let assistant_id = new_ulid().map_err(|_| "session_store_unavailable")?;
         let terminal_id = new_ulid().map_err(|_| "session_store_unavailable")?;
         let lease = self.guard.binding().map_err(map_session_error)?;
+        let observed_head = self
+            .guard
+            .visible_record_head()
+            .map_err(map_session_error)?;
         let visible_records = vec![
             SessionRecordV2 {
                 record_version: SESSION_RECORD_VERSION,
@@ -310,8 +469,11 @@ impl ProductTurnRuntime {
                     sources: self.sources.clone(),
                     usage,
                 },
-                parent_record_ids: vec![self.intent_record_id.clone()],
-                observed_head: Some(self.intent_record_id.clone()),
+                parent_record_ids: visible_parent_ids(
+                    &[self.intent_record_id.clone()],
+                    &observed_head,
+                ),
+                observed_head,
                 lease: lease.clone(),
                 created_at_ms,
             },
@@ -336,10 +498,13 @@ impl ProductTurnRuntime {
             .publish_terminal_with_request_objects(
                 visible_records.clone(),
                 &self.request_id,
-                tombstone,
+                tombstone.clone(),
                 std::mem::take(&mut self.pending_request_objects),
             )
             .map_err(map_session_error)?;
+        let _ = self
+            .guard
+            .compact_terminal_request(&self.request_id, &tombstone);
         self.context_snapshot_after_publish(visible_records)
     }
 
@@ -352,6 +517,10 @@ impl ProductTurnRuntime {
     ) -> Result<ProductSessionContextSnapshot, String> {
         let terminal_id = new_ulid().map_err(|_| "session_store_unavailable")?;
         let lease = self.guard.binding().map_err(map_session_error)?;
+        let observed_head = self
+            .guard
+            .visible_record_head()
+            .map_err(map_session_error)?;
         let visible_records = vec![SessionRecordV2 {
             record_version: SESSION_RECORD_VERSION,
             record_id: terminal_id,
@@ -359,8 +528,8 @@ impl ProductTurnRuntime {
             request_id: self.request_id.clone(),
             turn_id: self.turn_id.clone(),
             kind: SessionRecordKind::TurnTerminal { status, error_code },
-            parent_record_ids: vec![self.intent_record_id.clone()],
-            observed_head: Some(self.intent_record_id.clone()),
+            parent_record_ids: visible_parent_ids(&[self.intent_record_id.clone()], &observed_head),
+            observed_head,
             lease,
             created_at_ms,
         }];
@@ -369,10 +538,15 @@ impl ProductTurnRuntime {
             .publish_terminal_with_request_objects(
                 visible_records.clone(),
                 &self.request_id,
-                tombstone,
+                tombstone.clone(),
                 std::mem::take(&mut self.pending_request_objects),
             )
             .map_err(map_session_error)?;
+        if status != TurnTerminalStatus::OutcomeUnknown {
+            let _ = self
+                .guard
+                .compact_terminal_request(&self.request_id, &tombstone);
+        }
         self.context_snapshot_after_publish(visible_records)
     }
 
@@ -402,6 +576,10 @@ impl ProductTurnRuntime {
     ) -> Result<ProductSessionContextSnapshot, String> {
         let pending_id = new_ulid().map_err(|_| "session_store_unavailable")?;
         let lease = self.guard.binding().map_err(map_session_error)?;
+        let observed_head = self
+            .guard
+            .visible_record_head()
+            .map_err(map_session_error)?;
         let journal = self.terminal_journal(RequestPhase::PendingConfirmation)?;
         let mut request_objects = std::mem::take(&mut self.pending_request_objects);
         request_objects.push(journal);
@@ -414,18 +592,25 @@ impl ProductTurnRuntime {
             kind: SessionRecordKind::PendingOperation {
                 code: "confirmation_required".into(),
             },
-            parent_record_ids: vec![self.intent_record_id.clone()],
-            observed_head: Some(self.intent_record_id.clone()),
+            parent_record_ids: visible_parent_ids(&[self.intent_record_id.clone()], &observed_head),
+            observed_head,
             lease,
             created_at_ms,
         };
+        let visible_records = vec![pending_record.clone()];
+        let tombstone =
+            self.terminal_tombstone(TurnTerminalStatus::PendingConfirmation, &visible_records)?;
         self.guard
-            .publish(SessionCommitV1 {
-                visible_records: vec![pending_record.clone()],
+            .publish_terminal_with_request_objects(
+                visible_records,
+                &self.request_id,
+                tombstone.clone(),
                 request_objects,
-                uuid_bindings: vec![],
-            })
+            )
             .map_err(map_session_error)?;
+        let _ = self
+            .guard
+            .compact_terminal_request(&self.request_id, &tombstone);
         self.context_snapshot_after_publish(vec![pending_record])
     }
 
@@ -463,15 +648,18 @@ impl ProductTurnRuntime {
 
     fn publish_journal(&mut self) -> Result<(), String> {
         let journal_id = new_ulid().map_err(|_| "session_store_unavailable")?;
-        let mut request_objects = self.pending_request_objects.clone();
-        request_objects.push((
+        self.pending_request_objects.push((
             journal_id,
             serde_json::to_vec(&self.journal).map_err(|_| "session_store_unavailable")?,
         ));
+        self.publish_pending_request_objects()
+    }
+
+    fn publish_pending_request_objects(&mut self) -> Result<(), String> {
         self.guard
             .publish(SessionCommitV1 {
                 visible_records: vec![],
-                request_objects,
+                request_objects: self.pending_request_objects.clone(),
                 uuid_bindings: vec![],
             })
             .map_err(map_session_error)?;
@@ -536,6 +724,11 @@ fn recover_provider_messages_runtime<R: RecoveryRuntimeState>(
     executor: &dyn isyncyou_agent::ToolExecutor,
 ) -> Result<(), isyncyou_agent::AgentError> {
     for outcome in outcomes {
+        if outcome.terminal_validation_error.is_some() {
+            return Err(isyncyou_agent::AgentError::Provider(
+                isyncyou_agent::DUPLICATE_TOOL_USE_ID_CODE.into(),
+            ));
+        }
         let mut text = String::new();
         let mut tool_uses = Vec::new();
         for block in &outcome.normalized_blocks {
@@ -747,9 +940,6 @@ impl TurnObserver for ProductTurnRuntime {
                 "turn_outcome_unknown".into(),
             ));
         }
-        if self.prepublished_provider_step.take() == Some(step_seq) {
-            return Ok(());
-        }
         self.journal.phase = RequestPhase::ProviderStepStarted;
         self.publish_journal()
             .map_err(isyncyou_agent::AgentError::Provider)
@@ -759,6 +949,7 @@ impl TurnObserver for ProductTurnRuntime {
         &mut self,
         step_seq: u8,
         blocks: &[AssistantBlock],
+        usage: Option<&isyncyou_agent::Usage>,
     ) -> Result<(), isyncyou_agent::AgentError> {
         if step_seq != self.journal.next_step_seq {
             return Err(isyncyou_agent::AgentError::Provider(
@@ -783,10 +974,11 @@ impl TurnObserver for ProductTurnRuntime {
                 step_seq,
                 Vec::new(),
                 None,
-                Some("duplicate_tool_use_id".into()),
+                sanitize_provider_usage(usage),
+                Some(isyncyou_agent::DUPLICATE_TOOL_USE_ID_CODE.into()),
             )?;
             return Err(isyncyou_agent::AgentError::Provider(
-                "duplicate_tool_use_id".into(),
+                isyncyou_agent::DUPLICATE_TOOL_USE_ID_CODE.into(),
             ));
         }
         self.seen_tool_use_ids.extend(step_tool_use_ids);
@@ -820,6 +1012,7 @@ impl TurnObserver for ProductTurnRuntime {
             step_seq,
             normalized_blocks,
             (!final_text.is_empty()).then_some(final_text),
+            sanitize_provider_usage(usage),
             None,
         )
     }
@@ -831,11 +1024,14 @@ impl TurnObserver for ProductTurnRuntime {
         action: &ToolAction,
         local_effect: Option<&LocalEffectCheckpointV1>,
     ) -> Result<(), isyncyou_agent::AgentError> {
+        let policy = action.recovery_policy();
         if self.journal.read_checkpoints.len() >= isyncyou_agent::MAX_TOOL_CHECKPOINTS
             || self.journal.read_checkpoints.iter().any(|checkpoint| {
                 checkpoint.provider_step_seq == step_seq && checkpoint.tool_use_id == tool_use_id
             })
-            || action.recovery_policy() == isyncyou_agent::RecoveryPolicy::NeverRepeat
+            || policy == isyncyou_agent::RecoveryPolicy::NeverRepeat
+            || (policy == isyncyou_agent::RecoveryPolicy::IdempotentLocalMaterialize)
+                != local_effect.is_some()
         {
             return Err(isyncyou_agent::AgentError::Provider(
                 "turn_outcome_unknown".into(),
@@ -845,18 +1041,19 @@ impl TurnObserver for ProductTurnRuntime {
             provider_step_seq: step_seq,
             tool_use_id: tool_use_id.to_owned(),
             action: action.clone(),
-            policy: action.recovery_policy(),
+            policy,
             result_sha256: String::new(),
             local_effect: local_effect.cloned(),
         });
-        Ok(())
+        self.publish_journal()
+            .map_err(isyncyou_agent::AgentError::Provider)
     }
 
     fn read_tool_completed(
         &mut self,
         step_seq: u8,
         tool_use_id: &str,
-        _action: &ToolAction,
+        action: &ToolAction,
         result: &str,
     ) -> Result<(), isyncyou_agent::AgentError> {
         let checkpoint = self
@@ -868,12 +1065,21 @@ impl TurnObserver for ProductTurnRuntime {
                 checkpoint.provider_step_seq == step_seq && checkpoint.tool_use_id == tool_use_id
             })
             .ok_or_else(|| isyncyou_agent::AgentError::Provider("turn_outcome_unknown".into()))?;
+        if checkpoint.action != *action || checkpoint.policy != action.recovery_policy() {
+            return Err(isyncyou_agent::AgentError::Provider(
+                "turn_outcome_unknown".into(),
+            ));
+        }
         checkpoint.result_sha256 = tool_result_digest(result.as_bytes());
         if let Some(local_effect) = &mut checkpoint.local_effect {
             local_effect.state = isyncyou_agent::LocalEffectState::Committed;
         }
         collect_source_refs(result, &mut self.sources);
-        Ok(())
+        self.publish_journal().map_err(|_| {
+            // The read or deterministic local materialization already completed. A failed or
+            // ambiguous checkpoint publication must never be flattened into an ordinary error.
+            isyncyou_agent::AgentError::Provider("turn_outcome_unknown".into())
+        })
     }
 }
 
@@ -1243,12 +1449,19 @@ impl<'a> ProductSessionRegistry<'a> {
         session_id: &str,
         transport: OneDriveSessionV2Transport,
     ) -> Result<SessionV2Store<OneDriveSessionV2Transport>, String> {
+        self.open_known_with_transport(session_id, transport, false)
+    }
+
+    fn open_known_with_transport(
+        &self,
+        session_id: &str,
+        transport: OneDriveSessionV2Transport,
+        allow_archived: bool,
+    ) -> Result<SessionV2Store<OneDriveSessionV2Transport>, String> {
         let index = self.load_index()?;
-        if !index
-            .sessions
-            .iter()
-            .any(|session| session.session_id == session_id && !session.archived)
-        {
+        if !index.sessions.iter().any(|session| {
+            session.session_id == session_id && (allow_archived || !session.archived)
+        }) {
             return Err("session_not_found".into());
         }
         let payload = self.load_payload(session_id)?;
@@ -1267,6 +1480,66 @@ impl<'a> ProductSessionRegistry<'a> {
             .domain_hmac(CURSOR_HMAC_DOMAIN, session_id.as_bytes())
             .map_err(|_| "session_store_unavailable")?;
         Ok(SessionV2Store::new(transport, &cursor_key, object_crypto))
+    }
+
+    pub(crate) fn maintenance_targets(
+        &self,
+    ) -> Result<Vec<ProductSessionMaintenanceTarget>, String> {
+        let index = self.load_index()?;
+        let mut targets = index
+            .sessions
+            .into_iter()
+            .filter(|session| session.remote_initialized != Some(false))
+            .map(|session| ProductSessionMaintenanceTarget {
+                session_id: session.session_id,
+                local_account: session.local_account,
+            })
+            .collect::<Vec<_>>();
+        targets.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        Ok(targets)
+    }
+
+    pub(crate) fn maintain_remote_session(
+        &self,
+        graph_token: &str,
+        target: &ProductSessionMaintenanceTarget,
+        candidate_limit: usize,
+    ) -> Result<usize, String> {
+        let transport = OneDriveSessionV2Transport::new(graph_token, &target.session_id)
+            .map_err(map_session_error)?;
+        let session = self.open_known_with_transport(&target.session_id, transport, true)?;
+        let (current, server_time) = session
+            .current_manifest_with_server_time(&target.session_id)
+            .map_err(map_session_error)?;
+        let candidates = session
+            .terminal_compaction_candidates_from_manifest(&current, candidate_limit)
+            .map_err(map_session_error)?;
+        let lease_id = new_ulid().map_err(|_| "session_store_unavailable")?;
+        let holder_binding = self
+            .store
+            .domain_hmac(MAINTENANCE_HOLDER_DOMAIN, target.session_id.as_bytes())
+            .map(|bytes| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+            .map_err(|_| "session_store_unavailable")?;
+        let mut guard = session
+            .acquire_lease_from_manifest(current, &lease_id, &holder_binding)
+            .map_err(map_session_error)?;
+        let mut compacted = 0usize;
+        for candidate in candidates {
+            if !terminal_compaction_due_at(
+                &candidate.tombstone,
+                candidate.terminal_created_at_ms,
+                server_time.server_unix_ms,
+            ) {
+                continue;
+            }
+            guard
+                .compact_terminal_request(&candidate.request_id, &candidate.tombstone)
+                .map_err(map_session_error)?;
+            compacted = compacted.saturating_add(1);
+        }
+        let _ = guard.reap_orphans();
+        guard.release().map_err(map_session_error)?;
+        Ok(compacted)
     }
 
     pub fn remote_initialization_pending(&self, session_id: &str) -> Result<bool, String> {
@@ -1379,12 +1652,14 @@ impl<'a> ProductSessionRegistry<'a> {
             .map_err(map_session_error)?;
         let record_id = new_ulid().map_err(|_| "session_store_unavailable")?;
         let lease = guard.binding().map_err(map_session_error)?;
+        let observed_head = guard.visible_record_head().map_err(map_session_error)?;
         guard
             .publish(SessionCommitV1 {
                 visible_records: vec![pending_cancelled_record(
                     owner,
                     record_id,
                     pending_record_id,
+                    observed_head,
                     lease,
                     created_at_ms,
                 )],
@@ -1406,6 +1681,7 @@ impl<'a> ProductSessionRegistry<'a> {
             installation_principal,
             created_at_ms,
             cached_context,
+            context_budget,
         } = request;
         // This runs only in the admission worker. The route has already returned
         // the deterministic turn ID, so Graph manifest creation cannot delay the
@@ -1425,17 +1701,13 @@ impl<'a> ProductSessionRegistry<'a> {
         .into_iter()
         .filter(|record| record.request_id != request_id)
         .collect::<Vec<_>>();
-        let provider_history = select_provider_context(
-            &context_records,
-            None,
-            &isyncyou_agent::ContextBudget::default(),
-        )
-        .into_iter()
-        .map(|message| match message.role {
-            "assistant" => isyncyou_agent::Message::assistant(message.text, vec![]),
-            _ => isyncyou_agent::Message::user(message.text),
-        })
-        .collect();
+        let provider_history = select_provider_context(&context_records, None, &context_budget)
+            .into_iter()
+            .map(|message| match message.role {
+                "assistant" => isyncyou_agent::Message::assistant(message.text, vec![]),
+                _ => isyncyou_agent::Message::user(message.text),
+            })
+            .collect();
         let request_binding = RequestUuidBindingV1::new(
             RequestRouteDomain::AgentTurn,
             session_id,
@@ -1450,7 +1722,7 @@ impl<'a> ProductSessionRegistry<'a> {
             let mut final_text = None;
             let mut error_code = None;
             let mut intent_record = None;
-            for record in replay.visible_records {
+            for record in &replay.visible_records {
                 match &record.kind {
                     SessionRecordKind::TurnIntent { .. } => intent_record = Some(record.clone()),
                     SessionRecordKind::AssistantResult { text, .. } => {
@@ -1463,13 +1735,30 @@ impl<'a> ProductSessionRegistry<'a> {
                 }
             }
             if let Some(tombstone) = replay.tombstone {
-                let phase = match tombstone.terminal_status {
-                    TurnTerminalStatus::Complete => RequestPhase::Committed,
-                    TurnTerminalStatus::Cancelled => RequestPhase::Cancelled,
-                    TurnTerminalStatus::Error | TurnTerminalStatus::OutcomeUnknown => {
-                        RequestPhase::Failed
+                let phase = terminal_replay_phase(&tombstone.terminal_status);
+                if terminal_compaction_due(
+                    &tombstone,
+                    &replay.visible_records,
+                    admission_time.server_unix_ms,
+                ) {
+                    let lease_id = new_ulid().map_err(|_| "session_store_unavailable")?;
+                    let holder_binding = self
+                        .store
+                        .domain_hmac(
+                            TURN_HOLDER_DOMAIN,
+                            format!("{installation_principal}:{session_id}").as_bytes(),
+                        )
+                        .map(|bytes| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+                        .map_err(|_| "session_store_unavailable")?;
+                    if let Ok(mut guard) = store.acquire_lease_from_manifest(
+                        current.clone(),
+                        &lease_id,
+                        &holder_binding,
+                    ) {
+                        let _ = guard.compact_terminal_request(request_id, &tombstone);
+                        let _ = guard.release();
                     }
-                };
+                }
                 return Ok(ProductTurnStart::Replay(ProductTurnReplay {
                     phase,
                     final_text,
@@ -1507,7 +1796,6 @@ impl<'a> ProductSessionRegistry<'a> {
                     context_records: context_records.clone(),
                     journal: journal.clone(),
                     pending_request_objects: Vec::new(),
-                    prepublished_provider_step: None,
                     seen_tool_use_ids: replay
                         .outcomes
                         .iter()
@@ -1524,28 +1812,60 @@ impl<'a> ProductSessionRegistry<'a> {
                     recovery_outcomes: replay.outcomes,
                     sources: Vec::new(),
                 };
-                if runtime.journal.phase == RequestPhase::ProviderStepCompleted
-                    && runtime.recovery_outcomes.last().is_some_and(|outcome| {
-                        outcome
-                            .normalized_blocks
-                            .iter()
-                            .all(|block| matches!(block, NormalizedAssistantBlock::Text { .. }))
-                    })
-                {
-                    let text = runtime
-                        .recovery_outcomes
-                        .last()
-                        .and_then(|outcome| outcome.final_text.clone())
-                        .unwrap_or_default();
-                    runtime.finish_final(text.clone(), None, created_at_ms)?;
-                    return Ok(ProductTurnStart::Replay(ProductTurnReplay {
-                        phase: RequestPhase::Committed,
-                        final_text: Some(text),
-                        error_code: None,
-                    }));
+                if runtime.journal.phase == RequestPhase::ProviderStepCompleted {
+                    match classify_completed_recovery(&runtime.recovery_outcomes) {
+                        CompletedRecoveryDisposition::Final { text, usage } => {
+                            runtime.finish_final(text.clone(), usage, created_at_ms)?;
+                            return Ok(ProductTurnStart::Replay(ProductTurnReplay {
+                                phase: RequestPhase::Committed,
+                                final_text: Some(text),
+                                error_code: None,
+                            }));
+                        }
+                        CompletedRecoveryDisposition::Failed { code } => {
+                            runtime.finish_terminal(
+                                TurnTerminalStatus::Error,
+                                Some(code.into()),
+                                RequestPhase::Failed,
+                                created_at_ms,
+                            )?;
+                            return Ok(ProductTurnStart::Replay(ProductTurnReplay {
+                                phase: RequestPhase::Failed,
+                                final_text: None,
+                                error_code: Some(code.into()),
+                            }));
+                        }
+                        CompletedRecoveryDisposition::Continue => {}
+                    }
                 }
                 runtime.guard.finish_admission();
                 return Ok(ProductTurnStart::Started(Box::new(runtime)));
+            }
+            if journal.phase == RequestPhase::ProviderStepStarted {
+                let holder_binding = self
+                    .store
+                    .domain_hmac(
+                        TURN_HOLDER_DOMAIN,
+                        format!("{installation_principal}:{session_id}").as_bytes(),
+                    )
+                    .map(|bytes| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+                    .map_err(|_| "session_store_unavailable")?;
+                let intent_record =
+                    intent_record.ok_or_else(|| "session_store_unavailable".to_string())?;
+                record_ambiguous_provider_step(
+                    &store,
+                    current,
+                    &holder_binding,
+                    &request_binding,
+                    &intent_record,
+                    &journal,
+                    created_at_ms,
+                )?;
+                return Ok(ProductTurnStart::Replay(ProductTurnReplay {
+                    phase: RequestPhase::OutcomeUnknown,
+                    final_text,
+                    error_code: Some("turn_outcome_unknown".into()),
+                }));
             }
             return Ok(ProductTurnStart::Replay(ProductTurnReplay {
                 phase: journal.phase.recovery_phase(),
@@ -1574,16 +1894,14 @@ impl<'a> ProductSessionRegistry<'a> {
             request_id: request_id.to_owned(),
             turn_id: turn_id.clone(),
             provider_binding: provider_binding.clone(),
-            // Publish the first provider-start marker with admission. This removes a second
-            // manifest round trip before the first model request while retaining the
-            // conservative crash boundary: a restart never repeats this provider step.
-            phase: RequestPhase::ProviderStepStarted,
+            phase: RequestPhase::Accepted,
             next_step_seq: 0,
             completed_steps: vec![],
             read_checkpoints: vec![],
         };
         let journal_bytes =
             serde_json::to_vec(&journal).map_err(|_| "session_store_unavailable")?;
+        let observed_head = current.manifest.visible_record_head.clone();
         let intent_record = SessionRecordV2 {
             record_version: SESSION_RECORD_VERSION,
             record_id: intent_record_id.clone(),
@@ -1593,8 +1911,8 @@ impl<'a> ProductSessionRegistry<'a> {
             kind: SessionRecordKind::TurnIntent {
                 user_text: prompt.to_owned(),
             },
-            parent_record_ids: vec![],
-            observed_head: None,
+            parent_record_ids: visible_parent_ids(&[], &observed_head),
+            observed_head,
             lease: PersistedLeaseBinding {
                 lease_id: String::new(),
                 holder_binding: String::new(),
@@ -1635,7 +1953,6 @@ impl<'a> ProductSessionRegistry<'a> {
             context_records,
             journal,
             pending_request_objects: Vec::new(),
-            prepublished_provider_step: Some(0),
             seen_tool_use_ids: std::collections::BTreeSet::new(),
             provider_history,
             recovery_outcomes: Vec::new(),
@@ -1734,6 +2051,7 @@ fn pending_cancelled_record(
     owner: &PendingOwnerBinding,
     record_id: String,
     pending_record_id: String,
+    observed_head: Option<String>,
     lease: isyncyou_agent::PersistedLeaseBinding,
     created_at_ms: u64,
 ) -> SessionRecordV2 {
@@ -1746,11 +2064,21 @@ fn pending_cancelled_record(
         kind: SessionRecordKind::OperationState {
             code: "cancelled".into(),
         },
-        parent_record_ids: vec![pending_record_id.clone()],
-        observed_head: Some(pending_record_id),
+        parent_record_ids: visible_parent_ids(&[pending_record_id], &observed_head),
+        observed_head,
         lease,
         created_at_ms,
     }
+}
+
+fn visible_parent_ids(logical_parents: &[String], observed_head: &Option<String>) -> Vec<String> {
+    let mut parents = logical_parents.to_vec();
+    if let Some(head) = observed_head {
+        if !parents.contains(head) {
+            parents.push(head.clone());
+        }
+    }
+    parents
 }
 
 fn collect_source_refs(result: &str, output: &mut Vec<SourceRef>) {
@@ -1845,6 +2173,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use isyncyou_agent::InMemorySessionV2Transport;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2054,6 +2383,102 @@ mod tests {
     }
 
     #[test]
+    fn crash_after_provider_step_started_records_outcome_unknown_and_retains_diagnostics() {
+        const SESSION_ID: &str = "01J00000000000000000000000";
+        const REQUEST_ID: &str = "123e4567-e89b-42d3-a456-426614174000";
+        const TURN_ID: &str = "01J00000000000000000000001";
+        const INTENT_ID: &str = "01J00000000000000000000002";
+        const JOURNAL_ID: &str = "01J00000000000000000000003";
+
+        let payload = PairingPayload::generate(SessionId::new(SESSION_ID).unwrap()).unwrap();
+        let crypto =
+            SessionObjectCrypto::new(payload.pairing_secret(), payload.crypto_config().unwrap())
+                .unwrap();
+        let transport = InMemorySessionV2Transport::default();
+        transport.set_server_time_ms(10_000);
+        transport.create_session(SESSION_ID).unwrap();
+        let store = SessionV2Store::new(transport.clone(), &[73; 32], crypto);
+        let mut guard = store
+            .acquire_lease(SESSION_ID, "lease-a", "holder-a")
+            .unwrap();
+        let request_binding = RequestUuidBindingV1::new(
+            RequestRouteDomain::AgentTurn,
+            SESSION_ID,
+            REQUEST_ID,
+            payload_digest(&(SESSION_ID, "me", "question")).unwrap(),
+        )
+        .unwrap();
+        let intent_record = SessionRecordV2 {
+            record_version: SESSION_RECORD_VERSION,
+            record_id: INTENT_ID.into(),
+            session_id: SESSION_ID.into(),
+            request_id: REQUEST_ID.into(),
+            turn_id: TURN_ID.into(),
+            kind: SessionRecordKind::TurnIntent {
+                user_text: "question".into(),
+            },
+            parent_record_ids: vec![],
+            observed_head: None,
+            lease: guard.binding().unwrap(),
+            created_at_ms: 1,
+        };
+        let journal = RequestJournalV1 {
+            journal_version: REQUEST_JOURNAL_VERSION,
+            session_id: SESSION_ID.into(),
+            request_id: REQUEST_ID.into(),
+            turn_id: TURN_ID.into(),
+            provider_binding: recovery_binding(),
+            phase: RequestPhase::ProviderStepStarted,
+            next_step_seq: 0,
+            completed_steps: vec![],
+            read_checkpoints: vec![],
+        };
+        guard
+            .publish(SessionCommitV1 {
+                visible_records: vec![intent_record.clone()],
+                request_objects: vec![(JOURNAL_ID.into(), serde_json::to_vec(&journal).unwrap())],
+                uuid_bindings: vec![request_binding.clone()],
+            })
+            .unwrap();
+        guard.release().unwrap();
+
+        let current = store.current_manifest(SESSION_ID).unwrap();
+        record_ambiguous_provider_step(
+            &store,
+            current,
+            "holder-recovery",
+            &request_binding,
+            &intent_record,
+            &journal,
+            2,
+        )
+        .unwrap();
+
+        let current = store.current_manifest(SESSION_ID).unwrap();
+        assert_eq!(current.manifest.internal_record_count, 3);
+        let replay = store
+            .request_replay_from_manifest(&current, &request_binding)
+            .unwrap()
+            .unwrap();
+        assert!(replay.journal.is_none());
+        assert!(replay.outcomes.is_empty());
+        assert!(matches!(
+            replay.tombstone,
+            Some(IdempotencyTombstoneV1 {
+                terminal_status: TurnTerminalStatus::OutcomeUnknown,
+                ..
+            })
+        ));
+        assert!(replay.visible_records.iter().any(|record| matches!(
+            &record.kind,
+            SessionRecordKind::TurnTerminal {
+                status: TurnTerminalStatus::OutcomeUnknown,
+                error_code: Some(code),
+            } if code == "turn_outcome_unknown"
+        )));
+    }
+
+    #[test]
     fn pending_cancel_transcript_record_is_redacted_and_owner_bound() {
         let owner = PendingOwnerBinding {
             account: "private-account-alias".into(),
@@ -2065,6 +2490,7 @@ mod tests {
             &owner,
             "01J00000000000000000000002".into(),
             "01J00000000000000000000003".into(),
+            Some("01J00000000000000000000003".into()),
             isyncyou_agent::PersistedLeaseBinding {
                 lease_id: "lease".into(),
                 fence: 7,
@@ -2348,7 +2774,7 @@ mod tests {
             .and_then(|source| source.split("self.seen_tool_use_ids.extend").next())
             .expect("invalid tool-use branch");
         assert!(invalid_branch.contains("persist_provider_step_outcome"));
-        assert!(invalid_branch.contains("Some(\"duplicate_tool_use_id\".into())"));
+        assert!(invalid_branch.contains("Some(isyncyou_agent::DUPLICATE_TOOL_USE_ID_CODE.into())"));
 
         let binding = recovery_binding();
         let outcome = RequestStepOutcomeV1 {
@@ -2369,7 +2795,171 @@ mod tests {
         outcome.validate(&binding).unwrap();
         assert_eq!(
             outcome.terminal_validation_error.as_deref(),
-            Some("duplicate_tool_use_id")
+            Some(isyncyou_agent::DUPLICATE_TOOL_USE_ID_CODE)
+        );
+    }
+
+    #[test]
+    fn crash_after_terminal_tool_validation_error_replays_failed_not_empty_success() {
+        let binding = recovery_binding();
+        let outcome = RequestStepOutcomeV1 {
+            outcome_version: 1,
+            outcome_id: new_ulid().unwrap(),
+            step_seq: 0,
+            previous_outcome_id: None,
+            provider: binding.provider,
+            model: binding.model.clone(),
+            normalized_blocks: vec![],
+            final_text: None,
+            sanitized_usage: None,
+            terminal_validation_error: Some(isyncyou_agent::DUPLICATE_TOOL_USE_ID_CODE.into()),
+            outcome_digest: String::new(),
+        }
+        .seal_digest()
+        .unwrap();
+        assert_eq!(
+            classify_completed_recovery(std::slice::from_ref(&outcome)),
+            CompletedRecoveryDisposition::Failed {
+                code: "assistant_tool_response_invalid"
+            }
+        );
+
+        let executor = RecoveryExecutor {
+            result: "must-not-run".into(),
+            calls: AtomicUsize::new(0),
+        };
+        let error = recover_provider_messages(
+            &mut vec![isyncyou_agent::Message::user("question")],
+            &[outcome],
+            &recovery_journal(binding, vec![], 1),
+            &executor,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            isyncyou_agent::AgentError::Provider(code)
+                if code == isyncyou_agent::DUPLICATE_TOOL_USE_ID_CODE
+        ));
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn turn_admission_and_step_checkpoints_publish_at_their_exact_boundaries() {
+        let source = include_str!("product_session.rs");
+        let admission = source
+            .split("let journal = RequestJournalV1")
+            .nth(1)
+            .and_then(|source| source.split("let journal_bytes").next())
+            .expect("turn admission journal");
+        assert!(admission.contains("phase: RequestPhase::Accepted"));
+        assert!(!admission.contains("phase: RequestPhase::ProviderStepStarted"));
+
+        let provider_started = source
+            .split("fn provider_step_started")
+            .nth(1)
+            .and_then(|source| source.split("fn provider_step_completed").next())
+            .expect("provider-start transition");
+        assert!(provider_started.contains("RequestPhase::ProviderStepStarted"));
+        assert!(provider_started.contains("publish_journal"));
+
+        let provider_completed = source
+            .split("fn persist_provider_step_outcome")
+            .nth(1)
+            .and_then(|source| source.split("pub fn finish_final").next())
+            .expect("provider-complete transition");
+        assert!(provider_completed.contains("publish_pending_request_objects"));
+
+        for boundary in ["fn read_tool_started", "fn read_tool_completed"] {
+            let transition = source
+                .split(boundary)
+                .nth(1)
+                .and_then(|source| source.split("\n    fn ").next())
+                .expect("read checkpoint transition");
+            assert!(transition.contains("publish_journal"), "{boundary}");
+        }
+    }
+
+    #[test]
+    fn provider_step_usage_is_sanitized_before_session_persistence() {
+        let usage = isyncyou_agent::Usage {
+            input_tokens: 41,
+            output_tokens: 17,
+            provider: "provider-sensitive".into(),
+            model: "model-sensitive".into(),
+            request_id: Some("request-sensitive".into()),
+            rate_limit: std::collections::BTreeMap::from([(
+                "header-sensitive".into(),
+                "value-sensitive".into(),
+            )]),
+        };
+
+        let sanitized = sanitize_provider_usage(Some(&usage)).expect("sanitized usage");
+        assert_eq!(sanitized.input_tokens, 41);
+        assert_eq!(sanitized.output_tokens, 17);
+        let encoded = serde_json::to_string(&sanitized).unwrap();
+        assert!(!encoded.contains("sensitive"));
+    }
+
+    #[test]
+    fn outcome_unknown_compaction_waits_for_seven_day_retention() {
+        let terminal = SessionRecordV2 {
+            record_version: SESSION_RECORD_VERSION,
+            record_id: "01J0000000000000000000000A".into(),
+            session_id: "01J00000000000000000000000".into(),
+            request_id: "123e4567-e89b-42d3-a456-426614174000".into(),
+            turn_id: "01J00000000000000000000001".into(),
+            kind: SessionRecordKind::TurnTerminal {
+                status: TurnTerminalStatus::OutcomeUnknown,
+                error_code: Some("turn_outcome_unknown".into()),
+            },
+            parent_record_ids: vec!["01J00000000000000000000002".into()],
+            observed_head: Some("01J00000000000000000000002".into()),
+            lease: PersistedLeaseBinding {
+                lease_id: "lease-a".into(),
+                holder_binding: "holder-a".into(),
+                fence: 1,
+                expires_at_server_ms: u64::MAX,
+            },
+            created_at_ms: 10_000,
+        };
+        let tombstone = IdempotencyTombstoneV1 {
+            tombstone_version: 1,
+            route_domain: RequestRouteDomain::AgentTurn.canonical().into(),
+            session_scope: terminal.session_id.clone(),
+            request_key: request_object_digest(b"request-key"),
+            payload_digest: request_object_digest(b"payload"),
+            terminal_status: TurnTerminalStatus::OutcomeUnknown,
+            public_result_digest: request_object_digest(
+                &serde_json::to_vec(&vec![terminal.clone()]).unwrap(),
+            ),
+            visible_record_ids: vec![terminal.record_id.clone()],
+        };
+
+        assert!(!terminal_compaction_due(
+            &tombstone,
+            std::slice::from_ref(&terminal),
+            10_000 + OUTCOME_UNKNOWN_RETENTION_MS - 1,
+        ));
+        assert!(terminal_compaction_due(
+            &tombstone,
+            std::slice::from_ref(&terminal),
+            10_000 + OUTCOME_UNKNOWN_RETENTION_MS,
+        ));
+        let mut complete = tombstone;
+        complete.terminal_status = TurnTerminalStatus::Complete;
+        assert!(terminal_compaction_due(&complete, &[terminal], 10_000));
+    }
+
+    #[test]
+    fn outcome_unknown_terminal_replay_preserves_ambiguous_phase() {
+        assert_eq!(
+            terminal_replay_phase(&TurnTerminalStatus::OutcomeUnknown),
+            RequestPhase::OutcomeUnknown
+        );
+        assert_eq!(
+            terminal_replay_phase(&TurnTerminalStatus::Error),
+            RequestPhase::Failed
         );
     }
 }

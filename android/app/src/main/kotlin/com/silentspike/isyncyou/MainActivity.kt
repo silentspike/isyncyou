@@ -482,7 +482,7 @@ class MainActivity : FragmentActivity() {
 
     private fun sanitizedBridgeRequest(obj: JSONObject): String {
         val path = obj.optString("path", "/")
-        val storageNotLow = if (path == "/api/v1/mutation-intent/create") {
+        val storageNotLow = if (BridgeMessagePolicy.requiresTrustedStorageNotLow(path)) {
             registerReceiver(null, IntentFilter(Intent.ACTION_DEVICE_STORAGE_LOW)) == null
         } else {
             null

@@ -11,6 +11,9 @@ from pathlib import Path
 
 
 STABLE_REF = re.compile(r"^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+RC_TAG = re.compile(
+    r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.(0|[1-9][0-9]*)$"
+)
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 EXPECTED_ASSETS = {
     "isyncyou-linux-x86_64.tar.gz",
@@ -36,6 +39,65 @@ class ContractError(ValueError):
     """A release input or postcondition violates the closed contract."""
 
 
+def _asset_names(data: dict) -> set[str]:
+    assets = data.get("assets")
+    if not isinstance(assets, list) or any(not isinstance(asset, dict) for asset in assets):
+        raise ContractError("invalid release assets")
+    names = [asset.get("name") for asset in assets]
+    if any(not isinstance(name, str) or not name for name in names):
+        raise ContractError("invalid release asset name")
+    if len(names) != len(set(names)):
+        raise ContractError("duplicate release asset name")
+    return set(names)
+
+
+def candidate_rc_tags(data: object, sha: str) -> list[str]:
+    """Return only RC releases whose object claims the exact candidate commit.
+
+    The caller must still resolve each returned Git tag and pass that map to
+    ``select_matching_rc``. A release object's target text is not commit proof.
+    """
+    if not COMMIT.fullmatch(sha):
+        raise ContractError("invalid github sha")
+    if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
+        raise ContractError("invalid release list")
+    result: list[str] = []
+    seen: set[str] = set()
+    required = {
+        "isyncyou-android-arm64.apk",
+        "isyncyou-android-arm64.apk.sha256",
+    }
+    for item in data:
+        tag = item.get("tag_name")
+        if not isinstance(tag, str) or not RC_TAG.fullmatch(tag):
+            continue
+        if item.get("draft") is not False or item.get("prerelease") is not True:
+            continue
+        if item.get("target_commitish") != sha:
+            continue
+        if not required.issubset(_asset_names(item)):
+            continue
+        if tag in seen:
+            raise ContractError("duplicate RC release tag")
+        seen.add(tag)
+        result.append(tag)
+    return result
+
+
+def select_matching_rc(data: object, tag_commits: object, sha: str) -> str:
+    if not isinstance(tag_commits, dict) or any(
+        not isinstance(tag, str)
+        or not isinstance(commit, str)
+        or not COMMIT.fullmatch(commit)
+        for tag, commit in tag_commits.items()
+    ):
+        raise ContractError("invalid RC tag commit map")
+    for tag in candidate_rc_tags(data, sha):
+        if tag_commits.get(tag) == sha:
+            return tag
+    raise ContractError("no matching RC tag commit")
+
+
 def classify(event: str, ref: str, sha: str, expected_commit: str | None = "") -> tuple[str, str]:
     if not isinstance(sha, str) or not COMMIT.fullmatch(sha):
         raise ContractError("invalid github sha")
@@ -51,6 +113,12 @@ def classify(event: str, ref: str, sha: str, expected_commit: str | None = "") -
 
 
 def validate_release_object(data: dict, mode: str, tag: str, sha: str) -> None:
+    if not isinstance(data, dict) or not COMMIT.fullmatch(sha):
+        raise ContractError("invalid release object")
+    expected_tag = RC_TAG if mode == "rc" else STABLE_REF
+    tag_value = tag if mode == "rc" else f"refs/tags/{tag}"
+    if not expected_tag.fullmatch(tag_value):
+        raise ContractError("invalid release tag")
     if data.get("tag_name") != tag:
         raise ContractError("release tag mismatch")
     if data.get("draft") is not False:
@@ -59,7 +127,7 @@ def validate_release_object(data: dict, mode: str, tag: str, sha: str) -> None:
         raise ContractError("release prerelease flag mismatch")
     if data.get("target_commitish") != sha:
         raise ContractError("release target mismatch")
-    names = {asset.get("name") for asset in data.get("assets", []) if isinstance(asset, dict)}
+    names = _asset_names(data)
     missing = sorted(EXPECTED_ASSETS - names)
     if missing:
         raise ContractError("missing release assets: " + ",".join(missing))
@@ -73,6 +141,13 @@ def main() -> int:
     classify_parser.add_argument("--ref", required=True)
     classify_parser.add_argument("--sha", required=True)
     classify_parser.add_argument("--expected-commit", default="")
+    candidates_parser = subparsers.add_parser("candidate-rc-tags")
+    candidates_parser.add_argument("--json", type=Path, required=True)
+    candidates_parser.add_argument("--sha", required=True)
+    select_parser = subparsers.add_parser("select-rc")
+    select_parser.add_argument("--json", type=Path, required=True)
+    select_parser.add_argument("--tag-commits-json", type=Path, required=True)
+    select_parser.add_argument("--sha", required=True)
     validate_parser = subparsers.add_parser("validate-release")
     validate_parser.add_argument("--json", type=Path, required=True)
     validate_parser.add_argument("--mode", choices=("rc", "stable"), required=True)
@@ -83,6 +158,14 @@ def main() -> int:
         if args.command == "classify":
             mode, tag = classify(args.event, args.ref, args.sha, args.expected_commit)
             print(json.dumps({"mode": mode, "tag": tag}, separators=(",", ":")))
+        elif args.command == "candidate-rc-tags":
+            releases = json.loads(args.json.read_text())
+            for tag in candidate_rc_tags(releases, args.sha):
+                print(tag)
+        elif args.command == "select-rc":
+            releases = json.loads(args.json.read_text())
+            tag_commits = json.loads(args.tag_commits_json.read_text())
+            print(select_matching_rc(releases, tag_commits, args.sha))
         else:
             validate_release_object(json.loads(args.json.read_text()), args.mode, args.tag, args.sha)
     except (ContractError, json.JSONDecodeError, OSError) as error:

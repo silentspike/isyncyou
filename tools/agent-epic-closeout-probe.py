@@ -31,16 +31,36 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+try:
+    from tools.release_workflow_contract import (
+        ContractError as ReleaseContractError,
+        EXPECTED_ASSETS as EXPECTED_RELEASE_ASSETS,
+        RC_TAG as RELEASE_RC_TAG,
+        validate_release_object,
+    )
+except ModuleNotFoundError:  # Direct execution adds tools/, not the repository root.
+    from release_workflow_contract import (  # type: ignore[no-redef]
+        ContractError as ReleaseContractError,
+        EXPECTED_ASSETS as EXPECTED_RELEASE_ASSETS,
+        RC_TAG as RELEASE_RC_TAG,
+        validate_release_object,
+    )
+
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SAFE_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 AGENT_CAP_RE = re.compile(r'\bagent:\s*"([^"\\]{16,512})"')
+REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
+TIMESTAMP_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 MAX_JSON_BYTES = 1024 * 1024
 MAX_SSE_BYTES = 1024 * 1024
 MAX_SSE_LINE_BYTES = 256 * 1024
 MAX_SSE_EVENTS = 4096
 MAX_CDP_TARGET_BYTES = 64 * 1024
 CONTROL_REQUEST_TIMEOUT_SECONDS = 10.0
+MIN_RELEASE_RECHECK_SECONDS = 30
+MAX_RELEASE_RECHECK_SECONDS = 900
 HOOK_MARKERS = (
     b"ISY_MOBILE_JOB_DEVICE_HOOK_V1",
     b"ISY_AGENT_NETWORK_DEVICE_HOOK_V1",
@@ -285,6 +305,213 @@ def validate_git_object(value: str, expected_type: str, label: str) -> str:
     if result.stdout.strip() != expected_type:
         raise ProbeError(f"invalid_{label}_type")
     return validated
+
+
+def git_tree_for_commit(commit: str) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", f"{commit}^{{tree}}"],
+            cwd=Path(__file__).resolve().parents[1],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise ProbeError("rc_tree_unavailable") from error
+    tree = result.stdout.strip()
+    if not SHA_RE.fullmatch(tree):
+        raise ProbeError("rc_tree_invalid")
+    return tree
+
+
+def verify_candidate_tree(
+    rc_commit: str,
+    candidate_tree: str,
+    tree_resolver=git_tree_for_commit,
+) -> bool:
+    if tree_resolver(rc_commit) != candidate_tree:
+        raise ProbeError("rc_candidate_tree_mismatch")
+    return True
+
+
+def _strict_release_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ProbeError("release_snapshot_invalid")
+        result[key] = value
+    return result
+
+
+def _gh_json(args: list[str]) -> object:
+    try:
+        result = subprocess.run(
+            ["gh", "api", *args],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise ProbeError("release_api_unavailable") from error
+    if not result.stdout or len(result.stdout) > MAX_JSON_BYTES:
+        raise ProbeError("release_snapshot_invalid")
+    try:
+        return json.loads(result.stdout, object_pairs_hook=_strict_release_object)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ProbeError("release_snapshot_invalid") from error
+
+
+def fetch_release_object(repository: str, tag: str) -> dict[str, object]:
+    projection = (
+        "{id,tag_name,draft,prerelease,target_commitish,created_at,published_at,"
+        "updated_at,html_url,assets:[.assets[]|{id,name,size,digest,created_at,updated_at}]}"
+    )
+    value = _gh_json([f"repos/{repository}/releases/tags/{tag}", "--jq", projection])
+    if not isinstance(value, dict):
+        raise ProbeError("release_snapshot_invalid")
+    return value
+
+
+def resolve_release_tag_commit(repository: str, tag: str) -> str:
+    value = _gh_json([f"repos/{repository}/git/ref/tags/{tag}", "--jq", ".object"])
+    for _ in range(4):
+        if not isinstance(value, dict):
+            raise ProbeError("release_tag_invalid")
+        object_type = value.get("type")
+        sha = value.get("sha")
+        if not isinstance(sha, str) or not SHA_RE.fullmatch(sha):
+            raise ProbeError("release_tag_invalid")
+        if object_type == "commit":
+            return sha
+        if object_type != "tag":
+            raise ProbeError("release_tag_invalid")
+        value = _gh_json([f"repos/{repository}/git/tags/{sha}", "--jq", ".object"])
+    raise ProbeError("release_tag_invalid")
+
+
+def public_release_url_ready(repository: str, tag: str) -> bool:
+    url = f"https://github.com/{repository}/releases/tag/{tag}"
+    try:
+        subprocess.run(
+            ["curl", "-fsSIL", "--max-time", "20", url],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=25,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise ProbeError("release_public_url_unavailable") from error
+    return True
+
+
+def _normalized_release_snapshot(
+    data: dict[str, object], repository: str, tag: str, rc_commit: str
+) -> dict[str, object]:
+    try:
+        validate_release_object(data, "rc", tag, rc_commit)
+    except ReleaseContractError as error:
+        raise ProbeError("release_contract_invalid") from error
+    release_id = data.get("id")
+    expected_url = f"https://github.com/{repository}/releases/tag/{tag}"
+    if type(release_id) is not int or release_id <= 0 or data.get("html_url") != expected_url:
+        raise ProbeError("release_snapshot_invalid")
+    timestamps: dict[str, str] = {}
+    for field in ("created_at", "published_at", "updated_at"):
+        value = data.get(field)
+        if not isinstance(value, str) or not TIMESTAMP_RE.fullmatch(value):
+            raise ProbeError("release_snapshot_invalid")
+        timestamps[field] = value
+    raw_assets = data.get("assets")
+    if not isinstance(raw_assets, list):
+        raise ProbeError("release_snapshot_invalid")
+    assets: list[dict[str, object]] = []
+    for asset in raw_assets:
+        if not isinstance(asset, dict):
+            raise ProbeError("release_snapshot_invalid")
+        asset_id = asset.get("id")
+        name = asset.get("name")
+        size = asset.get("size")
+        digest = asset.get("digest")
+        if (
+            type(asset_id) is not int
+            or asset_id <= 0
+            or not isinstance(name, str)
+            or not name
+            or type(size) is not int
+            or size <= 0
+            or (
+                digest is not None
+                and (not isinstance(digest, str) or not DIGEST_RE.fullmatch(digest))
+            )
+        ):
+            raise ProbeError("release_snapshot_invalid")
+        asset_times: dict[str, str] = {}
+        for field in ("created_at", "updated_at"):
+            value = asset.get(field)
+            if not isinstance(value, str) or not TIMESTAMP_RE.fullmatch(value):
+                raise ProbeError("release_snapshot_invalid")
+            asset_times[field] = value
+        assets.append(
+            {
+                "id": asset_id,
+                "name": name,
+                "size": size,
+                "digest": digest,
+                **asset_times,
+            }
+        )
+    names = {asset["name"] for asset in assets}
+    if not EXPECTED_RELEASE_ASSETS.issubset(names):
+        raise ProbeError("release_snapshot_invalid")
+    assets.sort(key=lambda asset: str(asset["name"]))
+    return {
+        "release_id": release_id,
+        "tag": tag,
+        "target_commit": rc_commit,
+        "draft": False,
+        "prerelease": True,
+        "public_url": expected_url,
+        **timestamps,
+        "assets": assets,
+    }
+
+
+def inspect_release_integrity(
+    repository: str,
+    tag: str,
+    rc_commit: str,
+    delay_seconds: int,
+    release_fetcher=fetch_release_object,
+    tag_resolver=resolve_release_tag_commit,
+    public_url_probe=public_release_url_ready,
+    sleeper=time.sleep,
+) -> dict[str, object]:
+    if not REPOSITORY_RE.fullmatch(repository) or not RELEASE_RC_TAG.fullmatch(tag):
+        raise ProbeError("release_input_invalid")
+    if tag_resolver(repository, tag) != rc_commit:
+        raise ProbeError("release_tag_commit_mismatch")
+    first = _normalized_release_snapshot(
+        release_fetcher(repository, tag), repository, tag, rc_commit
+    )
+    if public_url_probe(repository, tag) is not True:
+        raise ProbeError("release_public_url_unavailable")
+    sleeper(delay_seconds)
+    second_commit = tag_resolver(repository, tag)
+    second = _normalized_release_snapshot(
+        release_fetcher(repository, tag), repository, tag, rc_commit
+    )
+    if second_commit != rc_commit or second != first:
+        raise ProbeError("release_integrity_changed")
+    return {
+        "state": "pass",
+        "code": "verified",
+        "recheck_delay_seconds": delay_seconds,
+        "tag_commit": rc_commit,
+        "snapshot": second,
+    }
 
 
 def loopback_endpoint(value: str) -> tuple[str, int, str]:
@@ -1045,9 +1272,21 @@ def run(args: argparse.Namespace) -> tuple[dict[str, object], int]:
     )
     candidate_tree = None
     rc_commit = None
+    candidate_tree_matches_rc = None
+    release_integrity: dict[str, object] = {
+        "state": "not_run",
+        "code": "pre_rc_mode",
+    }
     if args.mode == "final":
         candidate_tree = validate_git_object(args.candidate_tree, "tree", "candidate_tree")
         rc_commit = validate_git_object(args.rc_commit, "commit", "rc_commit")
+        candidate_tree_matches_rc = verify_candidate_tree(rc_commit, candidate_tree)
+        release_integrity = inspect_release_integrity(
+            args.release_repo,
+            args.release_tag,
+            rc_commit,
+            args.release_recheck_seconds,
+        )
     host, port, base = loopback_endpoint(args.endpoint or args.bind)
     runtime, remove_runtime = private_runtime_root(Path(args.runtime_root) if args.runtime_root else None)
     daemon: ManagedDaemon | None = None
@@ -1106,6 +1345,14 @@ def run(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 or apk_matrix["state"] == "pass"
             )
             and android_bridge["state"] in {"not_run", "pass"}
+            and (
+                args.mode != "final"
+                or (
+                    candidate_tree_matches_rc is True
+                    and release_integrity["state"] == "pass"
+                    and apk_matrix.get("published") is not None
+                )
+            )
             and all(item["state"] == "pass" for item in rows.values())
         )
         report: dict[str, object] = {
@@ -1114,6 +1361,8 @@ def run(args: argparse.Namespace) -> tuple[dict[str, object], int]:
             "implementation_commit": implementation,
             "candidate_tree": candidate_tree,
             "rc_commit": rc_commit,
+            "candidate_tree_matches_rc": candidate_tree_matches_rc,
+            "release_integrity": release_integrity,
             "managed_daemon": daemon is not None,
             "daemon_binary_sha256": binary_digest,
             "shell_ready": shell_ready,
@@ -1154,6 +1403,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--implementation-commit", required=True)
     parser.add_argument("--candidate-tree")
     parser.add_argument("--rc-commit")
+    parser.add_argument("--release-repo")
+    parser.add_argument("--release-tag")
+    parser.add_argument(
+        "--release-recheck-seconds",
+        type=int,
+        default=60,
+        help="bounded delay between the two final release API snapshots",
+    )
     endpoint = parser.add_mutually_exclusive_group()
     endpoint.add_argument("--endpoint")
     endpoint.add_argument("--daemon-bin")
@@ -1189,14 +1446,31 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--config is required with --daemon-bin")
     if not args.daemon_bin and not args.endpoint:
         parser.error("either --endpoint or --daemon-bin is required")
-    if args.mode == "final" and (not args.candidate_tree or not args.rc_commit):
-        parser.error("final mode requires --candidate-tree and --rc-commit")
+    if args.mode == "final" and any(
+        not value
+        for value in (
+            args.candidate_tree,
+            args.rc_commit,
+            args.release_repo,
+            args.release_tag,
+            args.hook_apk,
+            args.default_apk,
+            args.published_apk,
+        )
+    ):
+        parser.error(
+            "final mode requires candidate/RC/release identity and hook/default/published APKs"
+        )
+    if args.mode != "final" and (args.release_repo or args.release_tag):
+        parser.error("release identity is valid only in final mode")
     if args.account_id_file and not args.retrieval_prompt_file:
         parser.error("--account-id-file requires --retrieval-prompt-file")
     if bool(args.hook_apk) != bool(args.default_apk):
         parser.error("--hook-apk and --default-apk must be supplied together")
     if args.published_apk and args.mode != "final":
         parser.error("--published-apk is valid only in final mode")
+    if not MIN_RELEASE_RECHECK_SECONDS <= args.release_recheck_seconds <= MAX_RELEASE_RECHECK_SECONDS:
+        parser.error("--release-recheck-seconds is outside the bounded range")
     if args.turn_timeout <= 0 or args.turn_timeout > 1200:
         parser.error("--turn-timeout must be in (0, 1200]")
     return args

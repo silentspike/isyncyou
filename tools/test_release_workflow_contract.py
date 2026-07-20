@@ -5,7 +5,9 @@ from pathlib import Path
 from tools.release_workflow_contract import (
     ContractError,
     EXPECTED_ASSETS,
+    candidate_rc_tags,
     classify,
+    select_matching_rc,
     validate_release_object,
 )
 
@@ -77,6 +79,37 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         with self.assertRaises(ContractError):
             validate_release_object(release, "rc", "v1.0.0-rc.9", SHA)
 
+    def test_stable_rc_selection_requires_release_and_peeled_tag_commit(self):
+        release = self._valid_rc_release()
+        releases = [release]
+        self.assertEqual(candidate_rc_tags(releases, SHA), ["v1.0.0-rc.9"])
+        self.assertEqual(
+            select_matching_rc(releases, {"v1.0.0-rc.9": SHA}, SHA),
+            "v1.0.0-rc.9",
+        )
+        with self.assertRaises(ContractError):
+            select_matching_rc(releases, {"v1.0.0-rc.9": "b" * 40}, SHA)
+
+    def test_stable_rc_selection_rejects_target_only_spoof_and_bad_assets(self):
+        release = self._valid_rc_release()
+        wrong_target = copy.deepcopy(release)
+        wrong_target["target_commitish"] = "b" * 40
+        self.assertEqual(candidate_rc_tags([wrong_target], SHA), [])
+        bad_assets = copy.deepcopy(release)
+        bad_assets["assets"] = [{"name": "isyncyou-android-arm64.apk"}]
+        self.assertEqual(candidate_rc_tags([bad_assets], SHA), [])
+        draft = copy.deepcopy(release)
+        draft["draft"] = True
+        self.assertEqual(candidate_rc_tags([draft], SHA), [])
+
+    def test_release_validation_rejects_duplicate_assets_and_wrong_tag_class(self):
+        release = self._valid_rc_release()
+        release["assets"].append(copy.deepcopy(release["assets"][0]))
+        with self.assertRaises(ContractError):
+            validate_release_object(release, "rc", "v1.0.0-rc.9", SHA)
+        with self.assertRaises(ContractError):
+            validate_release_object(self._valid_rc_release(), "rc", "v1.0.0", SHA)
+
     def test_release_preflight_is_dependency_of_all_build_and_publish_jobs(self):
         workflow = Path(".github/workflows/release.yml").read_text()
         self.assertIn("expected_commit:", workflow)
@@ -109,6 +142,9 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         workflow = Path(".github/workflows/release.yml").read_text()
         self.assertIn("stable tag commit is not on main", workflow)
         self.assertIn("matching non-draft RC", workflow)
+        self.assertIn("candidate-rc-tags", workflow)
+        self.assertIn("select-rc", workflow)
+        self.assertIn('git rev-list -n1 "$rc"', workflow)
         self.assertIn("release object already exists", workflow)
 
     @staticmethod

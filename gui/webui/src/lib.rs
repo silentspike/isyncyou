@@ -339,14 +339,14 @@ product_post_routes! {
     SyncNow => ("/api/v1/sync/now", 8 * 1024, Sync),
     Verify => ("/api/v1/verify", 8 * 1024, Verify),
     Settings => ("/api/v1/settings", 8 * 1024, Settings),
-    MailSend => ("/api/v1/mail/send", 64 * 1024, Mail),
-    MailReply => ("/api/v1/mail/reply", 64 * 1024, Mail),
-    MailForward => ("/api/v1/mail/forward", 64 * 1024, Mail),
+    MailSend => ("/api/v1/mail/send", 8 * 1024, Mail),
+    MailReply => ("/api/v1/mail/reply", 8 * 1024, Mail),
+    MailForward => ("/api/v1/mail/forward", 8 * 1024, Mail),
     MailMove => ("/api/v1/mail/move", 8 * 1024, Mail),
     MailRead => ("/api/v1/mail/read", 8 * 1024, Mail),
     MailFlag => ("/api/v1/mail/flag", 8 * 1024, Mail),
     MailCategories => ("/api/v1/mail/categories", 8 * 1024, Mail),
-    MailDraft => ("/api/v1/mail/draft", 64 * 1024, Mail),
+    MailDraft => ("/api/v1/mail/draft", 8 * 1024, Mail),
     CalendarCreate => ("/api/v1/calendar/create", 8 * 1024, Calendar),
     CalendarUpdate => ("/api/v1/calendar/update", 8 * 1024, Calendar),
     CalendarDelete => ("/api/v1/calendar/delete", 8 * 1024, Calendar),
@@ -363,9 +363,9 @@ product_post_routes! {
     TodoChecklistDelete => ("/api/v1/todo/checklist-delete", 8 * 1024, Task),
     TodoListCreate => ("/api/v1/todo/list-create", 8 * 1024, Task),
     TodoListDelete => ("/api/v1/todo/list-delete", 8 * 1024, Task),
-    OnenoteCreate => ("/api/v1/onenote/create", 64 * 1024, Onenote),
+    OnenoteCreate => ("/api/v1/onenote/create", 8 * 1024, Onenote),
     OnenoteDelete => ("/api/v1/onenote/delete", 8 * 1024, Onenote),
-    OnenoteAppend => ("/api/v1/onenote/append", 64 * 1024, Onenote),
+    OnenoteAppend => ("/api/v1/onenote/append", 8 * 1024, Onenote),
     TransferCancel => ("/api/v1/onedrive/transfers/cancel", 8 * 1024, Transfer),
     TransferPause => ("/api/v1/onedrive/transfers/pause", 8 * 1024, Transfer),
     TransferRetry => ("/api/v1/onedrive/transfers/retry", 8 * 1024, Transfer),
@@ -506,7 +506,7 @@ impl ProductPostRoute {
     }
 }
 
-fn is_json_content_type(content_type: Option<&str>) -> bool {
+pub(crate) fn is_json_content_type(content_type: Option<&str>) -> bool {
     let Some(content_type) = content_type else {
         return false;
     };
@@ -517,13 +517,16 @@ fn is_json_content_type(content_type: Option<&str>) -> bool {
     {
         return false;
     }
-    parts.all(|parameter| {
-        let parameter = parameter.trim();
-        parameter.is_empty()
-            || parameter.split_once('=').is_some_and(|(name, value)| {
-                name.trim().eq_ignore_ascii_case("charset")
-                    && value.trim().trim_matches('"').eq_ignore_ascii_case("utf-8")
-            })
+    let parameter = parts.next();
+    if parts.next().is_some() {
+        return false;
+    }
+    parameter.is_none_or(|parameter| {
+        parameter.split_once('=').is_some_and(|(name, value)| {
+            let value = value.trim();
+            name.trim().eq_ignore_ascii_case("charset")
+                && (value.eq_ignore_ascii_case("utf-8") || value.eq_ignore_ascii_case("\"utf-8\""))
+        })
     })
 }
 
@@ -567,12 +570,28 @@ fn parse_agent_strict_json_with_limit<T: serde::de::DeserializeOwned>(
     }
     let body = std::str::from_utf8(&req.body)
         .map_err(|_| no_store_json_error(400, "invalid JSON request body"))?;
-    let mut deserializer = serde_json::Deserializer::from_str(body);
-    let value = StrictJsonValue::deserialize(&mut deserializer)
-        .and_then(|value| deserializer.end().map(|()| value.0))
+    let value = parse_strict_json_value(body)
         .map_err(|_| no_store_json_error(400, &format!("invalid {operation} request")))?;
     serde_json::from_value(value)
         .map_err(|_| no_store_json_error(400, &format!("invalid {operation} request")))
+}
+
+fn parse_product_strict_json<T: serde::de::DeserializeOwned>(
+    req: &ApiRequest,
+    route: ProductPostRoute,
+    operation: &str,
+) -> Result<T, ApiResponse> {
+    let spec = product_post_route(&req.path)
+        .filter(|spec| spec.route == route)
+        .ok_or_else(|| no_store_json_error(500, "product route policy mismatch"))?;
+    parse_agent_strict_json_with_limit(req, operation, spec.body_limit)
+}
+
+pub(crate) fn parse_strict_json_value(body: &str) -> Result<Value, ()> {
+    let mut deserializer = serde_json::Deserializer::from_str(body);
+    StrictJsonValue::deserialize(&mut deserializer)
+        .and_then(|value| deserializer.end().map(|()| value.0))
+        .map_err(|_| ())
 }
 
 struct StrictJsonValue(Value);
@@ -691,13 +710,14 @@ fn parse_strict_scalar_mutation(
     operation: &str,
     allowed_fields: &[&str],
 ) -> Result<ApiRequest, ApiResponse> {
-    let catalogue_fields = product_post_route(&req.path)
-        .and_then(|spec| scalar_product_fields(spec.route))
+    let spec = product_post_route(&req.path)
+        .ok_or_else(|| no_store_json_error(500, "product route policy mismatch"))?;
+    let catalogue_fields = scalar_product_fields(spec.route)
         .ok_or_else(|| no_store_json_error(500, "product route policy mismatch"))?;
     if catalogue_fields != allowed_fields {
         return Err(no_store_json_error(500, "product route policy mismatch"));
     }
-    let value: Value = parse_agent_strict_json_with_limit(req, operation, 64 * 1024)?;
+    let value: Value = parse_agent_strict_json_with_limit(req, operation, spec.body_limit)?;
     let object = value
         .as_object()
         .ok_or_else(|| no_store_json_error(400, &format!("invalid {operation} request")))?;
@@ -770,7 +790,9 @@ fn valid_sha256(value: &str) -> bool {
 fn mutation_error_response(error: &str) -> ApiResponse {
     let (status, code) = match error {
         "mutation_intent_quota_exceeded" | "mutation_intent_busy" => (429, error),
-        "mutation_intent_storage_unavailable" => (507, error),
+        "mutation_intent_storage_unavailable" | "mutation_intent_insufficient_storage" => {
+            (507, error)
+        }
         "request_id_conflict" | "mutation_intent_conflict" | "mutation_intent_outcome_unknown" => {
             (409, error)
         }
@@ -923,10 +945,20 @@ fn agent_session_error_status(error: &str) -> u16 {
         "invalid_cursor"
         | "invalid_request_id"
         | "invalid_request_route"
+        | "pairing_invalid_session"
+        | "presence_invalid_request"
         | "invalid_session_name"
         | "invalid_session_record" => 400,
-        "request_not_found" | "session_not_found" => 404,
+        "pairing_not_found" | "presence_not_found" | "request_not_found" | "session_not_found" => {
+            404
+        }
+        "presence_action_mismatch" | "presence_token_invalid" => 403,
         "manifest_conflict"
+        | "pairing_expired"
+        | "pairing_outcome_unknown"
+        | "pairing_revoked"
+        | "presence_expired"
+        | "presence_not_authorized"
         | "provider_generation_changed"
         | "request_id_conflict"
         | "session_limit_reached"
@@ -935,7 +967,9 @@ fn agent_session_error_status(error: &str) -> u16 {
         | "stale_cursor" => 409,
         "history_page_too_large" | "session_budget_exceeded" => 413,
         "session_account_selection_required" => 409,
-        "session_account_unavailable"
+        "pairing_unavailable"
+        | "presence_unavailable"
+        | "session_account_unavailable"
         | "session_store_unavailable"
         | "session_transport_unavailable"
         | "session_transport_timed_out" => 503,
@@ -945,6 +979,16 @@ fn agent_session_error_status(error: &str) -> u16 {
         | "session_storage_response_invalid" => 409,
         _ => 500,
     }
+}
+
+fn agent_session_error_response(error: &str) -> ApiResponse {
+    let status = agent_session_error_status(error);
+    let code = if status == 500 {
+        "agent_request_failed"
+    } else {
+        error
+    };
+    no_store_json_error(status, code)
 }
 
 fn closed_lifecycle_error(code: &str) -> String {
@@ -1021,10 +1065,6 @@ pub trait DurableRequestStore: Send + Sync {
         response: &ApiResponse,
     ) -> Result<(), String>;
     fn abort(&self, identity: &ProductRequestIdentity) -> Result<(), String>;
-    /// Remove a request that route validation rejected before any durable effect.
-    /// Implementations must delete the matching started receipt and UUID binding
-    /// atomically, and must not remove a completed response or turn admission.
-    fn reject(&self, identity: &ProductRequestIdentity) -> Result<(), String>;
 }
 
 fn normalize_semantic_json(value: &mut Value) {
@@ -1044,25 +1084,35 @@ fn normalize_semantic_json(value: &mut Value) {
     }
 }
 
-fn canonical_scope(object: &serde_json::Map<String, Value>) -> String {
-    for field in [
-        "session_id",
-        "operation_id",
-        "pending",
-        "turn_id",
-        "intent_id",
-        "account",
-    ] {
-        if let Some(value) = object.get(field).and_then(Value::as_str) {
-            return format!("{field}:{value}");
-        }
+fn canonical_scope(
+    route: ProductPostRoute,
+    object: &serde_json::Map<String, Value>,
+) -> Result<String, ApiResponse> {
+    if matches!(
+        route,
+        ProductPostRoute::AgentSessionArchive
+            | ProductPostRoute::AgentUserPresenceConfirm
+            | ProductPostRoute::AgentPairingReveal
+            | ProductPostRoute::AgentPairingClaim
+            | ProductPostRoute::AgentPairingFinalize
+            | ProductPostRoute::AgentPairingRevoke
+    ) {
+        return object
+            .get("operation_id")
+            .and_then(Value::as_str)
+            .filter(|operation_id| valid_opaque_agent_id(operation_id))
+            .map(|operation_id| format!("operation_id:{operation_id}"))
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"));
+    }
+    if let Some(session_id) = object.get("session_id").and_then(Value::as_str) {
+        return Ok(format!("session_id:{session_id}"));
     }
     if let Some(binding) = object.get("binding").and_then(Value::as_object) {
         if let Some(session_id) = binding.get("session_id").and_then(Value::as_str) {
-            return format!("session_id:{session_id}");
+            return Ok(format!("session_id:{session_id}"));
         }
     }
-    "installation".into()
+    Ok("installation".into())
 }
 
 fn replace_secret_with_digest(object: &mut serde_json::Map<String, Value>, field: &str) {
@@ -1270,6 +1320,398 @@ fn validate_scalar_product_request(value: &Value, fields: &[&str]) -> Result<(),
     Ok(())
 }
 
+fn require_non_empty_scalar_fields(
+    object: &serde_json::Map<String, Value>,
+    fields: &[&str],
+) -> Result<(), ApiResponse> {
+    fields
+        .iter()
+        .all(|field| {
+            object
+                .get(*field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        })
+        .then_some(())
+        .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+}
+
+fn require_present_scalar_fields(
+    object: &serde_json::Map<String, Value>,
+    fields: &[&str],
+) -> Result<(), ApiResponse> {
+    fields
+        .iter()
+        .all(|field| object.get(*field).and_then(Value::as_str).is_some())
+        .then_some(())
+        .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+}
+
+fn remove_empty_scalar_fields(object: &mut serde_json::Map<String, Value>, fields: &[&str]) {
+    for field in fields {
+        if object.get(*field).and_then(Value::as_str) == Some("") {
+            object.remove(*field);
+        }
+    }
+}
+
+fn set_scalar_default(object: &mut serde_json::Map<String, Value>, field: &str, default: &str) {
+    if object
+        .get(field)
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        object.insert(field.into(), Value::String(default.into()));
+    }
+}
+
+fn canonicalize_comma_list(object: &mut serde_json::Map<String, Value>, field: &str) {
+    let values = object
+        .get(field)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| Value::String(value.into()))
+        .collect();
+    object.insert(field.into(), Value::Array(values));
+}
+
+fn canonicalize_scalar_product_payload(
+    route: ProductPostRoute,
+    object: &mut serde_json::Map<String, Value>,
+) -> Result<(), ApiResponse> {
+    use ProductPostRoute::*;
+
+    match route {
+        Restore => {
+            require_non_empty_scalar_fields(object, &["account", "service", "id"])?;
+            let service = object.get("service").and_then(Value::as_str).unwrap_or("");
+            if !BACKUP_SERVICES.contains(&service) {
+                return Err(no_store_json_error(400, "unsupported restore service"));
+            }
+        }
+        Backup => {
+            require_non_empty_scalar_fields(object, &["account"])?;
+            let mut services = object
+                .get("services")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .split([',', ' '])
+                .map(str::trim)
+                .filter(|service| !service.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            services.sort();
+            services.dedup();
+            if services
+                .iter()
+                .any(|service| !BACKUP_SERVICES.contains(&service.as_str()))
+            {
+                return Err(no_store_json_error(400, "unsupported backup service"));
+            }
+            object.insert(
+                "services".into(),
+                Value::Array(services.into_iter().map(Value::String).collect()),
+            );
+        }
+        MobileJobCancel => {
+            require_non_empty_scalar_fields(object, &["account", "job_id"])?;
+        }
+        Share => {
+            require_non_empty_scalar_fields(object, &["account", "service", "id"])?;
+            if object.get("service").and_then(Value::as_str) != Some("onedrive") {
+                return Err(no_store_json_error(400, "unsupported share service"));
+            }
+            let email = object
+                .get("email")
+                .and_then(Value::as_str)
+                .filter(|email| !email.is_empty());
+            if let Some(email) = email {
+                let raw_recipients = email
+                    .split([',', ' '])
+                    .map(str::trim)
+                    .filter(|recipient| !recipient.is_empty())
+                    .collect::<Vec<_>>();
+                if raw_recipients.is_empty()
+                    || raw_recipients.len() > 20
+                    || raw_recipients.iter().any(|recipient| {
+                        recipient.len() > 320
+                            || recipient.chars().any(char::is_control)
+                            || !recipient.contains('@')
+                    })
+                {
+                    return Err(no_store_json_error(400, "invalid share recipient"));
+                }
+                let mut recipients = raw_recipients
+                    .into_iter()
+                    .map(str::to_ascii_lowercase)
+                    .collect::<Vec<_>>();
+                recipients.sort();
+                recipients.dedup();
+                set_scalar_default(object, "role", "read");
+                if !matches!(
+                    object.get("role").and_then(Value::as_str),
+                    Some("read" | "write")
+                ) {
+                    return Err(no_store_json_error(400, "invalid share role"));
+                }
+                object.insert(
+                    "email".into(),
+                    Value::Array(recipients.into_iter().map(Value::String).collect()),
+                );
+                object.remove("type");
+                object.remove("scope");
+            } else {
+                object.remove("email");
+                object.remove("role");
+                set_scalar_default(object, "type", "view");
+                set_scalar_default(object, "scope", "anonymous");
+                if !matches!(
+                    object.get("type").and_then(Value::as_str),
+                    Some("view" | "edit" | "embed")
+                ) || !matches!(
+                    object.get("scope").and_then(Value::as_str),
+                    Some("anonymous" | "organization" | "users")
+                ) {
+                    return Err(no_store_json_error(400, "invalid share policy"));
+                }
+            }
+        }
+        SyncPause | SyncResume | SyncNow | PushTest => {}
+        Verify | OnedriveCleanup => {
+            require_non_empty_scalar_fields(object, &["account"])?;
+        }
+        Settings => {
+            require_non_empty_scalar_fields(object, &["poll_interval_secs"])?;
+            let valid = object
+                .get("poll_interval_secs")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|value| (1..=3600).contains(&value));
+            if !valid {
+                return Err(no_store_json_error(400, "invalid poll interval"));
+            }
+        }
+        MailMove => {
+            require_non_empty_scalar_fields(object, &["account", "id", "destination"])?;
+        }
+        MailRead => {
+            require_non_empty_scalar_fields(object, &["account", "id"])?;
+            let value = if object.get("is_read").and_then(Value::as_str) == Some("0") {
+                "0"
+            } else {
+                "1"
+            };
+            object.insert("is_read".into(), Value::String(value.into()));
+        }
+        MailFlag => {
+            require_non_empty_scalar_fields(object, &["account", "id"])?;
+            set_scalar_default(object, "status", "flagged");
+            if !matches!(
+                object.get("status").and_then(Value::as_str),
+                Some("notFlagged" | "flagged" | "complete")
+            ) {
+                return Err(no_store_json_error(400, "invalid mail flag status"));
+            }
+            remove_empty_scalar_fields(object, &["due"]);
+            set_scalar_default(object, "tz", "UTC");
+        }
+        MailCategories => {
+            require_non_empty_scalar_fields(object, &["account", "id"])?;
+            canonicalize_comma_list(object, "categories");
+        }
+        CalendarCreate => {
+            require_non_empty_scalar_fields(object, &["account", "start"])?;
+            require_present_scalar_fields(object, &["subject"])?;
+            remove_empty_scalar_fields(object, &["end", "tz", "location", "body"]);
+            if object.contains_key("start") || object.contains_key("end") {
+                set_scalar_default(object, "tz", "UTC");
+            }
+            let all_day = object.get("all_day").and_then(Value::as_str) == Some("1");
+            object.insert(
+                "all_day".into(),
+                Value::String(if all_day { "1" } else { "0" }.into()),
+            );
+        }
+        CalendarUpdate => {
+            require_non_empty_scalar_fields(object, &["account", "id"])?;
+            remove_empty_scalar_fields(object, &["start", "end", "tz", "location", "body"]);
+            if object.contains_key("start") || object.contains_key("end") {
+                set_scalar_default(object, "tz", "UTC");
+            } else {
+                object.remove("tz");
+            }
+            let all_day = object.get("all_day").and_then(Value::as_str) == Some("1");
+            if all_day {
+                object.insert("all_day".into(), Value::String("1".into()));
+            } else {
+                object.remove("all_day");
+            }
+        }
+        CalendarDelete | ContactDelete | TodoListDelete | OnenoteDelete | OnedriveDelete
+        | OnedriveFreeUp | OnedriveDownloadNow => {
+            require_non_empty_scalar_fields(object, &["account", "id"])?;
+        }
+        CalendarRespond => {
+            require_non_empty_scalar_fields(object, &["account", "id"])?;
+            set_scalar_default(object, "response", "accept");
+            set_scalar_default(object, "comment", "");
+        }
+        ContactCreate | ContactUpdate => {
+            let required: &[&str] = if route == ContactCreate {
+                &["account"]
+            } else {
+                &["account", "id"]
+            };
+            require_non_empty_scalar_fields(object, required)?;
+            object.retain(|field, value| {
+                matches!(field.as_str(), "request_id" | "account" | "id")
+                    || value.as_str().is_some_and(|value| !value.is_empty())
+            });
+            if route == ContactCreate && object.len() <= 2 {
+                return Err(no_store_json_error(400, "contact field required"));
+            }
+        }
+        TodoCreate | TodoUpdate => {
+            let required: &[&str] = if route == TodoCreate {
+                &["account", "list", "title"]
+            } else {
+                &["account", "list", "id"]
+            };
+            require_non_empty_scalar_fields(object, required)?;
+            remove_empty_scalar_fields(
+                object,
+                &[
+                    "body",
+                    "importance",
+                    "status",
+                    "due",
+                    "start",
+                    "reminder",
+                    "tz",
+                ],
+            );
+            if object.contains_key("due")
+                || object.contains_key("start")
+                || object.contains_key("reminder")
+            {
+                set_scalar_default(object, "tz", "UTC");
+            } else {
+                object.remove("tz");
+            }
+            if object.contains_key("categories") {
+                canonicalize_comma_list(object, "categories");
+                if object
+                    .get("categories")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty)
+                {
+                    object.remove("categories");
+                }
+            }
+        }
+        TodoComplete | TodoDelete => {
+            require_non_empty_scalar_fields(object, &["account", "list", "id"])?;
+        }
+        TodoChecklistAdd => {
+            require_non_empty_scalar_fields(object, &["account", "list", "task", "title"])?;
+        }
+        TodoChecklistToggle => {
+            require_non_empty_scalar_fields(object, &["account", "list", "task", "item"])?;
+            let checked = object.get("checked").and_then(Value::as_str) == Some("1");
+            object.insert(
+                "checked".into(),
+                Value::String(if checked { "1" } else { "0" }.into()),
+            );
+        }
+        TodoChecklistDelete => {
+            require_non_empty_scalar_fields(object, &["account", "list", "task", "item"])?;
+        }
+        TodoListCreate => {
+            require_non_empty_scalar_fields(object, &["account", "name"])?;
+        }
+        TransferCancel | TransferPause | TransferRetry | AccountLoginPoll | AccountLoginCancel => {
+            require_non_empty_scalar_fields(object, &["id"])?;
+        }
+        OnedriveCreate => {
+            require_non_empty_scalar_fields(object, &["account", "name"])?;
+            set_scalar_default(object, "parent", "");
+        }
+        OnedriveRename => {
+            require_non_empty_scalar_fields(object, &["account", "id", "name"])?;
+        }
+        OnedriveMove => {
+            require_non_empty_scalar_fields(object, &["account", "id", "name"])?;
+            require_present_scalar_fields(object, &["parent"])?;
+        }
+        OnedriveMode => {
+            require_non_empty_scalar_fields(object, &["account", "folder"])?;
+            remove_empty_scalar_fields(object, &["mode"]);
+            if object
+                .get("mode")
+                .and_then(Value::as_str)
+                .is_some_and(|mode| !matches!(mode, "online" | "sync" | "offline"))
+            {
+                return Err(no_store_json_error(400, "invalid OneDrive mode"));
+            }
+        }
+        OnedriveConflictResolve => {
+            require_non_empty_scalar_fields(object, &["account", "id", "resolution"])?;
+            if !matches!(
+                object.get("resolution").and_then(Value::as_str),
+                Some("keep-both" | "keep-mine" | "keep-cloud")
+            ) {
+                return Err(no_store_json_error(400, "invalid conflict resolution"));
+            }
+        }
+        AccountLoginStart | AccountSignout => {
+            require_non_empty_scalar_fields(object, &["account", "role"])?;
+            if !matches!(
+                object.get("role").and_then(Value::as_str),
+                Some("reader" | "writer")
+            ) {
+                return Err(no_store_json_error(400, "invalid account role"));
+            }
+        }
+        MailSend
+        | MailReply
+        | MailForward
+        | MailDraft
+        | OnenoteCreate
+        | OnenoteAppend
+        | MutationIntentCreate
+        | MutationIntentChunk
+        | MutationIntentCommit
+        | MutationIntentCancel
+        | PushRegister
+        | AgentTurn
+        | AgentSessionCreate
+        | AgentSessionSelect
+        | AgentSessionArchive
+        | AgentUserPresenceStart
+        | AgentUserPresenceConfirm
+        | AgentPairingCreate
+        | AgentPairingReveal
+        | AgentPairingClaim
+        | AgentPairingFinalize
+        | AgentPairingRevoke
+        | AgentConfirm
+        | AgentTurnCancel
+        | AgentPendingCancel
+        | AgentConnectivityPreflight
+        | AgentCredentialRefresh
+        | AgentOauthStart
+        | AgentOauthLogout
+        | AgentOauthLifecycleResume
+        | AgentOauthCancel
+        | AgentOauthComplete
+        | AgentModel => return Err(no_store_json_error(400, "invalid product request")),
+    }
+    Ok(())
+}
+
 fn canonicalize_product_payload(
     route: ProductPostRoute,
     payload: &mut Value,
@@ -1295,6 +1737,7 @@ fn canonicalize_product_payload(
             };
             canonical.insert((*field).into(), value);
         }
+        canonicalize_scalar_product_payload(route, &mut canonical)?;
         *payload = Value::Object(canonical);
         return Ok(());
     }
@@ -1303,8 +1746,12 @@ fn canonicalize_product_payload(
         ($ty:ty) => {{
             let request = serde_json::from_value::<$ty>(payload.clone())
                 .map_err(|_| no_store_json_error(400, "invalid product request"))?;
-            *payload = serde_json::to_value(request)
+            let mut canonical = serde_json::to_value(request)
                 .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            if let Some(object) = canonical.as_object_mut() {
+                normalize_typed_product_payload(route, object);
+            }
+            *payload = canonical;
             Ok(())
         }};
     }
@@ -1346,30 +1793,138 @@ fn canonicalize_product_payload(
     }
 }
 
+fn normalize_typed_product_payload(
+    route: ProductPostRoute,
+    object: &mut serde_json::Map<String, Value>,
+) {
+    match route {
+        ProductPostRoute::MailSend
+            if object.get("importance").and_then(Value::as_str) == Some("") =>
+        {
+            object.remove("importance");
+        }
+        ProductPostRoute::MailReply | ProductPostRoute::MailForward
+            if object
+                .get("body")
+                .and_then(Value::as_str)
+                .is_some_and(|body| !body.is_empty()) =>
+        {
+            object.remove("comment");
+        }
+        ProductPostRoute::MailDraft if object.get("id").and_then(Value::as_str) == Some("") => {
+            object.remove("id");
+        }
+        _ => {}
+    }
+}
+
 fn validate_typed_product_request(
     route: ProductPostRoute,
     value: &Value,
 ) -> Result<(), ApiResponse> {
-    macro_rules! typed {
-        ($ty:ty) => {
-            serde_json::from_value::<$ty>(value.clone())
-                .map(|_| ())
-                .map_err(|_| no_store_json_error(400, "invalid product request"))
-        };
-    }
     use ProductPostRoute::*;
     match route {
-        PushRegister => typed!(PushRegisterRequest),
-        MailSend => typed!(MailSendRequest),
-        MailReply => typed!(MailReplyRequest),
-        MailForward => typed!(MailForwardRequest),
-        MailDraft => typed!(MailDraftRequest),
-        OnenoteCreate => typed!(OneNoteCreateRequest),
-        OnenoteAppend => typed!(OneNoteAppendRequest),
-        MutationIntentCreate => typed!(MutationIntentCreateRequest),
-        MutationIntentChunk => typed!(MutationIntentChunkRequest),
-        MutationIntentCommit => typed!(MutationIntentCommitRequest),
-        MutationIntentCancel => typed!(MutationIntentCancelRequest),
+        PushRegister => {
+            let request = serde_json::from_value::<PushRegisterRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (!request.token.is_empty())
+                .then_some(())
+                .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        MailSend => {
+            let request = serde_json::from_value::<MailSendRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            if !request.body.is_empty() {
+                return Err(no_store_json_error(409, "mutation_intent_required"));
+            }
+            (!request.account.is_empty() && !request.to.is_empty())
+                .then_some(())
+                .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        MailReply => {
+            let request = serde_json::from_value::<MailReplyRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            if !request.body.is_empty() || !request.comment.is_empty() {
+                return Err(no_store_json_error(409, "mutation_intent_required"));
+            }
+            (!request.account.is_empty() && !request.id.is_empty())
+                .then_some(())
+                .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        MailForward => {
+            let request = serde_json::from_value::<MailForwardRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            if !request.body.is_empty() || !request.comment.is_empty() {
+                return Err(no_store_json_error(409, "mutation_intent_required"));
+            }
+            (!request.account.is_empty() && !request.id.is_empty() && !request.to.is_empty())
+                .then_some(())
+                .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        MailDraft => {
+            let request = serde_json::from_value::<MailDraftRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            if !request.body.is_empty() {
+                return Err(no_store_json_error(409, "mutation_intent_required"));
+            }
+            (!request.account.is_empty())
+                .then_some(())
+                .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        OnenoteCreate => {
+            let request = serde_json::from_value::<OneNoteCreateRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            if !request.body.is_empty() {
+                return Err(no_store_json_error(409, "mutation_intent_required"));
+            }
+            (!request.account.is_empty() && !request.section.is_empty())
+                .then_some(())
+                .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        OnenoteAppend => {
+            let request = serde_json::from_value::<OneNoteAppendRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            if !request.text.is_empty() {
+                return Err(no_store_json_error(409, "mutation_intent_required"));
+            }
+            (!request.account.is_empty() && !request.id.is_empty() && !request.text.is_empty())
+                .then_some(())
+                .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        MutationIntentCreate => {
+            let request = serde_json::from_value::<MutationIntentCreateRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (request.purpose.is_valid() && valid_sha256(&request.sha256))
+                .then_some(())
+                .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        MutationIntentChunk => {
+            use base64::Engine as _;
+            let request = serde_json::from_value::<MutationIntentChunkRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            let valid_data = base64::engine::general_purpose::STANDARD
+                .decode(&request.data_base64)
+                .is_ok_and(|bytes| bytes.len() <= MUTATION_CHUNK_BYTES);
+            (valid_opaque_agent_id(&request.intent_id)
+                && valid_sha256(&request.chunk_sha256)
+                && valid_data)
+                .then_some(())
+                .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        MutationIntentCommit => {
+            let request = serde_json::from_value::<MutationIntentCommitRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&request.intent_id) && valid_sha256(&request.sha256))
+                .then_some(())
+                .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        MutationIntentCancel => {
+            let request = serde_json::from_value::<MutationIntentCancelRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            valid_opaque_agent_id(&request.intent_id)
+                .then_some(())
+                .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
         AgentTurn => {
             let request = serde_json::from_value::<AgentTurnRequest>(value.clone())
                 .map_err(|_| no_store_json_error(400, "invalid product request"))?;
@@ -1383,11 +1938,39 @@ fn validate_typed_product_request(
             }
             Ok(())
         }
-        AgentSessionCreate => typed!(AgentSessionCreateRequest),
-        AgentSessionSelect => typed!(AgentSessionSelectRequest),
+        AgentSessionCreate => {
+            let request = serde_json::from_value::<AgentSessionCreateRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            request
+                .display_name
+                .as_ref()
+                .is_none_or(|name| !name.is_empty() && name.len() <= 128)
+                .then_some(())
+                .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentSessionSelect => {
+            let request = serde_json::from_value::<AgentSessionSelectRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            valid_opaque_agent_id(&request.session_id)
+                .then_some(())
+                .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
         AgentSessionArchive | AgentPairingReveal | AgentPairingClaim | AgentPairingFinalize
-        | AgentPairingRevoke => typed!(AgentSessionPairingOperationRequest),
-        AgentPairingCreate => typed!(AgentSessionPairingCreateRequest),
+        | AgentPairingRevoke => {
+            let request =
+                serde_json::from_value::<AgentSessionPairingOperationRequest>(value.clone())
+                    .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            valid_opaque_agent_id(&request.operation_id)
+                .then_some(())
+                .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentPairingCreate => {
+            let request = serde_json::from_value::<AgentSessionPairingCreateRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            valid_opaque_agent_id(&request.session_id)
+                .then_some(())
+                .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
         AgentUserPresenceStart => {
             let request = serde_json::from_value::<AgentUserPresenceStartRequest>(value.clone())
                 .map_err(|_| no_store_json_error(400, "invalid product request"))?;
@@ -1575,7 +2158,7 @@ fn canonical_product_identity(
         .and_then(|value| value.as_str().map(str::to_owned))
         .filter(|value| valid_client_request_id(value))
         .ok_or_else(|| no_store_json_error(400, "invalid request_id"))?;
-    let request_scope = canonical_scope(object);
+    let request_scope = canonical_scope(spec.route, object)?;
 
     // These values prove authority but do not change the requested effect. They
     // must neither split idempotency nor be retained by the binding store.
@@ -2663,7 +3246,11 @@ pub enum MutationPurpose {
         operation: String,
         target: String,
         recipients: Vec<String>,
+        cc: Vec<String>,
+        bcc: Vec<String>,
         subject: String,
+        importance: Option<String>,
+        read_receipt: bool,
         all: bool,
     },
     OnenoteBody {
@@ -2694,13 +3281,52 @@ impl MutationPurpose {
                 operation,
                 target,
                 recipients,
+                cc,
+                bcc,
                 subject: _,
-                all: _,
+                importance,
+                read_receipt,
+                all,
             } => {
+                let recipient_count = recipients
+                    .len()
+                    .checked_add(cc.len())
+                    .and_then(|count| count.checked_add(bcc.len()));
+                let valid_importance = importance
+                    .as_deref()
+                    .is_none_or(|value| matches!(value, "low" | "normal" | "high"));
                 !account.is_empty()
-                    && matches!(operation.as_str(), "send" | "reply" | "forward" | "draft")
-                    && recipients.len() <= 256
-                    && (matches!(operation.as_str(), "send" | "draft") || !target.is_empty())
+                    && recipient_count.is_some_and(|count| count <= 256)
+                    && valid_importance
+                    && match operation.as_str() {
+                        "send" => !recipients.is_empty() && target.is_empty(),
+                        "draft" => {
+                            target.is_empty()
+                                && cc.is_empty()
+                                && bcc.is_empty()
+                                && importance.is_none()
+                                && !read_receipt
+                                && !all
+                        }
+                        "reply" => {
+                            !target.is_empty()
+                                && recipients.is_empty()
+                                && cc.is_empty()
+                                && bcc.is_empty()
+                                && importance.is_none()
+                                && !read_receipt
+                        }
+                        "forward" => {
+                            !target.is_empty()
+                                && !recipients.is_empty()
+                                && cc.is_empty()
+                                && bcc.is_empty()
+                                && importance.is_none()
+                                && !read_receipt
+                                && !all
+                        }
+                        _ => false,
+                    }
             }
             Self::OnenoteBody {
                 account,
@@ -3342,10 +3968,7 @@ impl Router {
         match req.per_action_token.as_deref().filter(|s| !s.is_empty()) {
             Some(pat) => match self.pending.consume(pat, op, account, service, item, now) {
                 Ok(()) => None,
-                Err(e) => Some(ApiResponse::error(
-                    403,
-                    &format!("biometric confirmation invalid: {e:?}"),
-                )),
+                Err(_) => Some(ApiResponse::error(403, "biometric_confirmation_invalid")),
             },
             None => {
                 match self.pending.register(
@@ -3753,13 +4376,7 @@ impl Router {
         match spec.route.replay_policy() {
             ProductReplayPolicy::AtomicTurnAdmission => return execute(Some(&identity)),
             ProductReplayPolicy::RouteOwned => match store.bind(&identity) {
-                Ok(DurableRequestBinding::Inserted) => {
-                    let response = execute(Some(&identity));
-                    if response.status == 400 && store.reject(&identity).is_err() {
-                        return ApiResponse::error(503, "request_store_unavailable");
-                    }
-                    return response;
-                }
+                Ok(DurableRequestBinding::Inserted) => return execute(Some(&identity)),
                 Ok(DurableRequestBinding::Existing) => return execute(Some(&identity)),
                 Ok(DurableRequestBinding::Conflict) => {
                     return ApiResponse::error(409, "request_id_conflict");
@@ -3767,13 +4384,7 @@ impl Router {
                 Err(_) => return ApiResponse::error(503, "request_store_unavailable"),
             },
             ProductReplayPolicy::EphemeralResponse => match store.bind(&identity) {
-                Ok(DurableRequestBinding::Inserted) => {
-                    let response = execute(Some(&identity));
-                    if response.status == 400 && store.reject(&identity).is_err() {
-                        return ApiResponse::error(503, "request_store_unavailable");
-                    }
-                    return response;
-                }
+                Ok(DurableRequestBinding::Inserted) => return execute(Some(&identity)),
                 Ok(DurableRequestBinding::Existing) => {
                     return ApiResponse::error(409, "request_outcome_unknown");
                 }
@@ -3816,11 +4427,17 @@ impl Router {
             if store.complete(&identity, &response).is_err() {
                 return ApiResponse::error(503, "request_outcome_unknown");
             }
-        } else if response.status == 400 {
-            if store.reject(&identity).is_err() {
-                return ApiResponse::error(503, "request_store_unavailable");
+        } else if response.status < 500 && response.status != 403 {
+            // Structural and semantic request validation completed before begin(). Any
+            // other caller-visible 4xx is therefore a terminal route/domain result and
+            // must keep the global UUID binding; reopening it could permit a second
+            // effect after a lost terminal response. A 403 is the sole exception: on
+            // biometric routes it means the native presence handle has not yet been
+            // armed, so the exact request must be allowed to continue after arming.
+            if store.complete(&identity, &response).is_err() {
+                return ApiResponse::error(503, "request_outcome_unknown");
             }
-        } else if response.status < 500 && store.abort(&identity).is_err() {
+        } else if response.status == 403 && store.abort(&identity).is_err() {
             return ApiResponse::error(503, "request_store_unavailable");
         }
         response
@@ -3845,6 +4462,19 @@ impl Router {
             .add_run(account, kind, &now, &now, status, &audit_summary(summary))
             .map(|_| ())
             .map_err(|e| e.to_string())
+    }
+
+    /// Convert an injected mutation-handler failure into a closed public/audit
+    /// code. Provider and transport diagnostics remain inside their owning
+    /// subsystem and must never cross the product HTTP or activity boundary.
+    fn closed_mutation_failure(
+        &self,
+        account: &str,
+        audit_kind: &'static str,
+        code: &'static str,
+    ) -> ApiResponse {
+        let _ = self.audit_account(account, audit_kind, "error", code);
+        ApiResponse::error(500, code)
     }
 
     /// Dispatch one request to a response. Never panics; unknown routes -> 404.
@@ -4245,7 +4875,7 @@ impl Router {
         };
         match handler.set_poll_interval_secs(secs) {
             Ok(()) => ApiResponse::ok_json(&serde_json::json!({ "poll_interval_secs": secs })),
-            Err(e) => ApiResponse::error(500, &format!("settings: {e}")),
+            Err(_) => ApiResponse::error(500, "settings_update_failed"),
         }
     }
 
@@ -4286,10 +4916,7 @@ impl Router {
                 let _ = self.audit_account(account, "audit:mail", "ok", what);
                 ApiResponse::ok_json(&json!({ "ok": true }))
             }
-            Err(e) => {
-                let _ = self.audit_account(account, "audit:mail", "error", &format!("{what}: {e}"));
-                ApiResponse::error(500, &e)
-            }
+            Err(_) => self.closed_mutation_failure(account, "audit:mail", "mail_write_failed"),
         }
     }
 
@@ -4318,10 +4945,8 @@ impl Router {
                 let _ = self.audit_account(account, "audit:calendar", "ok", what);
                 ApiResponse::ok_json(&json!({ "ok": true }))
             }
-            Err(e) => {
-                let _ =
-                    self.audit_account(account, "audit:calendar", "error", &format!("{what}: {e}"));
-                ApiResponse::error(500, &e)
+            Err(_) => {
+                self.closed_mutation_failure(account, "audit:calendar", "calendar_write_failed")
             }
         }
     }
@@ -4386,10 +5011,8 @@ impl Router {
                 let _ = self.audit_account(account, "audit:calendar", "ok", "create");
                 ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
             }
-            Err(e) => {
-                let _ =
-                    self.audit_account(account, "audit:calendar", "error", &format!("create: {e}"));
-                ApiResponse::error(500, &e)
+            Err(_) => {
+                self.closed_mutation_failure(account, "audit:calendar", "calendar_write_failed")
             }
         }
     }
@@ -4507,10 +5130,8 @@ impl Router {
                 let _ = self.audit_account(account, "audit:contact", "ok", what);
                 ApiResponse::ok_json(&json!({ "ok": true }))
             }
-            Err(e) => {
-                let _ =
-                    self.audit_account(account, "audit:contact", "error", &format!("{what}: {e}"));
-                ApiResponse::error(500, &e)
+            Err(_) => {
+                self.closed_mutation_failure(account, "audit:contact", "contact_write_failed")
             }
         }
     }
@@ -4640,10 +5261,8 @@ impl Router {
                 let _ = self.audit_account(account, "audit:contact", "ok", "create");
                 ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
             }
-            Err(e) => {
-                let _ =
-                    self.audit_account(account, "audit:contact", "error", &format!("create: {e}"));
-                ApiResponse::error(500, &e)
+            Err(_) => {
+                self.closed_mutation_failure(account, "audit:contact", "contact_write_failed")
             }
         }
     }
@@ -4756,10 +5375,7 @@ impl Router {
                 let _ = self.audit_account(account, "audit:todo", "ok", what);
                 ApiResponse::ok_json(&json!({ "ok": true }))
             }
-            Err(e) => {
-                let _ = self.audit_account(account, "audit:todo", "error", &format!("{what}: {e}"));
-                ApiResponse::error(500, &e)
-            }
+            Err(_) => self.closed_mutation_failure(account, "audit:todo", "todo_write_failed"),
         }
     }
 
@@ -4865,10 +5481,7 @@ impl Router {
                 let _ = self.audit_account(account, "audit:todo", "ok", "create");
                 ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
             }
-            Err(e) => {
-                let _ = self.audit_account(account, "audit:todo", "error", &format!("create: {e}"));
-                ApiResponse::error(500, &e)
-            }
+            Err(_) => self.closed_mutation_failure(account, "audit:todo", "todo_write_failed"),
         }
     }
 
@@ -5000,15 +5613,7 @@ impl Router {
                 let _ = self.audit_account(account, "audit:todo", "ok", "checklist-add");
                 ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
             }
-            Err(e) => {
-                let _ = self.audit_account(
-                    account,
-                    "audit:todo",
-                    "error",
-                    &format!("checklist-add: {e}"),
-                );
-                ApiResponse::error(500, &e)
-            }
+            Err(_) => self.closed_mutation_failure(account, "audit:todo", "todo_write_failed"),
         }
     }
 
@@ -5100,15 +5705,7 @@ impl Router {
                 let _ = self.audit_account(account, "audit:todo", "ok", "list-create");
                 ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
             }
-            Err(e) => {
-                let _ = self.audit_account(
-                    account,
-                    "audit:todo",
-                    "error",
-                    &format!("list-create: {e}"),
-                );
-                ApiResponse::error(500, &e)
-            }
+            Err(_) => self.closed_mutation_failure(account, "audit:todo", "todo_write_failed"),
         }
     }
 
@@ -5160,10 +5757,8 @@ impl Router {
                 let _ = self.audit_account(account, "audit:onenote", "ok", what);
                 ApiResponse::ok_json(&json!({ "ok": true }))
             }
-            Err(e) => {
-                let _ =
-                    self.audit_account(account, "audit:onenote", "error", &format!("{what}: {e}"));
-                ApiResponse::error(500, &e)
+            Err(_) => {
+                self.closed_mutation_failure(account, "audit:onenote", "onenote_write_failed")
             }
         }
     }
@@ -5192,7 +5787,8 @@ impl Router {
             Err(e) => return e,
         };
         let request: OneNoteCreateRequest =
-            match parse_agent_strict_json_with_limit(req, "OneNote create", 64 * 1024) {
+            match parse_product_strict_json(req, ProductPostRoute::OnenoteCreate, "OneNote create")
+            {
                 Ok(request) => request,
                 Err(response) => return response,
             };
@@ -5208,15 +5804,11 @@ impl Router {
                 let _ = self.audit_account(&request.account, "audit:onenote", "ok", "create");
                 ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
             }
-            Err(e) => {
-                let _ = self.audit_account(
-                    &request.account,
-                    "audit:onenote",
-                    "error",
-                    &format!("create: {e}"),
-                );
-                ApiResponse::error(500, &e)
-            }
+            Err(_) => self.closed_mutation_failure(
+                &request.account,
+                "audit:onenote",
+                "onenote_write_failed",
+            ),
         }
     }
 
@@ -5249,7 +5841,8 @@ impl Router {
             Err(e) => return e,
         };
         let request: OneNoteAppendRequest =
-            match parse_agent_strict_json_with_limit(req, "OneNote append", 64 * 1024) {
+            match parse_product_strict_json(req, ProductPostRoute::OnenoteAppend, "OneNote append")
+            {
                 Ok(request) => request,
                 Err(response) => return response,
             };
@@ -5310,11 +5903,14 @@ impl Router {
             Ok(value) => value,
             Err(response) => return response,
         };
-        let request: MutationIntentCreateRequest =
-            match parse_agent_strict_json_with_limit(req, "mutation intent create", 16 * 1024) {
-                Ok(request) => request,
-                Err(response) => return response,
-            };
+        let request: MutationIntentCreateRequest = match parse_product_strict_json(
+            req,
+            ProductPostRoute::MutationIntentCreate,
+            "mutation intent create",
+        ) {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
         if !valid_client_request_id(&request.request_id)
             || !request.purpose.is_valid()
             || !valid_sha256(&request.sha256)
@@ -5352,16 +5948,22 @@ impl Router {
             Ok(value) => value,
             Err(response) => return response,
         };
-        let request: MutationIntentChunkRequest =
-            match parse_agent_strict_json_with_limit(req, "mutation intent chunk", 16 * 1024) {
-                Ok(request) => request,
-                Err(response) => return response,
-            };
+        let request: MutationIntentChunkRequest = match parse_product_strict_json(
+            req,
+            ProductPostRoute::MutationIntentChunk,
+            "mutation intent chunk",
+        ) {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
         if !valid_client_request_id(&request.request_id)
             || !valid_opaque_agent_id(&request.intent_id)
             || !valid_sha256(&request.chunk_sha256)
         {
             return ApiResponse::error(400, "invalid mutation chunk request");
+        }
+        if self.biometric_gate && req.storage_not_low != Some(true) {
+            return ApiResponse::error(507, "mutation_intent_insufficient_storage");
         }
         let bytes = match base64::engine::general_purpose::STANDARD.decode(&request.data_base64) {
             Ok(bytes) if bytes.len() <= MUTATION_CHUNK_BYTES => bytes,
@@ -5386,16 +5988,22 @@ impl Router {
             Ok(value) => value,
             Err(response) => return response,
         };
-        let request: MutationIntentCommitRequest =
-            match parse_agent_strict_json_with_limit(req, "mutation intent commit", 16 * 1024) {
-                Ok(request) => request,
-                Err(response) => return response,
-            };
+        let request: MutationIntentCommitRequest = match parse_product_strict_json(
+            req,
+            ProductPostRoute::MutationIntentCommit,
+            "mutation intent commit",
+        ) {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
         if !valid_client_request_id(&request.request_id)
             || !valid_opaque_agent_id(&request.intent_id)
             || !valid_sha256(&request.sha256)
         {
             return ApiResponse::error(400, "invalid mutation commit request");
+        }
+        if self.biometric_gate && req.storage_not_low != Some(true) {
+            return ApiResponse::error(507, "mutation_intent_insufficient_storage");
         }
         match handler.commit(
             &owner,
@@ -5414,11 +6022,14 @@ impl Router {
             Ok(value) => value,
             Err(response) => return response,
         };
-        let request: MutationIntentCancelRequest =
-            match parse_agent_strict_json_with_limit(req, "mutation intent cancel", 16 * 1024) {
-                Ok(request) => request,
-                Err(response) => return response,
-            };
+        let request: MutationIntentCancelRequest = match parse_product_strict_json(
+            req,
+            ProductPostRoute::MutationIntentCancel,
+            "mutation intent cancel",
+        ) {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
         if !valid_client_request_id(&request.request_id)
             || !valid_opaque_agent_id(&request.intent_id)
         {
@@ -5437,10 +6048,8 @@ impl Router {
                 let _ = self.audit_account(account, "audit:onedrive", "ok", what);
                 ApiResponse::ok_json(&json!({ "ok": true }))
             }
-            Err(e) => {
-                let _ =
-                    self.audit_account(account, "audit:onedrive", "error", &format!("{what}: {e}"));
-                ApiResponse::error(500, &e)
+            Err(_) => {
+                self.closed_mutation_failure(account, "audit:onedrive", "onedrive_write_failed")
             }
         }
     }
@@ -5473,10 +6082,8 @@ impl Router {
                 let _ = self.audit_account(account, "audit:onedrive", "ok", "create");
                 ApiResponse::ok_json(&json!({ "ok": true, "id": id }))
             }
-            Err(e) => {
-                let _ =
-                    self.audit_account(account, "audit:onedrive", "error", &format!("create: {e}"));
-                ApiResponse::error(500, &e)
+            Err(_) => {
+                self.closed_mutation_failure(account, "audit:onedrive", "onedrive_write_failed")
             }
         }
     }
@@ -5636,15 +6243,11 @@ impl Router {
                 let _ = self.audit_account(account, "audit:onedrive-manage", "ok", "free-up");
                 ApiResponse::ok_json(&json!({ "ok": true }))
             }
-            Err(e) => {
-                let _ = self.audit_account(
-                    account,
-                    "audit:onedrive-manage",
-                    "error",
-                    &format!("free-up id={id}: {e}"),
-                );
-                ApiResponse::error(500, &e)
-            }
+            Err(_) => self.closed_mutation_failure(
+                account,
+                "audit:onedrive-manage",
+                "onedrive_manage_failed",
+            ),
         }
     }
 
@@ -5678,15 +6281,11 @@ impl Router {
                     "target": result.target,
                 }))
             }
-            Err(e) => {
-                let _ = self.audit_account(
-                    account,
-                    "audit:onedrive-manage",
-                    "error",
-                    &format!("download-now id={id}: {e}"),
-                );
-                ApiResponse::error(500, &e)
-            }
+            Err(_) => self.closed_mutation_failure(
+                account,
+                "audit:onedrive-manage",
+                "onedrive_manage_failed",
+            ),
         }
     }
 
@@ -5705,7 +6304,7 @@ impl Router {
         };
         match h.list_conflicts(account) {
             Ok(conflicts) => ApiResponse::ok_json(&json!({ "conflicts": conflicts })),
-            Err(e) => ApiResponse::error(500, &format!("conflicts: {e}")),
+            Err(_) => ApiResponse::error(500, "onedrive_conflicts_unavailable"),
         }
     }
 
@@ -5781,15 +6380,11 @@ impl Router {
                 let _ = self.audit_account(account, "audit:onedrive-manage", "ok", "cleanup");
                 ApiResponse::ok_json(&json!({ "ok": true, "cleanup": report }))
             }
-            Err(e) => {
-                let _ = self.audit_account(
-                    account,
-                    "audit:onedrive-manage",
-                    "error",
-                    &format!("cleanup: {e}"),
-                );
-                ApiResponse::error(500, &e)
-            }
+            Err(_) => self.closed_mutation_failure(
+                account,
+                "audit:onedrive-manage",
+                "onedrive_manage_failed",
+            ),
         }
     }
 
@@ -5799,7 +6394,7 @@ impl Router {
             Err(e) => return e,
         };
         let request: MailSendRequest =
-            match parse_agent_strict_json_with_limit(req, "mail send", 64 * 1024) {
+            match parse_product_strict_json(req, ProductPostRoute::MailSend, "mail send") {
                 Ok(request) => request,
                 Err(response) => return response,
             };
@@ -5836,7 +6431,7 @@ impl Router {
             Err(e) => return e,
         };
         let request: MailReplyRequest =
-            match parse_agent_strict_json_with_limit(req, "mail reply", 64 * 1024) {
+            match parse_product_strict_json(req, ProductPostRoute::MailReply, "mail reply") {
                 Ok(request) => request,
                 Err(response) => return response,
             };
@@ -5864,7 +6459,7 @@ impl Router {
             Err(e) => return e,
         };
         let request: MailForwardRequest =
-            match parse_agent_strict_json_with_limit(req, "mail forward", 64 * 1024) {
+            match parse_product_strict_json(req, ProductPostRoute::MailForward, "mail forward") {
                 Ok(request) => request,
                 Err(response) => return response,
             };
@@ -5912,15 +6507,7 @@ impl Router {
                 let _ = self.audit_account(account, "audit:mail", "ok", &format!("move id={id}"));
                 ApiResponse::ok_json(&json!({ "moved": id, "new_id": new_id }))
             }
-            Err(e) => {
-                let _ = self.audit_account(
-                    account,
-                    "audit:mail",
-                    "error",
-                    &format!("move id={id}: {e}"),
-                );
-                ApiResponse::error(500, &e)
-            }
+            Err(_) => self.closed_mutation_failure(account, "audit:mail", "mail_write_failed"),
         }
     }
 
@@ -6031,7 +6618,7 @@ impl Router {
             Err(e) => return e,
         };
         let request: MailDraftRequest =
-            match parse_agent_strict_json_with_limit(req, "mail draft", 64 * 1024) {
+            match parse_product_strict_json(req, ProductPostRoute::MailDraft, "mail draft") {
                 Ok(request) => request,
                 Err(response) => return response,
             };
@@ -6052,14 +6639,8 @@ impl Router {
                 let _ = self.audit_account(&request.account, "audit:mail", "ok", "create_draft");
                 ApiResponse::ok_json(&json!({ "draft_id": draft_id }))
             }
-            Err(e) => {
-                let _ = self.audit_account(
-                    &request.account,
-                    "audit:mail",
-                    "error",
-                    &format!("create_draft: {e}"),
-                );
-                ApiResponse::error(500, &e)
+            Err(_) => {
+                self.closed_mutation_failure(&request.account, "audit:mail", "mail_write_failed")
             }
         }
     }
@@ -6092,13 +6673,16 @@ impl Router {
         {
             return r;
         }
-        if let Err(e) = self.audit_account(
-            account,
-            "audit:restore",
-            "started",
-            &format!("restore requested service={service} id={id}"),
-        ) {
-            return ApiResponse::error(500, &format!("audit: {e}"));
+        if self
+            .audit_account(
+                account,
+                "audit:restore",
+                "started",
+                &format!("restore requested service={service} id={id}"),
+            )
+            .is_err()
+        {
+            return ApiResponse::error(500, "audit_unavailable");
         }
         match handler.restore(account, service, id) {
             Ok(RestoreResponse::Completed { new_id }) => {
@@ -6166,7 +6750,7 @@ impl Router {
         };
         let services = match parse_backup_services_param(req.q("services")) {
             Ok(services) => services,
-            Err(e) => return ApiResponse::error(400, &e),
+            Err(_) => return ApiResponse::error(400, "unsupported backup service"),
         };
         if let Some(r) = self.biometric_challenge("backup", account, "backup", account, req) {
             return r;
@@ -6178,7 +6762,7 @@ impl Router {
                 "kind": "backup",
                 "state": job.state,
             })),
-            Err(e) => ApiResponse::error(500, &e),
+            Err(_) => ApiResponse::error(500, "backup_enqueue_failed"),
         }
     }
 
@@ -6201,7 +6785,7 @@ impl Router {
                 "account": account,
                 "jobs": jobs.into_iter().map(mobile_job_summary_json).collect::<Vec<_>>(),
             })),
-            Err(e) => ApiResponse::error(500, &e),
+            Err(_) => ApiResponse::error(500, "mobile_jobs_unavailable"),
         }
     }
 
@@ -6230,7 +6814,7 @@ impl Router {
                 "cancelled": cancelled,
                 "job_id": job_id,
             })),
-            Err(e) => ApiResponse::error(500, &e),
+            Err(_) => ApiResponse::error(500, "mobile_job_cancel_failed"),
         }
     }
 
@@ -6267,7 +6851,7 @@ impl Router {
                     "checked": checked, "verified": verified,
                 }))
             }
-            Err(e) => ApiResponse::error(500, &e),
+            Err(_) => ApiResponse::error(500, "verify_failed"),
         }
     }
 
@@ -6317,16 +6901,19 @@ impl Router {
                 return ApiResponse::error(400, "no valid email address");
             }
             let role = req.q("role").filter(|r| !r.is_empty()).unwrap_or("read");
-            if let Err(e) = self.audit_account(
-                account,
-                "audit:share",
-                "started",
-                &format!(
-                    "invite requested service={service} id={id} role={role} n={}",
-                    emails.len()
-                ),
-            ) {
-                return ApiResponse::error(500, &format!("audit: {e}"));
+            if self
+                .audit_account(
+                    account,
+                    "audit:share",
+                    "started",
+                    &format!(
+                        "invite requested service={service} id={id} role={role} n={}",
+                        emails.len()
+                    ),
+                )
+                .is_err()
+            {
+                return ApiResponse::error(500, "audit_unavailable");
             }
             return match handler.invite(account, service, id, &emails, role) {
                 Ok(summary) => {
@@ -6357,13 +6944,18 @@ impl Router {
             .q("scope")
             .filter(|s| !s.is_empty())
             .unwrap_or("anonymous");
-        if let Err(e) = self.audit_account(
-            account,
-            "audit:share",
-            "started",
-            &format!("share requested service={service} id={id} type={link_type} scope={scope}"),
-        ) {
-            return ApiResponse::error(500, &format!("audit: {e}"));
+        if self
+            .audit_account(
+                account,
+                "audit:share",
+                "started",
+                &format!(
+                    "share requested service={service} id={id} type={link_type} scope={scope}"
+                ),
+            )
+            .is_err()
+        {
+            return ApiResponse::error(500, "audit_unavailable");
         }
         match handler.share(account, service, id, link_type, scope) {
             Ok(web_url) => {
@@ -6642,7 +7234,7 @@ impl Router {
         let modes = match &self.onedrive_mode {
             Some(h) => match h.modes(account) {
                 Ok(m) => m,
-                Err(e) => return ApiResponse::error(500, &format!("mode: {e}")),
+                Err(_) => return ApiResponse::error(500, "onedrive_mode_unavailable"),
             },
             None => self
                 .config
@@ -6730,8 +7322,11 @@ impl Router {
             "mode-set account={account} folder={folder} mode={}",
             mode.map(|m| m.as_str()).unwrap_or("clear")
         );
-        if let Err(e) = self.audit_account(account, "audit:onedrive-mode", "started", &summary) {
-            return ApiResponse::error(500, &format!("audit: {e}"));
+        if self
+            .audit_account(account, "audit:onedrive-mode", "started", &summary)
+            .is_err()
+        {
+            return ApiResponse::error(500, "audit_unavailable");
         }
         match handler.set_folder(account, folder, mode) {
             Ok(()) => {
@@ -6753,29 +7348,25 @@ impl Router {
                             Ok(report) => {
                                 resp["cleanup"] = report;
                             }
-                            Err(e) => {
+                            Err(_) => {
                                 let _ = self.audit_account(
                                     account,
                                     "audit:onedrive-manage",
                                     "error",
-                                    &format!("cleanup-on-mode account={account}: {e}"),
+                                    "onedrive_manage_failed",
                                 );
-                                resp["cleanup_error"] = json!(e);
+                                resp["cleanup_error"] = json!("onedrive_manage_failed");
                             }
                         }
                     }
                 }
                 ApiResponse::ok_json(&resp)
             }
-            Err(e) => {
-                let _ = self.audit_account(
-                    account,
-                    "audit:onedrive-mode",
-                    "error",
-                    &format!("{summary}: {e}"),
-                );
-                ApiResponse::error(500, &format!("mode: {e}"))
-            }
+            Err(_) => self.closed_mutation_failure(
+                account,
+                "audit:onedrive-mode",
+                "onedrive_mode_update_failed",
+            ),
         }
     }
 
@@ -6795,7 +7386,9 @@ impl Router {
             // No write token / not connected is an EXPECTED state (e.g. before
             // login) — return 200 with `available:false` so the UI shows a quiet
             // "not connected" state instead of a console error from a 5xx fetch.
-            Err(e) => ApiResponse::ok_json(&json!({ "available": false, "reason": e })),
+            Err(_) => ApiResponse::ok_json(
+                &json!({ "available": false, "reason": "onedrive_unavailable" }),
+            ),
         }
     }
 
@@ -6813,7 +7406,7 @@ impl Router {
         };
         match handler.permissions(account, id) {
             Ok(p) => ApiResponse::ok_json(&json!({ "permissions": p })),
-            Err(e) => ApiResponse::error(502, &e),
+            Err(_) => ApiResponse::error(502, "onedrive_permissions_unavailable"),
         }
     }
 
@@ -6864,7 +7457,7 @@ impl Router {
                 }
                 ApiResponse::ok_json(&json!({ "children": children }))
             }
-            Err(e) => ApiResponse::error(502, &e),
+            Err(_) => ApiResponse::error(502, "onedrive_listing_unavailable"),
         }
     }
 
@@ -6888,7 +7481,7 @@ impl Router {
                 body: bytes,
                 headers: Vec::new(),
             },
-            Err(e) => ApiResponse::error(502, &e),
+            Err(_) => ApiResponse::error(502, "onedrive_download_unavailable"),
         }
     }
 
@@ -6955,7 +7548,7 @@ impl Router {
         };
         match h.start_login(account, role) {
             Ok(v) => ApiResponse::ok_json(&v),
-            Err(e) => ApiResponse::error(502, &e),
+            Err(_) => ApiResponse::error(502, "account_login_unavailable"),
         }
     }
 
@@ -7012,7 +7605,7 @@ impl Router {
         };
         match h.sign_out(account, role) {
             Ok(v) => ApiResponse::ok_json(&v),
-            Err(e) => ApiResponse::error(500, &e),
+            Err(_) => ApiResponse::error(500, "account_signout_failed"),
         }
     }
 
@@ -7047,7 +7640,7 @@ impl Router {
         }
         match h.register(&request.token) {
             Ok(()) => ApiResponse::ok_json(&json!({ "registered": true })),
-            Err(e) => ApiResponse::error(500, &e),
+            Err(_) => ApiResponse::error(500, "push_register_failed"),
         }
     }
 
@@ -7062,7 +7655,7 @@ impl Router {
         }
         match h.send_test() {
             Ok(v) => ApiResponse::ok_json(&v),
-            Err(e) => ApiResponse::error(502, &e),
+            Err(_) => ApiResponse::error(502, "push_test_failed"),
         }
     }
 
@@ -7104,7 +7697,7 @@ impl Router {
         }
         match handler.session_create(&request.request_id, request.display_name.as_deref()) {
             Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
-            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+            Err(error) => agent_session_error_response(&error),
         }
     }
 
@@ -7125,7 +7718,7 @@ impl Router {
         }
         match handler.session_select(&request.request_id, &request.session_id) {
             Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
-            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+            Err(error) => agent_session_error_response(&error),
         }
     }
 
@@ -7144,7 +7737,7 @@ impl Router {
         };
         match handler.session_list(cursor, limit) {
             Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
-            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+            Err(error) => agent_session_error_response(&error),
         }
     }
 
@@ -7166,7 +7759,7 @@ impl Router {
         };
         match handler.session_history(session_id, cursor, limit) {
             Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
-            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+            Err(error) => agent_session_error_response(&error),
         }
     }
 
@@ -7198,7 +7791,7 @@ impl Router {
         };
         match handler.request_status(session_id, route, request_id) {
             Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
-            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+            Err(error) => agent_session_error_response(&error),
         }
     }
 
@@ -7248,7 +7841,7 @@ impl Router {
         }
         match handler.user_presence_start(request) {
             Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
-            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+            Err(error) => agent_session_error_response(&error),
         }
     }
 
@@ -7282,7 +7875,7 @@ impl Router {
         }
         match handler.user_presence_confirm(request) {
             Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
-            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+            Err(error) => agent_session_error_response(&error),
         }
     }
 
@@ -7303,7 +7896,7 @@ impl Router {
         }
         match handler.session_pairing_create(request) {
             Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
-            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+            Err(error) => agent_session_error_response(&error),
         }
     }
 
@@ -7324,7 +7917,7 @@ impl Router {
         }
         match handler.session_pairing_reveal(request) {
             Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
-            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+            Err(error) => agent_session_error_response(&error),
         }
     }
 
@@ -7374,7 +7967,7 @@ impl Router {
         }
         match operation(handler.as_ref(), request) {
             Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
-            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+            Err(error) => agent_session_error_response(&error),
         }
     }
 
@@ -7400,7 +7993,7 @@ impl Router {
         }
         match operation(handler.as_ref(), request) {
             Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
-            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+            Err(error) => agent_session_error_response(&error),
         }
     }
 
@@ -7455,7 +8048,7 @@ impl Router {
             {
                 no_store_json_error(409, &e)
             }
-            Err(e) => no_store_json_error(agent_session_error_status(&e), &e),
+            Err(e) => agent_session_error_response(&e),
         }
     }
 
@@ -7481,7 +8074,7 @@ impl Router {
         if self.biometric_gate {
             let binding = match handler.pending_binding(&request.pending, &request.action_hash) {
                 Ok(binding) => binding,
-                Err(e) => return ApiResponse::error(agent_confirm_error_status(&e), &e),
+                Err(e) => return agent_confirm_error_response(&e),
             };
             if let Some(r) = self.biometric_challenge(
                 &binding.op,
@@ -7498,7 +8091,7 @@ impl Router {
                 "confirmed": request.pending,
                 "result": "Completed successfully."
             })),
-            Err(e) => ApiResponse::error(agent_confirm_error_status(&e), &e),
+            Err(e) => agent_confirm_error_response(&e),
         }
     }
 
@@ -7526,7 +8119,7 @@ impl Router {
                 "state": "cancel_requested",
                 "turn_id": request.turn_id,
             }))),
-            Err(error) => no_store_json_error(agent_session_error_status(&error), &error),
+            Err(error) => agent_session_error_response(&error),
         }
     }
 
@@ -7558,7 +8151,7 @@ impl Router {
                 "state": "cancelled",
                 "pending": request.pending,
             }))),
-            Err(error) => no_store_json_error(agent_confirm_error_status(&error), &error),
+            Err(error) => agent_confirm_error_response(&error),
         }
     }
 
@@ -7875,7 +8468,7 @@ impl Router {
                 "model": request.model,
                 "reasoning_effort": request.reasoning_effort,
             })),
-            Err(e) => ApiResponse::error(400, &e),
+            Err(_) => ApiResponse::error(400, "model_selection_rejected"),
         }
     }
 
@@ -7953,7 +8546,7 @@ impl Router {
                     .collect();
                 ApiResponse::ok_json(&json!({ "runs": arr, "count": arr.len() }))
             }
-            Err(e) => ApiResponse::error(500, &format!("query: {e}")),
+            Err(_) => ApiResponse::error(500, "store_query_failed"),
         }
     }
 
@@ -7982,7 +8575,7 @@ impl Router {
                     }));
                 }
                 Ok(_) => {}
-                Err(e) => return ApiResponse::error(500, &format!("query: {e}")),
+                Err(_) => return ApiResponse::error(500, "store_query_failed"),
             }
         }
         let onedrive_cursor = store
@@ -8011,7 +8604,7 @@ impl Router {
         let path = self
             .store_path(account)
             .ok_or_else(|| ApiResponse::error(404, "unknown account"))?;
-        Store::open(path).map_err(|e| ApiResponse::error(500, &format!("store: {e}")))
+        Store::open(path).map_err(|_| ApiResponse::error(500, "store_unavailable"))
     }
 
     /// Read-only store open for GET endpoints: a WAL reader that takes no instance
@@ -8027,9 +8620,7 @@ impl Router {
             Ok(s) => Ok(s),
             // No migrated DB yet (first run): fall back to a writable open, which
             // creates + migrates it, so the endpoint still works before the first sync.
-            Err(_) => {
-                Store::open(&path).map_err(|e| ApiResponse::error(500, &format!("store: {e}")))
-            }
+            Err(_) => Store::open(&path).map_err(|_| ApiResponse::error(500, "store_unavailable")),
         }
     }
 
@@ -8079,7 +8670,7 @@ impl Router {
                     let strict_body_all = if strict_body_acc.is_some() {
                         match store.items_by_service(account, service) {
                             Ok(all) => Some(all),
-                            Err(e) => return ApiResponse::error(500, &format!("query: {e}")),
+                            Err(_) => return ApiResponse::error(500, "store_query_failed"),
                         }
                     } else {
                         None
@@ -8121,7 +8712,7 @@ impl Router {
                         "parent": parent,
                     }))
                 }
-                Err(e) => ApiResponse::error(500, &format!("query: {e}")),
+                Err(_) => ApiResponse::error(500, "store_query_failed"),
             };
         }
         // Page the listing so a large mailbox is never loaded all at once.
@@ -8132,7 +8723,7 @@ impl Router {
             .unwrap_or(0);
         let total = match store.count_by_service(account, service) {
             Ok(t) => t,
-            Err(e) => return ApiResponse::error(500, &format!("query: {e}")),
+            Err(_) => return ApiResponse::error(500, "store_query_failed"),
         };
         match store.items_by_service_page(account, service, limit, offset) {
             Ok(items) => {
@@ -8143,7 +8734,7 @@ impl Router {
                 let strict_body_all = if strict_body_acc.is_some() {
                     match store.items_by_service(account, service) {
                         Ok(all) => Some(all),
-                        Err(e) => return ApiResponse::error(500, &format!("query: {e}")),
+                        Err(_) => return ApiResponse::error(500, "store_query_failed"),
                     }
                 } else {
                     None
@@ -8299,7 +8890,7 @@ impl Router {
                     "offset": offset,
                 }))
             }
-            Err(e) => ApiResponse::error(500, &format!("query: {e}")),
+            Err(_) => ApiResponse::error(500, "store_query_failed"),
         }
     }
 
@@ -8322,7 +8913,7 @@ impl Router {
                 let onedrive_all = if service == "onedrive" {
                     match store.items_by_service(account, service) {
                         Ok(all) => Some(all),
-                        Err(e) => return ApiResponse::error(500, &format!("query: {e}")),
+                        Err(_) => return ApiResponse::error(500, "store_query_failed"),
                     }
                 } else {
                     None
@@ -8343,7 +8934,7 @@ impl Router {
                 ApiResponse::ok_json(&v)
             }
             Ok(None) => ApiResponse::error(404, "item not found"),
-            Err(e) => ApiResponse::error(500, &format!("query: {e}")),
+            Err(_) => ApiResponse::error(500, "store_query_failed"),
         }
     }
 
@@ -8369,7 +8960,7 @@ impl Router {
         let it = match store.get_item(account, service, id) {
             Ok(Some(it)) => it,
             Ok(None) => return Err(ApiResponse::error(404, "item not found")),
-            Err(e) => return Err(ApiResponse::error(500, &format!("query: {e}"))),
+            Err(_) => return Err(ApiResponse::error(500, "store_query_failed")),
         };
         // A OneDrive item's stored `local_path` is only the NAME segment; the on-disk body path
         // walks the parent-folder chain (materialize writes `sync_root/<folder>/…/<name>`).
@@ -8379,7 +8970,7 @@ impl Router {
         let rel = if service == "onedrive" {
             let items = store
                 .items_by_service(account, service)
-                .map_err(|e| ApiResponse::error(500, &format!("query: {e}")))?;
+                .map_err(|_| ApiResponse::error(500, "store_query_failed"))?;
             let by_id: HashMap<&str, &Item> =
                 items.iter().map(|i| (i.remote_id.as_str(), i)).collect();
             isyncyou_connectors::local_rel_path(&by_id, &it)
@@ -8420,7 +9011,7 @@ impl Router {
                 };
                 match read {
                     Ok(bytes) => Ok((rel, bytes, name)),
-                    Err(e) => Err(ApiResponse::error(500, &format!("read: {e}"))),
+                    Err(_) => Err(ApiResponse::error(500, "store_read_failed")),
                 }
             }
             (Ok(_), Ok(_)) => Err(ApiResponse::error(400, "body path escapes its root")),
@@ -8667,7 +9258,7 @@ impl Router {
         let mut hits = match store.search_names(account, q) {
             Ok(h) => h,
             // An invalid FTS expression is a client error, not a server fault.
-            Err(e) => return ApiResponse::error(400, &format!("invalid query: {e}")),
+            Err(_) => return ApiResponse::error(400, "invalid_query"),
         };
         // ... merged with indexed bodies (e.g. mail text), de-duplicated.
         let mut seen: std::collections::HashSet<(String, String)> = hits
@@ -8684,7 +9275,7 @@ impl Router {
                     }
                 }
             }
-            Err(e) => return ApiResponse::error(400, &format!("invalid query: {e}")),
+            Err(_) => return ApiResponse::error(400, "invalid_query"),
         }
         let arr: Vec<Value> = hits.iter().map(item_json).collect();
         ApiResponse::ok_json(&json!({ "query": q, "hits": arr, "count": arr.len() }))
@@ -8709,16 +9300,20 @@ fn audit_summary(summary: &str) -> String {
 }
 
 fn agent_confirm_error_status(error: &str) -> u16 {
-    if error.contains("BadToken")
-        || error.contains("Expired")
-        || error.contains("ActionMismatch")
-        || error.contains("NotFound")
-        || error == "bad token"
-    {
-        409
-    } else {
-        500
+    match error {
+        "BadToken" | "Expired" | "ActionMismatch" | "NotFound" | "bad token" => 409,
+        _ => 500,
     }
+}
+
+fn agent_confirm_error_response(error: &str) -> ApiResponse {
+    let status = agent_confirm_error_status(error);
+    let code = if status == 500 {
+        "confirmation_unavailable"
+    } else {
+        error
+    };
+    no_store_json_error(status, code)
 }
 
 /// Default and maximum page size for the items listing.
@@ -8749,7 +9344,7 @@ fn parse_backup_services_param(raw: Option<&str>) -> Result<Vec<String>, String>
     services.dedup();
     for service in &services {
         if !BACKUP_SERVICES.contains(&service.as_str()) {
-            return Err(format!("unsupported backup service: {service}"));
+            return Err("unsupported backup service".into());
         }
     }
     Ok(services)
@@ -10173,7 +10768,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
         assert_eq!(resp.status, 400);
         let body = body_json(&resp);
-        assert_eq!(body["error"], "unsupported backup service: shell");
+        assert_eq!(body["error"], "unsupported backup service");
         assert!(backup.calls.lock().unwrap().is_empty());
     }
 
@@ -10216,6 +10811,38 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         fn cancel(&self, _t: &str) {}
         fn open_stream(&self, _t: &str) -> Option<std::sync::mpsc::Receiver<String>> {
             None
+        }
+    }
+
+    #[derive(Default)]
+    struct ReconnectRequiredAgent {
+        refresh_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl AgentHandler for ReconnectRequiredAgent {
+        fn start_turn(&self, _account: &str, _prompt: &str) -> Result<String, String> {
+            Err("not enabled".into())
+        }
+
+        fn confirm(
+            &self,
+            _pending_id: &str,
+            _token: &str,
+            _action_hash: &str,
+        ) -> Result<String, String> {
+            Err("not enabled".into())
+        }
+
+        fn cancel(&self, _turn_id: &str) {}
+
+        fn open_stream(&self, _turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>> {
+            None
+        }
+
+        fn credential_refresh(&self, _provider: &str) -> Result<String, String> {
+            self.refresh_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("reconnect_required".into())
         }
     }
 
@@ -10814,6 +11441,127 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         }
         fn status_json(&self) -> String {
             "{\"connected\":true,\"enabled\":true,\"model\":\"fake-1\"}".to_string()
+        }
+    }
+
+    #[derive(Default)]
+    struct PresenceContractAgent {
+        operations: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+        authorized: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    }
+
+    impl PresenceContractAgent {
+        fn require_authorized(&self, operation_id: &str, kind: &str) -> Result<(), String> {
+            let matches_kind = self
+                .operations
+                .lock()
+                .unwrap()
+                .get(operation_id)
+                .is_some_and(|stored| stored == kind);
+            let authorized = self.authorized.lock().unwrap().contains(operation_id);
+            (matches_kind && authorized)
+                .then_some(())
+                .ok_or_else(|| "presence_not_authorized".into())
+        }
+    }
+
+    impl AgentHandler for PresenceContractAgent {
+        fn start_turn(&self, _account: &str, _prompt: &str) -> Result<String, String> {
+            Err("not enabled".into())
+        }
+
+        fn confirm(
+            &self,
+            _pending_id: &str,
+            _token: &str,
+            _action_hash: &str,
+        ) -> Result<String, String> {
+            Err("not enabled".into())
+        }
+
+        fn cancel(&self, _turn_id: &str) {}
+
+        fn open_stream(&self, _turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>> {
+            None
+        }
+
+        fn user_presence_start(
+            &self,
+            request: AgentUserPresenceStartRequest,
+        ) -> Result<serde_json::Value, String> {
+            let operation_id = format!("presence-{}", request.kind);
+            self.operations
+                .lock()
+                .unwrap()
+                .insert(operation_id.clone(), request.kind.clone());
+            Ok(json!({
+                "request_id": request.request_id,
+                "operation_id": operation_id,
+                "intent_id": format!("intent-{}", request.kind),
+                "token": format!("token-{}", request.kind),
+                "action_hash": "a".repeat(64),
+                "expires_at_ms": 1_000_000,
+            }))
+        }
+
+        fn user_presence_confirm(
+            &self,
+            request: AgentUserPresenceConfirmRequest,
+        ) -> Result<serde_json::Value, String> {
+            let kind = self
+                .operations
+                .lock()
+                .unwrap()
+                .get(&request.operation_id)
+                .cloned()
+                .ok_or_else(|| "presence_not_found".to_string())?;
+            if request.intent_id != format!("intent-{kind}")
+                || request.token != format!("token-{kind}")
+                || request.action_hash != "a".repeat(64)
+            {
+                return Err("presence_token_invalid".into());
+            }
+            self.authorized
+                .lock()
+                .unwrap()
+                .insert(request.operation_id.clone());
+            Ok(json!({
+                "request_id": request.request_id,
+                "operation_id": request.operation_id,
+                "state": "authorized",
+            }))
+        }
+
+        fn session_archive(
+            &self,
+            request: AgentSessionArchiveRequest,
+        ) -> Result<serde_json::Value, String> {
+            self.require_authorized(&request.operation_id, "session_archive")?;
+            Ok(json!({"state": "archived"}))
+        }
+
+        fn session_pairing_reveal(
+            &self,
+            request: AgentSessionPairingOperationRequest,
+        ) -> Result<serde_json::Value, String> {
+            self.require_authorized(&request.operation_id, "session_pairing_reveal")?;
+            Ok(json!({"state": "revealed"}))
+        }
+
+        fn session_pairing_claim(
+            &self,
+            request: AgentSessionPairingOperationRequest,
+        ) -> Result<serde_json::Value, String> {
+            self.require_authorized(&request.operation_id, "session_pairing_import")?;
+            Ok(json!({"state": "claimed"}))
+        }
+
+        fn session_pairing_finalize(
+            &self,
+            request: AgentSessionPairingOperationRequest,
+        ) -> Result<serde_json::Value, String> {
+            self.require_authorized(&request.operation_id, "session_pairing_import")?;
+            Ok(json!({"state": "consumed"}))
         }
     }
 
@@ -11639,7 +12387,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let router = router
             .with_agent(agent.clone(), "agentsecret".into())
             .with_session_token("sess".into())
-            .with_biometric_gate();
+            .with_biometric_gate()
+            .with_durable_requests(std::sync::Arc::new(MemoryDurableRequests::default()));
         let auth = || agent_confirm_request("hash");
 
         let first = router.route(&auth());
@@ -12344,6 +13093,42 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         }
     }
 
+    struct FailingCalendarWrite {
+        calls: std::sync::atomic::AtomicU64,
+        raw_error: String,
+    }
+
+    impl FailingCalendarWrite {
+        fn fail<T>(&self) -> Result<T, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(self.raw_error.clone())
+        }
+    }
+
+    impl CalendarWriteHandler for FailingCalendarWrite {
+        fn create(&self, _account: &str, _event: &Value) -> Result<String, String> {
+            self.fail()
+        }
+
+        fn update(&self, _account: &str, _event_id: &str, _event: &Value) -> Result<(), String> {
+            self.fail()
+        }
+
+        fn delete(&self, _account: &str, _event_id: &str) -> Result<(), String> {
+            self.fail()
+        }
+
+        fn respond(
+            &self,
+            _account: &str,
+            _event_id: &str,
+            _response: &str,
+            _comment: &str,
+        ) -> Result<(), String> {
+            self.fail()
+        }
+    }
+
     enum MemoryDurableRequestState {
         Started,
         Retryable,
@@ -12471,22 +13256,6 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 _ => Err("request_store_unavailable".into()),
             }
         }
-
-        fn reject(&self, identity: &ProductRequestIdentity) -> Result<(), String> {
-            let mut receipts = self.0.lock().unwrap();
-            match receipts.get(&identity.request_id) {
-                Some((route, scope, digest, state))
-                    if route == identity.route_domain
-                        && scope == &identity.request_scope
-                        && digest == &identity.payload_digest
-                        && !matches!(state, MemoryDurableRequestState::Completed(_)) =>
-                {
-                    receipts.remove(&identity.request_id);
-                    Ok(())
-                }
-                _ => Err("request_store_unavailable".into()),
-            }
-        }
     }
 
     struct UnavailableDurableRequests;
@@ -12512,10 +13281,6 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         }
 
         fn abort(&self, _identity: &ProductRequestIdentity) -> Result<(), String> {
-            Err("unavailable".into())
-        }
-
-        fn reject(&self, _identity: &ProductRequestIdentity) -> Result<(), String> {
             Err("unavailable".into())
         }
     }
@@ -13341,7 +14106,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "request_id": "123e4567-e89b-42d3-a456-426614174100",
             "account": "a",
             "subject": "Exactly once",
-            "body": "body",
+            "body": "",
             "to": ["x@example.invalid"],
             "cc": [],
             "bcc": [],
@@ -13435,7 +14200,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 "request_id": "123e4567-e89b-42d3-a456-426614174101",
                 "account": "a",
                 "subject": "Do not send",
-                "body": "body",
+                "body": "",
                 "to": ["x@example.invalid"],
                 "cc": [],
                 "bcc": [],
@@ -13486,6 +14251,40 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(conflict.status, 409);
         assert_eq!(body_json(&conflict)["error"], "request_id_conflict");
         assert_eq!(agent.selections.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn terminal_conflict_response_replays_without_second_handler_call() {
+        let (_directory, router) = setup();
+        let agent = std::sync::Arc::new(ReconnectRequiredAgent::default());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_durable_requests(std::sync::Arc::new(MemoryDurableRequests::default()));
+        let body = json!({
+            "request_id": "123e4567-e89b-42d3-a456-426614174123",
+            "provider": "codex"
+        });
+
+        let first = router.route(&strict_json_post(
+            "/api/v1/agent/credential/refresh",
+            body.clone(),
+            Some("agentsecret"),
+        ));
+        let replay = router.route(&strict_json_post(
+            "/api/v1/agent/credential/refresh",
+            body,
+            Some("agentsecret"),
+        ));
+
+        assert_eq!(first.status, 409);
+        assert_eq!(body_json(&first)["error"], "reconnect_required");
+        assert_eq!(replay, first);
+        assert_eq!(
+            agent
+                .refresh_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[test]
@@ -13587,6 +14386,64 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(
             canonical_product_identity(&numeric_setting, settings_spec).unwrap(),
             canonical_product_identity(&string_setting, settings_spec).unwrap()
+        );
+
+        let share_spec = product_post_route("/api/v1/share").unwrap();
+        let omitted_share_defaults = strict_json_post(
+            share_spec.path,
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174118",
+                "account": "a",
+                "service": "onedrive",
+                "id": "item-1"
+            }),
+            Some("sharesecret"),
+        );
+        let explicit_share_defaults = strict_json_post(
+            share_spec.path,
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174118",
+                "account": "a",
+                "service": "onedrive",
+                "id": "item-1",
+                "type": "view",
+                "scope": "anonymous"
+            }),
+            Some("sharesecret"),
+        );
+        assert_eq!(
+            canonical_product_identity(&omitted_share_defaults, share_spec).unwrap(),
+            canonical_product_identity(&explicit_share_defaults, share_spec).unwrap()
+        );
+
+        let invite_unsorted = strict_json_post(
+            share_spec.path,
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174119",
+                "account": "a",
+                "service": "onedrive",
+                "id": "item-2",
+                "email": "B@example.invalid,a@example.invalid,b@example.invalid"
+            }),
+            Some("sharesecret"),
+        );
+        let invite_normalized = strict_json_post(
+            share_spec.path,
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174119",
+                "account": "a",
+                "service": "onedrive",
+                "id": "item-2",
+                "email": "a@example.invalid,b@example.invalid",
+                "role": "read",
+                "type": "embed",
+                "scope": "users"
+            }),
+            Some("sharesecret"),
+        );
+        assert_eq!(
+            canonical_product_identity(&invite_unsorted, share_spec).unwrap(),
+            canonical_product_identity(&invite_normalized, share_spec).unwrap()
         );
     }
 
@@ -13797,7 +14654,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "request_id": "123e4567-e89b-42d3-a456-426614174000",
             "account": "a",
             "subject": "Hi",
-            "body": "body",
+            "body": "",
             "to": ["x@example.invalid"],
             "cc": [],
             "bcc": [],
@@ -13881,7 +14738,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                     "/api/v1/mail/reply",
                     json!({
                         "request_id": "123e4567-e89b-42d3-a456-426614174003",
-                        "account": "a", "id": "m1", "comment": "ok",
+                        "account": "a", "id": "m1", "comment": "",
                         "body": "", "all": true
                     }),
                     Some("secret"),
@@ -13897,7 +14754,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                     "/api/v1/mail/forward",
                     json!({
                         "request_id": "123e4567-e89b-42d3-a456-426614174004",
-                        "account": "a", "id": "m1", "comment": "see",
+                        "account": "a", "id": "m1", "comment": "",
                         "body": "", "to": ["y@example.invalid"]
                     }),
                     Some("secret"),
@@ -16129,7 +16986,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let router = router.with_onenote_write(rec.clone(), "notesecret".into());
         let create_body = json!({
             "request_id": "123e4567-e89b-42d3-a456-426614174020",
-            "account": "a", "section": "S1", "title": "Ideas", "body": "hello"
+            "account": "a", "section": "S1", "title": "Ideas", "body": ""
         });
         // missing token -> 401
         assert_eq!(
@@ -16163,19 +17020,16 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 .status,
             200
         );
-        assert_eq!(
-            router
-                .route(&strict_json_post(
-                    "/api/v1/onenote/append",
-                    json!({
-                        "request_id": "123e4567-e89b-42d3-a456-426614174022",
-                        "account": "a", "id": "P1", "text": "more"
-                    }),
-                    Some("notesecret"),
-                ))
-                .status,
-            200
-        );
+        let append = router.route(&strict_json_post(
+            "/api/v1/onenote/append",
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174022",
+                "account": "a", "id": "P1", "text": "more"
+            }),
+            Some("notesecret"),
+        ));
+        assert_eq!(append.status, 409);
+        assert_eq!(body_json(&append)["error"], "mutation_intent_required");
         assert_eq!(
             router
                 .route(&tok("/api/v1/onenote/delete?account=a&id=P1"))
@@ -16186,8 +17040,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         // the create built a non-empty page HTML and targeted section S1
         assert!(log[0].starts_with("create section=S1 bytes="));
         assert!(!log[0].ends_with("bytes=0"));
-        assert_eq!(log[1], "append id=P1 text=more");
-        assert_eq!(log[2], "delete id=P1");
+        assert_eq!(log[1], "delete id=P1");
 
         let legacy = ApiRequest::new(
             "POST",
@@ -16539,6 +17392,63 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(corrected.status, 200);
         assert_eq!(receipts.binding_count(), 1);
         assert_eq!(receipts.completed_response_count(), 0);
+        assert_eq!(
+            share.share_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
+    fn share_route_owned_terminal_400_keeps_uuid_binding_and_blocks_changed_effect() {
+        let (_directory, router) = setup();
+        let receipts = std::sync::Arc::new(MemoryDurableRequests::default());
+        let share = std::sync::Arc::new(SpyShare {
+            share_error: Some("share_policy_unsupported".into()),
+            ..Default::default()
+        });
+        let router = router
+            .with_share(share.clone(), "secret".into())
+            .with_durable_requests(receipts.clone());
+        let request_id = "123e4567-e89b-42d3-a456-426614174122";
+
+        let rejected_after_handler = router.route(&strict_json_post(
+            "/api/v1/share",
+            json!({
+                "request_id": request_id,
+                "account": "a",
+                "service": "onedrive",
+                "id": "item-1",
+                "type": "embed",
+                "scope": "anonymous"
+            }),
+            Some("secret"),
+        ));
+        assert_eq!(rejected_after_handler.status, 400);
+        assert_eq!(
+            body_json(&rejected_after_handler)["error"],
+            "share_policy_unsupported"
+        );
+        assert_eq!(receipts.binding_count(), 1);
+        assert_eq!(
+            share.share_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        let changed_effect = router.route(&strict_json_post(
+            "/api/v1/share",
+            json!({
+                "request_id": request_id,
+                "account": "a",
+                "service": "onedrive",
+                "id": "item-1",
+                "type": "view",
+                "scope": "anonymous"
+            }),
+            Some("secret"),
+        ));
+        assert_eq!(changed_effect.status, 409);
+        assert_eq!(body_json(&changed_effect)["error"], "request_id_conflict");
+        assert_eq!(receipts.binding_count(), 1);
         assert_eq!(
             share.share_calls.load(std::sync::atomic::Ordering::SeqCst),
             1
@@ -18683,6 +19593,7 @@ Content-Type: text/html; charset=utf-8\r\n\
     struct RecordingMutationIntents {
         creates: std::sync::Mutex<Vec<MutationIntentCreate>>,
         chunks: std::sync::Mutex<Vec<Vec<u8>>>,
+        commits: std::sync::Mutex<usize>,
     }
 
     impl MutationIntentHandler for RecordingMutationIntents {
@@ -18708,6 +19619,7 @@ Content-Type: text/html; charset=utf-8\r\n\
             _total_bytes: u64,
             _sha256: &str,
         ) -> Result<Value, String> {
+            *self.commits.lock().unwrap() += 1;
             Ok(json!({"ok": true}))
         }
 
@@ -18774,6 +19686,96 @@ Content-Type: text/html; charset=utf-8\r\n\
                 .iter()
                 .any(|(name, value)| name.eq_ignore_ascii_case("cache-control")
                     && value == "no-store")
+        );
+    }
+
+    #[test]
+    fn mail_and_onenote_content_require_mutation_intents_before_request_binding() {
+        let (_directory, router) = setup();
+        let mail = std::sync::Arc::new(RecordMailWrite::default());
+        let receipts = std::sync::Arc::new(MemoryDurableRequests::default());
+        let router = router
+            .with_mail_write(mail.clone(), "mail-cap".into())
+            .with_durable_requests(receipts.clone());
+        let request_id = "019f0000-0000-4000-8000-000000000280";
+        let content = router.route(&strict_json_post(
+            "/api/v1/mail/send",
+            json!({
+                "request_id": request_id,
+                "account": "a",
+                "subject": "fixture",
+                "body": "must be staged",
+                "to": ["recipient@example.invalid"],
+                "cc": [],
+                "bcc": [],
+                "importance": null,
+                "read_receipt": false
+            }),
+            Some("mail-cap"),
+        ));
+        assert_eq!(content.status, 409);
+        assert_eq!(body_json(&content)["error"], "mutation_intent_required");
+        assert_eq!(receipts.binding_count(), 0);
+        assert!(mail.0.lock().unwrap().is_empty());
+
+        let metadata_only = router.route(&strict_json_post(
+            "/api/v1/mail/send",
+            json!({
+                "request_id": request_id,
+                "account": "a",
+                "subject": "fixture",
+                "body": "",
+                "to": ["recipient@example.invalid"],
+                "cc": [],
+                "bcc": [],
+                "importance": null,
+                "read_receipt": false
+            }),
+            Some("mail-cap"),
+        ));
+        assert_eq!(metadata_only.status, 200);
+        assert_eq!(receipts.binding_count(), 1);
+        assert_eq!(mail.0.lock().unwrap().len(), 1);
+
+        let append = validate_typed_product_request(
+            ProductPostRoute::OnenoteAppend,
+            &json!({
+                "request_id": "019f0000-0000-4000-8000-000000000281",
+                "account": "a",
+                "id": "page",
+                "text": "must be staged"
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(append.status, 409);
+        assert_eq!(body_json(&append)["error"], "mutation_intent_required");
+    }
+
+    #[test]
+    fn mail_and_onenote_product_ui_stage_all_content() {
+        let source = include_str!("app.js");
+        assert!(source.contains("stageMutation(\"mail_body\""));
+        assert!(source.contains("stageMutation(\"onenote_body\""));
+        assert!(source.contains("new TextEncoder().encode(body)"));
+        assert!(source.contains("new TextEncoder().encode(text)"));
+        assert!(!source.contains("postJson(\"/api/v1/mail/send\""));
+        assert!(!source.contains("postJson(\"/api/v1/mail/draft\""));
+        assert!(!source.contains("postJson(\"/api/v1/mail/reply\""));
+        assert!(!source.contains("postJson(\"/api/v1/mail/forward\""));
+        assert!(!source.contains("postJson(\"/api/v1/onenote/create\""));
+        assert!(!source.contains("postJson(\"/api/v1/onenote/append\""));
+        assert!(source.contains("async function mutationPostWithTransportRetry"));
+        assert!(source.contains("if (error && error.responseReceived) throw error"));
+        assert!(source.contains("if (!commitAttempted && error && error.responseReceived)"));
+    }
+
+    #[test]
+    fn mutation_intent_insufficient_storage_maps_to_507() {
+        let response = mutation_error_response("mutation_intent_insufficient_storage");
+        assert_eq!(response.status, 507);
+        assert_eq!(
+            body_json(&response)["error"],
+            "mutation_intent_insufficient_storage"
         );
     }
 
@@ -18940,7 +19942,7 @@ Content-Type: text/html; charset=utf-8\r\n\
         assert!(source.contains("async function deleteTodoBatch(items)"));
         assert!(source.contains("return stageMutation(\"todo_delete_batch\""));
         assert!(source.contains("const MUTATION_COMMIT_TIMEOUT_MS = 125000"));
-        assert!(source.contains("timeoutMs: MUTATION_COMMIT_TIMEOUT_MS"));
+        assert!(source.contains("}, MUTATION_COMMIT_TIMEOUT_MS);"));
         assert!(source.contains("function selectAllVisibleTodoTasks()"));
         assert!(source.contains("function todoTaskCanBeDeleted(t)"));
         assert!(source.contains("stateKey(t) !== \"backup_only\""));
@@ -18963,12 +19965,117 @@ Content-Type: text/html; charset=utf-8\r\n\
 
     #[test]
     fn user_presence_start_confirm_contract_executes_archive_reveal_and_import() {
-        user_presence_and_agent_session_routes_require_session_cap_strict_json_and_no_store();
+        fn request(path: &str, request_id: &str, body: Value) -> ApiRequest {
+            let mut object = body.as_object().cloned().unwrap();
+            object.insert("request_id".into(), Value::String(request_id.into()));
+            strict_json_post(path, Value::Object(object), Some("agentsecret"))
+                .with_session_token(Some("sess".into()))
+        }
+
+        let (_directory, router) = setup();
+        let router = router
+            .with_agent(
+                std::sync::Arc::new(PresenceContractAgent::default()),
+                "agentsecret".into(),
+            )
+            .with_session_token("sess".into());
+        let flows = [
+            (
+                "session_archive",
+                json!({"session_id": "01JSESSION00000000000000000"}),
+                "/api/v1/agent/session/archive",
+                "archived",
+            ),
+            (
+                "session_pairing_reveal",
+                json!({
+                    "session_id": "01JSESSION00000000000000000",
+                    "pair_id": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                }),
+                "/api/v1/agent/session/pairing/reveal",
+                "revealed",
+            ),
+            (
+                "session_pairing_import",
+                json!({"pairing_code": format!("isy2.{}.{}", "A".repeat(32), "B".repeat(43))}),
+                "/api/v1/agent/session/pairing/claim",
+                "claimed",
+            ),
+        ];
+        for (index, (kind, binding, operation_path, terminal_state)) in
+            flows.into_iter().enumerate()
+        {
+            let start_id = format!("123e4567-e89b-42d3-a456-4266141741{index:02}");
+            let start = router.route(&request(
+                "/api/v1/agent/user-presence/start",
+                &start_id,
+                json!({"kind": kind, "binding": binding}),
+            ));
+            assert_eq!(start.status, 200, "start {kind}");
+            let started = body_json(&start);
+            let operation_id = started["operation_id"].as_str().unwrap();
+            let confirm_id = format!("123e4567-e89b-42d3-a456-4266141742{index:02}");
+            let confirmed = router.route(&request(
+                "/api/v1/agent/user-presence/confirm",
+                &confirm_id,
+                json!({
+                    "operation_id": operation_id,
+                    "intent_id": started["intent_id"],
+                    "token": started["token"],
+                    "action_hash": started["action_hash"],
+                }),
+            ));
+            assert_eq!(confirmed.status, 200, "confirm {kind}");
+            let operation_id = operation_id.to_owned();
+            let operation_id_body = json!({"operation_id": operation_id});
+            let operation_id_request = format!("123e4567-e89b-42d3-a456-4266141743{index:02}");
+            let completed = router.route(&request(
+                operation_path,
+                &operation_id_request,
+                operation_id_body,
+            ));
+            assert_eq!(completed.status, 200, "execute {kind}");
+            assert_eq!(body_json(&completed)["state"], terminal_state);
+        }
     }
 
     #[test]
     fn user_presence_operation_routes_reject_missing_or_unconfirmed_operation_id() {
-        user_presence_and_agent_session_routes_require_session_cap_strict_json_and_no_store();
+        let (_directory, router) = setup();
+        let router = router
+            .with_agent(
+                std::sync::Arc::new(PresenceContractAgent::default()),
+                "agentsecret".into(),
+            )
+            .with_session_token("sess".into());
+        let post = |path: &str, body: Value| {
+            strict_json_post(path, body, Some("agentsecret"))
+                .with_session_token(Some("sess".into()))
+        };
+        let missing = router.route(&post(
+            "/api/v1/agent/session/archive",
+            json!({"request_id": "123e4567-e89b-42d3-a456-426614174400"}),
+        ));
+        assert_eq!(missing.status, 400);
+
+        let started = router.route(&post(
+            "/api/v1/agent/user-presence/start",
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174401",
+                "kind": "session_archive",
+                "binding": {"session_id": "01JSESSION00000000000000000"},
+            }),
+        ));
+        assert_eq!(started.status, 200);
+        let unconfirmed = router.route(&post(
+            "/api/v1/agent/session/archive",
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174402",
+                "operation_id": body_json(&started)["operation_id"],
+            }),
+        ));
+        assert_eq!(unconfirmed.status, 409);
+        assert_eq!(body_json(&unconfirmed)["error"], "presence_not_authorized");
     }
 
     #[test]
@@ -18997,7 +20104,67 @@ Content-Type: text/html; charset=utf-8\r\n\
 
     #[test]
     fn mutation_intent_requires_storage_not_low_and_reserved_free_space() {
-        mutation_intent_create_requires_mobile_presence_before_accepting_chunks();
+        let handler = std::sync::Arc::new(RecordingMutationIntents::default());
+        let router = Router::new(Config::default())
+            .with_session_token("session".into())
+            .with_mutation_intents(handler.clone(), "mutation-cap".into())
+            .with_biometric_gate();
+        let empty_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let chunk = json!({
+            "request_id": "019f0000-0000-4000-8000-000000000247",
+            "intent_id": "intent_fixture",
+            "index": 0,
+            "offset": 0,
+            "data_base64": "",
+            "chunk_sha256": empty_sha,
+        });
+        assert_eq!(
+            router
+                .route(&mutation_request(
+                    "/api/v1/mutation-intent/chunk",
+                    chunk.clone()
+                ))
+                .status,
+            507
+        );
+        assert!(handler.chunks.lock().unwrap().is_empty());
+        assert_eq!(
+            router
+                .route(
+                    &mutation_request("/api/v1/mutation-intent/chunk", chunk)
+                        .with_storage_not_low(Some(true))
+                )
+                .status,
+            200
+        );
+        assert_eq!(handler.chunks.lock().unwrap().len(), 1);
+
+        let commit = json!({
+            "request_id": "019f0000-0000-4000-8000-000000000248",
+            "intent_id": "intent_fixture",
+            "total_bytes": 0,
+            "sha256": empty_sha,
+        });
+        assert_eq!(
+            router
+                .route(&mutation_request(
+                    "/api/v1/mutation-intent/commit",
+                    commit.clone()
+                ))
+                .status,
+            507
+        );
+        assert_eq!(*handler.commits.lock().unwrap(), 0);
+        assert_eq!(
+            router
+                .route(
+                    &mutation_request("/api/v1/mutation-intent/commit", commit)
+                        .with_storage_not_low(Some(true))
+                )
+                .status,
+            200
+        );
+        assert_eq!(*handler.commits.lock().unwrap(), 1);
     }
 
     #[test]
@@ -19008,22 +20175,106 @@ Content-Type: text/html; charset=utf-8\r\n\
                 std::sync::Arc::new(RecordingMutationIntents::default()),
                 "mutation-cap".into(),
             );
-        let request = ApiRequest::new("POST", "/api/v1/mutation-intent/create")
-            .with_content_type(Some("application/json".into()))
-            .with_session_token(Some("session".into()))
-            .with_cap_token(Some("mutation-cap".into()))
-            .with_storage_not_low(Some(true))
-            .with_body(
-                br#"{"request_id":"019f0000-0000-4000-8000-000000000240","purpose":"onedrive_upload","metadata":{"account":"a","account":"b","parent":"root","name":"x"},"total_bytes":0,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"} trailing"#.to_vec(),
-            );
-        assert_eq!(router.route(&request).status, 400);
+        let request = |body: &[u8]| {
+            ApiRequest::new("POST", "/api/v1/mutation-intent/create")
+                .with_content_type(Some("application/json".into()))
+                .with_session_token(Some("session".into()))
+                .with_cap_token(Some("mutation-cap".into()))
+                .with_storage_not_low(Some(true))
+                .with_body(body.to_vec())
+        };
+        let duplicate = br#"{"request_id":"019f0000-0000-4000-8000-000000000240","purpose":"onedrive_upload","metadata":{"account":"a","account":"b","parent":"root","name":"x"},"total_bytes":0,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}"#;
+        assert_eq!(router.route(&request(duplicate)).status, 400);
+
+        let trailing = br#"{"request_id":"019f0000-0000-4000-8000-000000000240","purpose":"onedrive_upload","metadata":{"account":"a","parent":"root","name":"x"},"total_bytes":0,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"} trailing"#;
+        assert_eq!(router.route(&request(trailing)).status, 400);
+    }
+
+    #[test]
+    fn product_request_scopes_are_session_installation_or_operation_bound() {
+        let identity = |path: &str, body: Value| {
+            let request = strict_json_post(path, body, None);
+            canonical_product_identity(&request, product_post_route(path).unwrap()).unwrap()
+        };
+        let calendar = identity(
+            "/api/v1/calendar/create",
+            json!({
+                "request_id": "019f0000-0000-4000-8000-000000000250",
+                "account": "device-local-alias",
+                "subject": "fixture",
+                "start": "2026-07-20T12:00:00Z",
+            }),
+        );
+        assert_eq!(calendar.request_scope, "installation");
+
+        let turn = identity(
+            "/api/v1/agent/turn",
+            json!({
+                "request_id": "019f0000-0000-4000-8000-000000000251",
+                "session_id": "01JSESSION00000000000000000",
+                "account": "device-local-alias",
+                "prompt": "fixture",
+            }),
+        );
+        assert_eq!(turn.request_scope, "session_id:01JSESSION00000000000000000");
+
+        let pairing = identity(
+            "/api/v1/agent/session/pairing/finalize",
+            json!({
+                "request_id": "019f0000-0000-4000-8000-000000000252",
+                "operation_id": "01JOPERATION00000000000000",
+            }),
+        );
+        assert_eq!(
+            pairing.request_scope,
+            "operation_id:01JOPERATION00000000000000"
+        );
+
+        let presence_confirm = identity(
+            "/api/v1/agent/user-presence/confirm",
+            json!({
+                "request_id": "019f0000-0000-4000-8000-000000000253",
+                "operation_id": "01JOPERATION00000000000001",
+                "intent_id": "01JINTENT00000000000000000",
+                "token": "short-lived-proof",
+                "action_hash": "a".repeat(64),
+            }),
+        );
+        assert_eq!(
+            presence_confirm.request_scope,
+            "operation_id:01JOPERATION00000000000001"
+        );
     }
 
     #[test]
     fn api_responses_are_no_store() {
-        status_carries_no_store_and_no_secrets();
-        agent_oauth_logout_response_is_no_store_and_closed_schema_only();
-        static_assets_carry_correct_type_and_no_store();
+        let router = Router::new(Config::default());
+        let assert_no_store = |label: &str, response: ApiResponse| {
+            assert!(
+                response.headers.iter().any(|(name, value)| {
+                    name.eq_ignore_ascii_case("cache-control") && value == "no-store"
+                }),
+                "{label} omitted Cache-Control: no-store"
+            );
+        };
+        for spec in PRODUCT_POST_ROUTES {
+            assert_no_store(
+                spec.path,
+                router.route(
+                    &ApiRequest::new("POST", spec.path)
+                        .with_content_type(Some("application/json".into()))
+                        .with_body(b"{}".to_vec()),
+                ),
+            );
+        }
+        for path in [
+            "/api/v1/status",
+            "/api/v1/agent/status",
+            "/api/v1/items?account=a&service=mail",
+            "/api/v1/unknown",
+        ] {
+            assert_no_store(path, router.route(&ApiRequest::get(path)));
+        }
     }
 
     #[test]
@@ -19055,14 +20306,63 @@ Content-Type: text/html; charset=utf-8\r\n\
     #[test]
     fn errors_do_not_echo_body_query_or_header_values() {
         let sentinel = "redaction-fixture-628";
+        let raw_error = format!(
+            "provider failed for person@example.com at https://example.invalid/?value={sentinel}"
+        );
+        let handler = std::sync::Arc::new(FailingCalendarWrite {
+            calls: std::sync::atomic::AtomicU64::new(0),
+            raw_error: raw_error.clone(),
+        });
+        let receipts = std::sync::Arc::new(MemoryDurableRequests::default());
+        let (_directory, router) = setup();
+        let router = router
+            .with_calendar_write(handler.clone(), "calendar-cap".into())
+            .with_durable_requests(receipts);
+        let request = strict_json_post(
+            "/api/v1/calendar/create",
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174071",
+                "account": "a",
+                "subject": sentinel,
+                "start": "2026-07-20T12:00:00Z",
+            }),
+            Some("calendar-cap"),
+        );
+
+        let response = router.route(&request);
+        assert_eq!(response.status, 500);
+        assert_eq!(body_json(&response)["error"], "calendar_write_failed");
+        let replay = router.route(&request);
+        assert_eq!(replay.status, 409);
+        assert_eq!(body_json(&replay)["error"], "request_outcome_unknown");
+        assert_eq!(handler.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let activity =
+            body_json(&router.route(&ApiRequest::get("/api/v1/activity?account=a&limit=5")));
+        let public_surface = format!(
+            "{}\n{}\n{}",
+            String::from_utf8_lossy(&response.body),
+            String::from_utf8_lossy(&replay.body),
+            serde_json::to_string(&activity).unwrap(),
+        );
+        for forbidden in [
+            sentinel,
+            "person@example.com",
+            "https://",
+            raw_error.as_str(),
+        ] {
+            assert!(!public_surface.contains(forbidden), "leaked: {forbidden}");
+        }
+        assert!(public_surface.contains("calendar_write_failed"));
+
         let route = format!("/api/v1/nope?value={sentinel}");
-        let request = ApiRequest::new("POST", &route)
+        let unknown_request = ApiRequest::new("POST", &route)
             .with_body(sentinel.as_bytes().to_vec())
             .with_session_token(Some(sentinel.into()))
             .with_cap_token(Some(sentinel.into()))
             .with_per_action_token(Some(sentinel.into()));
-        let debug = format!("{request:?}");
-        let response = Router::new(Config::default()).route(&request);
+        let debug = format!("{unknown_request:?}");
+        let response = Router::new(Config::default()).route(&unknown_request);
         assert!(!debug.contains(sentinel));
         assert!(!String::from_utf8_lossy(&response.body).contains(sentinel));
     }

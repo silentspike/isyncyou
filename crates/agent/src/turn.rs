@@ -146,6 +146,7 @@ pub trait TurnObserver {
         &mut self,
         _step_seq: u8,
         _blocks: &[crate::AssistantBlock],
+        _usage: Option<&crate::Usage>,
     ) -> Result<(), crate::AgentError> {
         Ok(())
     }
@@ -249,7 +250,8 @@ pub fn run_turn_cancellable(
         check_cancelled()?;
         let blocks = provider.next_cancellable(history, emit, cancellation)?;
         check_cancelled()?;
-        observer.provider_step_completed(step_seq, &blocks)?;
+        let usage = provider.last_usage();
+        observer.provider_step_completed(step_seq, &blocks, usage.as_ref())?;
         check_cancelled()?;
 
         // Collect the assistant turn: its text + the tool calls it made.
@@ -326,7 +328,6 @@ pub fn run_turn_cancellable(
                             None => return Err(error),
                         },
                     };
-                    check_cancelled()?;
                     observer.read_tool_completed(step_seq, &tu.id, &action, &result)?;
                     check_cancelled()?;
                     // Results carrying archived content are untrusted input.
@@ -924,7 +925,193 @@ mod tests {
 
     #[test]
     fn turn_cancel_before_persist_ignores_late_provider_result() {
-        turn_cancel_stops_before_read_tool_execution();
-        turn_cancel_after_provider_return_blocks_pending_registration();
+        struct RecordingObserver {
+            started: u32,
+            completed: u32,
+        }
+
+        impl TurnObserver for RecordingObserver {
+            fn provider_step_started(&mut self, _step_seq: u8) -> Result<(), crate::AgentError> {
+                self.started += 1;
+                Ok(())
+            }
+
+            fn provider_step_completed(
+                &mut self,
+                _step_seq: u8,
+                _blocks: &[AssistantBlock],
+                _usage: Option<&crate::Usage>,
+            ) -> Result<(), crate::AgentError> {
+                self.completed += 1;
+                Ok(())
+            }
+        }
+
+        let token = crate::CancellationToken::default();
+        let mut provider = CancelOnReturnProvider {
+            token: token.clone(),
+            blocks: vec![AssistantBlock::Text("late provider result".into())],
+        };
+        let executor = CountingExecutor::new("must not run");
+        let mut history = vec![Message::user("cancel this turn")];
+        let mut events = Vec::new();
+        let mut observer = RecordingObserver {
+            started: 0,
+            completed: 0,
+        };
+
+        let result = run_turn_cancellable(
+            &mut provider,
+            &executor,
+            &mut history,
+            &mut |event| events.push(event),
+            &mut observer,
+            Some(&token),
+        );
+
+        assert!(matches!(result, Err(crate::AgentError::Cancelled)));
+        assert_eq!(observer.started, 1);
+        assert_eq!(observer.completed, 0);
+        assert_eq!(history.len(), 1);
+        assert!(events.is_empty());
+        assert_eq!(executor.reads.get(), 0);
+    }
+
+    #[test]
+    fn turn_cancel_after_read_execution_persists_checkpoint_before_terminal() {
+        struct CancelDuringReadExecutor {
+            token: crate::CancellationToken,
+            reads: Cell<u32>,
+        }
+
+        impl ToolExecutor for CancelDuringReadExecutor {
+            fn execute_read(&self, _action: &ToolAction) -> Result<String, crate::AgentError> {
+                self.reads.set(self.reads.get() + 1);
+                self.token.cancel();
+                Ok("bounded result".into())
+            }
+        }
+
+        #[derive(Default)]
+        struct CheckpointObserver {
+            started: u32,
+            completed: u32,
+        }
+
+        impl TurnObserver for CheckpointObserver {
+            fn read_tool_started(
+                &mut self,
+                _step_seq: u8,
+                _tool_use_id: &str,
+                _action: &ToolAction,
+                _local_effect: Option<&crate::LocalEffectCheckpointV1>,
+            ) -> Result<(), crate::AgentError> {
+                self.started += 1;
+                Ok(())
+            }
+
+            fn read_tool_completed(
+                &mut self,
+                _step_seq: u8,
+                _tool_use_id: &str,
+                _action: &ToolAction,
+                _result: &str,
+            ) -> Result<(), crate::AgentError> {
+                self.completed += 1;
+                Ok(())
+            }
+        }
+
+        let token = crate::CancellationToken::default();
+        let mut provider = FakeProvider::new(vec![vec![tool_use(
+            "read-1",
+            json!({"op": "search", "account": "me", "query": "invoice"}),
+        )]]);
+        let executor = CancelDuringReadExecutor {
+            token: token.clone(),
+            reads: Cell::new(0),
+        };
+        let mut observer = CheckpointObserver::default();
+        let mut history = vec![Message::user("find invoice")];
+        let mut events = Vec::new();
+
+        let result = run_turn_cancellable(
+            &mut provider,
+            &executor,
+            &mut history,
+            &mut |event| events.push(event),
+            &mut observer,
+            Some(&token),
+        );
+
+        assert!(matches!(result, Err(crate::AgentError::Cancelled)));
+        assert_eq!(executor.reads.get(), 1);
+        assert_eq!(observer.started, 1);
+        assert_eq!(observer.completed, 1);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolResult { .. })));
+    }
+
+    #[test]
+    fn completed_provider_step_reports_usage_to_durable_observer_boundary() {
+        struct UsageProvider;
+
+        impl LlmProvider for UsageProvider {
+            fn name(&self) -> &str {
+                "usage-provider"
+            }
+
+            fn next(
+                &mut self,
+                _history: &[Message],
+                _emit: &mut dyn FnMut(StreamEvent),
+            ) -> Result<Vec<AssistantBlock>, crate::AgentError> {
+                Ok(vec![AssistantBlock::Text("complete".into())])
+            }
+
+            fn last_usage(&self) -> Option<crate::Usage> {
+                Some(crate::Usage {
+                    input_tokens: 29,
+                    output_tokens: 7,
+                    provider: "provider-private".into(),
+                    model: "model-private".into(),
+                    request_id: Some("request-private".into()),
+                    rate_limit: Default::default(),
+                })
+            }
+        }
+
+        #[derive(Default)]
+        struct UsageObserver {
+            token_counts: Option<(u64, u64)>,
+        }
+
+        impl TurnObserver for UsageObserver {
+            fn provider_step_completed(
+                &mut self,
+                _step_seq: u8,
+                _blocks: &[AssistantBlock],
+                usage: Option<&crate::Usage>,
+            ) -> Result<(), crate::AgentError> {
+                self.token_counts = usage.map(|usage| (usage.input_tokens, usage.output_tokens));
+                Ok(())
+            }
+        }
+
+        let mut provider = UsageProvider;
+        let mut observer = UsageObserver::default();
+        let mut history = vec![Message::user("question")];
+        let outcome = run_turn_observed(
+            &mut provider,
+            &CountingExecutor::new("unused"),
+            &mut history,
+            &mut |_| {},
+            &mut observer,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, TurnOutcome::Final { .. }));
+        assert_eq!(observer.token_counts, Some((29, 7)));
     }
 }

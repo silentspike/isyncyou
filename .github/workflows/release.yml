@@ -86,14 +86,29 @@ jobs:
             echo "::error::stable tag commit is not on main"
             exit 1
           }
-          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RUNNER_TEMP/releases.jsons"
-          matching_rc=$(jq -rs --arg sha "$GITHUB_SHA" \
-            '[.[][] | select(.draft==false and .prerelease==true and .target_commitish==$sha) | select(([.assets[].name] | index("isyncyou-android-arm64.apk")) != null and ([.assets[].name] | index("isyncyou-android-arm64.apk.sha256")) != null) | .tag_name][0] // empty' \
-            "$RUNNER_TEMP/releases.jsons")
-          test -n "$matching_rc" || {
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" | \
+            jq -s 'add' > "$RUNNER_TEMP/releases.json"
+          python3 tools/release_workflow_contract.py candidate-rc-tags \
+            --json "$RUNNER_TEMP/releases.json" --sha "$GITHUB_SHA" \
+            > "$RUNNER_TEMP/rc-tags.txt"
+          printf '{}\n' > "$RUNNER_TEMP/rc-tag-commits.json"
+          while IFS= read -r rc; do
+            test -n "$rc" || continue
+            git fetch --force --no-tags origin "refs/tags/$rc:refs/tags/$rc"
+            commit=$(git rev-list -n1 "$rc")
+            jq --arg tag "$rc" --arg commit "$commit" \
+              '. + {($tag): $commit}' "$RUNNER_TEMP/rc-tag-commits.json" \
+              > "$RUNNER_TEMP/rc-tag-commits.next.json"
+            mv "$RUNNER_TEMP/rc-tag-commits.next.json" "$RUNNER_TEMP/rc-tag-commits.json"
+          done < "$RUNNER_TEMP/rc-tags.txt"
+          matching_rc=$(python3 tools/release_workflow_contract.py select-rc \
+            --json "$RUNNER_TEMP/releases.json" \
+            --tag-commits-json "$RUNNER_TEMP/rc-tag-commits.json" \
+            --sha "$GITHUB_SHA" 2>/dev/null || true)
+          if [ -z "$matching_rc" ]; then
             echo "::error::stable release requires a matching non-draft RC and signed APK assets"
             exit 1
-          }
+          fi
           echo "matching_rc=$matching_rc" >> "$GITHUB_OUTPUT"
 
   build:

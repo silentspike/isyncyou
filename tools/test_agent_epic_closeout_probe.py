@@ -1,4 +1,5 @@
 import argparse
+import copy
 import importlib.util
 import json
 import socket
@@ -19,6 +20,32 @@ assert SPEC and SPEC.loader
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
+
+
+def valid_release_snapshot():
+    timestamp = "2026-07-20T12:00:00Z"
+    return {
+        "id": 42,
+        "tag_name": "v1.0.0-rc.9",
+        "draft": False,
+        "prerelease": True,
+        "target_commitish": "a" * 40,
+        "created_at": timestamp,
+        "published_at": timestamp,
+        "updated_at": timestamp,
+        "html_url": "https://github.com/silentspike/isyncyou/releases/tag/v1.0.0-rc.9",
+        "assets": [
+            {
+                "id": index,
+                "name": name,
+                "size": 100 + index,
+                "digest": "sha256:" + f"{index:064x}",
+                "created_at": timestamp,
+                "updated_at": timestamp,
+            }
+            for index, name in enumerate(sorted(MODULE.EXPECTED_RELEASE_ASSETS), start=1)
+        ],
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -229,6 +256,75 @@ class RetrievalHandler(BaseHTTPRequestHandler):
 
 
 class CloseoutProbeTest(unittest.TestCase):
+    def test_final_release_integrity_requires_unchanged_snapshots_and_tag_commit(self):
+        release = valid_release_snapshot()
+        fetches = []
+        sleeps = []
+
+        def fetcher(_repository, _tag):
+            fetches.append(True)
+            return copy.deepcopy(release)
+
+        result = MODULE.inspect_release_integrity(
+            "silentspike/isyncyou",
+            "v1.0.0-rc.9",
+            "a" * 40,
+            30,
+            release_fetcher=fetcher,
+            tag_resolver=lambda _repository, _tag: "a" * 40,
+            public_url_probe=lambda _repository, _tag: True,
+            sleeper=sleeps.append,
+        )
+        self.assertEqual(result["state"], "pass")
+        self.assertEqual(result["recheck_delay_seconds"], 30)
+        self.assertEqual(len(fetches), 2)
+        self.assertEqual(sleeps, [30])
+        self.assertEqual(result["snapshot"]["release_id"], 42)
+
+    def test_final_release_integrity_rejects_mutation_or_moved_tag(self):
+        release = valid_release_snapshot()
+        changed = copy.deepcopy(release)
+        changed["updated_at"] = "2026-07-20T12:01:00Z"
+        snapshots = iter((release, changed))
+        with self.assertRaisesRegex(MODULE.ProbeError, "release_integrity_changed"):
+            MODULE.inspect_release_integrity(
+                "silentspike/isyncyou",
+                "v1.0.0-rc.9",
+                "a" * 40,
+                30,
+                release_fetcher=lambda _repository, _tag: copy.deepcopy(next(snapshots)),
+                tag_resolver=lambda _repository, _tag: "a" * 40,
+                public_url_probe=lambda _repository, _tag: True,
+                sleeper=lambda _delay: None,
+            )
+        commits = iter(("a" * 40, "b" * 40))
+        with self.assertRaisesRegex(MODULE.ProbeError, "release_integrity_changed"):
+            MODULE.inspect_release_integrity(
+                "silentspike/isyncyou",
+                "v1.0.0-rc.9",
+                "a" * 40,
+                30,
+                release_fetcher=lambda _repository, _tag: copy.deepcopy(release),
+                tag_resolver=lambda _repository, _tag: next(commits),
+                public_url_probe=lambda _repository, _tag: True,
+                sleeper=lambda _delay: None,
+            )
+
+    def test_final_candidate_tree_must_equal_rc_commit_tree(self):
+        self.assertTrue(
+            MODULE.verify_candidate_tree(
+                "a" * 40,
+                "b" * 40,
+                tree_resolver=lambda _commit: "b" * 40,
+            )
+        )
+        with self.assertRaisesRegex(MODULE.ProbeError, "rc_candidate_tree_mismatch"):
+            MODULE.verify_candidate_tree(
+                "a" * 40,
+                "b" * 40,
+                tree_resolver=lambda _commit: "c" * 40,
+            )
+
     def test_rejects_non_loopback_and_invalid_commit(self):
         with self.assertRaisesRegex(MODULE.ProbeError, "endpoint_not_loopback"):
             MODULE.loopback_endpoint("https://example.com:443")

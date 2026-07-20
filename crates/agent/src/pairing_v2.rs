@@ -97,14 +97,24 @@ impl OneDrivePairingTransportV2 {
     }
 
     pub fn load(&self, pair_id: &str) -> Result<VersionedPairingDescriptorV2, PairingV2Error> {
+        self.load_optional(pair_id)?
+            .ok_or(PairingV2Error::InvalidDescriptor)
+    }
+
+    pub fn load_optional(
+        &self,
+        pair_id: &str,
+    ) -> Result<Option<VersionedPairingDescriptorV2>, PairingV2Error> {
         let path = self.path(pair_id)?;
-        let item = self
+        let Some(item) = self
             .client
             .get_drive_item_by_path(&path, &["id", "eTag"])
             .map_err(|_| PairingV2Error::TransportUnavailable)?
-            .ok_or(PairingV2Error::InvalidDescriptor)?;
+        else {
+            return Ok(None);
+        };
         let descriptor = PairingDescriptorV2::parse(&self.read_path(&path)?)?;
-        versioned_descriptor(item, descriptor)
+        versioned_descriptor(item, descriptor).map(Some)
     }
 
     pub fn compare_and_swap(
@@ -341,6 +351,22 @@ impl PairingDescriptorV2 {
             PairingRemoteStateV2::Consumed => Err(PairingV2Error::AlreadyClaimed),
             PairingRemoteStateV2::Revoked => Err(PairingV2Error::Revoked),
         }
+    }
+
+    pub fn cleanup_eligible_at(&self, now_ms: u64) -> Result<bool, PairingV2Error> {
+        self.validate()?;
+        Ok(match self.state {
+            PairingRemoteStateV2::Pending => now_ms > self.expires_at_ms,
+            PairingRemoteStateV2::Claimed => {
+                now_ms
+                    > self
+                        .resume_until_ms
+                        .ok_or(PairingV2Error::InvalidDescriptor)?
+            }
+            PairingRemoteStateV2::Consumed
+            | PairingRemoteStateV2::Revoked
+            | PairingRemoteStateV2::ClaimedExpired => true,
+        })
     }
 
     fn validate(&self) -> Result<(), PairingV2Error> {
@@ -682,24 +708,45 @@ impl PairingClaimV2 {
         open_pairing_payload(code, descriptor)
     }
 
+    /// Returns the claimed descriptor only when `current` is the exact pending
+    /// predecessor used to create this claim. An already-published copy is an
+    /// idempotent no-op; every other remote state belongs to another transition.
+    pub fn claim_transition(
+        &self,
+        current: &PairingDescriptorV2,
+    ) -> Result<Option<PairingDescriptorV2>, PairingV2Error> {
+        current.validate()?;
+        if current == &self.descriptor {
+            return Ok(None);
+        }
+
+        let mut pending = self.descriptor.clone();
+        pending.state = PairingRemoteStateV2::Pending;
+        pending.claim_id = None;
+        pending.claim_secret_hash = None;
+        pending.destination_binding = None;
+        pending.resume_until_ms = None;
+        if current != &pending {
+            return Err(PairingV2Error::AlreadyClaimed);
+        }
+        Ok(Some(self.descriptor.clone()))
+    }
+
     pub fn finalize(
         &self,
         descriptor: &PairingDescriptorV2,
     ) -> Result<PairingDescriptorV2, PairingV2Error> {
         descriptor.validate()?;
-        if descriptor.state == PairingRemoteStateV2::Consumed
-            && constant_time_eq(
-                hash_secret(&self.claim_secret).as_bytes(),
-                descriptor
-                    .claim_secret_hash
-                    .as_deref()
-                    .unwrap_or_default()
-                    .as_bytes(),
-            )
-        {
-            return Ok(descriptor.clone());
+        match descriptor.state {
+            PairingRemoteStateV2::Claimed | PairingRemoteStateV2::Consumed => {}
+            PairingRemoteStateV2::ClaimedExpired => return Err(PairingV2Error::Expired),
+            PairingRemoteStateV2::Revoked => return Err(PairingV2Error::Revoked),
+            PairingRemoteStateV2::Pending => return Err(PairingV2Error::WrongClaim),
         }
-        if descriptor.state != PairingRemoteStateV2::Claimed
+
+        let mut expected = self.descriptor.clone();
+        expected.state = descriptor.state.clone();
+        if descriptor != &expected
             || !constant_time_eq(
                 hash_secret(&self.claim_secret).as_bytes(),
                 descriptor
@@ -710,6 +757,9 @@ impl PairingClaimV2 {
             )
         {
             return Err(PairingV2Error::WrongClaim);
+        }
+        if descriptor.state == PairingRemoteStateV2::Consumed {
+            return Ok(descriptor.clone());
         }
         let mut consumed = descriptor.clone();
         consumed.state = PairingRemoteStateV2::Consumed;
@@ -976,6 +1026,26 @@ mod tests {
     }
 
     #[test]
+    fn pairing_claim_transition_accepts_only_exact_pending_predecessor() {
+        let source = source(1_000);
+        let code = PairingCodeV2::parse(&source.reveal_code()).unwrap();
+        let claim =
+            PairingClaimV2::claim(&code, source.descriptor(), "principal-a", 2_000).unwrap();
+        assert_eq!(
+            claim.claim_transition(source.descriptor()).unwrap(),
+            Some(claim.descriptor.clone())
+        );
+        assert_eq!(claim.claim_transition(&claim.descriptor).unwrap(), None);
+
+        let competing =
+            PairingClaimV2::claim(&code, source.descriptor(), "principal-b", 2_001).unwrap();
+        assert_eq!(
+            claim.claim_transition(&competing.descriptor).unwrap_err(),
+            PairingV2Error::AlreadyClaimed
+        );
+    }
+
+    #[test]
     fn pairing_claim_requires_same_claim_secret_and_device_binding() {
         let source = source(1_000);
         let code = PairingCodeV2::parse(&source.reveal_code()).unwrap();
@@ -1003,6 +1073,32 @@ mod tests {
     }
 
     #[test]
+    fn pairing_finalize_requires_exact_claim_and_device_binding() {
+        let source = source(1_000);
+        let code = PairingCodeV2::parse(&source.reveal_code()).unwrap();
+        let claim =
+            PairingClaimV2::claim(&code, source.descriptor(), "principal-a", 2_000).unwrap();
+        assert_eq!(
+            claim.finalize(&claim.descriptor).unwrap().state,
+            PairingRemoteStateV2::Consumed
+        );
+
+        let mut altered_binding = claim.descriptor.clone();
+        altered_binding.destination_binding = Some(URL_SAFE_NO_PAD.encode([9_u8; 32]));
+        assert_eq!(
+            claim.finalize(&altered_binding).unwrap_err(),
+            PairingV2Error::WrongClaim
+        );
+
+        let mut altered_claim = claim.descriptor.clone();
+        altered_claim.claim_id = Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into());
+        assert_eq!(
+            claim.finalize(&altered_claim).unwrap_err(),
+            PairingV2Error::WrongClaim
+        );
+    }
+
+    #[test]
     fn pairing_claim_after_resume_deadline_remains_unavailable_to_other_claimants() {
         let source = source(1_000);
         let code = PairingCodeV2::parse(&source.reveal_code()).unwrap();
@@ -1023,6 +1119,43 @@ mod tests {
                 .unwrap_err(),
             PairingV2Error::Expired
         );
+    }
+
+    #[test]
+    fn pairing_descriptor_cleanup_respects_pending_and_claim_resume_deadlines() {
+        let source = source(1_000);
+        let pending_deadline = source.descriptor().expires_at_ms;
+        assert!(!source
+            .descriptor()
+            .cleanup_eligible_at(pending_deadline)
+            .unwrap());
+        assert!(source
+            .descriptor()
+            .cleanup_eligible_at(pending_deadline + 1)
+            .unwrap());
+
+        let code = PairingCodeV2::parse(&source.reveal_code()).unwrap();
+        let claim =
+            PairingClaimV2::claim(&code, source.descriptor(), "principal-a", 2_000).unwrap();
+        let resume_deadline = claim.descriptor.resume_until_ms.unwrap();
+        assert!(!claim
+            .descriptor
+            .cleanup_eligible_at(resume_deadline)
+            .unwrap());
+        assert!(claim
+            .descriptor
+            .cleanup_eligible_at(resume_deadline + 1)
+            .unwrap());
+
+        let consumed = claim.finalize(&claim.descriptor).unwrap();
+        assert!(consumed.cleanup_eligible_at(0).unwrap());
+        assert!(source
+            .descriptor()
+            .clone()
+            .revoke()
+            .unwrap()
+            .cleanup_eligible_at(0)
+            .unwrap());
     }
 
     #[test]

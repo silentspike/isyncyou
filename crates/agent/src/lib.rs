@@ -97,7 +97,8 @@ pub use session_v2::{
     RequestUuidBindingV1, SanitizedUsage, SessionCommitV1, SessionLeaseGuard, SessionManifestV1,
     SessionRecordKind, SessionRecordV2, SessionV2Error, SessionV2Store, SessionV2Transport,
     SessionWritePolicy, SourceRef, TurnTerminalStatus, VersionedManifest, VisibleContextMessage,
-    MAX_TOOL_CHECKPOINTS, REQUEST_JOURNAL_VERSION, SESSION_RECORD_VERSION,
+    DUPLICATE_TOOL_USE_ID_CODE, MAX_CONTEXT_BYTES, MAX_CONTEXT_MESSAGES, MAX_TOOL_CHECKPOINTS,
+    REQUEST_JOURNAL_VERSION, SESSION_RECORD_VERSION, UNKNOWN_MODEL_INPUT_TOKENS,
 };
 pub use stream::{AgentStreamHub, CancellationToken};
 pub use tool::{

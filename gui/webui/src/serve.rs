@@ -14,7 +14,11 @@
 //! UI, and a **Unix-domain socket** ([`serve_unix`]) for owner-only local access
 //! where filesystem permissions (mode 0600) are the access control.
 
-use crate::{ApiRequest, ApiResponse, EventBus, Router};
+use crate::{
+    is_json_content_type, parse_strict_json_value, ApiRequest, ApiResponse, EventBus, Router,
+};
+use serde::Deserialize;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 #[cfg(unix)]
@@ -28,14 +32,11 @@ use std::time::Duration;
 const MAX_CONNS: usize = 128;
 static ACTIVE_CONNS: AtomicUsize = AtomicUsize::new(0);
 
-/// Upper bound on an in-memory request body (#0A). Generous enough for a document
-/// upload yet bounded so a bogus `Content-Length` can't make the server allocate without
-/// limit; an oversized body is refused (413) rather than buffered.
-const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 const MAX_REQUEST_HEAD: usize = 64 * 1024;
 const MAX_REQUEST_TARGET: usize = 8 * 1024;
 const MAX_HEADER_LINE: usize = 8 * 1024;
 const MAX_HEADER_FIELDS: usize = 128;
+const MAX_BRIDGE_MESSAGE_BYTES: usize = 16 * 1024;
 const AGENT_SSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Decrements the live-connection counter when a connection thread ends.
@@ -89,7 +90,6 @@ struct RequestHeaders {
     cookie: Option<String>,
     host: Option<String>,
     origin: Option<String>,
-    body_encoding: Option<String>,
     content_type: Option<String>,
     storage_not_low: Option<bool>,
 }
@@ -127,30 +127,6 @@ fn strict_json_body_limit(method: &str, target: &str) -> Option<usize> {
     match route_body_policy(method, target) {
         RouteBodyPolicy::Json(limit) => Some(limit),
         RouteBodyPolicy::None => None,
-    }
-}
-
-/// Decode a request body per the `X-Body-Encoding` header (#657 in-app upload/replace):
-/// `base64` → the raw bytes, bounded by `max`; any other/absent value passes the bytes
-/// through. Uploads ride base64 over the JSON bridge (which can't carry raw bytes) and,
-/// uniformly, over HTTP. Returns `(status, message)` on a 400 (bad base64) / 413 (oversize).
-fn decode_body(
-    encoding: Option<&str>,
-    raw: Vec<u8>,
-    max: usize,
-) -> Result<Vec<u8>, (u16, &'static str)> {
-    match encoding {
-        Some(e) if e.eq_ignore_ascii_case("base64") => {
-            use base64::Engine as _;
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(&raw)
-                .map_err(|_| (400u16, "invalid base64 request body"))?;
-            if decoded.len() > max {
-                return Err((413, "request body too large"));
-            }
-            Ok(decoded)
-        }
-        _ => Ok(raw),
     }
 }
 
@@ -219,27 +195,11 @@ pub fn dispatch_message(router: &Router, request: BridgeDispatchRequest<'_>) -> 
         && request
             .content_type
             .as_deref()
-            .is_none_or(|value| !valid_json_content_type(value))
+            .is_none_or(|value| !is_json_content_type(Some(value)))
     {
         return ApiResponse::error(400, "application/json required");
     }
     router.route(&build_request(request, true))
-}
-
-fn valid_json_content_type(value: &str) -> bool {
-    let mut parts = value.split(';').map(str::trim);
-    if !parts
-        .next()
-        .is_some_and(|mime| mime.eq_ignore_ascii_case("application/json"))
-    {
-        return false;
-    }
-    parts.all(|parameter| {
-        parameter.split_once('=').is_some_and(|(name, value)| {
-            name.trim().eq_ignore_ascii_case("charset")
-                && value.trim().trim_matches('"').eq_ignore_ascii_case("utf-8")
-        })
-    })
 }
 
 /// Handle one JSON-framed unary request from the Android in-process bridge (#0A) and
@@ -251,41 +211,62 @@ fn valid_json_content_type(value: &str) -> bool {
 /// routes are not handled here — the bridge streams them over its own push channel. Header
 /// lookup is case-insensitive; `id` is echoed so the JS promise resolves.
 pub fn handle_bridge_request(router: &Router, request_json: &str) -> String {
-    use serde_json::Value;
-    let v: Value = match serde_json::from_str(request_json) {
-        Ok(v) => v,
+    if request_json.len() > MAX_BRIDGE_MESSAGE_BYTES {
+        return bridge_error_envelope(None, 413, "bridge request too large");
+    }
+    let value = match parse_strict_json_value(request_json) {
+        Ok(value) => value,
         Err(_) => return bridge_error_envelope(None, 400, "bad bridge request"),
     };
-    let id = v.get("id").and_then(Value::as_str);
-    let path = match v.get("path").and_then(Value::as_str) {
-        Some(p) => p,
-        None => return bridge_error_envelope(id, 400, "missing path"),
+    let request: BridgeRequestEnvelope = match serde_json::from_value(value) {
+        Ok(request) => request,
+        Err(_) => return bridge_error_envelope(None, 400, "bad bridge request"),
     };
-    let method = v.get("method").and_then(Value::as_str).unwrap_or("GET");
-    let headers = v.get("headers").and_then(Value::as_object);
+    if request.t != "req"
+        || request.id.is_empty()
+        || request.id.len() > 128
+        || !matches!(request.method.as_str(), "GET" | "POST")
+        || request.path.is_empty()
+        || request.path.len() > MAX_REQUEST_TARGET
+        || !request.path.starts_with('/')
+        || request.path.starts_with("//")
+        || request.path.contains('#')
+    {
+        return bridge_error_envelope(Some(&request.id), 400, "bad bridge request");
+    }
+    let mut header_names = HashSet::new();
+    if request.headers.iter().any(|(name, value)| {
+        name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || value.len() > MAX_HEADER_LINE
+            || !header_names.insert(name.to_ascii_lowercase())
+    }) || request
+        .headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("x-body-encoding"))
+    {
+        return bridge_error_envelope(Some(&request.id), 400, "bad bridge request");
+    }
     let header = |name: &str| {
-        headers.and_then(|obj| {
-            obj.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                .and_then(|(_, val)| val.as_str())
-                .map(str::to_string)
-        })
+        request
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
     };
-    let raw = v
-        .get("body")
-        .and_then(Value::as_str)
-        .map(|s| s.as_bytes().to_vec())
+    let body = request
+        .body
+        .as_deref()
+        .map(|body| body.as_bytes().to_vec())
         .unwrap_or_default();
-    // #657: a binary upload rides base64 over this JSON bridge; decode it (+ size-cap).
-    let body = match decode_body(header("X-Body-Encoding").as_deref(), raw, MAX_REQUEST_BODY) {
-        Ok(b) => b,
-        Err((status, message)) => return bridge_error_envelope(id, status, message),
-    };
     let resp = dispatch_message(
         router,
         BridgeDispatchRequest {
-            method,
-            target: path,
+            method: &request.method,
+            target: &request.path,
             cap_token: header("X-Capability-Token"),
             session_token: header("X-Session-Token"),
             per_action_token: header("X-Per-Action-Token"),
@@ -301,11 +282,24 @@ pub fn handle_bridge_request(router: &Router, request_json: &str) -> String {
     );
     serde_json::json!({
         "t": "res",
-        "id": id,
+        "id": request.id,
         "status": resp.status,
         "body": String::from_utf8_lossy(&resp.body),
     })
     .to_string()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BridgeRequestEnvelope {
+    t: String,
+    id: String,
+    method: String,
+    path: String,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    #[serde(default)]
+    body: Option<String>,
 }
 
 /// A bridge reply carrying an error, echoing `id` so the JS promise still resolves.
@@ -624,6 +618,7 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
                     | "x-capability-token"
                     | "x-per-action-token"
                     | "x-storage-not-low"
+                    | "x-body-encoding"
             );
             if authority && !seen_authority.insert(k.to_ascii_lowercase()) {
                 malformed_framing = true;
@@ -641,12 +636,14 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
             } else if k.eq_ignore_ascii_case("origin") {
                 headers.origin = Some(v);
             } else if k.eq_ignore_ascii_case("content-length") {
-                content_length = v.parse::<usize>().ok();
+                content_length = (!v.is_empty() && v.bytes().all(|byte| byte.is_ascii_digit()))
+                    .then(|| v.parse::<usize>().ok())
+                    .flatten();
                 if content_length.is_none() {
                     malformed_framing = true;
                 }
             } else if k.eq_ignore_ascii_case("x-body-encoding") {
-                headers.body_encoding = Some(v);
+                malformed_framing = true;
             } else if k.eq_ignore_ascii_case("content-type") {
                 headers.content_type = Some(v);
             } else if k.eq_ignore_ascii_case("x-storage-not-low") {
@@ -662,9 +659,7 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
                 malformed_framing = true;
             }
         }
-        if malformed_framing
-            || (matches!(body_policy, RouteBodyPolicy::Json(_)) && headers.body_encoding.is_some())
-        {
+        if malformed_framing {
             let resp = ApiResponse::error(400, "invalid request framing");
             stream.write_all(&format_http(&resp))?;
             stream.flush()?;
@@ -708,7 +703,7 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
             && headers
                 .content_type
                 .as_deref()
-                .is_none_or(|value| !valid_json_content_type(value))
+                .is_none_or(|value| !is_json_content_type(Some(value)))
         {
             let resp = ApiResponse::error(400, "application/json required");
             stream.write_all(&format_http(&resp))?;
@@ -741,16 +736,6 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
             }
         } else {
             Vec::new()
-        };
-        // #657: an upload may ride base64 (uniform with the JSON bridge); decode it here.
-        let body = match decode_body(headers.body_encoding.as_deref(), body, body_limit) {
-            Ok(b) => b,
-            Err((status, message)) => {
-                let resp = ApiResponse::error(status, message);
-                stream.write_all(&format_http(&resp))?;
-                stream.flush()?;
-                return Ok(());
-            }
         };
         // Build the routed request from the same transport-agnostic path the in-process
         // bridge uses (#0A): explicit `X-Session-Token`, else the `isy_session` loopback
@@ -1189,40 +1174,11 @@ mod tests {
     }
 
     #[test]
-    fn decode_body_base64_roundtrips_and_bounds() {
-        let m = MAX_REQUEST_BODY;
-        // base64 (case-insensitive header value) -> raw bytes
-        assert_eq!(
-            decode_body(Some("base64"), b"aGVsbG8=".to_vec(), m).unwrap(),
-            b"hello".to_vec()
+    fn http_rejects_legacy_body_encoding_before_body_dispatch() {
+        let response = one_tcp_response(
+            b"POST /api/v1/agent/oauth/start HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nX-Body-Encoding: base64\r\nContent-Length: 2\r\n\r\n{}",
         );
-        assert_eq!(
-            decode_body(Some("BASE64"), b"aGk=".to_vec(), m).unwrap(),
-            b"hi".to_vec()
-        );
-        // absent / other encoding -> passthrough
-        assert_eq!(
-            decode_body(None, b"raw".to_vec(), m).unwrap(),
-            b"raw".to_vec()
-        );
-        assert_eq!(
-            decode_body(Some("identity"), b"raw".to_vec(), m).unwrap(),
-            b"raw".to_vec()
-        );
-        // bad base64 -> 400
-        assert_eq!(
-            decode_body(Some("base64"), b"@@@".to_vec(), m)
-                .unwrap_err()
-                .0,
-            400
-        );
-        // decoded "hello" (5 bytes) over a max of 4 -> 413
-        assert_eq!(
-            decode_body(Some("base64"), b"aGVsbG8=".to_vec(), 4)
-                .unwrap_err()
-                .0,
-            413
-        );
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
     }
 
     #[test]
@@ -1396,6 +1352,7 @@ mod tests {
         for framing in [
             "Content-Length: 0\r\nContent-Length: 0\r\n",
             "Content-Length: nope\r\n",
+            "Content-Length: +0\r\n",
         ] {
             let request = format!(
                 "POST /api/v1/agent/oauth/start HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{framing}\r\n"
@@ -1414,7 +1371,13 @@ mod tests {
 
     #[test]
     fn json_routes_require_application_json() {
-        for content_type in ["text/plain", "application/json; charset=latin1"] {
+        for content_type in [
+            "text/plain",
+            "application/json; charset=latin1",
+            "application/json; charset=utf-8; charset=utf-8",
+            "application/json;",
+            "application/json; charset=\"\"utf-8\"\"",
+        ] {
             let request = format!(
                 "POST /api/v1/agent/oauth/start HTTP/1.1\r\nHost: localhost\r\nContent-Type: {content_type}\r\nContent-Length: 2\r\n\r\n{{}}"
             );
@@ -2059,7 +2022,7 @@ mod tests {
         let gated = Router::new(Config::default()).with_session_token("sess-br".into());
         let denied = handle_bridge_request(
             &gated,
-            r#"{"method":"GET","path":"/api/v1/status","headers":{}}"#,
+            r#"{"t":"req","id":"denied","method":"GET","path":"/api/v1/status","headers":{}}"#,
         );
         assert_eq!(
             serde_json::from_str::<Value>(&denied).unwrap()["status"],
@@ -2067,13 +2030,41 @@ mod tests {
         );
         let ok = handle_bridge_request(
             &gated,
-            r#"{"method":"GET","path":"/api/v1/status","headers":{"x-session-token":"sess-br"}}"#,
+            r#"{"t":"req","id":"ok","method":"GET","path":"/api/v1/status","headers":{"x-session-token":"sess-br"}}"#,
         );
         assert_ne!(serde_json::from_str::<Value>(&ok).unwrap()["status"], 401);
 
         // Malformed JSON → a 400 envelope, never a panic.
         let bad = handle_bridge_request(&open, "not json");
         assert_eq!(serde_json::from_str::<Value>(&bad).unwrap()["status"], 400);
+
+        for invalid in [
+            r#"{"t":"req","id":"dup","method":"GET","path":"/api/v1/status","path":"/api/v1/accounts","headers":{}}"#,
+            r#"{"t":"req","id":"headers","method":"GET","path":"/api/v1/status","headers":{"Content-Type":"application/json","content-type":"text/plain"}}"#,
+            r#"{"t":"req","id":"legacy-body","method":"POST","path":"/api/v1/agent/oauth/start","headers":{"Content-Type":"application/json","X-Body-Encoding":"base64"},"body":"e30="}"#,
+            r#"{"t":"req","id":"trailing","method":"GET","path":"/api/v1/status","headers":{}} trailing"#,
+            r#"{"t":"req","id":"unknown","method":"GET","path":"/api/v1/status","headers":{},"unexpected":true}"#,
+            r#"{"t":"req","id":"method","method":"PUT","path":"/api/v1/status","headers":{}}"#,
+            r#"{"t":"req","id":"path","method":"GET","path":"//api/v1/status","headers":{}}"#,
+            r#"{"t":"req","id":"fragment","method":"GET","path":"/api/v1/status#x","headers":{}}"#,
+            r#"{"t":"req","id":"header-name","method":"GET","path":"/api/v1/status","headers":{"Bad Header":"x"}}"#,
+        ] {
+            let response = handle_bridge_request(&open, invalid);
+            assert_eq!(
+                serde_json::from_str::<Value>(&response).unwrap()["status"],
+                400,
+                "bridge accepted invalid envelope: {invalid}"
+            );
+        }
+        let oversized = format!(
+            r#"{{"t":"req","id":"large","method":"POST","path":"/api/v1/status","headers":{{}},"body":"{}"}}"#,
+            "x".repeat(MAX_BRIDGE_MESSAGE_BYTES)
+        );
+        let response = handle_bridge_request(&open, &oversized);
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap()["status"],
+            413
+        );
     }
 
     #[test]

@@ -195,28 +195,81 @@ fn agent_event_json(ev: &isyncyou_agent::StreamEvent) -> String {
 ))]
 const DEFAULT_MODEL: &str = "claude-sonnet-5";
 
-/// The Claude subscription models the in-app switcher offers (id, human label). Each id is
-/// verified against the subscription messages API.
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-const CLAUDE_MODELS: &[(&str, &str)] = &[
-    ("claude-opus-4-8", "Opus 4.8"),
-    ("claude-sonnet-5", "Sonnet 5"),
-    ("claude-haiku-4-5-20251001", "Haiku 4.5"),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProductModelSpec {
+    id: &'static str,
+    label: &'static str,
+    context_window_tokens: Option<usize>,
+    max_output_tokens: Option<usize>,
+}
+
+/// The Claude subscription models the in-app switcher offers. Each id is verified against the
+/// subscription messages API. Context limits remain unverified, so transcript selection uses the
+/// conservative unknown-model ceiling; the configured Messages output limit is 4,096 tokens.
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+const CLAUDE_MODELS: &[ProductModelSpec] = &[
+    ProductModelSpec {
+        id: "claude-opus-4-8",
+        label: "Opus 4.8",
+        context_window_tokens: None,
+        max_output_tokens: Some(4_096),
+    },
+    ProductModelSpec {
+        id: "claude-sonnet-5",
+        label: "Sonnet 5",
+        context_window_tokens: None,
+        max_output_tokens: Some(4_096),
+    },
+    ProductModelSpec {
+        id: "claude-haiku-4-5-20251001",
+        label: "Haiku 4.5",
+        context_window_tokens: None,
+        max_output_tokens: Some(4_096),
+    },
 ];
 /// The ChatGPT/Codex models the in-app switcher offers (id, human label).
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-const CODEX_MODELS: &[(&str, &str)] = &[
-    ("gpt-5.6-sol", "GPT-5.6 Sol"),
-    ("gpt-5.6-terra", "GPT-5.6 Terra"),
-    ("gpt-5.6-luna", "GPT-5.6 Luna"),
-    ("gpt-5.5", "GPT-5.5"),
-    ("gpt-5.4", "GPT-5.4"),
+const CODEX_MODELS: &[ProductModelSpec] = &[
+    ProductModelSpec {
+        id: "gpt-5.6-sol",
+        label: "GPT-5.6 Sol",
+        context_window_tokens: None,
+        max_output_tokens: None,
+    },
+    ProductModelSpec {
+        id: "gpt-5.6-terra",
+        label: "GPT-5.6 Terra",
+        context_window_tokens: None,
+        max_output_tokens: None,
+    },
+    ProductModelSpec {
+        id: "gpt-5.6-luna",
+        label: "GPT-5.6 Luna",
+        context_window_tokens: None,
+        max_output_tokens: None,
+    },
+    ProductModelSpec {
+        id: "gpt-5.5",
+        label: "GPT-5.5",
+        context_window_tokens: None,
+        max_output_tokens: None,
+    },
+    ProductModelSpec {
+        id: "gpt-5.4",
+        label: "GPT-5.4",
+        context_window_tokens: None,
+        max_output_tokens: None,
+    },
 ];
 #[cfg(any(
     feature = "agent-oauth-providers",
@@ -434,6 +487,12 @@ fn agent_safe_turn_error(error: &isyncyou_agent::AgentError) -> &'static str {
             "codex_safe:parse_failure" => "provider_response_invalid",
             "codex_safe:incomplete_response" => "provider_response_incomplete",
             "codex_safe:stream_failure" => "provider_stream_failed",
+            "subscription_safe:authorization_rejected" => "provider_authorization_rejected",
+            "subscription_safe:http_rate_limited" => "provider_rate_limited",
+            "subscription_safe:http_server_failure" => "provider_service_unavailable",
+            "subscription_safe:parse_failure" => "provider_response_invalid",
+            "subscription_safe:stream_failure" => "provider_stream_failed",
+            "subscription_safe:http_request_rejected" => "provider_request_rejected",
             "codex_safe:http_bad_request" | "codex_safe:http_request_rejected" => {
                 "provider_request_rejected"
             }
@@ -453,6 +512,17 @@ fn agent_safe_turn_error(error: &isyncyou_agent::AgentError) -> &'static str {
             "provider_response_read_failed" => "provider_response_read_failed",
             _ => "provider_transport_failed",
         },
+    }
+}
+
+fn product_turn_terminal_error(
+    error: &isyncyou_agent::AgentError,
+    provider_outcome_ambiguous: bool,
+) -> String {
+    if provider_outcome_ambiguous {
+        "turn_outcome_unknown".to_owned()
+    } else {
+        agent_safe_turn_error(error).to_owned()
     }
 }
 
@@ -1182,6 +1252,7 @@ enum TurnAuthorityState {
     Running,
     Cancelled,
     Pending(String),
+    Finalizing,
 }
 
 #[derive(Default)]
@@ -1198,6 +1269,18 @@ struct TurnRegistry {
 )]
 enum PendingTransition<T> {
     Committed(T),
+    Cancelled,
+}
+
+#[cfg_attr(
+    not(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    )),
+    allow(dead_code)
+)]
+enum TerminalTransition {
+    Proceed,
     Cancelled,
 }
 
@@ -1232,6 +1315,7 @@ impl TurnRegistry {
         match &*state {
             TurnAuthorityState::Cancelled => Ok(PendingTransition::Cancelled),
             TurnAuthorityState::Pending(_) => Err("pending_requires_explicit_cancel".into()),
+            TurnAuthorityState::Finalizing => Err("turn_not_found".into()),
             TurnAuthorityState::Running => match commit() {
                 Ok((pending_id, value)) => {
                     *state = TurnAuthorityState::Pending(pending_id);
@@ -1242,12 +1326,35 @@ impl TurnRegistry {
         }
     }
 
+    fn begin_terminal(
+        state: &Arc<Mutex<TurnAuthorityState>>,
+        cancellation: &isyncyou_agent::CancellationToken,
+    ) -> Result<TerminalTransition, String> {
+        let mut state = state
+            .lock()
+            .map_err(|_| "turn_registry_unavailable".to_string())?;
+        match &*state {
+            TurnAuthorityState::Cancelled => Ok(TerminalTransition::Cancelled),
+            TurnAuthorityState::Pending(_) => Err("pending_requires_explicit_cancel".into()),
+            TurnAuthorityState::Finalizing => Err("turn_not_found".into()),
+            TurnAuthorityState::Running if cancellation.is_cancelled() => {
+                *state = TurnAuthorityState::Cancelled;
+                Ok(TerminalTransition::Cancelled)
+            }
+            TurnAuthorityState::Running => {
+                *state = TurnAuthorityState::Finalizing;
+                Ok(TerminalTransition::Proceed)
+            }
+        }
+    }
+
     fn cancel(
         &self,
         pending: &isyncyou_agent::PendingRegistry,
         hub: &isyncyou_agent::AgentStreamHub,
         turn_id: &str,
         now_ms: u64,
+        persist: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
         let state = self
             .turns
@@ -1272,13 +1379,15 @@ impl TurnRegistry {
                 }
             }
             TurnAuthorityState::Cancelled => Ok(()),
+            TurnAuthorityState::Finalizing => Err("turn_not_found".into()),
             TurnAuthorityState::Running => {
+                let cancellation = hub
+                    .cancellation_token(turn_id)
+                    .ok_or_else(|| "turn_not_found".to_string())?;
+                persist()?;
                 *state = TurnAuthorityState::Cancelled;
-                if hub.cancel(turn_id) {
-                    Ok(())
-                } else {
-                    Err("turn_not_found".into())
-                }
+                cancellation.cancel();
+                Ok(())
             }
         }
     }
@@ -1307,8 +1416,9 @@ fn cancel_turn_with_pending_guard(
     hub: &isyncyou_agent::AgentStreamHub,
     turn_id: &str,
     now_ms: u64,
+    persist: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
-    turns.cancel(pending, hub, turn_id, now_ms)
+    turns.cancel(pending, hub, turn_id, now_ms, persist)
 }
 
 #[cfg_attr(
@@ -1555,6 +1665,32 @@ struct PreparedTurnProvider {
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
+fn dispatch_prepared_product_turn<T>(
+    prepared: PreparedTurnProvider,
+    start: Result<product_session::ProductTurnStart, String>,
+    launch: impl FnOnce(
+        PreparedTurnProvider,
+        Box<product_session::ProductTurnRuntime>,
+    ) -> Result<T, String>,
+    replay: impl FnOnce(product_session::ProductTurnReplay) -> Result<T, String>,
+) -> Result<T, String> {
+    match start {
+        Ok(product_session::ProductTurnStart::Started(runtime)) => launch(prepared, runtime),
+        Ok(product_session::ProductTurnStart::Replay(value)) => {
+            drop(prepared);
+            replay(value)
+        }
+        Err(error) => {
+            drop(prepared);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 struct ReservedAgentTurn {
     turn_id: String,
     sequence: u64,
@@ -1588,7 +1724,29 @@ struct LifecycleMaintenanceContext {
     oauth: Arc<isyncyou_agent::AgentOAuth>,
     oauth_attempts: Arc<Mutex<HashMap<String, OAuthAttempt>>>,
     oauth_lifecycle_bindings: Arc<Mutex<HashMap<String, OAuthLifecycleAttemptBinding>>>,
+    session_maintenance_last_ms: Arc<AtomicU64>,
 }
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+const PRODUCT_SESSION_MAINTENANCE_INTERVAL_MS: u64 = 6 * 60 * 60 * 1_000;
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+const PRODUCT_SESSION_MAINTENANCE_BATCH: usize = 8;
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+const PRODUCT_SESSION_COMPACTION_BATCH: usize = 8;
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+const PAIRING_DESCRIPTOR_CLEANUP_BATCH: usize = 8;
 
 #[cfg(any(
     feature = "agent-oauth-providers",
@@ -1648,6 +1806,14 @@ fn run_account_maintenance_once(
         }
     }
     reap_onboarding_journals_at(&context.oauth_dir, now_ms());
+    let maintenance_now_ms = unix_now_ms();
+    if product_session_maintenance_due(
+        &context.session_maintenance_last_ms,
+        maintenance_now_ms,
+        recover_interrupted_exchange,
+    ) {
+        run_product_session_maintenance_once(context);
+    }
     run_lifecycle_maintenance_once_at_with_recovery(
         &context.cfg,
         &context.oauth_dir,
@@ -1657,6 +1823,110 @@ fn run_account_maintenance_once(
         now_ms(),
         recover_interrupted_exchange,
     );
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn product_session_maintenance_due(last_ms: &AtomicU64, now_ms: u64, force: bool) -> bool {
+    if force {
+        last_ms.store(now_ms, Ordering::Release);
+        return true;
+    }
+    loop {
+        let last = last_ms.load(Ordering::Acquire);
+        if now_ms.saturating_sub(last) < PRODUCT_SESSION_MAINTENANCE_INTERVAL_MS {
+            return false;
+        }
+        if last_ms
+            .compare_exchange(last, now_ms, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn run_product_session_maintenance_once(context: &LifecycleMaintenanceContext) {
+    let Some(control_store) = context.control_store.as_ref() else {
+        return;
+    };
+    let Ok(credential_store) = agent_credential_store(&context.oauth_dir) else {
+        return;
+    };
+    let registry = product_session::ProductSessionRegistry::new(&credential_store);
+    let Ok(targets) = registry.maintenance_targets() else {
+        return;
+    };
+    cleanup_pairing_descriptors_once(&context.cfg, control_store, &targets, unix_now_ms());
+    if targets.is_empty() {
+        let _ = control_store.claim_session_maintenance_offset(0, 0);
+        return;
+    }
+    let Ok(offset) = control_store
+        .claim_session_maintenance_offset(targets.len(), PRODUCT_SESSION_MAINTENANCE_BATCH)
+    else {
+        return;
+    };
+    for target in targets
+        .iter()
+        .cycle()
+        .skip(offset)
+        .take(PRODUCT_SESSION_MAINTENANCE_BATCH.min(targets.len()))
+    {
+        let Ok(token) =
+            isyncyou_engine::auth::resolve_cached_sync_token(&context.cfg, &target.local_account)
+        else {
+            continue;
+        };
+        let _ = registry.maintain_remote_session(&token, target, PRODUCT_SESSION_COMPACTION_BATCH);
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn cleanup_pairing_descriptors_once(
+    cfg: &Config,
+    control_store: &agent_control_store::AgentControlStore,
+    session_targets: &[product_session::ProductSessionMaintenanceTarget],
+    now_ms: u64,
+) {
+    let Ok(cleanup_targets) =
+        control_store.pairing_descriptor_cleanup_targets(PAIRING_DESCRIPTOR_CLEANUP_BATCH)
+    else {
+        return;
+    };
+    for cleanup in cleanup_targets {
+        let Some(session) = session_targets
+            .iter()
+            .find(|target| target.session_id == cleanup.session_id)
+        else {
+            continue;
+        };
+        let Ok(token) =
+            isyncyou_engine::auth::resolve_cached_sync_token(cfg, &session.local_account)
+        else {
+            continue;
+        };
+        let transport = isyncyou_agent::OneDrivePairingTransportV2::new(token);
+        let Ok(Some(current)) = transport.load_optional(&cleanup.pair_id) else {
+            continue;
+        };
+        if current
+            .descriptor
+            .cleanup_eligible_at(now_ms)
+            .unwrap_or(false)
+        {
+            let _ = transport.delete(&current);
+        }
+    }
 }
 
 #[cfg(any(
@@ -2505,6 +2775,7 @@ impl DaemonAgent {
             oauth: Arc::clone(&self.oauth),
             oauth_attempts: Arc::clone(&self.oauth_attempts),
             oauth_lifecycle_bindings: Arc::clone(&self.oauth_lifecycle_bindings),
+            session_maintenance_last_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -5756,7 +6027,29 @@ fn provider_has_model(provider: ProductProviderId, model: &str) -> bool {
         ProductProviderId::Claude => CLAUDE_MODELS,
         ProductProviderId::Codex => CODEX_MODELS,
     };
-    known.iter().any(|(id, _)| *id == model)
+    known.iter().any(|spec| spec.id == model)
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn product_model_context_budget(
+    provider: ProductProviderId,
+    model: &str,
+) -> Result<isyncyou_agent::ContextBudget, String> {
+    let known = match provider {
+        ProductProviderId::Claude => CLAUDE_MODELS,
+        ProductProviderId::Codex => CODEX_MODELS,
+    };
+    let spec = known
+        .iter()
+        .find(|spec| spec.id == model)
+        .ok_or_else(|| "unknown_model".to_string())?;
+    Ok(isyncyou_agent::ContextBudget::for_model_limits(
+        spec.context_window_tokens,
+        spec.max_output_tokens,
+    ))
 }
 
 #[cfg(any(
@@ -7227,7 +7520,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         activate_product(&self.oauth_dir, provider, &meta.generation)?;
         let default_model = match provider {
             ProductProviderId::Claude => DEFAULT_MODEL,
-            ProductProviderId::Codex => CODEX_MODELS[0].0,
+            ProductProviderId::Codex => CODEX_MODELS[0].id,
         };
         self.set_agent_settings(provider.wire(), default_model)?;
         repository
@@ -8424,7 +8717,8 @@ impl DaemonAgent {
             .name(format!("agent-turn-{n}"))
             .spawn(move || {
                 let _admission = admission;
-                let _durable_admission = durable_admission;
+                let mut durable_admission = durable_admission;
+                let mut terminal_persisted = false;
                 let mut keep_turn_authority = false;
                 #[cfg(any(
                     feature = "agent-oauth-providers",
@@ -8483,6 +8777,22 @@ impl DaemonAgent {
                         last_usage.lock().unwrap().insert(provider_id, usage);
                     }
                 }
+                let outcome = if matches!(
+                    &outcome,
+                    Ok(isyncyou_agent::TurnOutcome::PendingConfirmation { .. })
+                ) {
+                    outcome
+                } else {
+                    match TurnRegistry::begin_terminal(&turn_state, &cancellation) {
+                        Ok(TerminalTransition::Proceed) => outcome,
+                        Ok(TerminalTransition::Cancelled) => {
+                            Err(isyncyou_agent::AgentError::Cancelled)
+                        }
+                        Err(_) => Err(isyncyou_agent::AgentError::Provider(
+                            "turn_registry_unavailable".into(),
+                        )),
+                    }
+                };
                 match outcome {
                     Ok(isyncyou_agent::TurnOutcome::Final { text }) => {
                         let persisted = product_turn.map_or(Ok(()), |runtime| {
@@ -8498,6 +8808,7 @@ impl DaemonAgent {
                                 ),
                             )
                         });
+                        terminal_persisted = persisted.is_ok();
                         cache_persisted_request_phase(
                             &hot_request_statuses,
                             hot_request_binding.as_ref(),
@@ -8516,22 +8827,61 @@ impl DaemonAgent {
                         let preview = match agent_ops::preview_for_pending_action(&action) {
                             Ok(preview) => preview,
                             Err(_) => {
+                                let cancelled = matches!(
+                                    TurnRegistry::begin_terminal(&turn_state, &cancellation),
+                                    Ok(TerminalTransition::Cancelled)
+                                );
+                                let (terminal_status, error_code, phase, done_reason) = if cancelled
+                                {
+                                    (
+                                        isyncyou_agent::TurnTerminalStatus::Cancelled,
+                                        None,
+                                        isyncyou_agent::RequestPhase::Cancelled,
+                                        isyncyou_agent::DoneReason::Cancelled,
+                                    )
+                                } else {
+                                    (
+                                        isyncyou_agent::TurnTerminalStatus::Error,
+                                        Some("confirmation_unavailable".into()),
+                                        isyncyou_agent::RequestPhase::Failed,
+                                        isyncyou_agent::DoneReason::Error,
+                                    )
+                                };
                                 let persisted = product_turn.take().map_or(Ok(()), |runtime| {
                                     cache_product_session_context(
                                         &hot_session_history,
                                         runtime.finish_terminal(
-                                            isyncyou_agent::TurnTerminalStatus::Error,
-                                            Some("confirmation_unavailable".into()),
-                                            isyncyou_agent::RequestPhase::Failed,
+                                            terminal_status,
+                                            error_code,
+                                            phase,
                                             unix_now_ms(),
                                         ),
                                     )
                                 });
-                                for event in terminal_error_events_after_persistence(
-                                    persisted,
-                                    "confirmation_unavailable",
-                                ) {
-                                    let _ = hub.emit(&tid, event);
+                                let persisted_ok = persisted.is_ok();
+                                cache_persisted_request_phase(
+                                    &hot_request_statuses,
+                                    hot_request_binding.as_ref(),
+                                    &persisted,
+                                    phase,
+                                );
+                                let events = if cancelled {
+                                    terminal_events_after_persistence(persisted, done_reason)
+                                } else {
+                                    terminal_error_events_after_persistence(
+                                        persisted,
+                                        "confirmation_unavailable",
+                                    )
+                                };
+                                for event in events {
+                                    let _ = if cancelled {
+                                        hub.emit_terminal(&tid, event)
+                                    } else {
+                                        hub.emit(&tid, event)
+                                    };
+                                }
+                                if persisted_ok {
+                                    let _ = durable_admission.complete();
                                 }
                                 hub.close(&tid);
                                 turns.remove(&tid);
@@ -8574,6 +8924,7 @@ impl DaemonAgent {
                                 );
                                 return Err(error);
                             }
+                            terminal_persisted = true;
                             cache_persisted_request_phase(
                                 &hot_request_statuses,
                                 hot_request_binding.as_ref(),
@@ -8616,6 +8967,7 @@ impl DaemonAgent {
                                         ),
                                     )
                                 });
+                                terminal_persisted = persisted.is_ok();
                                 cache_persisted_request_phase(
                                     &hot_request_statuses,
                                     hot_request_binding.as_ref(),
@@ -8630,28 +8982,56 @@ impl DaemonAgent {
                                 }
                             }
                             Err(error) => {
+                                let cancelled = matches!(
+                                    TurnRegistry::begin_terminal(&turn_state, &cancellation),
+                                    Ok(TerminalTransition::Cancelled)
+                                );
                                 let safe_code = pending_setup_error_code(&error);
+                                let (terminal_status, error_code, phase, done_reason) = if cancelled
+                                {
+                                    (
+                                        isyncyou_agent::TurnTerminalStatus::Cancelled,
+                                        None,
+                                        isyncyou_agent::RequestPhase::Cancelled,
+                                        isyncyou_agent::DoneReason::Cancelled,
+                                    )
+                                } else {
+                                    (
+                                        isyncyou_agent::TurnTerminalStatus::Error,
+                                        Some(safe_code.into()),
+                                        isyncyou_agent::RequestPhase::Failed,
+                                        isyncyou_agent::DoneReason::Error,
+                                    )
+                                };
                                 let persisted = product_turn.take().map_or(Ok(()), |runtime| {
                                     cache_product_session_context(
                                         &hot_session_history,
                                         runtime.finish_terminal(
-                                            isyncyou_agent::TurnTerminalStatus::Error,
-                                            Some(safe_code.into()),
-                                            isyncyou_agent::RequestPhase::Failed,
+                                            terminal_status,
+                                            error_code,
+                                            phase,
                                             unix_now_ms(),
                                         ),
                                     )
                                 });
+                                terminal_persisted = persisted.is_ok();
                                 cache_persisted_request_phase(
                                     &hot_request_statuses,
                                     hot_request_binding.as_ref(),
                                     &persisted,
-                                    isyncyou_agent::RequestPhase::Failed,
+                                    phase,
                                 );
-                                for event in
+                                let events = if cancelled {
+                                    terminal_events_after_persistence(persisted, done_reason)
+                                } else {
                                     terminal_error_events_after_persistence(persisted, safe_code)
-                                {
-                                    let _ = hub.emit(&tid, event);
+                                };
+                                for event in events {
+                                    let _ = if cancelled {
+                                        hub.emit_terminal(&tid, event)
+                                    } else {
+                                        hub.emit(&tid, event)
+                                    };
                                 }
                             }
                         }
@@ -8668,6 +9048,7 @@ impl DaemonAgent {
                                 ),
                             )
                         });
+                        terminal_persisted = persisted.is_ok();
                         cache_persisted_request_phase(
                             &hot_request_statuses,
                             hot_request_binding.as_ref(),
@@ -8695,23 +9076,40 @@ impl DaemonAgent {
                         }
                     }
                     Err(error) => {
-                        let safe_error = agent_safe_turn_error(&error).to_owned();
+                        let safe_error = product_turn_terminal_error(
+                            &error,
+                            product_turn.as_ref().is_some_and(
+                                product_session::ProductTurnRuntime::provider_outcome_is_ambiguous,
+                            ),
+                        );
+                        let (terminal_status, phase) = if safe_error == "turn_outcome_unknown" {
+                            (
+                                isyncyou_agent::TurnTerminalStatus::OutcomeUnknown,
+                                isyncyou_agent::RequestPhase::OutcomeUnknown,
+                            )
+                        } else {
+                            (
+                                isyncyou_agent::TurnTerminalStatus::Error,
+                                isyncyou_agent::RequestPhase::Failed,
+                            )
+                        };
                         let persisted = product_turn.map_or(Ok(()), |runtime| {
                             cache_product_session_context(
                                 &hot_session_history,
                                 runtime.finish_terminal(
-                                    isyncyou_agent::TurnTerminalStatus::Error,
+                                    terminal_status,
                                     Some(safe_error.clone()),
-                                    isyncyou_agent::RequestPhase::Failed,
+                                    phase,
                                     unix_now_ms(),
                                 ),
                             )
                         });
+                        terminal_persisted = persisted.is_ok();
                         cache_persisted_request_phase(
                             &hot_request_statuses,
                             hot_request_binding.as_ref(),
                             &persisted,
-                            isyncyou_agent::RequestPhase::Failed,
+                            phase,
                         );
                         let code = if persisted.is_ok() {
                             safe_error
@@ -8724,6 +9122,9 @@ impl DaemonAgent {
                             isyncyou_agent::StreamEvent::done(isyncyou_agent::DoneReason::Error),
                         );
                     }
+                }
+                if terminal_persisted {
+                    let _ = durable_admission.complete();
                 }
                 hub.close(&tid);
                 if let Some(session_id) = history_session_id.as_deref() {
@@ -9090,6 +9491,17 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             if route != "agent_turn" {
                 return Err("invalid_request_route".into());
             }
+            let request_scope = format!("session_id:{session_id}");
+            if let Some((phase, _error_code)) = self
+                .control_store
+                .as_ref()
+                .ok_or_else(|| "session_store_unavailable".to_string())?
+                .agent_turn_admission_terminal(request_id, &request_scope)?
+            {
+                self.hot_request_statuses
+                    .insert(session_id, request_id, phase);
+                return Ok(request_status_json(phase));
+            }
             if let Some(phase) = self.hot_request_statuses.get(session_id, request_id) {
                 return Ok(request_status_json(phase));
             }
@@ -9302,6 +9714,18 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             let credential_store = agent_credential_store(&self.oauth_dir)
                 .map_err(|_| "session_store_unavailable".to_string())?;
             let registry = product_session::ProductSessionRegistry::new(&credential_store);
+            if let Some(control_store) = self.control_store.as_ref() {
+                let maintenance_now_ms = unix_now_ms();
+                let _ = control_store.reap_expired(maintenance_now_ms, 256);
+                if let Ok(targets) = registry.maintenance_targets() {
+                    cleanup_pairing_descriptors_once(
+                        &self.cfg,
+                        control_store,
+                        &targets,
+                        maintenance_now_ms,
+                    );
+                }
+            }
             registry.account_for(&request.session_id)?;
             let payload = registry.pairing_payload(&request.session_id)?;
             let control_store = self
@@ -9436,12 +9860,15 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             let current = transport
                 .load(code.pair_id())
                 .map_err(|error| error.to_string())?;
-            if current.descriptor != claim.descriptor {
+            if let Some(next) = claim
+                .claim_transition(&current.descriptor)
+                .map_err(|error| error.to_string())?
+            {
                 let claimed = transport
-                    .compare_and_swap(&current, &claim.descriptor)
+                    .compare_and_swap(&current, &next)
                     .map_err(|error| error.to_string())?
                     .ok_or_else(|| "pairing_outcome_unknown".to_string())?;
-                if claimed.descriptor != claim.descriptor {
+                if claimed.descriptor != next {
                     return Err("pairing_outcome_unknown".into());
                 }
             }
@@ -9496,7 +9923,11 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             if control_store.pairing_claim_state(&request.operation_id, None)?
                 == Some("consumed".into())
             {
-                control_store.complete_pairing_claim(&request.operation_id, &request.request_id)?;
+                control_store.complete_pairing_claim(
+                    &request.operation_id,
+                    &request.request_id,
+                    unix_now_ms(),
+                )?;
                 return Ok(serde_json::json!({
                     "operation_id": request.operation_id,
                     "state": "consumed",
@@ -9508,19 +9939,46 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 unix_now_ms(),
             )?;
             let transport = isyncyou_agent::OneDrivePairingTransportV2::new(token);
-            let current = transport
-                .load(code.pair_id())
-                .map_err(|error| error.to_string())?;
-            let consumed = claim
-                .finalize(&current.descriptor)
-                .map_err(|error| error.to_string())?;
-            if consumed != current.descriptor {
-                transport
-                    .compare_and_swap(&current, &consumed)
+            if !control_store
+                .pairing_claim_remote_consumed(&request.operation_id, &request.request_id)?
+            {
+                let current = transport
+                    .load_optional(code.pair_id())
                     .map_err(|error| error.to_string())?
                     .ok_or_else(|| "pairing_outcome_unknown".to_string())?;
+                let consumed = claim
+                    .finalize(&current.descriptor)
+                    .map_err(|error| error.to_string())?;
+                let terminal = if consumed != current.descriptor {
+                    let published = transport
+                        .compare_and_swap(&current, &consumed)
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| "pairing_outcome_unknown".to_string())?;
+                    if published.descriptor != consumed {
+                        return Err("pairing_outcome_unknown".into());
+                    }
+                    published
+                } else {
+                    current
+                };
+                control_store.mark_pairing_claim_remote_consumed(
+                    &request.operation_id,
+                    &request.request_id,
+                )?;
+                let _ = transport.delete(&terminal);
+            } else if let Ok(Some(current)) = transport.load_optional(code.pair_id()) {
+                if claim
+                    .finalize(&current.descriptor)
+                    .is_ok_and(|descriptor| descriptor == current.descriptor)
+                {
+                    let _ = transport.delete(&current);
+                }
             }
-            control_store.complete_pairing_claim(&request.operation_id, &request.request_id)?;
+            control_store.complete_pairing_claim(
+                &request.operation_id,
+                &request.request_id,
+                unix_now_ms(),
+            )?;
             Ok(serde_json::json!({
                 "operation_id": request.operation_id,
                 "state": "consumed",
@@ -9571,31 +10029,40 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, &account)
                 .map_err(|_| "pairing_transport_unavailable".to_string())?;
             let transport = isyncyou_agent::OneDrivePairingTransportV2::new(token);
-            let current = transport
-                .load(source.pair_id())
-                .map_err(|error| error.to_string())?;
-            if current.descriptor.state != isyncyou_agent::PairingRemoteStateV2::Revoked {
-                let revoked = current
-                    .descriptor
-                    .clone()
-                    .revoke()
-                    .map_err(|error| error.to_string())?;
-                let updated = transport
-                    .compare_and_swap(&current, &revoked)
-                    .map_err(|error| error.to_string())?;
-                if updated.is_none() {
-                    let observed = transport
-                        .load(source.pair_id())
+            if let Some(current) = transport
+                .load_optional(source.pair_id())
+                .map_err(|error| error.to_string())?
+            {
+                if current.descriptor.state != isyncyou_agent::PairingRemoteStateV2::Revoked {
+                    let revoked = current
+                        .descriptor
+                        .clone()
+                        .revoke()
                         .map_err(|error| error.to_string())?;
-                    if observed.descriptor.state != isyncyou_agent::PairingRemoteStateV2::Revoked {
-                        return Err("pairing_outcome_unknown".into());
+                    let updated = transport
+                        .compare_and_swap(&current, &revoked)
+                        .map_err(|error| error.to_string())?;
+                    if updated.is_none() {
+                        let observed = transport
+                            .load_optional(source.pair_id())
+                            .map_err(|error| error.to_string())?;
+                        if observed.is_some_and(|observed| {
+                            observed.descriptor.state
+                                != isyncyou_agent::PairingRemoteStateV2::Revoked
+                        }) {
+                            return Err("pairing_outcome_unknown".into());
+                        }
                     }
                 }
+                if let Ok(Some(current)) = transport.load_optional(source.pair_id()) {
+                    let _ = transport.delete(&current);
+                }
             }
-            if let Ok(current) = transport.load(source.pair_id()) {
-                let _ = transport.delete(&current);
-            }
-            control_store.complete_pairing_revoke(&request.operation_id, &request.request_id)?;
+            control_store.complete_pairing_revoke(
+                &request.operation_id,
+                &request.request_id,
+                unix_now_ms(),
+            )?;
             Ok(serde_json::json!({
                 "operation_id": request.operation_id,
                 "state": "revoked",
@@ -9938,7 +10405,8 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 .as_ref()
                 .cloned()
                 .ok_or_else(|| "session_store_unavailable".to_string())?;
-            control_store.begin_agent_turn_admission_identity(&request, &turn_id, &identity)?;
+            let durable_state =
+                control_store.begin_agent_turn_admission_identity(&request, &turn_id, &identity)?;
             let admission = match self.turn_admissions.reserve(&turn_id, digest) {
                 Ok(Some(admission)) => admission,
                 Ok(None) => return Ok(turn_id),
@@ -9956,6 +10424,34 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 admission,
                 durable_admission,
             )?;
+            match durable_state {
+                agent_control_store::AgentTurnAdmissionBegin::Cancelled => {
+                    self.emit_product_turn_replay(
+                        &turn_id,
+                        product_session::ProductTurnReplay {
+                            phase: isyncyou_agent::RequestPhase::Cancelled,
+                            final_text: None,
+                            error_code: None,
+                        },
+                    );
+                    drop(reserved);
+                    return Ok(turn_id);
+                }
+                agent_control_store::AgentTurnAdmissionBegin::Failed(code) => {
+                    self.emit_product_turn_replay(
+                        &turn_id,
+                        product_session::ProductTurnReplay {
+                            phase: isyncyou_agent::RequestPhase::Failed,
+                            final_text: None,
+                            error_code: Some(code),
+                        },
+                    );
+                    drop(reserved);
+                    return Ok(turn_id);
+                }
+                agent_control_store::AgentTurnAdmissionBegin::Inserted
+                | agent_control_store::AgentTurnAdmissionBegin::Existing => {}
+            }
             let cached_context = self
                 .hot_session_history
                 .context_snapshot(&request.session_id);
@@ -9982,6 +10478,10 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                         .session_binding
                         .clone()
                         .ok_or_else(|| "provider_generation_changed".to_string())?;
+                    let context_budget = product_model_context_budget(
+                        provider_binding.provider,
+                        &provider_binding.model,
+                    )?;
                     let installation = account_lifecycle_repository(&worker.oauth_dir)
                         .and_then(|repository| {
                             repository
@@ -9999,39 +10499,67 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                         .map_err(|_| "session_store_unavailable".to_string())?;
                     let registry = product_session::ProductSessionRegistry::new(&store);
                     ensure_active()?;
-                    let product_turn =
-                        registry.begin_turn(product_session::ProductTurnRequest {
-                            graph_token: &token,
-                            session_id: &request.session_id,
-                            request_id: &request.request_id,
-                            turn_id: &worker_turn_id,
-                            local_account: &request.account,
-                            prompt: &request.prompt,
-                            provider_binding,
-                            installation_principal: installation.principal(),
-                            created_at_ms: unix_now_ms(),
-                            cached_context,
-                        })?;
+                    let product_turn = registry.begin_turn(product_session::ProductTurnRequest {
+                        graph_token: &token,
+                        session_id: &request.session_id,
+                        request_id: &request.request_id,
+                        turn_id: &worker_turn_id,
+                        local_account: &request.account,
+                        prompt: &request.prompt,
+                        provider_binding,
+                        installation_principal: installation.principal(),
+                        created_at_ms: unix_now_ms(),
+                        cached_context,
+                        context_budget,
+                    });
                     let mut reserved = reserved;
-                    reserved.durable_admission.complete()?;
-                    match product_turn {
-                        product_session::ProductTurnStart::Started(product_turn) => {
+                    if matches!(
+                        &product_turn,
+                        Ok(product_session::ProductTurnStart::Replay(_))
+                    ) {
+                        reserved.durable_admission.complete()?;
+                    }
+                    dispatch_prepared_product_turn(
+                        prepared,
+                        product_turn,
+                        |prepared, product_turn| {
                             worker.launch_prepared_turn(
                                 &request.account,
                                 &request.prompt,
                                 prepared,
                                 Some(*product_turn),
                                 reserved,
-                            )?;
-                        }
-                        product_session::ProductTurnStart::Replay(replay) => {
+                            )
+                        },
+                        |replay| {
                             worker.emit_product_turn_replay(&worker_turn_id, replay);
-                        }
-                    }
+                            Ok(worker_turn_id.clone())
+                        },
+                    )?;
                     Ok(())
                 })();
                 if let Err(error) = result {
-                    worker.fail_reserved_turn(&worker_turn_id, &error);
+                    let safe_error = agent_safe_turn_start_error(&error);
+                    let terminal =
+                        control_store.fail_agent_turn_admission(&worker_turn_id, safe_error);
+                    let emitted_error = match terminal {
+                        Ok(agent_control_store::AgentTurnAdmissionFailure::Cancelled) => {
+                            "turn_cancelled"
+                        }
+                        Ok(agent_control_store::AgentTurnAdmissionFailure::Failed)
+                        | Ok(agent_control_store::AgentTurnAdmissionFailure::Completed) => {
+                            safe_error
+                        }
+                        Err(_) => "turn_admission_unavailable",
+                    };
+                    if emitted_error != "turn_cancelled" {
+                        worker.hot_request_statuses.insert(
+                            &request.session_id,
+                            &request.request_id,
+                            isyncyou_agent::RequestPhase::Failed,
+                        );
+                    }
+                    worker.fail_reserved_turn(&worker_turn_id, emitted_error);
                 }
             });
             if preparation.is_err() {
@@ -10113,12 +10641,19 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
     }
 
     fn cancel_turn(&self, turn_id: &str) -> Result<(), String> {
+        let control_store = self.control_store.clone();
         cancel_turn_with_pending_guard(
             &self.turns,
             &self.pending,
             &self.hub,
             turn_id,
             unix_now_ms(),
+            || {
+                control_store
+                    .as_ref()
+                    .ok_or_else(|| "turn_admission_unavailable".to_string())?
+                    .cancel_agent_turn_admission(turn_id)
+            },
         )
     }
 
@@ -10882,8 +11417,14 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 .map(isyncyou_agent::CodexReasoningEffort::as_str)
                 .unwrap_or("");
             let selected_provider = selected_id.map(ProductProviderId::wire).unwrap_or("");
-            let list = |models: &[(&str, &str)]| -> serde_json::Value {
+            let model_list = |models: &[ProductModelSpec]| -> serde_json::Value {
                 models
+                    .iter()
+                    .map(|spec| serde_json::json!({ "id": spec.id, "label": spec.label }))
+                    .collect()
+            };
+            let option_list = |options: &[(&str, &str)]| -> serde_json::Value {
+                options
                     .iter()
                     .map(|(id, label)| serde_json::json!({ "id": id, "label": label }))
                     .collect()
@@ -10900,8 +11441,11 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 "credential_state": { "claude": claude_state, "codex": codex_state },
                 "control_store_state": self.control_store_state,
                 "reconnect_required": reconnect_required,
-                "models": { "claude": list(CLAUDE_MODELS), "codex": list(CODEX_MODELS) },
-                "reasoning_efforts": list(CODEX_REASONING_EFFORTS),
+                "models": {
+                    "claude": model_list(CLAUDE_MODELS),
+                    "codex": model_list(CODEX_MODELS)
+                },
+                "reasoning_efforts": option_list(CODEX_REASONING_EFFORTS),
             });
             if let Some(usage) = selected_id.and_then(|provider| {
                 self.last_usage
@@ -12231,10 +12775,6 @@ impl isyncyou_webui::DurableRequestStore for UnavailableDurableRequests {
     fn abort(&self, _identity: &isyncyou_webui::ProductRequestIdentity) -> Result<(), String> {
         Err("request_store_unavailable".into())
     }
-
-    fn reject(&self, _identity: &isyncyou_webui::ProductRequestIdentity) -> Result<(), String> {
-        Err("request_store_unavailable".into())
-    }
 }
 
 #[cfg(any(
@@ -12306,10 +12846,6 @@ impl isyncyou_webui::DurableRequestStore for DaemonDurableRequests {
 
     fn abort(&self, identity: &isyncyou_webui::ProductRequestIdentity) -> Result<(), String> {
         self.store.abort_product_request_identity(identity)
-    }
-
-    fn reject(&self, identity: &isyncyou_webui::ProductRequestIdentity) -> Result<(), String> {
-        self.store.reject_product_request_identity(identity)
     }
 }
 
@@ -12604,7 +13140,11 @@ impl isyncyou_webui::MutationIntentHandler for DaemonMutationIntents {
                 operation,
                 target,
                 recipients,
+                cc,
+                bcc,
                 subject,
+                importance,
+                read_receipt,
                 all,
             } => {
                 let bytes = source.read_range(
@@ -12615,10 +13155,16 @@ impl isyncyou_webui::MutationIntentHandler for DaemonMutationIntents {
                 let body = std::str::from_utf8(&bytes)
                     .map_err(|_| "mutation_intent_invalid".to_string())?;
                 match operation.as_str() {
-                    "send" => {
-                        self.mail
-                            .send(&account, &subject, body, &recipients, &[], &[], None, false)
-                    }
+                    "send" => self.mail.send(
+                        &account,
+                        &subject,
+                        body,
+                        &recipients,
+                        &cc,
+                        &bcc,
+                        importance.as_deref(),
+                        read_receipt,
+                    ),
                     "reply" => self.mail.reply_html(&account, &target, body, all),
                     "forward" => self.mail.forward_html(&account, &target, body, &recipients),
                     "draft" => self
@@ -12671,8 +13217,13 @@ impl isyncyou_webui::MutationIntentHandler for DaemonMutationIntents {
             }
         }
         .map_err(|_| "mutation_intent_outcome_unknown".to_string())?;
-        self.store
-            .complete_mutation_commit(owner, request_id, intent_id, &result)?;
+        self.store.complete_mutation_commit(
+            owner,
+            request_id,
+            intent_id,
+            &result,
+            unix_now_ms(),
+        )?;
         Ok(result)
     }
 
@@ -13583,6 +14134,26 @@ mod tests {
 
         let raw = isyncyou_agent::AgentError::Provider("private session detail".into());
         assert_eq!(agent_safe_turn_error(&raw), "provider_request_failed");
+    }
+
+    #[test]
+    fn provider_error_after_durable_step_start_is_outcome_unknown() {
+        let explicit = isyncyou_agent::AgentError::Provider("http_bad_request".into());
+        assert_eq!(
+            product_turn_terminal_error(&explicit, true),
+            "turn_outcome_unknown"
+        );
+        assert_eq!(
+            product_turn_terminal_error(&explicit, false),
+            "provider_request_failed"
+        );
+
+        let transport =
+            isyncyou_agent::AgentError::Transport("provider_response_read_failed".into());
+        assert_eq!(
+            product_turn_terminal_error(&transport, true),
+            "turn_outcome_unknown"
+        );
     }
 
     #[test]
@@ -15551,6 +16122,22 @@ mod tests {
             },
         );
 
+        let request = isyncyou_webui::AgentTurnRequest {
+            request_id: "019f0000-0000-4000-8000-000000000314".into(),
+            session_id: "01JSESSION00000000000000014".into(),
+            account: "controlled".into(),
+            prompt: "Cancel the durable turn".into(),
+        };
+        agent
+            .control_store
+            .as_ref()
+            .expect("control store")
+            .begin_agent_turn_admission(
+                &request,
+                turn,
+                "1414141414141414141414141414141414141414141414141414141414141414",
+            )
+            .expect("durable turn admission");
         isyncyou_webui::AgentHandler::cancel(&agent, turn);
         assert!(agent.hub.is_cancelled(turn));
         let rx = isyncyou_webui::AgentHandler::open_stream(&agent, turn).expect("turn stream");
@@ -19151,6 +19738,30 @@ mod tests {
         feature = "agent-subscription-experimental"
     ))]
     #[test]
+    fn product_model_catalog_supplies_conservative_context_budget() {
+        let claude = product_model_context_budget(ProductProviderId::Claude, DEFAULT_MODEL)
+            .expect("catalogued Claude model");
+        let codex = product_model_context_budget(ProductProviderId::Codex, CODEX_MODELS[0].id)
+            .expect("catalogued Codex model");
+
+        assert_eq!(
+            claude.max_tokens,
+            isyncyou_agent::UNKNOWN_MODEL_INPUT_TOKENS
+        );
+        assert_eq!(codex.max_tokens, isyncyou_agent::UNKNOWN_MODEL_INPUT_TOKENS);
+        assert_eq!(claude.max_messages, isyncyou_agent::MAX_CONTEXT_MESSAGES);
+        assert_eq!(codex.max_bytes, isyncyou_agent::MAX_CONTEXT_BYTES);
+        assert_eq!(
+            product_model_context_budget(ProductProviderId::Claude, "unreviewed-model"),
+            Err("unknown_model".to_string())
+        );
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
     fn product_settings_v1_defaults_codex_reasoning_effort_to_medium() {
         let _env = AppHostCredentialEnvGuard::new();
         let root = apphost_credential_test_root("settings-v1-codex-effort");
@@ -22086,6 +22697,31 @@ mod tests {
         feature = "agent-subscription-experimental"
     ))]
     #[test]
+    fn product_session_maintenance_runs_at_startup_and_six_hour_intervals() {
+        let last = AtomicU64::new(0);
+        assert!(product_session_maintenance_due(&last, 1_000, true));
+        assert!(!product_session_maintenance_due(
+            &last,
+            1_000 + PRODUCT_SESSION_MAINTENANCE_INTERVAL_MS - 1,
+            false,
+        ));
+        assert!(product_session_maintenance_due(
+            &last,
+            1_000 + PRODUCT_SESSION_MAINTENANCE_INTERVAL_MS,
+            false,
+        ));
+        assert!(!product_session_maintenance_due(
+            &last,
+            1_000 + PRODUCT_SESSION_MAINTENANCE_INTERVAL_MS,
+            false,
+        ));
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
     fn account_lifecycle_maintenance_runs_at_startup_interval_and_joined_shutdown() {
         let _env = AppHostCredentialEnvGuard::new();
         let root = apphost_credential_test_root("maintenance-runtime");
@@ -24002,7 +24638,115 @@ mod tests {
     ))]
     #[test]
     fn session_busy_releases_provider_lease_without_request_or_provider_call() {
-        provider_operation_lease_releases_on_error_cancel_completion_panic_and_spawn_failure();
+        struct CountingProvider(Arc<std::sync::atomic::AtomicUsize>);
+        impl isyncyou_agent::LlmProvider for CountingProvider {
+            fn name(&self) -> &str {
+                "counting"
+            }
+
+            fn next(
+                &mut self,
+                _history: &[isyncyou_agent::Message],
+                _emit: &mut dyn FnMut(isyncyou_agent::StreamEvent),
+            ) -> Result<Vec<isyncyou_agent::AssistantBlock>, isyncyou_agent::AgentError>
+            {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![])
+            }
+        }
+
+        let root = apphost_credential_test_root("session-busy-provider-release");
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = Arc::new(account_lifecycle::ProviderLeaseRegistry::default());
+        let lease = registry
+            .acquire_shared(
+                &root,
+                ProductProviderId::Claude,
+                account_lifecycle::mint_operation_id().unwrap(),
+                account_lifecycle::ProviderOperationKind::Turn,
+            )
+            .unwrap();
+        let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let prepared = PreparedTurnProvider {
+            provider: Box::new(CountingProvider(Arc::clone(&provider_calls))),
+            provider_id: Some(ProductProviderId::Claude),
+            operation_lease: Some(lease),
+            session_binding: None,
+        };
+
+        let result = dispatch_prepared_product_turn(
+            prepared,
+            Err("session_busy".into()),
+            |_prepared, _runtime| Ok::<(), String>(()),
+            |_replay| Ok::<(), String>(()),
+        );
+
+        assert_eq!(result, Err("session_busy".into()));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.counts(ProductProviderId::Claude).shared, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn same_request_id_same_terminal_result_does_not_call_provider_twice() {
+        struct CountingProvider(Arc<std::sync::atomic::AtomicUsize>);
+        impl isyncyou_agent::LlmProvider for CountingProvider {
+            fn name(&self) -> &str {
+                "counting"
+            }
+
+            fn next(
+                &mut self,
+                _history: &[isyncyou_agent::Message],
+                _emit: &mut dyn FnMut(isyncyou_agent::StreamEvent),
+            ) -> Result<Vec<isyncyou_agent::AssistantBlock>, isyncyou_agent::AgentError>
+            {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![])
+            }
+        }
+
+        let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let replay_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let prepared = PreparedTurnProvider {
+            provider: Box::new(CountingProvider(Arc::clone(&provider_calls))),
+            provider_id: Some(ProductProviderId::Claude),
+            operation_lease: None,
+            session_binding: None,
+        };
+        let replay_count = Arc::clone(&replay_calls);
+
+        dispatch_prepared_product_turn(
+            prepared,
+            Ok(product_session::ProductTurnStart::Replay(
+                product_session::ProductTurnReplay {
+                    phase: isyncyou_agent::RequestPhase::Committed,
+                    final_text: Some("durable answer".into()),
+                    error_code: None,
+                },
+            )),
+            |mut prepared, _runtime| {
+                prepared
+                    .provider
+                    .next(&[], &mut |_| {})
+                    .map_err(|_| "provider_failed".to_string())?;
+                Ok(())
+            },
+            move |replay| {
+                assert_eq!(replay.phase, isyncyou_agent::RequestPhase::Committed);
+                assert_eq!(replay.final_text.as_deref(), Some("durable answer"));
+                replay_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(replay_calls.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(any(
@@ -24011,7 +24755,56 @@ mod tests {
     ))]
     #[test]
     fn recovery_reacquires_provider_then_session_and_revalidates_binding() {
-        turn_revalidates_generation_and_journal_then_builds_without_refresh_under_shared_lease();
+        let host = include_str!("lib.rs");
+        let admission = host
+            .split("fn start_turn_request(")
+            .nth(1)
+            .unwrap()
+            .split("fn pending_binding(")
+            .next()
+            .unwrap();
+        assert!(
+            admission.find("resolve_turn_provider").unwrap()
+                < admission.find("registry.begin_turn").unwrap()
+        );
+
+        let product = include_str!("product_session.rs");
+        let begin_turn = product
+            .split("pub fn begin_turn(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn pairing_payload(")
+            .next()
+            .unwrap();
+        let recovery_branch = begin_turn
+            .split("let journal = replay")
+            .nth(1)
+            .unwrap()
+            .split("if journal.phase == RequestPhase::ProviderStepStarted")
+            .next()
+            .unwrap();
+        let revalidate = recovery_branch
+            .find("validate_provider_recovery_binding")
+            .unwrap();
+        let session_lease = recovery_branch.find("acquire_lease_from_manifest").unwrap();
+        assert!(revalidate < session_lease);
+
+        let recorded = isyncyou_agent::ProviderAttemptBindingV1 {
+            provider: ProductProviderId::Claude,
+            model: "model-a".into(),
+            reasoning_effort: None,
+            credential_generation: "generation-a".into(),
+            oauth_policy_fingerprint: "policy-a".into(),
+            harness_contract_version: 1,
+            origin_installation_digest: "installation-a".into(),
+        };
+        let mut changed = recorded.clone();
+        changed.credential_generation = "generation-b".into();
+        assert!(recorded.revalidate(&recorded).is_ok());
+        assert_eq!(
+            recorded.revalidate(&changed),
+            Err(isyncyou_agent::SessionV2Error::ProviderGenerationChanged)
+        );
     }
 }
 #[cfg(test)]
@@ -24039,6 +24832,49 @@ fn agent_request_status_prefers_bounded_hot_terminal_state() {
             "resume_allowed": false,
         })
     );
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[test]
+fn durable_turn_cancellation_overrides_stale_hot_request_status() {
+    let root =
+        std::env::temp_dir().join(format!("isyncyou-durable-cancel-status-{}", unix_now_ms()));
+    let _ = std::fs::remove_dir_all(&root);
+    let agent = DaemonAgent::new(Config::default(), root.clone());
+    let request = isyncyou_webui::AgentTurnRequest {
+        request_id: "019f0000-0000-4000-8000-000000000313".into(),
+        session_id: "01JSESSION00000000000000013".into(),
+        account: "controlled".into(),
+        prompt: "Cancelled before product session admission".into(),
+    };
+    let turn_id = "01JTURN0000000000000000013";
+    let digest = "1313131313131313131313131313131313131313131313131313131313131313";
+    let store = agent.control_store.as_ref().unwrap();
+    store
+        .begin_agent_turn_admission(&request, turn_id, digest)
+        .unwrap();
+    store.cancel_agent_turn_admission(turn_id).unwrap();
+    agent.hot_request_statuses.insert(
+        &request.session_id,
+        &request.request_id,
+        isyncyou_agent::RequestPhase::Committed,
+    );
+
+    assert_eq!(
+        isyncyou_webui::AgentHandler::request_status(
+            &agent,
+            &request.session_id,
+            "agent_turn",
+            &request.request_id,
+        )
+        .unwrap(),
+        request_status_json(isyncyou_agent::RequestPhase::Cancelled)
+    );
+    drop(agent);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[cfg(test)]
@@ -24455,7 +25291,7 @@ fn turn_cancel_with_existing_pending_requires_explicit_pending_cancel() {
         Ok(PendingTransition::Committed(()))
     ));
     assert_eq!(
-        cancel_turn_with_pending_guard(&turns, &pending, &hub, "turn", 2_000),
+        cancel_turn_with_pending_guard(&turns, &pending, &hub, "turn", 2_000, || Ok(())),
         Err("pending_requires_explicit_cancel".into())
     );
     pending
@@ -24463,7 +25299,7 @@ fn turn_cancel_with_existing_pending_requires_explicit_pending_cancel() {
         .unwrap();
     turns.remove_pending(&registered.id);
     assert_eq!(
-        cancel_turn_with_pending_guard(&turns, &pending, &hub, "turn", 2_001),
+        cancel_turn_with_pending_guard(&turns, &pending, &hub, "turn", 2_001, || Ok(())),
         Err("turn_not_found".into())
     );
 }
@@ -24530,7 +25366,7 @@ fn turn_cancel_after_provider_return_blocks_pending_registration() {
     let hub = isyncyou_agent::AgentStreamHub::new();
     let _receiver = hub.open("turn-race", 4);
     assert_eq!(
-        cancel_turn_with_pending_guard(&turns, &pending, &hub, "turn-race", 1_000),
+        cancel_turn_with_pending_guard(&turns, &pending, &hub, "turn-race", 1_000, || Ok(())),
         Ok(())
     );
     let mut called = false;
@@ -24542,6 +25378,72 @@ fn turn_cancel_after_provider_return_blocks_pending_registration() {
         Ok(PendingTransition::Cancelled)
     ));
     assert!(!called);
+}
+
+#[cfg(test)]
+#[test]
+fn turn_cancel_persistence_failure_keeps_turn_running_and_provider_active() {
+    let turns = TurnRegistry::default();
+    let state = turns.register("turn-persist-failure").unwrap();
+    let pending = isyncyou_agent::PendingRegistry::new();
+    let hub = isyncyou_agent::AgentStreamHub::new();
+    let _receiver = hub.open("turn-persist-failure", 4);
+    let cancellation = hub.cancellation_token("turn-persist-failure").unwrap();
+
+    assert_eq!(
+        cancel_turn_with_pending_guard(
+            &turns,
+            &pending,
+            &hub,
+            "turn-persist-failure",
+            1_000,
+            || Err("turn_admission_unavailable".into()),
+        ),
+        Err("turn_admission_unavailable".into())
+    );
+    assert!(!cancellation.is_cancelled());
+    let state = state.lock().unwrap();
+    assert!(matches!(&*state, TurnAuthorityState::Running));
+}
+
+#[cfg(test)]
+#[test]
+fn turn_cancel_after_final_provider_result_before_persistence_wins_terminal_claim() {
+    let turns = TurnRegistry::default();
+    let state = turns.register("turn-final-race").unwrap();
+    let pending = isyncyou_agent::PendingRegistry::new();
+    let hub = isyncyou_agent::AgentStreamHub::new();
+    let _receiver = hub.open("turn-final-race", 4);
+    let cancellation = hub.cancellation_token("turn-final-race").unwrap();
+
+    assert_eq!(
+        cancel_turn_with_pending_guard(&turns, &pending, &hub, "turn-final-race", 1_000, || Ok(()),),
+        Ok(())
+    );
+    assert!(matches!(
+        TurnRegistry::begin_terminal(&state, &cancellation),
+        Ok(TerminalTransition::Cancelled)
+    ));
+
+    let state = turns.register("turn-terminal-first").unwrap();
+    let _receiver = hub.open("turn-terminal-first", 4);
+    let cancellation = hub.cancellation_token("turn-terminal-first").unwrap();
+    assert!(matches!(
+        TurnRegistry::begin_terminal(&state, &cancellation),
+        Ok(TerminalTransition::Proceed)
+    ));
+    assert_eq!(
+        cancel_turn_with_pending_guard(
+            &turns,
+            &pending,
+            &hub,
+            "turn-terminal-first",
+            1_001,
+            || Ok(()),
+        ),
+        Err("turn_not_found".into())
+    );
+    assert!(!cancellation.is_cancelled());
 }
 
 #[cfg(test)]

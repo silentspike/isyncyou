@@ -52,7 +52,7 @@ if ((count == 0)); then
 fi
 
 echo "cargo filter matched $count test(s): package=$package filter=$filter" >&2
-run_output=$(mktemp /tmp/isyncyou-nonempty-cargo-run.XXXXXX)
+run_output=$(mktemp "${TMPDIR:-/tmp}/isyncyou-nonempty-cargo-run.XXXXXX")
 cleanup() { rm -f -- "$run_output"; }
 trap cleanup EXIT INT TERM
 
