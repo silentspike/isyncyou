@@ -45,6 +45,7 @@ type MutationCommitRow = (
 );
 type UserPresenceRow = (String, String, i64, Option<Vec<u8>>, Option<Vec<u8>>);
 type PendingRow = (String, u64, String, Option<Vec<u8>>);
+type ProductRequestReceiptRow = (String, String, String, String, Option<Vec<u8>>);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2338,7 +2339,7 @@ impl AgentControlStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| "request_store_unavailable")?;
-        let existing: Option<(String, String, String, String, Option<Vec<u8>>)> = transaction
+        let existing: Option<ProductRequestReceiptRow> = transaction
             .query_row(
                 "SELECT route_domain,request_scope,payload_digest,state,sealed_response
                  FROM product_request_receipts
@@ -2505,6 +2506,73 @@ impl AgentControlStore {
             )
             .map(|_| ())
             .map_err(|_| "request_store_unavailable".into())
+    }
+
+    pub(crate) fn reject_product_request_identity(
+        &self,
+        identity: &isyncyou_webui::ProductRequestIdentity,
+    ) -> Result<(), String> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| "request_store_unavailable")?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| "request_store_unavailable")?;
+        let completed_receipt: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM product_request_receipts
+                   WHERE request_id=?1 AND state='completed'
+                 )",
+                params![identity.request_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| "request_store_unavailable")?;
+        let turn_admission: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM agent_turn_admissions WHERE request_id=?1
+                 )",
+                params![identity.request_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| "request_store_unavailable")?;
+        if completed_receipt || turn_admission {
+            return Err("request_store_unavailable".into());
+        }
+        transaction
+            .execute(
+                "DELETE FROM product_request_receipts
+                 WHERE request_id=?1 AND route_domain=?2 AND request_scope=?3
+                   AND payload_digest=?4 AND state='started'",
+                params![
+                    identity.request_id,
+                    identity.route_domain,
+                    identity.request_scope,
+                    identity.payload_digest
+                ],
+            )
+            .map_err(|_| "request_store_unavailable")?;
+        let changed = transaction
+            .execute(
+                "DELETE FROM product_request_bindings
+                 WHERE request_id=?1 AND route_domain=?2 AND request_scope=?3
+                   AND payload_digest=?4",
+                params![
+                    identity.request_id,
+                    identity.route_domain,
+                    identity.request_scope,
+                    identity.payload_digest
+                ],
+            )
+            .map_err(|_| "request_store_unavailable")?;
+        if changed != 1 {
+            return Err("request_store_unavailable".into());
+        }
+        transaction
+            .commit()
+            .map_err(|_| "request_store_unavailable".to_string())
     }
 
     pub(crate) fn begin_agent_turn_admission_identity(
@@ -3890,13 +3958,39 @@ mod tests {
                 .unwrap_err(),
             "request_response_policy_violation"
         );
+        let share_identity = isyncyou_webui::ProductRequestIdentity {
+            request_id: "019f0000-0000-4000-8000-000000000307".into(),
+            route_domain: "post:/api/v1/share",
+            request_scope: "account:a".into(),
+            payload_digest: "abababababababababababababababababababababababababababababababab"
+                .into(),
+        };
+        let share_response = StoredProductResponseV1 {
+            status: 200,
+            content_type: "application/json".into(),
+            body: br#"{"webUrl":"must-not-be-stored","invited":["must-not-be-stored"]}"#.to_vec(),
+            headers: Vec::new(),
+        };
+        assert_eq!(
+            control
+                .begin_product_request_identity(&share_identity)
+                .unwrap_err(),
+            "request_response_policy_violation"
+        );
+        assert_eq!(
+            control
+                .complete_product_request_identity(&share_identity, &share_response)
+                .unwrap_err(),
+            "request_response_policy_violation"
+        );
         let receipt_count: i64 = control
             .connection
             .lock()
             .unwrap()
             .query_row(
-                "SELECT COUNT(*) FROM product_request_receipts WHERE request_id=?1",
-                params![identity.request_id],
+                "SELECT COUNT(*) FROM product_request_receipts
+                 WHERE request_id IN (?1, ?2)",
+                params![identity.request_id, share_identity.request_id],
                 |row| row.get(0),
             )
             .unwrap();
@@ -4129,6 +4223,79 @@ mod tests {
                 .unwrap(),
             ProductRequestBegin::Execute
         ));
+    }
+
+    #[test]
+    fn product_request_reject_atomically_removes_unused_binding_and_started_receipt() {
+        let root = temp_root("product-request-reject");
+        let credential_store = credential_store(&root);
+        let control =
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let identity = isyncyou_webui::ProductRequestIdentity {
+            request_id: "019f0000-0000-4000-8000-000000000305".into(),
+            route_domain: "post:/api/v1/onedrive/create",
+            request_scope: "account:a".into(),
+            payload_digest: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                .into(),
+        };
+        assert!(matches!(
+            control.begin_product_request_identity(&identity).unwrap(),
+            ProductRequestBegin::Execute
+        ));
+
+        control.reject_product_request_identity(&identity).unwrap();
+
+        let connection = control.connection.lock().unwrap();
+        let binding_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM product_request_bindings WHERE request_id=?1",
+                params![identity.request_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let receipt_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM product_request_receipts WHERE request_id=?1",
+                params![identity.request_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((binding_count, receipt_count), (0, 0));
+        drop(connection);
+
+        let corrected = isyncyou_webui::ProductRequestIdentity {
+            payload_digest: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                .into(),
+            ..identity
+        };
+        assert!(matches!(
+            control.begin_product_request_identity(&corrected).unwrap(),
+            ProductRequestBegin::Execute
+        ));
+        let response = StoredProductResponseV1 {
+            status: 200,
+            content_type: "application/json".into(),
+            body: br#"{"status":"ok"}"#.to_vec(),
+            headers: Vec::new(),
+        };
+        control
+            .complete_product_request_identity(&corrected, &response)
+            .unwrap();
+        assert_eq!(
+            control
+                .reject_product_request_identity(&corrected)
+                .unwrap_err(),
+            "request_store_unavailable"
+        );
+        let ProductRequestBegin::Replay(replayed) =
+            control.begin_product_request_identity(&corrected).unwrap()
+        else {
+            panic!("completed receipt must remain replayable after rejected deletion");
+        };
+        assert_eq!(replayed.status, response.status);
+        assert_eq!(replayed.content_type, response.content_type);
+        assert_eq!(replayed.body, response.body);
+        assert_eq!(replayed.headers, response.headers);
     }
 
     #[test]
@@ -4437,7 +4604,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema, "4");
+        assert_eq!(schema, SCHEMA_VERSION.to_string());
     }
 
     #[test]

@@ -424,9 +424,7 @@ impl ProductPostRoute {
         use ProductPostRoute::*;
         match self {
             AgentTurn => ProductReplayPolicy::AtomicTurnAdmission,
-            AccountLoginStart | AgentUserPresenceStart | AgentOauthStart => {
-                ProductReplayPolicy::EphemeralResponse
-            }
+            AccountLoginStart | AgentUserPresenceStart => ProductReplayPolicy::EphemeralResponse,
             AccountLoginPoll
             | AccountLoginCancel
             | MutationIntentCreate
@@ -441,11 +439,12 @@ impl ProductPostRoute {
             | AgentPairingClaim
             | AgentPairingFinalize
             | AgentPairingRevoke
-            | AgentConnectivityPreflight => ProductReplayPolicy::RouteOwned,
+            | AgentConnectivityPreflight
+            | AgentOauthStart
+            | Share => ProductReplayPolicy::RouteOwned,
             Restore
             | Backup
             | MobileJobCancel
-            | Share
             | SyncPause
             | SyncResume
             | SyncNow
@@ -692,6 +691,12 @@ fn parse_strict_scalar_mutation(
     operation: &str,
     allowed_fields: &[&str],
 ) -> Result<ApiRequest, ApiResponse> {
+    let catalogue_fields = product_post_route(&req.path)
+        .and_then(|spec| scalar_product_fields(spec.route))
+        .ok_or_else(|| no_store_json_error(500, "product route policy mismatch"))?;
+    if catalogue_fields != allowed_fields {
+        return Err(no_store_json_error(500, "product route policy mismatch"));
+    }
     let value: Value = parse_agent_strict_json_with_limit(req, operation, 64 * 1024)?;
     let object = value
         .as_object()
@@ -776,14 +781,14 @@ fn mutation_error_response(error: &str) -> ApiResponse {
     ApiResponse::error(status, code)
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct PushRegisterRequest {
     request_id: String,
     token: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct MailSendRequest {
     request_id: String,
@@ -802,7 +807,7 @@ struct MailSendRequest {
     read_receipt: bool,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct MailReplyRequest {
     request_id: String,
@@ -816,7 +821,7 @@ struct MailReplyRequest {
     all: bool,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct MailForwardRequest {
     request_id: String,
@@ -829,7 +834,7 @@ struct MailForwardRequest {
     to: Vec<String>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct MailDraftRequest {
     request_id: String,
@@ -843,7 +848,7 @@ struct MailDraftRequest {
     to: Vec<String>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct OneNoteCreateRequest {
     request_id: String,
@@ -855,7 +860,7 @@ struct OneNoteCreateRequest {
     body: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct OneNoteAppendRequest {
     request_id: String,
@@ -864,7 +869,7 @@ struct OneNoteAppendRequest {
     text: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct MutationIntentCreateRequest {
     request_id: String,
@@ -874,7 +879,7 @@ struct MutationIntentCreateRequest {
     sha256: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct MutationIntentChunkRequest {
     request_id: String,
@@ -885,7 +890,7 @@ struct MutationIntentChunkRequest {
     chunk_sha256: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct MutationIntentCommitRequest {
     request_id: String,
@@ -894,7 +899,7 @@ struct MutationIntentCommitRequest {
     sha256: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct MutationIntentCancelRequest {
     request_id: String,
@@ -1016,6 +1021,10 @@ pub trait DurableRequestStore: Send + Sync {
         response: &ApiResponse,
     ) -> Result<(), String>;
     fn abort(&self, identity: &ProductRequestIdentity) -> Result<(), String>;
+    /// Remove a request that route validation rejected before any durable effect.
+    /// Implementations must delete the matching started receipt and UUID binding
+    /// atomically, and must not remove a completed response or turn admission.
+    fn reject(&self, identity: &ProductRequestIdentity) -> Result<(), String>;
 }
 
 fn normalize_semantic_json(value: &mut Value) {
@@ -1072,6 +1081,269 @@ fn replace_secret_with_digest(object: &mut serde_json::Map<String, Value>, field
         ),
     );
     object.remove(field);
+}
+
+fn scalar_product_fields(route: ProductPostRoute) -> Option<&'static [&'static str]> {
+    use ProductPostRoute::*;
+    match route {
+        Restore => Some(&["account", "service", "id"]),
+        Backup => Some(&["account", "services"]),
+        MobileJobCancel => Some(&["account", "job_id"]),
+        Share => Some(&["account", "service", "id", "type", "scope", "email", "role"]),
+        SyncPause | SyncResume | SyncNow | PushTest => Some(&[]),
+        Verify => Some(&["account"]),
+        Settings => Some(&["poll_interval_secs"]),
+        MailMove => Some(&["account", "id", "destination"]),
+        MailRead => Some(&["account", "id", "is_read"]),
+        MailFlag => Some(&["account", "id", "status", "due", "tz"]),
+        MailCategories => Some(&["account", "id", "categories"]),
+        CalendarCreate => Some(&[
+            "account", "subject", "start", "end", "tz", "location", "body", "all_day",
+        ]),
+        CalendarUpdate => Some(&[
+            "account", "id", "subject", "start", "end", "tz", "location", "body", "all_day",
+        ]),
+        CalendarDelete => Some(&["account", "id"]),
+        CalendarRespond => Some(&["account", "id", "response", "comment"]),
+        ContactCreate => Some(&[
+            "account",
+            "given",
+            "surname",
+            "display_name",
+            "nickname",
+            "title",
+            "company",
+            "job",
+            "department",
+            "mobile",
+            "notes",
+            "birthday",
+            "email",
+            "business_phone",
+            "home_phone",
+            "business_street",
+            "business_city",
+            "business_state",
+            "business_zip",
+            "business_country",
+            "home_street",
+            "home_city",
+            "home_state",
+            "home_zip",
+            "home_country",
+            "other_street",
+            "other_city",
+            "other_state",
+            "other_zip",
+            "other_country",
+        ]),
+        ContactUpdate => Some(&[
+            "account",
+            "id",
+            "given",
+            "surname",
+            "display_name",
+            "nickname",
+            "title",
+            "company",
+            "job",
+            "department",
+            "mobile",
+            "notes",
+            "birthday",
+            "email",
+            "business_phone",
+            "home_phone",
+            "business_street",
+            "business_city",
+            "business_state",
+            "business_zip",
+            "business_country",
+            "home_street",
+            "home_city",
+            "home_state",
+            "home_zip",
+            "home_country",
+            "other_street",
+            "other_city",
+            "other_state",
+            "other_zip",
+            "other_country",
+        ]),
+        ContactDelete => Some(&["account", "id"]),
+        TodoCreate => Some(&[
+            "account",
+            "list",
+            "title",
+            "body",
+            "importance",
+            "status",
+            "due",
+            "start",
+            "reminder",
+            "tz",
+            "categories",
+        ]),
+        TodoUpdate => Some(&[
+            "account",
+            "list",
+            "id",
+            "title",
+            "body",
+            "importance",
+            "status",
+            "due",
+            "start",
+            "reminder",
+            "tz",
+            "categories",
+        ]),
+        TodoComplete | TodoDelete => Some(&["account", "list", "id"]),
+        TodoChecklistAdd => Some(&["account", "list", "task", "title"]),
+        TodoChecklistToggle => Some(&["account", "list", "task", "item", "checked"]),
+        TodoChecklistDelete => Some(&["account", "list", "task", "item"]),
+        TodoListCreate => Some(&["account", "name"]),
+        TodoListDelete | OnenoteDelete => Some(&["account", "id"]),
+        TransferCancel | TransferPause | TransferRetry => Some(&["id"]),
+        OnedriveCreate => Some(&["account", "parent", "name"]),
+        OnedriveRename => Some(&["account", "id", "name"]),
+        OnedriveMove => Some(&["account", "id", "parent", "name"]),
+        OnedriveDelete | OnedriveFreeUp | OnedriveDownloadNow => Some(&["account", "id"]),
+        OnedriveMode => Some(&["account", "folder", "mode"]),
+        OnedriveConflictResolve => Some(&["account", "id", "resolution"]),
+        OnedriveCleanup => Some(&["account"]),
+        AccountLoginStart | AccountSignout => Some(&["account", "role"]),
+        AccountLoginPoll | AccountLoginCancel => Some(&["id"]),
+        MailSend
+        | MailReply
+        | MailForward
+        | MailDraft
+        | OnenoteCreate
+        | OnenoteAppend
+        | MutationIntentCreate
+        | MutationIntentChunk
+        | MutationIntentCommit
+        | MutationIntentCancel
+        | PushRegister
+        | AgentTurn
+        | AgentSessionCreate
+        | AgentSessionSelect
+        | AgentSessionArchive
+        | AgentUserPresenceStart
+        | AgentUserPresenceConfirm
+        | AgentPairingCreate
+        | AgentPairingReveal
+        | AgentPairingClaim
+        | AgentPairingFinalize
+        | AgentPairingRevoke
+        | AgentConfirm
+        | AgentTurnCancel
+        | AgentPendingCancel
+        | AgentConnectivityPreflight
+        | AgentCredentialRefresh
+        | AgentOauthStart
+        | AgentOauthLogout
+        | AgentOauthLifecycleResume
+        | AgentOauthCancel
+        | AgentOauthComplete
+        | AgentModel => None,
+    }
+}
+
+fn validate_scalar_product_request(value: &Value, fields: &[&str]) -> Result<(), ApiResponse> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| no_store_json_error(400, "invalid product request"))?;
+    for (field, value) in object {
+        if field != "request_id" && !fields.contains(&field.as_str()) {
+            return Err(no_store_json_error(400, "invalid product request"));
+        }
+        if field == "request_id" {
+            continue;
+        }
+        match value {
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+            Value::String(value) if value.len() <= 32 * 1024 => {}
+            _ => return Err(no_store_json_error(400, "invalid product request")),
+        }
+    }
+    Ok(())
+}
+
+fn canonicalize_product_payload(
+    route: ProductPostRoute,
+    payload: &mut Value,
+) -> Result<(), ApiResponse> {
+    if let Some(fields) = scalar_product_fields(route) {
+        let object = payload
+            .as_object()
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))?;
+        let mut canonical = serde_json::Map::new();
+        if let Some(request_id) = object.get("request_id") {
+            canonical.insert("request_id".into(), request_id.clone());
+        }
+        for field in fields {
+            let Some(value) = object.get(*field) else {
+                continue;
+            };
+            let value = match value {
+                Value::Null => continue,
+                Value::String(value) => Value::String(value.clone()),
+                Value::Bool(value) => Value::String(if *value { "1" } else { "0" }.into()),
+                Value::Number(value) => Value::String(value.to_string()),
+                _ => return Err(no_store_json_error(400, "invalid product request")),
+            };
+            canonical.insert((*field).into(), value);
+        }
+        *payload = Value::Object(canonical);
+        return Ok(());
+    }
+
+    macro_rules! canonical_typed {
+        ($ty:ty) => {{
+            let request = serde_json::from_value::<$ty>(payload.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            *payload = serde_json::to_value(request)
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            Ok(())
+        }};
+    }
+
+    use ProductPostRoute::*;
+    match route {
+        PushRegister => canonical_typed!(PushRegisterRequest),
+        MailSend => canonical_typed!(MailSendRequest),
+        MailReply => canonical_typed!(MailReplyRequest),
+        MailForward => canonical_typed!(MailForwardRequest),
+        MailDraft => canonical_typed!(MailDraftRequest),
+        OnenoteCreate => canonical_typed!(OneNoteCreateRequest),
+        OnenoteAppend => canonical_typed!(OneNoteAppendRequest),
+        MutationIntentCreate => canonical_typed!(MutationIntentCreateRequest),
+        MutationIntentChunk => canonical_typed!(MutationIntentChunkRequest),
+        MutationIntentCommit => canonical_typed!(MutationIntentCommitRequest),
+        MutationIntentCancel => canonical_typed!(MutationIntentCancelRequest),
+        AgentTurn => canonical_typed!(AgentTurnRequest),
+        AgentSessionCreate => canonical_typed!(AgentSessionCreateRequest),
+        AgentSessionSelect => canonical_typed!(AgentSessionSelectRequest),
+        AgentSessionArchive | AgentPairingReveal | AgentPairingClaim | AgentPairingFinalize
+        | AgentPairingRevoke => canonical_typed!(AgentSessionPairingOperationRequest),
+        AgentPairingCreate => canonical_typed!(AgentSessionPairingCreateRequest),
+        AgentUserPresenceStart => canonical_typed!(AgentUserPresenceStartRequest),
+        AgentUserPresenceConfirm => canonical_typed!(AgentUserPresenceConfirmRequest),
+        AgentConfirm => canonical_typed!(AgentConfirmRequest),
+        AgentTurnCancel => canonical_typed!(AgentTurnCancelRequest),
+        AgentPendingCancel => canonical_typed!(AgentPendingCancelRequest),
+        AgentConnectivityPreflight => canonical_typed!(AgentConnectivityPreflightRequest),
+        AgentCredentialRefresh => canonical_typed!(AgentCredentialRefreshRequest),
+        AgentOauthStart => canonical_typed!(AgentOAuthStartRequest),
+        AgentOauthLogout => canonical_typed!(AgentOAuthLogoutRequest),
+        AgentOauthLifecycleResume => canonical_typed!(AgentOAuthLifecycleResumeRequest),
+        AgentOauthCancel => canonical_typed!(AgentOAuthCancelRequest),
+        AgentOauthComplete => canonical_typed!(AgentOAuthCompleteRequest),
+        AgentModel => canonical_typed!(AgentModelRequest),
+        scalar_route if scalar_product_fields(scalar_route).is_some() => unreachable!(),
+        _ => Err(no_store_json_error(400, "invalid product request")),
+    }
 }
 
 fn validate_typed_product_request(
@@ -1196,7 +1468,7 @@ fn validate_typed_product_request(
             (matches!(request.provider.as_str(), "claude" | "codex")
                 && matches!(
                     request.purpose.as_str(),
-                    "oauth_start" | "turn_start" | "refresh"
+                    "oauth_start" | "turn_start" | "refresh" | "credential_revoke"
                 )
                 && request
                     .snapshot_id
@@ -1281,24 +1553,9 @@ fn validate_typed_product_request(
             .then_some(())
             .ok_or_else(|| no_store_json_error(400, "invalid product request"))
         }
-        _ => {
-            let object = value
-                .as_object()
-                .ok_or_else(|| no_store_json_error(400, "invalid product request"))?;
-            if object.values().any(|value| {
-                !matches!(
-                    value,
-                    Value::Null
-                        | Value::Bool(_)
-                        | Value::Number(_)
-                        | Value::String(_)
-                        | Value::Array(_)
-                )
-            }) {
-                return Err(no_store_json_error(400, "invalid product request"));
-            }
-            Ok(())
-        }
+        scalar_route => scalar_product_fields(scalar_route)
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+            .and_then(|fields| validate_scalar_product_request(value, fields)),
     }
 }
 
@@ -1309,6 +1566,7 @@ fn canonical_product_identity(
     let mut payload: Value =
         parse_agent_strict_json_with_limit(req, "product request", spec.body_limit)?;
     validate_typed_product_request(spec.route, &payload)?;
+    canonicalize_product_payload(spec.route, &mut payload)?;
     let object = payload
         .as_object_mut()
         .ok_or_else(|| no_store_json_error(400, "invalid product request"))?;
@@ -1513,7 +1771,7 @@ pub struct AgentPendingBinding {
 }
 
 /// The only provider/purpose pairs accepted by the connectivity preflight route.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConnectivityPreflightRequest {
     pub request_id: String,
@@ -1535,14 +1793,14 @@ pub struct AgentConnectivityPreflightResponse {
 
 /// Closed request for the explicitly user-triggered product credential refresh. It is separate
 /// from status polling so an ordinary Assistant render cannot create provider network traffic.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentCredentialRefreshRequest {
     pub request_id: String,
     pub provider: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSessionCreateRequest {
     pub request_id: String,
@@ -1550,7 +1808,7 @@ pub struct AgentSessionCreateRequest {
     pub display_name: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSessionSelectRequest {
     pub request_id: String,
@@ -1566,14 +1824,14 @@ pub struct AgentTurnRequest {
     pub prompt: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentTurnCancelRequest {
     pub request_id: String,
     pub turn_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentPendingCancelRequest {
     pub request_id: String,
@@ -1581,26 +1839,26 @@ pub struct AgentPendingCancelRequest {
     pub action_hash: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSessionArchiveBinding {
     pub session_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSessionPairingRevealBinding {
     pub session_id: String,
     pub pair_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSessionPairingImportBinding {
     pub pairing_code: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(untagged)]
 pub enum AgentUserPresenceBinding {
     SessionArchive(AgentSessionArchiveBinding),
@@ -1608,7 +1866,7 @@ pub enum AgentUserPresenceBinding {
     SessionPairingImport(AgentSessionPairingImportBinding),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentUserPresenceStartRequest {
     pub request_id: String,
@@ -1616,7 +1874,7 @@ pub struct AgentUserPresenceStartRequest {
     pub binding: AgentUserPresenceBinding,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentUserPresenceConfirmRequest {
     pub request_id: String,
@@ -1626,7 +1884,7 @@ pub struct AgentUserPresenceConfirmRequest {
     pub action_hash: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfirmRequest {
     pub request_id: String,
@@ -1635,7 +1893,7 @@ pub struct AgentConfirmRequest {
     pub action_hash: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentModelRequest {
     pub request_id: String,
@@ -1644,14 +1902,14 @@ pub struct AgentModelRequest {
     pub reasoning_effort: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSessionPairingCreateRequest {
     pub request_id: String,
     pub session_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSessionPairingOperationRequest {
     pub request_id: String,
@@ -1671,7 +1929,7 @@ pub struct AgentOAuthStartResponse {
     pub lifecycle_operation_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentOAuthStartRequest {
     pub provider: String,
@@ -1680,14 +1938,14 @@ pub struct AgentOAuthStartRequest {
     pub lifecycle_operation_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentLifecycleResumeRef {
     pub operation_id: String,
     pub operation_etag: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentOAuthLogoutRequest {
     pub provider: String,
@@ -1700,7 +1958,7 @@ pub struct AgentOAuthLogoutRequest {
     pub acknowledge_full_grant: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentOAuthLifecycleResumeRequest {
     pub provider: String,
@@ -1726,7 +1984,7 @@ pub struct AgentAccountLifecycleResponse {
 }
 
 /// Closed cancellation request for one provider OAuth attempt.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentOAuthCancelRequest {
     pub request_id: String,
@@ -1737,7 +1995,7 @@ pub struct AgentOAuthCancelRequest {
 /// #639 T9: closed manual-completion request for the Claude copy-paste OAuth flow. The pasted code
 /// crosses the boundary only transiently in this body (never a URL/query/log). `deny_unknown_fields`
 /// plus serde's derived struct deserializer reject unknown AND duplicate keys.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentOAuthCompleteRequest {
     pub request_id: String,
@@ -3495,16 +3753,27 @@ impl Router {
         match spec.route.replay_policy() {
             ProductReplayPolicy::AtomicTurnAdmission => return execute(Some(&identity)),
             ProductReplayPolicy::RouteOwned => match store.bind(&identity) {
-                Ok(DurableRequestBinding::Inserted | DurableRequestBinding::Existing) => {
-                    return execute(Some(&identity));
+                Ok(DurableRequestBinding::Inserted) => {
+                    let response = execute(Some(&identity));
+                    if response.status == 400 && store.reject(&identity).is_err() {
+                        return ApiResponse::error(503, "request_store_unavailable");
+                    }
+                    return response;
                 }
+                Ok(DurableRequestBinding::Existing) => return execute(Some(&identity)),
                 Ok(DurableRequestBinding::Conflict) => {
                     return ApiResponse::error(409, "request_id_conflict");
                 }
                 Err(_) => return ApiResponse::error(503, "request_store_unavailable"),
             },
             ProductReplayPolicy::EphemeralResponse => match store.bind(&identity) {
-                Ok(DurableRequestBinding::Inserted) => return execute(Some(&identity)),
+                Ok(DurableRequestBinding::Inserted) => {
+                    let response = execute(Some(&identity));
+                    if response.status == 400 && store.reject(&identity).is_err() {
+                        return ApiResponse::error(503, "request_store_unavailable");
+                    }
+                    return response;
+                }
                 Ok(DurableRequestBinding::Existing) => {
                     return ApiResponse::error(409, "request_outcome_unknown");
                 }
@@ -3546,6 +3815,10 @@ impl Router {
         } else if response.status < 400 {
             if store.complete(&identity, &response).is_err() {
                 return ApiResponse::error(503, "request_outcome_unknown");
+            }
+        } else if response.status == 400 {
+            if store.reject(&identity).is_err() {
+                return ApiResponse::error(503, "request_store_unavailable");
             }
         } else if response.status < 500 && store.abort(&identity).is_err() {
             return ApiResponse::error(503, "request_store_unavailable");
@@ -5943,7 +6216,12 @@ impl Router {
         if !Self::cap_ok(&self.mobile_job_cap_token, req) {
             return ApiResponse::error(401, "missing or invalid capability token");
         }
-        let (account, job_id) = match (req.q("account"), req.q("job_id")) {
+        let parsed =
+            match parse_strict_scalar_mutation(req, "mobile job cancel", &["account", "job_id"]) {
+                Ok(req) => req,
+                Err(response) => return response,
+            };
+        let (account, job_id) = match (parsed.q("account"), parsed.q("job_id")) {
             (Some(a), Some(j)) if !a.is_empty() && !j.is_empty() => (a, j),
             _ => return ApiResponse::error(400, "account and job_id are required"),
         };
@@ -6779,6 +7057,9 @@ impl Router {
             Ok(h) => h,
             Err(e) => return e,
         };
+        if let Err(response) = parse_strict_scalar_mutation(req, "push test", &[]) {
+            return response;
+        }
         match h.send_test() {
             Ok(v) => ApiResponse::ok_json(&v),
             Err(e) => ApiResponse::error(502, &e),
@@ -9912,10 +10193,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(body["jobs"][0].get("intent_json").is_none());
         assert!(body["jobs"][0].get("result_json").is_none());
 
-        let cancel = router.route(
-            &ApiRequest::new("POST", "/api/v1/jobs/cancel?account=a&job_id=job-1")
-                .with_cap_token(Some("jobs-secret".into())),
-        );
+        let cancel = router.route(&strict_scalar_post_from_target(
+            "/api/v1/jobs/cancel?account=a&job_id=job-1",
+            "jobs-secret",
+        ));
         assert_eq!(cancel.status, 200);
         assert_eq!(
             jobs.cancelled.lock().unwrap().as_slice(),
@@ -10448,7 +10729,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             &self,
             request: AgentConnectivityPreflightRequest,
         ) -> Result<AgentConnectivityPreflightResponse, String> {
-            if request.provider != "claude" || request.purpose != "turn_start" {
+            if request.provider != "claude"
+                || !matches!(request.purpose.as_str(), "turn_start" | "credential_revoke")
+            {
                 return Err("unsupported test request".into());
             }
             Ok(AgentConnectivityPreflightResponse {
@@ -10666,6 +10949,18 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .headers
             .iter()
             .any(|(name, value)| name == "Cache-Control" && value == "no-store"));
+
+        let credential_revoke = router.route(
+            &ApiRequest::new("POST", "/api/v1/agent/connectivity/preflight")
+                .with_cap_token(Some("agentsecret".into()))
+                .with_content_type(Some("application/json".into()))
+                .with_body(
+                    br#"{"request_id":"550e8400-e29b-41d4-a716-446655440001","provider":"claude","purpose":"credential_revoke"}"#
+                        .to_vec(),
+                ),
+        );
+        assert_eq!(credential_revoke.status, 200);
+        assert_eq!(body_json(&credential_revoke)["code"], "ready");
     }
 
     #[test]
@@ -11456,7 +11751,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let unknown = request("openai").with_cap_token(Some("agentsecret".into()));
         let unknown = router.route(&unknown);
         assert_eq!(unknown.status, 400);
-        assert!(String::from_utf8_lossy(&unknown.body).contains("invalid oauth start request"));
+        assert!(String::from_utf8_lossy(&unknown.body).contains("invalid product request"));
         assert!(unknown.headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("cache-control") && value == "no-store"
         }));
@@ -11466,7 +11761,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .with_cap_token(Some("agentsecret".into()));
         let missing = router.route(&missing);
         assert_eq!(missing.status, 400);
-        assert!(String::from_utf8_lossy(&missing.body).contains("invalid oauth start request"));
+        assert!(String::from_utf8_lossy(&missing.body).contains("invalid product request"));
     }
 
     fn lifecycle_logout_request(body: serde_json::Value) -> ApiRequest {
@@ -12176,6 +12471,22 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 _ => Err("request_store_unavailable".into()),
             }
         }
+
+        fn reject(&self, identity: &ProductRequestIdentity) -> Result<(), String> {
+            let mut receipts = self.0.lock().unwrap();
+            match receipts.get(&identity.request_id) {
+                Some((route, scope, digest, state))
+                    if route == identity.route_domain
+                        && scope == &identity.request_scope
+                        && digest == &identity.payload_digest
+                        && !matches!(state, MemoryDurableRequestState::Completed(_)) =>
+                {
+                    receipts.remove(&identity.request_id);
+                    Ok(())
+                }
+                _ => Err("request_store_unavailable".into()),
+            }
+        }
     }
 
     struct UnavailableDurableRequests;
@@ -12201,6 +12512,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         }
 
         fn abort(&self, _identity: &ProductRequestIdentity) -> Result<(), String> {
+            Err("unavailable".into())
+        }
+
+        fn reject(&self, _identity: &ProductRequestIdentity) -> Result<(), String> {
             Err("unavailable".into())
         }
     }
@@ -13224,6 +13539,55 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 .unwrap();
         assert_eq!(first, rotated_proof);
         assert_ne!(first.payload_digest, changed_effect.payload_digest);
+
+        let reply_spec = product_post_route("/api/v1/mail/reply").unwrap();
+        let omitted_defaults = strict_json_post(
+            reply_spec.path,
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174116",
+                "account": "a",
+                "id": "message-1"
+            }),
+            Some("mailsecret"),
+        );
+        let explicit_defaults = strict_json_post(
+            reply_spec.path,
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174116",
+                "account": "a",
+                "id": "message-1",
+                "body": "",
+                "comment": "",
+                "all": false
+            }),
+            Some("mailsecret"),
+        );
+        assert_eq!(
+            canonical_product_identity(&omitted_defaults, reply_spec).unwrap(),
+            canonical_product_identity(&explicit_defaults, reply_spec).unwrap()
+        );
+
+        let settings_spec = product_post_route("/api/v1/settings").unwrap();
+        let numeric_setting = strict_json_post(
+            settings_spec.path,
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174117",
+                "poll_interval_secs": 300
+            }),
+            Some("settingssecret"),
+        );
+        let string_setting = strict_json_post(
+            settings_spec.path,
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174117",
+                "poll_interval_secs": "300"
+            }),
+            Some("settingssecret"),
+        );
+        assert_eq!(
+            canonical_product_identity(&numeric_setting, settings_spec).unwrap(),
+            canonical_product_identity(&string_setting, settings_spec).unwrap()
+        );
     }
 
     #[test]
@@ -13300,7 +13664,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             oauth,
             Some("agentsecret"),
         ));
-        assert_eq!(body_json(&oauth_retry)["error"], "request_outcome_unknown");
+        assert_eq!(oauth_retry.status, 200);
+        assert_eq!(body_json(&oauth_retry), body_json(&oauth_response));
         assert_eq!(receipts.completed_response_count(), 0);
     }
 
@@ -16067,6 +16432,117 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(!body.contains("webUrl"), "invite must not create a link");
         // invite still needs the capability token
         assert_eq!(router.route(&ApiRequest::new("POST", q)).status, 401);
+    }
+
+    #[test]
+    fn share_response_is_route_owned_and_never_persisted_by_global_receipts() {
+        let (_directory, router) = setup();
+        let receipts = std::sync::Arc::new(MemoryDurableRequests::default());
+        let router = router
+            .with_share(std::sync::Arc::new(OkShare), "secret".into())
+            .with_durable_requests(receipts.clone());
+
+        let link = router.route(&strict_json_post(
+            "/api/v1/share",
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174118",
+                "account": "a",
+                "service": "onedrive",
+                "id": "item-1"
+            }),
+            Some("secret"),
+        ));
+        assert_eq!(link.status, 200);
+        assert!(String::from_utf8_lossy(&link.body).contains("https://1drv.ms/x/abc"));
+
+        let invite = router.route(&strict_json_post(
+            "/api/v1/share",
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174119",
+                "account": "a",
+                "service": "onedrive",
+                "id": "item-2",
+                "email": "recipient@example.invalid",
+                "role": "write"
+            }),
+            Some("secret"),
+        ));
+        assert_eq!(invite.status, 200);
+        assert!(String::from_utf8_lossy(&invite.body).contains("recipient@example.invalid"));
+        assert_eq!(receipts.binding_count(), 2);
+        assert_eq!(receipts.completed_response_count(), 0);
+
+        let share_spec = product_post_route("/api/v1/share").unwrap();
+        let identity = canonical_product_identity(
+            &strict_json_post(
+                share_spec.path,
+                json!({
+                    "request_id": "123e4567-e89b-42d3-a456-426614174120",
+                    "account": "a",
+                    "service": "onedrive",
+                    "id": "item-3"
+                }),
+                Some("secret"),
+            ),
+            share_spec,
+        )
+        .unwrap();
+        assert!(!identity.permits_durable_response());
+    }
+
+    #[test]
+    fn share_validation_failure_does_not_poison_request_id_binding() {
+        let (_directory, router) = setup();
+        let receipts = std::sync::Arc::new(MemoryDurableRequests::default());
+        let share = std::sync::Arc::new(SpyShare::default());
+        let router = router
+            .with_share(share.clone(), "secret".into())
+            .with_durable_requests(receipts.clone());
+        let request_id = "123e4567-e89b-42d3-a456-426614174121";
+
+        let unknown_field = router.route(&strict_json_post(
+            "/api/v1/share",
+            json!({
+                "request_id": request_id,
+                "account": "a",
+                "service": "onedrive",
+                "id": "item-1",
+                "recipient": "recipient@example.invalid"
+            }),
+            Some("secret"),
+        ));
+        assert_eq!(unknown_field.status, 400);
+        assert_eq!(receipts.binding_count(), 0);
+
+        let missing_required = router.route(&strict_json_post(
+            "/api/v1/share",
+            json!({
+                "request_id": request_id,
+                "account": "a",
+                "service": "onedrive"
+            }),
+            Some("secret"),
+        ));
+        assert_eq!(missing_required.status, 400);
+        assert_eq!(receipts.binding_count(), 0);
+
+        let corrected = router.route(&strict_json_post(
+            "/api/v1/share",
+            json!({
+                "request_id": request_id,
+                "account": "a",
+                "service": "onedrive",
+                "id": "item-1"
+            }),
+            Some("secret"),
+        ));
+        assert_eq!(corrected.status, 200);
+        assert_eq!(receipts.binding_count(), 1);
+        assert_eq!(receipts.completed_response_count(), 0);
+        assert_eq!(
+            share.share_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[test]

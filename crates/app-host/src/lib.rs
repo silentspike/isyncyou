@@ -12231,6 +12231,10 @@ impl isyncyou_webui::DurableRequestStore for UnavailableDurableRequests {
     fn abort(&self, _identity: &isyncyou_webui::ProductRequestIdentity) -> Result<(), String> {
         Err("request_store_unavailable".into())
     }
+
+    fn reject(&self, _identity: &isyncyou_webui::ProductRequestIdentity) -> Result<(), String> {
+        Err("request_store_unavailable".into())
+    }
 }
 
 #[cfg(any(
@@ -12302,6 +12306,10 @@ impl isyncyou_webui::DurableRequestStore for DaemonDurableRequests {
 
     fn abort(&self, identity: &isyncyou_webui::ProductRequestIdentity) -> Result<(), String> {
         self.store.abort_product_request_identity(identity)
+    }
+
+    fn reject(&self, identity: &isyncyou_webui::ProductRequestIdentity) -> Result<(), String> {
+        self.store.reject_product_request_identity(identity)
     }
 }
 
