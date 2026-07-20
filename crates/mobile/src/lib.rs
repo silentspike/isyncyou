@@ -2648,7 +2648,7 @@ mod tests {
         // Data route without the session token → 401 (the Android-exposure gate, now over
         // the bridge rather than an open port).
         let no_tok = bridge_request(
-            r#"{"method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{}}"#,
+            r#"{"t":"req","id":"standalone-denied","method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{}}"#,
         );
         assert!(
             no_tok.contains("\"status\":401"),
@@ -2656,7 +2656,7 @@ mod tests {
         );
         // With the session token → reaches the handler (not a 401).
         let with_tok = bridge_request(&format!(
-            r#"{{"method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{{"X-Session-Token":"{tok}"}}}}"#
+            r#"{{"t":"req","id":"standalone-authorized","method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{{"X-Session-Token":"{tok}"}}}}"#
         ));
         assert!(
             !with_tok.contains("\"status\":401"),
@@ -2666,6 +2666,8 @@ mod tests {
         // the injected cap token and then the native per-action biometric token.
         let restore_no_cap = bridge_request(
             &serde_json::json!({
+                "t": "req",
+                "id": "standalone-restore",
                 "method": "POST",
                 "path": "/api/v1/restore",
                 "headers": {
@@ -2687,6 +2689,8 @@ mod tests {
         );
         let backup_no_cap = bridge_request(
             &serde_json::json!({
+                "t": "req",
+                "id": "standalone-backup",
                 "method": "POST",
                 "path": "/api/v1/backup",
                 "headers": {
@@ -2904,7 +2908,7 @@ mod tests {
         let tok = session_token().expect("token");
         // No session token → 401 envelope (the loopback-exposure gate applies here too).
         let denied = bridge_request(
-            r#"{"method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{}}"#,
+            r#"{"t":"req","id":"routing-denied","method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{}}"#,
         );
         assert!(
             denied.contains("\"status\":401"),
@@ -2912,7 +2916,7 @@ mod tests {
         );
         // With the token → reaches the handler (not a 401).
         let ok = bridge_request(&format!(
-            r#"{{"method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{{"X-Session-Token":"{tok}"}}}}"#
+            r#"{{"t":"req","id":"routing-authorized","method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{{"X-Session-Token":"{tok}"}}}}"#
         ));
         assert!(
             !ok.contains("\"status\":401"),

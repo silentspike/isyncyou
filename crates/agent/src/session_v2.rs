@@ -5516,7 +5516,6 @@ mod tests {
                 visible_record_head: Some(Some(ULID_A.into())),
                 request_index_head: Some(Some(index_ref("request"))),
                 uuid_binding_index_head: Some(Some(index_ref("uuid"))),
-                ..Default::default()
             })
             .unwrap();
         assert_eq!(

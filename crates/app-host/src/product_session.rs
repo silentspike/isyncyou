@@ -329,7 +329,10 @@ where
             status: TurnTerminalStatus::OutcomeUnknown,
             error_code: Some("turn_outcome_unknown".into()),
         },
-        parent_record_ids: visible_parent_ids(&[intent_record.record_id.clone()], &observed_head),
+        parent_record_ids: visible_parent_ids(
+            std::slice::from_ref(&intent_record.record_id),
+            &observed_head,
+        ),
         observed_head,
         lease: guard.binding().map_err(map_session_error)?,
         created_at_ms,

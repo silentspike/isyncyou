@@ -515,6 +515,11 @@ fn agent_safe_turn_error(error: &isyncyou_agent::AgentError) -> &'static str {
     }
 }
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
 fn product_turn_terminal_error(
     error: &isyncyou_agent::AgentError,
     provider_outcome_ambiguous: bool,
@@ -10575,7 +10580,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             feature = "agent-subscription-experimental"
         )))]
         {
-            let _ = request;
+            let _ = (request, identity);
             Err("product_sessions_unavailable".into())
         }
     }
@@ -10641,19 +10646,37 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
     }
 
     fn cancel_turn(&self, turn_id: &str) -> Result<(), String> {
-        let control_store = self.control_store.clone();
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            let control_store = self.control_store.clone();
+            cancel_turn_with_pending_guard(
+                &self.turns,
+                &self.pending,
+                &self.hub,
+                turn_id,
+                unix_now_ms(),
+                || {
+                    control_store
+                        .as_ref()
+                        .ok_or_else(|| "turn_admission_unavailable".to_string())?
+                        .cancel_agent_turn_admission(turn_id)
+                },
+            )
+        }
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         cancel_turn_with_pending_guard(
             &self.turns,
             &self.pending,
             &self.hub,
             turn_id,
             unix_now_ms(),
-            || {
-                control_store
-                    .as_ref()
-                    .ok_or_else(|| "turn_admission_unavailable".to_string())?
-                    .cancel_agent_turn_admission(turn_id)
-            },
+            || Ok(()),
         )
     }
 

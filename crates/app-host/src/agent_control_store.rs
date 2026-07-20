@@ -47,6 +47,7 @@ type MutationCommitRow = (
     Option<String>,
     Option<Vec<u8>>,
 );
+type MutationIntentCreateRow = (String, String, Vec<u8>, i64, String, i64, String);
 type UserPresenceRow = (String, String, i64, Option<Vec<u8>>, Option<Vec<u8>>);
 type PendingRow = (String, u64, String, Option<Vec<u8>>);
 type ProductRequestReceiptRow = (String, String, String, String, Option<Vec<u8>>);
@@ -1065,7 +1066,7 @@ impl AgentControlStore {
             ],
             now_ms,
         )?;
-        let existing: Option<(String, String, Vec<u8>, i64, String, i64, String)> = transaction
+        let existing: Option<MutationIntentCreateRow> = transaction
             .query_row(
                 "SELECT intent_id,owner_binding,purpose_json,total_bytes,content_sha256,
                         expires_at_ms,state
