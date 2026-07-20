@@ -257,6 +257,153 @@ fn agent_oauth_provider_param(provider: &str) -> Result<&'static str, &'static s
 const AGENT_STRICT_JSON_MAX_BYTES: usize = 8 * 1024;
 const AGENT_TURN_JSON_MAX_BYTES: usize = 64 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProductPostCapability {
+    Restore,
+    Backup,
+    MobileJob,
+    Share,
+    Sync,
+    Verify,
+    Settings,
+    Mail,
+    Calendar,
+    Contact,
+    Task,
+    Onenote,
+    Transfer,
+    OnedriveWrite,
+    OnedriveMode,
+    MutationIntent,
+    OnedriveManage,
+    Account,
+    Push,
+    Agent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProductPostRouteSpec {
+    pub route: ProductPostRoute,
+    pub path: &'static str,
+    pub domain: &'static str,
+    pub body_limit: usize,
+    pub capability: ProductPostCapability,
+}
+
+macro_rules! product_post_routes {
+    ($( $variant:ident => ($path:literal, $limit:expr, $capability:ident) ),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        pub(crate) enum ProductPostRoute {
+            $( $variant, )+
+        }
+
+        pub(crate) const PRODUCT_POST_ROUTES: &[ProductPostRouteSpec] = &[
+            $(
+                ProductPostRouteSpec {
+                    route: ProductPostRoute::$variant,
+                    path: $path,
+                    domain: concat!("post:", $path),
+                    body_limit: $limit,
+                    capability: ProductPostCapability::$capability,
+                },
+            )+
+        ];
+    };
+}
+
+// One production catalogue owns dispatch identity, capability, idempotency domain,
+// and pre-allocation body policy. Adding a POST route anywhere else is a test failure;
+// adding a variant here makes the exhaustive dispatcher fail to compile until wired.
+product_post_routes! {
+    Restore => ("/api/v1/restore", 8 * 1024, Restore),
+    Backup => ("/api/v1/backup", 8 * 1024, Backup),
+    MobileJobCancel => ("/api/v1/jobs/cancel", 8 * 1024, MobileJob),
+    Share => ("/api/v1/share", 8 * 1024, Share),
+    SyncPause => ("/api/v1/sync/pause", 8 * 1024, Sync),
+    SyncResume => ("/api/v1/sync/resume", 8 * 1024, Sync),
+    SyncNow => ("/api/v1/sync/now", 8 * 1024, Sync),
+    Verify => ("/api/v1/verify", 8 * 1024, Verify),
+    Settings => ("/api/v1/settings", 8 * 1024, Settings),
+    MailSend => ("/api/v1/mail/send", 64 * 1024, Mail),
+    MailReply => ("/api/v1/mail/reply", 64 * 1024, Mail),
+    MailForward => ("/api/v1/mail/forward", 64 * 1024, Mail),
+    MailMove => ("/api/v1/mail/move", 8 * 1024, Mail),
+    MailRead => ("/api/v1/mail/read", 8 * 1024, Mail),
+    MailFlag => ("/api/v1/mail/flag", 8 * 1024, Mail),
+    MailCategories => ("/api/v1/mail/categories", 8 * 1024, Mail),
+    MailDraft => ("/api/v1/mail/draft", 64 * 1024, Mail),
+    CalendarCreate => ("/api/v1/calendar/create", 8 * 1024, Calendar),
+    CalendarUpdate => ("/api/v1/calendar/update", 8 * 1024, Calendar),
+    CalendarDelete => ("/api/v1/calendar/delete", 8 * 1024, Calendar),
+    CalendarRespond => ("/api/v1/calendar/respond", 8 * 1024, Calendar),
+    ContactCreate => ("/api/v1/contact/create", 8 * 1024, Contact),
+    ContactUpdate => ("/api/v1/contact/update", 8 * 1024, Contact),
+    ContactDelete => ("/api/v1/contact/delete", 8 * 1024, Contact),
+    TodoCreate => ("/api/v1/todo/create", 8 * 1024, Task),
+    TodoUpdate => ("/api/v1/todo/update", 8 * 1024, Task),
+    TodoComplete => ("/api/v1/todo/complete", 8 * 1024, Task),
+    TodoDelete => ("/api/v1/todo/delete", 8 * 1024, Task),
+    TodoChecklistAdd => ("/api/v1/todo/checklist-add", 8 * 1024, Task),
+    TodoChecklistToggle => ("/api/v1/todo/checklist-toggle", 8 * 1024, Task),
+    TodoChecklistDelete => ("/api/v1/todo/checklist-delete", 8 * 1024, Task),
+    TodoListCreate => ("/api/v1/todo/list-create", 8 * 1024, Task),
+    TodoListDelete => ("/api/v1/todo/list-delete", 8 * 1024, Task),
+    OnenoteCreate => ("/api/v1/onenote/create", 64 * 1024, Onenote),
+    OnenoteDelete => ("/api/v1/onenote/delete", 8 * 1024, Onenote),
+    OnenoteAppend => ("/api/v1/onenote/append", 64 * 1024, Onenote),
+    TransferCancel => ("/api/v1/onedrive/transfers/cancel", 8 * 1024, Transfer),
+    TransferPause => ("/api/v1/onedrive/transfers/pause", 8 * 1024, Transfer),
+    TransferRetry => ("/api/v1/onedrive/transfers/retry", 8 * 1024, Transfer),
+    OnedriveCreate => ("/api/v1/onedrive/create", 8 * 1024, OnedriveWrite),
+    OnedriveRename => ("/api/v1/onedrive/rename", 8 * 1024, OnedriveWrite),
+    OnedriveMove => ("/api/v1/onedrive/move", 8 * 1024, OnedriveWrite),
+    OnedriveDelete => ("/api/v1/onedrive/delete", 8 * 1024, OnedriveWrite),
+    OnedriveMode => ("/api/v1/onedrive/mode", 8 * 1024, OnedriveMode),
+    MutationIntentCreate => ("/api/v1/mutation-intent/create", 16 * 1024, MutationIntent),
+    MutationIntentChunk => ("/api/v1/mutation-intent/chunk", 16 * 1024, MutationIntent),
+    MutationIntentCommit => ("/api/v1/mutation-intent/commit", 16 * 1024, MutationIntent),
+    MutationIntentCancel => ("/api/v1/mutation-intent/cancel", 16 * 1024, MutationIntent),
+    OnedriveFreeUp => ("/api/v1/onedrive/free-up", 8 * 1024, OnedriveManage),
+    OnedriveDownloadNow => ("/api/v1/onedrive/download-now", 8 * 1024, OnedriveManage),
+    OnedriveConflictResolve => ("/api/v1/onedrive/conflict/resolve", 8 * 1024, OnedriveManage),
+    OnedriveCleanup => ("/api/v1/onedrive/cleanup", 8 * 1024, OnedriveManage),
+    AccountLoginStart => ("/api/v1/account/login/start", 8 * 1024, Account),
+    AccountLoginPoll => ("/api/v1/account/login/poll", 8 * 1024, Account),
+    AccountLoginCancel => ("/api/v1/account/login/cancel", 8 * 1024, Account),
+    AccountSignout => ("/api/v1/account/signout", 8 * 1024, Account),
+    PushRegister => ("/api/v1/push/register", 8 * 1024, Push),
+    PushTest => ("/api/v1/push/test", 8 * 1024, Push),
+    AgentTurn => ("/api/v1/agent/turn", AGENT_TURN_JSON_MAX_BYTES, Agent),
+    AgentSessionCreate => ("/api/v1/agent/session/create", 8 * 1024, Agent),
+    AgentSessionSelect => ("/api/v1/agent/session/select", 8 * 1024, Agent),
+    AgentSessionArchive => ("/api/v1/agent/session/archive", 8 * 1024, Agent),
+    AgentUserPresenceStart => ("/api/v1/agent/user-presence/start", 8 * 1024, Agent),
+    AgentUserPresenceConfirm => ("/api/v1/agent/user-presence/confirm", 8 * 1024, Agent),
+    AgentPairingCreate => ("/api/v1/agent/session/pairing/create", 8 * 1024, Agent),
+    AgentPairingReveal => ("/api/v1/agent/session/pairing/reveal", 8 * 1024, Agent),
+    AgentPairingClaim => ("/api/v1/agent/session/pairing/claim", 8 * 1024, Agent),
+    AgentPairingFinalize => ("/api/v1/agent/session/pairing/finalize", 8 * 1024, Agent),
+    AgentPairingRevoke => ("/api/v1/agent/session/pairing/revoke", 8 * 1024, Agent),
+    AgentConfirm => ("/api/v1/agent/confirm", 8 * 1024, Agent),
+    AgentTurnCancel => ("/api/v1/agent/turn/cancel", 8 * 1024, Agent),
+    AgentPendingCancel => ("/api/v1/agent/pending/cancel", 8 * 1024, Agent),
+    AgentConnectivityPreflight => ("/api/v1/agent/connectivity/preflight", 8 * 1024, Agent),
+    AgentCredentialRefresh => ("/api/v1/agent/credential/refresh", 8 * 1024, Agent),
+    AgentOauthStart => ("/api/v1/agent/oauth/start", 8 * 1024, Agent),
+    AgentOauthLogout => ("/api/v1/agent/oauth/logout", 8 * 1024, Agent),
+    AgentOauthLifecycleResume => ("/api/v1/agent/oauth/lifecycle/resume", 8 * 1024, Agent),
+    AgentOauthCancel => ("/api/v1/agent/oauth/cancel", 8 * 1024, Agent),
+    AgentOauthComplete => ("/api/v1/agent/oauth/complete", 8 * 1024, Agent),
+    AgentModel => ("/api/v1/agent/model", 8 * 1024, Agent),
+}
+
+pub(crate) fn product_post_route(path: &str) -> Option<ProductPostRouteSpec> {
+    PRODUCT_POST_ROUTES
+        .iter()
+        .copied()
+        .find(|spec| spec.path == path)
+}
+
 fn is_json_content_type(content_type: Option<&str>) -> bool {
     let Some(content_type) = content_type else {
         return false;
@@ -949,7 +1096,7 @@ pub struct AgentSessionSelectRequest {
     pub session_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentTurnRequest {
     pub request_id: String,
@@ -2836,86 +2983,46 @@ impl Router {
         ct_eq(w.as_bytes(), g.as_bytes())
     }
 
-    fn ordinary_post_cap(&self, path: &str) -> Option<&Option<String>> {
-        match path {
-            "/api/v1/restore" => Some(&self.restore_cap_token),
-            "/api/v1/backup" => Some(&self.backup_cap_token),
-            "/api/v1/jobs/cancel" => Some(&self.mobile_job_cap_token),
-            "/api/v1/share" => Some(&self.share_cap_token),
-            "/api/v1/sync/pause" | "/api/v1/sync/resume" | "/api/v1/sync/now" => {
-                Some(&self.sync_cap_token)
-            }
-            "/api/v1/verify" => Some(&self.verify_cap_token),
-            "/api/v1/settings" => Some(&self.settings_cap_token),
-            "/api/v1/mail/send"
-            | "/api/v1/mail/reply"
-            | "/api/v1/mail/forward"
-            | "/api/v1/mail/move"
-            | "/api/v1/mail/read"
-            | "/api/v1/mail/flag"
-            | "/api/v1/mail/categories"
-            | "/api/v1/mail/draft" => Some(&self.mail_write_cap_token),
-            "/api/v1/calendar/create"
-            | "/api/v1/calendar/update"
-            | "/api/v1/calendar/delete"
-            | "/api/v1/calendar/respond" => Some(&self.calendar_write_cap_token),
-            "/api/v1/contact/create" | "/api/v1/contact/update" | "/api/v1/contact/delete" => {
-                Some(&self.contact_write_cap_token)
-            }
-            "/api/v1/todo/create"
-            | "/api/v1/todo/update"
-            | "/api/v1/todo/complete"
-            | "/api/v1/todo/delete"
-            | "/api/v1/todo/checklist-add"
-            | "/api/v1/todo/checklist-toggle"
-            | "/api/v1/todo/checklist-delete"
-            | "/api/v1/todo/list-create"
-            | "/api/v1/todo/list-delete" => Some(&self.task_write_cap_token),
-            "/api/v1/onenote/create" | "/api/v1/onenote/delete" | "/api/v1/onenote/append" => {
-                Some(&self.onenote_write_cap_token)
-            }
-            "/api/v1/onedrive/transfers/cancel"
-            | "/api/v1/onedrive/transfers/pause"
-            | "/api/v1/onedrive/transfers/retry" => Some(&self.transfer_cap_token),
-            "/api/v1/onedrive/create"
-            | "/api/v1/onedrive/rename"
-            | "/api/v1/onedrive/move"
-            | "/api/v1/onedrive/delete" => Some(&self.onedrive_write_cap_token),
-            "/api/v1/onedrive/mode" => Some(&self.onedrive_mode_cap_token),
-            "/api/v1/onedrive/free-up"
-            | "/api/v1/onedrive/download-now"
-            | "/api/v1/onedrive/conflict/resolve"
-            | "/api/v1/onedrive/cleanup" => Some(&self.onedrive_manage_cap_token),
-            "/api/v1/account/login/start"
-            | "/api/v1/account/login/poll"
-            | "/api/v1/account/login/cancel"
-            | "/api/v1/account/signout" => Some(&self.account_cap_token),
-            "/api/v1/push/register" | "/api/v1/push/test" => Some(&self.push_cap_token),
-            "/api/v1/agent/credential/refresh"
-            | "/api/v1/agent/turn"
-            | "/api/v1/agent/oauth/start"
-            | "/api/v1/agent/oauth/logout"
-            | "/api/v1/agent/oauth/lifecycle/resume"
-            | "/api/v1/agent/oauth/cancel"
-            | "/api/v1/agent/oauth/complete"
-            | "/api/v1/agent/model" => Some(&self.agent_cap_token),
-            _ => None,
+    fn product_post_cap(&self, capability: ProductPostCapability) -> &Option<String> {
+        match capability {
+            ProductPostCapability::Restore => &self.restore_cap_token,
+            ProductPostCapability::Backup => &self.backup_cap_token,
+            ProductPostCapability::MobileJob => &self.mobile_job_cap_token,
+            ProductPostCapability::Share => &self.share_cap_token,
+            ProductPostCapability::Sync => &self.sync_cap_token,
+            ProductPostCapability::Verify => &self.verify_cap_token,
+            ProductPostCapability::Settings => &self.settings_cap_token,
+            ProductPostCapability::Mail => &self.mail_write_cap_token,
+            ProductPostCapability::Calendar => &self.calendar_write_cap_token,
+            ProductPostCapability::Contact => &self.contact_write_cap_token,
+            ProductPostCapability::Task => &self.task_write_cap_token,
+            ProductPostCapability::Onenote => &self.onenote_write_cap_token,
+            ProductPostCapability::Transfer => &self.transfer_cap_token,
+            ProductPostCapability::OnedriveWrite => &self.onedrive_write_cap_token,
+            ProductPostCapability::OnedriveMode => &self.onedrive_mode_cap_token,
+            ProductPostCapability::MutationIntent => &self.mutation_intent_cap_token,
+            ProductPostCapability::OnedriveManage => &self.onedrive_manage_cap_token,
+            ProductPostCapability::Account => &self.account_cap_token,
+            ProductPostCapability::Push => &self.push_cap_token,
+            ProductPostCapability::Agent => &self.agent_cap_token,
         }
     }
 
-    fn execute_ordinary_post<F>(&self, req: &ApiRequest, execute: F) -> ApiResponse
+    fn execute_product_post<F>(
+        &self,
+        req: &ApiRequest,
+        spec: ProductPostRouteSpec,
+        execute: F,
+    ) -> ApiResponse
     where
         F: FnOnce() -> ApiResponse,
     {
         let Some(store) = self.durable_requests.as_ref() else {
             return execute();
         };
-        let Some(expected_cap) = self.ordinary_post_cap(&req.path) else {
-            return execute();
-        };
         // Preserve each route's existing handler-present error, and never create a
         // durable receipt before the capability gate succeeds.
-        if !Self::cap_ok(expected_cap, req) {
+        if !Self::cap_ok(self.product_post_cap(spec.capability), req) {
             return execute();
         }
         let mut payload: Value = match serde_json::from_slice(&req.body) {
@@ -2945,8 +3052,7 @@ impl Router {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         };
-        let route_domain = format!("post:{}", req.path);
-        match store.begin(&request_id, &route_domain, &payload_digest) {
+        match store.begin(&request_id, spec.domain, &payload_digest) {
             Ok(DurableRequestBegin::Replay(response)) => return response,
             Ok(DurableRequestBegin::Conflict) => {
                 return ApiResponse::error(409, "request_id_conflict")
@@ -2971,21 +3077,21 @@ impl Router {
             // the confirmed public handle must reach the handler, after which its
             // terminal result becomes the replayable receipt.
             if store
-                .abort(&request_id, &route_domain, &payload_digest)
+                .abort(&request_id, spec.domain, &payload_digest)
                 .is_err()
             {
                 return ApiResponse::error(503, "request_store_unavailable");
             }
         } else if response.status < 400 {
             if store
-                .complete(&request_id, &route_domain, &payload_digest, &response)
+                .complete(&request_id, spec.domain, &payload_digest, &response)
                 .is_err()
             {
                 return ApiResponse::error(503, "request_outcome_unknown");
             }
         } else if response.status < 500
             && store
-                .abort(&request_id, &route_domain, &payload_digest)
+                .abort(&request_id, spec.domain, &payload_digest)
                 .is_err()
         {
             return ApiResponse::error(503, "request_store_unavailable");
@@ -3115,92 +3221,96 @@ impl Router {
                 .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()))
         };
         if req.method == "POST" {
-            let execute = || match req.path.as_str() {
-                "/api/v1/restore" => self.restore(req),
-                "/api/v1/backup" => self.backup(req),
-                "/api/v1/jobs/cancel" => self.mobile_job_cancel(req),
-                "/api/v1/share" => self.share_link(req),
-                "/api/v1/sync/pause" => self.sync_command(req, |c| c.pause()),
-                "/api/v1/sync/resume" => self.sync_command(req, |c| c.resume()),
-                "/api/v1/sync/now" => self.sync_command(req, |c| c.trigger()),
-                "/api/v1/verify" => self.verify_run(req),
-                "/api/v1/settings" => self.update_settings(req),
-                "/api/v1/mail/send" => self.mail_send(req),
-                "/api/v1/mail/reply" => self.mail_reply(req),
-                "/api/v1/mail/forward" => self.mail_forward(req),
-                "/api/v1/mail/move" => self.mail_move(req),
-                "/api/v1/mail/read" => self.mail_read(req),
-                "/api/v1/mail/flag" => self.mail_flag(req),
-                "/api/v1/mail/categories" => self.mail_categories(req),
-                "/api/v1/mail/draft" => self.mail_draft(req),
-                "/api/v1/calendar/create" => self.calendar_create(req),
-                "/api/v1/calendar/update" => self.calendar_update(req),
-                "/api/v1/calendar/delete" => self.calendar_delete(req),
-                "/api/v1/calendar/respond" => self.calendar_respond(req),
-                "/api/v1/contact/create" => self.contact_create(req),
-                "/api/v1/contact/update" => self.contact_update(req),
-                "/api/v1/contact/delete" => self.contact_delete(req),
-                "/api/v1/todo/create" => self.todo_create(req),
-                "/api/v1/todo/update" => self.todo_update(req),
-                "/api/v1/todo/complete" => self.todo_complete(req),
-                "/api/v1/todo/delete" => self.todo_delete(req),
-                "/api/v1/todo/checklist-add" => self.todo_checklist_add(req),
-                "/api/v1/todo/checklist-toggle" => self.todo_checklist_toggle(req),
-                "/api/v1/todo/checklist-delete" => self.todo_checklist_delete(req),
-                "/api/v1/todo/list-create" => self.todo_list_create(req),
-                "/api/v1/todo/list-delete" => self.todo_list_delete(req),
-                "/api/v1/onenote/create" => self.onenote_create(req),
-                "/api/v1/onenote/delete" => self.onenote_delete(req),
-                "/api/v1/onenote/append" => self.onenote_append(req),
-                "/api/v1/onedrive/transfers/cancel" => self.transfers_cancel(req),
-                "/api/v1/onedrive/transfers/pause" => self.transfers_pause(req),
-                "/api/v1/onedrive/transfers/retry" => self.transfers_retry(req),
-                "/api/v1/onedrive/create" => self.onedrive_create(req),
-                "/api/v1/onedrive/rename" => self.onedrive_rename(req),
-                "/api/v1/onedrive/move" => self.onedrive_move(req),
-                "/api/v1/onedrive/delete" => self.onedrive_delete(req),
-                "/api/v1/onedrive/mode" => self.onedrive_set_mode(req),
-                "/api/v1/mutation-intent/create" => self.mutation_intent_create(req),
-                "/api/v1/mutation-intent/chunk" => self.mutation_intent_chunk(req),
-                "/api/v1/mutation-intent/commit" => self.mutation_intent_commit(req),
-                "/api/v1/mutation-intent/cancel" => self.mutation_intent_cancel(req),
-                "/api/v1/onedrive/free-up" => self.onedrive_free_up(req),
-                "/api/v1/onedrive/download-now" => self.onedrive_download_now(req),
-                "/api/v1/onedrive/conflict/resolve" => self.onedrive_conflict_resolve(req),
-                "/api/v1/onedrive/cleanup" => self.onedrive_cleanup(req),
-                "/api/v1/account/login/start" => self.account_login_start(req),
-                "/api/v1/account/login/poll" => self.account_login_poll(req),
-                "/api/v1/account/login/cancel" => self.account_login_cancel(req),
-                "/api/v1/account/signout" => self.account_signout(req),
-                "/api/v1/push/register" => self.push_register(req),
-                "/api/v1/push/test" => self.push_test(req),
-                "/api/v1/agent/turn" => self.agent_turn(req),
-                "/api/v1/agent/session/create" => self.agent_session_create(req),
-                "/api/v1/agent/session/select" => self.agent_session_select(req),
-                "/api/v1/agent/session/archive" => self.agent_session_archive(req),
-                "/api/v1/agent/user-presence/start" => self.agent_user_presence_start(req),
-                "/api/v1/agent/user-presence/confirm" => self.agent_user_presence_confirm(req),
-                "/api/v1/agent/session/pairing/create" => self.agent_session_pairing_create(req),
-                "/api/v1/agent/session/pairing/reveal" => self.agent_session_pairing_reveal(req),
-                "/api/v1/agent/session/pairing/claim" => self.agent_session_pairing_claim(req),
-                "/api/v1/agent/session/pairing/finalize" => {
-                    self.agent_session_pairing_finalize(req)
-                }
-                "/api/v1/agent/session/pairing/revoke" => self.agent_session_pairing_revoke(req),
-                "/api/v1/agent/confirm" => self.agent_confirm(req),
-                "/api/v1/agent/turn/cancel" => self.agent_turn_cancel(req),
-                "/api/v1/agent/pending/cancel" => self.agent_pending_cancel(req),
-                "/api/v1/agent/connectivity/preflight" => self.agent_connectivity_preflight(req),
-                "/api/v1/agent/credential/refresh" => self.agent_credential_refresh(req),
-                "/api/v1/agent/oauth/start" => self.agent_oauth_start(req),
-                "/api/v1/agent/oauth/logout" => self.agent_oauth_logout(req),
-                "/api/v1/agent/oauth/lifecycle/resume" => self.agent_oauth_lifecycle_resume(req),
-                "/api/v1/agent/oauth/cancel" => self.agent_oauth_cancel(req),
-                "/api/v1/agent/oauth/complete" => self.agent_oauth_complete(req),
-                "/api/v1/agent/model" => self.agent_set_model(req),
-                _ => ApiResponse::error(405, "method not allowed"),
+            let Some(spec) = product_post_route(&req.path) else {
+                return ApiResponse::error(405, "method not allowed");
             };
-            return self.execute_ordinary_post(req, execute);
+            let execute = || match spec.route {
+                ProductPostRoute::Restore => self.restore(req),
+                ProductPostRoute::Backup => self.backup(req),
+                ProductPostRoute::MobileJobCancel => self.mobile_job_cancel(req),
+                ProductPostRoute::Share => self.share_link(req),
+                ProductPostRoute::SyncPause => self.sync_command(req, |c| c.pause()),
+                ProductPostRoute::SyncResume => self.sync_command(req, |c| c.resume()),
+                ProductPostRoute::SyncNow => self.sync_command(req, |c| c.trigger()),
+                ProductPostRoute::Verify => self.verify_run(req),
+                ProductPostRoute::Settings => self.update_settings(req),
+                ProductPostRoute::MailSend => self.mail_send(req),
+                ProductPostRoute::MailReply => self.mail_reply(req),
+                ProductPostRoute::MailForward => self.mail_forward(req),
+                ProductPostRoute::MailMove => self.mail_move(req),
+                ProductPostRoute::MailRead => self.mail_read(req),
+                ProductPostRoute::MailFlag => self.mail_flag(req),
+                ProductPostRoute::MailCategories => self.mail_categories(req),
+                ProductPostRoute::MailDraft => self.mail_draft(req),
+                ProductPostRoute::CalendarCreate => self.calendar_create(req),
+                ProductPostRoute::CalendarUpdate => self.calendar_update(req),
+                ProductPostRoute::CalendarDelete => self.calendar_delete(req),
+                ProductPostRoute::CalendarRespond => self.calendar_respond(req),
+                ProductPostRoute::ContactCreate => self.contact_create(req),
+                ProductPostRoute::ContactUpdate => self.contact_update(req),
+                ProductPostRoute::ContactDelete => self.contact_delete(req),
+                ProductPostRoute::TodoCreate => self.todo_create(req),
+                ProductPostRoute::TodoUpdate => self.todo_update(req),
+                ProductPostRoute::TodoComplete => self.todo_complete(req),
+                ProductPostRoute::TodoDelete => self.todo_delete(req),
+                ProductPostRoute::TodoChecklistAdd => self.todo_checklist_add(req),
+                ProductPostRoute::TodoChecklistToggle => self.todo_checklist_toggle(req),
+                ProductPostRoute::TodoChecklistDelete => self.todo_checklist_delete(req),
+                ProductPostRoute::TodoListCreate => self.todo_list_create(req),
+                ProductPostRoute::TodoListDelete => self.todo_list_delete(req),
+                ProductPostRoute::OnenoteCreate => self.onenote_create(req),
+                ProductPostRoute::OnenoteDelete => self.onenote_delete(req),
+                ProductPostRoute::OnenoteAppend => self.onenote_append(req),
+                ProductPostRoute::TransferCancel => self.transfers_cancel(req),
+                ProductPostRoute::TransferPause => self.transfers_pause(req),
+                ProductPostRoute::TransferRetry => self.transfers_retry(req),
+                ProductPostRoute::OnedriveCreate => self.onedrive_create(req),
+                ProductPostRoute::OnedriveRename => self.onedrive_rename(req),
+                ProductPostRoute::OnedriveMove => self.onedrive_move(req),
+                ProductPostRoute::OnedriveDelete => self.onedrive_delete(req),
+                ProductPostRoute::OnedriveMode => self.onedrive_set_mode(req),
+                ProductPostRoute::MutationIntentCreate => self.mutation_intent_create(req),
+                ProductPostRoute::MutationIntentChunk => self.mutation_intent_chunk(req),
+                ProductPostRoute::MutationIntentCommit => self.mutation_intent_commit(req),
+                ProductPostRoute::MutationIntentCancel => self.mutation_intent_cancel(req),
+                ProductPostRoute::OnedriveFreeUp => self.onedrive_free_up(req),
+                ProductPostRoute::OnedriveDownloadNow => self.onedrive_download_now(req),
+                ProductPostRoute::OnedriveConflictResolve => self.onedrive_conflict_resolve(req),
+                ProductPostRoute::OnedriveCleanup => self.onedrive_cleanup(req),
+                ProductPostRoute::AccountLoginStart => self.account_login_start(req),
+                ProductPostRoute::AccountLoginPoll => self.account_login_poll(req),
+                ProductPostRoute::AccountLoginCancel => self.account_login_cancel(req),
+                ProductPostRoute::AccountSignout => self.account_signout(req),
+                ProductPostRoute::PushRegister => self.push_register(req),
+                ProductPostRoute::PushTest => self.push_test(req),
+                ProductPostRoute::AgentTurn => self.agent_turn(req),
+                ProductPostRoute::AgentSessionCreate => self.agent_session_create(req),
+                ProductPostRoute::AgentSessionSelect => self.agent_session_select(req),
+                ProductPostRoute::AgentSessionArchive => self.agent_session_archive(req),
+                ProductPostRoute::AgentUserPresenceStart => self.agent_user_presence_start(req),
+                ProductPostRoute::AgentUserPresenceConfirm => self.agent_user_presence_confirm(req),
+                ProductPostRoute::AgentPairingCreate => self.agent_session_pairing_create(req),
+                ProductPostRoute::AgentPairingReveal => self.agent_session_pairing_reveal(req),
+                ProductPostRoute::AgentPairingClaim => self.agent_session_pairing_claim(req),
+                ProductPostRoute::AgentPairingFinalize => self.agent_session_pairing_finalize(req),
+                ProductPostRoute::AgentPairingRevoke => self.agent_session_pairing_revoke(req),
+                ProductPostRoute::AgentConfirm => self.agent_confirm(req),
+                ProductPostRoute::AgentTurnCancel => self.agent_turn_cancel(req),
+                ProductPostRoute::AgentPendingCancel => self.agent_pending_cancel(req),
+                ProductPostRoute::AgentConnectivityPreflight => {
+                    self.agent_connectivity_preflight(req)
+                }
+                ProductPostRoute::AgentCredentialRefresh => self.agent_credential_refresh(req),
+                ProductPostRoute::AgentOauthStart => self.agent_oauth_start(req),
+                ProductPostRoute::AgentOauthLogout => self.agent_oauth_logout(req),
+                ProductPostRoute::AgentOauthLifecycleResume => {
+                    self.agent_oauth_lifecycle_resume(req)
+                }
+                ProductPostRoute::AgentOauthCancel => self.agent_oauth_cancel(req),
+                ProductPostRoute::AgentOauthComplete => self.agent_oauth_complete(req),
+                ProductPostRoute::AgentModel => self.agent_set_model(req),
+            };
+            return self.execute_product_post(req, spec, execute);
         }
         if req.method != "GET" {
             return ApiResponse::error(405, "method not allowed");
@@ -9186,7 +9296,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .lock()
             .unwrap()
             .values()
-            .any(|(_, _, response)| response.is_some()));
+            .any(|(_, _, state)| matches!(state, MemoryDurableRequestState::Completed(_))));
         let replay = mobile.route(&confirmed_request);
         assert_eq!(replay.status, ok.status);
         assert_eq!(replay.content_type, ok.content_type);
@@ -11450,7 +11560,13 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         }
     }
 
-    type DurableReceipt = (String, String, Option<ApiResponse>);
+    enum MemoryDurableRequestState {
+        Started,
+        Retryable,
+        Completed(ApiResponse),
+    }
+
+    type DurableReceipt = (String, String, MemoryDurableRequestState);
 
     #[derive(Default)]
     struct MemoryDurableRequests(
@@ -11469,12 +11585,29 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 Some((route, digest, _)) if route != route_domain || digest != payload_digest => {
                     Ok(DurableRequestBegin::Conflict)
                 }
-                Some((_, _, Some(response))) => Ok(DurableRequestBegin::Replay(response.clone())),
-                Some(_) => Ok(DurableRequestBegin::OutcomeUnknown),
+                Some((_, _, MemoryDurableRequestState::Completed(response))) => {
+                    Ok(DurableRequestBegin::Replay(response.clone()))
+                }
+                Some((_, _, MemoryDurableRequestState::Started)) => {
+                    Ok(DurableRequestBegin::OutcomeUnknown)
+                }
+                Some((route, digest, MemoryDurableRequestState::Retryable)) => {
+                    let route = route.clone();
+                    let digest = digest.clone();
+                    receipts.insert(
+                        request_id.into(),
+                        (route, digest, MemoryDurableRequestState::Started),
+                    );
+                    Ok(DurableRequestBegin::Execute)
+                }
                 None => {
                     receipts.insert(
                         request_id.into(),
-                        (route_domain.into(), payload_digest.into(), None),
+                        (
+                            route_domain.into(),
+                            payload_digest.into(),
+                            MemoryDurableRequestState::Started,
+                        ),
                     );
                     Ok(DurableRequestBegin::Execute)
                 }
@@ -11493,7 +11626,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 (
                     route_domain.into(),
                     payload_digest.into(),
-                    Some(response.clone()),
+                    MemoryDurableRequestState::Completed(response.clone()),
                 ),
             );
             Ok(())
@@ -11502,11 +11635,19 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         fn abort(
             &self,
             request_id: &str,
-            _route_domain: &str,
-            _payload_digest: &str,
+            route_domain: &str,
+            payload_digest: &str,
         ) -> Result<(), String> {
-            self.0.lock().unwrap().remove(request_id);
-            Ok(())
+            let mut receipts = self.0.lock().unwrap();
+            match receipts.get_mut(request_id) {
+                Some((route, digest, state))
+                    if route == route_domain && digest == payload_digest =>
+                {
+                    *state = MemoryDurableRequestState::Retryable;
+                    Ok(())
+                }
+                _ => Err("request_store_unavailable".into()),
+            }
         }
     }
 
@@ -12561,6 +12702,38 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(body_json(&route_conflict)["error"], "request_id_conflict");
         assert_eq!(agent.turns.lock().unwrap().len(), 1);
         assert!(agent.selections.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn global_product_uuid_binding_crosses_session_and_ordinary_route_families() {
+        let (_directory, router) = setup();
+        let agent = std::sync::Arc::new(FakeAgent);
+        let router = router
+            .with_agent(agent, "agentsecret".into())
+            .with_durable_requests(std::sync::Arc::new(MemoryDurableRequests::default()));
+        let request_id = "123e4567-e89b-42d3-a456-426614174106";
+        let created = router.route(&strict_json_post(
+            "/api/v1/agent/session/create",
+            json!({
+                "request_id": request_id,
+                "display_name": "Shared session"
+            }),
+            Some("agentsecret"),
+        ));
+        assert_eq!(created.status, 200);
+
+        let conflict = router.route(&strict_json_post(
+            "/api/v1/agent/model",
+            json!({
+                "request_id": request_id,
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "medium"
+            }),
+            Some("agentsecret"),
+        ));
+        assert_eq!(conflict.status, 409);
+        assert_eq!(body_json(&conflict)["error"], "request_id_conflict");
     }
 
     #[test]

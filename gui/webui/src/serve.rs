@@ -94,8 +94,6 @@ struct RequestHeaders {
     storage_not_low: Option<bool>,
 }
 
-const AGENT_STRICT_JSON_MAX_BYTES: usize = 8 * 1024;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RouteBodyPolicy {
     None,
@@ -119,104 +117,9 @@ fn route_body_policy(method: &str, target: &str) -> RouteBodyPolicy {
     if method != "POST" {
         return RouteBodyPolicy::None;
     }
-    if path == "/api/v1/agent/turn" {
-        return RouteBodyPolicy::Json(64 * 1024);
-    }
-    if matches!(
-        path,
-        "/api/v1/mutation-intent/create"
-            | "/api/v1/mutation-intent/chunk"
-            | "/api/v1/mutation-intent/commit"
-            | "/api/v1/mutation-intent/cancel"
-    ) {
-        return RouteBodyPolicy::Json(16 * 1024);
-    }
-    if matches!(
-        path,
-        "/api/v1/mail/send"
-            | "/api/v1/mail/reply"
-            | "/api/v1/mail/forward"
-            | "/api/v1/mail/draft"
-            | "/api/v1/onenote/create"
-            | "/api/v1/onenote/append"
-    ) {
-        return RouteBodyPolicy::Json(64 * 1024);
-    }
-    if matches!(
-        path,
-        "/api/v1/agent/connectivity/preflight"
-            | "/api/v1/agent/credential/refresh"
-            | "/api/v1/agent/session/create"
-            | "/api/v1/agent/session/select"
-            | "/api/v1/agent/session/archive"
-            | "/api/v1/agent/user-presence/start"
-            | "/api/v1/agent/user-presence/confirm"
-            | "/api/v1/agent/session/pairing/create"
-            | "/api/v1/agent/session/pairing/reveal"
-            | "/api/v1/agent/session/pairing/claim"
-            | "/api/v1/agent/session/pairing/finalize"
-            | "/api/v1/agent/session/pairing/revoke"
-            | "/api/v1/agent/turn/cancel"
-            | "/api/v1/agent/pending/cancel"
-            | "/api/v1/agent/confirm"
-            | "/api/v1/agent/model"
-            | "/api/v1/agent/oauth/cancel"
-            | "/api/v1/agent/oauth/complete"
-            | "/api/v1/agent/oauth/start"
-            | "/api/v1/agent/oauth/logout"
-            | "/api/v1/agent/oauth/lifecycle/resume"
-            | "/api/v1/mail/move"
-            | "/api/v1/mail/read"
-            | "/api/v1/mail/flag"
-            | "/api/v1/mail/categories"
-            | "/api/v1/calendar/create"
-            | "/api/v1/calendar/update"
-            | "/api/v1/calendar/delete"
-            | "/api/v1/calendar/respond"
-            | "/api/v1/contact/create"
-            | "/api/v1/contact/update"
-            | "/api/v1/contact/delete"
-            | "/api/v1/todo/create"
-            | "/api/v1/todo/update"
-            | "/api/v1/todo/complete"
-            | "/api/v1/todo/delete"
-            | "/api/v1/todo/checklist-add"
-            | "/api/v1/todo/checklist-toggle"
-            | "/api/v1/todo/checklist-delete"
-            | "/api/v1/todo/list-create"
-            | "/api/v1/todo/list-delete"
-            | "/api/v1/sync/pause"
-            | "/api/v1/sync/resume"
-            | "/api/v1/sync/now"
-            | "/api/v1/verify"
-            | "/api/v1/settings"
-            | "/api/v1/restore"
-            | "/api/v1/backup"
-            | "/api/v1/jobs/cancel"
-            | "/api/v1/share"
-            | "/api/v1/onenote/delete"
-            | "/api/v1/account/login/start"
-            | "/api/v1/account/login/poll"
-            | "/api/v1/account/login/cancel"
-            | "/api/v1/account/signout"
-            | "/api/v1/onedrive/transfers/cancel"
-            | "/api/v1/onedrive/transfers/pause"
-            | "/api/v1/onedrive/transfers/retry"
-            | "/api/v1/onedrive/create"
-            | "/api/v1/onedrive/rename"
-            | "/api/v1/onedrive/move"
-            | "/api/v1/onedrive/delete"
-            | "/api/v1/onedrive/mode"
-            | "/api/v1/onedrive/free-up"
-            | "/api/v1/onedrive/download-now"
-            | "/api/v1/onedrive/conflict/resolve"
-            | "/api/v1/onedrive/cleanup"
-            | "/api/v1/push/register"
-            | "/api/v1/push/test"
-    ) {
-        return RouteBodyPolicy::Json(AGENT_STRICT_JSON_MAX_BYTES);
-    }
-    RouteBodyPolicy::None
+    crate::product_post_route(path)
+        .map(|spec| RouteBodyPolicy::Json(spec.body_limit))
+        .unwrap_or(RouteBodyPolicy::None)
 }
 
 #[cfg(test)]
@@ -1093,6 +996,7 @@ pub fn serve_unix(path: &std::path::Path, router: Router) -> std::io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AGENT_STRICT_JSON_MAX_BYTES;
 
     #[test]
     fn parses_request_line() {
@@ -1242,101 +1146,31 @@ mod tests {
 
     #[test]
     fn every_post_route_has_one_dispatch_domain_and_body_policy() {
-        let routes = [
-            "/api/v1/restore",
-            "/api/v1/backup",
-            "/api/v1/jobs/cancel",
-            "/api/v1/share",
-            "/api/v1/sync/pause",
-            "/api/v1/sync/resume",
-            "/api/v1/sync/now",
-            "/api/v1/verify",
-            "/api/v1/settings",
-            "/api/v1/mail/send",
-            "/api/v1/mail/reply",
-            "/api/v1/mail/forward",
-            "/api/v1/mail/move",
-            "/api/v1/mail/read",
-            "/api/v1/mail/flag",
-            "/api/v1/mail/categories",
-            "/api/v1/mail/draft",
-            "/api/v1/calendar/create",
-            "/api/v1/calendar/update",
-            "/api/v1/calendar/delete",
-            "/api/v1/calendar/respond",
-            "/api/v1/contact/create",
-            "/api/v1/contact/update",
-            "/api/v1/contact/delete",
-            "/api/v1/todo/create",
-            "/api/v1/todo/update",
-            "/api/v1/todo/complete",
-            "/api/v1/todo/delete",
-            "/api/v1/todo/checklist-add",
-            "/api/v1/todo/checklist-toggle",
-            "/api/v1/todo/checklist-delete",
-            "/api/v1/todo/list-create",
-            "/api/v1/todo/list-delete",
-            "/api/v1/onenote/create",
-            "/api/v1/onenote/delete",
-            "/api/v1/onenote/append",
-            "/api/v1/onedrive/transfers/cancel",
-            "/api/v1/onedrive/transfers/pause",
-            "/api/v1/onedrive/transfers/retry",
-            "/api/v1/onedrive/create",
-            "/api/v1/onedrive/rename",
-            "/api/v1/onedrive/move",
-            "/api/v1/onedrive/delete",
-            "/api/v1/onedrive/mode",
-            "/api/v1/mutation-intent/create",
-            "/api/v1/mutation-intent/chunk",
-            "/api/v1/mutation-intent/commit",
-            "/api/v1/mutation-intent/cancel",
-            "/api/v1/onedrive/free-up",
-            "/api/v1/onedrive/download-now",
-            "/api/v1/onedrive/conflict/resolve",
-            "/api/v1/onedrive/cleanup",
-            "/api/v1/account/login/start",
-            "/api/v1/account/login/poll",
-            "/api/v1/account/login/cancel",
-            "/api/v1/account/signout",
-            "/api/v1/push/register",
-            "/api/v1/push/test",
-            "/api/v1/agent/turn",
-            "/api/v1/agent/session/create",
-            "/api/v1/agent/session/select",
-            "/api/v1/agent/session/archive",
-            "/api/v1/agent/user-presence/start",
-            "/api/v1/agent/user-presence/confirm",
-            "/api/v1/agent/session/pairing/create",
-            "/api/v1/agent/session/pairing/reveal",
-            "/api/v1/agent/session/pairing/claim",
-            "/api/v1/agent/session/pairing/finalize",
-            "/api/v1/agent/session/pairing/revoke",
-            "/api/v1/agent/confirm",
-            "/api/v1/agent/turn/cancel",
-            "/api/v1/agent/pending/cancel",
-            "/api/v1/agent/connectivity/preflight",
-            "/api/v1/agent/credential/refresh",
-            "/api/v1/agent/oauth/start",
-            "/api/v1/agent/oauth/logout",
-            "/api/v1/agent/oauth/lifecycle/resume",
-            "/api/v1/agent/oauth/cancel",
-            "/api/v1/agent/oauth/complete",
-            "/api/v1/agent/model",
-        ];
-        let unique = routes
+        let unique_paths = crate::PRODUCT_POST_ROUTES
             .iter()
-            .copied()
+            .map(|spec| spec.path)
+            .collect::<std::collections::BTreeSet<_>>();
+        let unique_domains = crate::PRODUCT_POST_ROUTES
+            .iter()
+            .map(|spec| spec.domain)
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
-            unique.len(),
-            routes.len(),
+            unique_paths.len(),
+            crate::PRODUCT_POST_ROUTES.len(),
             "duplicate POST route in catalogue"
         );
-        for route in routes {
-            assert!(
-                matches!(route_body_policy("POST", route), RouteBodyPolicy::Json(_)),
-                "{route} has no pre-allocation body policy"
+        assert_eq!(
+            unique_domains.len(),
+            crate::PRODUCT_POST_ROUTES.len(),
+            "duplicate POST idempotency domain in catalogue"
+        );
+        for spec in crate::PRODUCT_POST_ROUTES {
+            assert_eq!(spec.domain, format!("post:{}", spec.path));
+            assert_eq!(
+                route_body_policy("POST", spec.path),
+                RouteBodyPolicy::Json(spec.body_limit),
+                "{} has a divergent pre-allocation policy",
+                spec.path
             );
         }
     }

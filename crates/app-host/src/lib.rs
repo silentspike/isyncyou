@@ -557,6 +557,18 @@ fn turn_admission_digest(request: &isyncyou_webui::AgentTurnRequest) -> [u8; 32]
     feature = "agent-subscription-experimental",
     test
 ))]
+fn turn_admission_digest_hex(request: &isyncyou_webui::AgentTurnRequest) -> String {
+    turn_admission_digest(request)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
 const MAX_ACTIVE_TURN_ADMISSIONS: usize = 256;
 
 #[cfg(any(
@@ -1067,6 +1079,25 @@ impl Drop for TurnAdmissionLease {
 
 #[cfg(any(
     feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+struct DurableTurnAdmissionLease {
+    store: Arc<agent_control_store::AgentControlStore>,
+    request_id: String,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+impl Drop for DurableTurnAdmissionLease {
+    fn drop(&mut self) {
+        let _ = self.store.complete_agent_turn_admission(&self.request_id);
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental",
     test
 ))]
@@ -1537,6 +1568,7 @@ struct ReservedAgentTurn {
     turn_state: Arc<Mutex<TurnAuthorityState>>,
     cancellation: isyncyou_agent::CancellationToken,
     admission: TurnAdmissionLease,
+    durable_admission: DurableTurnAdmissionLease,
 }
 
 #[cfg(any(
@@ -8273,6 +8305,7 @@ impl DaemonAgent {
         turn_id: String,
         provider: Option<ProductProviderId>,
         admission: TurnAdmissionLease,
+        durable_admission: DurableTurnAdmissionLease,
     ) -> Result<ReservedAgentTurn, String> {
         let sequence = self.seq.fetch_add(1, Ordering::SeqCst);
         let rx_events = self.hub.open(&turn_id, 256);
@@ -8324,6 +8357,7 @@ impl DaemonAgent {
             turn_state,
             cancellation,
             admission,
+            durable_admission,
         })
     }
 
@@ -8356,6 +8390,7 @@ impl DaemonAgent {
             turn_state,
             cancellation,
             admission,
+            durable_admission,
         } = reserved;
         let hub = self.hub.clone();
         let tid = turn_id.clone();
@@ -8386,6 +8421,7 @@ impl DaemonAgent {
             .name(format!("agent-turn-{n}"))
             .spawn(move || {
                 let _admission = admission;
+                let _durable_admission = durable_admission;
                 let mut keep_turn_authority = false;
                 #[cfg(any(
                     feature = "agent-oauth-providers",
@@ -8804,6 +8840,26 @@ impl DaemonAgent {
         }
         self.hub.close(reserved_turn_id);
         self.turns.remove(reserved_turn_id);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn recover_durable_turn_admissions(self: &Arc<Self>) -> Result<usize, String> {
+        let Some(store) = self.control_store.as_ref() else {
+            return Ok(0);
+        };
+        let admissions = store.recover_agent_turn_admissions(MAX_ACTIVE_TURN_ADMISSIONS)?;
+        let mut started = 0usize;
+        for admission in admissions {
+            if turn_id_from_request_id(&admission.request.request_id)? != admission.turn_id {
+                return Err("turn_admission_unavailable".into());
+            }
+            isyncyou_webui::AgentHandler::start_turn_request(Arc::clone(self), admission.request)?;
+            started = started.saturating_add(1);
+        }
+        Ok(started)
     }
 }
 
@@ -9852,16 +9908,36 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 return Err("session_account_mismatch".into());
             }
             let turn_id = turn_id_from_request_id(&request.request_id)?;
-            let admission = match self
-                .turn_admissions
-                .reserve(&turn_id, turn_admission_digest(&request))?
-            {
-                Some(admission) => admission,
-                None => return Ok(turn_id),
+            let digest = turn_admission_digest(&request);
+            let digest_hex = turn_admission_digest_hex(&request);
+            let control_store = self
+                .control_store
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| "session_store_unavailable".to_string())?;
+            let durable_begin =
+                control_store.begin_agent_turn_admission(&request, &turn_id, &digest_hex)?;
+            let admission = match self.turn_admissions.reserve(&turn_id, digest) {
+                Ok(Some(admission)) => admission,
+                Ok(None) => return Ok(turn_id),
+                Err(error) => {
+                    if durable_begin == agent_control_store::AgentTurnAdmissionBegin::Inserted {
+                        let _ = control_store.complete_agent_turn_admission(&request.request_id);
+                    }
+                    return Err(error);
+                }
+            };
+            let durable_admission = DurableTurnAdmissionLease {
+                store: Arc::clone(&control_store),
+                request_id: request.request_id.clone(),
             };
             let selected_provider = self.agent_settings().map(|settings| settings.provider);
-            let reserved =
-                self.reserve_agent_turn(turn_id.clone(), selected_provider, admission)?;
+            let reserved = self.reserve_agent_turn(
+                turn_id.clone(),
+                selected_provider,
+                admission,
+                durable_admission,
+            )?;
             let cached_context = self
                 .hot_session_history
                 .context_snapshot(&request.session_id);
@@ -13202,6 +13278,11 @@ pub fn build_live_router(
         agent_policy,
         agent_gate,
     ));
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    let _ = agent.recover_durable_turn_admissions();
     let router = base
         .with_onedrive_info(Arc::new(DaemonOneDriveInfo { cfg: cfg.clone() }))
         .with_onedrive_list(Arc::new(DaemonOneDriveList { cfg: cfg.clone() }))
@@ -15476,7 +15557,7 @@ mod tests {
         feature = "agent-subscription-experimental"
     ))]
     #[test]
-    fn agent_turn_admission_returns_reserved_turn_before_onedrive_manifest_work() {
+    fn agent_turn_admission_is_durable_before_ack_and_precedes_manifest_work() {
         let source = include_str!("lib.rs");
         let function = source
             .split("fn start_turn_request(")
@@ -15485,6 +15566,9 @@ mod tests {
             .split("fn pending_binding(")
             .next()
             .expect("start_turn_request boundary");
+        let durable = function
+            .find("begin_agent_turn_admission")
+            .expect("durable turn admission");
         let reserve = function
             .find("reserve_agent_turn")
             .expect("turn reservation");
@@ -15497,11 +15581,33 @@ mod tests {
         let manifest = function.find("begin_turn").expect("manifest admission");
         let response = function.rfind("Ok(turn_id)").expect("immediate response");
 
+        assert!(durable < reserve);
         assert!(reserve < spawn);
         assert!(spawn < provider);
         assert!(spawn < manifest);
         assert!(manifest < response);
         assert!(function[..spawn].find("begin_turn").is_none());
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn live_router_recovers_durable_turn_admissions_before_serving_requests() {
+        let source = include_str!("lib.rs");
+        let builder = source
+            .split("pub fn build_live_router(")
+            .nth(1)
+            .expect("live router builder")
+            .split("fn with_mutation_intents_if_available")
+            .next()
+            .expect("live router boundary");
+        let construct = builder.find("DaemonAgent::new_with_policy").unwrap();
+        let recovery = builder.find("recover_durable_turn_admissions").unwrap();
+        let route_wiring = builder.find("let router = base").unwrap();
+        assert!(construct < recovery);
+        assert!(recovery < route_wiring);
     }
 
     #[cfg(any(

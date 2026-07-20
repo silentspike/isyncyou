@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const CONTROL_KEY_DOMAIN: &[u8] = b"isyncyou-agent-control-store-root/v1";
 const CONTROL_SUBKEY_SALT: &[u8] = b"isyncyou-agent-control-store-subkeys/v1";
 const SQLCIPHER_KEY_INFO: &[u8] = b"isyncyou-agent-control-sqlcipher/v1";
@@ -31,6 +31,8 @@ const MAX_MUTATION_CHUNKS: u32 = 8_192;
 const MUTATION_FREE_SPACE_RESERVE: u64 = 128 * 1024 * 1024;
 const PRODUCT_REQUEST_RECEIPT_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 const AGENT_TURN_ROUTE_DOMAIN: &str = "post:/api/v1/agent/turn";
+const MAX_AGENT_TURN_ADMISSIONS: i64 = 8;
+const MAX_AGENT_TURN_ADMISSION_BYTES: usize = 40 * 1024;
 
 type MutationCommitRow = (
     Vec<u8>,
@@ -53,11 +55,33 @@ pub(crate) struct StoredProductResponseV1 {
     pub headers: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProductRequestBegin {
     Execute,
     Replay(StoredProductResponseV1),
     Conflict,
     OutcomeUnknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentTurnAdmissionV1 {
+    version: u32,
+    turn_id: String,
+    payload_digest: String,
+    request: isyncyou_webui::AgentTurnRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoveredAgentTurnAdmission {
+    pub request: isyncyou_webui::AgentTurnRequest,
+    pub turn_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentTurnAdmissionBegin {
+    Inserted,
+    Existing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -464,6 +488,31 @@ impl AgentControlStore {
                  );
                  CREATE INDEX IF NOT EXISTS product_request_receipt_expiry
                    ON product_request_receipts(expires_at_ms);
+                 CREATE TABLE IF NOT EXISTS product_request_bindings (
+                   request_id TEXT PRIMARY KEY NOT NULL,
+                   route_domain TEXT NOT NULL,
+                   payload_digest TEXT NOT NULL,
+                   expires_at_ms INTEGER NOT NULL,
+                   logical_bytes INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS product_request_binding_expiry
+                   ON product_request_bindings(expires_at_ms);
+                 INSERT OR IGNORE INTO product_request_bindings(
+                   request_id,route_domain,payload_digest,expires_at_ms,logical_bytes
+                 )
+                 SELECT request_id,route_domain,payload_digest,expires_at_ms,
+                   length(request_id) + length(route_domain) + length(payload_digest) + 128
+                 FROM product_request_receipts;
+                 CREATE TABLE IF NOT EXISTS agent_turn_admissions (
+                   request_id TEXT PRIMARY KEY NOT NULL,
+                   turn_id TEXT UNIQUE NOT NULL,
+                   payload_digest TEXT NOT NULL,
+                   sealed_request BLOB NOT NULL,
+                   created_at_ms INTEGER NOT NULL,
+                   logical_bytes INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS agent_turn_admission_created
+                   ON agent_turn_admissions(created_at_ms,request_id);
                  CREATE TABLE IF NOT EXISTS mutation_chunks (
                    intent_id TEXT NOT NULL,
                    chunk_index INTEGER NOT NULL,
@@ -570,13 +619,24 @@ impl AgentControlStore {
                 params![u64_to_i64(now_ms)?, limit],
             )
             .map_err(|_| "control_store_unavailable")?;
+        let product_bindings = connection
+            .execute(
+                "DELETE FROM product_request_bindings
+                 WHERE request_id IN (
+                   SELECT request_id FROM product_request_bindings
+                   WHERE expires_at_ms < ?1 LIMIT ?2
+                 )",
+                params![u64_to_i64(now_ms)?, limit],
+            )
+            .map_err(|_| "control_store_unavailable")?;
         Ok(confirmations
             .saturating_add(presence)
             .saturating_add(pairing)
             .saturating_add(reveal_responses)
             .saturating_add(claims)
             .saturating_add(expired_intents)
-            .saturating_add(product_receipts))
+            .saturating_add(product_receipts)
+            .saturating_add(product_bindings))
     }
 
     pub(crate) fn pending_cancel_projections(
@@ -2199,6 +2259,48 @@ impl AgentControlStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| "request_store_unavailable")?;
+        let binding: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT route_domain,payload_digest FROM product_request_bindings
+                 WHERE request_id=?1",
+                params![request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| "request_store_unavailable")?;
+        match binding {
+            Some((stored_route, stored_digest))
+                if stored_route != route_domain || stored_digest != payload_digest =>
+            {
+                return Ok(ProductRequestBegin::Conflict);
+            }
+            Some(_) => {}
+            None => {
+                let binding_bytes = i64::try_from(
+                    request_id
+                        .len()
+                        .saturating_add(route_domain.len())
+                        .saturating_add(payload_digest.len())
+                        .saturating_add(128),
+                )
+                .map_err(|_| "request_store_unavailable")?;
+                enforce_control_quota(&transaction, binding_bytes)?;
+                transaction
+                    .execute(
+                        "INSERT INTO product_request_bindings(
+                           request_id,route_domain,payload_digest,expires_at_ms,logical_bytes
+                         ) VALUES(?1,?2,?3,?4,?5)",
+                        params![
+                            request_id,
+                            route_domain,
+                            payload_digest,
+                            expires_at_ms,
+                            binding_bytes
+                        ],
+                    )
+                    .map_err(|_| "request_store_unavailable")?;
+            }
+        }
         let existing: Option<(String, String, String, Option<Vec<u8>>)> = transaction
             .query_row(
                 "SELECT route_domain,payload_digest,state,sealed_response
@@ -2328,6 +2430,154 @@ impl AgentControlStore {
             )
             .map(|_| ())
             .map_err(|_| "request_store_unavailable".into())
+    }
+
+    pub(crate) fn begin_agent_turn_admission(
+        &self,
+        request: &isyncyou_webui::AgentTurnRequest,
+        turn_id: &str,
+        payload_digest: &str,
+    ) -> Result<AgentTurnAdmissionBegin, String> {
+        if request.request_id.len() > 64 || turn_id.len() > 128 || !valid_sha256(payload_digest) {
+            return Err("turn_admission_unavailable".into());
+        }
+        let record = AgentTurnAdmissionV1 {
+            version: 1,
+            turn_id: turn_id.to_owned(),
+            payload_digest: payload_digest.to_owned(),
+            request: request.clone(),
+        };
+        let plaintext = serde_json::to_vec(&record).map_err(|_| "turn_admission_unavailable")?;
+        if plaintext.len() > MAX_AGENT_TURN_ADMISSION_BYTES {
+            return Err("turn_admission_unavailable".into());
+        }
+        let sealed = seal_row(
+            &self.row_wrap_key,
+            "agent-turn-admission",
+            &request.request_id,
+            &plaintext,
+        )?;
+        let logical_bytes = i64::try_from(sealed.len().saturating_add(256))
+            .map_err(|_| "turn_admission_unavailable")?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| "turn_admission_unavailable")?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| "turn_admission_unavailable")?;
+        let existing: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT turn_id,payload_digest FROM agent_turn_admissions
+                 WHERE request_id=?1",
+                params![request.request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| "turn_admission_unavailable")?;
+        if let Some((stored_turn_id, stored_digest)) = existing {
+            return if stored_turn_id == turn_id && stored_digest == payload_digest {
+                Ok(AgentTurnAdmissionBegin::Existing)
+            } else {
+                Err("request_id_conflict".into())
+            };
+        }
+        let count: i64 = transaction
+            .query_row("SELECT COUNT(*) FROM agent_turn_admissions", [], |row| {
+                row.get(0)
+            })
+            .map_err(|_| "turn_admission_unavailable")?;
+        if count >= MAX_AGENT_TURN_ADMISSIONS {
+            return Err("turn_registry_unavailable".into());
+        }
+        enforce_control_quota(&transaction, logical_bytes)?;
+        transaction
+            .execute(
+                "INSERT INTO agent_turn_admissions(
+                   request_id,turn_id,payload_digest,sealed_request,created_at_ms,logical_bytes
+                 ) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    request.request_id,
+                    turn_id,
+                    payload_digest,
+                    sealed,
+                    u64_to_i64(crate::unix_now_ms())?,
+                    logical_bytes
+                ],
+            )
+            .map_err(|_| "turn_admission_unavailable")?;
+        transaction
+            .commit()
+            .map_err(|_| "turn_admission_unavailable")?;
+        Ok(AgentTurnAdmissionBegin::Inserted)
+    }
+
+    pub(crate) fn recover_agent_turn_admissions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RecoveredAgentTurnAdmission>, String> {
+        let limit = i64::try_from(limit.min(MAX_AGENT_TURN_ADMISSIONS as usize))
+            .map_err(|_| "turn_admission_unavailable")?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "turn_admission_unavailable")?;
+        let mut statement = connection
+            .prepare(
+                "SELECT request_id,turn_id,payload_digest,sealed_request
+                 FROM agent_turn_admissions
+                 ORDER BY created_at_ms,request_id LIMIT ?1",
+            )
+            .map_err(|_| "turn_admission_unavailable")?;
+        let rows = statement
+            .query_map(params![limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            })
+            .map_err(|_| "turn_admission_unavailable")?;
+        let mut recovered = Vec::new();
+        for row in rows {
+            let (request_id, turn_id, payload_digest, sealed) =
+                row.map_err(|_| "turn_admission_unavailable")?;
+            let plaintext = open_row(
+                &self.row_wrap_key,
+                "agent-turn-admission",
+                &request_id,
+                &sealed,
+            )?;
+            let record: AgentTurnAdmissionV1 =
+                serde_json::from_slice(&plaintext).map_err(|_| "turn_admission_unavailable")?;
+            if record.version != 1
+                || record.request.request_id != request_id
+                || record.turn_id != turn_id
+                || record.payload_digest != payload_digest
+            {
+                return Err("turn_admission_unavailable".into());
+            }
+            recovered.push(RecoveredAgentTurnAdmission {
+                request: record.request,
+                turn_id: record.turn_id,
+            });
+        }
+        Ok(recovered)
+    }
+
+    pub(crate) fn complete_agent_turn_admission(&self, request_id: &str) -> Result<(), String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "turn_admission_unavailable")?;
+        connection
+            .execute(
+                "DELETE FROM agent_turn_admissions WHERE request_id=?1",
+                params![request_id],
+            )
+            .map(|_| ())
+            .map_err(|_| "turn_admission_unavailable".into())
     }
 }
 
@@ -2656,7 +2906,7 @@ fn initialize_metadata(
         }
         match schema.parse::<i64>() {
             Ok(SCHEMA_VERSION) => {}
-            Ok(1 | 2) if SCHEMA_VERSION == 3 => {
+            Ok(1..=3) if SCHEMA_VERSION == 4 => {
                 connection
                     .execute(
                         "UPDATE control_metadata SET value=?1 WHERE key='schema_version'",
@@ -2753,7 +3003,9 @@ fn enforce_control_quota(connection: &Connection, additional_bytes: i64) -> Resu
                COALESCE((SELECT SUM(logical_bytes) FROM pairing_claims),0) +
                COALESCE((SELECT SUM(logical_bytes) FROM pairing_revocations),0) +
                COALESCE((SELECT SUM(logical_bytes) FROM mutation_request_bindings),0) +
+               COALESCE((SELECT SUM(logical_bytes) FROM product_request_bindings),0) +
                COALESCE((SELECT SUM(logical_bytes) FROM product_request_receipts),0) +
+               COALESCE((SELECT SUM(logical_bytes) FROM agent_turn_admissions),0) +
                COALESCE((SELECT SUM(logical_bytes) FROM mutation_intents),0)",
             [],
             |row| row.get(0),
@@ -3143,6 +3395,99 @@ mod tests {
     }
 
     #[test]
+    fn product_request_uuid_binding_survives_retryable_abort_across_route_families() {
+        let root = temp_root("product-request-global-binding");
+        let credential_store = credential_store(&root);
+        let control =
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let request_id = "019f0000-0000-4000-8000-000000000302";
+        let route = "post:/api/v1/agent/session/create";
+        let digest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        assert_eq!(
+            control
+                .begin_product_request(request_id, route, digest)
+                .unwrap(),
+            ProductRequestBegin::Execute
+        );
+        control
+            .abort_product_request(request_id, route, digest)
+            .unwrap();
+        assert!(matches!(
+            control
+                .begin_product_request(request_id, route, digest)
+                .unwrap(),
+            ProductRequestBegin::Execute
+        ));
+        control
+            .abort_product_request(request_id, route, digest)
+            .unwrap();
+        assert!(matches!(
+            control
+                .begin_product_request(request_id, "post:/api/v1/mutation-intent/create", digest,)
+                .unwrap(),
+            ProductRequestBegin::Conflict
+        ));
+    }
+
+    #[test]
+    fn agent_turn_admission_is_encrypted_restart_recoverable_and_conflict_safe() {
+        let root = temp_root("agent-turn-admission");
+        let credential_store = credential_store(&root);
+        let request = isyncyou_webui::AgentTurnRequest {
+            request_id: "019f0000-0000-4000-8000-000000000303".into(),
+            session_id: "01JSESSION00000000000000000".into(),
+            account: "controlled".into(),
+            prompt: "Read one controlled item".into(),
+        };
+        let turn_id = "01JTURN0000000000000000000";
+        let digest = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        {
+            let control =
+                AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1)
+                    .unwrap();
+            assert_eq!(
+                control
+                    .begin_agent_turn_admission(&request, turn_id, digest)
+                    .unwrap(),
+                AgentTurnAdmissionBegin::Inserted
+            );
+            assert_eq!(
+                control
+                    .begin_agent_turn_admission(&request, turn_id, digest)
+                    .unwrap(),
+                AgentTurnAdmissionBegin::Existing
+            );
+            let mut changed = request.clone();
+            changed.prompt = "Different request".into();
+            assert_eq!(
+                control
+                    .begin_agent_turn_admission(
+                        &changed,
+                        turn_id,
+                        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    )
+                    .unwrap_err(),
+                "request_id_conflict"
+            );
+        }
+
+        let control =
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        assert_eq!(
+            control.recover_agent_turn_admissions(8).unwrap(),
+            vec![RecoveredAgentTurnAdmission {
+                request: request.clone(),
+                turn_id: turn_id.into(),
+            }]
+        );
+        control
+            .complete_agent_turn_admission(&request.request_id)
+            .unwrap();
+        assert!(control.recover_agent_turn_admissions(8).unwrap().is_empty());
+    }
+
+    #[test]
     fn product_request_validation_abort_allows_corrected_retry() {
         let root = temp_root("product-request-abort");
         let credential_store = credential_store(&root);
@@ -3455,7 +3800,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_control_store_migrates_v1_metadata_to_v2_transactionally() {
+    fn agent_control_store_migrates_v1_metadata_to_current_schema_transactionally() {
         let connection = Connection::open_in_memory().unwrap();
         connection
             .execute_batch(
@@ -3475,7 +3820,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema, "3");
+        assert_eq!(schema, "4");
     }
 
     #[test]
@@ -4555,8 +4900,10 @@ mod tests {
                  CREATE TABLE pairing_claims(logical_bytes INTEGER NOT NULL);
                  CREATE TABLE pairing_revocations(logical_bytes INTEGER NOT NULL);
                  CREATE TABLE mutation_request_bindings(logical_bytes INTEGER NOT NULL);
+                 CREATE TABLE product_request_bindings(logical_bytes INTEGER NOT NULL);
                  CREATE TABLE mutation_intents(logical_bytes INTEGER NOT NULL);
-                 CREATE TABLE product_request_receipts(logical_bytes INTEGER NOT NULL);",
+                 CREATE TABLE product_request_receipts(logical_bytes INTEGER NOT NULL);
+                 CREATE TABLE agent_turn_admissions(logical_bytes INTEGER NOT NULL);",
             )
             .unwrap();
         connection
