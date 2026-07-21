@@ -536,6 +536,42 @@ fn product_turn_terminal_error(
     feature = "agent-subscription-experimental",
     test
 ))]
+fn provider_failure_is_definitive(error: &isyncyou_agent::AgentError) -> bool {
+    let isyncyou_agent::AgentError::Provider(code) = error else {
+        return false;
+    };
+    matches!(
+        code.as_str(),
+        "codex_safe:authorization_rejected"
+            | "codex_safe:reasoning_context"
+            | "codex_safe:function_call_pairing"
+            | "codex_safe:context_limit"
+            | "codex_safe:http_rate_limited"
+            | "codex_safe:http_bad_request"
+            | "codex_safe:http_request_rejected"
+            | "subscription_safe:authorization_rejected"
+            | "subscription_safe:http_rate_limited"
+            | "subscription_safe:http_request_rejected"
+    )
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
+fn provider_outcome_is_ambiguous(
+    error: &isyncyou_agent::AgentError,
+    provider_step_in_flight: bool,
+) -> bool {
+    provider_step_in_flight && !provider_failure_is_definitive(error)
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
 fn agent_safe_outcome_diagnostic(code: &str) -> &'static str {
     match code {
         "assistant_archive_unavailable" => "assistant_archive_unavailable",
@@ -9282,8 +9318,11 @@ impl DaemonAgent {
                         }
                     }
                     Err(error) => {
-                        let provider_outcome_ambiguous = product_turn.as_ref().is_some_and(
-                            product_session::ProductTurnRuntime::provider_outcome_is_ambiguous,
+                        let provider_outcome_ambiguous = provider_outcome_is_ambiguous(
+                            &error,
+                            product_turn.as_ref().is_some_and(
+                                product_session::ProductTurnRuntime::provider_outcome_is_ambiguous,
+                            ),
                         );
                         let diagnostic_code = agent_safe_turn_error(&error).to_owned();
                         let safe_error =
@@ -14452,21 +14491,53 @@ mod tests {
     }
 
     #[test]
-    fn provider_error_after_durable_step_start_is_outcome_unknown() {
-        let explicit = isyncyou_agent::AgentError::Provider("http_bad_request".into());
+    fn definitive_provider_rejection_after_durable_step_start_is_failed() {
+        for code in [
+            "codex_safe:authorization_rejected",
+            "codex_safe:reasoning_context",
+            "codex_safe:function_call_pairing",
+            "codex_safe:context_limit",
+            "codex_safe:http_rate_limited",
+            "codex_safe:http_bad_request",
+            "codex_safe:http_request_rejected",
+            "subscription_safe:authorization_rejected",
+            "subscription_safe:http_rate_limited",
+            "subscription_safe:http_request_rejected",
+        ] {
+            let explicit = isyncyou_agent::AgentError::Provider(code.into());
+            assert!(provider_failure_is_definitive(&explicit), "{code}");
+            assert!(!provider_outcome_is_ambiguous(&explicit, true), "{code}");
+            assert_ne!(
+                product_turn_terminal_error(
+                    &explicit,
+                    provider_outcome_is_ambiguous(&explicit, true),
+                ),
+                "turn_outcome_unknown",
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_provider_failure_after_durable_step_start_stays_outcome_unknown() {
+        let explicit =
+            isyncyou_agent::AgentError::Provider("codex_safe:http_server_failure".into());
+        assert!(!provider_failure_is_definitive(&explicit));
+        assert!(provider_outcome_is_ambiguous(&explicit, true));
         assert_eq!(
-            product_turn_terminal_error(&explicit, true),
+            product_turn_terminal_error(&explicit, provider_outcome_is_ambiguous(&explicit, true),),
             "turn_outcome_unknown"
-        );
-        assert_eq!(
-            product_turn_terminal_error(&explicit, false),
-            "provider_request_failed"
         );
 
         let transport =
             isyncyou_agent::AgentError::Transport("provider_response_read_failed".into());
+        assert!(!provider_failure_is_definitive(&transport));
+        assert!(provider_outcome_is_ambiguous(&transport, true));
         assert_eq!(
-            product_turn_terminal_error(&transport, true),
+            product_turn_terminal_error(
+                &transport,
+                provider_outcome_is_ambiguous(&transport, true),
+            ),
             "turn_outcome_unknown"
         );
     }
