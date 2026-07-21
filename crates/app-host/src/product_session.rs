@@ -497,13 +497,10 @@ impl ProductTurnRuntime {
             .publish_terminal_with_request_objects(
                 visible_records.clone(),
                 &self.request_id,
-                tombstone.clone(),
+                tombstone,
                 std::mem::take(&mut self.pending_request_objects),
             )
             .map_err(map_session_error)?;
-        let _ = self
-            .guard
-            .compact_terminal_request(&self.request_id, &tombstone);
         self.context_snapshot_after_publish(visible_records)
     }
 
@@ -537,15 +534,10 @@ impl ProductTurnRuntime {
             .publish_terminal_with_request_objects(
                 visible_records.clone(),
                 &self.request_id,
-                tombstone.clone(),
+                tombstone,
                 std::mem::take(&mut self.pending_request_objects),
             )
             .map_err(map_session_error)?;
-        if status != TurnTerminalStatus::OutcomeUnknown {
-            let _ = self
-                .guard
-                .compact_terminal_request(&self.request_id, &tombstone);
-        }
         self.context_snapshot_after_publish(visible_records)
     }
 
@@ -603,13 +595,10 @@ impl ProductTurnRuntime {
             .publish_terminal_with_request_objects(
                 visible_records,
                 &self.request_id,
-                tombstone.clone(),
+                tombstone,
                 request_objects,
             )
             .map_err(map_session_error)?;
-        let _ = self
-            .guard
-            .compact_terminal_request(&self.request_id, &tombstone);
         self.context_snapshot_after_publish(vec![pending_record])
     }
 
@@ -3048,6 +3037,33 @@ mod tests {
         assert!(replay.contains("ProductTurnStart::Replay"));
         assert!(!replay.contains("acquire_lease"));
         assert!(!replay.contains("compact_terminal_request"));
+    }
+
+    #[test]
+    fn terminal_publication_leaves_compaction_to_bounded_maintenance() {
+        let source = include_str!("product_session.rs");
+        let final_path = source
+            .split("pub fn finish_final(")
+            .nth(1)
+            .and_then(|source| source.split("pub fn finish_terminal(").next())
+            .expect("final publication path");
+        let error_path = source
+            .split("pub fn finish_terminal(")
+            .nth(1)
+            .and_then(|source| source.split("fn context_snapshot_after_publish(").next())
+            .expect("terminal publication path");
+        let pending_path = source
+            .split("pub fn finish_pending(")
+            .nth(1)
+            .and_then(|source| source.split("fn terminal_journal(").next())
+            .expect("pending publication path");
+
+        for publication_path in [final_path, error_path, pending_path] {
+            assert!(publication_path.contains("publish_terminal_with_request_objects"));
+            assert!(!publication_path.contains("compact_terminal_request"));
+        }
+        assert!(source.contains("pub(crate) fn maintain_remote_session("));
+        assert!(source.contains("guard\n                .compact_terminal_request"));
     }
 
     #[test]
