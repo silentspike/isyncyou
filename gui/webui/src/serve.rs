@@ -921,8 +921,8 @@ pub fn serve_listener(listener: TcpListener, router: Router) -> std::io::Result<
 /// Bind `addr` and serve `router` forever. Returns only on a fatal bind/accept error.
 pub fn serve(addr: &str, router: Router) -> std::io::Result<()> {
     let listener = bind_loopback(addr)?;
-    let local = listener.local_addr()?;
-    eprintln!("iSyncYou web UI listening on http://{local}/");
+    let _local = listener.local_addr()?;
+    eprintln!("isyncyou_webui_listening_tcp");
     serve_listener(listener, router)
 }
 
@@ -936,8 +936,8 @@ fn spawn_conn<S: Conn + Send + 'static>(mut stream: S, router: Arc<Router>, poli
     }
     std::thread::spawn(move || {
         let _guard = ConnGuard; // decrements the live count when this thread ends
-        if let Err(e) = handle(&mut stream, &router, policy) {
-            eprintln!("connection error: {e}");
+        if let Err(_error) = handle(&mut stream, &router, policy) {
+            eprintln!("isyncyou_webui_connection_failed");
         }
         // dropping `stream` here sends FIN so the client sees a clean EOF; a
         // zero-length drain read could block and delay that close.
@@ -970,7 +970,7 @@ pub fn serve_unix(path: &std::path::Path, router: Router) -> std::io::Result<()>
     }
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    eprintln!("iSyncYou web UI listening on unix:{}", path.display());
+    eprintln!("isyncyou_webui_listening_unix");
     let router = Arc::new(router);
     for stream in listener.incoming() {
         spawn_conn(stream?, Arc::clone(&router), AccessPolicy::UnixSocket);

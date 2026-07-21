@@ -467,7 +467,7 @@ requirements:
       their authoritative session lease, remain bound to the exact provider credential
       generation and product harness, and publish completion only after durable terminal
       state. Cross-device transfer uses a confirmed, one-time, five-minute pairing
-      protocol with encrypted crash recovery. (S-AG.16, #628)
+      protocol with encrypted crash recovery. (S-AG.13, #628)
     status: planned
     design: docs/adr/007-agent-architecture.md
     acceptance:
@@ -476,6 +476,7 @@ requirements:
       - Cancellation and pending cancellation reduce authority; done(complete) is emitted only after terminal persistence and late provider or tool results cannot publish.
       - Desktop and Android use the same strict session/capability/request contract; mutable values are JSON or bounded sealed chunks rather than URL parameters.
       - Pairing is confirmation-gated, single-use, expires after five minutes, and cannot be taken over by another claimant after a durable claim.
+      - Pairing source and claim cleanup authority survives retention expiry until conditional remote deletion succeeds or remote absence is proven.
     verified_by:
       - test: session_v2_round_trips_user_assistant_sources_and_terminal_state
       - test: manifest_cas_atomically_advances_visible_request_and_uuid_binding_heads

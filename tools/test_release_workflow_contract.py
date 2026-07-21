@@ -7,6 +7,7 @@ from tools.release_workflow_contract import (
     EXPECTED_ASSETS,
     candidate_rc_tags,
     classify,
+    require_absent_http_status,
     select_matching_rc,
     validate_release_object,
 )
@@ -126,8 +127,9 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         build = workflow.index("  build:")
         self.assertLess(preflight, build)
         self.assertLess(preflight, android)
-        self.assertIn("release object already exists", workflow)
-        self.assertIn("tag already exists", workflow)
+        self.assertIn("require-absent", workflow)
+        self.assertIn("release existence check unavailable", workflow)
+        self.assertIn("tag existence check unavailable", workflow)
         self.assertIn("stable tag commit is not on main", workflow)
         self.assertIn("matching non-draft RC", workflow)
         self.assertIn("Verify the published release object", workflow)
@@ -135,8 +137,18 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
 
     def test_rc_preflight_rejects_existing_tag_or_release(self):
         workflow = Path(".github/workflows/release.yml").read_text()
-        self.assertIn("release object already exists", workflow)
-        self.assertIn("tag already exists", workflow)
+        self.assertIn("require-absent", workflow)
+        self.assertIn('--status "$release_status"', workflow)
+        self.assertIn('--resource release', workflow)
+        self.assertIn('--resource tag', workflow)
+        self.assertNotIn('releases/tags/$RELEASE_TAG" >/dev/null 2>&1', workflow)
+
+    def test_release_preflight_accepts_only_authoritative_not_found(self):
+        for resource in ("release", "tag"):
+            require_absent_http_status(404, resource)
+            for status in (0, 200, 401, 403, 429, 500, 503):
+                with self.subTest(resource=resource, status=status), self.assertRaises(ContractError):
+                    require_absent_http_status(status, resource)
 
     def test_stable_preflight_requires_peeled_main_tag_matching_rc_and_no_release(self):
         workflow = Path(".github/workflows/release.yml").read_text()
@@ -145,7 +157,7 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         self.assertIn("candidate-rc-tags", workflow)
         self.assertIn("select-rc", workflow)
         self.assertIn('git rev-list -n1 "$rc"', workflow)
-        self.assertIn("release object already exists", workflow)
+        self.assertIn('--resource release', workflow)
 
     @staticmethod
     def _valid_rc_release():

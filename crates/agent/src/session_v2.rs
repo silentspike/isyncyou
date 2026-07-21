@@ -43,9 +43,14 @@ pub const DUPLICATE_TOOL_USE_ID_CODE: &str = "duplicate_tool_use_id";
 pub const SESSION_LEASE_TTL_MS: u64 = 120_000;
 pub const SESSION_LEASE_RENEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const SESSION_LEASE_TAKEOVER_MARGIN_MS: u64 = 5_000;
+// Leave one renewal interval for the bounded transport mutation to finish. A
+// holder that cannot preserve this budget gives up authority instead of racing
+// the five-second takeover margin with an in-flight cloud write/delete.
+const SESSION_LEASE_MUTATION_SAFETY_MS: u64 = 30_000;
 const MAX_SERVER_TIME_SAMPLE_AGE: std::time::Duration = std::time::Duration::from_secs(10);
 const ORPHAN_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 const ORPHAN_REAP_BATCH: usize = 128;
+const ORPHAN_REAP_WORK_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 const MAX_INDEX_PAGE_ENTRIES: usize = 256;
 const MAX_INDEX_PAGE_COALESCE_READS: usize = 1;
 const MAX_RECENT_INDEX_PAGE_READS: usize = 4;
@@ -135,7 +140,7 @@ pub struct PersistedLeaseBinding {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionRecordKind {
     TurnIntent {
         user_text: String,
@@ -389,11 +394,28 @@ impl SessionManifestV1 {
             .checked_add(self.internal_encrypted_bytes)
             .ok_or(SessionV2Error::SessionLimit)?;
         let visible_shape_valid = match self.visible_record_count {
-            0 => self.visible_index_head.is_none() && self.visible_record_head.is_none(),
-            _ => self.visible_index_head.is_some() && self.visible_record_head.is_some(),
+            0 => {
+                self.visible_index_head.is_none()
+                    && self.visible_record_head.is_none()
+                    && self.visible_encrypted_bytes == 0
+            }
+            _ => {
+                self.visible_index_head.is_some()
+                    && self.visible_record_head.is_some()
+                    && self.visible_encrypted_bytes > 0
+            }
         };
-        let internal_shape_valid = self.internal_record_count != 0
-            || (self.request_index_head.is_none() && self.uuid_binding_index_head.is_none());
+        let internal_shape_valid = match self.internal_record_count {
+            0 => {
+                self.request_index_head.is_none()
+                    && self.uuid_binding_index_head.is_none()
+                    && self.internal_encrypted_bytes == 0
+            }
+            _ => {
+                (self.request_index_head.is_some() || self.uuid_binding_index_head.is_some())
+                    && self.internal_encrypted_bytes > 0
+            }
+        };
         let lease_valid = self.active_lease.as_ref().is_none_or(|lease| {
             !self.archived
                 && !lease.lease_id.is_empty()
@@ -783,11 +805,24 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
         }
     }
 
+    #[cfg(test)]
     fn publish(
         &self,
         current: &VersionedManifest,
         commit: SessionCommitV1,
     ) -> Result<VersionedManifest, SessionV2Error> {
+        self.publish_with_pre_cas(current, commit, || Ok(()))
+    }
+
+    fn publish_with_pre_cas<F>(
+        &self,
+        current: &VersionedManifest,
+        commit: SessionCommitV1,
+        mut pre_cas: F,
+    ) -> Result<VersionedManifest, SessionV2Error>
+    where
+        F: FnMut() -> Result<(), SessionV2Error>,
+    {
         validate_publish_base(&current.manifest)?;
         if commit.visible_records.is_empty()
             && commit.request_objects.is_empty()
@@ -818,9 +853,7 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
 
         let mut binding_objects = Vec::with_capacity(commit.uuid_bindings.len());
         for binding in &commit.uuid_bindings {
-            if binding.binding_version != 1 || !valid_uuid_v4(&binding.request_id) {
-                return Err(SessionV2Error::InvalidRequestId);
-            }
+            binding.validate()?;
             let plaintext =
                 serde_json::to_vec(binding).map_err(|_| SessionV2Error::InvalidRecord)?;
             binding_objects.push((binding.request_key.clone(), plaintext));
@@ -922,6 +955,7 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
             request_index_head: request_page.head.clone().map(Some),
             uuid_binding_index_head: binding_page.head.clone().map(Some),
         })?;
+        pre_cas()?;
         self.transport
             .compare_and_swap_manifest(current, &next)
             .map_err(|_| SessionV2Error::LeaseLost)?
@@ -934,6 +968,19 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
         request_id: &str,
         tombstone: &IdempotencyTombstoneV1,
     ) -> Result<VersionedManifest, SessionV2Error> {
+        self.compact_terminal_request_with_pre_cas(current, request_id, tombstone, || Ok(()))
+    }
+
+    fn compact_terminal_request_with_pre_cas<F>(
+        &self,
+        current: &VersionedManifest,
+        request_id: &str,
+        tombstone: &IdempotencyTombstoneV1,
+        mut pre_cas: F,
+    ) -> Result<VersionedManifest, SessionV2Error>
+    where
+        F: FnMut() -> Result<(), SessionV2Error>,
+    {
         if !valid_uuid_v4(request_id) {
             return Err(SessionV2Error::InvalidRecord);
         }
@@ -1044,6 +1091,7 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
             request_index_head: request_index_head.map(Some),
             uuid_binding_index_head: None,
         })?;
+        pre_cas()?;
         self.transport
             .compare_and_swap_manifest(current, &next)?
             .ok_or(SessionV2Error::ManifestConflict)
@@ -1238,6 +1286,74 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
             return Err(SessionV2Error::InvalidRecord);
         }
         Ok(records)
+    }
+
+    /// Load the visible records for one accepted request from one immutable
+    /// manifest snapshot. Maintenance uses this instead of public pagination so
+    /// lease-renewal generation changes cannot invalidate its own cursor.
+    pub fn visible_records_for_request_from_manifest(
+        &self,
+        current: &VersionedManifest,
+        request_id: &str,
+        turn_id: &str,
+    ) -> Result<Vec<SessionRecordV2>, SessionV2Error> {
+        if !valid_uuid_v4(request_id) || !valid_ulid(turn_id) {
+            return Err(SessionV2Error::InvalidRecord);
+        }
+        current.manifest.validate()?;
+        let session_id = &current.manifest.session_id;
+        let entries = self.load_index_entries(
+            session_id,
+            SessionObjectClass::VisibleIndex,
+            current.manifest.visible_index_head.as_ref(),
+        )?;
+        if entries.len() as u64 != current.manifest.visible_record_count {
+            return Err(SessionV2Error::InvalidRecord);
+        }
+        let objects = self.load_indexed_objects_bounded(
+            session_id,
+            SessionObjectClass::VisibleRecord,
+            &entries,
+        )?;
+        if objects.len() != entries.len() {
+            return Err(SessionV2Error::InvalidRecord);
+        }
+
+        let mut expected_head = None;
+        let mut plaintext_bytes = 0u64;
+        let mut matching = Vec::new();
+        for (entry, bytes) in entries.iter().zip(objects) {
+            if !valid_index_entry(entry) {
+                return Err(SessionV2Error::InvalidRecord);
+            }
+            plaintext_bytes = plaintext_bytes
+                .checked_add(u64::try_from(bytes.len()).map_err(|_| SessionV2Error::SessionLimit)?)
+                .ok_or(SessionV2Error::SessionLimit)?;
+            if plaintext_bytes > MAX_SESSION_ENCRYPTED_BYTES {
+                return Err(SessionV2Error::SessionLimit);
+            }
+            let record: SessionRecordV2 =
+                serde_json::from_slice(&bytes).map_err(|_| SessionV2Error::InvalidRecord)?;
+            record.validate()?;
+            if record.session_id != *session_id
+                || record.record_id != entry.object_id
+                || record.observed_head != expected_head
+                || expected_head
+                    .as_ref()
+                    .is_some_and(|head| !record.parent_record_ids.contains(head))
+                || (expected_head.is_none() && !record.parent_record_ids.is_empty())
+            {
+                return Err(SessionV2Error::InvalidRecord);
+            }
+            expected_head = Some(record.record_id.clone());
+            if record.request_id == request_id && record.turn_id == turn_id {
+                matching.push(record);
+            }
+        }
+        if expected_head != current.manifest.visible_record_head {
+            return Err(SessionV2Error::InvalidRecord);
+        }
+        Ok(matching)
     }
 
     pub fn load_request_chain(
@@ -1674,12 +1790,8 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
             entries,
         };
         let bytes = serde_json::to_vec(&page).map_err(|_| SessionV2Error::InvalidRecord)?;
-        let sealed = self
-            .object_crypto
-            .seal(session_id, object_class, &page_id, &bytes)
-            .map_err(|_| SessionV2Error::InvalidRecord)?;
-        self.transport
-            .stage_immutable(object_class, &page_id, &sealed)?;
+        let sealed =
+            self.stage_authenticated_immutable(session_id, object_class, &page_id, &bytes)?;
         Ok(StagedIndexPage {
             head: Some(IndexPageRef {
                 page_id,
@@ -1710,12 +1822,8 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
                 entries: chunk.to_vec(),
             };
             let bytes = serde_json::to_vec(&page).map_err(|_| SessionV2Error::InvalidRecord)?;
-            let sealed = self
-                .object_crypto
-                .seal(session_id, object_class, &page_id, &bytes)
-                .map_err(|_| SessionV2Error::InvalidRecord)?;
-            self.transport
-                .stage_immutable(object_class, &page_id, &sealed)?;
+            let sealed =
+                self.stage_authenticated_immutable(session_id, object_class, &page_id, &bytes)?;
             encrypted_bytes = encrypted_bytes
                 .checked_add(sealed.len() as u64)
                 .ok_or(SessionV2Error::SessionLimit)?;
@@ -1872,6 +1980,7 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
         object_class: SessionObjectClass,
         head: Option<&IndexPageRef>,
         reachable: &mut BTreeSet<(SessionObjectClass, String)>,
+        deadline: std::time::Instant,
     ) -> Result<(), SessionV2Error> {
         let mut cursor = head.cloned();
         let mut seen = BTreeSet::new();
@@ -1880,9 +1989,9 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
             if !seen.insert(reference.page_id.clone()) {
                 return Err(SessionV2Error::InvalidRecord);
             }
-            let sealed = self
-                .transport
-                .load_immutable(index_class, &reference.page_id)?;
+            let sealed =
+                self.transport
+                    .load_immutable_before(index_class, &reference.page_id, deadline)?;
             if bytes_digest(&sealed) != reference.sha256
                 || sealed.len() as u64 != reference.encrypted_bytes
             {
@@ -1915,6 +2024,7 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
     fn reachable_objects(
         &self,
         manifest: &SessionManifestV1,
+        deadline: std::time::Instant,
     ) -> Result<BTreeSet<(SessionObjectClass, String)>, SessionV2Error> {
         let mut reachable = BTreeSet::new();
         self.collect_reachable_index(
@@ -1923,6 +2033,7 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
             SessionObjectClass::VisibleRecord,
             manifest.visible_index_head.as_ref(),
             &mut reachable,
+            deadline,
         )?;
         self.collect_reachable_index(
             &manifest.session_id,
@@ -1930,6 +2041,7 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
             SessionObjectClass::RequestState,
             manifest.request_index_head.as_ref(),
             &mut reachable,
+            deadline,
         )?;
         self.collect_reachable_index(
             &manifest.session_id,
@@ -1937,6 +2049,7 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
             SessionObjectClass::UuidBinding,
             manifest.uuid_binding_index_head.as_ref(),
             &mut reachable,
+            deadline,
         )?;
         Ok(reachable)
     }
@@ -2008,13 +2121,41 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
         object_id: &str,
         plaintext: &[u8],
     ) -> Result<ImmutableIndexEntryV1, SessionV2Error> {
+        let sealed =
+            self.stage_authenticated_immutable(session_id, object_class, object_id, plaintext)?;
+        Ok(index_entry(object_id, &sealed))
+    }
+
+    fn stage_authenticated_immutable(
+        &self,
+        session_id: &str,
+        object_class: SessionObjectClass,
+        object_id: &str,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, SessionV2Error> {
         let sealed = self
             .object_crypto
             .seal(session_id, object_class, object_id, plaintext)
             .map_err(|_| SessionV2Error::InvalidRecord)?;
-        self.transport
-            .stage_immutable(object_class, object_id, &sealed)?;
-        Ok(index_entry(object_id, &sealed))
+        match self
+            .transport
+            .stage_immutable(object_class, object_id, &sealed)
+        {
+            Ok(()) => Ok(sealed),
+            Err(SessionV2Error::ManifestConflict) => {
+                let existing = self.transport.load_immutable(object_class, object_id)?;
+                let existing_plaintext = self
+                    .object_crypto
+                    .open(session_id, object_class, object_id, &existing)
+                    .map_err(|_| SessionV2Error::ManifestConflict)?;
+                if existing_plaintext == plaintext {
+                    Ok(existing)
+                } else {
+                    Err(SessionV2Error::ManifestConflict)
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn stage_sealed_batch(
@@ -2170,8 +2311,25 @@ impl<T: SessionV2Transport + Clone + 'static> SessionV2Store<T> {
         let commit = build_commit(&binding)?;
         let mut leased_current = current;
         leased_current.manifest.active_lease = Some(lease.clone());
-        let current = self.publish(&leased_current, commit)?;
-        self.start_lease_guard(current, lease, now, SESSION_LEASE_RENEW_INTERVAL)
+        let mut last_server_time_ms = now;
+        let current = self.publish_with_pre_cas(&leased_current, commit, || {
+            let pre_cas_now = fresh_server_time_with_retry(&self.transport)?;
+            if pre_cas_now < last_server_time_ms
+                || pre_cas_now
+                    .checked_add(SESSION_LEASE_RENEW_INTERVAL.as_millis() as u64)
+                    .is_none_or(|first_renewal| first_renewal > lease.expires_at_server_ms)
+            {
+                return Err(SessionV2Error::LeaseLost);
+            }
+            last_server_time_ms = pre_cas_now;
+            Ok(())
+        })?;
+        self.start_lease_guard(
+            current,
+            lease,
+            last_server_time_ms,
+            SESSION_LEASE_RENEW_INTERVAL,
+        )
     }
 
     fn acquire_lease_with_interval(
@@ -2398,16 +2556,8 @@ impl<T: SessionV2Transport + Clone + 'static> SessionLeaseGuard<T> {
     }
 
     pub fn publish(&self, commit: SessionCommitV1) -> Result<(), SessionV2Error> {
-        let now = fresh_server_time_with_retry(&self.store.transport)?;
         let mut state = self.state.lock().map_err(|_| SessionV2Error::LeaseLost)?;
-        observe_server_time(&mut state, now)?;
-        if state.lost
-            || now > state.lease.expires_at_server_ms
-            || state.current.manifest.active_lease.as_ref() != Some(&state.lease)
-        {
-            state.lost = true;
-            return Err(SessionV2Error::LeaseLost);
-        }
+        revalidate_publication_time(&self.store.transport, &mut state)?;
         let expected = PersistedLeaseBinding {
             lease_id: state.lease.lease_id.clone(),
             holder_binding: state.lease.holder_binding.clone(),
@@ -2422,7 +2572,12 @@ impl<T: SessionV2Transport + Clone + 'static> SessionLeaseGuard<T> {
             return Err(SessionV2Error::LeaseLost);
         }
         for attempt in 0..MAX_PRE_CAS_PUBLISH_ATTEMPTS {
-            match self.store.publish(&state.current, commit.clone()) {
+            let current = state.current.clone();
+            match self
+                .store
+                .publish_with_pre_cas(&current, commit.clone(), || {
+                    revalidate_publication_time(&self.store.transport, &mut state)
+                }) {
                 Ok(current) => {
                     state.current = current;
                     return Ok(());
@@ -2449,20 +2604,15 @@ impl<T: SessionV2Transport + Clone + 'static> SessionLeaseGuard<T> {
         request_id: &str,
         tombstone: &IdempotencyTombstoneV1,
     ) -> Result<(), SessionV2Error> {
-        let now = fresh_server_time(&self.store.transport)?;
         let mut state = self.state.lock().map_err(|_| SessionV2Error::LeaseLost)?;
-        observe_server_time(&mut state, now)?;
-        if state.lost
-            || now > state.lease.expires_at_server_ms
-            || state.current.manifest.active_lease.as_ref() != Some(&state.lease)
-        {
-            state.lost = true;
-            return Err(SessionV2Error::LeaseLost);
-        }
-        match self
-            .store
-            .compact_terminal_request(&state.current, request_id, tombstone)
-        {
+        revalidate_publication_time(&self.store.transport, &mut state)?;
+        let current = state.current.clone();
+        match self.store.compact_terminal_request_with_pre_cas(
+            &current,
+            request_id,
+            tombstone,
+            || revalidate_publication_time(&self.store.transport, &mut state),
+        ) {
             Ok(current) => {
                 state.current = current;
                 Ok(())
@@ -2542,26 +2692,36 @@ impl<T: SessionV2Transport + Clone + 'static> SessionLeaseGuard<T> {
     }
 
     pub fn reap_orphans(&self) -> Result<usize, SessionV2Error> {
-        let now = fresh_server_time(&self.store.transport)?;
+        let mut state = self.state.lock().map_err(|_| SessionV2Error::LeaseLost)?;
+        revalidate_publication_time(&self.store.transport, &mut state)?;
+        let now = state.last_server_time_ms;
         let Some(cutoff) = now.checked_sub(ORPHAN_RETENTION_MS) else {
             return Ok(0);
         };
-        let mut state = self.state.lock().map_err(|_| SessionV2Error::LeaseLost)?;
-        observe_server_time(&mut state, now)?;
-        if state.lost
-            || now > state.lease.expires_at_server_ms
-            || state.current.manifest.active_lease.as_ref() != Some(&state.lease)
-        {
-            return Err(SessionV2Error::LeaseLost);
-        }
-        let reachable = self.store.reachable_objects(&state.current.manifest)?;
+        let deadline = std::time::Instant::now()
+            .checked_add(ORPHAN_REAP_WORK_BUDGET)
+            .ok_or(SessionV2Error::TransportTimedOut)?;
+        let reachable = self
+            .store
+            .reachable_objects(&state.current.manifest, deadline)?;
+        // The bounded index walk may have consumed most of the lease. Sample
+        // Graph time again before the first destructive request.
+        revalidate_publication_time(&self.store.transport, &mut state)?;
         self.store
             .transport
-            .reap_unreachable(&reachable, cutoff, ORPHAN_REAP_BATCH)
+            .reap_unreachable(&reachable, cutoff, ORPHAN_REAP_BATCH, deadline)
     }
 
     pub fn is_lost(&self) -> bool {
         self.state.lock().map_or(true, |state| state.lost)
+    }
+
+    pub fn manifest_snapshot(&self) -> Result<VersionedManifest, SessionV2Error> {
+        let state = self.state.lock().map_err(|_| SessionV2Error::LeaseLost)?;
+        if state.lost || state.current.manifest.active_lease.as_ref() != Some(&state.lease) {
+            return Err(SessionV2Error::LeaseLost);
+        }
+        Ok(state.current.clone())
     }
 }
 
@@ -2606,6 +2766,25 @@ fn observe_server_time(state: &mut LeaseGuardState, now: u64) -> Result<(), Sess
     Ok(())
 }
 
+fn revalidate_publication_time<T: SessionV2Transport>(
+    transport: &T,
+    state: &mut LeaseGuardState,
+) -> Result<(), SessionV2Error> {
+    let now = fresh_server_time_with_retry(transport)?;
+    observe_server_time(state, now)?;
+    if state.lost
+        || now >= state.lease.expires_at_server_ms
+        || now
+            .checked_add(SESSION_LEASE_MUTATION_SAFETY_MS)
+            .is_none_or(|end| end > state.lease.expires_at_server_ms)
+        || state.current.manifest.active_lease.as_ref() != Some(&state.lease)
+    {
+        state.lost = true;
+        return Err(SessionV2Error::LeaseLost);
+    }
+    Ok(())
+}
+
 fn transient_transport_error(error: &SessionV2Error) -> bool {
     matches!(
         error,
@@ -2619,10 +2798,19 @@ fn renew_lease<T: SessionV2Transport + Clone>(
     store: &SessionV2Store<T>,
     state: &Arc<Mutex<LeaseGuardState>>,
 ) -> Result<(), SessionV2Error> {
-    let now = fresh_server_time(&store.transport)?;
     let mut state = state.lock().map_err(|_| SessionV2Error::LeaseLost)?;
+    // Renewal and publication share this mutex. Sampling after acquisition keeps
+    // mutex wait time from making the server-time decision stale before its CAS.
+    let now = fresh_server_time(&store.transport)?;
     observe_server_time(&mut state, now)?;
-    if state.lost || state.current.manifest.active_lease.as_ref() != Some(&state.lease) {
+    if state.lost
+        || now >= state.lease.expires_at_server_ms
+        || now
+            .checked_add(SESSION_LEASE_MUTATION_SAFETY_MS)
+            .is_none_or(|end| end > state.lease.expires_at_server_ms)
+        || state.current.manifest.active_lease.as_ref() != Some(&state.lease)
+    {
+        state.lost = true;
         return Err(SessionV2Error::LeaseLost);
     }
     let mut lease = state.lease.clone();
@@ -2679,6 +2867,17 @@ pub trait SessionV2Transport: Send + Sync {
         object_class: SessionObjectClass,
         object_id: &str,
     ) -> Result<Vec<u8>, SessionV2Error>;
+    fn load_immutable_before(
+        &self,
+        object_class: SessionObjectClass,
+        object_id: &str,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<u8>, SessionV2Error> {
+        if std::time::Instant::now() >= deadline {
+            return Err(SessionV2Error::TransportTimedOut);
+        }
+        self.load_immutable(object_class, object_id)
+    }
     fn load_immutable_batch(
         &self,
         object_class: SessionObjectClass,
@@ -2703,6 +2902,7 @@ pub trait SessionV2Transport: Send + Sync {
         reachable: &BTreeSet<(SessionObjectClass, String)>,
         older_than_server_ms: u64,
         limit: usize,
+        deadline: std::time::Instant,
     ) -> Result<usize, SessionV2Error>;
     fn compare_and_swap_manifest(
         &self,
@@ -2803,6 +3003,10 @@ struct MemoryV2State {
     cas_calls: usize,
     #[cfg(test)]
     admission_complete_calls: usize,
+    #[cfg(test)]
+    server_time_after_next_stage_ms: Option<u64>,
+    #[cfg(test)]
+    server_time_after_next_immutable_load_ms: Option<u64>,
 }
 
 impl InMemorySessionV2Transport {
@@ -2889,6 +3093,20 @@ impl InMemorySessionV2Transport {
             .lock()
             .map(|state| state.admission_complete_calls)
             .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    fn set_server_time_after_next_stage_ms(&self, server_unix_ms: u64) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.server_time_after_next_stage_ms = Some(server_unix_ms);
+        }
+    }
+
+    #[cfg(test)]
+    fn set_server_time_after_next_immutable_load_ms(&self, server_unix_ms: u64) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.server_time_after_next_immutable_load_ms = Some(server_unix_ms);
+        }
     }
 
     #[cfg(test)]
@@ -2988,6 +3206,10 @@ impl SessionV2Transport for InMemorySessionV2Transport {
         state
             .object_created_at_ms
             .insert((object_class, object_id.to_owned()), created_at_ms);
+        #[cfg(test)]
+        if let Some(server_unix_ms) = state.server_time_after_next_stage_ms.take() {
+            state.server_unix_ms = server_unix_ms;
+        }
         Ok(())
     }
 
@@ -3006,11 +3228,15 @@ impl SessionV2Transport for InMemorySessionV2Transport {
         {
             *state.immutable_load_counts.entry(object_class).or_default() += 1;
         }
-        state
+        let value = state
             .objects
             .get(&(object_class, object_id.to_owned()))
-            .cloned()
-            .ok_or(SessionV2Error::InvalidJournal)
+            .cloned();
+        #[cfg(test)]
+        if let Some(server_unix_ms) = state.server_time_after_next_immutable_load_ms.take() {
+            state.server_unix_ms = server_unix_ms;
+        }
+        value.ok_or(SessionV2Error::InvalidJournal)
     }
 
     fn load_immutable_optional(
@@ -3039,7 +3265,11 @@ impl SessionV2Transport for InMemorySessionV2Transport {
         reachable: &BTreeSet<(SessionObjectClass, String)>,
         older_than_server_ms: u64,
         limit: usize,
+        deadline: std::time::Instant,
     ) -> Result<usize, SessionV2Error> {
+        if std::time::Instant::now() >= deadline {
+            return Err(SessionV2Error::TransportTimedOut);
+        }
         let mut state = self
             .inner
             .lock()
@@ -3303,6 +3533,20 @@ mod onedrive_transport {
                 .map_err(|_| SessionV2Error::TransportTimedOut)
         }
 
+        fn client_before(
+            &self,
+            deadline: std::time::Instant,
+        ) -> Result<GraphClient, SessionV2Error> {
+            self.check_admission_budget()?;
+            self.client
+                .clone_with_deadline(
+                    deadline,
+                    INTERACTIVE_GRAPH_REQUEST_TIMEOUT,
+                    INTERACTIVE_GRAPH_CONNECT_TIMEOUT,
+                )
+                .map_err(|_| SessionV2Error::TransportTimedOut)
+        }
+
         pub fn create_session(&self) -> Result<VersionedManifest, SessionV2Error> {
             self.check_admission_budget()?;
             self.ensure_session_folders()?;
@@ -3446,6 +3690,17 @@ mod onedrive_transport {
                 .map_err(map_upload_error)
         }
 
+        fn read_path_before(
+            &self,
+            path: &str,
+            limit: usize,
+            deadline: std::time::Instant,
+        ) -> Result<Vec<u8>, SessionV2Error> {
+            self.client_before(deadline)?
+                .get_bytes_bounded(&format!("/me/drive/root:/{path}:/content"), limit)
+                .map_err(map_upload_error)
+        }
+
         fn manifest_item(&self) -> Result<serde_json::Value, SessionV2Error> {
             self.check_admission_budget()?;
             self.client_for_request()?
@@ -3558,6 +3813,16 @@ mod onedrive_transport {
             self.read_path(&path, MAX_IMMUTABLE_OBJECT_BYTES)
         }
 
+        fn load_immutable_before(
+            &self,
+            object_class: SessionObjectClass,
+            object_id: &str,
+            deadline: std::time::Instant,
+        ) -> Result<Vec<u8>, SessionV2Error> {
+            let path = self.object_path(object_class, object_id)?;
+            self.read_path_before(&path, MAX_IMMUTABLE_OBJECT_BYTES, deadline)
+        }
+
         fn load_immutable_batch(
             &self,
             object_class: SessionObjectClass,
@@ -3612,6 +3877,7 @@ mod onedrive_transport {
             reachable: &BTreeSet<(SessionObjectClass, String)>,
             older_than_server_ms: u64,
             limit: usize,
+            deadline: std::time::Instant,
         ) -> Result<usize, SessionV2Error> {
             let mut reaped = 0usize;
             for object_class in [
@@ -3631,7 +3897,7 @@ mod onedrive_transport {
                     object_class_segment(object_class)
                 );
                 let Some(folder) = self
-                    .client_for_request()?
+                    .client_before(deadline)?
                     .get_drive_item_by_path(&folder_path, &["id", "folder"])
                     .map_err(map_upload_error)?
                 else {
@@ -3642,7 +3908,7 @@ mod onedrive_transport {
                     .and_then(serde_json::Value::as_str)
                     .ok_or(SessionV2Error::TransportUnavailable)?;
                 for item in self
-                    .client_for_request()?
+                    .client_before(deadline)?
                     .list_children(folder_id)
                     .map_err(map_upload_error)?
                 {
@@ -3674,7 +3940,7 @@ mod onedrive_transport {
                         .and_then(serde_json::Value::as_str)
                         .filter(|value| !value.is_empty())
                         .ok_or(SessionV2Error::TransportUnavailable)?;
-                    self.client_for_request()?
+                    self.client_before(deadline)?
                         .delete_item(item_id)
                         .map_err(map_upload_error)?;
                     reaped += 1;
@@ -4185,7 +4451,7 @@ impl RequestPhase {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NormalizedAssistantBlock {
     Text {
         text: String,
@@ -5226,6 +5492,102 @@ mod tests {
     }
 
     #[test]
+    fn expired_lease_cannot_be_renewed_back_into_authority() {
+        let transport = InMemorySessionV2Transport::default();
+        transport.set_server_time_ms(10_000);
+        transport.create_session("s").unwrap();
+        let store = SessionV2Store::new(transport.clone(), &[36; 32], object_crypto());
+        let guard = store
+            .acquire_lease("s", "lease-a", "session-holder")
+            .unwrap();
+        let lease = guard.binding().unwrap();
+        let generation = store.current_manifest("s").unwrap().manifest.generation;
+        let cas_calls = transport.cas_calls();
+
+        transport.set_server_time_ms(lease.expires_at_server_ms);
+        assert_eq!(
+            renew_lease(&store, &guard.state),
+            Err(SessionV2Error::LeaseLost)
+        );
+        assert!(guard.is_lost());
+        assert_eq!(transport.cas_calls(), cas_calls);
+        assert_eq!(
+            store.current_manifest("s").unwrap().manifest.generation,
+            generation
+        );
+    }
+
+    #[test]
+    fn lease_authority_ends_exactly_at_expiry_for_publish_and_reap() {
+        let transport = InMemorySessionV2Transport::default();
+        transport.set_server_time_ms(10_000);
+        transport.create_session("publish").unwrap();
+        transport.create_session("reap").unwrap();
+        let store = SessionV2Store::new(transport.clone(), &[37; 32], object_crypto());
+        let publish_guard = store
+            .acquire_lease("publish", "lease-publish", "holder-publish")
+            .unwrap();
+        let reap_guard = store
+            .acquire_lease("reap", "lease-reap", "holder-reap")
+            .unwrap();
+        let expiry = publish_guard.binding().unwrap().expires_at_server_ms;
+        assert_eq!(reap_guard.binding().unwrap().expires_at_server_ms, expiry);
+        transport.set_server_time_ms(expiry);
+
+        let mut value = record(ULID_A, ULID_A, RID, "late");
+        value.lease = publish_guard.binding().unwrap();
+        assert_eq!(
+            publish_guard.publish(SessionCommitV1 {
+                visible_records: vec![value],
+                request_objects: vec![],
+                uuid_bindings: vec![],
+            }),
+            Err(SessionV2Error::LeaseLost)
+        );
+        assert_eq!(reap_guard.reap_orphans(), Err(SessionV2Error::LeaseLost));
+        assert!(publish_guard.is_lost());
+        assert!(reap_guard.is_lost());
+        assert_eq!(transport.object_count(), 0);
+    }
+
+    #[test]
+    fn lease_mutations_require_one_renewal_interval_of_safety() {
+        let transport = InMemorySessionV2Transport::default();
+        transport.set_server_time_ms(10_000);
+        transport.create_session("publish").unwrap();
+        transport.create_session("renew").unwrap();
+        let store = SessionV2Store::new(transport.clone(), &[38; 32], object_crypto());
+        let publish_guard = store
+            .acquire_lease("publish", "lease-publish", "holder-publish")
+            .unwrap();
+        let renew_guard = store
+            .acquire_lease("renew", "lease-renew", "holder-renew")
+            .unwrap();
+        let expiry = publish_guard.binding().unwrap().expires_at_server_ms;
+        let cas_calls = transport.cas_calls();
+
+        transport.set_server_time_ms(expiry - SESSION_LEASE_MUTATION_SAFETY_MS + 1);
+        let mut value = record(ULID_A, ULID_A, RID, "late");
+        value.lease = publish_guard.binding().unwrap();
+        assert_eq!(
+            publish_guard.publish(SessionCommitV1 {
+                visible_records: vec![value],
+                request_objects: vec![],
+                uuid_bindings: vec![],
+            }),
+            Err(SessionV2Error::LeaseLost)
+        );
+        assert_eq!(
+            renew_lease(&store, &renew_guard.state),
+            Err(SessionV2Error::LeaseLost)
+        );
+        assert!(publish_guard.is_lost());
+        assert!(renew_guard.is_lost());
+        assert_eq!(transport.cas_calls(), cas_calls);
+        assert_eq!(transport.object_count(), 0);
+    }
+
+    #[test]
     fn ambiguous_renewal_cas_failure_immediately_loses_lease() {
         let transport = InMemorySessionV2Transport::default();
         transport.set_server_time_ms(10_000);
@@ -5364,6 +5726,60 @@ mod tests {
         assert!(guard.is_lost());
     }
 
+    #[test]
+    fn publication_rechecks_lease_after_staging_before_manifest_cas() {
+        let transport = InMemorySessionV2Transport::default();
+        transport.set_server_time_ms(10_000);
+        transport.create_session("s").unwrap();
+        let store = SessionV2Store::new(transport.clone(), &[30; 32], object_crypto());
+        let guard = store.acquire_lease("s", "lease-a", "holder-a").unwrap();
+        let mut value = record(ULID_A, ULID_A, RID, "prompt");
+        value.lease = guard.binding().unwrap();
+        let cas_calls = transport.cas_calls();
+
+        transport.set_server_time_after_next_stage_ms(10_001 + SESSION_LEASE_TTL_MS);
+        assert_eq!(
+            guard.publish(SessionCommitV1 {
+                visible_records: vec![value],
+                request_objects: vec![],
+                uuid_bindings: vec![],
+            }),
+            Err(SessionV2Error::LeaseLost)
+        );
+        assert!(guard.is_lost());
+        assert_eq!(transport.cas_calls(), cas_calls);
+        assert!(store.recent_visible_records("s", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn atomic_admission_rechecks_lease_after_staging_before_manifest_cas() {
+        let transport = InMemorySessionV2Transport::default();
+        transport.set_server_time_ms(10_000);
+        let current = transport.create_session("s").unwrap();
+        let store = SessionV2Store::new(transport.clone(), &[31; 32], object_crypto());
+        transport.set_server_time_after_next_stage_ms(10_001 + SESSION_LEASE_TTL_MS);
+
+        let result = store.acquire_lease_and_publish_from_manifest(
+            current,
+            "lease-a",
+            "holder-a",
+            |lease| {
+                let mut value = record(ULID_A, ULID_A, RID, "prompt");
+                value.lease = lease.clone();
+                Ok(SessionCommitV1 {
+                    visible_records: vec![value],
+                    request_objects: vec![],
+                    uuid_bindings: vec![],
+                })
+            },
+        );
+
+        assert_eq!(result.err(), Some(SessionV2Error::LeaseLost));
+        assert_eq!(transport.cas_calls(), 0);
+        assert_eq!(store.current_manifest("s").unwrap().manifest.generation, 0);
+        assert!(store.recent_visible_records("s", 10).unwrap().is_empty());
+    }
+
     fn assert_takeover_uses_server_time() {
         let transport = InMemorySessionV2Transport::default();
         transport.set_server_time_ms(1_000);
@@ -5479,6 +5895,20 @@ mod tests {
     }
 
     #[test]
+    fn session_v2_rejects_unknown_persisted_variant_fields() {
+        let mut value = serde_json::to_value(record(ULID_A, ULID_A, RID, "prompt")).unwrap();
+        value["kind"]["unexpected"] = serde_json::Value::Bool(true);
+        assert!(serde_json::from_value::<SessionRecordV2>(value).is_err());
+
+        let block = serde_json::json!({
+            "type": "text",
+            "text": "answer",
+            "unexpected": true
+        });
+        assert!(serde_json::from_value::<NormalizedAssistantBlock>(block).is_err());
+    }
+
+    #[test]
     fn session_v2_never_persists_raw_tool_results_or_provider_frames() {
         let source = include_str!("session_v2.rs")
             .split("#[cfg(test)]")
@@ -5561,6 +5991,21 @@ mod tests {
             ),
             (1, 2, 10, 20)
         );
+    }
+
+    #[test]
+    fn session_manifest_rejects_unreachable_internal_record_count() {
+        let mut manifest = SessionManifestV1::empty("s");
+        manifest.internal_record_count = 1;
+
+        assert_eq!(manifest.validate(), Err(SessionV2Error::SessionLimit));
+        manifest.request_index_head = Some(index_ref("request"));
+        assert_eq!(manifest.validate(), Err(SessionV2Error::SessionLimit));
+        manifest.internal_encrypted_bytes = 1;
+        manifest.validate().unwrap();
+
+        manifest.internal_record_count = 0;
+        assert_eq!(manifest.validate(), Err(SessionV2Error::SessionLimit));
     }
 
     #[test]
@@ -5647,6 +6092,46 @@ mod tests {
     }
 
     #[test]
+    fn immutable_retry_reuses_only_matching_authenticated_envelope() {
+        let transport = InMemorySessionV2Transport::default();
+        let crypto = object_crypto();
+        let store = SessionV2Store::new(transport, &[7; 32], crypto.clone());
+        let first = store
+            .stage_authenticated_immutable(
+                "s",
+                SessionObjectClass::RequestState,
+                ULID_A,
+                b"request state",
+            )
+            .unwrap();
+        let retry = store
+            .stage_authenticated_immutable(
+                "s",
+                SessionObjectClass::RequestState,
+                ULID_A,
+                b"request state",
+            )
+            .unwrap();
+
+        assert_eq!(retry, first);
+        assert_eq!(
+            crypto
+                .open("s", SessionObjectClass::RequestState, ULID_A, &retry,)
+                .unwrap(),
+            b"request state"
+        );
+        assert_eq!(
+            store.stage_authenticated_immutable(
+                "s",
+                SessionObjectClass::RequestState,
+                ULID_A,
+                b"changed state",
+            ),
+            Err(SessionV2Error::ManifestConflict)
+        );
+    }
+
+    #[test]
     fn orphan_staged_records_are_reaped_without_affecting_visible_history() {
         let transport = InMemorySessionV2Transport::default();
         transport.set_server_time_ms(1);
@@ -5683,6 +6168,52 @@ mod tests {
         let history = store.history("s", None, None).unwrap();
         assert_eq!(history.records.len(), 1);
         assert_eq!(history.records[0].record_id, ULID_A);
+    }
+
+    #[test]
+    fn orphan_reap_revalidates_server_time_after_reachability_scan() {
+        let transport = InMemorySessionV2Transport::default();
+        transport.set_server_time_ms(1);
+        transport.create_session("s").unwrap();
+        transport
+            .stage_immutable(
+                SessionObjectClass::RequestState,
+                "0000000000000000000000000Z",
+                b"orphan",
+            )
+            .unwrap();
+        let store = SessionV2Store::new(transport.clone(), &[39; 32], object_crypto());
+        let guard = store.acquire_lease("s", "lease-a", "holder-a").unwrap();
+        let mut visible = record(ULID_A, ULID_A, RID, "prompt");
+        visible.lease = guard.binding().unwrap();
+        guard
+            .publish(SessionCommitV1 {
+                visible_records: vec![visible],
+                request_objects: vec![],
+                uuid_bindings: vec![],
+            })
+            .unwrap();
+        drop(guard);
+
+        transport.set_server_time_ms(ORPHAN_RETENTION_MS + 2);
+        let guard = store.acquire_lease("s", "lease-b", "holder-b").unwrap();
+        let expiry = guard.binding().unwrap().expires_at_server_ms;
+        transport.set_server_time_after_next_immutable_load_ms(
+            expiry - SESSION_LEASE_MUTATION_SAFETY_MS + 1,
+        );
+
+        assert_eq!(guard.reap_orphans(), Err(SessionV2Error::LeaseLost));
+        assert!(guard.is_lost());
+        assert_eq!(transport.object_count(), 3);
+        assert_eq!(
+            transport
+                .load_immutable(
+                    SessionObjectClass::RequestState,
+                    "0000000000000000000000000Z"
+                )
+                .unwrap(),
+            b"orphan"
+        );
     }
 
     #[test]
@@ -5744,6 +6275,35 @@ mod tests {
             Err(SessionV2Error::RequestConflict)
         );
         original.permits_replay(&original).unwrap();
+    }
+
+    #[test]
+    fn publish_rejects_malformed_uuid_binding_before_staging() {
+        let transport = InMemorySessionV2Transport::default();
+        transport.set_server_time_ms(10_000);
+        transport.create_session("s").unwrap();
+        let store = SessionV2Store::new(transport.clone(), &[42; 32], object_crypto());
+        let guard = store.acquire_lease("s", "lease-a", "holder-a").unwrap();
+        let mut binding = RequestUuidBindingV1::new(
+            RequestRouteDomain::AgentTurn,
+            "s",
+            RID,
+            payload_digest(&"prompt").unwrap(),
+        )
+        .unwrap();
+        binding.request_key = payload_digest(&"wrong key").unwrap();
+        let objects_before = transport.object_count();
+
+        assert_eq!(
+            guard.publish(SessionCommitV1 {
+                visible_records: vec![],
+                request_objects: vec![],
+                uuid_bindings: vec![binding],
+            }),
+            Err(SessionV2Error::InvalidRecord)
+        );
+        assert_eq!(transport.object_count(), objects_before);
+        assert!(!guard.is_lost());
     }
 
     #[test]
@@ -5864,7 +6424,7 @@ mod tests {
     fn request_terminal_compaction_removes_recovery_payload_and_keeps_idempotency() {
         let transport = InMemorySessionV2Transport::default();
         let current = transport.create_session("s").unwrap();
-        let store = SessionV2Store::new(transport, &[6; 32], object_crypto());
+        let store = SessionV2Store::new(transport.clone(), &[6; 32], object_crypto());
         let request_binding = RequestUuidBindingV1::new(
             RequestRouteDomain::AgentTurn,
             "s",
@@ -5954,6 +6514,14 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].request_id, RID);
         assert_eq!(candidates[0].tombstone, tombstone);
+        let cas_calls = transport.cas_calls();
+        assert_eq!(
+            store.compact_terminal_request_with_pre_cas(&current, RID, &tombstone, || {
+                Err(SessionV2Error::LeaseLost)
+            }),
+            Err(SessionV2Error::LeaseLost)
+        );
+        assert_eq!(transport.cas_calls(), cas_calls);
         let compacted = store
             .compact_terminal_request(&current, RID, &tombstone)
             .unwrap();
@@ -6386,6 +6954,41 @@ mod tests {
     }
 
     #[test]
+    fn request_record_scan_remains_bound_to_one_manifest_generation() {
+        const RID_TWO: &str = "00000000-0000-4000-8000-000000000002";
+        let transport = InMemorySessionV2Transport::default();
+        let current = transport.create_session("s").unwrap();
+        let store = SessionV2Store::new(transport.clone(), &[45; 32], object_crypto());
+        let snapshot = store
+            .publish_test_fixture(
+                &current,
+                SessionCommitV1 {
+                    visible_records: vec![
+                        record(ULID_A, ULID_A, RID, "first"),
+                        record(ULID_B, ULID_B, RID_TWO, "second"),
+                    ],
+                    request_objects: vec![],
+                    uuid_bindings: vec![],
+                },
+            )
+            .unwrap();
+
+        let mut renewed = snapshot.manifest.clone();
+        renewed.generation += 1;
+        transport
+            .compare_and_swap_manifest(&snapshot, &renewed)
+            .unwrap()
+            .unwrap();
+
+        let records = store
+            .visible_records_for_request_from_manifest(&snapshot, RID, ULID_A)
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].request_id, RID);
+        assert_eq!(records[0].turn_id, ULID_A);
+    }
+
+    #[test]
     fn session_v2_cloud_objects_are_encrypted_and_class_bound() {
         let transport = InMemorySessionV2Transport::default();
         let current = transport.create_session("s").unwrap();
@@ -6414,6 +7017,8 @@ mod tests {
         let mut manifest = SessionManifestV1::empty("s");
         manifest.visible_record_count = MAX_SESSION_RECORDS - 1;
         manifest.internal_record_count = 1;
+        manifest.visible_encrypted_bytes = 1;
+        manifest.internal_encrypted_bytes = 1;
         manifest.visible_index_head = Some(index_ref("visible-limit"));
         manifest.visible_record_head = Some(ULID_A.into());
         manifest.request_index_head = Some(index_ref("request-limit"));
@@ -6437,10 +7042,15 @@ mod tests {
         oversized.validate().unwrap();
 
         let mut manifest = SessionManifestV1::empty("s");
+        manifest.visible_record_count = 1;
         manifest.visible_encrypted_bytes = MAX_SESSION_ENCRYPTED_BYTES;
+        manifest.visible_index_head = Some(index_ref("visible-limit"));
+        manifest.visible_record_head = Some(ULID_A.into());
         assert_eq!(
             manifest.apply_delta(&ManifestDelta {
+                internal_records: 1,
                 internal_bytes: 1,
+                request_index_head: Some(Some(index_ref("request-limit"))),
                 ..Default::default()
             }),
             Err(SessionV2Error::SessionLimit)

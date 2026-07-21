@@ -557,18 +557,33 @@ async function request(method, path, opts) {
   }
   if (!Number.isFinite(status) || status < 200 || status >= 300) {
     const error = new Error(d.error || status || "Request failed");
+    error.code = typeof d.error === "string" ? d.error : "request_failed";
     error.responseReceived = true;
     throw error;
   }
   return d;
 }
 async function api(path) { return request("GET", path); }
+const POST_NO_TRANSPORT_RETRY = new Set([
+  "/api/v1/account/login/start",
+  "/api/v1/agent/user-presence/start",
+]);
 async function postJson(path, capToken, value) {
-  return request("POST", path, {
+  const body = JSON.stringify(value);
+  const send = () => request("POST", path, {
     capToken,
-    body: JSON.stringify(value),
+    body,
     headers: { "Content-Type": "application/json" },
   });
+  try {
+    return await send();
+  } catch (error) {
+    if ((error && error.responseReceived) || POST_NO_TRANSPORT_RETRY.has(path)) throw error;
+    return send();
+  }
+}
+function isReplayedRequest(value) {
+  return !!value && value.code === "request_replayed" && value.status === "completed";
 }
 /* Base64-encode one bounded mutation-intent chunk for its strict JSON data_base64 field. */
 function bytesToBase64(bytes) {
@@ -675,8 +690,18 @@ async function mutationPostWithTransportRetry(path, value, timeoutMs) {
   try {
     return await send();
   } catch (error) {
+    if (error && error.code === "mutation_intent_already_completed") {
+      return { status: "completed" };
+    }
     if (error && error.responseReceived) throw error;
-    return send();
+    try {
+      return await send();
+    } catch (retryError) {
+      if (retryError && retryError.code === "mutation_intent_already_completed") {
+        return { status: "completed" };
+      }
+      throw retryError;
+    }
   }
 }
 async function stageMutation(purpose, metadata, input) {
@@ -2925,7 +2950,11 @@ async function downloadNowItem(it) {
     const d = await postJson("/api/v1/onedrive/download-now", CAP.onedriveManage, {
       request_id: crypto.randomUUID(), account: App.account, id: it.remote_id,
     });
-    toast(d && d.downloaded === false ? "Not downloaded (blocked by policy)" : "Downloaded " + (it.name || "file"));
+    toast(isReplayedRequest(d)
+      ? "Download request completed"
+      : d && d.downloaded === false
+        ? "Not downloaded (blocked by policy)"
+        : "Downloaded " + (it.name || "file"));
     closeSheet();
     driveLoad();
   } catch (e) { toast("Could not download: " + e.message, "err"); }
@@ -3537,7 +3566,9 @@ async function contactsVerify(btn) {
   btn.disabled = true;
   try {
     const r = await postJson("/api/v1/verify", CAP.verify, { request_id: crypto.randomUUID(), account: App.account });
-    toast(`Integrity: ${r.verified}/${r.checked} records verified`);
+    toast(isReplayedRequest(r)
+      ? "Integrity check completed; refreshing results"
+      : `Integrity: ${r.verified}/${r.checked} records verified`);
     const [status, d] = await Promise.all([
       api("/api/v1/status?" + qs({ account: App.account })).catch(() => Contacts.status),
       api("/api/v1/items?" + qs({ account: App.account, service: "contacts", limit: 1000 })),
@@ -3706,7 +3737,9 @@ async function runVerifyThen(btn, refreshFn) {
   btn.disabled = true;
   try {
     const r = await postJson("/api/v1/verify", CAP.verify, { request_id: crypto.randomUUID(), account: App.account });
-    toast(`Integrity: ${r.verified}/${r.checked} records verified`);
+    toast(isReplayedRequest(r)
+      ? "Integrity check completed; refreshing results"
+      : `Integrity: ${r.verified}/${r.checked} records verified`);
     await refreshFn();
   } catch (e) { toast("Verify failed: " + e.message, "err"); } finally { btn.disabled = false; }
 }
@@ -4338,6 +4371,11 @@ async function addStep(t, inp, steps, renderSteps, updateCount) {
   if (!title) return;
   try {
     const r = await postJson("/api/v1/todo/checklist-add", CAP.todowrite, { request_id: crypto.randomUUID(), account: App.account, list: t.parent_remote_id, task: t.remote_id, title });
+    if (isReplayedRequest(r)) {
+      inp.value = "";
+      await todoReload();
+      return;
+    }
     steps.push({ id: r.id, displayName: title, isChecked: false }); inp.value = ""; renderSteps(); updateCount(); inp.focus();
   } catch (e) { toast("Failed: " + e.message, "err"); }
 }
@@ -4741,7 +4779,9 @@ async function doRestore(it, btn) {
   btn.disabled = true;
   try {
     const d = await postJson("/api/v1/restore", CAP.restore, { request_id: crypto.randomUUID(), account: App.account, service: it.service, id: it.remote_id });
-    if (d.queued) {
+    if (isReplayedRequest(d)) {
+      toast("Restore request completed");
+    } else if (d.queued) {
       toast(`Restore queued (${String(d.job_id || "job").slice(0, 12)}…)`);
     } else {
       toast(`Restored (new id ${String(d.new_id || "").slice(0, 8)}…)`);
@@ -4775,7 +4815,7 @@ async function cancelAccountLogin(loginId = accountMenuLogin) {
       request_id: crypto.randomUUID(),
       id: loginId,
     });
-    if (result && result.cancelled === true) {
+    if ((result && result.cancelled === true) || isReplayedRequest(result)) {
       if (accountMenuLogin === loginId) accountMenuLogin = null;
       await finishAccountLoginGuard(loginId);
       return true;
@@ -6534,6 +6574,17 @@ async function loadAgentRequestStatus(sessionId, requestId) {
 
 function sessionRecordsToTranscript(records) {
   const transcript = [];
+  const operationMessages = new Map();
+  const operationCopy = (code) => {
+    const copy = {
+      confirmation_required: "Action awaiting confirmation.",
+      completed: "Action completed.",
+      cancelled: "Action cancelled. No changes were made.",
+      failed: "Action did not complete.",
+      outcome_unknown: "The action outcome could not be verified.",
+    };
+    return copy[code] || "Action status updated.";
+  };
   (records || []).forEach((record) => {
     if (!record || typeof record !== "object") return;
     const payload = record.kind && typeof record.kind === "object" ? record.kind : record;
@@ -6549,6 +6600,24 @@ function sessionRecordsToTranscript(records) {
         pending: null,
         doneReason: "complete",
       });
+    } else if (kind === "pending_operation" || kind === "operation_state") {
+      const turnId = typeof record.turn_id === "string" ? record.turn_id : "";
+      const code = typeof payload.code === "string" ? payload.code : "";
+      let message = turnId ? operationMessages.get(turnId) : null;
+      if (!message) {
+        message = {
+          role: "assistant",
+          text: operationCopy(code),
+          chips: [], stages: [], results: [], tools: [], errors: [],
+          citations: [], pending: null,
+          doneReason: kind === "pending_operation" ? "pending_confirmation" : code,
+        };
+        transcript.push(message);
+        if (turnId) operationMessages.set(turnId, message);
+      } else if (kind === "operation_state") {
+        message.text = operationCopy(code);
+        message.doneReason = code;
+      }
     }
   });
   return transcript;
@@ -7004,6 +7073,7 @@ async function agentSend(text) {
   // desktop. The agent's events arrive as `message` (a data line to JSON-parse). Only a
   // host-emitted JSON terminal event completes the turn; a transport drop is reconciled.
   let stream;
+  let terminalReplayAttempted = false;
   finish = (msg, terminalReason) => {
     clearThinking();
     if (AssistantState.activeStream === stream) closeAssistantStream("turn-finish");
@@ -7046,7 +7116,7 @@ async function agentSend(text) {
     finish,
     reconcileRequestStatus,
   };
-  stream = openEventStream(url, (name, data) => {
+  const openTurnStream = () => openEventStream(url, (name, data) => {
     if (name !== "message") return; // ignore ping heartbeats
     let d;
     try { d = JSON.parse(data); }
@@ -7059,11 +7129,32 @@ async function agentSend(text) {
   }, () => {
     void (async () => {
       const status = await reconcileRequestStatus();
+      if (status && status.terminal && !terminalReplayAttempted
+          && AssistantState.activeMessage === asst && AssistantState.activeTurnId === turn) {
+        terminalReplayAttempted = true;
+        try {
+          const replay = await postJson("/api/v1/agent/turn", CAP.agent, {
+            request_id: requestId,
+            session_id: sessionId,
+            account: App.account,
+            prompt: text,
+          });
+          if (replay && replay.turn === turn
+              && AssistantState.activeMessage === asst && AssistantState.activeTurnId === turn) {
+            stream = openTurnStream();
+            AssistantState.activeStream = stream;
+            return;
+          }
+        } catch (_) {
+          // Fall through to the already persisted closed status.
+        }
+      }
       if (finishFromRequestStatus(status)) return;
       if (AssistantState.activeMessage !== asst || AssistantState.activeTurnId !== turn) return;
       finish("⚠ connection lost");
     })();
   });
+  stream = openTurnStream();
   AssistantState.activeStream = stream;
   AssistantState.turnStreamReady = true;
   syncAssistantComposerControls();

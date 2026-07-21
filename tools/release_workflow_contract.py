@@ -39,6 +39,17 @@ class ContractError(ValueError):
     """A release input or postcondition violates the closed contract."""
 
 
+def require_absent_http_status(status: int, resource: str) -> None:
+    """Accept only an authoritative GitHub API 404 for a missing resource."""
+    if resource not in {"release", "tag"}:
+        raise ContractError("invalid release resource")
+    if status == 404:
+        return
+    if status == 200:
+        raise ContractError(f"{resource} already exists")
+    raise ContractError(f"{resource} existence check unavailable")
+
+
 def _asset_names(data: dict) -> set[str]:
     assets = data.get("assets")
     if not isinstance(assets, list) or any(not isinstance(asset, dict) for asset in assets):
@@ -153,6 +164,9 @@ def main() -> int:
     validate_parser.add_argument("--mode", choices=("rc", "stable"), required=True)
     validate_parser.add_argument("--tag", required=True)
     validate_parser.add_argument("--sha", required=True)
+    absent_parser = subparsers.add_parser("require-absent")
+    absent_parser.add_argument("--status", type=int, required=True)
+    absent_parser.add_argument("--resource", choices=("release", "tag"), required=True)
     args = parser.parse_args()
     try:
         if args.command == "classify":
@@ -166,8 +180,10 @@ def main() -> int:
             releases = json.loads(args.json.read_text())
             tag_commits = json.loads(args.tag_commits_json.read_text())
             print(select_matching_rc(releases, tag_commits, args.sha))
-        else:
+        elif args.command == "validate-release":
             validate_release_object(json.loads(args.json.read_text()), args.mode, args.tag, args.sha)
+        else:
+            require_absent_http_status(args.status, args.resource)
     except (ContractError, json.JSONDecodeError, OSError) as error:
         print(str(error), file=sys.stderr)
         return 2

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use zeroize::Zeroizing;
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 18;
 const CONTROL_KEY_DOMAIN: &[u8] = b"isyncyou-agent-control-store-root/v1";
 const CONTROL_SUBKEY_SALT: &[u8] = b"isyncyou-agent-control-store-subkeys/v1";
 const SQLCIPHER_KEY_INFO: &[u8] = b"isyncyou-agent-control-sqlcipher/v1";
@@ -33,38 +33,90 @@ const MAX_MUTATION_INTENTS_PROCESS: i64 = 8;
 const MAX_MUTATION_STAGED_BYTES: i64 = 256 * 1024 * 1024;
 const MAX_MUTATION_CHUNKS: u32 = 8_192;
 const MUTATION_FREE_SPACE_RESERVE: u64 = 128 * 1024 * 1024;
+const MAX_SEALED_MUTATION_CHUNK_BYTES: usize = isyncyou_webui::MUTATION_CHUNK_BYTES * 2 + 4 * 1024;
 const PRODUCT_REQUEST_RECEIPT_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 const AGENT_TURN_ROUTE_DOMAIN: &str = "post:/api/v1/agent/turn";
 const MAX_AGENT_TURN_ADMISSIONS: i64 = 8;
 const MAX_AGENT_TURN_ADMISSION_BYTES: usize = 40 * 1024;
 
-type MutationCommitRow = (
-    Vec<u8>,
-    i64,
-    String,
-    i64,
-    String,
-    Option<String>,
-    Option<Vec<u8>>,
-);
+type MutationCommitRow = (Vec<u8>, i64, String, i64, String, Option<String>, String);
 type MutationIntentCreateRow = (String, String, Vec<u8>, i64, String, i64, String);
 type UserPresenceRow = (String, String, i64, Option<Vec<u8>>, Option<Vec<u8>>);
 type PendingRow = (String, u64, String, Option<Vec<u8>>);
-type ProductRequestReceiptRow = (String, String, String, String, Option<Vec<u8>>);
+type PendingConfirmRow = (
+    String,
+    i64,
+    String,
+    Option<Vec<u8>>,
+    String,
+    String,
+    String,
+    String,
+);
+type PendingTakeRow = (String, String, i64, Option<Vec<u8>>, i64);
+type ProductRequestReceiptRow = (String, String, String, String, i64, String, Option<Vec<u8>>);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct StoredProductResponseV1 {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProductRequestTerminalV1 {
     pub status: u16,
-    pub content_type: String,
-    pub body: Vec<u8>,
-    pub headers: Vec<(String, String)>,
+    pub result_digest: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyStoredProductResponseV1 {
+    status: u16,
+    content_type: String,
+    body: Vec<u8>,
+    headers: Vec<(String, String)>,
+}
+
+impl ProductRequestTerminalV1 {
+    pub(crate) fn from_api_response(
+        response: &isyncyou_webui::ApiResponse,
+    ) -> Result<Self, String> {
+        if !matches!(response.status, 200..=299 | 400..=499) {
+            return Err("request_store_unavailable".into());
+        }
+        let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+        digest.update(b"isyncyou-product-response-result/v1\0");
+        update_response_digest_component(&mut digest, &response.status.to_be_bytes())?;
+        update_response_digest_component(&mut digest, response.content_type.as_bytes())?;
+        update_response_digest_component(&mut digest, &response.body)?;
+        update_response_digest_component(
+            &mut digest,
+            &u64::try_from(response.headers.len())
+                .map_err(|_| "request_store_unavailable")?
+                .to_be_bytes(),
+        )?;
+        for (name, value) in &response.headers {
+            update_response_digest_component(&mut digest, name.as_bytes())?;
+            update_response_digest_component(&mut digest, value.as_bytes())?;
+        }
+        Ok(Self {
+            status: response.status,
+            result_digest: digest_hex(digest.finish().as_ref()),
+        })
+    }
+}
+
+fn update_response_digest_component(
+    digest: &mut ring::digest::Context,
+    value: &[u8],
+) -> Result<(), String> {
+    digest.update(
+        &u64::try_from(value.len())
+            .map_err(|_| "request_store_unavailable")?
+            .to_be_bytes(),
+    );
+    digest.update(value);
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProductRequestBegin {
     Execute,
-    Replay(StoredProductResponseV1),
+    Completed { status: u16 },
     Conflict,
     OutcomeUnknown,
 }
@@ -96,11 +148,17 @@ struct LegacyAgentTurnAdmissionV1 {
     request: isyncyou_webui::AgentTurnRequest,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct RecoveredAgentTurnAdmission {
     pub request: isyncyou_webui::AgentTurnRequest,
     pub turn_id: String,
     pub identity: isyncyou_webui::ProductRequestIdentity,
+}
+
+impl std::fmt::Debug for RecoveredAgentTurnAdmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RecoveredAgentTurnAdmission([redacted])")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,11 +177,38 @@ pub(crate) enum AgentTurnAdmissionFailure {
     Completed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct PendingCancelProjection {
     pub pending_id: String,
     pub owner: PendingOwnerBinding,
     pub created_at_ms: u64,
+}
+
+impl std::fmt::Debug for PendingCancelProjection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingCancelProjection")
+            .field("created_at_ms", &self.created_at_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct PendingConfirmProjection {
+    pub pending_id: String,
+    pub owner: PendingOwnerBinding,
+    pub code: String,
+    pub created_at_ms: u64,
+}
+
+impl std::fmt::Debug for PendingConfirmProjection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingConfirmProjection")
+            .field("code", &self.code)
+            .field("created_at_ms", &self.created_at_ms)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -132,7 +217,7 @@ pub(crate) enum MutationCommitStart {
         purpose: Box<isyncyou_webui::MutationPurpose>,
         source: MutationChunkSource,
     },
-    Replay(serde_json::Value),
+    Completed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,10 +269,12 @@ impl MutationChunkSource {
             if chunk_end <= offset || descriptor.offset >= requested_end {
                 continue;
             }
-            let sealed = std::fs::read(
-                self.root
+            let sealed = read_private_regular_file_bounded(
+                &self
+                    .root
                     .join("mutation-staging")
                     .join(&descriptor.relative_path),
+                MAX_SEALED_MUTATION_CHUNK_BYTES,
             )
             .map_err(|_| "mutation_intent_outcome_unknown")?;
             let chunk = open_row(
@@ -212,19 +299,67 @@ impl MutationChunkSource {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct PairingSourceRecord {
     pub pair_id: String,
     pub expires_at_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl std::fmt::Debug for PairingSourceRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PairingSourceRecord")
+            .field("pair_id", &"[redacted]")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct PairingDescriptorCleanupTarget {
     pub pair_id: String,
     pub session_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl std::fmt::Debug for PairingDescriptorCleanupTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PairingDescriptorCleanupTarget([redacted])")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct PairingClaimRecoveryTarget {
+    pub operation_id: String,
+    pub request_id: String,
+    pub finalize_request_id: String,
+    pub local_account: String,
+    pub state: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct PairingClaimDescriptorCleanupTarget {
+    pub operation_id: String,
+    pub pair_id: String,
+    pub local_account: String,
+    pub state: String,
+}
+
+impl std::fmt::Debug for PairingClaimDescriptorCleanupTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PairingClaimDescriptorCleanupTarget([redacted])")
+    }
+}
+
+impl std::fmt::Debug for PairingClaimRecoveryTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PairingClaimRecoveryTarget")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum UserPresenceBinding {
     #[serde(rename = "session_archive")]
@@ -233,6 +368,16 @@ pub(crate) enum UserPresenceBinding {
     PairingReveal { session_id: String, pair_id: String },
     #[serde(rename = "session_pairing_import")]
     PairingImport { pairing_code: String },
+}
+
+impl std::fmt::Debug for UserPresenceBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("UserPresenceBinding")
+            .field(&self.kind())
+            .field(&"[redacted]")
+            .finish()
+    }
 }
 
 impl UserPresenceBinding {
@@ -270,7 +415,7 @@ fn update_digest_component(context: &mut ring::digest::Context, value: &str) {
     context.update(value.as_bytes());
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct UserPresenceChallenge {
     pub operation_id: String,
     pub intent_id: String,
@@ -279,7 +424,20 @@ pub(crate) struct UserPresenceChallenge {
     pub expires_at_ms: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+impl std::fmt::Debug for UserPresenceChallenge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UserPresenceChallenge")
+            .field("operation_id", &"[redacted]")
+            .field("intent_id", &"[redacted]")
+            .field("token", &"[redacted]")
+            .field("action_hash", &"[redacted]")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UserPresenceSecretV1 {
     version: u32,
@@ -287,7 +445,7 @@ struct UserPresenceSecretV1 {
     token_hash: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UserPresenceConsumptionV1 {
     version: u32,
@@ -295,7 +453,7 @@ struct UserPresenceConsumptionV1 {
     binding: UserPresenceBinding,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PairingRevealResponseV1 {
     version: u32,
@@ -303,7 +461,7 @@ struct PairingRevealResponseV1 {
     source_secret: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PendingSecretV1 {
     version: u32,
@@ -313,7 +471,7 @@ struct PendingSecretV1 {
     risk: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SealedRowV1 {
     version: u32,
@@ -336,7 +494,7 @@ impl std::fmt::Debug for AgentControlStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("AgentControlStore")
-            .field("root", &self.root)
+            .field("root", &"[redacted]")
             .field("installation_binding", &"[redacted]")
             .finish_non_exhaustive()
     }
@@ -458,6 +616,20 @@ impl AgentControlStore {
                    length(request_id) + length(turn_id) + length(owner_binding) + 128
                  FROM confirmation_intents
                  WHERE state='cancelled' AND session_id!='legacy-local';
+                 CREATE TABLE IF NOT EXISTS pending_confirm_projections (
+                   pending_id TEXT PRIMARY KEY NOT NULL,
+                   account_id TEXT NOT NULL,
+                   session_id TEXT NOT NULL,
+                   request_id TEXT NOT NULL,
+                   turn_id TEXT NOT NULL,
+                   owner_binding TEXT NOT NULL,
+                   code TEXT NOT NULL CHECK(code IN ('executing','completed','failed','outcome_unknown')),
+                   created_at_ms INTEGER NOT NULL,
+                   logical_bytes INTEGER NOT NULL,
+                   FOREIGN KEY(pending_id) REFERENCES confirmation_intents(intent_id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX IF NOT EXISTS pending_confirm_projection_created
+                   ON pending_confirm_projections(code,created_at_ms);
                  CREATE TABLE IF NOT EXISTS user_presence_intents (
                    operation_id TEXT PRIMARY KEY NOT NULL,
                    intent_id TEXT UNIQUE NOT NULL,
@@ -482,6 +654,7 @@ impl AgentControlStore {
                    expires_at_ms INTEGER NOT NULL,
                    state TEXT NOT NULL CHECK(state IN ('local','revealed','revoked','expired')),
                    sealed_source BLOB,
+                   descriptor_cleanup_complete INTEGER NOT NULL DEFAULT 0,
                    terminal_expires_at_ms INTEGER NOT NULL DEFAULT 0,
                    logical_bytes INTEGER NOT NULL
                  );
@@ -491,12 +664,15 @@ impl AgentControlStore {
                    operation_id TEXT PRIMARY KEY NOT NULL,
                    request_id TEXT UNIQUE NOT NULL,
                    pair_id TEXT NOT NULL,
+                   local_account TEXT NOT NULL,
+                   recovery_request_id TEXT NOT NULL,
                    owner_binding TEXT NOT NULL,
                    state TEXT NOT NULL CHECK(state IN ('claimed','installed','consumed','aborted','claimed_expired')),
                    resume_expires_at_ms INTEGER NOT NULL,
                    installed_session_id TEXT,
                    finalize_request_id TEXT,
                    sealed_resume BLOB,
+                   descriptor_cleanup_complete INTEGER NOT NULL DEFAULT 0,
                    terminal_expires_at_ms INTEGER NOT NULL DEFAULT 0,
                    logical_bytes INTEGER NOT NULL
                  );
@@ -520,6 +696,7 @@ impl AgentControlStore {
                    state TEXT NOT NULL CHECK(state IN ('active','committing','committed','cancelled','expired')),
                    commit_request_id TEXT,
                    result_json BLOB,
+                   result_digest TEXT NOT NULL DEFAULT '',
                    terminal_expires_at_ms INTEGER NOT NULL DEFAULT 0,
                    logical_bytes INTEGER NOT NULL
                  );
@@ -539,6 +716,8 @@ impl AgentControlStore {
                    request_scope TEXT NOT NULL DEFAULT 'installation',
                    payload_digest TEXT NOT NULL,
                    state TEXT NOT NULL CHECK(state IN ('started','completed')),
+                   terminal_status INTEGER NOT NULL DEFAULT 0,
+                   result_digest TEXT NOT NULL DEFAULT '',
                    sealed_response BLOB,
                    expires_at_ms INTEGER NOT NULL,
                    logical_bytes INTEGER NOT NULL
@@ -593,6 +772,8 @@ impl AgentControlStore {
             "request_scope",
             "installation",
         )?;
+        ensure_text_column(&migration, "product_request_receipts", "result_digest", "")?;
+        ensure_integer_column(&migration, "product_request_receipts", "terminal_status")?;
         ensure_text_column(
             &migration,
             "agent_turn_admissions",
@@ -601,6 +782,24 @@ impl AgentControlStore {
         )?;
         ensure_text_column(&migration, "agent_turn_admissions", "state", "active")?;
         ensure_nullable_text_column(&migration, "agent_turn_admissions", "terminal_code")?;
+        ensure_text_column(&migration, "pairing_claims", "local_account", "")?;
+        ensure_text_column(&migration, "pairing_claims", "recovery_request_id", "")?;
+        ensure_integer_column(&migration, "pairing_sources", "descriptor_cleanup_complete")?;
+        ensure_integer_column(&migration, "pairing_claims", "descriptor_cleanup_complete")?;
+        let invalid_pairing_cleanup_markers: i64 = migration
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM pairing_sources
+                    WHERE descriptor_cleanup_complete NOT IN (0,1)) +
+                   (SELECT COUNT(*) FROM pairing_claims
+                    WHERE descriptor_cleanup_complete NOT IN (0,1))",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| "control_store_migration_failed")?;
+        if invalid_pairing_cleanup_markers != 0 {
+            return Err("control_store_migration_failed".into());
+        }
         let invalid_admission_states: i64 = migration
             .query_row(
                 "SELECT COUNT(*) FROM agent_turn_admissions
@@ -635,6 +834,7 @@ impl AgentControlStore {
         ensure_request_key_column(&migration, "product_request_receipts")?;
         ensure_request_key_column(&migration, "product_request_bindings")?;
         ensure_integer_column(&migration, "mutation_intents", "terminal_expires_at_ms")?;
+        ensure_text_column(&migration, "mutation_intents", "result_digest", "")?;
         ensure_integer_column(&migration, "mutation_request_bindings", "expires_at_ms")?;
         for table in [
             "confirmation_intents",
@@ -645,9 +845,14 @@ impl AgentControlStore {
         ] {
             ensure_integer_column(&migration, table, "terminal_expires_at_ms")?;
         }
+        let migration_now_ms = crate::unix_now_ms();
+        let expired_duplicate_pending =
+            migrate_duplicate_pending_confirmations(&migration, migration_now_ms)?;
         migration
             .execute_batch(
-                "CREATE INDEX IF NOT EXISTS mutation_intent_terminal_expiry
+                "CREATE UNIQUE INDEX IF NOT EXISTS confirmation_pending_turn
+                   ON confirmation_intents(turn_id) WHERE state='pending';
+                 CREATE INDEX IF NOT EXISTS mutation_intent_terminal_expiry
                    ON mutation_intents(state,terminal_expires_at_ms);
                  CREATE INDEX IF NOT EXISTS mutation_request_binding_expiry
                    ON mutation_request_bindings(expires_at_ms);
@@ -664,10 +869,11 @@ impl AgentControlStore {
             )
             .map_err(|_| "control_store_migration_failed")?;
         let stored_schema_version = stored_control_schema_version(&migration)?;
-        let migration_now_ms = crate::unix_now_ms();
         if matches!(stored_schema_version, Some(1..=8)) {
             migrate_mutation_retention_v9(&migration, &row_wrap_key, migration_now_ms)?;
         }
+        let purged_legacy_mutation_results =
+            migrate_mutation_results_v15(&migration, &row_wrap_key)?;
         if matches!(stored_schema_version, Some(1..=9)) {
             migrate_control_tombstone_retention_v10(&migration, migration_now_ms)?;
         }
@@ -698,10 +904,18 @@ impl AgentControlStore {
             .map_err(|_| "control_store_migration_failed")?;
         migrate_product_request_scopes_v7(&migration, installation_principal)?;
         migrate_product_request_keys(&migration, installation_principal)?;
+        let purged_legacy_product_responses =
+            migrate_product_request_results_v15(&migration, &row_wrap_key)?;
         initialize_metadata(&migration, &installation_binding, lifecycle_key_version)?;
         migration
             .commit()
             .map_err(|_| "control_store_migration_failed")?;
+        if purged_legacy_product_responses
+            || purged_legacy_mutation_results
+            || expired_duplicate_pending
+        {
+            checkpoint_secure_erasure(&connection).map_err(|_| "control_store_migration_failed")?;
+        }
         secure_file_mode(&db_path)?;
         for suffix in ["-wal", "-shm"] {
             let path = PathBuf::from(format!("{}{}", db_path.display(), suffix));
@@ -744,7 +958,7 @@ impl AgentControlStore {
                      logical_bytes=0
                  WHERE intent_id IN (
                    SELECT intent_id FROM confirmation_intents
-                   WHERE state='pending' AND expires_at_ms < ?1 LIMIT ?2
+                   WHERE state='pending' AND expires_at_ms <= ?1 LIMIT ?2
                  )",
                     params![now, remaining, terminal_expires_at_ms],
                 )
@@ -757,7 +971,7 @@ impl AgentControlStore {
                      terminal_expires_at_ms=?3, logical_bytes=0
                  WHERE operation_id IN (
                    SELECT operation_id FROM user_presence_intents
-                   WHERE state IN ('pending','authorized') AND expires_at_ms < ?1 LIMIT ?2
+                   WHERE state IN ('pending','authorized') AND expires_at_ms <= ?1 LIMIT ?2
                  )",
                     params![now, remaining, terminal_expires_at_ms],
                 )
@@ -770,7 +984,7 @@ impl AgentControlStore {
                      logical_bytes=0
                  WHERE pair_id IN (
                    SELECT pair_id FROM pairing_sources
-                   WHERE state IN ('local','revealed') AND expires_at_ms < ?1
+                   WHERE state IN ('local','revealed') AND expires_at_ms <= ?1
                      AND NOT EXISTS (
                        SELECT 1 FROM pairing_revocations
                        WHERE pairing_revocations.pair_id=pairing_sources.pair_id
@@ -789,7 +1003,7 @@ impl AgentControlStore {
                  WHERE operation_id IN (
                    SELECT operation_id FROM user_presence_intents
                    WHERE state='consumed' AND kind='session_pairing_reveal'
-                     AND expires_at_ms < ?1 AND sealed_response IS NOT NULL LIMIT ?2
+                     AND expires_at_ms <= ?1 AND sealed_response IS NOT NULL LIMIT ?2
                  )",
                     params![now, remaining],
                 )
@@ -802,7 +1016,7 @@ impl AgentControlStore {
                      logical_bytes=0
                  WHERE operation_id IN (
                    SELECT operation_id FROM pairing_claims
-                   WHERE state IN ('claimed','installed') AND resume_expires_at_ms < ?1 LIMIT ?2
+                   WHERE state IN ('claimed','installed') AND resume_expires_at_ms <= ?1 LIMIT ?2
                  )",
                     params![now, remaining, terminal_expires_at_ms],
                 )
@@ -814,7 +1028,7 @@ impl AgentControlStore {
                      WHERE request_id IN (
                        SELECT request_id FROM agent_turn_admissions
                        WHERE (state='cancelled' OR terminal_code IS NOT NULL)
-                         AND created_at_ms < ?1
+                         AND created_at_ms <= ?1
                        ORDER BY created_at_ms,request_id LIMIT ?2
                      )",
                     params![request_terminal_cutoff_ms, remaining],
@@ -874,7 +1088,7 @@ impl AgentControlStore {
                     "DELETE FROM product_request_receipts
                  WHERE request_id IN (
                    SELECT request_id FROM product_request_receipts
-                   WHERE expires_at_ms < ?1 LIMIT ?2
+                   WHERE expires_at_ms <= ?1 LIMIT ?2
                  )",
                     params![now, remaining],
                 )
@@ -885,7 +1099,7 @@ impl AgentControlStore {
                     "DELETE FROM product_request_bindings
                  WHERE request_id IN (
                    SELECT binding.request_id FROM product_request_bindings AS binding
-                   WHERE binding.expires_at_ms < ?1
+                   WHERE binding.expires_at_ms <= ?1
                      AND NOT EXISTS (
                        SELECT 1 FROM agent_turn_admissions AS admission
                        WHERE admission.request_id=binding.request_id
@@ -902,7 +1116,7 @@ impl AgentControlStore {
                     "DELETE FROM mutation_request_bindings
                  WHERE request_id IN (
                    SELECT request_id FROM mutation_request_bindings
-                   WHERE expires_at_ms < ?1 LIMIT ?2
+                   WHERE expires_at_ms <= ?1 LIMIT ?2
                  )",
                     params![now, remaining],
                 )
@@ -1047,6 +1261,123 @@ impl AgentControlStore {
             )
             .map_err(|_| "control_store_unavailable")?;
         Ok(())
+    }
+
+    pub(crate) fn recover_interrupted_pending_confirmations(
+        &self,
+        now_ms: u64,
+    ) -> Result<usize, String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "control_store_unavailable")?;
+        connection
+            .execute(
+                "UPDATE pending_confirm_projections
+                 SET code='outcome_unknown',created_at_ms=?2
+                 WHERE owner_binding=?1 AND code='executing'",
+                params![self.installation_binding, u64_to_i64(now_ms)?],
+            )
+            .map_err(|_| "control_store_unavailable".into())
+    }
+
+    pub(crate) fn finish_pending_confirmation(
+        &self,
+        pending_id: &str,
+        code: &str,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        if !matches!(code, "completed" | "failed") {
+            return Err("control_store_unavailable".into());
+        }
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "control_store_unavailable")?;
+        let changed = connection
+            .execute(
+                "UPDATE pending_confirm_projections
+                 SET code=?3,created_at_ms=?4
+                 WHERE pending_id=?1 AND owner_binding=?2 AND code='executing'",
+                params![
+                    pending_id,
+                    self.installation_binding,
+                    code,
+                    u64_to_i64(now_ms)?
+                ],
+            )
+            .map_err(|_| "control_store_unavailable")?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err("confirmation_outcome_unknown".into())
+        }
+    }
+
+    pub(crate) fn pending_confirm_projections(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<PendingConfirmProjection>, String> {
+        let limit = i64::try_from(limit.min(32)).map_err(|_| "control_store_unavailable")?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "control_store_unavailable")?;
+        let mut statement = connection
+            .prepare(
+                "SELECT pending_id,account_id,session_id,request_id,turn_id,code,created_at_ms
+                 FROM pending_confirm_projections
+                 WHERE owner_binding=?1 AND code!='executing'
+                 ORDER BY created_at_ms,pending_id
+                 LIMIT ?2",
+            )
+            .map_err(|_| "control_store_unavailable")?;
+        let rows = statement
+            .query_map(params![self.installation_binding, limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    PendingOwnerBinding {
+                        account: row.get(1)?,
+                        session_id: row.get(2)?,
+                        request_id: row.get(3)?,
+                        turn_id: row.get(4)?,
+                    },
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .map_err(|_| "control_store_unavailable")?;
+        let mut projections = Vec::new();
+        for row in rows {
+            let (pending_id, owner, code, created_at_ms) =
+                row.map_err(|_| "control_store_unavailable")?;
+            projections.push(PendingConfirmProjection {
+                pending_id,
+                owner,
+                code,
+                created_at_ms: u64::try_from(created_at_ms)
+                    .map_err(|_| "control_store_unavailable")?,
+            });
+        }
+        Ok(projections)
+    }
+
+    pub(crate) fn complete_pending_confirm_projection(
+        &self,
+        pending_id: &str,
+    ) -> Result<(), String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "control_store_unavailable")?;
+        connection
+            .execute(
+                "DELETE FROM pending_confirm_projections
+                 WHERE pending_id=?1 AND owner_binding=?2 AND code!='executing'",
+                params![pending_id, self.installation_binding],
+            )
+            .map(|_| ())
+            .map_err(|_| "control_store_unavailable".into())
     }
 
     fn mutation_owner_binding(&self, owner: &str) -> Result<String, String> {
@@ -1303,26 +1634,44 @@ impl AgentControlStore {
         let Some((state, total_bytes, expires)) = intent else {
             return Err("mutation_intent_not_found".into());
         };
-        if now_ms > u64::try_from(expires).map_err(|_| "mutation_intent_failed")? {
+        if now_ms >= u64::try_from(expires).map_err(|_| "mutation_intent_failed")? {
             return Err("mutation_intent_expired".into());
         }
         if state != "active" || offset.saturating_add(bytes.len() as u64) > total_bytes as u64 {
             return Err("mutation_intent_conflict".into());
         }
-        let existing: Option<(i64, i64, String)> = transaction
+        let existing: Option<(i64, i64, String, String)> = transaction
             .query_row(
-                "SELECT chunk_offset,chunk_bytes,chunk_sha256 FROM mutation_chunks
+                "SELECT chunk_offset,chunk_bytes,chunk_sha256,sealed_path FROM mutation_chunks
                  WHERE intent_id=?1 AND chunk_index=?2",
                 params![intent_id, index],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(|_| "mutation_intent_failed")?;
-        if let Some((stored_offset, stored_bytes, stored_sha)) = existing {
+        if let Some((stored_offset, stored_bytes, stored_sha, stored_path)) = existing {
             if stored_offset == offset as i64
                 && stored_bytes == bytes.len() as i64
                 && stored_sha == chunk_sha256
             {
+                if stored_path != format!("{intent_id}/{index}.chunk") {
+                    return Err("mutation_intent_outcome_unknown".into());
+                }
+                let sealed = read_private_regular_file_bounded(
+                    &self.root.join("mutation-staging").join(&stored_path),
+                    MAX_SEALED_MUTATION_CHUNK_BYTES,
+                )
+                .map_err(|_| "mutation_intent_outcome_unknown")?;
+                let stored_plaintext = open_row(
+                    &self.row_wrap_key,
+                    "mutation-chunk",
+                    &format!("{intent_id}:{index}"),
+                    &sealed,
+                )
+                .map_err(|_| "mutation_intent_outcome_unknown".to_string())?;
+                if stored_plaintext != bytes {
+                    return Err("mutation_intent_outcome_unknown".into());
+                }
                 transaction.commit().map_err(|_| "mutation_intent_failed")?;
                 return Ok(());
             }
@@ -1413,10 +1762,21 @@ impl AgentControlStore {
         )?;
         let row: Option<MutationCommitRow> = transaction
             .query_row(
-                "SELECT purpose_json,total_bytes,content_sha256,expires_at_ms,state,commit_request_id,result_json
+                "SELECT purpose_json,total_bytes,content_sha256,expires_at_ms,state,
+                        commit_request_id,result_digest
                  FROM mutation_intents WHERE intent_id=?1 AND owner_binding=?2",
                 params![intent_id, owner_binding],
-                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|_| "mutation_intent_failed")?;
@@ -1427,7 +1787,7 @@ impl AgentControlStore {
             expires,
             state,
             stored_request,
-            result_json,
+            result_digest,
         )) = row
         else {
             return Err("mutation_intent_not_found".into());
@@ -1439,22 +1799,15 @@ impl AgentControlStore {
             if stored_request.as_deref() != Some(request_id) {
                 return Err("request_id_conflict".into());
             }
-            let result = open_row(
-                &self.row_wrap_key,
-                "mutation-result",
-                intent_id,
-                result_json
-                    .as_deref()
-                    .ok_or("mutation_intent_outcome_unknown")?,
-            )?;
-            let result =
-                serde_json::from_slice(&result).map_err(|_| "mutation_intent_outcome_unknown")?;
+            if !valid_sha256(&result_digest) {
+                return Err("mutation_intent_outcome_unknown".into());
+            }
             self.remove_mutation_chunk_files(&transaction, intent_id)
                 .map_err(|_| "mutation_intent_outcome_unknown")?;
             transaction.commit().map_err(|_| "mutation_intent_failed")?;
             checkpoint_secure_erasure(&connection)
                 .map_err(|_| "mutation_intent_outcome_unknown")?;
-            return Ok(MutationCommitStart::Replay(result));
+            return Ok(MutationCommitStart::Completed);
         }
         if state == "committing" {
             if stored_request.as_deref() != Some(request_id) {
@@ -1463,7 +1816,7 @@ impl AgentControlStore {
             transaction.commit().map_err(|_| "mutation_intent_failed")?;
             return Err("mutation_intent_outcome_unknown".into());
         }
-        if now_ms > u64::try_from(expires).map_err(|_| "mutation_intent_failed")? {
+        if now_ms >= u64::try_from(expires).map_err(|_| "mutation_intent_failed")? {
             return Err("mutation_intent_expired".into());
         }
         if state != "active" {
@@ -1500,8 +1853,11 @@ impl AgentControlStore {
             {
                 return Err("mutation_intent_conflict".into());
             }
-            let sealed = std::fs::read(self.root.join("mutation-staging").join(&relative_path))
-                .map_err(|_| "mutation_intent_outcome_unknown")?;
+            let sealed = read_private_regular_file_bounded(
+                &self.root.join("mutation-staging").join(&relative_path),
+                MAX_SEALED_MUTATION_CHUNK_BYTES,
+            )
+            .map_err(|_| "mutation_intent_outcome_unknown")?;
             let chunk = open_row(
                 &self.row_wrap_key,
                 "mutation-chunk",
@@ -1569,13 +1925,8 @@ impl AgentControlStore {
     ) -> Result<(), String> {
         let owner_binding = self.mutation_owner_binding(owner)?;
         let result_json = serde_json::to_vec(result).map_err(|_| "mutation_intent_failed")?;
-        let sealed_result = seal_row(
-            &self.row_wrap_key,
-            "mutation-result",
-            intent_id,
-            &result_json,
-        )?;
-        let logical_bytes = i64::try_from(sealed_result.len().saturating_add(512))
+        let result_digest = mutation_result_digest(&result_json);
+        let logical_bytes = i64::try_from(result_digest.len().saturating_add(512))
             .map_err(|_| "mutation_intent_failed")?;
         let terminal_expires_at_ms = now_ms
             .checked_add(MUTATION_TERMINAL_TTL_MS)
@@ -1587,14 +1938,14 @@ impl AgentControlStore {
         let changed = connection
             .execute(
                 "UPDATE mutation_intents
-                 SET state='committed',purpose_json=X'',result_json=?4,
+                 SET state='committed',purpose_json=X'',result_json=NULL,result_digest=?4,
                      terminal_expires_at_ms=?5,logical_bytes=?6
                  WHERE intent_id=?1 AND owner_binding=?2 AND commit_request_id=?3 AND state='committing'",
                 params![
                     intent_id,
                     owner_binding,
                     request_id,
-                    sealed_result,
+                    result_digest,
                     u64_to_i64(terminal_expires_at_ms)?,
                     logical_bytes
                 ],
@@ -1680,7 +2031,7 @@ impl AgentControlStore {
         let mut statement = connection
             .prepare(
                 "SELECT intent_id FROM mutation_intents
-                 WHERE state='active' AND expires_at_ms < ?1 LIMIT ?2",
+                 WHERE state='active' AND expires_at_ms <= ?1 LIMIT ?2",
             )
             .map_err(|_| "mutation_intent_failed")?;
         let ids = statement
@@ -1716,7 +2067,7 @@ impl AgentControlStore {
             .prepare(
                 "SELECT intent_id FROM mutation_intents
                  WHERE state IN ('committed','cancelled','expired')
-                   AND terminal_expires_at_ms > 0 AND terminal_expires_at_ms < ?1
+                   AND terminal_expires_at_ms > 0 AND terminal_expires_at_ms <= ?1
                  LIMIT ?2",
             )
             .map_err(|_| "mutation_intent_failed")?;
@@ -1881,7 +2232,8 @@ impl AgentControlStore {
             return Err("pairing_source_too_large".into());
         }
         let sealed = seal_row(&self.row_wrap_key, "pairing-source", &pair_id, &plaintext)?;
-        let logical_bytes = i64::try_from(sealed.len()).map_err(|_| "pairing_unavailable")?;
+        let logical_bytes =
+            i64::try_from(sealed.len().saturating_add(512)).map_err(|_| "pairing_unavailable")?;
         let mut connection = self.connection.lock().map_err(|_| "pairing_unavailable")?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1939,6 +2291,7 @@ impl AgentControlStore {
             .prepare(
                 "SELECT pair_id,session_id FROM pairing_sources
                  WHERE owner_binding=?1 AND state IN ('revoked','expired')
+                   AND descriptor_cleanup_complete=0
                  ORDER BY expires_at_ms,pair_id LIMIT ?2",
             )
             .map_err(|_| "pairing_unavailable")?;
@@ -1952,6 +2305,147 @@ impl AgentControlStore {
             .map_err(|_| "pairing_unavailable")?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|_| "pairing_unavailable".into())
+    }
+
+    pub(crate) fn pairing_claim_recovery_targets(
+        &self,
+        limit: usize,
+        now_ms: u64,
+    ) -> Result<Vec<PairingClaimRecoveryTarget>, String> {
+        if limit == 0 || limit > 8 {
+            return Err("pairing_unavailable".into());
+        }
+        let connection = self.connection.lock().map_err(|_| "pairing_unavailable")?;
+        let mut statement = connection
+            .prepare(
+                "SELECT operation_id,request_id,
+                        COALESCE(NULLIF(finalize_request_id,''),recovery_request_id),
+                        local_account,state
+                 FROM pairing_claims
+                 WHERE owner_binding=?1 AND state IN ('claimed','installed')
+                   AND resume_expires_at_ms>?2 AND local_account!=''
+                   AND recovery_request_id!=''
+                 ORDER BY resume_expires_at_ms,operation_id LIMIT ?3",
+            )
+            .map_err(|_| "pairing_unavailable")?;
+        let rows = statement
+            .query_map(
+                params![
+                    self.installation_binding,
+                    u64_to_i64(now_ms)?,
+                    i64::try_from(limit).map_err(|_| "pairing_unavailable")?
+                ],
+                |row| {
+                    Ok(PairingClaimRecoveryTarget {
+                        operation_id: row.get(0)?,
+                        request_id: row.get(1)?,
+                        finalize_request_id: row.get(2)?,
+                        local_account: row.get(3)?,
+                        state: row.get(4)?,
+                    })
+                },
+            )
+            .map_err(|_| "pairing_unavailable")?;
+        let targets = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "pairing_unavailable".to_string())?;
+        if targets.iter().any(|target| {
+            target.operation_id.is_empty()
+                || target.request_id.is_empty()
+                || !crate::is_uuid_v4(&target.finalize_request_id)
+                || target.local_account.is_empty()
+                || target.local_account.len() > 128
+                || !matches!(target.state.as_str(), "claimed" | "installed")
+        }) {
+            return Err("pairing_unavailable".into());
+        }
+        Ok(targets)
+    }
+
+    pub(crate) fn pairing_claim_descriptor_cleanup_targets(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<PairingClaimDescriptorCleanupTarget>, String> {
+        if limit == 0 || limit > 8 {
+            return Err("pairing_unavailable".into());
+        }
+        let connection = self.connection.lock().map_err(|_| "pairing_unavailable")?;
+        let mut statement = connection
+            .prepare(
+                "SELECT operation_id,pair_id,local_account,state FROM pairing_claims
+                 WHERE owner_binding=?1 AND state IN ('consumed','claimed_expired')
+                   AND descriptor_cleanup_complete=0 AND local_account!=''
+                 ORDER BY terminal_expires_at_ms,operation_id LIMIT ?2",
+            )
+            .map_err(|_| "pairing_unavailable")?;
+        let rows = statement
+            .query_map(
+                params![
+                    self.installation_binding,
+                    i64::try_from(limit).map_err(|_| "pairing_unavailable")?
+                ],
+                |row| {
+                    Ok(PairingClaimDescriptorCleanupTarget {
+                        operation_id: row.get(0)?,
+                        pair_id: row.get(1)?,
+                        local_account: row.get(2)?,
+                        state: row.get(3)?,
+                    })
+                },
+            )
+            .map_err(|_| "pairing_unavailable")?;
+        let targets = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "pairing_unavailable".to_string())?;
+        if targets.iter().any(|target| {
+            target.operation_id.is_empty()
+                || target.operation_id.len() > 128
+                || target.pair_id.is_empty()
+                || target.pair_id.len() > 128
+                || target.local_account.is_empty()
+                || target.local_account.len() > 128
+                || !matches!(target.state.as_str(), "consumed" | "claimed_expired")
+        }) {
+            return Err("pairing_unavailable".into());
+        }
+        Ok(targets)
+    }
+
+    pub(crate) fn mark_pairing_claim_descriptor_cleanup_complete(
+        &self,
+        operation_id: &str,
+    ) -> Result<(), String> {
+        let connection = self.connection.lock().map_err(|_| "pairing_unavailable")?;
+        let changed = connection
+            .execute(
+                "UPDATE pairing_claims SET descriptor_cleanup_complete=1
+                 WHERE operation_id=?1 AND owner_binding=?2
+                   AND state IN ('installed','consumed','claimed_expired')",
+                params![operation_id, self.installation_binding],
+            )
+            .map_err(|_| "pairing_unavailable")?;
+        if changed != 1 {
+            return Err("pairing_not_found".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mark_pairing_source_descriptor_cleanup_complete(
+        &self,
+        pair_id: &str,
+    ) -> Result<(), String> {
+        let connection = self.connection.lock().map_err(|_| "pairing_unavailable")?;
+        let changed = connection
+            .execute(
+                "UPDATE pairing_sources SET descriptor_cleanup_complete=1
+                 WHERE pair_id=?1 AND owner_binding=?2 AND state IN ('revoked','expired')",
+                params![pair_id, self.installation_binding],
+            )
+            .map_err(|_| "pairing_unavailable")?;
+        if changed != 1 {
+            return Err("pairing_not_found".into());
+        }
+        Ok(())
     }
 
     pub(crate) fn consume_pairing_reveal(
@@ -1988,7 +2482,8 @@ impl AgentControlStore {
         if kind != "session_pairing_reveal" {
             return Err("presence_not_authorized".into());
         }
-        if now_ms > u64::try_from(expires).map_err(|_| "pairing_unavailable")? {
+        let presence_expires_at_ms = u64::try_from(expires).map_err(|_| "pairing_unavailable")?;
+        if now_ms >= presence_expires_at_ms {
             return Err("presence_expired".into());
         }
         if state == "consumed" {
@@ -2045,9 +2540,11 @@ impl AgentControlStore {
         if stored_session != session_id || !matches!(source_state.as_str(), "local" | "revealed") {
             return Err("pairing_not_found".into());
         }
-        if now_ms > u64::try_from(source_expires).map_err(|_| "pairing_unavailable")? {
+        if now_ms >= u64::try_from(source_expires).map_err(|_| "pairing_unavailable")? {
             return Err("pairing_expired".into());
         }
+        let replay_expires_at_ms = presence_expires_at_ms
+            .min(u64::try_from(source_expires).map_err(|_| "pairing_unavailable")?);
         let plaintext = open_row(
             &self.row_wrap_key,
             "pairing-source",
@@ -2083,11 +2580,12 @@ impl AgentControlStore {
             .execute(
                 "UPDATE user_presence_intents
                  SET state='consumed',sealed_payload=NULL,sealed_response=?2,
-                     terminal_expires_at_ms=?3,logical_bytes=?4
+                     expires_at_ms=?3,terminal_expires_at_ms=?4,logical_bytes=?5
                  WHERE operation_id=?1 AND state='authorized'",
                 params![
                     operation_id,
                     response,
+                    u64_to_i64(replay_expires_at_ms)?,
                     terminal_expires_at_ms,
                     response_bytes
                 ],
@@ -2283,10 +2781,14 @@ impl AgentControlStore {
         &self,
         request_id: &str,
         operation_id: &str,
+        local_account: &str,
         descriptor: &PairingDescriptorV2,
         installation_principal: &str,
         now_ms: u64,
     ) -> Result<(PairingCodeV2, PairingClaimV2), String> {
+        if local_account.is_empty() || local_account.len() > 128 {
+            return Err("pairing_unavailable".into());
+        }
         match self.load_pairing_claim_for_request(
             operation_id,
             request_id,
@@ -2294,6 +2796,10 @@ impl AgentControlStore {
             now_ms,
         ) {
             Ok(existing) => {
+                if self.pairing_claim_local_account(operation_id)?.as_deref() != Some(local_account)
+                {
+                    return Err("pairing_account_mismatch".into());
+                }
                 let connection = self.connection.lock().map_err(|_| "pairing_unavailable")?;
                 checkpoint_secure_erasure(&connection).map_err(|_| "pairing_unavailable")?;
                 return Ok(existing);
@@ -2308,10 +2814,13 @@ impl AgentControlStore {
             .to_resume_bytes(&code)
             .map_err(|error| error.to_string())?;
         let sealed = seal_row(&self.row_wrap_key, "pairing-claim", operation_id, &resume)?;
-        let logical_bytes = i64::try_from(sealed.len()).map_err(|_| "pairing_unavailable")?;
+        let logical_bytes =
+            i64::try_from(sealed.len().saturating_add(512)).map_err(|_| "pairing_unavailable")?;
         let resume_expires_at_ms = now_ms
             .checked_add(PAIRING_CLAIM_RESUME_TTL_MS)
             .ok_or_else(|| "pairing_unavailable".to_string())?;
+        let recovery_request_id =
+            crate::uuid_v4().map_err(|_| "pairing_unavailable".to_string())?;
         let mut connection = self.connection.lock().map_err(|_| "pairing_unavailable")?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -2320,13 +2829,16 @@ impl AgentControlStore {
         transaction
             .execute(
                 "INSERT INTO pairing_claims(
-                   operation_id,request_id,pair_id,owner_binding,state,resume_expires_at_ms,
-                   installed_session_id,finalize_request_id,sealed_resume,logical_bytes
-                 ) VALUES(?1,?2,?3,?4,'claimed',?5,NULL,NULL,?6,?7)",
+                   operation_id,request_id,pair_id,local_account,recovery_request_id,
+                   owner_binding,state,resume_expires_at_ms,installed_session_id,
+                   finalize_request_id,sealed_resume,logical_bytes
+                 ) VALUES(?1,?2,?3,?4,?5,?6,'claimed',?7,NULL,NULL,?8,?9)",
                 params![
                     operation_id,
                     request_id,
                     code.pair_id(),
+                    local_account,
+                    recovery_request_id,
                     self.installation_binding,
                     u64_to_i64(resume_expires_at_ms)?,
                     sealed,
@@ -2365,7 +2877,7 @@ impl AgentControlStore {
             .query_row(
                 "SELECT sealed_resume FROM pairing_claims
                  WHERE operation_id=?1 AND owner_binding=?2
-                   AND state IN ('claimed','installed') AND resume_expires_at_ms>=?3",
+                   AND state IN ('claimed','installed') AND resume_expires_at_ms>?3",
                 params![operation_id, self.installation_binding, u64_to_i64(now_ms)?],
                 |row| row.get(0),
             )
@@ -2571,6 +3083,29 @@ impl AgentControlStore {
         Ok(Some(state))
     }
 
+    pub(crate) fn pairing_claim_local_account(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<String>, String> {
+        let connection = self.connection.lock().map_err(|_| "pairing_unavailable")?;
+        let account: Option<String> = connection
+            .query_row(
+                "SELECT local_account FROM pairing_claims
+                 WHERE operation_id=?1 AND owner_binding=?2",
+                params![operation_id, self.installation_binding],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| "pairing_unavailable")?;
+        if account
+            .as_ref()
+            .is_some_and(|account| account.is_empty() || account.len() > 128)
+        {
+            return Err("pairing_recovery_required".into());
+        }
+        Ok(account)
+    }
+
     pub(crate) fn pairing_claim_result_session(
         &self,
         operation_id: &str,
@@ -2681,7 +3216,7 @@ impl AgentControlStore {
         if !matches!(state.as_str(), "pending" | "authorized") {
             return Err("presence_not_found".into());
         }
-        if now_ms > u64::try_from(expires).map_err(|_| "presence_unavailable")? {
+        if now_ms >= u64::try_from(expires).map_err(|_| "presence_unavailable")? {
             return Err("presence_expired".into());
         }
         if !constant_time_eq(action_hash.as_bytes(), expected_action_hash.as_bytes()) {
@@ -2780,7 +3315,7 @@ impl AgentControlStore {
         if state != "authorized" {
             return Err("presence_not_authorized".into());
         }
-        if now_ms > u64::try_from(expires).map_err(|_| "presence_unavailable")? {
+        if now_ms >= u64::try_from(expires).map_err(|_| "presence_unavailable")? {
             return Err("presence_expired".into());
         }
         let payload = open_row(
@@ -2948,7 +3483,7 @@ impl AgentControlStore {
         &self,
         identity: &isyncyou_webui::ProductRequestIdentity,
     ) -> Result<ProductRequestBegin, String> {
-        if !identity.permits_durable_response() {
+        if !identity.permits_durable_terminal() {
             return Err("request_response_policy_violation".into());
         }
         match self.bind_product_request(identity)? {
@@ -2967,7 +3502,8 @@ impl AgentControlStore {
         let request_key = product_request_key(identity, &self.installation_principal)?;
         let existing: Option<ProductRequestReceiptRow> = transaction
             .query_row(
-                "SELECT route_domain,request_scope,payload_digest,state,sealed_response
+                "SELECT route_domain,request_scope,payload_digest,state,
+                        terminal_status,result_digest,sealed_response
                  FROM product_request_receipts
                  WHERE request_key=?1 AND request_id=?2",
                 params![request_key, identity.request_id],
@@ -2978,12 +3514,22 @@ impl AgentControlStore {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
             .optional()
             .map_err(|_| "request_store_unavailable")?;
-        if let Some((stored_route, stored_scope, stored_digest, state, sealed_response)) = existing
+        if let Some((
+            stored_route,
+            stored_scope,
+            stored_digest,
+            state,
+            terminal_status,
+            result_digest,
+            sealed_response,
+        )) = existing
         {
             if stored_route != identity.route_domain
                 || stored_scope != identity.request_scope
@@ -2991,19 +3537,21 @@ impl AgentControlStore {
             {
                 return Ok(ProductRequestBegin::Conflict);
             }
-            if state == "started" {
+            if sealed_response.is_some() {
+                return Err("request_store_unavailable".into());
+            }
+            if state == "started" && terminal_status == 0 && result_digest.is_empty() {
                 return Ok(ProductRequestBegin::OutcomeUnknown);
             }
-            let sealed = sealed_response.ok_or("request_store_unavailable")?;
-            let plaintext = open_row(
-                &self.row_wrap_key,
-                "product-request-response",
-                &identity.request_id,
-                &sealed,
-            )?;
-            let response: StoredProductResponseV1 =
-                serde_json::from_slice(&plaintext).map_err(|_| "request_store_unavailable")?;
-            return Ok(ProductRequestBegin::Replay(response));
+            if state == "completed" {
+                let status = u16::try_from(terminal_status)
+                    .map_err(|_| "request_store_unavailable".to_string())?;
+                if !matches!(status, 200..=299 | 400..=499) || !valid_sha256(&result_digest) {
+                    return Err("request_store_unavailable".into());
+                }
+                return Ok(ProductRequestBegin::Completed { status });
+            }
+            return Err("request_store_unavailable".into());
         }
         let logical_bytes = i64::try_from(
             identity
@@ -3021,8 +3569,8 @@ impl AgentControlStore {
             .execute(
                 "INSERT INTO product_request_receipts(
                    request_id,request_key,route_domain,request_scope,payload_digest,
-                   state,sealed_response,expires_at_ms,logical_bytes
-                 ) VALUES(?1,?2,?3,?4,?5,'started',NULL,?6,?7)",
+                   state,terminal_status,result_digest,sealed_response,expires_at_ms,logical_bytes
+                 ) VALUES(?1,?2,?3,?4,?5,'started',0,'',NULL,?6,?7)",
                 params![
                     identity.request_id,
                     request_key,
@@ -3043,21 +3591,16 @@ impl AgentControlStore {
     pub(crate) fn complete_product_request_identity(
         &self,
         identity: &isyncyou_webui::ProductRequestIdentity,
-        response: &StoredProductResponseV1,
+        terminal: &ProductRequestTerminalV1,
     ) -> Result<(), String> {
-        if !identity.permits_durable_response() {
+        if !identity.permits_durable_terminal() {
             return Err("request_response_policy_violation".into());
         }
-        let plaintext = serde_json::to_vec(response).map_err(|_| "request_store_unavailable")?;
-        if plaintext.len() > 1024 * 1024 || response.headers.len() > 32 {
+        if !matches!(terminal.status, 200..=299 | 400..=499)
+            || !valid_sha256(&terminal.result_digest)
+        {
             return Err("request_store_unavailable".into());
         }
-        let sealed = seal_row(
-            &self.row_wrap_key,
-            "product-request-response",
-            &identity.request_id,
-            &plaintext,
-        )?;
         let request_key = product_request_key(identity, &self.installation_principal)?;
         let mut connection = self
             .connection
@@ -3082,18 +3625,30 @@ impl AgentControlStore {
                 |row| row.get(0),
             )
             .map_err(|_| "request_store_unavailable")?;
-        let next_bytes = i64::try_from(sealed.len().saturating_add(256))
-            .map_err(|_| "request_store_unavailable")?;
+        let next_bytes = i64::try_from(
+            identity
+                .request_id
+                .len()
+                .saturating_add(request_key.len())
+                .saturating_add(identity.route_domain.len())
+                .saturating_add(identity.request_scope.len())
+                .saturating_add(identity.payload_digest.len())
+                .saturating_add(terminal.result_digest.len())
+                .saturating_add(256),
+        )
+        .map_err(|_| "request_store_unavailable")?;
         enforce_control_quota(&transaction, next_bytes.saturating_sub(previous_bytes))?;
         let changed = transaction
             .execute(
                 "UPDATE product_request_receipts
-                 SET state='completed',sealed_response=?1,logical_bytes=?2
-                 WHERE request_key=?3 AND request_id=?4 AND route_domain=?5
-                   AND request_scope=?6 AND payload_digest=?7
+                 SET state='completed',terminal_status=?1,result_digest=?2,
+                     sealed_response=NULL,logical_bytes=?3
+                 WHERE request_key=?4 AND request_id=?5 AND route_domain=?6
+                   AND request_scope=?7 AND payload_digest=?8
                    AND state='started'",
                 params![
-                    sealed,
+                    i64::from(terminal.status),
+                    terminal.result_digest,
                     next_bytes,
                     request_key,
                     identity.request_id,
@@ -3115,7 +3670,7 @@ impl AgentControlStore {
         &self,
         identity: &isyncyou_webui::ProductRequestIdentity,
     ) -> Result<(), String> {
-        if !identity.permits_durable_response() {
+        if !identity.permits_durable_terminal() {
             return Err("request_response_policy_violation".into());
         }
         let request_key = product_request_key(identity, &self.installation_principal)?;
@@ -3295,7 +3850,7 @@ impl AgentControlStore {
         request_id: &str,
         route_domain: &'static str,
         payload_digest: &str,
-        response: &StoredProductResponseV1,
+        terminal: &ProductRequestTerminalV1,
     ) -> Result<(), String> {
         self.complete_product_request_identity(
             &isyncyou_webui::ProductRequestIdentity {
@@ -3304,7 +3859,7 @@ impl AgentControlStore {
                 request_scope: "installation".into(),
                 payload_digest: payload_digest.into(),
             },
-            response,
+            terminal,
         )
     }
 
@@ -3810,7 +4365,7 @@ fn derive_control_subkeys(control_root: &[u8; 32]) -> Result<ControlSubkeys, Str
 
 impl PendingPersistence for AgentControlStore {
     fn insert(&self, pending: PersistedPendingAction) -> Result<(), ConfirmError> {
-        self.reap_expired(crate::unix_now_ms(), 256)
+        self.reap_expired(pending.created_at_ms, 256)
             .map_err(|_| ConfirmError::Unavailable)?;
         if pending.id.is_empty()
             || pending.action_hash.len() != 64
@@ -3882,15 +4437,70 @@ impl PendingPersistence for AgentControlStore {
         action_hash: &str,
         now_ms: u64,
     ) -> Result<ToolAction, ConfirmError> {
-        let Some((state, expires, expected_action_hash, sealed)) = self.load_pending(pending_id)?
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| ConfirmError::Unavailable)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| ConfirmError::Unavailable)?;
+        let row: Option<PendingConfirmRow> = transaction
+            .query_row(
+                "SELECT state,expires_at_ms,action_hash,sealed_payload,
+                            account_id,session_id,request_id,turn_id
+                     FROM confirmation_intents
+                     WHERE intent_id=?1 AND owner_binding=?2",
+                params![pending_id, self.installation_binding],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| ConfirmError::Unavailable)?;
+        let Some((
+            state,
+            expires,
+            expected_action_hash,
+            sealed,
+            account,
+            session_id,
+            request_id,
+            turn_id,
+        )) = row
         else {
             return Err(ConfirmError::NotFound);
         };
         if state != "pending" {
             return Err(ConfirmError::NotFound);
         }
-        if now_ms > expires {
-            self.erase_with_state(pending_id, "expired", now_ms)?;
+        let now = u64_to_i64(now_ms).map_err(|_| ConfirmError::Unavailable)?;
+        if now >= expires {
+            transaction
+                .execute(
+                    "UPDATE confirmation_intents
+                     SET state='expired',sealed_payload=NULL,terminal_expires_at_ms=?3,
+                         logical_bytes=0
+                     WHERE intent_id=?1 AND owner_binding=?2 AND state='pending'",
+                    params![
+                        pending_id,
+                        self.installation_binding,
+                        control_tombstone_expiry(now_ms).map_err(|_| ConfirmError::Unavailable)?
+                    ],
+                )
+                .map_err(|_| ConfirmError::Unavailable)?;
+            transaction
+                .commit()
+                .map_err(|_| ConfirmError::Unavailable)?;
+            checkpoint_secure_erasure(&connection).map_err(|_| ConfirmError::Unavailable)?;
             return Err(ConfirmError::Expired);
         }
         if !constant_time_eq(action_hash.as_bytes(), expected_action_hash.as_bytes()) {
@@ -3906,7 +4516,59 @@ impl PendingPersistence for AgentControlStore {
         if !constant_time_eq(token_hash, &expected_token) {
             return Err(ConfirmError::BadToken);
         }
-        self.erase_with_state(pending_id, "consumed", now_ms)?;
+        let terminal_expires_at_ms =
+            control_tombstone_expiry(now_ms).map_err(|_| ConfirmError::Unavailable)?;
+        let changed = transaction
+            .execute(
+                "UPDATE confirmation_intents
+                 SET state='consumed',sealed_payload=NULL,terminal_expires_at_ms=?3,
+                     logical_bytes=0
+                 WHERE intent_id=?1 AND owner_binding=?2 AND state='pending'",
+                params![
+                    pending_id,
+                    self.installation_binding,
+                    terminal_expires_at_ms
+                ],
+            )
+            .map_err(|_| ConfirmError::Unavailable)?;
+        if changed != 1 {
+            return Err(ConfirmError::NotFound);
+        }
+        let projection_bytes = i64::try_from(
+            pending_id
+                .len()
+                .saturating_add(account.len())
+                .saturating_add(session_id.len())
+                .saturating_add(request_id.len())
+                .saturating_add(turn_id.len())
+                .saturating_add(self.installation_binding.len())
+                .saturating_add(128),
+        )
+        .map_err(|_| ConfirmError::Unavailable)?;
+        enforce_control_quota(&transaction, projection_bytes)
+            .map_err(|_| ConfirmError::Unavailable)?;
+        transaction
+            .execute(
+                "INSERT INTO pending_confirm_projections(
+                   pending_id,account_id,session_id,request_id,turn_id,owner_binding,
+                   code,created_at_ms,logical_bytes
+                 ) VALUES(?1,?2,?3,?4,?5,?6,'executing',?7,?8)",
+                params![
+                    pending_id,
+                    account,
+                    session_id,
+                    request_id,
+                    turn_id,
+                    self.installation_binding,
+                    now,
+                    projection_bytes,
+                ],
+            )
+            .map_err(|_| ConfirmError::Unavailable)?;
+        transaction
+            .commit()
+            .map_err(|_| ConfirmError::Unavailable)?;
+        checkpoint_secure_erasure(&connection).map_err(|_| ConfirmError::Unavailable)?;
         Ok(pending.action)
     }
 
@@ -3923,7 +4585,7 @@ impl PendingPersistence for AgentControlStore {
         if state != "pending" {
             return Err(ConfirmError::NotFound);
         }
-        if now_ms > expires {
+        if now_ms >= expires {
             self.erase_with_state(pending_id, "expired", now_ms)?;
             return Err(ConfirmError::Expired);
         }
@@ -3991,7 +4653,7 @@ impl PendingPersistence for AgentControlStore {
         if state != "pending" && state != "cancelled" {
             return Err(ConfirmError::NotFound);
         }
-        if state == "pending" && now > expires {
+        if state == "pending" && now >= expires {
             let terminal_expires_at_ms =
                 control_tombstone_expiry(now_ms).map_err(|_| ConfirmError::Unavailable)?;
             transaction
@@ -4066,6 +4728,7 @@ impl PendingPersistence for AgentControlStore {
                 ],
             )
             .map_err(|_| ConfirmError::Unavailable)?;
+        enforce_control_quota(&transaction, 0).map_err(|_| ConfirmError::Unavailable)?;
         transaction
             .commit()
             .map_err(|_| ConfirmError::Unavailable)?;
@@ -4079,6 +4742,156 @@ impl PendingPersistence for AgentControlStore {
         Ok(owner)
     }
 
+    fn reissue_for_owner(
+        &self,
+        owner: &PendingOwnerBinding,
+        token_hash: &[u8; 32],
+        now_ms: u64,
+    ) -> Result<Option<isyncyou_agent::PendingAction>, ConfirmError> {
+        if owner.account.is_empty()
+            || owner.session_id.is_empty()
+            || owner.request_id.is_empty()
+            || owner.turn_id.is_empty()
+        {
+            return Err(ConfirmError::Unavailable);
+        }
+        let now = u64_to_i64(now_ms).map_err(|_| ConfirmError::Unavailable)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| ConfirmError::Unavailable)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| ConfirmError::Unavailable)?;
+        let matching_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM confirmation_intents
+                 WHERE account_id=?1 AND session_id=?2 AND request_id=?3 AND turn_id=?4
+                   AND owner_binding=?5 AND state='pending'",
+                params![
+                    owner.account,
+                    owner.session_id,
+                    owner.request_id,
+                    owner.turn_id,
+                    self.installation_binding,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|_| ConfirmError::Unavailable)?;
+        if matching_count > 1 {
+            return Err(ConfirmError::Unavailable);
+        }
+        let row: Option<PendingTakeRow> = transaction
+            .query_row(
+                "SELECT intent_id,action_hash,expires_at_ms,sealed_payload,logical_bytes
+                 FROM confirmation_intents
+                 WHERE account_id=?1 AND session_id=?2 AND request_id=?3 AND turn_id=?4
+                   AND owner_binding=?5 AND state='pending'",
+                params![
+                    owner.account,
+                    owner.session_id,
+                    owner.request_id,
+                    owner.turn_id,
+                    self.installation_binding,
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| ConfirmError::Unavailable)?;
+        let Some((pending_id, expected_action_hash, expires, sealed, previous_bytes)) = row else {
+            transaction
+                .commit()
+                .map_err(|_| ConfirmError::Unavailable)?;
+            return Ok(None);
+        };
+        if now >= expires {
+            transaction
+                .execute(
+                    "UPDATE confirmation_intents
+                     SET state='expired',sealed_payload=NULL,terminal_expires_at_ms=?3,
+                         logical_bytes=0
+                     WHERE intent_id=?1 AND owner_binding=?2 AND state='pending'",
+                    params![
+                        pending_id,
+                        self.installation_binding,
+                        control_tombstone_expiry(now_ms).map_err(|_| ConfirmError::Unavailable)?
+                    ],
+                )
+                .map_err(|_| ConfirmError::Unavailable)?;
+            transaction
+                .commit()
+                .map_err(|_| ConfirmError::Unavailable)?;
+            checkpoint_secure_erasure(&connection).map_err(|_| ConfirmError::Unavailable)?;
+            return Ok(None);
+        }
+        let mut pending = self.decrypt_pending(
+            &pending_id,
+            sealed.as_deref().ok_or(ConfirmError::Unavailable)?,
+        )?;
+        let recomputed_action_hash = isyncyou_agent::action_hash(
+            &pending.action,
+            u64::try_from(expires).map_err(|_| ConfirmError::Unavailable)?,
+        )
+        .map_err(|_| ConfirmError::Unavailable)?;
+        if pending.version != 1
+            || pending.action.account() != owner.account.as_str()
+            || !constant_time_eq(
+                recomputed_action_hash.as_bytes(),
+                expected_action_hash.as_bytes(),
+            )
+        {
+            return Err(ConfirmError::Unavailable);
+        }
+        pending.token_hash = URL_SAFE_NO_PAD.encode(token_hash);
+        let plaintext = serde_json::to_vec(&pending).map_err(|_| ConfirmError::Unavailable)?;
+        if plaintext.len() > MAX_PENDING_PLAINTEXT {
+            return Err(ConfirmError::Unavailable);
+        }
+        let sealed = seal_row(&self.row_wrap_key, "agent-tool", &pending_id, &plaintext)
+            .map_err(|_| ConfirmError::Unavailable)?;
+        let logical_bytes = i64::try_from(sealed.len()).map_err(|_| ConfirmError::Unavailable)?;
+        enforce_control_quota(&transaction, logical_bytes.saturating_sub(previous_bytes))
+            .map_err(|_| ConfirmError::Unavailable)?;
+        let changed = transaction
+            .execute(
+                "UPDATE confirmation_intents SET sealed_payload=?1,logical_bytes=?2
+                 WHERE intent_id=?3 AND owner_binding=?4 AND state='pending'
+                   AND action_hash=?5 AND expires_at_ms=?6",
+                params![
+                    sealed,
+                    logical_bytes,
+                    pending_id,
+                    self.installation_binding,
+                    expected_action_hash,
+                    expires,
+                ],
+            )
+            .map_err(|_| ConfirmError::Unavailable)?;
+        if changed != 1 {
+            return Err(ConfirmError::Unavailable);
+        }
+        transaction
+            .commit()
+            .map_err(|_| ConfirmError::Unavailable)?;
+        checkpoint_secure_erasure(&connection).map_err(|_| ConfirmError::Unavailable)?;
+        Ok(Some(isyncyou_agent::PendingAction {
+            id: pending_id,
+            action: pending.action,
+            preview: pending.preview,
+            action_hash: expected_action_hash,
+            risk: pending.risk,
+            expires_at_ms: u64::try_from(expires).map_err(|_| ConfirmError::Unavailable)?,
+        }))
+    }
+
     fn has_pending_for_turn(&self, turn_id: &str, now_ms: u64) -> Result<bool, ConfirmError> {
         let now = u64_to_i64(now_ms).map_err(|_| ConfirmError::Unavailable)?;
         let connection = self
@@ -4089,7 +4902,7 @@ impl PendingPersistence for AgentControlStore {
             .query_row(
                 "SELECT COUNT(*) FROM confirmation_intents
                  WHERE turn_id=?1 AND owner_binding=?2 AND state='pending'
-                   AND expires_at_ms>=?3",
+                   AND expires_at_ms>?3",
                 params![turn_id, self.installation_binding, now],
                 |row| row.get(0),
             )
@@ -4122,9 +4935,16 @@ fn ensure_text_column(
         | ("agent_turn_admissions", "request_scope", "installation") => {
             format!("ALTER TABLE {table} ADD COLUMN {column} TEXT NOT NULL DEFAULT 'installation'")
         }
+        ("product_request_receipts", "result_digest", "")
+        | ("mutation_intents", "result_digest", "") => {
+            format!("ALTER TABLE {table} ADD COLUMN result_digest TEXT NOT NULL DEFAULT ''")
+        }
         ("agent_turn_admissions", "state", "active") => {
             "ALTER TABLE agent_turn_admissions ADD COLUMN state TEXT NOT NULL DEFAULT 'active'"
                 .into()
+        }
+        ("pairing_claims", "local_account", "") | ("pairing_claims", "recovery_request_id", "") => {
+            format!("ALTER TABLE pairing_claims ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
         }
         _ => return Err("control_store_migration_failed".into()),
     };
@@ -4199,8 +5019,11 @@ fn ensure_integer_column(connection: &Connection, table: &str, column: &str) -> 
             | ("confirmation_intents", "terminal_expires_at_ms")
             | ("user_presence_intents", "terminal_expires_at_ms")
             | ("pairing_sources", "terminal_expires_at_ms")
+            | ("pairing_sources", "descriptor_cleanup_complete")
             | ("pairing_claims", "terminal_expires_at_ms")
+            | ("pairing_claims", "descriptor_cleanup_complete")
             | ("pairing_revocations", "terminal_expires_at_ms")
+            | ("product_request_receipts", "terminal_status")
     ) {
         return Err("control_store_migration_failed".into());
     }
@@ -4253,13 +5076,29 @@ fn delete_expired_control_tombstones(
     ) {
         return Err("control_store_unavailable".into());
     }
+    let deletion_guard = match table {
+        "confirmation_intents" => {
+            "AND NOT EXISTS (
+               SELECT 1 FROM pending_cancel_projections
+               WHERE pending_cancel_projections.pending_id=confirmation_intents.intent_id
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM pending_confirm_projections
+               WHERE pending_confirm_projections.pending_id=confirmation_intents.intent_id
+             )"
+        }
+        "pairing_sources" => "AND descriptor_cleanup_complete=1",
+        "pairing_claims" => "AND (state='aborted' OR descriptor_cleanup_complete=1)",
+        _ => "",
+    };
     connection
         .execute(
             &format!(
                 "DELETE FROM {table} WHERE {id_column} IN (
                    SELECT {id_column} FROM {table}
                    WHERE state IN ({terminal_states})
-                     AND terminal_expires_at_ms > 0 AND terminal_expires_at_ms < ?1
+                     AND terminal_expires_at_ms > 0 AND terminal_expires_at_ms <= ?1
+                     {deletion_guard}
                    LIMIT ?2
                  )"
             ),
@@ -4275,6 +5114,27 @@ fn consume_reaper_budget(remaining: &mut i64, changed: usize) -> Result<(), Stri
     }
     *remaining -= changed;
     Ok(())
+}
+
+fn migrate_duplicate_pending_confirmations(
+    transaction: &Transaction<'_>,
+    now_ms: u64,
+) -> Result<bool, String> {
+    let terminal_expires_at_ms =
+        control_tombstone_expiry(now_ms).map_err(|_| "control_store_migration_failed")?;
+    let changed = transaction
+        .execute(
+            "UPDATE confirmation_intents
+             SET state='expired',sealed_payload=NULL,terminal_expires_at_ms=?1,logical_bytes=0
+             WHERE state='pending' AND turn_id IN (
+               SELECT turn_id FROM confirmation_intents
+               WHERE state='pending'
+               GROUP BY turn_id HAVING COUNT(*)>1
+             )",
+            params![terminal_expires_at_ms],
+        )
+        .map_err(|_| "control_store_migration_failed")?;
+    Ok(changed != 0)
 }
 
 fn stored_control_schema_version(connection: &Connection) -> Result<Option<i64>, String> {
@@ -4391,6 +5251,205 @@ fn migrate_mutation_retention_v9(
             .map_err(|_| "control_store_migration_failed")?;
     }
     Ok(())
+}
+
+fn migrate_mutation_results_v15(
+    transaction: &Transaction<'_>,
+    row_wrap_key: &[u8; 32],
+) -> Result<bool, String> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT intent_id,state,result_json,logical_bytes FROM mutation_intents
+             WHERE result_json IS NOT NULL",
+        )
+        .map_err(|_| "control_store_migration_failed")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|_| "control_store_migration_failed")?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "control_store_migration_failed")?;
+    drop(statement);
+    let purged = !rows.is_empty();
+    for (intent_id, state, sealed_result, previous_logical_bytes) in rows {
+        let result_digest = if state == "committed" {
+            let result = open_row(row_wrap_key, "mutation-result", &intent_id, &sealed_result)
+                .map_err(|_| "control_store_migration_failed")?;
+            serde_json::from_slice::<serde_json::Value>(&result)
+                .map_err(|_| "control_store_migration_failed")?;
+            mutation_result_digest(&result)
+        } else {
+            String::new()
+        };
+        let logical_bytes = if state == "committed" {
+            i64::try_from(result_digest.len().saturating_add(512))
+                .map_err(|_| "control_store_migration_failed")?
+        } else {
+            let sealed_bytes =
+                i64::try_from(sealed_result.len()).map_err(|_| "control_store_migration_failed")?;
+            previous_logical_bytes
+                .checked_sub(sealed_bytes)
+                .filter(|remaining| *remaining >= 0)
+                .ok_or("control_store_migration_failed")?
+        };
+        transaction
+            .execute(
+                "UPDATE mutation_intents
+                 SET result_json=NULL,result_digest=?1,logical_bytes=?2
+                 WHERE intent_id=?3",
+                params![result_digest, logical_bytes, intent_id],
+            )
+            .map_err(|_| "control_store_migration_failed")?;
+    }
+    let mut statement = transaction
+        .prepare("SELECT state,result_json,result_digest,logical_bytes FROM mutation_intents")
+        .map_err(|_| "control_store_migration_failed")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|_| "control_store_migration_failed")?;
+    for row in rows {
+        let (state, result_json, result_digest, logical_bytes) =
+            row.map_err(|_| "control_store_migration_failed")?;
+        let valid = if state == "committed" {
+            result_json.is_none() && valid_sha256(&result_digest) && logical_bytes >= 0
+        } else {
+            result_json.is_none() && result_digest.is_empty() && logical_bytes >= 0
+        };
+        if !valid {
+            return Err("control_store_migration_failed".into());
+        }
+    }
+    Ok(purged)
+}
+
+fn migrate_product_request_results_v15(
+    transaction: &Transaction<'_>,
+    row_wrap_key: &[u8; 32],
+) -> Result<bool, String> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT request_id,request_key,route_domain,request_scope,payload_digest,sealed_response
+             FROM product_request_receipts
+             WHERE sealed_response IS NOT NULL",
+        )
+        .map_err(|_| "control_store_migration_failed")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+            ))
+        })
+        .map_err(|_| "control_store_migration_failed")?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "control_store_migration_failed")?;
+    drop(statement);
+    let purged = !rows.is_empty();
+    for (request_id, request_key, route_domain, request_scope, payload_digest, sealed_response) in
+        rows
+    {
+        let plaintext = open_row(
+            row_wrap_key,
+            "product-request-response",
+            &request_id,
+            &sealed_response,
+        )
+        .map_err(|_| "control_store_migration_failed")?;
+        let legacy: LegacyStoredProductResponseV1 =
+            serde_json::from_slice(&plaintext).map_err(|_| "control_store_migration_failed")?;
+        let response = isyncyou_webui::ApiResponse {
+            status: legacy.status,
+            content_type: legacy.content_type,
+            body: legacy.body,
+            headers: legacy.headers,
+        };
+        let terminal = ProductRequestTerminalV1::from_api_response(&response)
+            .map_err(|_| "control_store_migration_failed")?;
+        let logical_bytes = i64::try_from(
+            request_id
+                .len()
+                .saturating_add(request_key.len())
+                .saturating_add(route_domain.len())
+                .saturating_add(request_scope.len())
+                .saturating_add(payload_digest.len())
+                .saturating_add(terminal.result_digest.len())
+                .saturating_add(256),
+        )
+        .map_err(|_| "control_store_migration_failed")?;
+        transaction
+            .execute(
+                "UPDATE product_request_receipts
+                 SET sealed_response=NULL,terminal_status=?1,result_digest=?2,logical_bytes=?3
+                 WHERE request_id=?4",
+                params![
+                    i64::from(terminal.status),
+                    terminal.result_digest,
+                    logical_bytes,
+                    request_id
+                ],
+            )
+            .map_err(|_| "control_store_migration_failed")?;
+    }
+    let mut statement = transaction
+        .prepare(
+            "SELECT state,terminal_status,result_digest,sealed_response
+             FROM product_request_receipts",
+        )
+        .map_err(|_| "control_store_migration_failed")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<Vec<u8>>>(3)?,
+            ))
+        })
+        .map_err(|_| "control_store_migration_failed")?;
+    for row in rows {
+        let (state, terminal_status, result_digest, sealed_response) =
+            row.map_err(|_| "control_store_migration_failed")?;
+        let valid = match state.as_str() {
+            "started" => {
+                terminal_status == 0 && result_digest.is_empty() && sealed_response.is_none()
+            }
+            "completed" => {
+                matches!(terminal_status, 200..=299 | 400..=499)
+                    && valid_sha256(&result_digest)
+                    && sealed_response.is_none()
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err("control_store_migration_failed".into());
+        }
+    }
+    Ok(purged)
+}
+
+fn mutation_result_digest(result_json: &[u8]) -> String {
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    digest.update(b"isyncyou-mutation-result/v1\0");
+    digest.update(&(result_json.len() as u64).to_be_bytes());
+    digest.update(result_json);
+    digest_hex(digest.finish().as_ref())
 }
 
 fn migrate_control_tombstone_retention_v10(
@@ -4827,7 +5886,7 @@ fn initialize_metadata(
         }
         match schema.parse::<i64>() {
             Ok(SCHEMA_VERSION) => {}
-            Ok(1..=11) if SCHEMA_VERSION == 12 => {
+            Ok(1..=17) if SCHEMA_VERSION == 18 => {
                 connection
                     .execute(
                         "UPDATE control_metadata SET value=?1 WHERE key='schema_version'",
@@ -4929,6 +5988,7 @@ fn enforce_control_quota(connection: &Connection, additional_bytes: i64) -> Resu
             "SELECT
                COALESCE((SELECT SUM(logical_bytes) FROM confirmation_intents),0) +
                COALESCE((SELECT SUM(logical_bytes) FROM pending_cancel_projections),0) +
+               COALESCE((SELECT SUM(logical_bytes) FROM pending_confirm_projections),0) +
                COALESCE((SELECT SUM(logical_bytes) FROM user_presence_intents),0) +
                COALESCE((SELECT SUM(logical_bytes) FROM pairing_sources),0) +
                COALESCE((SELECT SUM(logical_bytes) FROM pairing_claims),0) +
@@ -5106,6 +6166,50 @@ fn random_id(bytes: usize) -> Result<String, String> {
         .fill(&mut value)
         .map_err(|_| "control_store_unavailable")?;
     Ok(URL_SAFE_NO_PAD.encode(value))
+}
+
+fn read_private_regular_file_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, ()> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(path)
+        .map_err(|_| ())?
+        .file_type()
+        .is_symlink()
+    {
+        return Err(());
+    }
+
+    let mut file = options.open(path).map_err(|_| ())?;
+    let metadata = file.metadata().map_err(|_| ())?;
+    if !metadata.file_type().is_file() {
+        return Err(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o777 != 0o600
+        {
+            return Err(());
+        }
+    }
+    if metadata.len() > max_bytes as u64 {
+        return Err(());
+    }
+    let mut output = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(max_bytes as u64 + 1)
+        .read_to_end(&mut output)
+        .map_err(|_| ())?;
+    (output.len() <= max_bytes).then_some(output).ok_or(())
 }
 
 fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -5482,18 +6586,109 @@ mod tests {
     }
 
     #[test]
-    fn product_request_receipt_survives_restart_replays_and_rejects_uuid_reuse() {
+    fn agent_control_store_debug_redacts_local_path_and_installation_binding() {
+        let root = temp_root("debug-redaction");
+        let credential_store = credential_store(&root);
+        let control =
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
+
+        let debug = format!("{control:?}");
+        assert!(!debug.contains(root.to_string_lossy().as_ref()));
+        assert!(!debug.contains(INSTALLATION_PRINCIPAL));
+        assert!(debug.contains("[redacted]"));
+
+        let response = isyncyou_webui::ApiResponse {
+            status: 200,
+            content_type: "application/json".into(),
+            body: b"private-response-marker".to_vec(),
+            headers: vec![("x-private".into(), "private-header-marker".into())],
+        };
+        let terminal = ProductRequestTerminalV1::from_api_response(&response).unwrap();
+        let source = PairingSourceRecord {
+            pair_id: "private-pair-marker".into(),
+            expires_at_ms: 1,
+        };
+        let cleanup = PairingDescriptorCleanupTarget {
+            pair_id: "private-cleanup-pair-marker".into(),
+            session_id: "private-session-marker".into(),
+        };
+        let recovery = PairingClaimRecoveryTarget {
+            operation_id: "private-recovery-operation-marker".into(),
+            request_id: "private-recovery-request-marker".into(),
+            finalize_request_id: "private-recovery-finalize-marker".into(),
+            local_account: "private-recovery-account-marker".into(),
+            state: "claimed".into(),
+        };
+        let binding = UserPresenceBinding::PairingImport {
+            pairing_code: "private-pairing-code-marker".into(),
+        };
+        let challenge = UserPresenceChallenge {
+            operation_id: "private-operation-marker".into(),
+            intent_id: "private-intent-marker".into(),
+            token: "private-token-marker".into(),
+            action_hash: "private-action-marker".into(),
+            expires_at_ms: 1,
+        };
+        let projection_owner = PendingOwnerBinding {
+            account: "private-projection-account-marker".into(),
+            session_id: "private-projection-session-marker".into(),
+            request_id: "private-projection-request-marker".into(),
+            turn_id: "private-projection-turn-marker".into(),
+        };
+        let cancel_projection = PendingCancelProjection {
+            pending_id: "private-cancel-pending-marker".into(),
+            owner: projection_owner.clone(),
+            created_at_ms: 1,
+        };
+        let confirm_projection = PendingConfirmProjection {
+            pending_id: "private-confirm-pending-marker".into(),
+            owner: projection_owner,
+            code: "completed".into(),
+            created_at_ms: 1,
+        };
+        let sensitive_debug = format!(
+            "{terminal:?}{source:?}{cleanup:?}{recovery:?}{binding:?}{challenge:?}{cancel_projection:?}{confirm_projection:?}"
+        );
+        for marker in [
+            "private-response-marker",
+            "private-header-marker",
+            "private-pair-marker",
+            "private-cleanup-pair-marker",
+            "private-session-marker",
+            "private-recovery-operation-marker",
+            "private-recovery-request-marker",
+            "private-recovery-finalize-marker",
+            "private-recovery-account-marker",
+            "private-pairing-code-marker",
+            "private-operation-marker",
+            "private-intent-marker",
+            "private-token-marker",
+            "private-action-marker",
+            "private-projection-account-marker",
+            "private-projection-session-marker",
+            "private-projection-request-marker",
+            "private-projection-turn-marker",
+            "private-cancel-pending-marker",
+            "private-confirm-pending-marker",
+        ] {
+            assert!(!sensitive_debug.contains(marker));
+        }
+    }
+
+    #[test]
+    fn product_request_receipt_survives_restart_without_response_content() {
         let root = temp_root("product-request-receipt");
         let credential_store = credential_store(&root);
         let request_id = "019f0000-0000-4000-8000-000000000301";
         let route = "post:/api/v1/mail/send";
         let digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let response = StoredProductResponseV1 {
+        let response = isyncyou_webui::ApiResponse {
             status: 200,
             content_type: "application/json".into(),
-            body: br#"{"ok":true}"#.to_vec(),
-            headers: vec![("Cache-Control".into(), "no-store".into())],
+            body: br#"{"recipient":"private-response-marker"}"#.to_vec(),
+            headers: vec![("x-private".into(), "private-header-marker".into())],
         };
+        let terminal = ProductRequestTerminalV1::from_api_response(&response).unwrap();
         {
             let control =
                 AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1)
@@ -5511,24 +6706,180 @@ mod tests {
                 ProductRequestBegin::OutcomeUnknown
             ));
             control
-                .complete_product_request(request_id, route, digest, &response)
+                .complete_product_request(request_id, route, digest, &terminal)
                 .unwrap();
+            let stored: (i64, String, Option<Vec<u8>>) = control
+                .connection
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT terminal_status,result_digest,sealed_response
+                     FROM product_request_receipts WHERE request_id=?1",
+                    params![request_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(stored, (200, terminal.result_digest.clone(), None));
         }
         let control =
             AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
-        match control
-            .begin_product_request(request_id, route, digest)
-            .unwrap()
-        {
-            ProductRequestBegin::Replay(stored) => assert_eq!(stored, response),
-            _ => panic!("completed receipt must replay"),
-        }
+        assert_eq!(
+            control
+                .begin_product_request(request_id, route, digest)
+                .unwrap(),
+            ProductRequestBegin::Completed { status: 200 }
+        );
         assert!(matches!(
             control
                 .begin_product_request(request_id, "post:/api/v1/calendar/create", digest,)
                 .unwrap(),
             ProductRequestBegin::Conflict
         ));
+        drop(control);
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!(
+                "{}{}",
+                root.join("agent-control/.isyncyou-agent-control.db")
+                    .display(),
+                suffix
+            ));
+            if path.exists() {
+                let bytes = std::fs::read(path).unwrap();
+                for marker in [
+                    b"private-response-marker".as_slice(),
+                    b"private-header-marker",
+                ] {
+                    assert!(!bytes.windows(marker.len()).any(|window| window == marker));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn product_request_terminal_rejects_redirect_and_server_error_responses() {
+        for status in [300, 307, 500, 503] {
+            let response = isyncyou_webui::ApiResponse {
+                status,
+                content_type: "application/json".into(),
+                body: br#"{"code":"not_terminal"}"#.to_vec(),
+                headers: vec![],
+            };
+
+            assert_eq!(
+                ProductRequestTerminalV1::from_api_response(&response),
+                Err("request_store_unavailable".into())
+            );
+        }
+    }
+
+    #[test]
+    fn product_request_v13_migration_erases_legacy_response_content() {
+        let root = temp_root("product-request-v13-response-erasure");
+        let credential_store = credential_store(&root);
+        let identity = isyncyou_webui::ProductRequestIdentity {
+            request_id: "019f0000-0000-4000-8000-000000000323".into(),
+            route_domain: "post:/api/v1/mail/send",
+            request_scope: "installation".into(),
+            payload_digest: "abababababababababababababababababababababababababababababababab"
+                .into(),
+        };
+        let legacy_marker = b"legacy-private-product-response-marker";
+        let legacy_response = LegacyStoredProductResponseV1 {
+            status: 201,
+            content_type: "application/json".into(),
+            body: legacy_marker.to_vec(),
+            headers: vec![("x-private".into(), "legacy-private-header-marker".into())],
+        };
+        let expected_terminal =
+            ProductRequestTerminalV1::from_api_response(&isyncyou_webui::ApiResponse {
+                status: legacy_response.status,
+                content_type: legacy_response.content_type.clone(),
+                body: legacy_response.body.clone(),
+                headers: legacy_response.headers.clone(),
+            })
+            .unwrap();
+        let legacy_sealed_response;
+        {
+            let control =
+                AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1)
+                    .unwrap();
+            assert_eq!(
+                control.begin_product_request_identity(&identity).unwrap(),
+                ProductRequestBegin::Execute
+            );
+            let connection = control.connection.lock().unwrap();
+            let sealed_response = seal_row(
+                &control.row_wrap_key,
+                "product-request-response",
+                &identity.request_id,
+                &serde_json::to_vec(&legacy_response).unwrap(),
+            )
+            .unwrap();
+            legacy_sealed_response = sealed_response.clone();
+            connection
+                .execute(
+                    "UPDATE product_request_receipts
+                     SET state='completed',sealed_response=?1
+                     WHERE request_id=?2",
+                    params![sealed_response, identity.request_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE control_metadata SET value='13' WHERE key='schema_version'",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let control =
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let stored: (i64, String, Option<Vec<u8>>) = control
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT terminal_status,result_digest,sealed_response
+                 FROM product_request_receipts WHERE request_id=?1",
+                params![identity.request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            (
+                i64::from(expected_terminal.status),
+                expected_terminal.result_digest,
+                None
+            )
+        );
+        assert_eq!(
+            control.begin_product_request_identity(&identity).unwrap(),
+            ProductRequestBegin::Completed { status: 201 }
+        );
+        drop(control);
+
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!(
+                "{}{}",
+                root.join("agent-control/.isyncyou-agent-control.db")
+                    .display(),
+                suffix
+            ));
+            if path.exists() {
+                let bytes = std::fs::read(path).unwrap();
+                assert!(!bytes
+                    .windows(legacy_sealed_response.len())
+                    .any(|window| window == legacy_sealed_response));
+                assert!(!bytes
+                    .windows(legacy_marker.len())
+                    .any(|window| window == legacy_marker));
+                let header_marker = b"legacy-private-header-marker";
+                assert!(!bytes
+                    .windows(header_marker.len())
+                    .any(|window| window == header_marker));
+            }
+        }
     }
 
     #[test]
@@ -5855,11 +7206,9 @@ mod tests {
             payload_digest: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
                 .into(),
         };
-        let response = StoredProductResponseV1 {
+        let response = ProductRequestTerminalV1 {
             status: 200,
-            content_type: "application/json".into(),
-            body: br#"{"pairing_code":"must-not-be-stored"}"#.to_vec(),
-            headers: Vec::new(),
+            result_digest: "a".repeat(64),
         };
         assert_eq!(
             control
@@ -5880,11 +7229,9 @@ mod tests {
             payload_digest: "abababababababababababababababababababababababababababababababab"
                 .into(),
         };
-        let share_response = StoredProductResponseV1 {
+        let share_response = ProductRequestTerminalV1 {
             status: 200,
-            content_type: "application/json".into(),
-            body: br#"{"webUrl":"must-not-be-stored","invited":["must-not-be-stored"]}"#.to_vec(),
-            headers: Vec::new(),
+            result_digest: "b".repeat(64),
         };
         assert_eq!(
             control
@@ -6681,7 +8028,7 @@ mod tests {
             )
             .unwrap();
         let expires_at_ms = u64::try_from(expires_at_ms).unwrap();
-        control.reap_expired(expires_at_ms, 256).unwrap();
+        control.reap_expired(expires_at_ms - 1, 256).unwrap();
         assert_eq!(
             control.bind_product_request(&identity).unwrap(),
             ProductRequestBinding::Existing
@@ -6694,7 +8041,7 @@ mod tests {
             ProductRequestBinding::Conflict
         );
 
-        assert_eq!(control.reap_expired(expires_at_ms + 1, 256).unwrap(), 1);
+        assert_eq!(control.reap_expired(expires_at_ms, 256).unwrap(), 1);
         assert_eq!(
             control.bind_product_request(&identity).unwrap(),
             ProductRequestBinding::Inserted
@@ -6737,6 +8084,261 @@ mod tests {
             registry.confirm(&pending.id, &token, &pending.action_hash, 2_002),
             Err(ConfirmError::NotFound)
         );
+        drop(registry);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirmed_action_projection_is_atomic_terminal_and_restart_recoverable() {
+        let root = temp_root("confirm-projection");
+        let credential_store = credential_store(&root);
+        let persistence = Arc::new(
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap(),
+        );
+        let registry = PendingRegistry::with_persistence(persistence.clone());
+        let expected_owner = owner();
+        let (pending, token) = registry
+            .register_bound(
+                backup_action(),
+                "backup",
+                1_000,
+                60_000,
+                expected_owner.clone(),
+            )
+            .unwrap();
+        registry
+            .confirm(&pending.id, &token, &pending.action_hash, 2_000)
+            .unwrap();
+        assert!(persistence
+            .pending_confirm_projections(8)
+            .unwrap()
+            .is_empty());
+        let executing: String = persistence
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT code FROM pending_confirm_projections WHERE pending_id=?1",
+                params![pending.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(executing, "executing");
+        persistence
+            .finish_pending_confirmation(&pending.id, "completed", 2_001)
+            .unwrap();
+        let projections = persistence.pending_confirm_projections(8).unwrap();
+        assert_eq!(projections.len(), 1);
+        assert_eq!(projections[0].owner, expected_owner);
+        assert_eq!(projections[0].code, "completed");
+        persistence
+            .complete_pending_confirm_projection(&pending.id)
+            .unwrap();
+        assert!(persistence
+            .pending_confirm_projections(8)
+            .unwrap()
+            .is_empty());
+        drop(registry);
+        drop(persistence);
+
+        let persistence = Arc::new(
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap(),
+        );
+        let registry = PendingRegistry::with_persistence(persistence.clone());
+        let (pending, token) = registry
+            .register_bound(backup_action(), "backup", 3_000, 60_000, owner())
+            .unwrap();
+        registry
+            .confirm(&pending.id, &token, &pending.action_hash, 3_001)
+            .unwrap();
+        drop(registry);
+        drop(persistence);
+
+        let reopened =
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        assert_eq!(
+            reopened
+                .recover_interrupted_pending_confirmations(4_000)
+                .unwrap(),
+            1
+        );
+        let projections = reopened.pending_confirm_projections(8).unwrap();
+        assert_eq!(projections.len(), 1);
+        assert_eq!(projections[0].code, "outcome_unknown");
+        assert_eq!(projections[0].created_at_ms, 4_000);
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirmation_consume_rolls_back_when_projection_cannot_be_published() {
+        let root = temp_root("confirm-projection-rollback");
+        let credential_store = credential_store(&root);
+        let persistence = Arc::new(
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap(),
+        );
+        let registry = PendingRegistry::with_persistence(persistence.clone());
+        let (pending, token) = registry
+            .register_bound(backup_action(), "backup", 1_000, 60_000, owner())
+            .unwrap();
+        persistence
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_confirm_projection
+                 BEFORE INSERT ON pending_confirm_projections
+                 BEGIN SELECT RAISE(ABORT, 'controlled failure'); END;",
+            )
+            .unwrap();
+        assert_eq!(
+            registry.confirm(&pending.id, &token, &pending.action_hash, 2_000),
+            Err(ConfirmError::Unavailable)
+        );
+        persistence
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_confirm_projection")
+            .unwrap();
+        assert_eq!(
+            registry
+                .confirm(&pending.id, &token, &pending.action_hash, 2_001)
+                .unwrap(),
+            backup_action()
+        );
+        drop(registry);
+        drop(persistence);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirmation_reaper_retains_tombstones_until_terminal_projection_commits() {
+        let root = temp_root("confirmation-projection-retention");
+        let credential_store = credential_store(&root);
+        let persistence = Arc::new(
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap(),
+        );
+        let registry = PendingRegistry::with_persistence(persistence.clone());
+
+        let (confirmed, token) = registry
+            .register_bound(backup_action(), "backup", 1_000, 60_000, owner())
+            .unwrap();
+        registry
+            .confirm(&confirmed.id, &token, &confirmed.action_hash, 2_000)
+            .unwrap();
+        persistence
+            .finish_pending_confirmation(&confirmed.id, "completed", 2_001)
+            .unwrap();
+
+        let mut cancelled_owner = owner();
+        cancelled_owner.request_id = "019f0000-0000-4000-8000-000000000002".into();
+        cancelled_owner.turn_id = "turn-v2-cancel".into();
+        let (cancelled, _) = registry
+            .register_bound(backup_action(), "backup", 3_000, 60_000, cancelled_owner)
+            .unwrap();
+        registry
+            .cancel(&cancelled.id, &cancelled.action_hash, 3_001)
+            .unwrap();
+
+        let after_retention = 3_001 + CONTROL_TOMBSTONE_TTL_MS + 1;
+        persistence.reap_expired(after_retention, 256).unwrap();
+        let retained: i64 = persistence
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM confirmation_intents
+                 WHERE intent_id IN (?1,?2)",
+                params![confirmed.id, cancelled.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, 2);
+
+        persistence
+            .complete_pending_confirm_projection(&confirmed.id)
+            .unwrap();
+        persistence
+            .complete_pending_cancel_projection(&cancelled.id)
+            .unwrap();
+        persistence.reap_expired(after_retention, 256).unwrap();
+        let retained: i64 = persistence
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM confirmation_intents
+                 WHERE intent_id IN (?1,?2)",
+                params![confirmed.id, cancelled.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, 0);
+
+        drop(registry);
+        drop(persistence);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_replay_after_restart_rotates_token_for_exact_owner() {
+        let root = temp_root("pending-replay-restart");
+        let store = credential_store(&root);
+        let persistence =
+            AgentControlStore::open(&root, &store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let registry = PendingRegistry::with_persistence(Arc::new(persistence));
+        let expected_owner = owner();
+        let (pending, old_token) = registry
+            .register_bound(
+                backup_action(),
+                "backup",
+                1_000,
+                60_000,
+                expected_owner.clone(),
+            )
+            .unwrap();
+        drop(registry);
+
+        let persistence =
+            AgentControlStore::open(&root, &store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let registry = PendingRegistry::with_persistence(Arc::new(persistence));
+        let (reissued, new_token) = registry
+            .reissue_for_owner(&expected_owner, 2_000)
+            .unwrap()
+            .expect("pending survives restart");
+        assert_eq!(reissued.id, pending.id);
+        assert_eq!(reissued.action_hash, pending.action_hash);
+        assert_ne!(new_token, old_token);
+        assert_eq!(
+            registry.confirm(&pending.id, &old_token, &pending.action_hash, 2_001),
+            Err(ConfirmError::BadToken)
+        );
+        assert_eq!(
+            registry
+                .confirm(&pending.id, &new_token, &pending.action_hash, 2_002)
+                .unwrap(),
+            backup_action()
+        );
+        drop(registry);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirmation_store_allows_only_one_live_pending_per_turn() {
+        let root = temp_root("single-pending-turn");
+        let store = credential_store(&root);
+        let persistence =
+            AgentControlStore::open(&root, &store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let registry = PendingRegistry::with_persistence(Arc::new(persistence));
+        registry
+            .register_bound(backup_action(), "first", 1_000, 60_000, owner())
+            .unwrap();
+        assert!(matches!(
+            registry.register_bound(backup_action(), "second", 1_001, 60_000, owner()),
+            Err(isyncyou_agent::AgentError::Provider(code))
+                if code == "confirmation_unavailable"
+        ));
         drop(registry);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -6949,6 +8551,30 @@ mod tests {
     }
 
     #[test]
+    fn agent_control_store_migrates_previous_metadata_schema_to_current_version() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE control_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO control_metadata VALUES('installation_binding','expected');
+                 INSERT INTO control_metadata VALUES('key_version','1');
+                 INSERT INTO control_metadata VALUES('schema_version','12');",
+            )
+            .unwrap();
+        let migration = connection.unchecked_transaction().unwrap();
+        initialize_metadata(&migration, "expected", 1).unwrap();
+        migration.commit().unwrap();
+        let schema: String = connection
+            .query_row(
+                "SELECT value FROM control_metadata WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema, SCHEMA_VERSION.to_string());
+    }
+
+    #[test]
     fn confirmation_reaper_erases_sensitive_fields_and_keeps_only_bounded_tombstone() {
         let root = temp_root("reaper");
         let store = credential_store(&root);
@@ -6958,9 +8584,9 @@ mod tests {
         let (pending, token) = registry
             .register_bound(backup_action(), "backup", 1_000, 60_000, owner())
             .unwrap();
-        assert_eq!(persistence.reap_expired(61_001, 16).unwrap(), 1);
+        assert_eq!(persistence.reap_expired(61_000, 16).unwrap(), 1);
         assert_eq!(
-            registry.confirm(&pending.id, &token, &pending.action_hash, 61_001),
+            registry.confirm(&pending.id, &token, &pending.action_hash, 61_000),
             Err(ConfirmError::NotFound)
         );
         let connection = persistence.connection.lock().unwrap();
@@ -7000,7 +8626,7 @@ mod tests {
             assert!(!envelope.wrapped_key.is_empty());
         }
 
-        persistence.reap_expired(61_001, 16).unwrap();
+        persistence.reap_expired(61_000, 16).unwrap();
         let connection = persistence.connection.lock().unwrap();
         let sealed: Option<Vec<u8>> = connection
             .query_row(
@@ -7088,6 +8714,50 @@ mod tests {
     }
 
     #[test]
+    fn pending_cancel_rolls_back_when_projection_cannot_be_published() {
+        let root = temp_root("pending-cancel-projection-rollback");
+        let credential_store = credential_store(&root);
+        let persistence = Arc::new(
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap(),
+        );
+        let registry = PendingRegistry::with_persistence(persistence.clone());
+        let (pending, token) = registry
+            .register_bound(backup_action(), "backup", 1_000, 60_000, owner())
+            .unwrap();
+        persistence
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_cancel_projection
+                 BEFORE INSERT ON pending_cancel_projections
+                 BEGIN SELECT RAISE(ABORT, 'controlled failure'); END;",
+            )
+            .unwrap();
+
+        assert_eq!(
+            registry.cancel(&pending.id, &pending.action_hash, 2_000),
+            Err(ConfirmError::Unavailable)
+        );
+        persistence
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_cancel_projection")
+            .unwrap();
+        assert_eq!(
+            registry
+                .confirm(&pending.id, &token, &pending.action_hash, 2_001)
+                .unwrap(),
+            backup_action()
+        );
+
+        drop(registry);
+        drop(persistence);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn pending_cancel_v1_migration_backfills_unprojected_cancelled_authority() {
         let root = temp_root("pending-cancel-v1-backfill");
         let credential_store = credential_store(&root);
@@ -7144,7 +8814,7 @@ mod tests {
                 UserPresenceBinding::Archive {
                     session_id: "session-v2".into(),
                 },
-                1_011,
+                1_010,
             )
             .unwrap();
 
@@ -7253,6 +8923,26 @@ mod tests {
             ),
             Err("request_id_conflict".into())
         );
+
+        let expired = store
+            .start_user_presence(
+                "019f0000-0000-4000-8000-000000000032",
+                UserPresenceBinding::Archive {
+                    session_id: "session-v2".into(),
+                },
+                3_000,
+            )
+            .unwrap();
+        assert_eq!(
+            store.confirm_user_presence(
+                &expired.operation_id,
+                &expired.intent_id,
+                &expired.token,
+                &expired.action_hash,
+                expired.expires_at_ms,
+            ),
+            Err("presence_expired".into())
+        );
     }
 
     #[test]
@@ -7332,17 +9022,17 @@ mod tests {
                 .unwrap_err(),
             "request_id_conflict"
         );
-        assert_eq!(reopened.reap_expired(302_000, 16).unwrap(), 2);
         assert_eq!(
             reopened
                 .consume_pairing_reveal(
                     &challenge.operation_id,
                     "019f0000-0000-4000-8000-000000000006",
-                    302_001,
+                    source.expires_at_ms,
                 )
                 .unwrap_err(),
             "presence_expired"
         );
+        assert_eq!(reopened.reap_expired(source.expires_at_ms, 16).unwrap(), 2);
         drop(reopened);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -7526,6 +9216,224 @@ mod tests {
     }
 
     #[test]
+    fn pairing_claim_v15_migration_adds_fail_closed_recovery_and_cleanup_bindings() {
+        let root = temp_root("pairing-claim-v15-migration");
+        let credential_store = credential_store(&root);
+        {
+            let store =
+                AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1)
+                    .unwrap();
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO pairing_claims(
+                       operation_id,request_id,pair_id,local_account,recovery_request_id,
+                       owner_binding,state,resume_expires_at_ms,sealed_resume,logical_bytes
+                     ) VALUES('legacy-claim','legacy-request','legacy-pair','legacy-account',
+                       '019f0000-0000-4000-8000-000000000899',?1,'claimed',10000,X'00',1)",
+                    params![&store.installation_binding],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO pairing_sources(
+                       pair_id,request_id,session_id,owner_binding,expires_at_ms,state,
+                       sealed_source,descriptor_cleanup_complete,logical_bytes
+                     ) VALUES('legacy-source','legacy-source-request','session',?1,1,'expired',
+                       NULL,0,0)",
+                    params![&store.installation_binding],
+                )
+                .unwrap();
+            connection
+                .execute_batch(
+                    "ALTER TABLE pairing_claims DROP COLUMN local_account;
+                     ALTER TABLE pairing_claims DROP COLUMN recovery_request_id;
+                     ALTER TABLE pairing_claims DROP COLUMN descriptor_cleanup_complete;
+                     ALTER TABLE pairing_sources DROP COLUMN descriptor_cleanup_complete;
+                     UPDATE control_metadata SET value='15' WHERE key='schema_version';",
+                )
+                .unwrap();
+        }
+
+        let reopened =
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let (schema, local_account, recovery_request_id, cleanup_complete): (
+            String,
+            String,
+            String,
+            i64,
+        ) = reopened
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT
+                   (SELECT value FROM control_metadata WHERE key='schema_version'),
+                   local_account,recovery_request_id,descriptor_cleanup_complete
+                 FROM pairing_claims WHERE operation_id='legacy-claim'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(schema, SCHEMA_VERSION.to_string());
+        assert!(local_account.is_empty());
+        assert!(recovery_request_id.is_empty());
+        assert_eq!(cleanup_complete, 0);
+        let source_cleanup_complete: i64 = reopened
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT descriptor_cleanup_complete FROM pairing_sources
+                 WHERE pair_id='legacy-source'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_cleanup_complete, 0);
+        assert!(reopened
+            .pairing_claim_recovery_targets(8, 1_000)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            reopened
+                .pairing_claim_local_account("legacy-claim")
+                .unwrap_err(),
+            "pairing_recovery_required"
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn control_store_migration_expires_duplicate_pending_before_unique_index() {
+        let root = temp_root("duplicate-pending-migration");
+        let credential_store = credential_store(&root);
+        {
+            let store =
+                AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1)
+                    .unwrap();
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute_batch(
+                    "DROP INDEX confirmation_pending_turn;
+                     INSERT INTO confirmation_intents(
+                       intent_id,account_id,session_id,request_id,turn_id,owner_binding,
+                       action_hash,expires_at_ms,state,sealed_payload,logical_bytes
+                     ) VALUES
+                       ('duplicate-one','account','session','request-one','duplicate-turn','owner',
+                        'hash-one',9999999999999,'pending',X'01',1),
+                       ('duplicate-two','account','session','request-two','duplicate-turn','owner',
+                        'hash-two',9999999999999,'pending',X'02',1);
+                     UPDATE control_metadata SET value='17' WHERE key='schema_version';",
+                )
+                .unwrap();
+        }
+
+        let reopened =
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let connection = reopened.connection.lock().unwrap();
+        let normalized: (i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT
+                   SUM(state='pending'),SUM(state='expired'),
+                   SUM(sealed_payload IS NOT NULL),SUM(logical_bytes)
+                 FROM confirmation_intents WHERE turn_id='duplicate-turn'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(normalized, (0, 2, 0, 0));
+        let index_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM sqlite_master
+                   WHERE type='index' AND name='confirmation_pending_turn'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index_exists);
+        drop(connection);
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn control_store_migration_rejects_invalid_product_terminal_status() {
+        let root = temp_root("invalid-product-terminal-migration");
+        let credential_store = credential_store(&root);
+        {
+            let store =
+                AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1)
+                    .unwrap();
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO product_request_receipts(
+                       request_id,request_key,route_domain,request_scope,payload_digest,state,
+                       terminal_status,result_digest,sealed_response,expires_at_ms,logical_bytes
+                     ) VALUES(
+                       '019f0000-0000-4000-8000-000000000931','request-key',
+                       'post:/api/v1/agent/session/create','installation',?1,'completed',500,?2,
+                       NULL,9999999999999,1
+                     )",
+                    params!["b".repeat(64), "c".repeat(64)],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE control_metadata SET value='17' WHERE key='schema_version'",
+                    [],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1)
+                .unwrap_err(),
+            "control_store_migration_failed"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn control_store_migration_rejects_negative_mutation_logical_bytes() {
+        let root = temp_root("negative-mutation-bytes-migration");
+        let credential_store = credential_store(&root);
+        {
+            let store =
+                AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1)
+                    .unwrap();
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO mutation_intents(
+                       intent_id,create_request_id,owner_binding,purpose_json,total_bytes,
+                       content_sha256,expires_at_ms,state,result_json,logical_bytes
+                     ) VALUES('negative-bytes','negative-bytes-request','owner',X'',0,?1,
+                       9999999999999,'active',X'00',0)",
+                    params!["d".repeat(64)],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE control_metadata SET value='17' WHERE key='schema_version'",
+                    [],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1)
+                .unwrap_err(),
+            "control_store_migration_failed"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn pairing_claim_persists_before_remote_mutation_and_resumes_after_restart() {
         let root = temp_root("pairing-claim-restart");
         let credential_store = credential_store(&root);
@@ -7556,6 +9464,7 @@ mod tests {
             .begin_pairing_claim(
                 request_id,
                 &challenge.operation_id,
+                "me",
                 source.descriptor(),
                 INSTALLATION_PRINCIPAL,
                 1_003,
@@ -7581,6 +9490,33 @@ mod tests {
             .unwrap();
         assert_eq!(resumed.descriptor, first_claim.descriptor);
         assert_eq!(resumed.payload.session_id, payload.session_id);
+        let targets = reopened.pairing_claim_recovery_targets(8, 1_004).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].operation_id, challenge.operation_id);
+        assert_eq!(targets[0].request_id, request_id);
+        assert_eq!(targets[0].local_account, "me");
+        assert_eq!(targets[0].state, "claimed");
+        assert!(crate::is_uuid_v4(&targets[0].finalize_request_id));
+        let debug = format!("{:?}", targets[0]);
+        assert_eq!(
+            debug,
+            "PairingClaimRecoveryTarget { state: \"claimed\", .. }"
+        );
+        assert!(!debug.contains(&targets[0].operation_id));
+        assert!(!debug.contains(&targets[0].request_id));
+        assert_eq!(
+            reopened
+                .begin_pairing_claim(
+                    request_id,
+                    &challenge.operation_id,
+                    "other-account",
+                    source.descriptor(),
+                    INSTALLATION_PRINCIPAL,
+                    1_004,
+                )
+                .unwrap_err(),
+            "pairing_account_mismatch"
+        );
         assert_eq!(
             reopened
                 .load_pairing_claim_for_request(
@@ -7626,6 +9562,7 @@ mod tests {
             .begin_pairing_claim(
                 "019f0000-0000-4000-8000-000000000010",
                 &challenge.operation_id,
+                "me",
                 source.descriptor(),
                 INSTALLATION_PRINCIPAL,
                 1_003,
@@ -7694,6 +9631,24 @@ mod tests {
         assert!(sealed.is_none());
         assert_eq!(bytes, 0);
         drop(connection);
+        assert_eq!(
+            reopened
+                .pairing_claim_descriptor_cleanup_targets(8)
+                .unwrap(),
+            vec![PairingClaimDescriptorCleanupTarget {
+                operation_id: challenge.operation_id.clone(),
+                pair_id: source.pair_id().to_owned(),
+                local_account: "me".into(),
+                state: "consumed".into(),
+            }]
+        );
+        reopened
+            .mark_pairing_claim_descriptor_cleanup_complete(&challenge.operation_id)
+            .unwrap();
+        assert!(reopened
+            .pairing_claim_descriptor_cleanup_targets(8)
+            .unwrap()
+            .is_empty());
         drop(reopened);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -7728,6 +9683,7 @@ mod tests {
             .begin_pairing_claim(
                 "019f0000-0000-4000-8000-000000000014",
                 &challenge.operation_id,
+                "me",
                 source.descriptor(),
                 INSTALLATION_PRINCIPAL,
                 1_003,
@@ -7735,16 +9691,6 @@ mod tests {
             .unwrap();
         store
             .reap_expired(1_003 + PAIRING_CLAIM_RESUME_TTL_MS, 16)
-            .unwrap();
-        assert!(store
-            .load_pairing_claim(
-                &challenge.operation_id,
-                INSTALLATION_PRINCIPAL,
-                1_003 + PAIRING_CLAIM_RESUME_TTL_MS,
-            )
-            .is_ok());
-        store
-            .reap_expired(1_004 + PAIRING_CLAIM_RESUME_TTL_MS, 16)
             .unwrap();
         assert_eq!(
             store
@@ -7757,10 +9703,19 @@ mod tests {
                 .load_pairing_claim(
                     &challenge.operation_id,
                     INSTALLATION_PRINCIPAL,
-                    1_004 + PAIRING_CLAIM_RESUME_TTL_MS,
+                    1_003 + PAIRING_CLAIM_RESUME_TTL_MS,
                 )
                 .unwrap_err(),
             "pairing_not_found"
+        );
+        assert_eq!(
+            store.pairing_claim_descriptor_cleanup_targets(8).unwrap(),
+            vec![PairingClaimDescriptorCleanupTarget {
+                operation_id: challenge.operation_id.clone(),
+                pair_id: source.pair_id().to_owned(),
+                local_account: "me".into(),
+                state: "claimed_expired".into(),
+            }]
         );
         let connection = store.connection.lock().unwrap();
         let (sealed, bytes): (Option<Vec<u8>>, i64) = connection
@@ -7802,8 +9757,8 @@ mod tests {
                     "INSERT INTO pending_cancel_projections(
                        pending_id,account_id,session_id,request_id,turn_id,owner_binding,
                        created_at_ms,logical_bytes
-                     ) VALUES('terminal-confirm','account','session','request','turn','owner',1,0)",
-                    [],
+                     ) VALUES('terminal-confirm','account','session','request','turn',?1,1,0)",
+                    params![store.installation_binding],
                 )
                 .unwrap();
             connection
@@ -7821,20 +9776,21 @@ mod tests {
                 .execute(
                     "INSERT INTO pairing_sources(
                        pair_id,request_id,session_id,owner_binding,expires_at_ms,state,
-                       sealed_source,terminal_expires_at_ms,logical_bytes
+                       sealed_source,descriptor_cleanup_complete,terminal_expires_at_ms,logical_bytes
                      ) VALUES('terminal-source','source-request','session','owner',1,'revoked',
-                       NULL,?1,0)",
+                       NULL,1,?1,0)",
                     params![terminal_expiry as i64],
                 )
                 .unwrap();
             connection
                 .execute(
                     "INSERT INTO pairing_claims(
-                       operation_id,request_id,pair_id,owner_binding,state,resume_expires_at_ms,
-                       installed_session_id,finalize_request_id,sealed_resume,
+                       operation_id,request_id,pair_id,local_account,recovery_request_id,
+                       owner_binding,state,resume_expires_at_ms,installed_session_id,
+                       finalize_request_id,sealed_resume,descriptor_cleanup_complete,
                        terminal_expires_at_ms,logical_bytes
-                     ) VALUES('terminal-claim','claim-request','pair','owner','consumed',1,
-                       'session','finalize',NULL,?1,0)",
+                     ) VALUES('terminal-claim','claim-request','pair','','','owner','consumed',1,
+                       'session','finalize',NULL,1,?1,0)",
                     params![terminal_expiry as i64],
                 )
                 .unwrap();
@@ -7856,9 +9812,31 @@ mod tests {
                     [],
                 )
                 .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO pairing_sources(
+                       pair_id,request_id,session_id,owner_binding,expires_at_ms,state,
+                       sealed_source,descriptor_cleanup_complete,terminal_expires_at_ms,logical_bytes
+                     ) VALUES('cleanup-source','cleanup-source-request','session',?1,1,'revoked',
+                       NULL,0,?2,0)",
+                    params![store.installation_binding, terminal_expiry as i64],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO pairing_claims(
+                       operation_id,request_id,pair_id,local_account,recovery_request_id,
+                       owner_binding,state,resume_expires_at_ms,installed_session_id,
+                       finalize_request_id,sealed_resume,descriptor_cleanup_complete,
+                       terminal_expires_at_ms,logical_bytes
+                     ) VALUES('cleanup-claim','cleanup-claim-request','cleanup-pair','','',?1,
+                       'claimed_expired',1,NULL,NULL,NULL,0,?2,0)",
+                    params![store.installation_binding, terminal_expiry as i64],
+                )
+                .unwrap();
         }
 
-        store.reap_expired(terminal_expiry, 256).unwrap();
+        store.reap_expired(terminal_expiry - 1, 256).unwrap();
         let connection = store.connection.lock().unwrap();
         for (table, column, id) in [
             ("confirmation_intents", "intent_id", "terminal-confirm"),
@@ -7874,14 +9852,13 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert!(exists, "{table} tombstone was reaped at its boundary");
+            assert!(exists, "{table} tombstone was reaped before its boundary");
         }
         drop(connection);
 
-        store.reap_expired(terminal_expiry + 1, 256).unwrap();
+        store.reap_expired(terminal_expiry, 256).unwrap();
         let connection = store.connection.lock().unwrap();
         for (table, column, id) in [
-            ("confirmation_intents", "intent_id", "terminal-confirm"),
             ("user_presence_intents", "operation_id", "terminal-presence"),
             ("pairing_sources", "pair_id", "terminal-source"),
             ("pairing_claims", "operation_id", "terminal-claim"),
@@ -7896,6 +9873,16 @@ mod tests {
                 .unwrap();
             assert!(!exists, "{table} tombstone exceeded its retention");
         }
+        let confirmation_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM confirmation_intents WHERE intent_id='terminal-confirm'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(confirmation_exists);
         let projection_exists: bool = connection
             .query_row(
                 "SELECT EXISTS(
@@ -7905,7 +9892,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(!projection_exists);
+        assert!(projection_exists);
         let active_revoke_exists: bool = connection
             .query_row(
                 "SELECT EXISTS(
@@ -7916,7 +9903,57 @@ mod tests {
             )
             .unwrap();
         assert!(active_revoke_exists);
+        for (table, column, id) in [
+            ("pairing_sources", "pair_id", "cleanup-source"),
+            ("pairing_claims", "operation_id", "cleanup-claim"),
+        ] {
+            let exists: bool = connection
+                .query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {column}=?1)"),
+                    params![id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "cleanup authority was reaped before remote absence");
+        }
         drop(connection);
+
+        store
+            .mark_pairing_source_descriptor_cleanup_complete("cleanup-source")
+            .unwrap();
+        store
+            .mark_pairing_claim_descriptor_cleanup_complete("cleanup-claim")
+            .unwrap();
+        store
+            .complete_pending_cancel_projection("terminal-confirm")
+            .unwrap();
+        store.reap_expired(terminal_expiry, 256).unwrap();
+        let confirmation_exists: bool = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM confirmation_intents WHERE intent_id='terminal-confirm'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!confirmation_exists);
+        let cleanup_rows: i64 = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM pairing_sources WHERE pair_id='cleanup-source') +
+                   (SELECT COUNT(*) FROM pairing_claims WHERE operation_id='cleanup-claim')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cleanup_rows, 0);
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -7939,10 +9976,10 @@ mod tests {
                        'terminal-presence','intent','presence-request','owner','session_archive',
                        'hash',1,'expired',NULL,NULL,0,0);
                      INSERT INTO pairing_sources VALUES(
-                       'terminal-source','source-request','session','owner',1,'expired',NULL,0,0);
+                       'terminal-source','source-request','session','owner',1,'expired',NULL,1,0,0);
                      INSERT INTO pairing_claims VALUES(
-                       'terminal-claim','claim-request','pair','owner','claimed_expired',1,NULL,NULL,
-                       NULL,0,0);
+                       'terminal-claim','claim-request','pair','','','owner','claimed_expired',1,
+                       NULL,NULL,NULL,0,0,0);
                      INSERT INTO pairing_revocations VALUES(
                        'terminal-revoke','revoke-request','pair','owner','completed',0,0);
                      UPDATE control_metadata SET value='9' WHERE key='schema_version';",
@@ -8044,7 +10081,7 @@ mod tests {
     }
 
     #[test]
-    fn mutation_intent_staging_is_sealed_and_commit_replays_result() {
+    fn mutation_intent_staging_is_sealed_and_commit_retains_only_digest() {
         let root = temp_root("mutation-sealed-replay");
         let credential_store = credential_store(&root);
         let store =
@@ -8119,7 +10156,7 @@ mod tests {
                     payload[boundary..boundary + 12]
                 );
             }
-            MutationCommitStart::Replay(_) => panic!("first commit unexpectedly replayed"),
+            MutationCommitStart::Completed => panic!("first commit unexpectedly completed"),
         }
         let result = json!({"ok": true, "id": "opaque"});
         store
@@ -8136,18 +10173,57 @@ mod tests {
                     1_005,
                 )
                 .unwrap(),
-            MutationCommitStart::Replay(result)
+            MutationCommitStart::Completed
+        );
+        let stored: (Option<Vec<u8>>, String) = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT result_json,result_digest FROM mutation_intents WHERE intent_id=?1",
+                params![info.intent_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            (
+                None,
+                mutation_result_digest(&serde_json::to_vec(&result).unwrap())
+            )
         );
         assert!(!root
             .join("agent-control/mutation-staging")
             .join(&info.intent_id)
             .exists());
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE mutation_intents SET result_digest='' WHERE intent_id=?1",
+                params![info.intent_id],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .begin_mutation_commit(
+                    "owner-a",
+                    commit_request,
+                    &info.intent_id,
+                    payload.len() as u64,
+                    &sha256_hex(&payload),
+                    1_006,
+                )
+                .unwrap_err(),
+            "mutation_intent_outcome_unknown"
+        );
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn mutation_cleanup_failure_is_retried_before_commit_replay() {
+    fn mutation_cleanup_failure_is_retried_before_completed_receipt() {
         let root = temp_root("mutation-cleanup-retry");
         let credential_store = credential_store(&root);
         let store =
@@ -8184,8 +10260,16 @@ mod tests {
         let intent_dir = root
             .join("agent-control/mutation-staging")
             .join(&info.intent_id);
-        let blocker = intent_dir.join("unexpected");
-        std::fs::write(&blocker, b"block cleanup").unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE mutation_chunks SET sealed_path='invalid-cleanup-path'
+                 WHERE intent_id=?1 AND chunk_index=0",
+                params![info.intent_id],
+            )
+            .unwrap();
         let result = json!({"ok": true});
         assert_eq!(
             store.complete_mutation_commit(
@@ -8197,7 +10281,16 @@ mod tests {
             ),
             Err("mutation_intent_outcome_unknown".into())
         );
-        std::fs::remove_file(blocker).unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE mutation_chunks SET sealed_path=?2
+                 WHERE intent_id=?1 AND chunk_index=0",
+                params![info.intent_id, format!("{}/0.chunk", info.intent_id)],
+            )
+            .unwrap();
         assert_eq!(
             store
                 .begin_mutation_commit(
@@ -8209,7 +10302,7 @@ mod tests {
                     1_004,
                 )
                 .unwrap(),
-            MutationCommitStart::Replay(result)
+            MutationCommitStart::Completed
         );
         assert!(!intent_dir.exists());
         drop(store);
@@ -8278,7 +10371,7 @@ mod tests {
                     1_000 + MUTATION_INTENT_TTL_MS + 1,
                 )
                 .unwrap(),
-            MutationCommitStart::Replay(result)
+            MutationCommitStart::Completed
         );
 
         let ambiguous = store
@@ -8521,7 +10614,7 @@ mod tests {
         let retained_dir = root
             .join("agent-control/mutation-staging")
             .join(&retained.intent_id);
-        let expired_at = 1_000 + MUTATION_INTENT_TTL_MS + 1;
+        let expired_at = 1_000 + MUTATION_INTENT_TTL_MS;
 
         assert_eq!(store.reap_expired(expired_at, 16).unwrap(), 1);
         let state: String = store
@@ -8578,34 +10671,40 @@ mod tests {
             .unwrap();
 
         let terminal_expiry = completed_at + MUTATION_TERMINAL_TTL_MS;
-        let (purpose, sealed_result, stored_expiry, logical_bytes): (Vec<u8>, Vec<u8>, i64, i64) =
-            store
-                .connection
-                .lock()
-                .unwrap()
-                .query_row(
-                    "SELECT purpose_json,result_json,terminal_expires_at_ms,logical_bytes
+        let (purpose, stored_result, result_digest, stored_expiry, logical_bytes): (
+            Vec<u8>,
+            Option<Vec<u8>>,
+            String,
+            i64,
+            i64,
+        ) = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT purpose_json,result_json,result_digest,terminal_expires_at_ms,logical_bytes
                  FROM mutation_intents WHERE intent_id=?1",
-                    params![info.intent_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .unwrap();
-        assert!(purpose.is_empty());
-        assert_ne!(sealed_result, result_bytes);
-        assert_eq!(
-            open_row(
-                &store.row_wrap_key,
-                "mutation-result",
-                &info.intent_id,
-                &sealed_result,
+                params![info.intent_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
-            .unwrap(),
-            result_bytes
+            .unwrap();
+        assert!(purpose.is_empty());
+        assert_eq!(
+            (stored_result, result_digest),
+            (None, mutation_result_digest(&result_bytes))
         );
         assert_eq!(stored_expiry, terminal_expiry as i64);
-        assert!(logical_bytes > 512);
+        assert_eq!(logical_bytes, 576);
 
-        store.reap_expired(terminal_expiry, 256).unwrap();
+        store.reap_expired(terminal_expiry - 1, 256).unwrap();
         let retained: bool = store
             .connection
             .lock()
@@ -8617,7 +10716,7 @@ mod tests {
             )
             .unwrap();
         assert!(retained);
-        store.reap_expired(terminal_expiry + 1, 256).unwrap();
+        store.reap_expired(terminal_expiry, 256).unwrap();
         assert_eq!(
             store.create_mutation_intent(&create, terminal_expiry + 2),
             Err("mutation_intent_outcome_unknown".into())
@@ -8643,7 +10742,11 @@ mod tests {
         let committed = mutation_create(committed_request, "owner-b", b"committed");
         let active_purpose = serde_json::to_vec(&active.purpose).unwrap();
         let committed_purpose = serde_json::to_vec(&committed.purpose).unwrap();
-        let committed_result = serde_json::to_vec(&json!({"ok": true})).unwrap();
+        let committed_result = serde_json::to_vec(&json!({
+            "private": "legacy-private-mutation-result-marker"
+        }))
+        .unwrap();
+        let committed_result_digest = mutation_result_digest(&committed_result);
         let (active_id, committed_id, committed_source_expiry) = {
             let store =
                 AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1)
@@ -8691,21 +10794,31 @@ mod tests {
 
         let store =
             AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
-        let (active_sealed, committed_purpose_after, committed_sealed, terminal_expiry): (
-            Vec<u8>,
-            Vec<u8>,
-            Vec<u8>,
-            i64,
-        ) = store
+        let (
+            active_sealed,
+            committed_purpose_after,
+            committed_result_after,
+            result_digest,
+            terminal_expiry,
+        ): (Vec<u8>, Vec<u8>, Option<Vec<u8>>, String, i64) = store
             .connection
             .lock()
             .unwrap()
             .query_row(
-                "SELECT a.purpose_json,c.purpose_json,c.result_json,c.terminal_expires_at_ms
+                "SELECT a.purpose_json,c.purpose_json,c.result_json,c.result_digest,
+                        c.terminal_expires_at_ms
                  FROM mutation_intents a, mutation_intents c
                  WHERE a.intent_id=?1 AND c.intent_id=?2",
                 params![active_id, committed_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(
@@ -8720,14 +10833,8 @@ mod tests {
         );
         assert!(committed_purpose_after.is_empty());
         assert_eq!(
-            open_row(
-                &store.row_wrap_key,
-                "mutation-result",
-                &committed_id,
-                &committed_sealed,
-            )
-            .unwrap(),
-            serde_json::to_vec(&json!({"ok": true})).unwrap()
+            (committed_result_after, result_digest),
+            (None, committed_result_digest)
         );
         assert_eq!(
             terminal_expiry,
@@ -8748,6 +10855,19 @@ mod tests {
         assert_eq!(schema, SCHEMA_VERSION.to_string());
         assert_eq!(expired_bindings, 0);
         drop(store);
+        let marker = b"legacy-private-mutation-result-marker";
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!(
+                "{}{}",
+                root.join("agent-control/.isyncyou-agent-control.db")
+                    .display(),
+                suffix
+            ));
+            if path.exists() {
+                let bytes = std::fs::read(path).unwrap();
+                assert!(!bytes.windows(marker.len()).any(|window| window == marker));
+            }
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -8999,6 +11119,7 @@ mod tests {
             .execute_batch(
                 "CREATE TABLE confirmation_intents(logical_bytes INTEGER NOT NULL);
                  CREATE TABLE pending_cancel_projections(logical_bytes INTEGER NOT NULL);
+                 CREATE TABLE pending_confirm_projections(logical_bytes INTEGER NOT NULL);
                  CREATE TABLE user_presence_intents(logical_bytes INTEGER NOT NULL);
                  CREATE TABLE pairing_sources(logical_bytes INTEGER NOT NULL);
                  CREATE TABLE pairing_claims(logical_bytes INTEGER NOT NULL);
@@ -9380,6 +11501,79 @@ mod tests {
     }
 
     #[test]
+    fn pairing_terminal_replay_precedes_account_token_and_transport_resolution() {
+        let host = include_str!("lib.rs");
+        let claim = host
+            .split("fn session_pairing_claim(")
+            .nth(1)
+            .unwrap()
+            .split("fn session_pairing_finalize(")
+            .next()
+            .unwrap();
+        let claim_state = claim.find("pairing_claim_state").unwrap();
+        let installed_replay = claim.find("\"installed\" | \"consumed\"").unwrap();
+        let claim_account = claim.find("product_session_account").unwrap();
+        let claim_transport = claim.find("OneDrivePairingTransportV2::new").unwrap();
+        assert!(claim_state < installed_replay);
+        assert!(installed_replay < claim_account && claim_account < claim_transport);
+
+        let finalize = host
+            .split("fn session_pairing_finalize(")
+            .nth(1)
+            .unwrap()
+            .split("fn session_pairing_revoke(")
+            .next()
+            .unwrap();
+        let terminal_state = finalize.find("pairing_claim_state").unwrap();
+        let terminal_replay = finalize.find("\"state\": \"consumed\"").unwrap();
+        let finalize_account = finalize.find("pairing_claim_local_account").unwrap();
+        let finalize_transport = finalize.find("OneDrivePairingTransportV2::new").unwrap();
+        assert!(terminal_state < terminal_replay);
+        assert!(terminal_replay < finalize_account && finalize_account < finalize_transport);
+    }
+
+    #[test]
+    fn durable_pending_reissue_fails_closed_for_duplicate_owner_binding() {
+        let root = temp_root("pending-reissue-duplicate-owner");
+        let credential_store = credential_store(&root);
+        let store = std::sync::Arc::new(
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap(),
+        );
+        let registry = isyncyou_agent::PendingRegistry::with_persistence(store.clone());
+        let owner = PendingOwnerBinding {
+            account: "me".into(),
+            session_id: "session".into(),
+            request_id: "request".into(),
+            turn_id: "turn".into(),
+        };
+        registry
+            .register_bound(backup_action(), "first", 1_000, 60_000, owner.clone())
+            .unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute_batch(
+                    "DROP INDEX confirmation_pending_turn;
+                     INSERT INTO confirmation_intents(
+                       intent_id,account_id,session_id,request_id,turn_id,owner_binding,
+                       action_hash,expires_at_ms,state,sealed_payload,logical_bytes
+                     )
+                     SELECT 'duplicate-pending',account_id,session_id,request_id,turn_id,
+                            owner_binding,action_hash,expires_at_ms,state,sealed_payload,logical_bytes
+                     FROM confirmation_intents WHERE state='pending';",
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            registry.reissue_for_owner(&owner, 2_000),
+            Err(ConfirmError::Unavailable)
+        );
+        drop(registry);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn pairing_reveal_secret_is_erased_on_expiry_consumed_or_revoke() {
         pairing_revoke_retains_authority_until_remote_completion_and_replays_exact_request();
         pairing_reaper_never_removes_active_claim_and_erases_expired_resume_secret();
@@ -9504,6 +11698,140 @@ mod tests {
     }
 
     #[test]
+    fn mutation_chunk_retry_authenticates_the_indexed_sealed_file() {
+        let root = temp_root("mutation-chunk-retry-file");
+        let credential_store = credential_store(&root);
+        let store =
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let payload = b"bounded mutation payload";
+        let info = store
+            .create_mutation_intent(
+                &mutation_create("019f0000-0000-4000-8000-000000000320", "owner-a", payload),
+                1_000,
+            )
+            .unwrap();
+        let request_id = "019f0000-0000-4000-8000-000000000321";
+        let digest = sha256_hex(payload);
+        store
+            .put_mutation_chunk(
+                "owner-a",
+                request_id,
+                &info.intent_id,
+                0,
+                0,
+                &digest,
+                payload,
+                1_001,
+            )
+            .unwrap();
+        store
+            .put_mutation_chunk(
+                "owner-a",
+                request_id,
+                &info.intent_id,
+                0,
+                0,
+                &digest,
+                payload,
+                1_002,
+            )
+            .unwrap();
+
+        let chunk_path = store
+            .root
+            .join("mutation-staging")
+            .join(&info.intent_id)
+            .join("0.chunk");
+        std::fs::remove_file(&chunk_path).unwrap();
+        assert_eq!(
+            store.put_mutation_chunk(
+                "owner-a",
+                request_id,
+                &info.intent_id,
+                0,
+                0,
+                &digest,
+                payload,
+                1_003,
+            ),
+            Err("mutation_intent_outcome_unknown".into())
+        );
+
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_chunk_retry_and_commit_reject_symlinked_sealed_file() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("mutation-chunk-symlink");
+        let credential_store = credential_store(&root);
+        let store =
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let payload = b"bounded mutation payload";
+        let info = store
+            .create_mutation_intent(
+                &mutation_create("019f0000-0000-4000-8000-000000000322", "owner-a", payload),
+                1_000,
+            )
+            .unwrap();
+        let request_id = "019f0000-0000-4000-8000-000000000323";
+        let digest = sha256_hex(payload);
+        store
+            .put_mutation_chunk(
+                "owner-a",
+                request_id,
+                &info.intent_id,
+                0,
+                0,
+                &digest,
+                payload,
+                1_001,
+            )
+            .unwrap();
+        let chunk_path = store
+            .root
+            .join("mutation-staging")
+            .join(&info.intent_id)
+            .join("0.chunk");
+        let sealed = std::fs::read(&chunk_path).unwrap();
+        std::fs::remove_file(&chunk_path).unwrap();
+        let target = store.root.join("symlink-target.chunk");
+        write_private_atomic(&target, &sealed).unwrap();
+        symlink(&target, &chunk_path).unwrap();
+
+        assert_eq!(
+            store.put_mutation_chunk(
+                "owner-a",
+                request_id,
+                &info.intent_id,
+                0,
+                0,
+                &digest,
+                payload,
+                1_002,
+            ),
+            Err("mutation_intent_outcome_unknown".into())
+        );
+        assert_eq!(
+            store.begin_mutation_commit(
+                "owner-a",
+                "019f0000-0000-4000-8000-000000000324",
+                &info.intent_id,
+                payload.len() as u64,
+                &digest,
+                1_003,
+            ),
+            Err("mutation_intent_outcome_unknown".into())
+        );
+
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn mutation_intent_commit_verifies_total_hash_length_expiry_and_binding() {
         let root = temp_root("mutation-commit-validation");
         let credential_store = credential_store(&root);
@@ -9551,6 +11879,19 @@ mod tests {
             Err("mutation_intent_conflict".into())
         );
         assert_eq!(
+            store.put_mutation_chunk(
+                "owner-a",
+                "019f0000-0000-4000-8000-000000000316",
+                &info.intent_id,
+                0,
+                0,
+                &sha256_hex(payload),
+                payload,
+                info.expires_at_ms,
+            ),
+            Err("mutation_intent_expired".into())
+        );
+        assert_eq!(
             store.begin_mutation_commit(
                 "owner-a",
                 "019f0000-0000-4000-8000-000000000314",
@@ -9568,7 +11909,7 @@ mod tests {
                 &info.intent_id,
                 payload.len() as u64,
                 &sha256_hex(payload),
-                1_000 + MUTATION_INTENT_TTL_MS + 1,
+                info.expires_at_ms,
             ),
             Err("mutation_intent_expired".into())
         );

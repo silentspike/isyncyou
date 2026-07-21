@@ -292,8 +292,8 @@ pub(crate) struct ProductPostRouteSpec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProductReplayPolicy {
-    /// The generic store may persist the bounded, non-secret terminal response.
-    DurableResponse,
+    /// The generic store may persist only a closed terminal status and result digest.
+    DurableTerminal,
     /// The route's own journal owns replay and retention. The global layer binds
     /// the UUID only and never stores a response body.
     RouteOwned,
@@ -501,7 +501,7 @@ impl ProductPostRoute {
             | AgentOauthLifecycleResume
             | AgentOauthCancel
             | AgentOauthComplete
-            | AgentModel => ProductReplayPolicy::DurableResponse,
+            | AgentModel => ProductReplayPolicy::DurableTerminal,
         }
     }
 }
@@ -793,9 +793,10 @@ fn mutation_error_response(error: &str) -> ApiResponse {
         "mutation_intent_storage_unavailable" | "mutation_intent_insufficient_storage" => {
             (507, error)
         }
-        "request_id_conflict" | "mutation_intent_conflict" | "mutation_intent_outcome_unknown" => {
-            (409, error)
-        }
+        "request_id_conflict"
+        | "mutation_intent_conflict"
+        | "mutation_intent_outcome_unknown"
+        | "mutation_intent_already_completed" => (409, error),
         "mutation_intent_not_found" => (404, error),
         "mutation_intent_expired" | "mutation_intent_invalid" => (400, error),
         _ => (500, "mutation_intent_failed"),
@@ -1025,7 +1026,7 @@ pub struct ApiResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DurableRequestBegin {
     Execute,
-    Replay(ApiResponse),
+    Completed { status: u16 },
     Conflict,
     OutcomeUnknown,
 }
@@ -1039,10 +1040,10 @@ pub struct ProductRequestIdentity {
 }
 
 impl ProductRequestIdentity {
-    pub fn permits_durable_response(&self) -> bool {
+    pub fn permits_durable_terminal(&self) -> bool {
         PRODUCT_POST_ROUTES.iter().any(|spec| {
             spec.domain == self.route_domain
-                && spec.route.replay_policy() == ProductReplayPolicy::DurableResponse
+                && spec.route.replay_policy() == ProductReplayPolicy::DurableTerminal
         })
     }
 }
@@ -2234,6 +2235,24 @@ impl ApiResponse {
     }
     fn error(status: u16, message: &str) -> Self {
         Self::json(status, &json!({ "error": message }))
+    }
+}
+
+fn durable_terminal_replay_response(status: u16) -> ApiResponse {
+    match status {
+        200..=299 => ApiResponse::ok_json(&json!({
+            "status": "completed",
+            "code": "request_replayed",
+            "terminal_status": status,
+        })),
+        400..=499 => ApiResponse::json(
+            status,
+            &json!({
+                "error": "request_replayed",
+                "terminal_status": status,
+            }),
+        ),
+        _ => ApiResponse::error(503, "request_store_unavailable"),
     }
 }
 
@@ -4393,11 +4412,13 @@ impl Router {
                 }
                 Err(_) => return ApiResponse::error(503, "request_store_unavailable"),
             },
-            ProductReplayPolicy::DurableResponse => {}
+            ProductReplayPolicy::DurableTerminal => {}
         }
 
         match store.begin(&identity) {
-            Ok(DurableRequestBegin::Replay(response)) => return response,
+            Ok(DurableRequestBegin::Completed { status }) => {
+                return durable_terminal_replay_response(status)
+            }
             Ok(DurableRequestBegin::Conflict) => {
                 return ApiResponse::error(409, "request_id_conflict")
             }
@@ -4423,11 +4444,11 @@ impl Router {
             if store.abort(&identity).is_err() {
                 return ApiResponse::error(503, "request_store_unavailable");
             }
-        } else if response.status < 400 {
+        } else if (200..300).contains(&response.status) {
             if store.complete(&identity, &response).is_err() {
                 return ApiResponse::error(503, "request_outcome_unknown");
             }
-        } else if response.status < 500 && response.status != 403 {
+        } else if (400..500).contains(&response.status) && response.status != 403 {
             // Structural and semantic request validation completed before begin(). Any
             // other caller-visible 4xx is therefore a terminal route/domain result and
             // must keep the global UUID binding; reopening it could permit a second
@@ -8023,19 +8044,9 @@ impl Router {
         {
             return no_store_json_error(400, "invalid agent turn request");
         }
-        let identity = identity.unwrap_or_else(|| ProductRequestIdentity {
-            request_id: request.request_id.clone(),
-            route_domain: "post:/api/v1/agent/turn",
-            request_scope: format!("session_id:{}", request.session_id),
-            payload_digest: {
-                let digest = ring::digest::digest(&ring::digest::SHA256, &req.body);
-                digest
-                    .as_ref()
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect()
-            },
-        });
+        let Some(identity) = identity else {
+            return no_store_json_error(503, "request_store_unavailable");
+        };
         match std::sync::Arc::clone(handler).start_turn_request(request, identity) {
             Ok(turn_id) => with_no_store(ApiResponse::ok_json(&json!({ "turn": turn_id }))),
             // #639: a host-verified not-ready product turn is a closed 409, not a blanket 500.
@@ -8154,9 +8165,8 @@ impl Router {
         }
     }
 
-    /// Run a bounded, redacted connectivity preflight. This is deliberately the only
-    /// new #640 JSON route in this change; legacy agent routes remain query-based until
-    /// their separate hardening work lands.
+    /// Run a bounded, redacted connectivity preflight through the shared strict-JSON
+    /// request policy used by the product Agent routes.
     fn agent_connectivity_preflight(&self, req: &ApiRequest) -> ApiResponse {
         let handler = match self.agent_gate(req) {
             Ok(h) => h,
@@ -10645,11 +10655,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .lock()
             .unwrap()
             .values()
-            .any(|(_, _, _, state)| matches!(state, MemoryDurableRequestState::Completed(_))));
+            .any(|(_, _, _, state)| matches!(state, MemoryDurableRequestState::Completed(200))));
         let replay = mobile.route(&confirmed_request);
-        assert_eq!(replay.status, ok.status);
-        assert_eq!(replay.content_type, ok.content_type);
-        assert_eq!(replay.body, ok.body);
+        assert_eq!(replay.status, 200);
+        assert_eq!(body_json(&replay)["code"], "request_replayed");
+        assert_eq!(body_json(&replay)["terminal_status"], 200);
         assert!(replay.headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("cache-control") && value == "no-store"
         }));
@@ -11130,7 +11140,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         ));
 
         let open = APP_JS
-            .find("stream = openEventStream(url")
+            .find("stream = openTurnStream();")
             .expect("assistant stream open");
         let ready = APP_JS[open..]
             .find("AssistantState.turnStreamReady = true;")
@@ -11147,6 +11157,35 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         );
         assert!(APP_JS.contains("const status = await reconcileRequestStatus();"));
         assert!(APP_JS.contains("if (finishFromRequestStatus(status)) return;"));
+    }
+
+    #[test]
+    fn assistant_stream_loss_replays_terminal_turn_with_same_request_identity_once() {
+        let start = APP_JS
+            .find("async function agentSend(text)")
+            .expect("agent send function");
+        let end = APP_JS[start..]
+            .find("const ACCOUNT_ROLE_META")
+            .map(|offset| start + offset)
+            .expect("agent send function end");
+        let send = &APP_JS[start..end];
+        assert!(send.contains("let terminalReplayAttempted = false;"));
+        assert!(send.contains("status && status.terminal && !terminalReplayAttempted"));
+        assert!(send.contains("terminalReplayAttempted = true;"));
+        assert!(send.contains("const replay = await postJson(\"/api/v1/agent/turn\""));
+        assert!(send.contains("request_id: requestId"));
+        assert!(send.contains("session_id: sessionId"));
+        assert!(send.contains("prompt: text"));
+        assert!(send.contains("replay && replay.turn === turn"));
+        assert!(send.contains("stream = openTurnStream();"));
+        let replay = send
+            .find("const replay = await postJson")
+            .expect("terminal replay request");
+        let fallback = send[replay..]
+            .find("if (finishFromRequestStatus(status)) return;")
+            .map(|offset| replay + offset)
+            .expect("persisted-status fallback");
+        assert!(replay < fallback);
     }
 
     // #639 T9 AC3: the status response carries Cache-Control: no-store and never leaks a secret.
@@ -12766,6 +12805,31 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn assistant_history_hydrates_only_closed_redacted_operation_state() {
+        let hydrate = APP_JS
+            .split("function sessionRecordsToTranscript(records)")
+            .nth(1)
+            .unwrap()
+            .split("async function hydrateAgentSession(sessionId)")
+            .next()
+            .unwrap();
+        for required in [
+            "pending_operation",
+            "operation_state",
+            "Action awaiting confirmation.",
+            "Action completed.",
+            "Action cancelled. No changes were made.",
+            "The action outcome could not be verified.",
+        ] {
+            assert!(hydrate.contains(required));
+        }
+        assert!(!hydrate.contains("payload.preview"));
+        assert!(!hydrate.contains("payload.error"));
+        assert!(!hydrate.contains("payload.token"));
+        assert!(!hydrate.contains("payload.action_hash"));
+    }
+
+    #[test]
     fn assistant_shared_session_errors_use_actionable_closed_copy() {
         for code in [
             "session_busy",
@@ -13131,7 +13195,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     enum MemoryDurableRequestState {
         Started,
         Retryable,
-        Completed(ApiResponse),
+        Completed(u16),
     }
 
     type DurableReceipt = (String, String, String, MemoryDurableRequestState);
@@ -13146,7 +13210,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             self.0.lock().unwrap().len()
         }
 
-        fn completed_response_count(&self) -> usize {
+        fn completed_receipt_count(&self) -> usize {
             self.0
                 .lock()
                 .unwrap()
@@ -13193,8 +13257,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 {
                     Ok(DurableRequestBegin::Conflict)
                 }
-                Some((_, _, _, MemoryDurableRequestState::Completed(response))) => {
-                    Ok(DurableRequestBegin::Replay(response.clone()))
+                Some((_, _, _, MemoryDurableRequestState::Completed(status))) => {
+                    Ok(DurableRequestBegin::Completed { status: *status })
                 }
                 Some((_, _, _, MemoryDurableRequestState::Started)) => {
                     Ok(DurableRequestBegin::OutcomeUnknown)
@@ -13235,7 +13299,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                     identity.route_domain.into(),
                     identity.request_scope.clone(),
                     identity.payload_digest.clone(),
-                    MemoryDurableRequestState::Completed(response.clone()),
+                    MemoryDurableRequestState::Completed(response.status),
                 ),
             );
             Ok(())
@@ -14095,7 +14159,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
-    fn ordinary_product_post_replays_durable_response_without_second_mail_effect() {
+    fn ordinary_product_post_returns_completed_without_second_mail_effect() {
         let (_dir, router) = setup();
         let mail = std::sync::Arc::new(RecordMailWrite::default());
         let router = router
@@ -14122,7 +14186,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             body.clone(),
             Some("secret"),
         ));
-        assert_eq!(first, replay);
+        assert_eq!(first.status, 200);
+        assert_eq!(replay.status, 200);
+        assert_eq!(body_json(&replay)["code"], "request_replayed");
+        assert_eq!(body_json(&replay)["terminal_status"], 200);
         assert_eq!(mail.0.lock().unwrap().len(), 1);
 
         let mut changed = body;
@@ -14138,7 +14205,66 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
-    fn calendar_and_onedrive_create_replay_without_duplicate_effect() {
+    fn product_post_transport_retry_reuses_one_serialized_body_and_skips_ephemeral_authority() {
+        let source = include_str!("app.js");
+        let helper = source
+            .split("async function postJson(path, capToken, value) {")
+            .nth(1)
+            .unwrap()
+            .split("function isReplayedRequest")
+            .next()
+            .unwrap();
+        assert!(helper.contains("const body = JSON.stringify(value);"));
+        assert!(helper.contains("const send = () => request(\"POST\", path"));
+        assert!(helper.contains("return await send();"));
+        assert!(helper.contains("return send();"));
+        assert!(helper.contains("POST_NO_TRANSPORT_RETRY.has(path)"));
+        assert!(source.contains("\"/api/v1/account/login/start\","));
+        assert!(source.contains("\"/api/v1/agent/user-presence/start\","));
+    }
+
+    #[test]
+    fn account_login_cancel_terminal_replay_releases_the_oauth_guard() {
+        let source = include_str!("app.js");
+        let cancel = source
+            .split("async function cancelAccountLogin(loginId = accountMenuLogin) {")
+            .nth(1)
+            .unwrap()
+            .split("function queueAccountLoginCancel()")
+            .next()
+            .unwrap();
+        assert!(cancel.contains("result.cancelled === true) || isReplayedRequest(result)"));
+        assert!(cancel.contains("accountMenuLogin = null"));
+        assert!(cancel.contains("await finishAccountLoginGuard(loginId)"));
+        assert!(cancel.contains("return true"));
+    }
+
+    #[test]
+    fn completed_request_replay_exposes_only_closed_terminal_projection() {
+        let success = durable_terminal_replay_response(202);
+        assert_eq!(success.status, 200);
+        assert_eq!(body_json(&success)["status"], "completed");
+        assert_eq!(body_json(&success)["code"], "request_replayed");
+        assert_eq!(body_json(&success)["terminal_status"], 202);
+        let rejected = durable_terminal_replay_response(409);
+        assert_eq!(rejected.status, 409);
+        assert_eq!(body_json(&rejected)["error"], "request_replayed");
+        assert_eq!(body_json(&rejected)["terminal_status"], 409);
+        let invalid = durable_terminal_replay_response(500);
+        assert_eq!(invalid.status, 503);
+        let encoded = format!(
+            "{}{}{}",
+            String::from_utf8_lossy(&success.body),
+            String::from_utf8_lossy(&rejected.body),
+            String::from_utf8_lossy(&invalid.body)
+        );
+        for forbidden in ["result_digest", "recipient", "webUrl", "token"] {
+            assert!(!encoded.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn calendar_and_onedrive_create_return_completed_without_duplicate_effect() {
         let (_dir, router) = setup();
         let calendar = std::sync::Arc::new(RecCalWrite::default());
         let onedrive = std::sync::Arc::new(FakeOneDriveWrite::default());
@@ -14163,7 +14289,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             calendar_body,
             Some("calendar-secret"),
         ));
-        assert_eq!(first_calendar, replayed_calendar);
+        assert_eq!(first_calendar.status, 200);
+        assert_eq!(replayed_calendar.status, 200);
+        assert_eq!(body_json(&replayed_calendar)["code"], "request_replayed");
+        assert_eq!(body_json(&replayed_calendar)["terminal_status"], 200);
         assert_eq!(calendar.0.lock().unwrap().len(), 1);
 
         let onedrive_body = json!({
@@ -14182,7 +14311,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             onedrive_body,
             Some("onedrive-secret"),
         ));
-        assert_eq!(first_onedrive, replayed_onedrive);
+        assert_eq!(first_onedrive.status, 200);
+        assert_eq!(replayed_onedrive.status, 200);
+        assert_eq!(body_json(&replayed_onedrive)["code"], "request_replayed");
+        assert_eq!(body_json(&replayed_onedrive)["terminal_status"], 200);
         assert_eq!(onedrive.creates.lock().unwrap().len(), 1);
     }
 
@@ -14215,7 +14347,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
-    fn agent_product_mutation_replays_durable_response_without_second_effect() {
+    fn agent_product_mutation_returns_completed_without_second_effect() {
         let (_directory, router) = setup();
         let agent = std::sync::Arc::new(RecordingModelAgent::default());
         let router = router
@@ -14237,7 +14369,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             body.clone(),
             Some("agentsecret"),
         ));
-        assert_eq!(first, replay);
+        assert_eq!(first.status, 200);
+        assert_eq!(replay.status, 200);
+        assert_eq!(body_json(&replay)["code"], "request_replayed");
+        assert_eq!(body_json(&replay)["terminal_status"], 200);
         assert_eq!(agent.selections.lock().unwrap().len(), 1);
 
         let mut changed = body;
@@ -14253,7 +14388,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
-    fn terminal_conflict_response_replays_without_second_handler_call() {
+    fn terminal_conflict_receipt_blocks_second_handler_call() {
         let (_directory, router) = setup();
         let agent = std::sync::Arc::new(ReconnectRequiredAgent::default());
         let router = router
@@ -14277,7 +14412,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
         assert_eq!(first.status, 409);
         assert_eq!(body_json(&first)["error"], "reconnect_required");
-        assert_eq!(replay, first);
+        assert_eq!(replay.status, 409);
+        assert_eq!(body_json(&replay)["error"], "request_replayed");
+        assert_eq!(body_json(&replay)["terminal_status"], 409);
         assert_eq!(
             agent
                 .refresh_calls
@@ -14466,7 +14603,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         ));
         assert_eq!(presence_response.status, 200);
         assert_eq!(body_json(&presence_response)["token"], "confirmation-token");
-        assert_eq!(receipts.completed_response_count(), 0);
+        assert_eq!(receipts.completed_receipt_count(), 0);
         let presence_retry = router.route(&strict_json_post(
             "/api/v1/agent/user-presence/start",
             presence,
@@ -14490,7 +14627,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(body_json(&reveal_response)["pairing_code"]
             .as_str()
             .is_some_and(|value| value.starts_with("isy2.")));
-        assert_eq!(receipts.completed_response_count(), 0);
+        assert_eq!(receipts.completed_receipt_count(), 0);
         assert_eq!(
             router
                 .route(&strict_json_post(
@@ -14514,7 +14651,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         ));
         assert_eq!(oauth_response.status, 200);
         assert!(body_json(&oauth_response)["authorize_url"].is_string());
-        assert_eq!(receipts.completed_response_count(), 0);
+        assert_eq!(receipts.completed_receipt_count(), 0);
         let oauth_retry = router.route(&strict_json_post(
             "/api/v1/agent/oauth/start",
             oauth,
@@ -14522,7 +14659,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         ));
         assert_eq!(oauth_retry.status, 200);
         assert_eq!(body_json(&oauth_retry), body_json(&oauth_response));
-        assert_eq!(receipts.completed_response_count(), 0);
+        assert_eq!(receipts.completed_receipt_count(), 0);
     }
 
     #[test]
@@ -14596,6 +14733,28 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(body_json(&conflict)["error"], "request_id_conflict");
 
         assert_eq!(agent.turns.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn agent_turn_without_catalogued_request_identity_fails_closed() {
+        let (_directory, router) = setup();
+        let agent = std::sync::Arc::new(RecordingModelAgent::default());
+        let router = router.with_agent(agent.clone(), "agentsecret".into());
+        let request = strict_json_post(
+            "/api/v1/agent/turn",
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174116",
+                "session_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "account": "a",
+                "prompt": "Read one item"
+            }),
+            Some("agentsecret"),
+        );
+
+        let response = router.agent_turn(&request, None);
+        assert_eq!(response.status, 503);
+        assert_eq!(body_json(&response)["error"], "request_store_unavailable");
+        assert!(agent.turns.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -17322,7 +17481,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(invite.status, 200);
         assert!(String::from_utf8_lossy(&invite.body).contains("recipient@example.invalid"));
         assert_eq!(receipts.binding_count(), 2);
-        assert_eq!(receipts.completed_response_count(), 0);
+        assert_eq!(receipts.completed_receipt_count(), 0);
 
         let share_spec = product_post_route("/api/v1/share").unwrap();
         let identity = canonical_product_identity(
@@ -17339,7 +17498,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             share_spec,
         )
         .unwrap();
-        assert!(!identity.permits_durable_response());
+        assert!(!identity.permits_durable_terminal());
     }
 
     #[test]
@@ -17390,7 +17549,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         ));
         assert_eq!(corrected.status, 200);
         assert_eq!(receipts.binding_count(), 1);
-        assert_eq!(receipts.completed_response_count(), 0);
+        assert_eq!(receipts.completed_receipt_count(), 0);
         assert_eq!(
             share.share_calls.load(std::sync::atomic::Ordering::SeqCst),
             1
@@ -19765,6 +19924,8 @@ Content-Type: text/html; charset=utf-8\r\n\
         assert!(!source.contains("postJson(\"/api/v1/onenote/append\""));
         assert!(source.contains("async function mutationPostWithTransportRetry"));
         assert!(source.contains("if (error && error.responseReceived) throw error"));
+        assert!(source.contains("error.code === \"mutation_intent_already_completed\""));
+        assert!(source.contains("return { status: \"completed\" }"));
         assert!(source.contains("if (!commitAttempted && error && error.responseReceived)"));
     }
 
@@ -19775,6 +19936,16 @@ Content-Type: text/html; charset=utf-8\r\n\
         assert_eq!(
             body_json(&response)["error"],
             "mutation_intent_insufficient_storage"
+        );
+    }
+
+    #[test]
+    fn mutation_intent_completed_receipt_maps_to_closed_conflict() {
+        let response = mutation_error_response("mutation_intent_already_completed");
+        assert_eq!(response.status, 409);
+        assert_eq!(
+            body_json(&response)["error"],
+            "mutation_intent_already_completed"
         );
     }
 

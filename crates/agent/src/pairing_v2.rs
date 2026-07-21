@@ -55,11 +55,18 @@ pub struct OneDrivePairingTransportV2 {
 }
 
 #[cfg(feature = "onedrive")]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct VersionedPairingDescriptorV2 {
     pub descriptor: PairingDescriptorV2,
     pub item_id: String,
     pub etag: String,
+}
+
+#[cfg(feature = "onedrive")]
+impl std::fmt::Debug for VersionedPairingDescriptorV2 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("VersionedPairingDescriptorV2([redacted])")
+    }
 }
 
 #[cfg(feature = "onedrive")]
@@ -271,7 +278,7 @@ impl std::fmt::Debug for PairingCodeV2 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PairingCodeV2")
-            .field("pair_id", &self.pair_id)
+            .field("pair_id", &"[redacted]")
             .field("transfer_key", &"[redacted]")
             .finish()
     }
@@ -287,7 +294,7 @@ pub enum PairingRemoteStateV2 {
     ClaimedExpired,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PairingDescriptorV2 {
     pub version: u32,
@@ -304,6 +311,12 @@ pub struct PairingDescriptorV2 {
     pub destination_binding: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_until_ms: Option<u64>,
+}
+
+impl std::fmt::Debug for PairingDescriptorV2 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PairingDescriptorV2([redacted])")
+    }
 }
 
 impl PairingDescriptorV2 {
@@ -341,7 +354,7 @@ impl PairingDescriptorV2 {
     pub fn expire_claim(mut self, now_ms: u64) -> Result<Self, PairingV2Error> {
         self.validate()?;
         match self.state {
-            PairingRemoteStateV2::Claimed if now_ms > self.resume_until_ms.unwrap_or_default() => {
+            PairingRemoteStateV2::Claimed if now_ms >= self.resume_until_ms.unwrap_or_default() => {
                 self.state = PairingRemoteStateV2::ClaimedExpired;
                 Ok(self)
             }
@@ -356,10 +369,10 @@ impl PairingDescriptorV2 {
     pub fn cleanup_eligible_at(&self, now_ms: u64) -> Result<bool, PairingV2Error> {
         self.validate()?;
         Ok(match self.state {
-            PairingRemoteStateV2::Pending => now_ms > self.expires_at_ms,
+            PairingRemoteStateV2::Pending => now_ms >= self.expires_at_ms,
             PairingRemoteStateV2::Claimed => {
                 now_ms
-                    > self
+                    >= self
                         .resume_until_ms
                         .ok_or(PairingV2Error::InvalidDescriptor)?
             }
@@ -620,7 +633,7 @@ impl std::fmt::Debug for PairingSourceSecretV2 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PairingSourceSecretV2")
-            .field("pair_id", &self.code.pair_id)
+            .field("pair_id", &"[redacted]")
             .field("secret", &"[redacted]")
             .finish()
     }
@@ -648,7 +661,7 @@ impl PairingClaimV2 {
             PairingRemoteStateV2::Revoked => return Err(PairingV2Error::Revoked),
             _ => return Err(PairingV2Error::AlreadyClaimed),
         }
-        if now_ms > descriptor.expires_at_ms {
+        if now_ms >= descriptor.expires_at_ms {
             return Err(PairingV2Error::Expired);
         }
         let payload = open_pairing_payload(code, descriptor)?;
@@ -688,7 +701,7 @@ impl PairingClaimV2 {
             PairingRemoteStateV2::Revoked => return Err(PairingV2Error::Revoked),
             PairingRemoteStateV2::Pending => return Err(PairingV2Error::WrongClaim),
         }
-        if now_ms > descriptor.resume_until_ms.unwrap_or_default() {
+        if now_ms >= descriptor.resume_until_ms.unwrap_or_default() {
             return Err(PairingV2Error::Expired);
         }
         let expected_hash = descriptor.claim_secret_hash.as_deref().unwrap_or_default();
@@ -829,7 +842,7 @@ impl std::fmt::Debug for PairingClaimV2 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PairingClaimV2")
-            .field("descriptor", &self.descriptor)
+            .field("descriptor", &"[redacted]")
             .field("payload", &"[redacted]")
             .field("claim_secret", &"[redacted]")
             .finish()
@@ -1007,7 +1020,13 @@ mod tests {
         let source = source(1_000);
         let code = PairingCodeV2::parse(&source.reveal_code()).unwrap();
         assert_eq!(
-            PairingClaimV2::claim(&code, source.descriptor(), "principal", 301_001).unwrap_err(),
+            PairingClaimV2::claim(
+                &code,
+                source.descriptor(),
+                "principal",
+                source.descriptor().expires_at_ms,
+            )
+            .unwrap_err(),
             PairingV2Error::Expired
         );
     }
@@ -1107,7 +1126,7 @@ mod tests {
         let expired = claim
             .descriptor
             .clone()
-            .expire_claim(2_001 + CLAIM_RESUME_TTL_MS)
+            .expire_claim(claim.descriptor.resume_until_ms.unwrap())
             .unwrap();
         assert_eq!(expired.state, PairingRemoteStateV2::ClaimedExpired);
         assert_eq!(
@@ -1125,7 +1144,7 @@ mod tests {
     fn pairing_descriptor_cleanup_respects_pending_and_claim_resume_deadlines() {
         let source = source(1_000);
         let pending_deadline = source.descriptor().expires_at_ms;
-        assert!(!source
+        assert!(source
             .descriptor()
             .cleanup_eligible_at(pending_deadline)
             .unwrap());
@@ -1138,7 +1157,7 @@ mod tests {
         let claim =
             PairingClaimV2::claim(&code, source.descriptor(), "principal-a", 2_000).unwrap();
         let resume_deadline = claim.descriptor.resume_until_ms.unwrap();
-        assert!(!claim
+        assert!(claim
             .descriptor
             .cleanup_eligible_at(resume_deadline)
             .unwrap());
@@ -1171,7 +1190,7 @@ mod tests {
         let expired = claim
             .descriptor
             .clone()
-            .expire_claim(2_001 + CLAIM_RESUME_TTL_MS)
+            .expire_claim(claim.descriptor.resume_until_ms.unwrap())
             .unwrap();
         assert_eq!(
             PairingClaimV2::claim(&code, &expired, "principal-b", 3_000).unwrap_err(),
@@ -1194,6 +1213,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resumed.session_id.as_str(), "session-v2");
+        assert_eq!(
+            PairingClaimV2::resume(
+                &code,
+                &claim.descriptor,
+                claim.claim_secret(),
+                "principal-a",
+                claim.descriptor.resume_until_ms.unwrap(),
+            )
+            .unwrap_err(),
+            PairingV2Error::Expired
+        );
     }
 
     #[test]
@@ -1268,9 +1298,26 @@ mod tests {
     fn pairing_secret_never_appears_in_logs_api_errors_or_evidence() {
         let source = source(1_000);
         let code = source.reveal_code();
-        assert!(!format!("{source:?}").contains(&code));
+        let pair_id = source.pair_id().to_owned();
+        let ciphertext = source.descriptor().ciphertext.clone();
+        let source_debug = format!("{source:?}");
+        assert!(!source_debug.contains(&code));
+        assert!(!source_debug.contains(&pair_id));
+        let descriptor_debug = format!("{:?}", source.descriptor());
+        assert!(!descriptor_debug.contains(&pair_id));
+        assert!(!descriptor_debug.contains(&ciphertext));
         let parsed = PairingCodeV2::parse(&code).unwrap();
-        assert!(!format!("{parsed:?}").contains(&code));
+        let parsed_debug = format!("{parsed:?}");
+        assert!(!parsed_debug.contains(&code));
+        assert!(!parsed_debug.contains(&pair_id));
+        let claim =
+            PairingClaimV2::claim(&parsed, source.descriptor(), "principal", 2_000).unwrap();
+        let claim_debug = format!("{claim:?}");
+        assert!(!claim_debug.contains(&pair_id));
+        assert!(!claim_debug.contains(&ciphertext));
+        assert!(!claim_debug.contains(claim.descriptor.claim_id.as_deref().unwrap()));
+        assert!(!claim_debug.contains(claim.descriptor.claim_secret_hash.as_deref().unwrap()));
+        assert!(!claim_debug.contains(claim.descriptor.destination_binding.as_deref().unwrap()));
         assert_eq!(
             PairingV2Error::WrongClaim.to_string(),
             "pairing_wrong_claim"

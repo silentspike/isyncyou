@@ -168,8 +168,8 @@ class MainActivity : FragmentActivity() {
                 val path = (url.encodedPath ?: "/") + (url.encodedQuery?.let { "?$it" } ?: "")
                 return try {
                     decodeAssetResponse(NativeEngine.nativeAssetRequestWithSession(path, sessionToken))
-                } catch (e: Exception) {
-                    android.util.Log.w(TAG, "asset serve failed for ${url.encodedPath}", e)
+                } catch (_: Exception) {
+                    android.util.Log.w(TAG, "asset_serve_failed")
                     null
                 }
             }
@@ -178,7 +178,7 @@ class MainActivity : FragmentActivity() {
             // smoke (REQ-AND-004) and handy for on-device diagnostics.
             override fun onPageFinished(view: WebView, url: String) {
                 if (url.startsWith(APP_ORIGIN)) {
-                    android.util.Log.i(TAG, "shell loaded: $url")
+                    android.util.Log.i(TAG, "shell_loaded")
                 }
             }
         }
@@ -227,11 +227,11 @@ class MainActivity : FragmentActivity() {
             try {
                 val token = EngineBootstrap.ensureStarted(filesDir)
                 runOnUiThread { onEngineReady(if (token.isEmpty()) -1 else 1, token) }
-            } catch (t: EncryptedStorageSetupException) {
-                android.util.Log.e(TAG, "encrypted storage setup failed; local data was not opened", t)
+            } catch (_: EncryptedStorageSetupException) {
+                android.util.Log.e(TAG, "encrypted_storage_setup_failed")
                 runOnUiThread { onEncryptedStorageFailed() }
-            } catch (t: Throwable) {
-                android.util.Log.e(TAG, "engine thread crashed starting the native engine", t)
+            } catch (_: Throwable) {
+                android.util.Log.e(TAG, "engine_start_failed")
                 runOnUiThread { onEngineReady(-1, "") }
             }
         }.start()
@@ -284,8 +284,8 @@ class MainActivity : FragmentActivity() {
             val charging = getSystemService(BatteryManager::class.java)?.isCharging ?: true
             val freeBytes = StatFs(filesDir.absolutePath).availableBytes
             NativeEngine.nativeDeviceState(metered, charging, freeBytes)
-        } catch (t: Throwable) {
-            android.util.Log.w(TAG, "pushDeviceState failed", t)
+        } catch (_: Throwable) {
+            android.util.Log.w(TAG, "device_state_update_failed")
         }
     }
 
@@ -329,8 +329,8 @@ class MainActivity : FragmentActivity() {
                 setCookie("$APP_ORIGIN/", "isy_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT")
                 flush()
             }
-        } catch (t: Throwable) {
-            android.util.Log.w(TAG, "legacy session cookie cleanup failed", t)
+        } catch (_: Throwable) {
+            android.util.Log.w(TAG, "legacy_session_cookie_cleanup_failed")
         }
     }
 
@@ -373,8 +373,8 @@ class MainActivity : FragmentActivity() {
                 registrationSucceeded = true,
                 forcedDebugFailure = false,
             )
-        } catch (e: Exception) {
-            android.util.Log.w(TAG, "bridge preflight failed (${BridgeStartupDecision.FailRegistration.name})", e)
+        } catch (_: Exception) {
+            android.util.Log.w(TAG, "bridge_registration_failed")
             BridgeStartupPolicy.decide(
                 webMessageListenerSupported = true,
                 registrationSucceeded = false,
@@ -437,8 +437,8 @@ class MainActivity : FragmentActivity() {
                 val requestJson = sanitizedBridgeRequest(obj)
                 val resp = try {
                     NativeEngine.nativeBridgeRequest(requestJson)
-                } catch (e: Exception) {
-                    android.util.Log.w(TAG, "bridge request failed", e)
+                } catch (_: Exception) {
+                    android.util.Log.w(TAG, "bridge_request_failed")
                     BridgeMessagePolicy.responseJson(
                         validation.id,
                         500,
@@ -637,8 +637,8 @@ class MainActivity : FragmentActivity() {
             try {
                 startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)))
                 postBridgeResponse(reply, id, 200, JSONObject().put("ok", true))
-            } catch (e: Exception) {
-                android.util.Log.w(TAG, "external auth launch failed (${decision.reason})", e)
+            } catch (_: Exception) {
+                android.util.Log.w(TAG, "external_auth_launch_failed")
                 postBridgeError(reply, id, 500, "external_launch_failed", "launch_failed")
             }
         }
@@ -702,16 +702,16 @@ class MainActivity : FragmentActivity() {
             kg.generateKey()
         }
         Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, key) }
-    } catch (e: KeyPermanentlyInvalidatedException) {
+    } catch (_: KeyPermanentlyInvalidatedException) {
         // Biometric set changed → the old key is dead; drop it so the next attempt recreates it.
-        android.util.Log.w(TAG, "bio confirm key invalidated by new enrollment; recreating", e)
+        android.util.Log.w(TAG, "biometric_key_invalidated")
         try {
             KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry(bioKeyAlias)
         } catch (_: Exception) {
         }
         null
-    } catch (e: Exception) {
-        android.util.Log.w(TAG, "bio confirm key/cipher unavailable", e)
+    } catch (_: Exception) {
+        android.util.Log.w(TAG, "biometric_key_unavailable")
         null
     }
 
@@ -731,8 +731,8 @@ class MainActivity : FragmentActivity() {
                     ?: return reply.postMessage(bioReplyJson(reqId, false, "descriptor_unavailable"))
                 PendingPromptDescriptor(op, label)
             }
-        } catch (e: Exception) {
-            android.util.Log.w(TAG, "pending action descriptor unavailable", e)
+        } catch (_: Exception) {
+            android.util.Log.w(TAG, "pending_action_descriptor_unavailable")
             reply.postMessage(bioReplyJson(reqId, false, "descriptor_unavailable"))
             return
         }
@@ -788,8 +788,8 @@ class MainActivity : FragmentActivity() {
                                 ?: throw IllegalStateException("no crypto object in auth result")
                         }
                         NativeEngine.nativeConfirmAction(pat)
-                    } catch (e: Exception) {
-                        android.util.Log.w(TAG, "confirm crypto/arming failed", e)
+                    } catch (_: Exception) {
+                        android.util.Log.w(TAG, "confirmation_arming_failed")
                         false
                     }
                     reply.postMessage(
@@ -825,8 +825,8 @@ class MainActivity : FragmentActivity() {
             } else {
                 prompt.authenticate(info)
             }
-        } catch (e: Exception) {
-            android.util.Log.w(TAG, "biometric prompt failed to start", e)
+        } catch (_: Exception) {
+            android.util.Log.w(TAG, "biometric_prompt_start_failed")
             completeBiometric(pat, reqId, reply, false, "start_failed")
         }
     }
@@ -864,8 +864,8 @@ class MainActivity : FragmentActivity() {
         mainHandler.postDelayed(timeout, BIO_TIMEOUT_MS)
         try {
             startActivityForResult(intent, DEVICE_CREDENTIAL_REQUEST_CODE)
-        } catch (e: Exception) {
-            android.util.Log.w(TAG, "device credential prompt failed to start", e)
+        } catch (_: Exception) {
+            android.util.Log.w(TAG, "device_credential_prompt_start_failed")
             activeDeviceCredential = null
             completeBiometric(pat, reqId, reply, false, "start_failed")
         }
@@ -881,7 +881,7 @@ class MainActivity : FragmentActivity() {
         mainHandler.removeCallbacks(pending.timeout)
         val armed = if (resultCode == Activity.RESULT_OK) {
             runCatching { NativeEngine.nativeConfirmAction(pat) }.getOrElse {
-                android.util.Log.w(TAG, "device credential arming failed", it)
+                android.util.Log.w(TAG, "device_credential_arming_failed")
                 false
             }
         } else {

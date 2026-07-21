@@ -173,10 +173,10 @@ pub(crate) fn run_mobile_backup_account(
         Ok(run) => ("ok", run.summary.as_str()),
         Err(_) => ("error", "mobile backup failed"),
     };
-    if let Err(error) =
+    if let Err(_error) =
         LiveBackupRuntime.record_run(cfg, account, &started, &finished, status, summary)
     {
-        eprintln!("isyncyou: could not record mobile backup run for {account}: {error}");
+        eprintln!("isyncyou: mobile_backup_run_record_failed");
     }
     result
 }
@@ -334,10 +334,10 @@ fn run_backup_account_with_runtime<R: BackupRuntime>(
     let finished = crate::unix_now();
     let (status, summary) = match &result {
         Ok(run) => ("ok", run.summary.as_str()),
-        Err(error) => ("error", error.as_str()),
+        Err(_) => ("error", "backup failed"),
     };
-    if let Err(e) = runtime.record_run(cfg, account, &started, &finished, status, summary) {
-        eprintln!("isyncyou: could not record backup run for {account}: {e}");
+    if let Err(_error) = runtime.record_run(cfg, account, &started, &finished, status, summary) {
+        eprintln!("isyncyou: backup_run_record_failed");
     }
     result
 }
@@ -3217,6 +3217,28 @@ mod tests {
         assert_eq!(state.recorded.len(), 1);
         assert_eq!(state.recorded[0].0, "ok");
         assert!(state.recorded[0].1.contains("mail:"));
+    }
+
+    #[test]
+    fn agent_backup_failure_records_only_closed_summary() {
+        let sensitive = "refresh failed for user@example.invalid at https://provider.invalid/token";
+        let runtime = RecordingBackupRuntime::failing_read(sensitive);
+        let gate = Arc::new(Mutex::new(()));
+
+        let error = run_backup_account_with_runtime(
+            &Config::default(),
+            "private-alias",
+            &gate,
+            &[],
+            &runtime,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, sensitive);
+        assert_eq!(
+            runtime.state().recorded,
+            vec![("error".to_string(), "backup failed".to_string())]
+        );
     }
 
     #[test]

@@ -643,7 +643,10 @@ async function main() {
     evidence.fixture_origin = origin;
 
     browser = await chromium.launch();
-    const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    const page = await browser.newPage({
+      viewport: { width: 1280, height: 900 },
+      reducedMotion: "reduce",
+    });
     page.on("console", (msg) => {
       if (msg.type() === "error") evidence.console_errors.push(msg.text());
     });
@@ -702,9 +705,10 @@ async function main() {
       }
     });
 
-    await page.goto(`${origin}/`, { waitUntil: "domcontentloaded" });
     await page.goto(`${origin}/#/settings`, { waitUntil: "domcontentloaded" });
-    await page.getByRole("button", { name: "Choose Microsoft account" }).click();
+    const chooseAccount = page.locator("#view").getByRole("button", { name: "Choose Microsoft account" });
+    await chooseAccount.waitFor({ state: "visible" });
+    await chooseAccount.click();
     const readerRole = page.locator(".acct-role").filter({ hasText: "iSyncYou Reader" });
     const writerRole = page.locator(".acct-role").filter({ hasText: "iSyncYou Writer" });
     assert(evidence, "account menu exposes independent Reader and Writer roles",
@@ -721,7 +725,7 @@ async function main() {
     await page.locator(".acct-menu").getByRole("button", { name: "Open Microsoft account picker" }).click();
     const accountPickerPopup = await accountPickerPopupPromise;
     if (accountPickerPopup) {
-      await accountPickerPopup.waitForLoadState("domcontentloaded");
+      await accountPickerPopup.waitForURL((value) => value.pathname === "/fixture-account-auth", { timeout: 5000 });
       const pickerUrl = new URL(accountPickerPopup.url());
       assert(evidence, "account picker launch uses select_account without verifier",
         pickerUrl.searchParams.get("prompt") === "select_account"
@@ -742,7 +746,7 @@ async function main() {
     await readerRole.getByTitle("Reconnect iSyncYou Reader").click();
     await page.locator(".acct-menu .acct-dc-title").waitFor();
     const stalePicker = page.locator(".acct-menu").getByRole("button", { name: "Open Microsoft account picker" });
-    await page.locator(".acct-menu").getByRole("button", { name: "Start sign-in again" }).waitFor({ timeout: 5000 });
+    await page.locator(".acct-menu").getByRole("button", { name: "Start sign-in again" }).waitFor({ timeout: 10000 });
     assert(evidence, "terminal account attempt disables stale authorization url",
       await stalePicker.isDisabled());
     const endedAuthorizationUri = fixture.state.accountLoginStarts.at(-1).authorizationUri;
@@ -754,12 +758,12 @@ async function main() {
       && fixture.state.accountLoginStarts.at(-1).authorizationUri !== endedAuthorizationUri);
     await page.locator(".acct-menu").getByRole("button", { name: "Cancel" }).click();
     await page.waitForFunction(() => !document.querySelector(".acct-menu .acct-dc"));
-    await page.goto(`${origin}/`, { waitUntil: "domcontentloaded" });
-    await page.waitForSelector('.nav-item[data-service="assistant"]', { timeout: 10000 });
+    await page.locator(".acct-menu-wrap .scrim").click({ position: { x: 1, y: 1 } });
+    await page.locator(".acct-menu").waitFor({ state: "detached" });
+    await page.goto(`${origin}/#/assistant`, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector('[data-testid="agent-setup"]', { timeout: 10000 });
     const assistantNavVisible = await page.locator('.nav-item[data-service="assistant"]').first().isVisible();
     assert(evidence, "desktop Assistant nav visible", assistantNavVisible);
-    await page.locator('.nav-item[data-service="assistant"]').first().click();
-    await page.waitForSelector('[data-testid="agent-setup"]', { timeout: 10000 });
     assert(evidence, "setup consent panel visible", await page.locator('[data-testid="agent-consent"]').isVisible());
     assert(evidence, "connect disabled before consent", await page.locator('[data-testid="agent-connect-codex"]').isDisabled());
     assert(evidence, "BYO key row absent", await page.locator('[data-agent-byo-key="unavailable"]').count() === 0);

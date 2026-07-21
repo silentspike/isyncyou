@@ -1220,6 +1220,23 @@ fn cache_product_session_context(
     feature = "agent-subscription-experimental",
     test
 ))]
+fn persist_product_runtime_if_expected<T>(
+    runtime: Option<T>,
+    expected: bool,
+    persist: impl FnOnce(T) -> Result<(), String>,
+) -> Result<(), String> {
+    match runtime {
+        Some(runtime) => persist(runtime),
+        None if expected => Err("session_store_unavailable".into()),
+        None => Ok(()),
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
 fn cache_persisted_request_phase(
     cache: &HotRequestStatusCache,
     binding: Option<&(String, String)>,
@@ -1630,8 +1647,17 @@ impl TurnRegistry {
             .lock()
             .map_err(|_| "turn_registry_unavailable".to_string())?
             .get(turn_id)
-            .cloned()
-            .ok_or_else(|| "turn_not_found".to_string())?;
+            .cloned();
+        let Some(state) = state else {
+            return if pending
+                .has_pending_for_turn(turn_id, now_ms)
+                .map_err(|_| "confirmation_unavailable".to_string())?
+            {
+                Err("pending_requires_explicit_cancel".into())
+            } else {
+                Err("turn_not_found".into())
+            };
+        };
         let mut state = state
             .lock()
             .map_err(|_| "turn_registry_unavailable".to_string())?;
@@ -1650,6 +1676,12 @@ impl TurnRegistry {
             TurnAuthorityState::Cancelled => Ok(()),
             TurnAuthorityState::Finalizing => Err("turn_not_found".into()),
             TurnAuthorityState::Running => {
+                if pending
+                    .has_pending_for_turn(turn_id, now_ms)
+                    .map_err(|_| "confirmation_unavailable".to_string())?
+                {
+                    return Err("pending_requires_explicit_cancel".into());
+                }
                 let cancellation = hub
                     .cancellation_token(turn_id)
                     .ok_or_else(|| "turn_not_found".to_string())?;
@@ -1965,7 +1997,7 @@ struct ReservedAgentTurn {
     sequence: u64,
     turn_state: Arc<Mutex<TurnAuthorityState>>,
     cancellation: isyncyou_agent::CancellationToken,
-    admission: TurnAdmissionLease,
+    admission: Option<TurnAdmissionLease>,
     durable_admission: DurableTurnAdmissionLease,
 }
 
@@ -2016,6 +2048,59 @@ const PRODUCT_SESSION_COMPACTION_BATCH: usize = 8;
     feature = "agent-subscription-experimental"
 ))]
 const PAIRING_DESCRIPTOR_CLEANUP_BATCH: usize = 8;
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+const PAIRING_CLAIM_RECOVERY_BATCH: usize = 8;
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+trait PairingRecoveryTransport {
+    type Versioned;
+
+    fn load_optional(&self, pair_id: &str) -> Result<Option<Self::Versioned>, String>;
+    fn descriptor(value: &Self::Versioned) -> &isyncyou_agent::PairingDescriptorV2;
+    fn compare_and_swap(
+        &self,
+        current: &Self::Versioned,
+        next: &isyncyou_agent::PairingDescriptorV2,
+    ) -> Result<Option<Self::Versioned>, String>;
+    fn delete(&self, current: &Self::Versioned) -> Result<bool, String>;
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+impl PairingRecoveryTransport for isyncyou_agent::OneDrivePairingTransportV2 {
+    type Versioned = isyncyou_agent::VersionedPairingDescriptorV2;
+
+    fn load_optional(&self, pair_id: &str) -> Result<Option<Self::Versioned>, String> {
+        isyncyou_agent::OneDrivePairingTransportV2::load_optional(self, pair_id)
+            .map_err(|error| error.to_string())
+    }
+
+    fn descriptor(value: &Self::Versioned) -> &isyncyou_agent::PairingDescriptorV2 {
+        &value.descriptor
+    }
+
+    fn compare_and_swap(
+        &self,
+        current: &Self::Versioned,
+        next: &isyncyou_agent::PairingDescriptorV2,
+    ) -> Result<Option<Self::Versioned>, String> {
+        isyncyou_agent::OneDrivePairingTransportV2::compare_and_swap(self, current, next)
+            .map_err(|error| error.to_string())
+    }
+
+    fn delete(&self, current: &Self::Versioned) -> Result<bool, String> {
+        isyncyou_agent::OneDrivePairingTransportV2::delete(self, current)
+            .map_err(|error| error.to_string())
+    }
+}
 
 #[cfg(any(
     feature = "agent-oauth-providers",
@@ -2065,6 +2150,7 @@ fn run_account_maintenance_once(
     if let Some(store) = &context.control_store {
         let _ = store.reap_expired(unix_now_ms(), 256);
         reconcile_pending_cancel_projections(&context.cfg, &context.oauth_dir, store, 8);
+        reconcile_pending_confirm_projections(&context.cfg, &context.oauth_dir, store, 8);
     }
     if let Ok(mut attempts) = context.oauth_attempts.lock() {
         let expired = reap_oauth_attempts(&mut attempts, &context.oauth_dir);
@@ -2129,10 +2215,23 @@ fn run_product_session_maintenance_once(context: &LifecycleMaintenanceContext) {
         return;
     };
     let registry = product_session::ProductSessionRegistry::new(&credential_store);
+    let maintenance_now_ms = unix_now_ms();
+    if let Ok(repository) = account_lifecycle_repository(&context.oauth_dir) {
+        if let Ok(Some(installation)) = repository.load_existing() {
+            recover_pairing_claims_once(
+                &context.cfg,
+                control_store,
+                &registry,
+                installation.principal(),
+                maintenance_now_ms,
+            );
+        }
+    }
+    cleanup_pairing_claim_descriptors_once(&context.cfg, control_store, maintenance_now_ms);
     let Ok(targets) = registry.maintenance_targets() else {
         return;
     };
-    cleanup_pairing_descriptors_once(&context.cfg, control_store, &targets, unix_now_ms());
+    cleanup_pairing_descriptors_once(&context.cfg, control_store, &targets, maintenance_now_ms);
     if targets.is_empty() {
         let _ = control_store.claim_session_maintenance_offset(0, 0);
         return;
@@ -2155,6 +2254,209 @@ fn run_product_session_maintenance_once(context: &LifecycleMaintenanceContext) {
         };
         let _ = registry.maintain_remote_session(&token, target, PRODUCT_SESSION_COMPACTION_BATCH);
     }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn recover_pairing_claims_once(
+    cfg: &Config,
+    control_store: &agent_control_store::AgentControlStore,
+    registry: &product_session::ProductSessionRegistry<'_>,
+    installation_principal: &str,
+    now_ms: u64,
+) {
+    let Ok(targets) =
+        control_store.pairing_claim_recovery_targets(PAIRING_CLAIM_RECOVERY_BATCH, now_ms)
+    else {
+        return;
+    };
+    for target in targets {
+        let Ok(token) =
+            isyncyou_engine::auth::resolve_cached_sync_token(cfg, &target.local_account)
+        else {
+            continue;
+        };
+        let transport = isyncyou_agent::OneDrivePairingTransportV2::new(token);
+        let _ = recover_pairing_claim_target(
+            control_store,
+            registry,
+            &target,
+            installation_principal,
+            now_ms,
+            &transport,
+        );
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn recover_pairing_claim_target<T: PairingRecoveryTransport>(
+    control_store: &agent_control_store::AgentControlStore,
+    registry: &product_session::ProductSessionRegistry<'_>,
+    target: &agent_control_store::PairingClaimRecoveryTarget,
+    installation_principal: &str,
+    now_ms: u64,
+    transport: &T,
+) -> Result<(), String> {
+    let (code, claim) =
+        control_store.load_pairing_claim(&target.operation_id, installation_principal, now_ms)?;
+    if target.state == "claimed" {
+        let current = transport
+            .load_optional(code.pair_id())?
+            .ok_or_else(|| "pairing_outcome_unknown".to_string())?;
+        if let Some(next) = claim
+            .claim_transition(T::descriptor(&current))
+            .map_err(|error| error.to_string())?
+        {
+            let published = transport
+                .compare_and_swap(&current, &next)?
+                .ok_or_else(|| "pairing_outcome_unknown".to_string())?;
+            if T::descriptor(&published) != &next {
+                return Err("pairing_outcome_unknown".into());
+            }
+        }
+        let session = registry.import_pairing_payload(
+            &target.request_id,
+            &target.local_account,
+            &claim.payload,
+            now_ms,
+        )?;
+        control_store.mark_pairing_claim_installed(&target.operation_id, &session.session_id)?;
+    }
+
+    if !control_store
+        .pairing_claim_remote_consumed(&target.operation_id, &target.finalize_request_id)?
+    {
+        let current = transport
+            .load_optional(code.pair_id())?
+            .ok_or_else(|| "pairing_outcome_unknown".to_string())?;
+        let consumed = claim
+            .finalize(T::descriptor(&current))
+            .map_err(|error| error.to_string())?;
+        let terminal = if &consumed == T::descriptor(&current) {
+            current
+        } else {
+            let published = transport
+                .compare_and_swap(&current, &consumed)?
+                .ok_or_else(|| "pairing_outcome_unknown".to_string())?;
+            if T::descriptor(&published) != &consumed {
+                return Err("pairing_outcome_unknown".into());
+            }
+            published
+        };
+        control_store.mark_pairing_claim_remote_consumed(
+            &target.operation_id,
+            &target.finalize_request_id,
+        )?;
+        if transport.delete(&terminal).is_ok_and(|deleted| deleted) {
+            let _ =
+                control_store.mark_pairing_claim_descriptor_cleanup_complete(&target.operation_id);
+        }
+    } else {
+        match transport.load_optional(code.pair_id()) {
+            Ok(None) => {
+                let _ = control_store
+                    .mark_pairing_claim_descriptor_cleanup_complete(&target.operation_id);
+            }
+            Ok(Some(current)) => {
+                if claim
+                    .finalize(T::descriptor(&current))
+                    .is_ok_and(|descriptor| &descriptor == T::descriptor(&current))
+                    && transport.delete(&current).is_ok_and(|deleted| deleted)
+                {
+                    let _ = control_store
+                        .mark_pairing_claim_descriptor_cleanup_complete(&target.operation_id);
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    control_store.complete_pairing_claim(&target.operation_id, &target.finalize_request_id, now_ms)
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn cleanup_pairing_claim_descriptors_once(
+    cfg: &Config,
+    control_store: &agent_control_store::AgentControlStore,
+    now_ms: u64,
+) {
+    let Ok(targets) =
+        control_store.pairing_claim_descriptor_cleanup_targets(PAIRING_DESCRIPTOR_CLEANUP_BATCH)
+    else {
+        return;
+    };
+    for target in targets {
+        let Ok(token) =
+            isyncyou_engine::auth::resolve_cached_sync_token(cfg, &target.local_account)
+        else {
+            continue;
+        };
+        let transport = isyncyou_agent::OneDrivePairingTransportV2::new(token);
+        let _ = cleanup_pairing_claim_descriptor_target(control_store, &target, now_ms, &transport);
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn cleanup_pairing_claim_descriptor_target<T: PairingRecoveryTransport>(
+    control_store: &agent_control_store::AgentControlStore,
+    target: &agent_control_store::PairingClaimDescriptorCleanupTarget,
+    now_ms: u64,
+    transport: &T,
+) -> Result<(), String> {
+    if let Some(current) = transport.load_optional(&target.pair_id)? {
+        let descriptor = T::descriptor(&current);
+        if descriptor.pair_id != target.pair_id {
+            return Err("pairing_outcome_unknown".into());
+        }
+        let valid_state = match target.state.as_str() {
+            "consumed" => descriptor.state == isyncyou_agent::PairingRemoteStateV2::Consumed,
+            "claimed_expired" => true,
+            _ => false,
+        };
+        if !valid_state || !descriptor.cleanup_eligible_at(now_ms).unwrap_or(false) {
+            return Err("pairing_outcome_unknown".into());
+        }
+        if !transport.delete(&current)? {
+            return Err("pairing_outcome_unknown".into());
+        }
+    }
+    control_store.mark_pairing_claim_descriptor_cleanup_complete(&target.operation_id)
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn cleanup_pairing_source_descriptor_target<T: PairingRecoveryTransport>(
+    control_store: &agent_control_store::AgentControlStore,
+    target: &agent_control_store::PairingDescriptorCleanupTarget,
+    now_ms: u64,
+    transport: &T,
+) -> Result<(), String> {
+    let Some(current) = transport.load_optional(&target.pair_id)? else {
+        return control_store.mark_pairing_source_descriptor_cleanup_complete(&target.pair_id);
+    };
+    let descriptor = T::descriptor(&current);
+    if descriptor.pair_id != target.pair_id {
+        return Err("pairing_outcome_unknown".into());
+    }
+    if !descriptor.cleanup_eligible_at(now_ms).unwrap_or(false) {
+        return Ok(());
+    }
+    if !transport.delete(&current)? {
+        return Err("pairing_outcome_unknown".into());
+    }
+    control_store.mark_pairing_source_descriptor_cleanup_complete(&target.pair_id)
 }
 
 #[cfg(any(
@@ -2185,16 +2487,8 @@ fn cleanup_pairing_descriptors_once(
             continue;
         };
         let transport = isyncyou_agent::OneDrivePairingTransportV2::new(token);
-        let Ok(Some(current)) = transport.load_optional(&cleanup.pair_id) else {
-            continue;
-        };
-        if current
-            .descriptor
-            .cleanup_eligible_at(now_ms)
-            .unwrap_or(false)
-        {
-            let _ = transport.delete(&current);
-        }
+        let _ =
+            cleanup_pairing_source_descriptor_target(control_store, &cleanup, now_ms, &transport);
     }
 }
 
@@ -2214,6 +2508,26 @@ fn reconcile_pending_cancel_projections(
     for projection in projections {
         if project_pending_cancel(cfg, oauth_dir, &projection).is_ok() {
             let _ = store.complete_pending_cancel_projection(&projection.pending_id);
+        }
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn reconcile_pending_confirm_projections(
+    cfg: &Config,
+    oauth_dir: &Path,
+    store: &agent_control_store::AgentControlStore,
+    limit: usize,
+) {
+    let Ok(projections) = store.pending_confirm_projections(limit) else {
+        return;
+    };
+    for projection in projections {
+        if project_pending_confirm(cfg, oauth_dir, &projection).is_ok() {
+            let _ = store.complete_pending_confirm_projection(&projection.pending_id);
         }
     }
 }
@@ -2243,6 +2557,36 @@ fn project_pending_cancel(
         &token,
         &projection.owner,
         installation.principal(),
+        projection.created_at_ms,
+    )
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn project_pending_confirm(
+    cfg: &Config,
+    oauth_dir: &Path,
+    projection: &agent_control_store::PendingConfirmProjection,
+) -> Result<(), String> {
+    if projection.owner.session_id == "legacy-local" {
+        return Ok(());
+    }
+    let token = isyncyou_engine::auth::resolve_cached_sync_token(cfg, &projection.owner.account)
+        .map_err(|_| "session_transport_unavailable".to_string())?;
+    let credential_store =
+        agent_credential_store(oauth_dir).map_err(|_| "session_store_unavailable".to_string())?;
+    let repository = account_lifecycle_repository(oauth_dir)?;
+    let installation = repository
+        .load_existing()
+        .map_err(|_| "session_store_unavailable".to_string())?
+        .ok_or_else(|| "session_store_unavailable".to_string())?;
+    product_session::ProductSessionRegistry::new(&credential_store).append_pending_operation_state(
+        &token,
+        &projection.owner,
+        installation.principal(),
+        &projection.code,
         projection.created_at_ms,
     )
 }
@@ -2800,10 +3144,10 @@ pub struct DaemonAgent {
         allow(dead_code)
     )]
     credential_refresh_gate: Mutex<()>,
-    /// #639: the single in-process product-runtime gate. One hold spans selection + model +
-    /// refresh + activation-check + attestation + provider construction (and the status readiness
-    /// read + the selection write), so status and a turn can never observe credential and
-    /// activation from different revisions. Lock order: this gate BEFORE `credential_refresh_gate`.
+    /// #639: the in-process product-runtime snapshot gate. One hold spans a consistent selection,
+    /// credential, activation, and harness snapshot (and the selection write), but never provider
+    /// network I/O. Refresh retains only the provider-exclusive lifecycle lease across I/O, then
+    /// reacquires this gate before `credential_refresh_gate` and the cross-process snapshot lock.
     #[cfg_attr(
         not(any(
             feature = "agent-oauth-providers",
@@ -2879,7 +3223,7 @@ impl DaemonAgent {
             feature = "agent-oauth-providers",
             feature = "agent-subscription-experimental"
         ))]
-        let (control_store, control_store_state) = if lifecycle_initialized {
+        let (control_store, mut control_store_state) = if lifecycle_initialized {
             match open_agent_control_store(&oauth_dir) {
                 Ok(store) => (Some(store), "ready"),
                 Err(error) => (None, public_control_store_init_code(&error)),
@@ -2891,7 +3235,24 @@ impl DaemonAgent {
             feature = "agent-oauth-providers",
             feature = "agent-subscription-experimental"
         ))]
-        let lifecycle_initialized = lifecycle_initialized && control_store.is_some();
+        let pending_confirmation_recovery_ready = control_store.as_ref().is_some_and(|store| {
+            store
+                .recover_interrupted_pending_confirmations(unix_now_ms())
+                .is_ok()
+        });
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        if control_store.is_some() && !pending_confirmation_recovery_ready {
+            control_store_state = "recovery_required";
+        }
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        let lifecycle_initialized =
+            lifecycle_initialized && control_store.is_some() && pending_confirmation_recovery_ready;
         #[cfg(any(
             feature = "agent-oauth-providers",
             feature = "agent-subscription-experimental"
@@ -3531,13 +3892,13 @@ impl DaemonAgent {
         }
     }
 
-    /// #639 T7: the single atomic product-runtime gate for building a turn's provider. One hold of
-    /// `product_runtime_gate` spans selection + readiness (activation + attestation) + provider
-    /// construction — status and a turn can never read credential and activation from different
-    /// revisions, and there is no second settings/credential read. It runs BEFORE any turn-id /
-    /// stream-slot / archive resolution: a rejected turn creates none of that state. The PRODUCT
-    /// path uses ONLY the selected provider and ONLY when host-verified ready (no fallback). #627
-    /// experimental is a separate, compiled-in-only path that never confers product readiness.
+    /// #639 T7/#645: build a turn provider from one lifecycle-fenced product snapshot. Short
+    /// runtime/refresh/file locks validate and copy the minimum refresh input, are released for
+    /// provider I/O, and are reacquired in the fixed order for publication. The exclusive provider
+    /// lease is then handed off to a shared turn lease; under that lease the current encrypted
+    /// bundle and activation are re-read and provider construction is refresh-free. This runs
+    /// before turn-id/stream/archive allocation. The product path uses only host-verified product
+    /// authority; #627 remains a separate compiled-in path that never confers product readiness.
     #[cfg(any(
         feature = "agent-oauth-providers",
         feature = "agent-subscription-experimental"
@@ -3547,8 +3908,14 @@ impl DaemonAgent {
         system: &str,
     ) -> Result<PreparedTurnProvider, AgentStartTurnError> {
         enum CredentialSnapshot {
-            Claude(StoredCredential),
-            Codex(CodexStoredCredential),
+            Claude {
+                credential: StoredCredential,
+                refresh_fence: Option<ProductRefreshFence>,
+            },
+            Codex {
+                credential: CodexStoredCredential,
+                refresh_fence: Option<ProductRefreshFence>,
+            },
         }
 
         // Preliminary read selects only the provider enum; no credential material survives it.
@@ -3575,7 +3942,7 @@ impl DaemonAgent {
             )
             .map_err(|_| AgentStartTurnError::ProductNotReady)?;
 
-        let (settings, generation, credential) = {
+        let (settings, meta, turn_fence, credential) = {
             let _gate = self
                 .product_runtime_gate
                 .lock()
@@ -3596,31 +3963,30 @@ impl DaemonAgent {
             match selected {
                 ProductProviderId::Claude => {
                     let state = self.claude_product_bundle_state();
-                    let (credential, meta) = match state {
-                        ProductCredentialState::PresentValid(bundle) => bundle,
+                    let (credential, meta, refresh_required) = match state {
+                        ProductCredentialState::PresentValid((credential, meta)) => {
+                            (credential, meta, false)
+                        }
                         ProductCredentialState::PresentNeedsRefresh((credential, meta)) => {
                             if !self.provider_activation_valid_for_meta(selected, &meta) {
                                 return Err(AgentStartTurnError::ProductNotReady);
                             }
-                            // The provider lifecycle lease and refresh serializer remain held, but
-                            // the short product snapshot locks must never span provider I/O.
-                            drop(_file_gate);
-                            drop(_gate);
-                            let refreshed = self
-                                .refresh_claude_product_credential_unlocked(
-                                    credential,
-                                    meta.clone(),
-                                )
-                                .map_err(|_| AgentStartTurnError::ProductNotReady)?;
-                            (refreshed, meta)
+                            (credential, meta, true)
                         }
                         ProductCredentialState::Absent => {
                             #[cfg(feature = "agent-subscription-experimental")]
-                            if let Some(provider) = self.try_experimental_only_provider(
-                                selected,
-                                &settings.model,
-                                system,
-                            ) {
+                            if let Some((provider, experimental_fence)) = self
+                                .capture_absent_product_refresh_fence(selected)
+                                .ok()
+                                .and_then(|fence| {
+                                    self.try_experimental_only_provider(
+                                        selected,
+                                        &settings.model,
+                                        system,
+                                    )
+                                    .map(|provider| (provider, fence))
+                                })
+                            {
                                 drop(_file_gate);
                                 drop(_refresh);
                                 drop(_gate);
@@ -3634,6 +4000,25 @@ impl DaemonAgent {
                                         account_lifecycle::ProviderOperationKind::Turn,
                                     )
                                     .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+                                let still_absent = {
+                                    let _gate = self
+                                        .product_runtime_gate
+                                        .lock()
+                                        .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+                                    let _file_gate =
+                                        acquire_product_runtime_file_lock(&self.oauth_dir)
+                                            .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+                                    self.product_refresh_fence_matches(
+                                        selected,
+                                        &experimental_fence,
+                                    ) && matches!(
+                                        self.claude_product_bundle_state(),
+                                        ProductCredentialState::Absent
+                                    )
+                                };
+                                if !still_absent {
+                                    return Err(AgentStartTurnError::ProductNotReady);
+                                }
                                 return Ok(PreparedTurnProvider {
                                     provider,
                                     provider_id: Some(selected),
@@ -3650,35 +4035,45 @@ impl DaemonAgent {
                     if !self.provider_activation_valid_for_meta(selected, &meta) {
                         return Err(AgentStartTurnError::ProductNotReady);
                     }
+                    let turn_fence = self
+                        .capture_bound_product_refresh_fence(selected)
+                        .map_err(|_| AgentStartTurnError::ProductNotReady)?;
                     (
                         settings,
-                        meta.generation,
-                        CredentialSnapshot::Claude(credential),
+                        meta,
+                        turn_fence.clone(),
+                        CredentialSnapshot::Claude {
+                            credential,
+                            refresh_fence: refresh_required.then_some(turn_fence),
+                        },
                     )
                 }
                 ProductProviderId::Codex => {
                     let state = self.codex_product_bundle_state();
-                    let (credential, meta) = match state {
-                        ProductCredentialState::PresentValid(bundle) => bundle,
+                    let (credential, meta, refresh_required) = match state {
+                        ProductCredentialState::PresentValid((credential, meta)) => {
+                            (credential, meta, false)
+                        }
                         ProductCredentialState::PresentNeedsRefresh((credential, meta)) => {
                             if !self.provider_activation_valid_for_meta(selected, &meta) {
                                 return Err(AgentStartTurnError::ProductNotReady);
                             }
-                            // Revalidation happens after the exclusive-to-shared handoff below.
-                            drop(_file_gate);
-                            drop(_gate);
-                            let refreshed = self
-                                .refresh_codex_product_credential_unlocked(credential, meta.clone())
-                                .map_err(|_| AgentStartTurnError::ProductNotReady)?;
-                            (refreshed, meta)
+                            (credential, meta, true)
                         }
                         ProductCredentialState::Absent => {
                             #[cfg(feature = "agent-subscription-experimental")]
-                            if let Some(provider) = self.try_experimental_only_provider(
-                                selected,
-                                &settings.model,
-                                system,
-                            ) {
+                            if let Some((provider, experimental_fence)) = self
+                                .capture_absent_product_refresh_fence(selected)
+                                .ok()
+                                .and_then(|fence| {
+                                    self.try_experimental_only_provider(
+                                        selected,
+                                        &settings.model,
+                                        system,
+                                    )
+                                    .map(|provider| (provider, fence))
+                                })
+                            {
                                 drop(_file_gate);
                                 drop(_refresh);
                                 drop(_gate);
@@ -3692,6 +4087,25 @@ impl DaemonAgent {
                                         account_lifecycle::ProviderOperationKind::Turn,
                                     )
                                     .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+                                let still_absent = {
+                                    let _gate = self
+                                        .product_runtime_gate
+                                        .lock()
+                                        .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+                                    let _file_gate =
+                                        acquire_product_runtime_file_lock(&self.oauth_dir)
+                                            .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+                                    self.product_refresh_fence_matches(
+                                        selected,
+                                        &experimental_fence,
+                                    ) && matches!(
+                                        self.codex_product_bundle_state(),
+                                        ProductCredentialState::Absent
+                                    )
+                                };
+                                if !still_absent {
+                                    return Err(AgentStartTurnError::ProductNotReady);
+                                }
                                 return Ok(PreparedTurnProvider {
                                     provider,
                                     provider_id: Some(selected),
@@ -3708,14 +4122,53 @@ impl DaemonAgent {
                     if !self.provider_activation_valid_for_meta(selected, &meta) {
                         return Err(AgentStartTurnError::ProductNotReady);
                     }
+                    let turn_fence = self
+                        .capture_bound_product_refresh_fence(selected)
+                        .map_err(|_| AgentStartTurnError::ProductNotReady)?;
                     (
                         settings,
-                        meta.generation,
-                        CredentialSnapshot::Codex(credential),
+                        meta,
+                        turn_fence.clone(),
+                        CredentialSnapshot::Codex {
+                            credential,
+                            refresh_fence: refresh_required.then_some(turn_fence),
+                        },
                     )
                 }
             }
         };
+        // Provider I/O runs with only the provider-exclusive lifecycle lease held. The refresh
+        // publisher reacquires runtime -> refresh -> file locks and validates this exact fence.
+        let credential = match credential {
+            CredentialSnapshot::Claude {
+                credential,
+                refresh_fence: Some(refresh_fence),
+            } => CredentialSnapshot::Claude {
+                credential: self
+                    .refresh_claude_product_credential_with_fence(
+                        credential,
+                        meta.clone(),
+                        refresh_fence,
+                    )
+                    .map_err(|_| AgentStartTurnError::ProductNotReady)?,
+                refresh_fence: None,
+            },
+            CredentialSnapshot::Codex {
+                credential,
+                refresh_fence: Some(refresh_fence),
+            } => CredentialSnapshot::Codex {
+                credential: self
+                    .refresh_codex_product_credential_with_fence(
+                        credential,
+                        meta.clone(),
+                        refresh_fence,
+                    )
+                    .map_err(|_| AgentStartTurnError::ProductNotReady)?,
+                refresh_fence: None,
+            },
+            credential => credential,
+        };
+        let generation = meta.generation.clone();
         drop(exclusive);
 
         let shared = self
@@ -3734,24 +4187,58 @@ impl DaemonAgent {
                 .map_err(|_| AgentStartTurnError::ProductNotReady)?;
             let _file_gate = acquire_product_runtime_file_lock(&self.oauth_dir)
                 .map_err(|_| AgentStartTurnError::ProductNotReady)?;
-            if self.lifecycle_provider_blocked(selected)
-                || self
-                    .agent_settings()
-                    .is_none_or(|current| current != settings)
-            {
+            if !self.product_refresh_fence_matches(selected, &turn_fence) {
                 return Err(AgentStartTurnError::ProductNotReady);
             }
-            let credential_id = match selected {
-                ProductProviderId::Claude => SUBSCRIPTION_CREDENTIAL_ID,
-                ProductProviderId::Codex => CODEX_CREDENTIAL_ID,
+            // Another process may win the exclusive lease between our release and this
+            // shared acquisition and refresh the same credential generation. Its etag and
+            // lifecycle fence remain unchanged, so reload the encrypted bundle while the
+            // shared lease now prevents another refresh. This construction path never
+            // performs network I/O or upgrades the shared lease.
+            let credential = match (selected, credential) {
+                (ProductProviderId::Claude, CredentialSnapshot::Claude { .. }) => {
+                    match self.claude_product_bundle_state() {
+                        ProductCredentialState::PresentValid((credential, current_meta))
+                            if current_meta == meta =>
+                        {
+                            CredentialSnapshot::Claude {
+                                credential,
+                                refresh_fence: None,
+                            }
+                        }
+                        ProductCredentialState::PresentValid(_)
+                        | ProductCredentialState::PresentNeedsRefresh(_)
+                        | ProductCredentialState::PresentInvalid
+                        | ProductCredentialState::Absent => {
+                            return Err(AgentStartTurnError::ProductNotReady);
+                        }
+                    }
+                }
+                (ProductProviderId::Codex, CredentialSnapshot::Codex { .. }) => {
+                    match self.codex_product_bundle_state() {
+                        ProductCredentialState::PresentValid((credential, current_meta))
+                            if current_meta == meta =>
+                        {
+                            CredentialSnapshot::Codex {
+                                credential,
+                                refresh_fence: None,
+                            }
+                        }
+                        ProductCredentialState::PresentValid(_)
+                        | ProductCredentialState::PresentNeedsRefresh(_)
+                        | ProductCredentialState::PresentInvalid
+                        | ProductCredentialState::Absent => {
+                            return Err(AgentStartTurnError::ProductNotReady);
+                        }
+                    }
+                }
+                _ => return Err(AgentStartTurnError::ProductNotReady),
             };
-            if load_product_bundle_meta(&self.oauth_dir, credential_id)
-                .is_none_or(|meta| meta.generation != generation)
-            {
+            if !self.provider_activation_valid_for_meta(selected, &meta) {
                 return Err(AgentStartTurnError::ProductNotReady);
             }
             match credential {
-                CredentialSnapshot::Claude(credential) => {
+                CredentialSnapshot::Claude { credential, .. } => {
                     isyncyou_agent::SubscriptionProvider::new(
                         credential.access_token,
                         &settings.model,
@@ -3763,7 +4250,7 @@ impl DaemonAgent {
                     })
                     .map_err(|_| AgentStartTurnError::ProductNotReady)?
                 }
-                CredentialSnapshot::Codex(credential) => {
+                CredentialSnapshot::Codex { credential, .. } => {
                     let config = isyncyou_agent::CodexConfig {
                         account_id: credential.account_id,
                         model: settings.model.clone(),
@@ -3918,7 +4405,7 @@ impl DaemonAgent {
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct StoredCredential {
     access_token: String,
     refresh_token: String,
@@ -5189,8 +5676,8 @@ fn reap_onboarding_journals_at(oauth_dir: &Path, now: u64) {
             continue;
         };
         // The index is written before its journal so a failed journal write can be rolled back. A
-        // process crash in that narrow window leaves a dangling index entry; remove it on startup
-        // and status reaping instead of projecting `journal_invalid` forever.
+        // process crash in that narrow window leaves a dangling index entry; remove it during
+        // startup or bounded maintenance instead of projecting `journal_invalid` forever.
         let expired_or_dangling: Vec<String> = index
             .entries
             .iter()
@@ -5428,7 +5915,7 @@ fn acquire_product_runtime_file_lock(oauth_dir: &Path) -> Result<isyncyou_agent:
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct CodexStoredCredential {
     access_token: String,
     refresh_token: String,
@@ -5456,6 +5943,19 @@ enum ProductCredentialState<T> {
     PresentValid(T),
     PresentNeedsRefresh(T),
     PresentInvalid,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[derive(Clone, PartialEq, Eq)]
+struct ProductRefreshFence {
+    selection: Option<AgentSettingsSnapshot>,
+    lifecycle_epoch: u64,
+    fence_epoch: u64,
+    lifecycle_key_version: u32,
+    credential_etag: Option<String>,
 }
 
 #[cfg(any(
@@ -7474,7 +7974,9 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                 .map_err(|_| "provider_busy".to_string())?;
             let _snapshot = acquire_product_runtime_file_lock(&self.oauth_dir)?;
             delete_provider_product_state_durable(&self.oauth_dir, provider)?;
-            self.last_usage.lock().unwrap().remove(&provider);
+            if let Ok(mut usage) = self.last_usage.lock() {
+                usage.remove(&provider);
+            }
             if mode == account_lifecycle::AccountLifecycleMode::Disconnect {
                 repository
                     .complete_disconnect(&operation.journal_record_id, (self.credential_now_ms)())
@@ -7551,7 +8053,9 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                     .map_err(|error| error.wire().to_string())?;
                 account_lifecycle_revoke_checkpoint_for_device_test();
                 delete_provider_product_state_durable(&self.oauth_dir, provider)?;
-                self.last_usage.lock().unwrap().remove(&provider);
+                if let Ok(mut usage) = self.last_usage.lock() {
+                    usage.remove(&provider);
+                }
                 if mode == account_lifecycle::AccountLifecycleMode::Disconnect {
                     repository
                         .complete_disconnect(
@@ -8045,7 +8549,9 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                     .map_err(|_| "provider_busy".to_string())?;
                 let _snapshot = acquire_product_runtime_file_lock(&self.oauth_dir)?;
                 delete_provider_product_state_durable(&self.oauth_dir, provider)?;
-                self.last_usage.lock().unwrap().remove(&provider);
+                if let Ok(mut usage) = self.last_usage.lock() {
+                    usage.remove(&provider);
+                }
                 if mode == account_lifecycle::AccountLifecycleMode::Disconnect {
                     repository
                         .complete_disconnect(&journal_id, (self.credential_now_ms)())
@@ -8107,7 +8613,9 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                             .map_err(|_| "provider_busy".to_string())?;
                         let _snapshot = acquire_product_runtime_file_lock(&self.oauth_dir)?;
                         delete_provider_product_state_durable(&self.oauth_dir, provider)?;
-                        self.last_usage.lock().unwrap().remove(&provider);
+                        if let Ok(mut usage) = self.last_usage.lock() {
+                            usage.remove(&provider);
+                        }
                         if mode == account_lifecycle::AccountLifecycleMode::Disconnect {
                             repository
                                 .complete_disconnect(&journal_id, (self.credential_now_ms)())
@@ -8223,67 +8731,200 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         }
     }
 
-    fn refresh_claude_product_credential_unlocked(
+    fn capture_product_refresh_fence(
         &self,
-        credential: StoredCredential,
-        mut meta: ProductBundleMeta,
-    ) -> Result<StoredCredential, ProviderCredentialResolutionError> {
-        let official_policy = oauth_policy_fingerprint(ProductProviderId::Claude);
-        if meta.provider != ProductProviderId::Claude
-            || meta.lifecycle != CredentialLifecycle::Active
-            || meta.policy_fingerprint != official_policy
-        {
-            meta.lifecycle = CredentialLifecycle::ReconnectRequired {
-                closed_code: "oauth_policy_changed".into(),
-            };
-            let _ = self.store_claude_bundle(&credential, &meta);
+        provider: ProductProviderId,
+    ) -> Result<ProductRefreshFence, ProviderCredentialResolutionError> {
+        let repository = account_lifecycle_repository(&self.oauth_dir)
+            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+        let context = repository
+            .load_existing()
+            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?
+            .ok_or(ProviderCredentialResolutionError::ProductReconnectRequired)?;
+        if context.authority.active_operations.contains_key(&provider) {
             return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
         }
-        if credential.refresh_token.trim().is_empty() {
-            meta.lifecycle = CredentialLifecycle::ReconnectRequired {
-                closed_code: "refresh_failed".into(),
-            };
-            let _ = self.store_claude_bundle(&credential, &meta);
+        Ok(ProductRefreshFence {
+            selection: self.agent_settings(),
+            lifecycle_epoch: context.authority.lifecycle_epoch,
+            fence_epoch: context.authority.fence_epoch,
+            lifecycle_key_version: context.authority.lifecycle_key_version,
+            credential_etag: context
+                .authority
+                .current_credential_etags
+                .get(&provider)
+                .cloned(),
+        })
+    }
+
+    fn capture_bound_product_refresh_fence(
+        &self,
+        provider: ProductProviderId,
+    ) -> Result<ProductRefreshFence, ProviderCredentialResolutionError> {
+        let fence = self.capture_product_refresh_fence(provider)?;
+        fence
+            .credential_etag
+            .as_ref()
+            .filter(|etag| !etag.is_empty())
+            .ok_or(ProviderCredentialResolutionError::ProductReconnectRequired)?;
+        Ok(fence)
+    }
+
+    #[cfg(feature = "agent-subscription-experimental")]
+    fn capture_absent_product_refresh_fence(
+        &self,
+        provider: ProductProviderId,
+    ) -> Result<ProductRefreshFence, ProviderCredentialResolutionError> {
+        let fence = self.capture_product_refresh_fence(provider)?;
+        if fence.credential_etag.is_some() {
             return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
         }
-        let config = self.load_oauth_config().map_err(|_| {
-            meta.lifecycle = CredentialLifecycle::ReconnectRequired {
-                closed_code: "oauth_policy_changed".into(),
-            };
-            let _ = self.store_claude_bundle(&credential, &meta);
-            ProviderCredentialResolutionError::ProductReconnectRequired
-        })?;
-        let http = match isyncyou_agent::http::HttpTransport::shared() {
-            Ok(http) => http,
-            Err(_) => {
-                meta.lifecycle = CredentialLifecycle::ReconnectRequired {
-                    closed_code: "refresh_failed".into(),
-                };
-                let _ = self.store_claude_bundle(&credential, &meta);
-                return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
-            }
+        Ok(fence)
+    }
+
+    fn product_refresh_fence_matches(
+        &self,
+        provider: ProductProviderId,
+        expected: &ProductRefreshFence,
+    ) -> bool {
+        let Ok(repository) = account_lifecycle_repository(&self.oauth_dir) else {
+            return false;
         };
-        let outcome = isyncyou_agent::oauth::refresh(&http, &config, &credential.refresh_token)
-            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)
-            .and_then(|refreshed| {
-                complete_claude_refresh(credential.clone(), refreshed, (self.credential_now_ms)())
-            });
+        let Ok(Some(context)) = repository.load_existing() else {
+            return false;
+        };
+        // Epochs are installation-wide while provider leases are intentionally provider-scoped.
+        // A monotonic advance caused solely by the other provider is safe when this provider's
+        // generation etag, key version, selection, and active-operation slot are unchanged.
+        !context.authority.active_operations.contains_key(&provider)
+            && self.agent_settings() == expected.selection
+            && context.authority.lifecycle_epoch >= expected.lifecycle_epoch
+            && context.authority.fence_epoch >= expected.fence_epoch
+            && context.authority.lifecycle_key_version == expected.lifecycle_key_version
+            && context.authority.current_credential_etags.get(&provider)
+                == expected.credential_etag.as_ref()
+    }
+
+    fn claude_bundle_matches(
+        &self,
+        expected_credential: &StoredCredential,
+        expected_meta: &ProductBundleMeta,
+    ) -> bool {
+        let Ok(Some(secret)) =
+            load_agent_credential_blob(&self.oauth_dir, SUBSCRIPTION_CREDENTIAL_ID)
+        else {
+            return false;
+        };
+        StoredCredential::from_json(secret.expose()).as_ref() == Some(expected_credential)
+            && ProductBundleMeta::from_blob(secret.expose(), ProductProviderId::Claude).as_ref()
+                == Some(expected_meta)
+    }
+
+    fn publish_claude_refresh_outcome(
+        &self,
+        original_credential: &StoredCredential,
+        original_meta: &ProductBundleMeta,
+        fence: &ProductRefreshFence,
+        outcome: Result<StoredCredential, ProviderCredentialResolutionError>,
+        failure_code: &'static str,
+    ) -> Result<StoredCredential, ProviderCredentialResolutionError> {
+        let _runtime = self
+            .product_runtime_gate
+            .lock()
+            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+        let _refresh = self
+            .credential_refresh_gate
+            .lock()
+            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+        let _snapshot = acquire_product_runtime_file_lock(&self.oauth_dir)
+            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+        if !self.product_refresh_fence_matches(ProductProviderId::Claude, fence)
+            || !self.claude_bundle_matches(original_credential, original_meta)
+        {
+            return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
+        }
         match outcome {
             Ok(refreshed_credential) => {
-                self.store_claude_bundle(&refreshed_credential, &meta)
+                self.store_claude_bundle(&refreshed_credential, original_meta)
                     .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
                 Ok(refreshed_credential)
             }
-            Err(e) => {
-                // #639: persist ReconnectRequired (fail-closed) so the next status reports reconnect
-                // instead of re-attempting a refresh loop on the same expired credential.
-                meta.lifecycle = CredentialLifecycle::ReconnectRequired {
-                    closed_code: "refresh_failed".into(),
+            Err(error) => {
+                let mut reconnect_meta = original_meta.clone();
+                reconnect_meta.lifecycle = CredentialLifecycle::ReconnectRequired {
+                    closed_code: failure_code.into(),
                 };
-                let _ = self.store_claude_bundle(&credential, &meta);
-                Err(e)
+                self.store_claude_bundle(original_credential, &reconnect_meta)
+                    .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+                Err(error)
             }
         }
+    }
+
+    fn refresh_claude_product_credential_with_fence(
+        &self,
+        credential: StoredCredential,
+        meta: ProductBundleMeta,
+        fence: ProductRefreshFence,
+    ) -> Result<StoredCredential, ProviderCredentialResolutionError> {
+        let official_policy = oauth_policy_fingerprint(ProductProviderId::Claude);
+        let (outcome, failure_code) = if meta.provider != ProductProviderId::Claude
+            || meta.lifecycle != CredentialLifecycle::Active
+            || meta.policy_fingerprint != official_policy
+        {
+            (
+                Err(ProviderCredentialResolutionError::ProductReconnectRequired),
+                "oauth_policy_changed",
+            )
+        } else if credential.refresh_token.trim().is_empty() {
+            (
+                Err(ProviderCredentialResolutionError::ProductReconnectRequired),
+                "refresh_failed",
+            )
+        } else if let Ok(config) = self.load_oauth_config() {
+            let outcome = isyncyou_agent::http::HttpTransport::shared()
+                .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)
+                .and_then(|http| {
+                    isyncyou_agent::oauth::refresh(&http, &config, &credential.refresh_token)
+                        .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)
+                })
+                .and_then(|refreshed| {
+                    complete_claude_refresh(
+                        credential.clone(),
+                        refreshed,
+                        (self.credential_now_ms)(),
+                    )
+                });
+            (outcome, "refresh_failed")
+        } else {
+            (
+                Err(ProviderCredentialResolutionError::ProductReconnectRequired),
+                "oauth_policy_changed",
+            )
+        };
+        self.publish_claude_refresh_outcome(&credential, &meta, &fence, outcome, failure_code)
+    }
+
+    #[cfg(test)]
+    fn refresh_claude_product_credential_unlocked(
+        &self,
+        credential: StoredCredential,
+        meta: ProductBundleMeta,
+    ) -> Result<StoredCredential, ProviderCredentialResolutionError> {
+        let fence = {
+            let _runtime = self
+                .product_runtime_gate
+                .lock()
+                .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+            let _refresh = self
+                .credential_refresh_gate
+                .lock()
+                .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+            let _snapshot = acquire_product_runtime_file_lock(&self.oauth_dir)
+                .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+            self.capture_bound_product_refresh_fence(ProductProviderId::Claude)?
+        };
+        self.refresh_claude_product_credential_with_fence(credential, meta, fence)
     }
 
     #[cfg(any(test, feature = "agent-subscription-experimental"))]
@@ -8315,10 +8956,6 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     fn resolve_claude_credential(
         &self,
     ) -> Result<ResolvedProviderCredential, ProviderCredentialResolutionError> {
-        let _refresh = self
-            .credential_refresh_gate
-            .lock()
-            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
         match self.claude_product_bundle_state() {
             ProductCredentialState::PresentValid((credential, _meta)) => {
                 Ok(ResolvedProviderCredential::Claude {
@@ -8429,43 +9066,89 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
         }
     }
 
-    fn refresh_codex_product_credential_unlocked(
+    fn codex_bundle_matches(
+        &self,
+        expected_credential: &CodexStoredCredential,
+        expected_meta: &ProductBundleMeta,
+    ) -> bool {
+        let Ok(Some(secret)) = load_agent_credential_blob(&self.oauth_dir, CODEX_CREDENTIAL_ID)
+        else {
+            return false;
+        };
+        CodexStoredCredential::from_json(secret.expose()).as_ref() == Some(expected_credential)
+            && ProductBundleMeta::from_blob(secret.expose(), ProductProviderId::Codex).as_ref()
+                == Some(expected_meta)
+    }
+
+    fn publish_codex_refresh_outcome(
+        &self,
+        original_credential: &CodexStoredCredential,
+        original_meta: &ProductBundleMeta,
+        fence: &ProductRefreshFence,
+        outcome: Result<CodexStoredCredential, ProviderCredentialResolutionError>,
+        failure_code: &'static str,
+    ) -> Result<CodexStoredCredential, ProviderCredentialResolutionError> {
+        let _runtime = self
+            .product_runtime_gate
+            .lock()
+            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+        let _refresh = self
+            .credential_refresh_gate
+            .lock()
+            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+        let _snapshot = acquire_product_runtime_file_lock(&self.oauth_dir)
+            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+        if !self.product_refresh_fence_matches(ProductProviderId::Codex, fence)
+            || !self.codex_bundle_matches(original_credential, original_meta)
+        {
+            return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
+        }
+        match outcome {
+            Ok(refreshed_credential) => {
+                store_codex_bundle(&self.oauth_dir, &refreshed_credential, original_meta)
+                    .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+                Ok(refreshed_credential)
+            }
+            Err(error) => {
+                let mut reconnect_meta = original_meta.clone();
+                reconnect_meta.lifecycle = CredentialLifecycle::ReconnectRequired {
+                    closed_code: failure_code.into(),
+                };
+                store_codex_bundle(&self.oauth_dir, original_credential, &reconnect_meta)
+                    .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn refresh_codex_product_credential_with_fence(
         &self,
         credential: CodexStoredCredential,
-        mut meta: ProductBundleMeta,
+        meta: ProductBundleMeta,
+        fence: ProductRefreshFence,
     ) -> Result<CodexStoredCredential, ProviderCredentialResolutionError> {
         let official_policy = oauth_policy_fingerprint(ProductProviderId::Codex);
-        if meta.provider != ProductProviderId::Codex
+        let (outcome, failure_code) = if meta.provider != ProductProviderId::Codex
             || meta.lifecycle != CredentialLifecycle::Active
             || meta.policy_fingerprint != official_policy
         {
-            meta.lifecycle = CredentialLifecycle::ReconnectRequired {
-                closed_code: "oauth_policy_changed".into(),
-            };
-            let _ = store_codex_bundle(&self.oauth_dir, &credential, &meta);
-            return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
-        }
-        if credential.refresh_token.trim().is_empty() {
-            meta.lifecycle = CredentialLifecycle::ReconnectRequired {
-                closed_code: "refresh_failed".into(),
-            };
-            let _ = store_codex_bundle(&self.oauth_dir, &credential, &meta);
-            return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
-        }
-        let config = isyncyou_agent::oauth::CodexOAuthConfig::default();
-        let http = match isyncyou_agent::http::HttpTransport::shared() {
-            Ok(http) => http,
-            Err(_) => {
-                meta.lifecycle = CredentialLifecycle::ReconnectRequired {
-                    closed_code: "refresh_failed".into(),
-                };
-                let _ = store_codex_bundle(&self.oauth_dir, &credential, &meta);
-                return Err(ProviderCredentialResolutionError::ProductReconnectRequired);
-            }
-        };
-        let outcome =
-            isyncyou_agent::oauth::codex_refresh(&http, &config, &credential.refresh_token)
+            (
+                Err(ProviderCredentialResolutionError::ProductReconnectRequired),
+                "oauth_policy_changed",
+            )
+        } else if credential.refresh_token.trim().is_empty() {
+            (
+                Err(ProviderCredentialResolutionError::ProductReconnectRequired),
+                "refresh_failed",
+            )
+        } else {
+            let config = isyncyou_agent::oauth::CodexOAuthConfig::default();
+            let outcome = isyncyou_agent::http::HttpTransport::shared()
                 .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)
+                .and_then(|http| {
+                    isyncyou_agent::oauth::codex_refresh(&http, &config, &credential.refresh_token)
+                        .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)
+                })
                 .and_then(|refreshed| {
                     complete_codex_refresh(
                         credential.clone(),
@@ -8473,21 +9156,31 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                         (self.credential_now_ms)(),
                     )
                 });
-        match outcome {
-            Ok(refreshed_credential) => {
-                store_codex_bundle(&self.oauth_dir, &refreshed_credential, &meta)
-                    .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
-                Ok(refreshed_credential)
-            }
-            Err(e) => {
-                // #639: persist ReconnectRequired (fail-closed) — no refresh loop.
-                meta.lifecycle = CredentialLifecycle::ReconnectRequired {
-                    closed_code: "refresh_failed".into(),
-                };
-                let _ = store_codex_bundle(&self.oauth_dir, &credential, &meta);
-                Err(e)
-            }
-        }
+            (outcome, "refresh_failed")
+        };
+        self.publish_codex_refresh_outcome(&credential, &meta, &fence, outcome, failure_code)
+    }
+
+    #[cfg(test)]
+    fn refresh_codex_product_credential_unlocked(
+        &self,
+        credential: CodexStoredCredential,
+        meta: ProductBundleMeta,
+    ) -> Result<CodexStoredCredential, ProviderCredentialResolutionError> {
+        let fence = {
+            let _runtime = self
+                .product_runtime_gate
+                .lock()
+                .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+            let _refresh = self
+                .credential_refresh_gate
+                .lock()
+                .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+            let _snapshot = acquire_product_runtime_file_lock(&self.oauth_dir)
+                .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
+            self.capture_bound_product_refresh_fence(ProductProviderId::Codex)?
+        };
+        self.refresh_codex_product_credential_with_fence(credential, meta, fence)
     }
 
     #[cfg(any(test, feature = "agent-subscription-experimental"))]
@@ -8520,10 +9213,6 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     fn resolve_codex_credential(
         &self,
     ) -> Result<ResolvedProviderCredential, ProviderCredentialResolutionError> {
-        let _refresh = self
-            .credential_refresh_gate
-            .lock()
-            .map_err(|_| ProviderCredentialResolutionError::ProductReconnectRequired)?;
         match self.codex_product_bundle_state() {
             ProductCredentialState::PresentValid((credential, _meta)) => {
                 Ok(ResolvedProviderCredential::Codex {
@@ -8581,6 +9270,16 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
     /// local CLI source, and the encrypted store is updated only by the existing atomic writer
     /// after a complete finite credential response has been validated.
     fn refresh_product_credential(&self, provider: &str) -> Result<&'static str, String> {
+        enum RefreshPlan {
+            Connected,
+            Claude(StoredCredential, ProductBundleMeta, ProductRefreshFence),
+            Codex(
+                CodexStoredCredential,
+                ProductBundleMeta,
+                ProductRefreshFence,
+            ),
+        }
+
         let selected =
             ProductProviderId::parse(provider).ok_or_else(|| "reconnect_required".to_string())?;
         let operation_id =
@@ -8595,59 +9294,63 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
             )
             .map_err(|_| "provider_busy".to_string())?;
         // The provider lifecycle lease serializes this refresh against turns and account lifecycle
-        // operations. The short runtime/file locks protect only snapshots and are released before
-        // provider I/O; the refresh mutex coalesces concurrent refresh attempts.
-        let _gate = self
-            .product_runtime_gate
-            .lock()
-            .map_err(|_| "reconnect_required".to_string())?;
-        let _file_gate = acquire_product_runtime_file_lock(&self.oauth_dir)
-            .map_err(|_| "reconnect_required".to_string())?;
-        let _refresh = self
-            .credential_refresh_gate
-            .lock()
-            .map_err(|_| "reconnect_required".to_string())?;
-        match Some(selected) {
-            Some(ProductProviderId::Claude) => match self.claude_product_bundle_state() {
-                ProductCredentialState::PresentValid(_) => Ok("connected"),
-                ProductCredentialState::PresentNeedsRefresh((credential, meta)) => {
-                    drop(_file_gate);
-                    drop(_gate);
-                    self.refresh_claude_product_credential_unlocked(credential, meta)
-                        .map(|_| "connected")
-                        .map_err(|_| "reconnect_required".into())
-                }
-                ProductCredentialState::Absent | ProductCredentialState::PresentInvalid => {
-                    Err("reconnect_required".into())
-                }
-            },
-            Some(ProductProviderId::Codex) => {
-                #[cfg(feature = "agent-network-device-test-hooks")]
-                let force_refresh = take_codex_refresh_for_device_test();
-                #[cfg(not(feature = "agent-network-device-test-hooks"))]
-                let force_refresh = false;
-                match self.codex_product_bundle_state() {
-                    ProductCredentialState::PresentValid((credential, meta)) if force_refresh => {
-                        drop(_file_gate);
-                        drop(_gate);
-                        self.refresh_codex_product_credential_unlocked(credential, meta)
-                            .map(|_| "connected")
-                            .map_err(|_| "reconnect_required".into())
-                    }
-                    ProductCredentialState::PresentValid(_) => Ok("connected"),
+        // operations. Short locks are ordered runtime -> refresh -> file and protect snapshots only.
+        let plan = {
+            let _runtime = self
+                .product_runtime_gate
+                .lock()
+                .map_err(|_| "reconnect_required".to_string())?;
+            let _refresh = self
+                .credential_refresh_gate
+                .lock()
+                .map_err(|_| "reconnect_required".to_string())?;
+            let _snapshot = acquire_product_runtime_file_lock(&self.oauth_dir)
+                .map_err(|_| "reconnect_required".to_string())?;
+            let fence = self
+                .capture_bound_product_refresh_fence(selected)
+                .map_err(|_| "reconnect_required".to_string())?;
+            match selected {
+                ProductProviderId::Claude => match self.claude_product_bundle_state() {
+                    ProductCredentialState::PresentValid(_) => RefreshPlan::Connected,
                     ProductCredentialState::PresentNeedsRefresh((credential, meta)) => {
-                        drop(_file_gate);
-                        drop(_gate);
-                        self.refresh_codex_product_credential_unlocked(credential, meta)
-                            .map(|_| "connected")
-                            .map_err(|_| "reconnect_required".into())
+                        RefreshPlan::Claude(credential, meta, fence)
                     }
                     ProductCredentialState::Absent | ProductCredentialState::PresentInvalid => {
-                        Err("reconnect_required".into())
+                        return Err("reconnect_required".into());
+                    }
+                },
+                ProductProviderId::Codex => {
+                    #[cfg(feature = "agent-network-device-test-hooks")]
+                    let force_refresh = take_codex_refresh_for_device_test();
+                    #[cfg(not(feature = "agent-network-device-test-hooks"))]
+                    let force_refresh = false;
+                    match self.codex_product_bundle_state() {
+                        ProductCredentialState::PresentValid((credential, meta))
+                            if force_refresh =>
+                        {
+                            RefreshPlan::Codex(credential, meta, fence)
+                        }
+                        ProductCredentialState::PresentValid(_) => RefreshPlan::Connected,
+                        ProductCredentialState::PresentNeedsRefresh((credential, meta)) => {
+                            RefreshPlan::Codex(credential, meta, fence)
+                        }
+                        ProductCredentialState::Absent | ProductCredentialState::PresentInvalid => {
+                            return Err("reconnect_required".into());
+                        }
                     }
                 }
             }
-            None => Err("unknown provider".into()),
+        };
+        match plan {
+            RefreshPlan::Connected => Ok("connected"),
+            RefreshPlan::Claude(credential, meta, fence) => self
+                .refresh_claude_product_credential_with_fence(credential, meta, fence)
+                .map(|_| "connected")
+                .map_err(|_| "reconnect_required".into()),
+            RefreshPlan::Codex(credential, meta, fence) => self
+                .refresh_codex_product_credential_with_fence(credential, meta, fence)
+                .map(|_| "connected")
+                .map_err(|_| "reconnect_required".into()),
         }
     }
 
@@ -8921,7 +9624,7 @@ impl DaemonAgent {
             sequence,
             turn_state,
             cancellation,
-            admission,
+            admission: Some(admission),
             durable_admission,
         })
     }
@@ -8954,7 +9657,7 @@ impl DaemonAgent {
             sequence: n,
             turn_state,
             cancellation,
-            admission,
+            mut admission,
             durable_admission,
         } = reserved;
         let hub = self.hub.clone();
@@ -8985,10 +9688,8 @@ impl DaemonAgent {
         let turn_thread = std::thread::Builder::new()
             .name(format!("agent-turn-{n}"))
             .spawn(move || {
-                let _admission = admission;
                 let mut durable_admission = durable_admission;
                 let mut terminal_persisted = false;
-                let mut keep_turn_authority = false;
                 #[cfg(any(
                     feature = "agent-oauth-providers",
                     feature = "agent-subscription-experimental"
@@ -9037,15 +9738,6 @@ impl DaemonAgent {
                     }
                 });
                 let usage = provider.last_usage();
-                #[cfg(any(
-                    feature = "agent-oauth-providers",
-                    feature = "agent-subscription-experimental"
-                ))]
-                if let Some(usage) = usage.clone() {
-                    if let Some(provider_id) = provider_id {
-                        last_usage.lock().unwrap().insert(provider_id, usage);
-                    }
-                }
                 let outcome = if matches!(
                     &outcome,
                     Ok(isyncyou_agent::TurnOutcome::PendingConfirmation { .. })
@@ -9069,7 +9761,7 @@ impl DaemonAgent {
                                 &hot_session_history,
                                 runtime.finish_final(
                                     text,
-                                    usage.map(|usage| isyncyou_agent::SanitizedUsage {
+                                    usage.clone().map(|usage| isyncyou_agent::SanitizedUsage {
                                         input_tokens: usage.input_tokens,
                                         output_tokens: usage.output_tokens,
                                     }),
@@ -9077,6 +9769,17 @@ impl DaemonAgent {
                                 ),
                             )
                         });
+                        #[cfg(any(
+                            feature = "agent-oauth-providers",
+                            feature = "agent-subscription-experimental"
+                        ))]
+                        if persisted.is_ok() {
+                            if let (Some(provider_id), Some(usage)) = (provider_id, usage.clone()) {
+                                if let Ok(mut last_usage) = last_usage.lock() {
+                                    last_usage.insert(provider_id, usage);
+                                }
+                            }
+                        }
                         terminal_persisted = persisted.is_ok();
                         cache_persisted_request_phase(
                             &hot_request_statuses,
@@ -9085,6 +9788,10 @@ impl DaemonAgent {
                             isyncyou_agent::RequestPhase::Committed,
                             None,
                         );
+                        if terminal_persisted {
+                            let _ = durable_admission.complete();
+                            drop(admission.take());
+                        }
                         for event in terminal_events_after_persistence(
                             persisted,
                             isyncyou_agent::DoneReason::Complete,
@@ -9117,17 +9824,21 @@ impl DaemonAgent {
                                         isyncyou_agent::DoneReason::Error,
                                     )
                                 };
-                                let persisted = product_turn.take().map_or(Ok(()), |runtime| {
-                                    cache_product_session_context(
-                                        &hot_session_history,
-                                        runtime.finish_terminal(
-                                            terminal_status,
-                                            error_code.clone(),
-                                            phase,
-                                            unix_now_ms(),
-                                        ),
-                                    )
-                                });
+                                let persisted = persist_product_runtime_if_expected(
+                                    product_turn.take(),
+                                    hot_request_binding.is_some(),
+                                    |runtime| {
+                                        cache_product_session_context(
+                                            &hot_session_history,
+                                            runtime.finish_terminal(
+                                                terminal_status,
+                                                error_code.clone(),
+                                                phase,
+                                                unix_now_ms(),
+                                            ),
+                                        )
+                                    },
+                                );
                                 let persisted_ok = persisted.is_ok();
                                 cache_persisted_request_phase(
                                     &hot_request_statuses,
@@ -9136,6 +9847,10 @@ impl DaemonAgent {
                                     phase,
                                     error_code.as_deref(),
                                 );
+                                if persisted_ok {
+                                    let _ = durable_admission.complete();
+                                    drop(admission.take());
+                                }
                                 let events = if cancelled {
                                     terminal_events_after_persistence(persisted, done_reason)
                                 } else {
@@ -9150,9 +9865,6 @@ impl DaemonAgent {
                                     } else {
                                         hub.emit(&tid, event)
                                     };
-                                }
-                                if persisted_ok {
-                                    let _ = durable_admission.complete();
                                 }
                                 hub.close(&tid);
                                 turns.remove(&tid);
@@ -9207,7 +9919,19 @@ impl DaemonAgent {
                         });
                         match transition {
                             Ok(PendingTransition::Committed((pending_action, token))) => {
-                                keep_turn_authority = true;
+                                let _ = durable_admission.complete();
+                                drop(admission.take());
+                                #[cfg(any(
+                                    feature = "agent-oauth-providers",
+                                    feature = "agent-subscription-experimental"
+                                ))]
+                                if let (Some(provider_id), Some(usage)) =
+                                    (provider_id, usage.clone())
+                                {
+                                    if let Ok(mut last_usage) = last_usage.lock() {
+                                        last_usage.insert(provider_id, usage);
+                                    }
+                                }
                                 let _ = hub.emit(
                                     &tid,
                                     isyncyou_agent::StreamEvent::ConfirmationRequired {
@@ -9247,6 +9971,10 @@ impl DaemonAgent {
                                     isyncyou_agent::RequestPhase::Cancelled,
                                     None,
                                 );
+                                if terminal_persisted {
+                                    let _ = durable_admission.complete();
+                                    drop(admission.take());
+                                }
                                 for event in terminal_events_after_persistence(
                                     persisted,
                                     isyncyou_agent::DoneReason::Cancelled,
@@ -9276,17 +10004,21 @@ impl DaemonAgent {
                                         isyncyou_agent::DoneReason::Error,
                                     )
                                 };
-                                let persisted = product_turn.take().map_or(Ok(()), |runtime| {
-                                    cache_product_session_context(
-                                        &hot_session_history,
-                                        runtime.finish_terminal(
-                                            terminal_status,
-                                            error_code.clone(),
-                                            phase,
-                                            unix_now_ms(),
-                                        ),
-                                    )
-                                });
+                                let persisted = persist_product_runtime_if_expected(
+                                    product_turn.take(),
+                                    hot_request_binding.is_some(),
+                                    |runtime| {
+                                        cache_product_session_context(
+                                            &hot_session_history,
+                                            runtime.finish_terminal(
+                                                terminal_status,
+                                                error_code.clone(),
+                                                phase,
+                                                unix_now_ms(),
+                                            ),
+                                        )
+                                    },
+                                );
                                 terminal_persisted = persisted.is_ok();
                                 cache_persisted_request_phase(
                                     &hot_request_statuses,
@@ -9295,6 +10027,10 @@ impl DaemonAgent {
                                     phase,
                                     error_code.as_deref(),
                                 );
+                                if terminal_persisted {
+                                    let _ = durable_admission.complete();
+                                    drop(admission.take());
+                                }
                                 let events = if cancelled {
                                     terminal_events_after_persistence(persisted, done_reason)
                                 } else {
@@ -9330,6 +10066,10 @@ impl DaemonAgent {
                             isyncyou_agent::RequestPhase::Cancelled,
                             None,
                         );
+                        if terminal_persisted {
+                            let _ = durable_admission.complete();
+                            drop(admission.take());
+                        }
                         if persisted.is_ok() {
                             let _ = hub.emit_terminal(
                                 &tid,
@@ -9387,12 +10127,17 @@ impl DaemonAgent {
                                 ),
                             )
                         });
-                        if persisted.is_ok() && provider_outcome_ambiguous {
-                            if let Err(error) =
-                                durable_admission.outcome_unknown(&tid, &diagnostic_code)
-                            {
-                                persisted = Err(error);
+                        if persisted.is_ok() {
+                            if provider_outcome_ambiguous {
+                                if let Err(error) =
+                                    durable_admission.outcome_unknown(&tid, &diagnostic_code)
+                                {
+                                    persisted = Err(error);
+                                }
+                            } else {
+                                let _ = durable_admission.complete();
                             }
+                            drop(admission.take());
                         }
                         terminal_persisted = persisted.is_ok();
                         cache_persisted_request_phase(
@@ -9416,14 +10161,14 @@ impl DaemonAgent {
                 }
                 if terminal_persisted {
                     let _ = durable_admission.complete();
+                    drop(admission.take());
                 }
+                drop(admission.take());
                 hub.close(&tid);
                 if let Some(session_id) = history_session_id.as_deref() {
                     hot_session_history.invalidate(session_id);
                 }
-                if !keep_turn_authority {
-                    turns.remove(&tid);
-                }
+                turns.remove(&tid);
             });
         if turn_thread.is_err() {
             let product_turn = product_turn
@@ -9457,6 +10202,7 @@ impl DaemonAgent {
         &self,
         reserved_turn_id: &str,
         replay: product_session::ProductTurnReplay,
+        pending_owner: Option<&isyncyou_agent::PendingOwnerBinding>,
     ) {
         let mut events = Vec::new();
         match replay.phase {
@@ -9489,12 +10235,37 @@ impl DaemonAgent {
                 ));
             }
             isyncyou_agent::RequestPhase::PendingConfirmation => {
-                events.push(isyncyou_agent::StreamEvent::Error(
-                    "confirmation_unavailable".into(),
-                ));
-                events.push(isyncyou_agent::StreamEvent::done(
-                    isyncyou_agent::DoneReason::Error,
-                ));
+                let pending = pending_owner
+                    .ok_or(isyncyou_agent::ConfirmError::Unavailable)
+                    .and_then(|owner| {
+                        self.pending
+                            .reissue_for_owner(owner, unix_now_ms())
+                            .and_then(|value| value.ok_or(isyncyou_agent::ConfirmError::NotFound))
+                    });
+                match pending {
+                    Ok((pending_action, token)) => {
+                        events.push(isyncyou_agent::StreamEvent::ConfirmationRequired {
+                            id: pending_action.id,
+                            action: Box::new(pending_action.action),
+                            preview: pending_action.preview,
+                            action_hash: pending_action.action_hash,
+                            risk: pending_action.risk,
+                            expires_at_ms: pending_action.expires_at_ms,
+                            token,
+                        });
+                        events.push(isyncyou_agent::StreamEvent::done(
+                            isyncyou_agent::DoneReason::PendingConfirmation,
+                        ));
+                    }
+                    Err(_) => {
+                        events.push(isyncyou_agent::StreamEvent::Error(
+                            "confirmation_unavailable".into(),
+                        ));
+                        events.push(isyncyou_agent::StreamEvent::done(
+                            isyncyou_agent::DoneReason::Error,
+                        ));
+                    }
+                }
             }
             isyncyou_agent::RequestPhase::Accepted
             | isyncyou_agent::RequestPhase::ProviderStepCompleted => {
@@ -9559,6 +10330,38 @@ impl DaemonAgent {
             started = started.saturating_add(1);
         }
         Ok(started)
+    }
+
+    fn finish_pending_confirmation_state(
+        &self,
+        pending_id: &str,
+        code: &str,
+        completed_at_ms: u64,
+    ) -> Result<(), String> {
+        if !self.pending.is_persistent() {
+            return Ok(());
+        }
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            let store = self
+                .control_store
+                .as_ref()
+                .ok_or_else(|| "confirmation_outcome_unknown".to_string())?;
+            store.finish_pending_confirmation(pending_id, code, completed_at_ms)?;
+            reconcile_pending_confirm_projections(&self.cfg, &self.oauth_dir, store, 1);
+            Ok(())
+        }
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
+        {
+            let _ = (pending_id, code, completed_at_ms);
+            Err("confirmation_outcome_unknown".into())
+        }
     }
 }
 
@@ -10056,6 +10859,11 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             if let Some(control_store) = self.control_store.as_ref() {
                 let maintenance_now_ms = unix_now_ms();
                 let _ = control_store.reap_expired(maintenance_now_ms, 256);
+                cleanup_pairing_claim_descriptors_once(
+                    &self.cfg,
+                    control_store,
+                    maintenance_now_ms,
+                );
                 if let Ok(targets) = registry.maintenance_targets() {
                     cleanup_pairing_descriptors_once(
                         &self.cfg,
@@ -10147,7 +10955,27 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             feature = "agent-subscription-experimental"
         ))]
         {
-            let account = self.product_session_account()?.to_owned();
+            let control_store = self
+                .control_store
+                .as_ref()
+                .ok_or_else(|| "pairing_unavailable".to_string())?;
+            let terminal_state = control_store
+                .pairing_claim_state(&request.operation_id, Some(&request.request_id))?;
+            if let Some(state @ ("installed" | "consumed")) = terminal_state.as_deref() {
+                let session_id = control_store
+                    .pairing_claim_result_session(&request.operation_id, &request.request_id)?
+                    .ok_or_else(|| "pairing_unavailable".to_string())?;
+                return Ok(serde_json::json!({
+                    "operation_id": request.operation_id,
+                    "state": if state == "consumed" { "consumed" } else { "claimed" },
+                    "session_id": session_id,
+                }));
+            }
+            cleanup_pairing_claim_descriptors_once(&self.cfg, control_store, unix_now_ms());
+            let account = match control_store.pairing_claim_local_account(&request.operation_id)? {
+                Some(account) => account,
+                None => self.product_session_account()?.to_owned(),
+            };
             let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, &account)
                 .map_err(|_| "pairing_transport_unavailable".to_string())?;
             let repository = account_lifecycle_repository(&self.oauth_dir)?;
@@ -10155,23 +10983,6 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 .load_existing()
                 .map_err(|_| "pairing_identity_unavailable".to_string())?
                 .ok_or_else(|| "pairing_identity_unavailable".to_string())?;
-            let control_store = self
-                .control_store
-                .as_ref()
-                .ok_or_else(|| "pairing_unavailable".to_string())?;
-            if control_store
-                .pairing_claim_state(&request.operation_id, Some(&request.request_id))?
-                == Some("consumed".into())
-            {
-                let session_id = control_store
-                    .pairing_claim_result_session(&request.operation_id, &request.request_id)?
-                    .ok_or_else(|| "pairing_unavailable".to_string())?;
-                return Ok(serde_json::json!({
-                    "operation_id": request.operation_id,
-                    "state": "consumed",
-                    "session_id": session_id,
-                }));
-            }
             let transport = isyncyou_agent::OneDrivePairingTransportV2::new(token);
             let existing = control_store.load_pairing_claim_for_request(
                 &request.operation_id,
@@ -10189,6 +11000,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     control_store.begin_pairing_claim(
                         &request.request_id,
                         &request.operation_id,
+                        &account,
                         &current.descriptor,
                         installation.principal(),
                         unix_now_ms(),
@@ -10247,14 +11059,6 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             feature = "agent-subscription-experimental"
         ))]
         {
-            let account = self.product_session_account()?.to_owned();
-            let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, &account)
-                .map_err(|_| "pairing_transport_unavailable".to_string())?;
-            let repository = account_lifecycle_repository(&self.oauth_dir)?;
-            let installation = repository
-                .load_existing()
-                .map_err(|_| "pairing_identity_unavailable".to_string())?
-                .ok_or_else(|| "pairing_identity_unavailable".to_string())?;
             let control_store = self
                 .control_store
                 .as_ref()
@@ -10262,16 +11066,21 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             if control_store.pairing_claim_state(&request.operation_id, None)?
                 == Some("consumed".into())
             {
-                control_store.complete_pairing_claim(
-                    &request.operation_id,
-                    &request.request_id,
-                    unix_now_ms(),
-                )?;
                 return Ok(serde_json::json!({
                     "operation_id": request.operation_id,
                     "state": "consumed",
                 }));
             }
+            let account = control_store
+                .pairing_claim_local_account(&request.operation_id)?
+                .ok_or_else(|| "pairing_not_found".to_string())?;
+            let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, &account)
+                .map_err(|_| "pairing_transport_unavailable".to_string())?;
+            let repository = account_lifecycle_repository(&self.oauth_dir)?;
+            let installation = repository
+                .load_existing()
+                .map_err(|_| "pairing_identity_unavailable".to_string())?
+                .ok_or_else(|| "pairing_identity_unavailable".to_string())?;
             let (code, claim) = control_store.load_pairing_claim(
                 &request.operation_id,
                 installation.principal(),
@@ -10304,13 +11113,28 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     &request.operation_id,
                     &request.request_id,
                 )?;
-                let _ = transport.delete(&terminal);
-            } else if let Ok(Some(current)) = transport.load_optional(code.pair_id()) {
-                if claim
-                    .finalize(&current.descriptor)
-                    .is_ok_and(|descriptor| descriptor == current.descriptor)
-                {
-                    let _ = transport.delete(&current);
+                if transport.delete(&terminal).is_ok_and(|deleted| deleted) {
+                    let _ = control_store
+                        .mark_pairing_claim_descriptor_cleanup_complete(&request.operation_id);
+                }
+            } else {
+                match transport.load_optional(code.pair_id()) {
+                    Ok(None) => {
+                        let _ = control_store
+                            .mark_pairing_claim_descriptor_cleanup_complete(&request.operation_id);
+                    }
+                    Ok(Some(current)) => {
+                        if claim
+                            .finalize(&current.descriptor)
+                            .is_ok_and(|descriptor| descriptor == current.descriptor)
+                            && transport.delete(&current).is_ok_and(|deleted| deleted)
+                        {
+                            let _ = control_store.mark_pairing_claim_descriptor_cleanup_complete(
+                                &request.operation_id,
+                            );
+                        }
+                    }
+                    Err(_) => {}
                 }
             }
             control_store.complete_pairing_claim(
@@ -10368,6 +11192,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, &account)
                 .map_err(|_| "pairing_transport_unavailable".to_string())?;
             let transport = isyncyou_agent::OneDrivePairingTransportV2::new(token);
+            let mut descriptor_cleanup_complete = false;
             if let Some(current) = transport
                 .load_optional(source.pair_id())
                 .map_err(|error| error.to_string())?
@@ -10381,27 +11206,44 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     let updated = transport
                         .compare_and_swap(&current, &revoked)
                         .map_err(|error| error.to_string())?;
-                    if updated.is_none() {
-                        let observed = transport
-                            .load_optional(source.pair_id())
-                            .map_err(|error| error.to_string())?;
-                        if observed.is_some_and(|observed| {
-                            observed.descriptor.state
-                                != isyncyou_agent::PairingRemoteStateV2::Revoked
-                        }) {
-                            return Err("pairing_outcome_unknown".into());
+                    match updated {
+                        Some(updated) if updated.descriptor == revoked => {}
+                        Some(_) => return Err("pairing_outcome_unknown".into()),
+                        None => {
+                            let observed = transport
+                                .load_optional(source.pair_id())
+                                .map_err(|error| error.to_string())?;
+                            match observed {
+                                None => descriptor_cleanup_complete = true,
+                                Some(observed)
+                                    if observed.descriptor.state
+                                        == isyncyou_agent::PairingRemoteStateV2::Revoked => {}
+                                Some(_) => return Err("pairing_outcome_unknown".into()),
+                            }
                         }
                     }
                 }
-                if let Ok(Some(current)) = transport.load_optional(source.pair_id()) {
-                    let _ = transport.delete(&current);
+                if !descriptor_cleanup_complete {
+                    match transport.load_optional(source.pair_id()) {
+                        Ok(None) => descriptor_cleanup_complete = true,
+                        Ok(Some(current)) => {
+                            descriptor_cleanup_complete =
+                                transport.delete(&current).is_ok_and(|deleted| deleted);
+                        }
+                        Err(_) => {}
+                    }
                 }
+            } else {
+                descriptor_cleanup_complete = true;
             }
             control_store.complete_pairing_revoke(
                 &request.operation_id,
                 &request.request_id,
                 unix_now_ms(),
             )?;
+            if descriptor_cleanup_complete {
+                control_store.mark_pairing_source_descriptor_cleanup_complete(source.pair_id())?;
+            }
             Ok(serde_json::json!({
                 "operation_id": request.operation_id,
                 "state": "revoked",
@@ -10610,7 +11452,9 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 ))]
                 if let Some(usage) = provider.last_usage() {
                     if let Some(provider_id) = provider_id {
-                        last_usage.lock().unwrap().insert(provider_id, usage);
+                        if let Ok(mut last_usage) = last_usage.lock() {
+                            last_usage.insert(provider_id, usage);
+                        }
                     }
                 }
                 match outcome {
@@ -10744,17 +11588,17 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 .as_ref()
                 .cloned()
                 .ok_or_else(|| "session_store_unavailable".to_string())?;
+            let admission = match self.turn_admissions.reserve(&turn_id, digest) {
+                Ok(Some(admission)) => admission,
+                Ok(None) => return Ok(turn_id),
+                Err(error) => return Err(error),
+            };
             let durable_state =
                 control_store.begin_agent_turn_admission_identity(&request, &turn_id, &identity)?;
             let recovered_admission = matches!(
                 &durable_state,
                 agent_control_store::AgentTurnAdmissionBegin::Existing
             );
-            let admission = match self.turn_admissions.reserve(&turn_id, digest) {
-                Ok(Some(admission)) => admission,
-                Ok(None) => return Ok(turn_id),
-                Err(error) => return Err(error),
-            };
             let durable_admission = DurableTurnAdmissionLease {
                 store: Arc::clone(&control_store),
                 request_id: request.request_id.clone(),
@@ -10776,6 +11620,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                             final_text: None,
                             error_code: None,
                         },
+                        None,
                     );
                     drop(reserved);
                     return Ok(turn_id);
@@ -10788,6 +11633,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                             final_text: None,
                             error_code: Some(code),
                         },
+                        None,
                     );
                     drop(reserved);
                     return Ok(turn_id);
@@ -10800,6 +11646,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                             final_text: None,
                             error_code: Some(code),
                         },
+                        None,
                     );
                     drop(reserved);
                     return Ok(turn_id);
@@ -10892,9 +11739,107 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                             let mut owned_reserved = reserved
                                 .take()
                                 .ok_or_else(|| "turn_registry_unavailable".to_string())?;
+                            let pending_owner = isyncyou_agent::PendingOwnerBinding {
+                                account: request.account.clone(),
+                                session_id: request.session_id.clone(),
+                                request_id: request.request_id.clone(),
+                                turn_id: worker_turn_id.clone(),
+                            };
+                            let mut product_turn = Some(product_turn);
+                            if recovered_admission
+                                && matches!(
+                                    product_turn.as_ref(),
+                                    Some(product_session::ProductTurnStart::Started(_))
+                                )
+                            {
+                                let reissued_pending = match worker
+                                    .pending
+                                    .reissue_for_owner(&pending_owner, unix_now_ms())
+                                {
+                                    Ok(value) => value,
+                                    Err(_) => {
+                                        drop(prepared);
+                                        worker.fail_reserved_turn(
+                                            &worker_turn_id,
+                                            "request_resume_required",
+                                        );
+                                        return Ok(());
+                                    }
+                                };
+                                if let Some((pending_action, token)) = reissued_pending {
+                                    let product_session::ProductTurnStart::Started(runtime) =
+                                        product_turn.take().ok_or_else(|| {
+                                            "session_store_unavailable".to_string()
+                                        })?
+                                    else {
+                                        return Err("session_store_unavailable".into());
+                                    };
+                                    let pending_id = pending_action.id.clone();
+                                    let transition = TurnRegistry::begin_pending(
+                                        &owned_reserved.turn_state,
+                                        || {
+                                            cache_product_session_context(
+                                                &worker.hot_session_history,
+                                                runtime.finish_pending(unix_now_ms()),
+                                            )?;
+                                            Ok((pending_id, (pending_action, token)))
+                                        },
+                                    );
+                                    drop(prepared);
+                                    match transition {
+                                        Ok(PendingTransition::Committed((
+                                            pending_action,
+                                            token,
+                                        ))) => {
+                                            worker.hot_request_statuses.insert(
+                                                &request.session_id,
+                                                &request.request_id,
+                                                isyncyou_agent::RequestPhase::PendingConfirmation,
+                                            );
+                                            let _ = owned_reserved.durable_admission.complete();
+                                            drop(owned_reserved.admission.take());
+                                            let _ = worker.hub.emit(
+                                                &worker_turn_id,
+                                                isyncyou_agent::StreamEvent::ConfirmationRequired {
+                                                    id: pending_action.id,
+                                                    action: Box::new(pending_action.action),
+                                                    preview: pending_action.preview,
+                                                    action_hash: pending_action.action_hash,
+                                                    risk: pending_action.risk,
+                                                    expires_at_ms: pending_action.expires_at_ms,
+                                                    token,
+                                                },
+                                            );
+                                            let _ = worker.hub.emit(
+                                                &worker_turn_id,
+                                                isyncyou_agent::StreamEvent::done(
+                                                    isyncyou_agent::DoneReason::PendingConfirmation,
+                                                ),
+                                            );
+                                            worker.hub.close(&worker_turn_id);
+                                            worker.turns.remove(&worker_turn_id);
+                                            worker
+                                                .hot_session_history
+                                                .invalidate(&request.session_id);
+                                            return Ok(());
+                                        }
+                                        Ok(PendingTransition::Cancelled) | Err(_) => {
+                                            worker.fail_reserved_turn(
+                                                &worker_turn_id,
+                                                "request_resume_required",
+                                            );
+                                            return Ok(());
+                                        }
+                                    }
+                                }
+                            }
+                            let product_turn = product_turn
+                                .take()
+                                .ok_or_else(|| "session_store_unavailable".to_string())?;
                             if matches!(&product_turn, product_session::ProductTurnStart::Replay(_))
                             {
                                 owned_reserved.durable_admission.complete()?;
+                                drop(owned_reserved.admission.take());
                             }
                             dispatch_prepared_product_turn(
                                 prepared,
@@ -10909,7 +11854,11 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                                     )
                                 },
                                 |replay| {
-                                    worker.emit_product_turn_replay(&worker_turn_id, replay);
+                                    worker.emit_product_turn_replay(
+                                        &worker_turn_id,
+                                        replay,
+                                        Some(&pending_owner),
+                                    );
                                     Ok(worker_turn_id.clone())
                                 },
                             )?;
@@ -10994,20 +11943,31 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             .confirm(pending_id, token, action_hash, unix_now_ms())
             .map_err(|e| format!("{e:?}"))?;
         self.turns.remove_pending(pending_id);
-        agent_ops::preview_for_pending_action(&action).map_err(|e| {
-            format!(
+        if let Err(error) = agent_ops::preview_for_pending_action(&action) {
+            self.finish_pending_confirmation_state(pending_id, "failed", unix_now_ms())?;
+            return Err(format!(
                 "invalid_confirmed_action: {}",
-                agent_ops::redact_agent_operation_text(&e)
-            )
-        })?;
+                agent_ops::redact_agent_operation_text(&error)
+            ));
+        }
         let action_summary = agent_action_summary(&action);
-        self.audit_sink
-            .record_confirm(&action, "started", &action_summary)?;
+        if self
+            .audit_sink
+            .record_confirm(&action, "started", &action_summary)
+            .is_err()
+        {
+            self.finish_pending_confirmation_state(pending_id, "failed", unix_now_ms())?;
+            return Err("audit_start_failed".into());
+        }
         match self.confirmed_executor.execute_confirmed(&action) {
             Ok(result) => {
                 let safe_summary = agent_ops::redact_agent_operation_text(&result.summary);
-                self.audit_sink
-                    .record_confirm(&action, "ok", &format!("{action_summary} ok"))?;
+                let audit_result = self
+                    .audit_sink
+                    .record_confirm(&action, "ok", &format!("{action_summary} ok"))
+                    .map_err(|_| "audit_finish_failed".to_string());
+                self.finish_pending_confirmation_state(pending_id, "completed", unix_now_ms())?;
+                audit_result?;
                 serde_json::to_string(&serde_json::json!({
                     "status": "ok",
                     "op": action.op(),
@@ -11017,11 +11977,12 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             }
             Err(e) => {
                 let safe = agent_safe_executor_error(&e);
-                self.audit_sink.record_confirm(
-                    &action,
-                    "error",
-                    &format!("{action_summary} error={safe}"),
-                )?;
+                let audit_result = self
+                    .audit_sink
+                    .record_confirm(&action, "error", &format!("{action_summary} error={safe}"))
+                    .map_err(|_| "audit_finish_failed".to_string());
+                self.finish_pending_confirmation_state(pending_id, "failed", unix_now_ms())?;
+                audit_result?;
                 Err(format!("{} failed: {safe}", action.op()))
             }
         }
@@ -11925,8 +12886,31 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         model: &str,
         reasoning_effort: Option<&str>,
     ) -> Result<(), String> {
-        // #639 (F2): the selection write shares the product-runtime gate, so a status snapshot or a
-        // turn build never observes a selection that is inconsistent with the readiness it just read.
+        // Selection may change while existing turns hold shared leases, but it cannot overtake a
+        // provider refresh or lifecycle mutation. Acquire both shared leases in fixed provider order
+        // before the short runtime snapshot lock so a refresh can revalidate selection after I/O.
+        let claude_operation =
+            account_lifecycle::mint_operation_id().map_err(|_| "product_busy".to_string())?;
+        let _claude = self
+            .provider_leases
+            .acquire_shared(
+                &self.oauth_dir,
+                ProductProviderId::Claude,
+                claude_operation,
+                account_lifecycle::ProviderOperationKind::Turn,
+            )
+            .map_err(|_| "product_busy".to_string())?;
+        let codex_operation =
+            account_lifecycle::mint_operation_id().map_err(|_| "product_busy".to_string())?;
+        let _codex = self
+            .provider_leases
+            .acquire_shared(
+                &self.oauth_dir,
+                ProductProviderId::Codex,
+                codex_operation,
+                account_lifecycle::ProviderOperationKind::Turn,
+            )
+            .map_err(|_| "product_busy".to_string())?;
         let _gate = self
             .product_runtime_gate
             .try_lock()
@@ -12965,7 +13949,7 @@ impl DaemonPush {
             .map_err(|e| e.to_string())
             .and_then(|j| isyncyou_graph::push::ServiceAccount::from_json(&j))
         else {
-            eprintln!("isyncyoud: push disabled — service-account unreadable");
+            eprintln!("isyncyoud: push_service_account_unavailable");
             return 0;
         };
         let now = unix_now().parse::<u64>().unwrap_or(0);
@@ -12973,7 +13957,7 @@ impl DaemonPush {
         for t in self.load_tokens() {
             match isyncyou_graph::push::fcm_send(&sa, &t, title, body, now) {
                 Ok(_) => sent += 1,
-                Err(e) => eprintln!("isyncyoud: push to a device failed: {e}"),
+                Err(_) => eprintln!("isyncyoud: push_send_failed"),
             }
         }
         sent
@@ -13226,13 +14210,8 @@ impl isyncyou_webui::DurableRequestStore for DaemonDurableRequests {
                 agent_control_store::ProductRequestBegin::OutcomeUnknown => {
                     isyncyou_webui::DurableRequestBegin::OutcomeUnknown
                 }
-                agent_control_store::ProductRequestBegin::Replay(response) => {
-                    isyncyou_webui::DurableRequestBegin::Replay(isyncyou_webui::ApiResponse {
-                        status: response.status,
-                        content_type: response.content_type,
-                        body: response.body,
-                        headers: response.headers,
-                    })
+                agent_control_store::ProductRequestBegin::Completed { status } => {
+                    isyncyou_webui::DurableRequestBegin::Completed { status }
                 }
             })
     }
@@ -13242,15 +14221,9 @@ impl isyncyou_webui::DurableRequestStore for DaemonDurableRequests {
         identity: &isyncyou_webui::ProductRequestIdentity,
         response: &isyncyou_webui::ApiResponse,
     ) -> Result<(), String> {
-        self.store.complete_product_request_identity(
-            identity,
-            &agent_control_store::StoredProductResponseV1 {
-                status: response.status,
-                content_type: response.content_type.clone(),
-                body: response.body.clone(),
-                headers: response.headers.clone(),
-            },
-        )
+        let terminal = agent_control_store::ProductRequestTerminalV1::from_api_response(response)?;
+        self.store
+            .complete_product_request_identity(identity, &terminal)
     }
 
     fn abort(&self, identity: &isyncyou_webui::ProductRequestIdentity) -> Result<(), String> {
@@ -13506,7 +14479,9 @@ impl isyncyou_webui::MutationIntentHandler for DaemonMutationIntents {
             unix_now_ms(),
         )?;
         let (purpose, source) = match material {
-            agent_control_store::MutationCommitStart::Replay(result) => return Ok(result),
+            agent_control_store::MutationCommitStart::Completed => {
+                return Err("mutation_intent_already_completed".into())
+            }
             agent_control_store::MutationCommitStart::Execute { purpose, source } => {
                 (*purpose, source)
             }
@@ -14451,6 +15426,76 @@ mod tests {
     ))]
     static APP_HOST_CREDENTIAL_ENV_TEST_LOCK: StdOnceLock<StdMutex<()>> = StdOnceLock::new();
 
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    struct FakePairingRecoveryTransport {
+        current: std::sync::Mutex<Option<isyncyou_agent::PairingDescriptorV2>>,
+        lose_first_publish_response: std::sync::atomic::AtomicBool,
+        fail_first_delete: std::sync::atomic::AtomicBool,
+        lose_first_delete_match: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    impl PairingRecoveryTransport for FakePairingRecoveryTransport {
+        type Versioned = isyncyou_agent::PairingDescriptorV2;
+
+        fn load_optional(&self, _pair_id: &str) -> Result<Option<Self::Versioned>, String> {
+            self.current
+                .lock()
+                .map_err(|_| "pairing_transport_unavailable".to_string())
+                .map(|current| current.clone())
+        }
+
+        fn descriptor(value: &Self::Versioned) -> &isyncyou_agent::PairingDescriptorV2 {
+            value
+        }
+
+        fn compare_and_swap(
+            &self,
+            current: &Self::Versioned,
+            next: &isyncyou_agent::PairingDescriptorV2,
+        ) -> Result<Option<Self::Versioned>, String> {
+            let mut remote = self
+                .current
+                .lock()
+                .map_err(|_| "pairing_transport_unavailable".to_string())?;
+            if remote.as_ref() != Some(current) {
+                return Ok(None);
+            }
+            *remote = Some(next.clone());
+            if self
+                .lose_first_publish_response
+                .swap(false, Ordering::AcqRel)
+            {
+                return Err("pairing_transport_unavailable".into());
+            }
+            Ok(Some(next.clone()))
+        }
+
+        fn delete(&self, current: &Self::Versioned) -> Result<bool, String> {
+            if self.fail_first_delete.swap(false, Ordering::AcqRel) {
+                return Err("pairing_transport_unavailable".into());
+            }
+            if self.lose_first_delete_match.swap(false, Ordering::AcqRel) {
+                return Ok(false);
+            }
+            let mut remote = self
+                .current
+                .lock()
+                .map_err(|_| "pairing_transport_unavailable".to_string())?;
+            if remote.as_ref() == Some(current) {
+                *remote = None;
+                return Ok(true);
+            }
+            Ok(false)
+        }
+    }
+
     #[test]
     fn agent_prompt_forbids_internal_source_payloads_in_visible_answer() {
         assert!(AGENT_SYSTEM_PROMPT.contains(
@@ -14838,7 +15883,7 @@ mod tests {
     struct RecordingAuditSink {
         events: Arc<StdMutex<Vec<(String, String, String)>>>,
         order: Arc<StdMutex<Vec<String>>>,
-        fail_start: bool,
+        fail_status: Option<String>,
     }
 
     impl RecordingAuditSink {
@@ -14846,13 +15891,20 @@ mod tests {
             Self {
                 events: Arc::new(StdMutex::new(Vec::new())),
                 order,
-                fail_start: false,
+                fail_status: None,
             }
         }
 
         fn failing_start(order: Arc<StdMutex<Vec<String>>>) -> Self {
             Self {
-                fail_start: true,
+                fail_status: Some("started".into()),
+                ..Self::new(order)
+            }
+        }
+
+        fn failing_status(order: Arc<StdMutex<Vec<String>>>, status: &str) -> Self {
+            Self {
+                fail_status: Some(status.into()),
                 ..Self::new(order)
             }
         }
@@ -14870,8 +15922,8 @@ mod tests {
             summary: &str,
         ) -> Result<(), String> {
             self.order.lock().unwrap().push(format!("audit:{status}"));
-            if self.fail_start && status == "started" {
-                return Err("audit_start_failed".to_string());
+            if self.fail_status.as_deref() == Some(status) {
+                return Err(format!("audit_{status}_failed"));
             }
             self.events.lock().unwrap().push((
                 action.op().to_string(),
@@ -15030,6 +16082,22 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn bind_test_product_refresh_authority(root: &Path, provider: ProductProviderId, fill: char) {
+        let repository = account_lifecycle_repository(root).unwrap();
+        let mut context = repository.load_existing().unwrap().unwrap();
+        context
+            .authority
+            .current_credential_etags
+            .insert(provider, fill.to_string().repeat(43));
+        repository
+            .put_authority(context.principal(), &context.authority)
+            .unwrap();
     }
 
     #[cfg(any(
@@ -15728,6 +16796,63 @@ mod tests {
         assert_eq!(err, "audit_start_failed");
         assert_eq!(executor.call_count(), 0);
         assert_eq!(order.lock().unwrap().as_slice(), ["audit:started"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn confirmed_action_terminal_state_survives_finish_audit_failure() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("backup accepted", order.clone());
+        let audit = RecordingAuditSink::failing_status(order.clone(), "ok");
+        let root = temp_agent_root("confirm-finish-audit-fail");
+        let mut agent = DaemonAgent::new(Config::default(), root.clone());
+        agent.confirmed_executor = Arc::new(executor.clone());
+        agent.audit_sink = Arc::new(audit);
+        assert!(agent.pending.is_persistent());
+        let owner = isyncyou_agent::PendingOwnerBinding {
+            account: "controlled".into(),
+            session_id: "01JSESSION00000000000000028".into(),
+            request_id: "019f0000-0000-4000-8000-000000000028".into(),
+            turn_id: "01JTURN0000000000000000028".into(),
+        };
+        let (pending, token) = agent
+            .pending
+            .register_bound(
+                backup_action(),
+                "backup mail",
+                unix_now_ms(),
+                AGENT_CONFIRM_TTL_MS,
+                owner,
+            )
+            .unwrap();
+
+        let error = isyncyou_webui::AgentHandler::confirm(
+            &agent,
+            &pending.id,
+            &token,
+            &pending.action_hash,
+        )
+        .unwrap_err();
+        assert_eq!(error, "audit_finish_failed");
+        assert_eq!(executor.call_count(), 1);
+        assert_eq!(
+            order.lock().unwrap().as_slice(),
+            ["audit:started", "execute", "audit:ok"]
+        );
+        let projections = agent
+            .control_store
+            .as_ref()
+            .unwrap()
+            .pending_confirm_projections(8)
+            .unwrap();
+        assert_eq!(projections.len(), 1);
+        assert_eq!(projections[0].pending_id, pending.id);
+        assert_eq!(projections[0].code, "completed");
+        drop(agent);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -16771,6 +17896,9 @@ mod tests {
         let durable = function
             .find("begin_agent_turn_admission")
             .expect("durable turn admission");
+        let local = function
+            .find("self.turn_admissions.reserve")
+            .expect("local turn admission fence");
         let reserve = function
             .find("reserve_agent_turn")
             .expect("turn reservation");
@@ -16783,6 +17911,7 @@ mod tests {
         let manifest = function.find("begin_turn").expect("manifest admission");
         let response = function.rfind("Ok(turn_id)").expect("immediate response");
 
+        assert!(local < durable);
         assert!(durable < reserve);
         assert!(reserve < spawn);
         assert!(spawn < provider);
@@ -16991,6 +18120,72 @@ mod tests {
             .reserve(&turn_id, turn_admission_digest(&changed))
             .unwrap()
             .is_some());
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn local_turn_admission_fences_durable_terminal_cleanup_retry() {
+        let root = temp_agent_root("turn-admission-terminal-fence");
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let request = isyncyou_webui::AgentTurnRequest {
+            request_id: "019f0000-0000-4000-8000-000000000319".into(),
+            session_id: "01JSESSION00000000000000019".into(),
+            account: "controlled".into(),
+            prompt: "Preserve one admission owner during terminal cleanup".into(),
+        };
+        let turn_id = turn_id_from_request_id(&request.request_id).unwrap();
+        let digest = turn_admission_digest(&request);
+        let identity = isyncyou_webui::ProductRequestIdentity {
+            request_id: request.request_id.clone(),
+            route_domain: "post:/api/v1/agent/turn",
+            request_scope: format!("session_id:{}", request.session_id),
+            payload_digest: "1919191919191919191919191919191919191919191919191919191919191919"
+                .into(),
+        };
+        let local = agent
+            .turn_admissions
+            .reserve(&turn_id, digest)
+            .unwrap()
+            .expect("first process-local owner");
+        let store = agent.control_store.as_ref().unwrap();
+        assert!(matches!(
+            store
+                .begin_agent_turn_admission_identity(&request, &turn_id, &identity)
+                .unwrap(),
+            agent_control_store::AgentTurnAdmissionBegin::Inserted
+        ));
+        store
+            .complete_agent_turn_admission(&request.request_id)
+            .unwrap();
+
+        assert!(agent
+            .turn_admissions
+            .reserve(&turn_id, digest)
+            .unwrap()
+            .is_none());
+        assert!(store.recover_agent_turn_admissions(1).unwrap().is_empty());
+
+        drop(local);
+        let retry = agent
+            .turn_admissions
+            .reserve(&turn_id, digest)
+            .unwrap()
+            .expect("retry owns both admission layers after release");
+        assert!(matches!(
+            store
+                .begin_agent_turn_admission_identity(&request, &turn_id, &identity)
+                .unwrap(),
+            agent_control_store::AgentTurnAdmissionBegin::Inserted
+        ));
+        store
+            .complete_agent_turn_admission(&request.request_id)
+            .unwrap();
+        drop(retry);
+        drop(agent);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -18684,6 +19879,7 @@ mod tests {
         )
         .unwrap();
         let agent = DaemonAgent::new(Config::default(), root.clone());
+        bind_test_product_refresh_authority(&root, ProductProviderId::Claude, 'e');
 
         // The policy mismatch is rejected before transport construction or refresh. Persisted
         // metadata keeps the original policy/generation and becomes reconnect-required.
@@ -18725,6 +19921,7 @@ mod tests {
         };
         let claude_meta = ProductBundleMeta::fresh(ProductProviderId::Claude).unwrap();
         agent.store_claude_bundle(&claude, &claude_meta).unwrap();
+        bind_test_product_refresh_authority(&root, ProductProviderId::Claude, 'e');
         assert!(matches!(
             agent.refresh_claude_product_credential_unlocked(claude, claude_meta.clone()),
             Err(ProviderCredentialResolutionError::ProductReconnectRequired)
@@ -18747,6 +19944,7 @@ mod tests {
         };
         let codex_meta = ProductBundleMeta::fresh(ProductProviderId::Codex).unwrap();
         store_codex_bundle(&root, &codex, &codex_meta).unwrap();
+        bind_test_product_refresh_authority(&root, ProductProviderId::Codex, 'f');
         assert!(matches!(
             agent.refresh_codex_product_credential_unlocked(codex, codex_meta.clone()),
             Err(ProviderCredentialResolutionError::ProductReconnectRequired)
@@ -20693,6 +21891,126 @@ mod tests {
         feature = "agent-subscription-experimental"
     ))]
     #[test]
+    fn refresh_publication_rejects_a_changed_credential_snapshot() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("refresh-stale-credential-snapshot");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let meta = ProductBundleMeta::fresh(ProductProviderId::Claude).unwrap();
+        let original = StoredCredential {
+            access_token: "original-access".into(),
+            refresh_token: "original-refresh".into(),
+            expires_at_ms: 1,
+        };
+        agent.store_claude_bundle(&original, &meta).unwrap();
+        let fence = {
+            let _runtime = agent.product_runtime_gate.lock().unwrap();
+            let _refresh = agent.credential_refresh_gate.lock().unwrap();
+            let _snapshot = acquire_product_runtime_file_lock(&root).unwrap();
+            agent
+                .capture_product_refresh_fence(ProductProviderId::Claude)
+                .unwrap()
+        };
+        let replacement = StoredCredential {
+            access_token: "replacement-access".into(),
+            refresh_token: "replacement-refresh".into(),
+            expires_at_ms: 2,
+        };
+        agent.store_claude_bundle(&replacement, &meta).unwrap();
+        let refreshed = StoredCredential {
+            access_token: "stale-result".into(),
+            refresh_token: "stale-refresh".into(),
+            expires_at_ms: 3,
+        };
+        assert!(agent
+            .publish_claude_refresh_outcome(
+                &original,
+                &meta,
+                &fence,
+                Ok(refreshed),
+                "refresh_failed",
+            )
+            .is_err());
+        let persisted = load_agent_credential_blob(&root, SUBSCRIPTION_CREDENTIAL_ID)
+            .unwrap()
+            .unwrap();
+        assert!(StoredCredential::from_json(persisted.expose()) == Some(replacement));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn refresh_fence_allows_other_provider_epoch_advance_but_rejects_own_etag_change() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("refresh-provider-scoped-fence");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let fence = agent
+            .capture_product_refresh_fence(ProductProviderId::Claude)
+            .unwrap();
+        let repository = account_lifecycle_repository(&root).unwrap();
+        let mut context = repository.load_existing().unwrap().unwrap();
+        context.authority.lifecycle_epoch += 1;
+        context.authority.fence_epoch += 1;
+        context
+            .authority
+            .current_credential_etags
+            .insert(ProductProviderId::Codex, "c".repeat(43));
+        repository
+            .put_authority(context.principal(), &context.authority)
+            .unwrap();
+        assert!(agent.product_refresh_fence_matches(ProductProviderId::Claude, &fence));
+
+        let mut context = repository.load_existing().unwrap().unwrap();
+        context
+            .authority
+            .current_credential_etags
+            .insert(ProductProviderId::Claude, "d".repeat(43));
+        repository
+            .put_authority(context.principal(), &context.authority)
+            .unwrap();
+        assert!(!agent.product_refresh_fence_matches(ProductProviderId::Claude, &fence));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn product_refresh_requires_current_provider_credential_etag() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("refresh-requires-etag");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+
+        assert!(agent
+            .capture_bound_product_refresh_fence(ProductProviderId::Claude)
+            .is_err());
+        let repository = account_lifecycle_repository(&root).unwrap();
+        let mut context = repository.load_existing().unwrap().unwrap();
+        context
+            .authority
+            .current_credential_etags
+            .insert(ProductProviderId::Claude, "e".repeat(43));
+        repository
+            .put_authority(context.principal(), &context.authority)
+            .unwrap();
+        assert!(agent
+            .capture_bound_product_refresh_fence(ProductProviderId::Claude)
+            .is_ok());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
     fn failed_refresh_drops_readiness_without_relogin_journal() {
         let _env = AppHostCredentialEnvGuard::new();
         let root = apphost_credential_test_root("failed-refresh-reconnect");
@@ -21170,7 +22488,7 @@ mod tests {
         feature = "agent-subscription-experimental"
     ))]
     #[test]
-    fn product_runtime_gate_uses_one_bundle_snapshot_per_provider_branch() {
+    fn product_runtime_gate_bounds_bundle_snapshots_per_provider_stage() {
         let source = production_source_before_final_test_module(include_str!("lib.rs"));
         let start = source
             .find("    fn product_runtime_gate(")
@@ -21181,11 +22499,31 @@ mod tests {
             .expect("runtime gate end marker exists");
         let gate = &tail[..end];
 
+        let shared_stage = gate
+            .split("        let shared = self")
+            .nth(1)
+            .expect("shared lifecycle stage exists");
+
+        // Each provider has one initial snapshot, one mutually exclusive experimental-absence
+        // revalidation branch, and one normal shared-lease revalidation. No runtime path can
+        // execute both post-exclusive branches.
         assert_eq!(
             gate.matches("self.claude_product_bundle_state()").count(),
+            3
+        );
+        assert_eq!(gate.matches("self.codex_product_bundle_state()").count(), 3);
+        assert_eq!(
+            shared_stage
+                .matches("self.claude_product_bundle_state()")
+                .count(),
             1
         );
-        assert_eq!(gate.matches("self.codex_product_bundle_state()").count(), 1);
+        assert_eq!(
+            shared_stage
+                .matches("self.codex_product_bundle_state()")
+                .count(),
+            1
+        );
         assert!(!gate.contains("provider_credential_state_class"));
         assert!(!gate.contains("try_subscription_provider"));
         assert!(!gate.contains("try_codex_provider"));
@@ -22600,10 +23938,93 @@ mod tests {
             .unwrap();
         let shared = gate.rfind("acquire_shared").unwrap();
         let after = &gate[shared..];
-        assert!(after.contains("lifecycle_provider_blocked"));
-        assert!(after.contains("meta.generation != generation"));
-        assert!(!after.contains("refresh_claude_product_credential_unlocked"));
-        assert!(!after.contains("refresh_codex_product_credential_unlocked"));
+        assert!(after.contains("product_refresh_fence_matches"));
+        assert!(after.contains("claude_product_bundle_state"));
+        assert!(after.contains("codex_product_bundle_state"));
+        assert!(after.contains("ProductCredentialState::PresentValid"));
+        assert!(after.contains("provider_activation_valid_for_meta"));
+        assert!(!after.contains("refresh_claude_product_credential_with_fence"));
+        assert!(!after.contains("refresh_codex_product_credential_with_fence"));
+    }
+
+    #[cfg(feature = "agent-subscription-experimental")]
+    #[test]
+    fn experimental_fallback_revalidates_absence_after_shared_lease_handoff() {
+        let source = include_str!("lib.rs");
+        let gate = source
+            .split("fn product_runtime_gate(")
+            .nth(1)
+            .unwrap()
+            .split("fn commit_claude_oauth_success")
+            .next()
+            .unwrap();
+
+        assert_eq!(gate.matches("experimental_fence").count(), 4);
+        assert_eq!(gate.matches("ProductCredentialState::Absent").count(), 4);
+        assert_eq!(gate.matches("let still_absent").count(), 2);
+        assert_eq!(gate.matches("product_refresh_fence_matches").count(), 3);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn refresh_network_io_releases_short_locks_and_publication_reacquires_fixed_order() {
+        let source = include_str!("lib.rs");
+        let refresh = source
+            .split("fn refresh_claude_product_credential_with_fence(")
+            .nth(1)
+            .unwrap()
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(
+            refresh.find("oauth::refresh").unwrap()
+                < refresh.find("publish_claude_refresh_outcome").unwrap()
+        );
+
+        let publish = source
+            .split("fn publish_claude_refresh_outcome(")
+            .nth(1)
+            .unwrap()
+            .split("fn refresh_claude_product_credential_with_fence")
+            .next()
+            .unwrap();
+        let runtime = publish.find("product_runtime_gate").unwrap();
+        let refresh_gate = publish.find("credential_refresh_gate").unwrap();
+        let snapshot = publish.find("acquire_product_runtime_file_lock").unwrap();
+        let revalidate = publish.find("product_refresh_fence_matches").unwrap();
+        let store = publish.find("store_claude_bundle").unwrap();
+        assert!(runtime < refresh_gate);
+        assert!(refresh_gate < snapshot);
+        assert!(snapshot < revalidate);
+        assert!(revalidate < store);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn model_selection_uses_provider_leases_before_runtime_snapshot_lock() {
+        let source = include_str!("lib.rs");
+        let set_model = source
+            .split("    fn set_model(")
+            .nth(1)
+            .unwrap()
+            .split("\n    }\n}")
+            .next()
+            .unwrap();
+        assert_eq!(set_model.matches("acquire_shared").count(), 2);
+        assert!(
+            set_model.find("ProductProviderId::Claude").unwrap()
+                < set_model.find("ProductProviderId::Codex").unwrap()
+        );
+        assert!(
+            set_model.rfind("acquire_shared").unwrap()
+                < set_model.find("product_runtime_gate").unwrap()
+        );
     }
 
     #[cfg(any(
@@ -23293,6 +24714,419 @@ mod tests {
             1_000 + PRODUCT_SESSION_MAINTENANCE_INTERVAL_MS,
             false,
         ));
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn pairing_claim_startup_recovery_adopts_lost_remote_response_and_finishes_once() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("pairing-startup-recovery");
+        let _ = std::fs::remove_dir_all(&root);
+        let credential_store = agent_credential_store(&root).unwrap();
+        let installation_principal = "pairing-recovery-id-01";
+        let control_store = agent_control_store::AgentControlStore::open(
+            &root,
+            &credential_store,
+            installation_principal,
+            1,
+        )
+        .unwrap();
+        let registry = product_session::ProductSessionRegistry::new(&credential_store);
+        let payload = isyncyou_agent::PairingPayload::generate(
+            isyncyou_agent::SessionId::new("session-v2").unwrap(),
+        )
+        .unwrap();
+        let source = isyncyou_agent::PairingSourceSecretV2::create(&payload, 1_000).unwrap();
+        let challenge = control_store
+            .start_user_presence(
+                "019f0000-0000-4000-8000-000000000901",
+                agent_control_store::UserPresenceBinding::PairingImport {
+                    pairing_code: source.reveal_code(),
+                },
+                1_001,
+            )
+            .unwrap();
+        control_store
+            .confirm_user_presence(
+                &challenge.operation_id,
+                &challenge.intent_id,
+                &challenge.token,
+                &challenge.action_hash,
+                1_002,
+            )
+            .unwrap();
+        control_store
+            .begin_pairing_claim(
+                "019f0000-0000-4000-8000-000000000902",
+                &challenge.operation_id,
+                "me",
+                source.descriptor(),
+                installation_principal,
+                1_003,
+            )
+            .unwrap();
+        let transport = FakePairingRecoveryTransport {
+            current: std::sync::Mutex::new(Some(source.descriptor().clone())),
+            lose_first_publish_response: std::sync::atomic::AtomicBool::new(true),
+            fail_first_delete: std::sync::atomic::AtomicBool::new(false),
+            lose_first_delete_match: std::sync::atomic::AtomicBool::new(false),
+        };
+        let target = control_store
+            .pairing_claim_recovery_targets(8, 1_004)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        assert_eq!(
+            recover_pairing_claim_target(
+                &control_store,
+                &registry,
+                &target,
+                installation_principal,
+                1_004,
+                &transport,
+            ),
+            Err("pairing_transport_unavailable".into())
+        );
+        assert!(registry.account_for("session-v2").is_err());
+        assert_eq!(
+            control_store
+                .pairing_claim_state(&challenge.operation_id, None)
+                .unwrap(),
+            Some("claimed".into())
+        );
+
+        let retry = control_store
+            .pairing_claim_recovery_targets(8, 1_005)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        recover_pairing_claim_target(
+            &control_store,
+            &registry,
+            &retry,
+            installation_principal,
+            1_005,
+            &transport,
+        )
+        .unwrap();
+        assert_eq!(registry.account_for("session-v2").unwrap(), "me");
+        assert_eq!(
+            control_store
+                .pairing_claim_state(&challenge.operation_id, None)
+                .unwrap(),
+            Some("consumed".into())
+        );
+        assert!(control_store
+            .pairing_claim_recovery_targets(8, 1_006)
+            .unwrap()
+            .is_empty());
+        assert!(transport.current.lock().unwrap().is_none());
+
+        drop(control_store);
+        drop(credential_store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn pairing_claim_recovery_retries_descriptor_cleanup_after_remote_consumed_commit() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("pairing-recovery-consumed-cleanup");
+        let _ = std::fs::remove_dir_all(&root);
+        let credential_store = agent_credential_store(&root).unwrap();
+        let installation_principal = "pairing-recovery-id-01";
+        let control_store = agent_control_store::AgentControlStore::open(
+            &root,
+            &credential_store,
+            installation_principal,
+            1,
+        )
+        .unwrap();
+        let registry = product_session::ProductSessionRegistry::new(&credential_store);
+        let payload = isyncyou_agent::PairingPayload::generate(
+            isyncyou_agent::SessionId::new("session-v2").unwrap(),
+        )
+        .unwrap();
+        let source = isyncyou_agent::PairingSourceSecretV2::create(&payload, 1_000).unwrap();
+        let challenge = control_store
+            .start_user_presence(
+                "019f0000-0000-4000-8000-000000000911",
+                agent_control_store::UserPresenceBinding::PairingImport {
+                    pairing_code: source.reveal_code(),
+                },
+                1_001,
+            )
+            .unwrap();
+        control_store
+            .confirm_user_presence(
+                &challenge.operation_id,
+                &challenge.intent_id,
+                &challenge.token,
+                &challenge.action_hash,
+                1_002,
+            )
+            .unwrap();
+        let (_, claim) = control_store
+            .begin_pairing_claim(
+                "019f0000-0000-4000-8000-000000000912",
+                &challenge.operation_id,
+                "me",
+                source.descriptor(),
+                installation_principal,
+                1_003,
+            )
+            .unwrap();
+        let session = registry
+            .import_pairing_payload(
+                "019f0000-0000-4000-8000-000000000912",
+                "me",
+                &claim.payload,
+                1_004,
+            )
+            .unwrap();
+        control_store
+            .mark_pairing_claim_installed(&challenge.operation_id, &session.session_id)
+            .unwrap();
+        let finalize_request_id = "019f0000-0000-4000-8000-000000000913";
+        let consumed = claim.finalize(&claim.descriptor).unwrap();
+        control_store
+            .mark_pairing_claim_remote_consumed(&challenge.operation_id, finalize_request_id)
+            .unwrap();
+        let transport = FakePairingRecoveryTransport {
+            current: std::sync::Mutex::new(Some(consumed)),
+            lose_first_publish_response: std::sync::atomic::AtomicBool::new(false),
+            fail_first_delete: std::sync::atomic::AtomicBool::new(false),
+            lose_first_delete_match: std::sync::atomic::AtomicBool::new(true),
+        };
+        let target = control_store
+            .pairing_claim_recovery_targets(8, 1_005)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        recover_pairing_claim_target(
+            &control_store,
+            &registry,
+            &target,
+            installation_principal,
+            1_005,
+            &transport,
+        )
+        .unwrap();
+
+        assert!(transport.current.lock().unwrap().is_some());
+        assert_eq!(
+            control_store
+                .pairing_claim_state(&challenge.operation_id, None)
+                .unwrap(),
+            Some("consumed".into())
+        );
+        let cleanup = control_store
+            .pairing_claim_descriptor_cleanup_targets(8)
+            .unwrap();
+        assert_eq!(cleanup.len(), 1);
+        cleanup_pairing_claim_descriptor_target(&control_store, &cleanup[0], 1_006, &transport)
+            .unwrap();
+        assert!(transport.current.lock().unwrap().is_none());
+        assert!(control_store
+            .pairing_claim_descriptor_cleanup_targets(8)
+            .unwrap()
+            .is_empty());
+        drop(control_store);
+        drop(credential_store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn pairing_source_cleanup_retains_authority_until_delete_or_absence_is_proven() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("pairing-source-cleanup-authority");
+        let _ = std::fs::remove_dir_all(&root);
+        let credential_store = agent_credential_store(&root).unwrap();
+        let control_store = agent_control_store::AgentControlStore::open(
+            &root,
+            &credential_store,
+            "pairing-recovery-id-01",
+            1,
+        )
+        .unwrap();
+        let payload = isyncyou_agent::PairingPayload::generate(
+            isyncyou_agent::SessionId::new("session-v2").unwrap(),
+        )
+        .unwrap();
+        let source_record = control_store
+            .create_pairing_source(
+                "019f0000-0000-4000-8000-000000000921",
+                "session-v2",
+                &payload,
+                1_000,
+            )
+            .unwrap();
+        let presence = control_store
+            .start_user_presence(
+                "019f0000-0000-4000-8000-000000000922",
+                agent_control_store::UserPresenceBinding::PairingReveal {
+                    session_id: "session-v2".into(),
+                    pair_id: source_record.pair_id.clone(),
+                },
+                1_001,
+            )
+            .unwrap();
+        control_store
+            .confirm_user_presence(
+                &presence.operation_id,
+                &presence.intent_id,
+                &presence.token,
+                &presence.action_hash,
+                1_002,
+            )
+            .unwrap();
+        let source = control_store
+            .consume_pairing_reveal(
+                &presence.operation_id,
+                "019f0000-0000-4000-8000-000000000923",
+                1_003,
+            )
+            .unwrap();
+        let revoke_request = "019f0000-0000-4000-8000-000000000924";
+        control_store
+            .begin_pairing_revoke(&presence.operation_id, revoke_request)
+            .unwrap();
+        control_store
+            .complete_pairing_revoke(&presence.operation_id, revoke_request, 1_004)
+            .unwrap();
+        control_store
+            .reap_expired(1_004 + 8 * 24 * 60 * 60 * 1_000, 256)
+            .unwrap();
+        let target = control_store
+            .pairing_descriptor_cleanup_targets(8)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let transport = FakePairingRecoveryTransport {
+            current: std::sync::Mutex::new(Some(source.descriptor().clone().revoke().unwrap())),
+            lose_first_publish_response: std::sync::atomic::AtomicBool::new(false),
+            fail_first_delete: std::sync::atomic::AtomicBool::new(false),
+            lose_first_delete_match: std::sync::atomic::AtomicBool::new(true),
+        };
+
+        assert_eq!(
+            cleanup_pairing_source_descriptor_target(&control_store, &target, 1_005, &transport,),
+            Err("pairing_outcome_unknown".into())
+        );
+        assert_eq!(
+            control_store
+                .pairing_descriptor_cleanup_targets(8)
+                .unwrap()
+                .len(),
+            1
+        );
+        *transport.current.lock().unwrap() = None;
+        cleanup_pairing_source_descriptor_target(&control_store, &target, 1_006, &transport)
+            .unwrap();
+        assert!(control_store
+            .pairing_descriptor_cleanup_targets(8)
+            .unwrap()
+            .is_empty());
+
+        drop(control_store);
+        drop(credential_store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn pairing_expired_claim_cleans_any_expired_remote_descriptor_state() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("pairing-expired-claim-cleanup");
+        let _ = std::fs::remove_dir_all(&root);
+        let credential_store = agent_credential_store(&root).unwrap();
+        let installation_principal = "pairing-recovery-id-01";
+        let control_store = agent_control_store::AgentControlStore::open(
+            &root,
+            &credential_store,
+            installation_principal,
+            1,
+        )
+        .unwrap();
+        let payload = isyncyou_agent::PairingPayload::generate(
+            isyncyou_agent::SessionId::new("session-v2").unwrap(),
+        )
+        .unwrap();
+        let source = isyncyou_agent::PairingSourceSecretV2::create(&payload, 1_000).unwrap();
+        let presence = control_store
+            .start_user_presence(
+                "019f0000-0000-4000-8000-000000000925",
+                agent_control_store::UserPresenceBinding::PairingImport {
+                    pairing_code: source.reveal_code(),
+                },
+                1_001,
+            )
+            .unwrap();
+        control_store
+            .confirm_user_presence(
+                &presence.operation_id,
+                &presence.intent_id,
+                &presence.token,
+                &presence.action_hash,
+                1_002,
+            )
+            .unwrap();
+        control_store
+            .begin_pairing_claim(
+                "019f0000-0000-4000-8000-000000000926",
+                &presence.operation_id,
+                "me",
+                source.descriptor(),
+                installation_principal,
+                1_003,
+            )
+            .unwrap();
+        let expired_at = 1_003 + 24 * 60 * 60 * 1_000;
+        control_store.reap_expired(expired_at, 256).unwrap();
+        let target = control_store
+            .pairing_claim_descriptor_cleanup_targets(8)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(target.state, "claimed_expired");
+        let transport = FakePairingRecoveryTransport {
+            current: std::sync::Mutex::new(Some(source.descriptor().clone())),
+            lose_first_publish_response: std::sync::atomic::AtomicBool::new(false),
+            fail_first_delete: std::sync::atomic::AtomicBool::new(false),
+            lose_first_delete_match: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        cleanup_pairing_claim_descriptor_target(&control_store, &target, expired_at, &transport)
+            .unwrap();
+        assert!(transport.current.lock().unwrap().is_none());
+        assert!(control_store
+            .pairing_claim_descriptor_cleanup_targets(8)
+            .unwrap()
+            .is_empty());
+
+        drop(control_store);
+        drop(credential_store);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(any(
@@ -26040,6 +27874,23 @@ fn persist_failure_serializes_only_safe_session_code() {
 
 #[cfg(test)]
 #[test]
+fn consumed_product_runtime_cannot_claim_terminal_persistence() {
+    assert_eq!(
+        persist_product_runtime_if_expected::<()>(None, true, |_| Ok(())),
+        Err("session_store_unavailable".into())
+    );
+    assert_eq!(
+        persist_product_runtime_if_expected::<()>(None, false, |_| Ok(())),
+        Ok(())
+    );
+    assert_eq!(
+        persist_product_runtime_if_expected(Some(()), true, |_| Err("lease_lost".into())),
+        Err("lease_lost".into())
+    );
+}
+
+#[cfg(test)]
+#[test]
 fn cancelled_turn_emits_one_done_cancelled() {
     let events = terminal_events_after_persistence(Ok(()), isyncyou_agent::DoneReason::Cancelled);
     assert_eq!(events.len(), 1);
@@ -26049,6 +27900,74 @@ fn cancelled_turn_emits_one_done_cancelled() {
             reason: isyncyou_agent::DoneReason::Cancelled
         }
     ));
+}
+
+#[cfg(test)]
+#[test]
+fn cancelled_or_unpersisted_turn_does_not_publish_provider_usage() {
+    let production = include_str!("lib.rs")
+        .split("#[cfg(test)]\nmod tests")
+        .next()
+        .unwrap();
+    let turn_completion = production
+        .split("fn launch_prepared_turn(")
+        .nth(1)
+        .unwrap()
+        .split("fn fail_reserved_turn(")
+        .next()
+        .unwrap()
+        .split("let usage = provider.last_usage();")
+        .nth(1)
+        .unwrap();
+    let authority_gate = turn_completion.split("match outcome {").next().unwrap();
+    assert!(!authority_gate.contains("last_usage.lock()"));
+
+    let final_branch = turn_completion
+        .split("Ok(isyncyou_agent::TurnOutcome::Final { text }) =>")
+        .nth(1)
+        .unwrap()
+        .split("Ok(isyncyou_agent::TurnOutcome::PendingConfirmation")
+        .next()
+        .unwrap();
+    assert!(final_branch.contains("if persisted.is_ok()"));
+    assert!(final_branch.contains("last_usage.lock()"));
+
+    let pending_branch = turn_completion
+        .split("Ok(PendingTransition::Committed((pending_action, token))) =>")
+        .nth(1)
+        .unwrap()
+        .split("Ok(PendingTransition::Cancelled)")
+        .next()
+        .unwrap();
+    assert!(pending_branch.contains("last_usage.lock()"));
+}
+
+#[cfg(test)]
+#[test]
+fn poisoned_usage_cache_cannot_abort_lifecycle_or_terminal_publication() {
+    let production = include_str!("lib.rs")
+        .split("#[cfg(test)]\nmod tests")
+        .next()
+        .unwrap();
+    assert!(!production.contains("last_usage.lock().unwrap()"));
+    assert!(!production.contains("self.last_usage.lock().unwrap()"));
+}
+
+#[cfg(test)]
+#[test]
+fn product_runtime_logs_use_closed_codes_for_sensitive_failures() {
+    let host = include_str!("lib.rs")
+        .split("#[cfg(test)]\nmod tests")
+        .next()
+        .unwrap();
+    let operations = include_str!("agent_ops.rs");
+    let webui = include_str!("../../../gui/webui/src/serve.rs");
+
+    assert!(!host.contains("push to a device failed: {e}"));
+    assert!(!operations.contains("for {account}: {error}"));
+    assert!(!operations.contains("for {account}: {e}"));
+    assert!(!webui.contains("connection error: {e}"));
+    assert!(!webui.contains("listening on unix:{}"));
 }
 
 #[cfg(test)]
@@ -26095,6 +28014,171 @@ fn turn_cancel_with_existing_pending_requires_explicit_pending_cancel() {
         cancel_turn_with_pending_guard(&turns, &pending, &hub, "turn", 2_001, || Ok(())),
         Err("turn_not_found".into())
     );
+}
+
+#[cfg(test)]
+#[test]
+fn turn_cancel_uses_durable_pending_when_process_registry_is_empty() {
+    let pending = isyncyou_agent::PendingRegistry::new();
+    let turns = TurnRegistry::default();
+    let action = isyncyou_agent::parse_action(&serde_json::json!({
+        "op": "backup",
+        "account": "me",
+        "services": ["mail"]
+    }))
+    .unwrap();
+    pending
+        .register_bound(
+            action,
+            "backup",
+            1_000,
+            60_000,
+            isyncyou_agent::PendingOwnerBinding {
+                account: "me".into(),
+                session_id: "session".into(),
+                request_id: "request".into(),
+                turn_id: "turn-restarted".into(),
+            },
+        )
+        .unwrap();
+    let hub = isyncyou_agent::AgentStreamHub::new();
+    assert_eq!(
+        cancel_turn_with_pending_guard(&turns, &pending, &hub, "turn-restarted", 2_000, || panic!(
+            "pending turn must not persist cancellation"
+        ),),
+        Err("pending_requires_explicit_cancel".into())
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn turn_cancel_checks_durable_pending_before_cancelling_running_state() {
+    let pending = isyncyou_agent::PendingRegistry::new();
+    let turns = TurnRegistry::default();
+    turns.register("turn-crash-window").unwrap();
+    let action = isyncyou_agent::parse_action(&serde_json::json!({
+        "op": "backup",
+        "account": "me",
+        "services": ["mail"]
+    }))
+    .unwrap();
+    pending
+        .register_bound(
+            action,
+            "backup",
+            1_000,
+            60_000,
+            isyncyou_agent::PendingOwnerBinding {
+                account: "me".into(),
+                session_id: "session".into(),
+                request_id: "request".into(),
+                turn_id: "turn-crash-window".into(),
+            },
+        )
+        .unwrap();
+    let hub = isyncyou_agent::AgentStreamHub::new();
+    let _receiver = hub.open("turn-crash-window", 4);
+    assert_eq!(
+        cancel_turn_with_pending_guard(
+            &turns,
+            &pending,
+            &hub,
+            "turn-crash-window",
+            2_000,
+            || panic!("durable pending authority must win the race"),
+        ),
+        Err("pending_requires_explicit_cancel".into())
+    );
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[test]
+fn pending_confirmation_replay_returns_fresh_confirmable_token() {
+    let root = std::env::temp_dir().join(format!(
+        "isyncyou-pending-confirmation-replay-{}",
+        unix_now_ms()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let agent = DaemonAgent::new(Config::default(), root.clone());
+    let owner = isyncyou_agent::PendingOwnerBinding {
+        account: "controlled".into(),
+        session_id: "session-v2".into(),
+        request_id: "019f0000-0000-4000-8000-000000000701".into(),
+        turn_id: "turn-pending-replay".into(),
+    };
+    let action = isyncyou_agent::parse_action(&serde_json::json!({
+        "op": "backup",
+        "account": "controlled",
+        "services": ["mail"]
+    }))
+    .unwrap();
+    let (pending, old_token) = agent
+        .pending
+        .register_bound(action, "backup", unix_now_ms(), 60_000, owner.clone())
+        .unwrap();
+    agent.turns.register(&owner.turn_id).unwrap();
+    let receiver = agent.hub.open(&owner.turn_id, 4);
+
+    agent.emit_product_turn_replay(
+        &owner.turn_id,
+        product_session::ProductTurnReplay {
+            phase: isyncyou_agent::RequestPhase::PendingConfirmation,
+            final_text: None,
+            error_code: None,
+        },
+        Some(&owner),
+    );
+
+    let confirmation = receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("replayed confirmation");
+    let done = receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("replayed pending terminal");
+    let isyncyou_agent::StreamEvent::ConfirmationRequired {
+        id,
+        action: _,
+        preview: _,
+        action_hash,
+        risk: _,
+        expires_at_ms: _,
+        token: new_token,
+    } = confirmation
+    else {
+        panic!("expected replayed confirmation");
+    };
+    assert_eq!(id, pending.id);
+    assert_eq!(action_hash, pending.action_hash);
+    assert!(matches!(
+        done,
+        isyncyou_agent::StreamEvent::Done {
+            reason: isyncyou_agent::DoneReason::PendingConfirmation
+        }
+    ));
+    assert_ne!(new_token, old_token);
+    assert_eq!(
+        agent
+            .pending
+            .confirm(&pending.id, &old_token, &pending.action_hash, unix_now_ms()),
+        Err(isyncyou_agent::ConfirmError::BadToken)
+    );
+    assert!(agent
+        .pending
+        .confirm(&pending.id, &new_token, &pending.action_hash, unix_now_ms())
+        .is_ok());
+    assert!(agent
+        .turns
+        .turns
+        .lock()
+        .unwrap()
+        .get(&owner.turn_id)
+        .is_none());
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[cfg(any(

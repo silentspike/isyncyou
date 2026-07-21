@@ -21,6 +21,7 @@ const MAX_INDEX_ENVELOPE_BYTES: usize = 256 * 1024;
 const MAX_SESSION_SECRET_ENVELOPE_BYTES: usize = 16 * 1024;
 const MAX_REQUEST_RECEIPTS: usize = 512;
 const CURSOR_HMAC_DOMAIN: &[u8] = b"isyncyou-product-session-cursor-v1";
+const CREATE_SESSION_ID_DOMAIN: &[u8] = b"isyncyou-product-session-create-id-v1";
 const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_PAGE_SIZE: usize = 100;
 const TURN_HOLDER_DOMAIN: &[u8] = b"isyncyou-session-holder-v1";
@@ -427,6 +428,9 @@ impl ProductTurnRuntime {
         }
         .seal_digest()
         .map_err(|error| isyncyou_agent::AgentError::Provider(error.to_string()))?;
+        outcome
+            .validate(&self.provider_binding)
+            .map_err(|error| isyncyou_agent::AgentError::Provider(error.to_string()))?;
         let outcome_bytes = serde_json::to_vec(&outcome).map_err(|_| {
             isyncyou_agent::AgentError::Provider("session_store_unavailable".into())
         })?;
@@ -1146,7 +1150,10 @@ impl<'a> ProductSessionRegistry<'a> {
         if index.request_receipts.len() >= MAX_REQUEST_RECEIPTS {
             return Err("session_request_capacity_reached".into());
         }
-        let session_id = new_ulid().map_err(|_| "session_store_unavailable")?;
+        // The secret record and local index are independently durable. Deriving the
+        // opaque ID from the installation key makes a retry reuse the same secret
+        // slot if the process dies after the secret write but before the index write.
+        let session_id = self.session_id_for_create_request(request_id)?;
         let payload = PairingPayload::generate(
             SessionId::new(&session_id).map_err(|_| "session_store_unavailable")?,
         )
@@ -1622,33 +1629,33 @@ impl<'a> ProductSessionRegistry<'a> {
         installation_principal: &str,
         created_at_ms: u64,
     ) -> Result<(), String> {
+        self.append_pending_operation_state(
+            graph_token,
+            owner,
+            installation_principal,
+            "cancelled",
+            created_at_ms,
+        )
+    }
+
+    pub fn append_pending_operation_state(
+        &self,
+        graph_token: &str,
+        owner: &PendingOwnerBinding,
+        installation_principal: &str,
+        code: &str,
+        created_at_ms: u64,
+    ) -> Result<(), String> {
         if owner.session_id == "legacy-local" {
             return Ok(());
         }
-        let store = self.open(graph_token, &owner.session_id)?;
-        let records = store
-            .recent_visible_records(&owner.session_id, 128)
-            .map_err(map_session_error)?;
-        if records.iter().any(|record| {
-            record.request_id == owner.request_id
-                && record.turn_id == owner.turn_id
-                && matches!(
-                    &record.kind,
-                    SessionRecordKind::OperationState { code } if code == "cancelled"
-                )
-        }) {
-            return Ok(());
+        if !matches!(
+            code,
+            "cancelled" | "completed" | "failed" | "outcome_unknown"
+        ) {
+            return Err("session_state_invalid".into());
         }
-        let pending_record_id = records
-            .iter()
-            .rev()
-            .find(|record| {
-                record.request_id == owner.request_id
-                    && record.turn_id == owner.turn_id
-                    && matches!(&record.kind, SessionRecordKind::PendingOperation { .. })
-            })
-            .map(|record| record.record_id.clone())
-            .ok_or_else(|| "session_state_invalid".to_string())?;
+        let store = self.open(graph_token, &owner.session_id)?;
         let lease_id = new_ulid().map_err(|_| "session_store_unavailable")?;
         let holder_binding = self
             .store
@@ -1661,17 +1668,47 @@ impl<'a> ProductSessionRegistry<'a> {
         let guard = store
             .acquire_lease(&owner.session_id, &lease_id, &holder_binding)
             .map_err(map_session_error)?;
+        let current = guard.manifest_snapshot().map_err(map_session_error)?;
+        let records = store
+            .visible_records_for_request_from_manifest(&current, &owner.request_id, &owner.turn_id)
+            .map_err(map_session_error)?;
+        let mut pending_record_id = None;
+        let mut state_exists = false;
+        for record in records {
+            match record.kind {
+                SessionRecordKind::PendingOperation { .. } => {
+                    pending_record_id = Some(record.record_id);
+                }
+                SessionRecordKind::OperationState { code: existing } if existing == code => {
+                    state_exists = true;
+                }
+                _ => {}
+            }
+        }
+        if state_exists {
+            return Ok(());
+        }
+        let Some(pending_record_id) = pending_record_id else {
+            // Cancellation only reduces authority. If pending publication never
+            // became visible, there is no transcript operation left to cancel.
+            return if code == "cancelled" {
+                Ok(())
+            } else {
+                Err("session_state_invalid".into())
+            };
+        };
         let record_id = new_ulid().map_err(|_| "session_store_unavailable")?;
         let lease = guard.binding().map_err(map_session_error)?;
         let observed_head = guard.visible_record_head().map_err(map_session_error)?;
         guard
             .publish(SessionCommitV1 {
-                visible_records: vec![pending_cancelled_record(
+                visible_records: vec![pending_operation_state_record(
                     owner,
                     record_id,
                     pending_record_id,
                     observed_head,
                     lease,
+                    code,
                     created_at_ms,
                 )],
                 request_objects: vec![],
@@ -2020,6 +2057,16 @@ impl<'a> ProductSessionRegistry<'a> {
             .map_err(|_| "session_store_unavailable".to_string())
     }
 
+    fn session_id_for_create_request(&self, request_id: &str) -> Result<String, String> {
+        let digest = self
+            .store
+            .domain_hmac(CREATE_SESSION_ID_DOMAIN, request_id.as_bytes())
+            .map_err(|_| "session_store_unavailable")?;
+        let session_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..16]);
+        SessionId::new(&session_id).map_err(|_| "session_store_unavailable")?;
+        Ok(session_id)
+    }
+
     fn encode_cursor(&self, offset: usize, generation: u64) -> Result<String, String> {
         let offset = u64::try_from(offset).map_err(|_| "invalid_cursor")?;
         let mut payload = Vec::with_capacity(48);
@@ -2058,12 +2105,13 @@ impl<'a> ProductSessionRegistry<'a> {
     }
 }
 
-fn pending_cancelled_record(
+fn pending_operation_state_record(
     owner: &PendingOwnerBinding,
     record_id: String,
     pending_record_id: String,
     observed_head: Option<String>,
     lease: isyncyou_agent::PersistedLeaseBinding,
+    code: &str,
     created_at_ms: u64,
 ) -> SessionRecordV2 {
     SessionRecordV2 {
@@ -2072,9 +2120,7 @@ fn pending_cancelled_record(
         session_id: owner.session_id.clone(),
         request_id: owner.request_id.clone(),
         turn_id: owner.turn_id.clone(),
-        kind: SessionRecordKind::OperationState {
-            code: "cancelled".into(),
-        },
+        kind: SessionRecordKind::OperationState { code: code.into() },
         parent_record_ids: visible_parent_ids(&[pending_record_id], &observed_head),
         observed_head,
         lease,
@@ -2395,6 +2441,45 @@ mod tests {
     }
 
     #[test]
+    fn session_create_retry_reuses_secret_slot_after_pre_index_crash() {
+        let root = temp_root("create-crash-window");
+        let store = credential_store(&root);
+        let registry = ProductSessionRegistry::new(&store);
+        let request_id = "123e4567-e89b-42d3-a456-426614174009";
+        let session_id = registry.session_id_for_create_request(request_id).unwrap();
+
+        // Simulate a process death after the first independently durable write.
+        let orphan = PairingPayload::generate(SessionId::new(&session_id).unwrap()).unwrap();
+        store
+            .put_bounded(
+                SecretClass::SessionPairingKey,
+                &session_secret_id(&session_id),
+                &Secret::new(orphan.encode().unwrap().into_bytes()),
+                MAX_SESSION_SECRET_ENVELOPE_BYTES,
+            )
+            .unwrap();
+        assert!(registry.load_index().unwrap().sessions.is_empty());
+
+        let created = registry
+            .create("me", request_id, Some("Recovered"), 1)
+            .unwrap();
+        assert_eq!(created.session_id, session_id);
+        let index = registry.load_index().unwrap();
+        assert_eq!(index.sessions.len(), 1);
+        assert_eq!(index.request_receipts.len(), 1);
+        assert_eq!(
+            registry
+                .pairing_payload(&session_id)
+                .unwrap()
+                .session_id
+                .as_str(),
+            session_id
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn crash_after_provider_step_started_records_outcome_unknown_and_retains_diagnostics() {
         const SESSION_ID: &str = "01J00000000000000000000000";
         const REQUEST_ID: &str = "123e4567-e89b-42d3-a456-426614174000";
@@ -2498,7 +2583,7 @@ mod tests {
             request_id: "123e4567-e89b-42d3-a456-426614174000".into(),
             turn_id: "01J00000000000000000000001".into(),
         };
-        let record = pending_cancelled_record(
+        let record = pending_operation_state_record(
             &owner,
             "01J00000000000000000000002".into(),
             "01J00000000000000000000003".into(),
@@ -2509,6 +2594,7 @@ mod tests {
                 holder_binding: "holder".into(),
                 expires_at_server_ms: 120_000,
             },
+            "cancelled",
             10,
         );
         let encoded = serde_json::to_string(&record).unwrap();
@@ -2809,6 +2895,24 @@ mod tests {
             outcome.terminal_validation_error.as_deref(),
             Some(isyncyou_agent::DUPLICATE_TOOL_USE_ID_CODE)
         );
+    }
+
+    #[test]
+    fn provider_step_outcome_is_validated_before_authoritative_publication() {
+        let source = include_str!("product_session.rs");
+        let persist = source
+            .split("fn persist_provider_step_outcome(")
+            .nth(1)
+            .and_then(|source| source.split("pub fn finish_final(").next())
+            .expect("provider outcome persistence implementation");
+        let validation = persist
+            .find(".validate(&self.provider_binding)")
+            .expect("provider outcome validation");
+        let publication = persist
+            .find("self.publish_pending_request_objects()")
+            .expect("provider outcome publication");
+
+        assert!(validation < publication);
     }
 
     #[test]

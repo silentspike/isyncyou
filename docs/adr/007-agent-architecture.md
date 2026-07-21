@@ -157,7 +157,7 @@ The constraints that force the shape of this decision:
     `credential_revoke` foreground guard and a one-shot session/guard/purpose-bound network
     snapshot. Default product artifacts exclude deterministic lifecycle test hooks.
 
-15. **Shared product-session authority (REQ-AGENT-016, S-AG.16/#628).** Writable
+15. **Shared product-session authority (REQ-AGENT-016, S-AG.13/#628).** Writable
     product sessions use V2 encrypted records and an authoritative manifest. Immutable
     visible records, request journals, provider-step outcomes, and UUID bindings are
     staged first and become authoritative only through one lease- and fence-bound
@@ -171,9 +171,17 @@ The constraints that force the shape of this decision:
     publication. App-wide confirmation, pairing, mutation reservations, and request
     tombstones live in one encrypted control store. Pairing V2 reveals a five-minute
     one-time transfer only after user presence and permanently fences the first claim.
+    Source and destination cleanup receipts retain encrypted deletion authority until a
+    conditional remote delete succeeds or remote absence is observed; retention time alone
+    cannot reap that authority.
     Mutable APIs use strict JSON and bounded sealed chunks; desktop authority is an
     HttpOnly process cookie with exact-origin mutation checks, while Android injects
-    its native session authority.
+    its native session authority. App-wide request receipts never retain API response
+    bodies or headers: terminal mutations keep only a closed status plus a
+    domain-separated result digest, and a same-request replay returns a fixed closed
+    completion response without executing the effect again. Mutation-intent commits likewise erase
+    their sealed result JSON immediately and retain only committed state and a result
+    digest for the bounded replay window.
 
 ## Consequences
 
