@@ -1459,18 +1459,18 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
         Ok(candidates)
     }
 
-    /// Read only the durable lifecycle phase for a previously accepted request.
+    /// Read only the durable lifecycle status for a previously accepted request.
     ///
     /// Status lookup deliberately does not accept a payload digest: the original
     /// semantic binding remains sealed in the UUID index and this path cannot
     /// authorize a replay. The caller must still supply the exact closed route
     /// domain, session scope, and canonical request UUID.
-    pub fn request_phase(
+    pub fn request_status(
         &self,
         session_id: &str,
         route: RequestRouteDomain,
         request_id: &str,
-    ) -> Result<Option<RequestPhase>, SessionV2Error> {
+    ) -> Result<Option<RequestStatusV1>, SessionV2Error> {
         if session_id.is_empty() || session_id.len() > 128 || !valid_uuid_v4(request_id) {
             return Err(SessionV2Error::InvalidRequestId);
         }
@@ -1518,7 +1518,7 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
                     let visible_records =
                         self.load_tombstone_visible_records(&current, &tombstone, request_id)?;
                     tombstone.validate_visible_records(request_id, &visible_records)?;
-                    return Ok(Some(match tombstone.terminal_status {
+                    let phase = match tombstone.terminal_status {
                         TurnTerminalStatus::Complete => RequestPhase::Committed,
                         TurnTerminalStatus::PendingConfirmation => {
                             RequestPhase::PendingConfirmation
@@ -1526,6 +1526,21 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
                         TurnTerminalStatus::Cancelled => RequestPhase::Cancelled,
                         TurnTerminalStatus::Error => RequestPhase::Failed,
                         TurnTerminalStatus::OutcomeUnknown => RequestPhase::OutcomeUnknown,
+                    };
+                    let terminal_code = visible_records
+                        .iter()
+                        .find_map(|record| match &record.kind {
+                            SessionRecordKind::TurnTerminal { status, error_code }
+                                if *status == tombstone.terminal_status =>
+                            {
+                                Some(error_code.clone())
+                            }
+                            _ => None,
+                        })
+                        .flatten();
+                    return Ok(Some(RequestStatusV1 {
+                        phase,
+                        terminal_code,
                     }));
                 }
                 continue;
@@ -1535,10 +1550,23 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
             };
             if journal.session_id == session_id && journal.request_id == request_id {
                 self.load_request_chain(&journal)?;
-                return Ok(Some(journal.phase.recovery_phase()));
+                return Ok(Some(RequestStatusV1 {
+                    phase: journal.phase.recovery_phase(),
+                    terminal_code: None,
+                }));
             }
         }
         Err(SessionV2Error::InvalidJournal)
+    }
+
+    pub fn request_phase(
+        &self,
+        session_id: &str,
+        route: RequestRouteDomain,
+        request_id: &str,
+    ) -> Result<Option<RequestPhase>, SessionV2Error> {
+        self.request_status(session_id, route, request_id)
+            .map(|status| status.map(|status| status.phase))
     }
 
     fn load_tombstone_visible_records(
@@ -4136,6 +4164,12 @@ pub enum RequestPhase {
     OutcomeUnknown,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestStatusV1 {
+    pub phase: RequestPhase,
+    pub terminal_code: Option<String>,
+}
+
 impl RequestPhase {
     pub fn permits_automatic_resume(self) -> bool {
         matches!(self, Self::Accepted | Self::ProviderStepCompleted)
@@ -5876,8 +5910,8 @@ mod tests {
         let assistant = assistant_record("0000000000000000000000000D", ULID_A, RID, "answer");
         let mut terminal = record("0000000000000000000000000E", ULID_A, RID, "placeholder");
         terminal.kind = SessionRecordKind::TurnTerminal {
-            status: TurnTerminalStatus::Complete,
-            error_code: None,
+            status: TurnTerminalStatus::Error,
+            error_code: Some("provider_rate_limited".into()),
         };
         let mut visible_records = vec![assistant, terminal];
         link_visible_records(
@@ -5891,7 +5925,7 @@ mod tests {
             session_scope: "s".into(),
             request_key: request_binding.request_key.clone(),
             payload_digest: request_binding.payload_digest.clone(),
-            terminal_status: TurnTerminalStatus::Complete,
+            terminal_status: TurnTerminalStatus::Error,
             public_result_digest: request_object_digest(
                 &serde_json::to_vec(&visible_records).unwrap(),
             ),
@@ -5937,6 +5971,15 @@ mod tests {
         assert!(replay.journal.is_none());
         assert!(replay.outcomes.is_empty());
         assert_eq!(replay.visible_records.len(), 3);
+        assert_eq!(
+            store
+                .request_status("s", RequestRouteDomain::AgentTurn, RID)
+                .unwrap(),
+            Some(RequestStatusV1 {
+                phase: RequestPhase::Failed,
+                terminal_code: Some("provider_rate_limited".into()),
+            })
+        );
     }
 
     #[test]
@@ -6152,7 +6195,7 @@ mod tests {
         let mut terminal = record("0000000000000000000000000E", ULID_A, RID, "placeholder");
         terminal.kind = SessionRecordKind::TurnTerminal {
             status: TurnTerminalStatus::OutcomeUnknown,
-            error_code: Some("turn_outcome_unknown".into()),
+            error_code: Some("provider_response_timed_out".into()),
         };
         let mut visible_records = vec![terminal];
         link_visible_records(
@@ -6199,6 +6242,15 @@ mod tests {
             .expect("terminal replay");
         assert_eq!(replay.tombstone, Some(tombstone));
         assert!(replay.journal.is_none());
+        assert_eq!(
+            store
+                .request_status("s", RequestRouteDomain::AgentTurn, RID)
+                .unwrap(),
+            Some(RequestStatusV1 {
+                phase: RequestPhase::OutcomeUnknown,
+                terminal_code: Some("provider_response_timed_out".into()),
+            })
+        );
     }
 
     #[test]

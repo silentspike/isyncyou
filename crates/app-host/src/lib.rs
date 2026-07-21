@@ -834,8 +834,19 @@ const HOT_SESSION_HISTORY_READY_TTL: Duration = Duration::from_secs(5);
 ))]
 #[derive(Default)]
 struct HotRequestStatusCache {
-    entries: Mutex<HashMap<(String, String), (isyncyou_agent::RequestPhase, u64)>>,
+    entries: Mutex<HashMap<(String, String), HotRequestStatusEntry>>,
     sequence: AtomicU64,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
+struct HotRequestStatusEntry {
+    phase: isyncyou_agent::RequestPhase,
+    terminal_code: Option<String>,
+    sequence: u64,
 }
 
 #[cfg(any(
@@ -845,6 +856,16 @@ struct HotRequestStatusCache {
 ))]
 impl HotRequestStatusCache {
     fn insert(&self, session_id: &str, request_id: &str, phase: isyncyou_agent::RequestPhase) {
+        self.insert_with_terminal_code(session_id, request_id, phase, None);
+    }
+
+    fn insert_with_terminal_code(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        phase: isyncyou_agent::RequestPhase,
+        terminal_code: Option<&str>,
+    ) {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
         let mut entries = self
             .entries
@@ -854,21 +875,32 @@ impl HotRequestStatusCache {
         if entries.len() >= MAX_HOT_REQUEST_STATUSES && !entries.contains_key(&key) {
             if let Some(oldest) = entries
                 .iter()
-                .min_by_key(|(_, (_, inserted))| *inserted)
+                .min_by_key(|(_, entry)| entry.sequence)
                 .map(|(key, _)| key.clone())
             {
                 entries.remove(&oldest);
             }
         }
-        entries.insert(key, (phase, sequence));
+        entries.insert(
+            key,
+            HotRequestStatusEntry {
+                phase,
+                terminal_code: terminal_code.map(str::to_owned),
+                sequence,
+            },
+        );
     }
 
-    fn get(&self, session_id: &str, request_id: &str) -> Option<isyncyou_agent::RequestPhase> {
+    fn get(
+        &self,
+        session_id: &str,
+        request_id: &str,
+    ) -> Option<(isyncyou_agent::RequestPhase, Option<String>)> {
         self.entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&(session_id.to_owned(), request_id.to_owned()))
-            .map(|(phase, _)| *phase)
+            .map(|entry| (entry.phase, entry.terminal_code.clone()))
     }
 
     fn remove(&self, session_id: &str, request_id: &str) {
@@ -1193,10 +1225,11 @@ fn cache_persisted_request_phase(
     binding: Option<&(String, String)>,
     persisted: &Result<(), String>,
     phase: isyncyou_agent::RequestPhase,
+    terminal_code: Option<&str>,
 ) {
     if persisted.is_ok() {
         if let Some((session_id, request_id)) = binding {
-            cache.insert(session_id, request_id, phase);
+            cache.insert_with_terminal_code(session_id, request_id, phase, terminal_code);
         }
     }
 }
@@ -1210,6 +1243,7 @@ fn request_status_json_with_terminal_code(
     phase: isyncyou_agent::RequestPhase,
     terminal_code: Option<&str>,
 ) -> serde_json::Value {
+    let safe_start_code = terminal_code.map(agent_safe_turn_start_error);
     let (state, code, terminal, resume_allowed) = match phase {
         isyncyou_agent::RequestPhase::Accepted => {
             ("accepted", "request_resume_required", false, true)
@@ -1230,8 +1264,8 @@ fn request_status_json_with_terminal_code(
         isyncyou_agent::RequestPhase::Committed => ("committed", "ok", true, false),
         isyncyou_agent::RequestPhase::Failed => (
             "failed",
-            terminal_code
-                .map(agent_safe_turn_start_error)
+            safe_start_code
+                .filter(|code| *code != "turn_start_failed")
                 .unwrap_or("turn_failed"),
             true,
             false,
@@ -1244,26 +1278,19 @@ fn request_status_json_with_terminal_code(
         "terminal": terminal,
         "resume_allowed": resume_allowed,
     });
-    if matches!(
+    let exposes_diagnostic = matches!(
         phase,
         isyncyou_agent::RequestPhase::ProviderStepStarted
             | isyncyou_agent::RequestPhase::OutcomeUnknown
-    ) {
+    ) || (phase == isyncyou_agent::RequestPhase::Failed
+        && safe_start_code == Some("turn_start_failed"));
+    if exposes_diagnostic {
         if let Some(diagnostic) = terminal_code {
             status["diagnostic_code"] =
                 serde_json::Value::String(agent_safe_outcome_diagnostic(diagnostic).into());
         }
     }
     status
-}
-
-#[cfg(any(
-    feature = "agent-oauth-providers",
-    feature = "agent-subscription-experimental",
-    test
-))]
-fn request_status_json(phase: isyncyou_agent::RequestPhase) -> serde_json::Value {
-    request_status_json_with_terminal_code(phase, None)
 }
 
 #[cfg(any(
@@ -9056,6 +9083,7 @@ impl DaemonAgent {
                             hot_request_binding.as_ref(),
                             &persisted,
                             isyncyou_agent::RequestPhase::Committed,
+                            None,
                         );
                         for event in terminal_events_after_persistence(
                             persisted,
@@ -9094,7 +9122,7 @@ impl DaemonAgent {
                                         &hot_session_history,
                                         runtime.finish_terminal(
                                             terminal_status,
-                                            error_code,
+                                            error_code.clone(),
                                             phase,
                                             unix_now_ms(),
                                         ),
@@ -9106,6 +9134,7 @@ impl DaemonAgent {
                                     hot_request_binding.as_ref(),
                                     &persisted,
                                     phase,
+                                    error_code.as_deref(),
                                 );
                                 let events = if cancelled {
                                     terminal_events_after_persistence(persisted, done_reason)
@@ -9172,6 +9201,7 @@ impl DaemonAgent {
                                 hot_request_binding.as_ref(),
                                 &Ok(()),
                                 isyncyou_agent::RequestPhase::PendingConfirmation,
+                                None,
                             );
                             Ok((pending_action.id.clone(), (pending_action, token)))
                         });
@@ -9215,6 +9245,7 @@ impl DaemonAgent {
                                     hot_request_binding.as_ref(),
                                     &persisted,
                                     isyncyou_agent::RequestPhase::Cancelled,
+                                    None,
                                 );
                                 for event in terminal_events_after_persistence(
                                     persisted,
@@ -9250,7 +9281,7 @@ impl DaemonAgent {
                                         &hot_session_history,
                                         runtime.finish_terminal(
                                             terminal_status,
-                                            error_code,
+                                            error_code.clone(),
                                             phase,
                                             unix_now_ms(),
                                         ),
@@ -9262,6 +9293,7 @@ impl DaemonAgent {
                                     hot_request_binding.as_ref(),
                                     &persisted,
                                     phase,
+                                    error_code.as_deref(),
                                 );
                                 let events = if cancelled {
                                     terminal_events_after_persistence(persisted, done_reason)
@@ -9296,6 +9328,7 @@ impl DaemonAgent {
                             hot_request_binding.as_ref(),
                             &persisted,
                             isyncyou_agent::RequestPhase::Cancelled,
+                            None,
                         );
                         if persisted.is_ok() {
                             let _ = hub.emit_terminal(
@@ -9338,16 +9371,17 @@ impl DaemonAgent {
                                 isyncyou_agent::RequestPhase::Failed,
                             )
                         };
+                        let terminal_code = if provider_outcome_ambiguous {
+                            diagnostic_code.clone()
+                        } else {
+                            safe_error.clone()
+                        };
                         let mut persisted = product_turn.map_or(Ok(()), |runtime| {
                             cache_product_session_context(
                                 &hot_session_history,
                                 runtime.finish_terminal(
                                     terminal_status,
-                                    Some(if provider_outcome_ambiguous {
-                                        diagnostic_code.clone()
-                                    } else {
-                                        safe_error.clone()
-                                    }),
+                                    Some(terminal_code.clone()),
                                     phase,
                                     unix_now_ms(),
                                 ),
@@ -9366,6 +9400,7 @@ impl DaemonAgent {
                             hot_request_binding.as_ref(),
                             &persisted,
                             phase,
+                            Some(&terminal_code),
                         );
                         let code = if persisted.is_ok() {
                             safe_error
@@ -9756,18 +9791,27 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 control_store.agent_turn_admission_status(request_id, &request_scope)?;
             if let Some((phase, error_code)) = durable_admission.as_ref() {
                 if *phase != isyncyou_agent::RequestPhase::Accepted {
-                    self.hot_request_statuses
-                        .insert(session_id, request_id, *phase);
+                    self.hot_request_statuses.insert_with_terminal_code(
+                        session_id,
+                        request_id,
+                        *phase,
+                        error_code.as_deref(),
+                    );
                     return Ok(request_status_json_with_terminal_code(
                         *phase,
                         error_code.as_deref(),
                     ));
                 }
             }
-            if let Some(phase) = self.hot_request_statuses.get(session_id, request_id) {
-                return Ok(request_status_json(phase));
+            if let Some((phase, terminal_code)) =
+                self.hot_request_statuses.get(session_id, request_id)
+            {
+                return Ok(request_status_json_with_terminal_code(
+                    phase,
+                    terminal_code.as_deref(),
+                ));
             }
-            let remote_phase = (|| -> Result<Option<isyncyou_agent::RequestPhase>, String> {
+            let remote_status = (|| -> Result<Option<isyncyou_agent::RequestStatusV1>, String> {
                 let store = agent_credential_store(&self.oauth_dir)
                     .map_err(|_| "session_store_unavailable".to_string())?;
                 let registry = product_session::ProductSessionRegistry::new(&store);
@@ -9776,7 +9820,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     .map_err(|_| "session_transport_unavailable".to_string())?;
                 registry
                     .open(&token, session_id)?
-                    .request_phase(
+                    .request_status(
                         session_id,
                         isyncyou_agent::RequestRouteDomain::AgentTurn,
                         request_id,
@@ -9812,8 +9856,8 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                         _ => "session_store_unavailable".to_string(),
                     })
             })();
-            let phase = match remote_phase {
-                Ok(phase) => phase,
+            let status = match remote_status {
+                Ok(status) => status,
                 Err(error)
                     if durable_admission.is_some()
                         && durable_admission_covers_remote_status_error(&error) =>
@@ -9822,14 +9866,25 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 }
                 Err(error) => return Err(error),
             };
-            if let Some(phase) = phase {
-                self.hot_request_statuses
-                    .insert(session_id, request_id, phase);
-                return Ok(request_status_json(phase));
+            if let Some(status) = status {
+                self.hot_request_statuses.insert_with_terminal_code(
+                    session_id,
+                    request_id,
+                    status.phase,
+                    status.terminal_code.as_deref(),
+                );
+                return Ok(request_status_json_with_terminal_code(
+                    status.phase,
+                    status.terminal_code.as_deref(),
+                ));
             }
             if let Some((phase, error_code)) = durable_admission {
-                self.hot_request_statuses
-                    .insert(session_id, request_id, phase);
+                self.hot_request_statuses.insert_with_terminal_code(
+                    session_id,
+                    request_id,
+                    phase,
+                    error_code.as_deref(),
+                );
                 return Ok(request_status_json_with_terminal_code(
                     phase,
                     error_code.as_deref(),
@@ -25344,14 +25399,14 @@ fn agent_request_status_prefers_bounded_hot_terminal_state() {
     assert!(cache.get("session", "request-0").is_none());
     assert_eq!(
         cache.get("session", &format!("request-{MAX_HOT_REQUEST_STATUSES}")),
-        Some(isyncyou_agent::RequestPhase::Committed)
+        Some((isyncyou_agent::RequestPhase::Committed, None))
     );
     cache.remove("session", &format!("request-{MAX_HOT_REQUEST_STATUSES}"));
     assert!(cache
         .get("session", &format!("request-{MAX_HOT_REQUEST_STATUSES}"))
         .is_none());
     assert_eq!(
-        request_status_json(isyncyou_agent::RequestPhase::Committed),
+        request_status_json_with_terminal_code(isyncyou_agent::RequestPhase::Committed, None),
         serde_json::json!({
             "state": "committed",
             "code": "ok",
@@ -25375,8 +25430,27 @@ fn agent_request_status_prefers_bounded_hot_terminal_state() {
         request_status_json_with_terminal_code(
             isyncyou_agent::RequestPhase::Failed,
             Some("raw private transport detail"),
-        )["code"],
-        "turn_start_failed"
+        ),
+        serde_json::json!({
+            "state": "failed",
+            "code": "turn_failed",
+            "terminal": true,
+            "resume_allowed": false,
+            "diagnostic_code": "provider_request_failed",
+        })
+    );
+    assert_eq!(
+        request_status_json_with_terminal_code(
+            isyncyou_agent::RequestPhase::Failed,
+            Some("provider_rate_limited"),
+        ),
+        serde_json::json!({
+            "state": "failed",
+            "code": "turn_failed",
+            "terminal": true,
+            "resume_allowed": false,
+            "diagnostic_code": "provider_rate_limited",
+        })
     );
     assert_eq!(
         request_status_json_with_terminal_code(
@@ -25487,7 +25561,7 @@ fn active_turn_admission_survives_hot_status_eviction() {
             &request.request_id,
         )
         .unwrap(),
-        request_status_json(isyncyou_agent::RequestPhase::Accepted)
+        request_status_json_with_terminal_code(isyncyou_agent::RequestPhase::Accepted, None)
     );
 
     drop(agent);
@@ -25585,7 +25659,7 @@ fn durable_turn_cancellation_overrides_stale_hot_request_status() {
             &request.request_id,
         )
         .unwrap(),
-        request_status_json(isyncyou_agent::RequestPhase::Cancelled)
+        request_status_json_with_terminal_code(isyncyou_agent::RequestPhase::Cancelled, None)
     );
     drop(agent);
     let _ = std::fs::remove_dir_all(root);
@@ -25601,6 +25675,7 @@ fn terminal_request_status_is_cached_only_after_persistence() {
         Some(&binding),
         &Err("lease_lost".into()),
         isyncyou_agent::RequestPhase::Committed,
+        None,
     );
     assert!(cache.get("session", "request").is_none());
 
@@ -25608,11 +25683,15 @@ fn terminal_request_status_is_cached_only_after_persistence() {
         &cache,
         Some(&binding),
         &Ok(()),
-        isyncyou_agent::RequestPhase::Committed,
+        isyncyou_agent::RequestPhase::Failed,
+        Some("provider_rate_limited"),
     );
     assert_eq!(
         cache.get("session", "request"),
-        Some(isyncyou_agent::RequestPhase::Committed)
+        Some((
+            isyncyou_agent::RequestPhase::Failed,
+            Some("provider_rate_limited".into()),
+        ))
     );
 }
 
