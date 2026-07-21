@@ -277,21 +277,6 @@ fn terminal_replay_phase(status: &TurnTerminalStatus) -> RequestPhase {
     }
 }
 
-fn terminal_compaction_due(
-    tombstone: &IdempotencyTombstoneV1,
-    visible_records: &[SessionRecordV2],
-    server_now_ms: u64,
-) -> bool {
-    let terminal_created_at_ms = visible_records
-        .iter()
-        .filter(|record| tombstone.visible_record_ids.contains(&record.record_id))
-        .map(|record| record.created_at_ms)
-        .max();
-    terminal_created_at_ms.is_some_and(|created_at_ms| {
-        terminal_compaction_due_at(tombstone, created_at_ms, server_now_ms)
-    })
-}
-
 fn terminal_compaction_due_at(
     tombstone: &IdempotencyTombstoneV1,
     terminal_created_at_ms: u64,
@@ -1784,29 +1769,9 @@ impl<'a> ProductSessionRegistry<'a> {
             }
             if let Some(tombstone) = replay.tombstone {
                 let phase = terminal_replay_phase(&tombstone.terminal_status);
-                if terminal_compaction_due(
-                    &tombstone,
-                    &replay.visible_records,
-                    admission_time.server_unix_ms,
-                ) {
-                    let lease_id = new_ulid().map_err(|_| "session_store_unavailable")?;
-                    let holder_binding = self
-                        .store
-                        .domain_hmac(
-                            TURN_HOLDER_DOMAIN,
-                            format!("{installation_principal}:{session_id}").as_bytes(),
-                        )
-                        .map(|bytes| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
-                        .map_err(|_| "session_store_unavailable")?;
-                    if let Ok(mut guard) = store.acquire_lease_from_manifest(
-                        current.clone(),
-                        &lease_id,
-                        &holder_binding,
-                    ) {
-                        let _ = guard.compact_terminal_request(request_id, &tombstone);
-                        let _ = guard.release();
-                    }
-                }
+                // A terminal replay is a read-only idempotency lookup. Recovery-payload
+                // compaction is owned by bounded session maintenance so a retry cannot
+                // acquire a lease or block a new turn while scanning remote objects.
                 return Ok(ProductTurnStart::Replay(ProductTurnReplay {
                     phase,
                     final_text,
@@ -3052,19 +3017,37 @@ mod tests {
             visible_record_ids: vec![terminal.record_id.clone()],
         };
 
-        assert!(!terminal_compaction_due(
+        assert!(!terminal_compaction_due_at(
             &tombstone,
-            std::slice::from_ref(&terminal),
+            terminal.created_at_ms,
             10_000 + OUTCOME_UNKNOWN_RETENTION_MS - 1,
         ));
-        assert!(terminal_compaction_due(
+        assert!(terminal_compaction_due_at(
             &tombstone,
-            std::slice::from_ref(&terminal),
+            terminal.created_at_ms,
             10_000 + OUTCOME_UNKNOWN_RETENTION_MS,
         ));
         let mut complete = tombstone;
         complete.terminal_status = TurnTerminalStatus::Complete;
-        assert!(terminal_compaction_due(&complete, &[terminal], 10_000));
+        assert!(terminal_compaction_due_at(
+            &complete,
+            terminal.created_at_ms,
+            10_000
+        ));
+    }
+
+    #[test]
+    fn terminal_replay_is_read_only_and_leaves_compaction_to_maintenance() {
+        let source = include_str!("product_session.rs");
+        let replay = source
+            .split("if let Some(tombstone) = replay.tombstone {")
+            .nth(1)
+            .and_then(|source| source.split("let journal = replay").next())
+            .expect("terminal replay branch");
+
+        assert!(replay.contains("ProductTurnStart::Replay"));
+        assert!(!replay.contains("acquire_lease"));
+        assert!(!replay.contains("compact_terminal_request"));
     }
 
     #[test]
