@@ -565,6 +565,63 @@ fn agent_safe_turn_start_error(error: &str) -> &'static str {
     feature = "agent-subscription-experimental",
     test
 ))]
+fn recovered_turn_start_error_is_retryable(error: &str) -> bool {
+    matches!(
+        error,
+        "provider_busy"
+            | "session_busy"
+            | "manifest_conflict"
+            | "session_transport_unavailable"
+            | "session_transport_timed_out"
+            | "session_name_resolution_failed"
+            | "session_tls_failed"
+            | "session_connect_failed"
+            | "session_storage_response_invalid"
+    )
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
+#[derive(Debug, PartialEq, Eq)]
+enum TurnAdmissionPreparation<T> {
+    Ready(T),
+    Deferred,
+    Terminal(String),
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
+fn prepare_turn_admission<T>(
+    recovered: bool,
+    mut attempt: impl FnMut() -> Result<T, String>,
+    mut retry_available: impl FnMut() -> bool,
+    mut wait_before_retry: impl FnMut(),
+) -> TurnAdmissionPreparation<T> {
+    loop {
+        match attempt() {
+            Ok(value) => return TurnAdmissionPreparation::Ready(value),
+            Err(error) if recovered && recovered_turn_start_error_is_retryable(&error) => {
+                if !retry_available() {
+                    return TurnAdmissionPreparation::Deferred;
+                }
+                wait_before_retry();
+            }
+            Err(error) => return TurnAdmissionPreparation::Terminal(error),
+        }
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
 fn safe_session_history_error(error: &str) -> &'static str {
     match error {
         "session_store_unavailable" => "session_store_unavailable",
@@ -633,6 +690,20 @@ fn turn_admission_digest(request: &isyncyou_webui::AgentTurnRequest) -> [u8; 32]
     test
 ))]
 const MAX_ACTIVE_TURN_ADMISSIONS: usize = 256;
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+// Covers the authoritative lease plus its server-side takeover margin and transport jitter.
+const RECOVERED_TURN_START_RETRY_WINDOW: Duration =
+    Duration::from_millis(isyncyou_agent::session_v2::SESSION_LEASE_TTL_MS + 30_000);
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+const RECOVERED_TURN_START_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 #[cfg(any(
     feature = "agent-oauth-providers",
@@ -710,6 +781,13 @@ impl HotRequestStatusCache {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&(session_id.to_owned(), request_id.to_owned()))
             .map(|(phase, _)| *phase)
+    }
+
+    fn remove(&self, session_id: &str, request_id: &str) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&(session_id.to_owned(), request_id.to_owned()));
     }
 }
 
@@ -1040,7 +1118,10 @@ fn cache_persisted_request_phase(
     feature = "agent-subscription-experimental",
     test
 ))]
-fn request_status_json(phase: isyncyou_agent::RequestPhase) -> serde_json::Value {
+fn request_status_json_with_terminal_code(
+    phase: isyncyou_agent::RequestPhase,
+    terminal_code: Option<&str>,
+) -> serde_json::Value {
     let (state, code, terminal, resume_allowed) = match phase {
         isyncyou_agent::RequestPhase::Accepted => {
             ("accepted", "request_resume_required", false, true)
@@ -1059,7 +1140,14 @@ fn request_status_json(phase: isyncyou_agent::RequestPhase) -> serde_json::Value
             ("pending_confirmation", "pending_confirmation", true, false)
         }
         isyncyou_agent::RequestPhase::Committed => ("committed", "ok", true, false),
-        isyncyou_agent::RequestPhase::Failed => ("failed", "turn_failed", true, false),
+        isyncyou_agent::RequestPhase::Failed => (
+            "failed",
+            terminal_code
+                .map(agent_safe_turn_start_error)
+                .unwrap_or("turn_failed"),
+            true,
+            false,
+        ),
         isyncyou_agent::RequestPhase::Cancelled => ("cancelled", "turn_cancelled", true, false),
     };
     serde_json::json!({
@@ -1068,6 +1156,15 @@ fn request_status_json(phase: isyncyou_agent::RequestPhase) -> serde_json::Value
         "terminal": terminal,
         "resume_allowed": resume_allowed,
     })
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
+fn request_status_json(phase: isyncyou_agent::RequestPhase) -> serde_json::Value {
+    request_status_json_with_terminal_code(phase, None)
 }
 
 #[cfg(any(
@@ -9497,7 +9594,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 return Err("invalid_request_route".into());
             }
             let request_scope = format!("session_id:{session_id}");
-            if let Some((phase, _error_code)) = self
+            if let Some((phase, error_code)) = self
                 .control_store
                 .as_ref()
                 .ok_or_else(|| "session_store_unavailable".to_string())?
@@ -9505,7 +9602,10 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             {
                 self.hot_request_statuses
                     .insert(session_id, request_id, phase);
-                return Ok(request_status_json(phase));
+                return Ok(request_status_json_with_terminal_code(
+                    phase,
+                    error_code.as_deref(),
+                ));
             }
             if let Some(phase) = self.hot_request_statuses.get(session_id, request_id) {
                 return Ok(request_status_json(phase));
@@ -10412,6 +10512,10 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 .ok_or_else(|| "session_store_unavailable".to_string())?;
             let durable_state =
                 control_store.begin_agent_turn_admission_identity(&request, &turn_id, &identity)?;
+            let recovered_admission = matches!(
+                &durable_state,
+                agent_control_store::AgentTurnAdmissionBegin::Existing
+            );
             let admission = match self.turn_admissions.reserve(&turn_id, digest) {
                 Ok(Some(admission)) => admission,
                 Ok(None) => return Ok(turn_id),
@@ -10457,93 +10561,129 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 agent_control_store::AgentTurnAdmissionBegin::Inserted
                 | agent_control_store::AgentTurnAdmissionBegin::Existing => {}
             }
+            self.hot_request_statuses.insert(
+                &request.session_id,
+                &request.request_id,
+                isyncyou_agent::RequestPhase::Accepted,
+            );
             let cached_context = self
                 .hot_session_history
                 .context_snapshot(&request.session_id);
-            let worker = Arc::clone(&self);
+            let worker = Arc::downgrade(&self);
             let worker_turn_id = turn_id.clone();
             let admission_cancellation = reserved.cancellation.clone();
             let preparation = spawn_agent_turn_admission(move || {
-                let result = (|| -> Result<(), String> {
-                    let ensure_active = || {
+                let retry_deadline = std::time::Instant::now() + RECOVERED_TURN_START_RETRY_WINDOW;
+                let mut reserved = Some(reserved);
+                let prepared_start = prepare_turn_admission(
+                    recovered_admission,
+                    || {
+                        let worker = worker
+                            .upgrade()
+                            .ok_or_else(|| "daemon_unavailable".to_string())?;
                         if admission_cancellation.is_cancelled() {
-                            Err("turn_cancelled".to_string())
-                        } else {
-                            Ok(())
+                            return Err("turn_cancelled".to_string());
                         }
-                    };
-                    ensure_active()?;
-                    let system = format!(
-                        "{AGENT_SYSTEM_PROMPT}\n\nActive account: {}.",
-                        request.account
-                    );
-                    let prepared = worker.resolve_turn_provider(&system)?;
-                    ensure_active()?;
-                    let provider_binding = prepared
-                        .session_binding
-                        .clone()
-                        .ok_or_else(|| "provider_generation_changed".to_string())?;
-                    let context_budget = product_model_context_budget(
-                        provider_binding.provider,
-                        &provider_binding.model,
-                    )?;
-                    let installation = account_lifecycle_repository(&worker.oauth_dir)
-                        .and_then(|repository| {
-                            repository
-                                .load_existing()
-                                .map_err(|_| "lifecycle_unavailable".to_string())
-                        })?
-                        .ok_or_else(|| "lifecycle_unavailable".to_string())?;
-                    let token = isyncyou_engine::auth::resolve_cached_sync_token(
-                        &worker.cfg,
-                        &request.account,
-                    )
-                    .map_err(|_| "session_writer_reconnect_required".to_string())?;
-                    ensure_active()?;
-                    let store = agent_credential_store(&worker.oauth_dir)
-                        .map_err(|_| "session_store_unavailable".to_string())?;
-                    let registry = product_session::ProductSessionRegistry::new(&store);
-                    ensure_active()?;
-                    let product_turn = registry.begin_turn(product_session::ProductTurnRequest {
-                        graph_token: &token,
-                        session_id: &request.session_id,
-                        request_id: &request.request_id,
-                        turn_id: &worker_turn_id,
-                        local_account: &request.account,
-                        prompt: &request.prompt,
-                        provider_binding,
-                        installation_principal: installation.principal(),
-                        created_at_ms: unix_now_ms(),
-                        cached_context,
-                        context_budget,
-                    });
-                    let mut reserved = reserved;
-                    if matches!(
-                        &product_turn,
-                        Ok(product_session::ProductTurnStart::Replay(_))
-                    ) {
-                        reserved.durable_admission.complete()?;
-                    }
-                    dispatch_prepared_product_turn(
-                        prepared,
-                        product_turn,
-                        |prepared, product_turn| {
-                            worker.launch_prepared_turn(
-                                &request.account,
-                                &request.prompt,
+                        let system = format!(
+                            "{AGENT_SYSTEM_PROMPT}\n\nActive account: {}.",
+                            request.account
+                        );
+                        let prepared = worker.resolve_turn_provider(&system)?;
+                        if admission_cancellation.is_cancelled() {
+                            return Err("turn_cancelled".to_string());
+                        }
+                        let provider_binding = prepared
+                            .session_binding
+                            .clone()
+                            .ok_or_else(|| "provider_generation_changed".to_string())?;
+                        let context_budget = product_model_context_budget(
+                            provider_binding.provider,
+                            &provider_binding.model,
+                        )?;
+                        let installation = account_lifecycle_repository(&worker.oauth_dir)
+                            .and_then(|repository| {
+                                repository
+                                    .load_existing()
+                                    .map_err(|_| "lifecycle_unavailable".to_string())
+                            })?
+                            .ok_or_else(|| "lifecycle_unavailable".to_string())?;
+                        let token = isyncyou_engine::auth::resolve_cached_sync_token(
+                            &worker.cfg,
+                            &request.account,
+                        )
+                        .map_err(|_| "session_writer_reconnect_required".to_string())?;
+                        if admission_cancellation.is_cancelled() {
+                            return Err("turn_cancelled".to_string());
+                        }
+                        let store = agent_credential_store(&worker.oauth_dir)
+                            .map_err(|_| "session_store_unavailable".to_string())?;
+                        let registry = product_session::ProductSessionRegistry::new(&store);
+                        let product_turn =
+                            registry.begin_turn(product_session::ProductTurnRequest {
+                                graph_token: &token,
+                                session_id: &request.session_id,
+                                request_id: &request.request_id,
+                                turn_id: &worker_turn_id,
+                                local_account: &request.account,
+                                prompt: &request.prompt,
+                                provider_binding,
+                                installation_principal: installation.principal(),
+                                created_at_ms: unix_now_ms(),
+                                cached_context: cached_context.clone(),
+                                context_budget,
+                            })?;
+                        Ok((worker, prepared, product_turn))
+                    },
+                    || std::time::Instant::now() < retry_deadline,
+                    || std::thread::sleep(RECOVERED_TURN_START_RETRY_INTERVAL),
+                );
+                let result = match prepared_start {
+                    TurnAdmissionPreparation::Ready((worker, prepared, product_turn)) => {
+                        worker
+                            .hot_request_statuses
+                            .remove(&request.session_id, &request.request_id);
+                        (|| -> Result<(), String> {
+                            let mut owned_reserved = reserved
+                                .take()
+                                .ok_or_else(|| "turn_registry_unavailable".to_string())?;
+                            if matches!(&product_turn, product_session::ProductTurnStart::Replay(_))
+                            {
+                                owned_reserved.durable_admission.complete()?;
+                            }
+                            dispatch_prepared_product_turn(
                                 prepared,
-                                Some(*product_turn),
-                                reserved,
-                            )
-                        },
-                        |replay| {
-                            worker.emit_product_turn_replay(&worker_turn_id, replay);
-                            Ok(worker_turn_id.clone())
-                        },
-                    )?;
-                    Ok(())
-                })();
+                                Ok(product_turn),
+                                |prepared, product_turn| {
+                                    worker.launch_prepared_turn(
+                                        &request.account,
+                                        &request.prompt,
+                                        prepared,
+                                        Some(*product_turn),
+                                        owned_reserved,
+                                    )
+                                },
+                                |replay| {
+                                    worker.emit_product_turn_replay(&worker_turn_id, replay);
+                                    Ok(worker_turn_id.clone())
+                                },
+                            )?;
+                            Ok(())
+                        })()
+                    }
+                    TurnAdmissionPreparation::Deferred => {
+                        if let Some(worker) = worker.upgrade() {
+                            worker.fail_reserved_turn(&worker_turn_id, "request_resume_required");
+                        }
+                        drop(reserved.take());
+                        return;
+                    }
+                    TurnAdmissionPreparation::Terminal(error) => Err(error),
+                };
                 if let Err(error) = result {
+                    let Some(worker) = worker.upgrade() else {
+                        drop(reserved.take());
+                        return;
+                    };
                     let safe_error = agent_safe_turn_start_error(&error);
                     let terminal =
                         control_store.fail_agent_turn_admission(&worker_turn_id, safe_error);
@@ -14177,6 +14317,143 @@ mod tests {
             product_turn_terminal_error(&transport, true),
             "turn_outcome_unknown"
         );
+    }
+
+    #[test]
+    fn recovered_turn_start_retries_transient_failures_and_defers_without_terminalizing() {
+        for error in [
+            "provider_busy",
+            "session_busy",
+            "manifest_conflict",
+            "session_transport_unavailable",
+            "session_transport_timed_out",
+            "session_name_resolution_failed",
+            "session_tls_failed",
+            "session_connect_failed",
+            "session_storage_response_invalid",
+        ] {
+            assert!(recovered_turn_start_error_is_retryable(error), "{error}");
+        }
+        assert!(!recovered_turn_start_error_is_retryable(
+            "provider_generation_changed"
+        ));
+        assert!(!recovered_turn_start_error_is_retryable(
+            "session_writer_reconnect_required"
+        ));
+
+        let mut attempts = 0usize;
+        let mut waits = 0usize;
+        let recovered = prepare_turn_admission(
+            true,
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err("manifest_conflict".into())
+                } else {
+                    Ok("resumed")
+                }
+            },
+            || true,
+            || waits += 1,
+        );
+        assert_eq!(recovered, TurnAdmissionPreparation::Ready("resumed"));
+        assert_eq!(attempts, 2);
+        assert_eq!(waits, 1);
+
+        assert_eq!(
+            prepare_turn_admission(
+                true,
+                || Err::<(), _>("manifest_conflict".into()),
+                || false,
+                || panic!("deferred recovery must not wait past its bound"),
+            ),
+            TurnAdmissionPreparation::Deferred
+        );
+        assert_eq!(
+            prepare_turn_admission(
+                true,
+                || Err::<(), _>("provider_generation_changed".into()),
+                || true,
+                || panic!("terminal binding failure must not be retried"),
+            ),
+            TurnAdmissionPreparation::Terminal("provider_generation_changed".into())
+        );
+        assert_eq!(
+            prepare_turn_admission(
+                false,
+                || Err::<(), _>("manifest_conflict".into()),
+                || true,
+                || panic!("a fresh admission must not use restart recovery retries"),
+            ),
+            TurnAdmissionPreparation::Terminal("manifest_conflict".into())
+        );
+    }
+
+    #[test]
+    fn recovered_turn_defer_path_preserves_durable_admission_for_same_request_resume() {
+        let root = temp_agent_root("recovered-turn-defer");
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let request = isyncyou_webui::AgentTurnRequest {
+            request_id: "019f0000-0000-4000-8000-000000000314".into(),
+            session_id: "01JSESSION00000000000000014".into(),
+            account: "controlled".into(),
+            prompt: "Resume this exact encrypted admission".into(),
+        };
+        let turn_id = turn_id_from_request_id(&request.request_id).unwrap();
+        let digest = "1414141414141414141414141414141414141414141414141414141414141414";
+        let store = agent.control_store.as_ref().unwrap();
+        assert!(matches!(
+            store
+                .begin_agent_turn_admission(&request, &turn_id, digest)
+                .unwrap(),
+            agent_control_store::AgentTurnAdmissionBegin::Inserted
+        ));
+
+        assert_eq!(
+            prepare_turn_admission(
+                true,
+                || Err::<(), _>("manifest_conflict".into()),
+                || false,
+                || panic!("deferred recovery must not sleep after its bound"),
+            ),
+            TurnAdmissionPreparation::Deferred
+        );
+        let recovered = store.recover_agent_turn_admissions(1).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].request, request);
+        assert!(matches!(
+            store
+                .begin_agent_turn_admission(&request, &turn_id, digest)
+                .unwrap(),
+            agent_control_store::AgentTurnAdmissionBegin::Existing
+        ));
+
+        let source = include_str!("lib.rs");
+        let admission = source
+            .split("fn start_turn_request(")
+            .nth(1)
+            .expect("turn admission implementation")
+            .split("fn pending_binding(")
+            .next()
+            .expect("turn admission boundary");
+        let deferred = admission
+            .split("TurnAdmissionPreparation::Deferred =>")
+            .nth(1)
+            .expect("deferred recovery branch")
+            .split("TurnAdmissionPreparation::Terminal")
+            .next()
+            .expect("terminal recovery boundary");
+        assert!(deferred.contains("request_resume_required"));
+        assert!(!deferred.contains("fail_agent_turn_admission"));
+        assert!(admission.contains("cached_context: cached_context.clone()"));
+        assert!(admission.contains("let worker = Arc::downgrade(&self)"));
+
+        store
+            .complete_agent_turn_admission(&request.request_id)
+            .unwrap();
+        assert!(store.recover_agent_turn_admissions(1).unwrap().is_empty());
+        drop(agent);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -24846,6 +25123,10 @@ fn agent_request_status_prefers_bounded_hot_terminal_state() {
         cache.get("session", &format!("request-{MAX_HOT_REQUEST_STATUSES}")),
         Some(isyncyou_agent::RequestPhase::Committed)
     );
+    cache.remove("session", &format!("request-{MAX_HOT_REQUEST_STATUSES}"));
+    assert!(cache
+        .get("session", &format!("request-{MAX_HOT_REQUEST_STATUSES}"))
+        .is_none());
     assert_eq!(
         request_status_json(isyncyou_agent::RequestPhase::Committed),
         serde_json::json!({
@@ -24854,6 +25135,25 @@ fn agent_request_status_prefers_bounded_hot_terminal_state() {
             "terminal": true,
             "resume_allowed": false,
         })
+    );
+    assert_eq!(
+        request_status_json_with_terminal_code(
+            isyncyou_agent::RequestPhase::Failed,
+            Some("session_transport_unavailable"),
+        ),
+        serde_json::json!({
+            "state": "failed",
+            "code": "session_transport_unavailable",
+            "terminal": true,
+            "resume_allowed": false,
+        })
+    );
+    assert_eq!(
+        request_status_json_with_terminal_code(
+            isyncyou_agent::RequestPhase::Failed,
+            Some("raw private transport detail"),
+        )["code"],
+        "turn_start_failed"
     );
 }
 
