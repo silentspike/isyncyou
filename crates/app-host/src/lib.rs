@@ -1172,6 +1172,27 @@ fn request_status_json(phase: isyncyou_agent::RequestPhase) -> serde_json::Value
     feature = "agent-subscription-experimental",
     test
 ))]
+fn durable_admission_covers_remote_status_error(error: &str) -> bool {
+    matches!(
+        error,
+        "session_not_found"
+            | "session_store_unavailable"
+            | "session_transport_unavailable"
+            | "session_transport_timed_out"
+            | "session_name_resolution_failed"
+            | "session_tls_failed"
+            | "session_connect_failed"
+            | "session_writer_reconnect_required"
+            | "session_storage_permission_denied"
+            | "session_storage_request_rejected"
+    )
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
 #[derive(Default)]
 struct TurnAdmissionRegistry {
     bindings: Mutex<HashMap<String, [u8; 32]>>,
@@ -9594,12 +9615,86 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 return Err("invalid_request_route".into());
             }
             let request_scope = format!("session_id:{session_id}");
-            if let Some((phase, error_code)) = self
+            let control_store = self
                 .control_store
                 .as_ref()
-                .ok_or_else(|| "session_store_unavailable".to_string())?
-                .agent_turn_admission_terminal(request_id, &request_scope)?
-            {
+                .ok_or_else(|| "session_store_unavailable".to_string())?;
+            let durable_admission =
+                control_store.agent_turn_admission_status(request_id, &request_scope)?;
+            if let Some((phase, error_code)) = durable_admission.as_ref() {
+                if *phase != isyncyou_agent::RequestPhase::Accepted {
+                    self.hot_request_statuses
+                        .insert(session_id, request_id, *phase);
+                    return Ok(request_status_json_with_terminal_code(
+                        *phase,
+                        error_code.as_deref(),
+                    ));
+                }
+            }
+            if let Some(phase) = self.hot_request_statuses.get(session_id, request_id) {
+                return Ok(request_status_json(phase));
+            }
+            let remote_phase = (|| -> Result<Option<isyncyou_agent::RequestPhase>, String> {
+                let store = agent_credential_store(&self.oauth_dir)
+                    .map_err(|_| "session_store_unavailable".to_string())?;
+                let registry = product_session::ProductSessionRegistry::new(&store);
+                let account = registry.account_for(session_id)?;
+                let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, &account)
+                    .map_err(|_| "session_transport_unavailable".to_string())?;
+                registry
+                    .open(&token, session_id)?
+                    .request_phase(
+                        session_id,
+                        isyncyou_agent::RequestRouteDomain::AgentTurn,
+                        request_id,
+                    )
+                    .map_err(|error| match error {
+                        isyncyou_agent::SessionV2Error::InvalidRecord
+                        | isyncyou_agent::SessionV2Error::InvalidJournal => {
+                            "session_state_invalid".to_string()
+                        }
+                        isyncyou_agent::SessionV2Error::InvalidRequestId => {
+                            "invalid_request_id".to_string()
+                        }
+                        isyncyou_agent::SessionV2Error::ManifestConflict
+                        | isyncyou_agent::SessionV2Error::LeaseLost => "lease_lost".to_string(),
+                        isyncyou_agent::SessionV2Error::TransportUnavailable => {
+                            "session_transport_unavailable".to_string()
+                        }
+                        isyncyou_agent::SessionV2Error::TransportTimedOut => {
+                            "session_transport_timed_out".to_string()
+                        }
+                        isyncyou_agent::SessionV2Error::TransportResponseInvalid => {
+                            "session_storage_response_invalid".to_string()
+                        }
+                        isyncyou_agent::SessionV2Error::TransportAuthenticationRequired => {
+                            "session_writer_reconnect_required".to_string()
+                        }
+                        isyncyou_agent::SessionV2Error::TransportPermissionDenied => {
+                            "session_storage_permission_denied".to_string()
+                        }
+                        isyncyou_agent::SessionV2Error::TransportRequestRejected => {
+                            "session_storage_request_rejected".to_string()
+                        }
+                        _ => "session_store_unavailable".to_string(),
+                    })
+            })();
+            let phase = match remote_phase {
+                Ok(phase) => phase,
+                Err(error)
+                    if durable_admission.is_some()
+                        && durable_admission_covers_remote_status_error(&error) =>
+                {
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(phase) = phase {
+                self.hot_request_statuses
+                    .insert(session_id, request_id, phase);
+                return Ok(request_status_json(phase));
+            }
+            if let Some((phase, error_code)) = durable_admission {
                 self.hot_request_statuses
                     .insert(session_id, request_id, phase);
                 return Ok(request_status_json_with_terminal_code(
@@ -9607,56 +9702,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     error_code.as_deref(),
                 ));
             }
-            if let Some(phase) = self.hot_request_statuses.get(session_id, request_id) {
-                return Ok(request_status_json(phase));
-            }
-            let store = agent_credential_store(&self.oauth_dir)
-                .map_err(|_| "session_store_unavailable".to_string())?;
-            let registry = product_session::ProductSessionRegistry::new(&store);
-            let account = registry.account_for(session_id)?;
-            let token = isyncyou_engine::auth::resolve_cached_sync_token(&self.cfg, &account)
-                .map_err(|_| "session_transport_unavailable".to_string())?;
-            let phase = registry
-                .open(&token, session_id)?
-                .request_phase(
-                    session_id,
-                    isyncyou_agent::RequestRouteDomain::AgentTurn,
-                    request_id,
-                )
-                .map_err(|error| match error {
-                    isyncyou_agent::SessionV2Error::InvalidRecord
-                    | isyncyou_agent::SessionV2Error::InvalidJournal => {
-                        "session_state_invalid".to_string()
-                    }
-                    isyncyou_agent::SessionV2Error::InvalidRequestId => {
-                        "invalid_request_id".to_string()
-                    }
-                    isyncyou_agent::SessionV2Error::ManifestConflict
-                    | isyncyou_agent::SessionV2Error::LeaseLost => "lease_lost".to_string(),
-                    isyncyou_agent::SessionV2Error::TransportUnavailable => {
-                        "session_transport_unavailable".to_string()
-                    }
-                    isyncyou_agent::SessionV2Error::TransportTimedOut => {
-                        "session_transport_timed_out".to_string()
-                    }
-                    isyncyou_agent::SessionV2Error::TransportResponseInvalid => {
-                        "session_storage_response_invalid".to_string()
-                    }
-                    isyncyou_agent::SessionV2Error::TransportAuthenticationRequired => {
-                        "session_writer_reconnect_required".to_string()
-                    }
-                    isyncyou_agent::SessionV2Error::TransportPermissionDenied => {
-                        "session_storage_permission_denied".to_string()
-                    }
-                    isyncyou_agent::SessionV2Error::TransportRequestRejected => {
-                        "session_storage_request_rejected".to_string()
-                    }
-                    _ => "session_store_unavailable".to_string(),
-                })?
-                .ok_or_else(|| "request_not_found".to_string())?;
-            self.hot_request_statuses
-                .insert(session_id, request_id, phase);
-            Ok(request_status_json(phase))
+            Err("request_not_found".into())
         }
         #[cfg(not(any(
             feature = "agent-oauth-providers",
@@ -25155,6 +25201,100 @@ fn agent_request_status_prefers_bounded_hot_terminal_state() {
         )["code"],
         "turn_start_failed"
     );
+}
+
+#[cfg(test)]
+#[test]
+fn durable_turn_admission_never_masks_invalid_remote_session_state() {
+    for error in [
+        "session_not_found",
+        "session_store_unavailable",
+        "session_transport_unavailable",
+        "session_transport_timed_out",
+        "session_name_resolution_failed",
+        "session_tls_failed",
+        "session_connect_failed",
+        "session_writer_reconnect_required",
+        "session_storage_permission_denied",
+        "session_storage_request_rejected",
+    ] {
+        assert!(durable_admission_covers_remote_status_error(error));
+    }
+    for error in [
+        "session_state_invalid",
+        "session_storage_response_invalid",
+        "invalid_request_id",
+        "lease_lost",
+        "unknown_future_error",
+    ] {
+        assert!(!durable_admission_covers_remote_status_error(error));
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[test]
+fn active_turn_admission_survives_hot_status_eviction() {
+    let root =
+        std::env::temp_dir().join(format!("isyncyou-durable-active-status-{}", unix_now_ms()));
+    let _ = std::fs::remove_dir_all(&root);
+    let agent = DaemonAgent::new(Config::default(), root.clone());
+    let request = isyncyou_webui::AgentTurnRequest {
+        request_id: "019f0000-0000-4000-8000-000000000314".into(),
+        session_id: "01JSESSION00000000000000014".into(),
+        account: "controlled".into(),
+        prompt: "Admission remains queryable".into(),
+    };
+    let store = agent.control_store.as_ref().unwrap();
+    store
+        .begin_agent_turn_admission(
+            &request,
+            "01JTURN0000000000000000014",
+            "1414141414141414141414141414141414141414141414141414141414141414",
+        )
+        .unwrap();
+
+    assert_eq!(
+        store
+            .agent_turn_admission_status(
+                &request.request_id,
+                &format!("session_id:{}", request.session_id),
+            )
+            .unwrap(),
+        Some((isyncyou_agent::RequestPhase::Accepted, None))
+    );
+
+    agent.hot_request_statuses.insert(
+        &request.session_id,
+        &request.request_id,
+        isyncyou_agent::RequestPhase::Accepted,
+    );
+    for index in 0..=MAX_HOT_REQUEST_STATUSES {
+        agent.hot_request_statuses.insert(
+            "another-session",
+            &format!("request-{index}"),
+            isyncyou_agent::RequestPhase::Committed,
+        );
+    }
+    assert!(agent
+        .hot_request_statuses
+        .get(&request.session_id, &request.request_id)
+        .is_none());
+    assert_eq!(
+        isyncyou_webui::AgentHandler::request_status(
+            &agent,
+            &request.session_id,
+            "agent_turn",
+            &request.request_id,
+        )
+        .unwrap(),
+        request_status_json(isyncyou_agent::RequestPhase::Accepted)
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[cfg(any(

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use zeroize::Zeroizing;
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 const CONTROL_KEY_DOMAIN: &[u8] = b"isyncyou-agent-control-store-root/v1";
 const CONTROL_SUBKEY_SALT: &[u8] = b"isyncyou-agent-control-store-subkeys/v1";
 const SQLCIPHER_KEY_INFO: &[u8] = b"isyncyou-agent-control-sqlcipher/v1";
@@ -246,21 +246,27 @@ impl UserPresenceBinding {
     fn public_binding_digest(&self) -> String {
         let mut context = ring::digest::Context::new(&ring::digest::SHA256);
         context.update(b"isyncyou-user-presence-binding-v1\0");
+        update_digest_component(&mut context, self.kind());
         match self {
-            Self::Archive { session_id } => context.update(session_id.as_bytes()),
+            Self::Archive { session_id } => update_digest_component(&mut context, session_id),
             Self::PairingReveal {
                 session_id,
                 pair_id,
             } => {
-                context.update(session_id.as_bytes());
-                context.update(pair_id.as_bytes());
+                update_digest_component(&mut context, session_id);
+                update_digest_component(&mut context, pair_id);
             }
             Self::PairingImport { pairing_code } => {
-                context.update(pairing_code.as_bytes());
+                update_digest_component(&mut context, pairing_code);
             }
         }
         URL_SAFE_NO_PAD.encode(context.finish())
     }
+}
+
+fn update_digest_component(context: &mut ring::digest::Context, value: &str) {
+    context.update(&(value.len() as u64).to_be_bytes());
+    context.update(value.as_bytes());
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -657,13 +663,38 @@ impl AgentControlStore {
             )
             .map_err(|_| "control_store_migration_failed")?;
         let stored_schema_version = stored_control_schema_version(&migration)?;
+        let migration_now_ms = crate::unix_now_ms();
         if matches!(stored_schema_version, Some(1..=8)) {
-            migrate_mutation_retention_v9(&migration, &row_wrap_key, crate::unix_now_ms())?;
+            migrate_mutation_retention_v9(&migration, &row_wrap_key, migration_now_ms)?;
         }
         if matches!(stored_schema_version, Some(1..=9)) {
-            migrate_control_tombstone_retention_v10(&migration, crate::unix_now_ms())?;
+            migrate_control_tombstone_retention_v10(&migration, migration_now_ms)?;
         }
-        migrate_agent_turn_admissions_v2(&migration, &row_wrap_key, installation_principal)?;
+        if matches!(stored_schema_version, Some(1..=11)) {
+            migration
+                .execute(
+                    "UPDATE agent_turn_admissions SET created_at_ms=?1
+                     WHERE state='cancelled' OR terminal_code IS NOT NULL",
+                    params![u64_to_i64(migration_now_ms)
+                        .map_err(|_| "control_store_migration_failed".to_string())?],
+                )
+                .map_err(|_| "control_store_migration_failed")?;
+        }
+        let product_request_expiry = product_request_expiry(migration_now_ms)
+            .map_err(|_| "control_store_migration_failed".to_string())?;
+        migrate_agent_turn_admissions_v2(
+            &migration,
+            &row_wrap_key,
+            installation_principal,
+            product_request_expiry,
+        )?;
+        migration
+            .execute(
+                "UPDATE product_request_bindings SET expires_at_ms=?1
+                 WHERE route_domain=?2 AND expires_at_ms=?3",
+                params![product_request_expiry, AGENT_TURN_ROUTE_DOMAIN, i64::MAX],
+            )
+            .map_err(|_| "control_store_migration_failed")?;
         migrate_product_request_scopes_v7(&migration, installation_principal)?;
         migrate_product_request_keys(&migration, installation_principal)?;
         initialize_metadata(&migration, &installation_binding, lifecycle_key_version)?;
@@ -694,6 +725,10 @@ impl AgentControlStore {
         let now = u64_to_i64(now_ms)?;
         let terminal_expires_at_ms = now.saturating_add(
             i64::try_from(CONTROL_TOMBSTONE_TTL_MS)
+                .map_err(|_| "control_store_unavailable".to_string())?,
+        );
+        let request_terminal_cutoff_ms = now.saturating_sub(
+            i64::try_from(PRODUCT_REQUEST_RECEIPT_TTL_MS)
                 .map_err(|_| "control_store_unavailable".to_string())?,
         );
         let connection = self
@@ -772,6 +807,19 @@ impl AgentControlStore {
                 )
                 .map_err(|_| "control_store_unavailable")?;
             consume_reaper_budget(&mut remaining, claims)?;
+            let turn_admissions = connection
+                .execute(
+                    "DELETE FROM agent_turn_admissions
+                     WHERE request_id IN (
+                       SELECT request_id FROM agent_turn_admissions
+                       WHERE (state='cancelled' OR terminal_code IS NOT NULL)
+                         AND created_at_ms < ?1
+                       ORDER BY created_at_ms,request_id LIMIT ?2
+                     )",
+                    params![request_terminal_cutoff_ms, remaining],
+                )
+                .map_err(|_| "control_store_unavailable")?;
+            consume_reaper_budget(&mut remaining, turn_admissions)?;
             let confirmation_tombstones = delete_expired_control_tombstones(
                 &connection,
                 "confirmation_intents",
@@ -835,8 +883,14 @@ impl AgentControlStore {
                 .execute(
                     "DELETE FROM product_request_bindings
                  WHERE request_id IN (
-                   SELECT request_id FROM product_request_bindings
-                   WHERE expires_at_ms < ?1 LIMIT ?2
+                   SELECT binding.request_id FROM product_request_bindings AS binding
+                   WHERE binding.expires_at_ms < ?1
+                     AND NOT EXISTS (
+                       SELECT 1 FROM agent_turn_admissions AS admission
+                       WHERE admission.request_id=binding.request_id
+                         AND admission.state='active' AND admission.terminal_code IS NULL
+                     )
+                   LIMIT ?2
                  )",
                     params![now, remaining],
                 )
@@ -858,6 +912,7 @@ impl AgentControlStore {
                 .saturating_add(pairing)
                 .saturating_add(reveal_responses)
                 .saturating_add(claims)
+                .saturating_add(turn_admissions)
                 .saturating_add(confirmation_tombstones)
                 .saturating_add(presence_tombstones)
                 .saturating_add(source_tombstones)
@@ -2865,19 +2920,10 @@ impl AgentControlStore {
         }
         let now_ms = crate::unix_now_ms();
         self.reap_expired(now_ms, 256)?;
-        // A turn UUID is scoped to an encrypted session and must remain bound for
-        // that session's lifetime. Ordinary app-wide mutation receipts retain the
-        // bounded 30-day policy; turn bindings are quota-bounded and survive until
-        // the app profile is explicitly reset.
-        let expires_at_ms = if identity.route_domain == AGENT_TURN_ROUTE_DOMAIN {
-            i64::MAX
-        } else {
-            u64_to_i64(
-                now_ms
-                    .checked_add(PRODUCT_REQUEST_RECEIPT_TTL_MS)
-                    .ok_or_else(|| "request_store_unavailable".to_string())?,
-            )?
-        };
+        // The session manifest retains turn idempotency for the encrypted session
+        // lifetime. This app-wide cross-route binding needs only the bounded replay
+        // window and must not consume the control quota forever.
+        let expires_at_ms = product_request_expiry(now_ms)?;
         let mut connection = self
             .connection
             .lock()
@@ -2909,15 +2955,7 @@ impl AgentControlStore {
             ProductRequestBinding::Inserted | ProductRequestBinding::Existing => {}
         }
         let now_ms = crate::unix_now_ms();
-        let expires_at_ms = if identity.route_domain == AGENT_TURN_ROUTE_DOMAIN {
-            i64::MAX
-        } else {
-            u64_to_i64(
-                now_ms
-                    .checked_add(PRODUCT_REQUEST_RECEIPT_TTL_MS)
-                    .ok_or_else(|| "request_store_unavailable".to_string())?,
-            )?
-        };
+        let expires_at_ms = product_request_expiry(now_ms)?;
         let mut connection = self
             .connection
             .lock()
@@ -3144,10 +3182,12 @@ impl AgentControlStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| "turn_admission_unavailable")?;
+        let expires_at_ms = product_request_expiry(crate::unix_now_ms())
+            .map_err(|_| "turn_admission_unavailable".to_string())?;
         match bind_product_request_transaction(
             &transaction,
             identity,
-            i64::MAX,
+            expires_at_ms,
             &self.installation_principal,
         )
         .map_err(|_| "turn_admission_unavailable")?
@@ -3358,24 +3398,56 @@ impl AgentControlStore {
     }
 
     pub(crate) fn complete_agent_turn_admission(&self, request_id: &str) -> Result<(), String> {
-        let connection = self
+        let expires_at_ms = product_request_expiry(crate::unix_now_ms())
+            .map_err(|_| "turn_admission_unavailable".to_string())?;
+        let mut connection = self
             .connection
             .lock()
             .map_err(|_| "turn_admission_unavailable")?;
-        let changed = connection
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| "turn_admission_unavailable")?;
+        let admission_exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_turn_admissions WHERE request_id=?1)",
+                params![request_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| "turn_admission_unavailable")?;
+        if !admission_exists {
+            transaction
+                .commit()
+                .map_err(|_| "turn_admission_unavailable")?;
+            return Ok(());
+        }
+        let bound = transaction
+            .execute(
+                "UPDATE product_request_bindings SET expires_at_ms=?1 WHERE request_id=?2",
+                params![expires_at_ms, request_id],
+            )
+            .map_err(|_| "turn_admission_unavailable")?;
+        if bound != 1 {
+            return Err("turn_admission_unavailable".into());
+        }
+        let deleted = transaction
             .execute(
                 "DELETE FROM agent_turn_admissions WHERE request_id=?1",
                 params![request_id],
             )
             .map_err(|_| "turn_admission_unavailable")?;
-        if changed > 0 {
-            checkpoint_secure_erasure(&connection)
-                .map_err(|_| "turn_admission_unavailable".to_string())?;
+        if deleted != 1 {
+            return Err("turn_admission_unavailable".into());
         }
-        Ok(())
+        transaction
+            .commit()
+            .map_err(|_| "turn_admission_unavailable".to_string())?;
+        checkpoint_secure_erasure(&connection).map_err(|_| "turn_admission_unavailable".to_string())
     }
 
     pub(crate) fn cancel_agent_turn_admission(&self, turn_id: &str) -> Result<(), String> {
+        let terminal_at_ms = crate::unix_now_ms();
+        let binding_expires_at_ms = product_request_expiry(terminal_at_ms)
+            .map_err(|_| "turn_admission_unavailable".to_string())?;
         let mut connection = self
             .connection
             .lock()
@@ -3415,12 +3487,26 @@ impl AgentControlStore {
         let changed = transaction
             .execute(
                 "UPDATE agent_turn_admissions
-                 SET state='cancelled',sealed_request=X'',logical_bytes=?1
-                 WHERE turn_id=?2 AND request_id=?3 AND state='active'",
-                params![logical_bytes, turn_id, request_id],
+                 SET state='cancelled',sealed_request=X'',created_at_ms=?1,logical_bytes=?2
+                 WHERE turn_id=?3 AND request_id=?4 AND state='active'",
+                params![
+                    u64_to_i64(terminal_at_ms)?,
+                    logical_bytes,
+                    turn_id,
+                    request_id
+                ],
             )
             .map_err(|_| "turn_admission_unavailable")?;
         if changed != 1 {
+            return Err("turn_admission_unavailable".into());
+        }
+        let bound = transaction
+            .execute(
+                "UPDATE product_request_bindings SET expires_at_ms=?1 WHERE request_id=?2",
+                params![binding_expires_at_ms, request_id],
+            )
+            .map_err(|_| "turn_admission_unavailable")?;
+        if bound != 1 {
             return Err("turn_admission_unavailable".into());
         }
         transaction
@@ -3437,6 +3523,9 @@ impl AgentControlStore {
         if !valid_turn_terminal_code(terminal_code) {
             return Err("turn_admission_unavailable".into());
         }
+        let terminal_at_ms = crate::unix_now_ms();
+        let binding_expires_at_ms = product_request_expiry(terminal_at_ms)
+            .map_err(|_| "turn_admission_unavailable".to_string())?;
         let mut connection = self
             .connection
             .lock()
@@ -3444,15 +3533,16 @@ impl AgentControlStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| "turn_admission_unavailable")?;
-        let existing: Option<(String, Option<String>)> = transaction
+        let existing: Option<(String, String, Option<String>)> = transaction
             .query_row(
-                "SELECT state,terminal_code FROM agent_turn_admissions WHERE turn_id=?1",
+                "SELECT request_id,state,terminal_code
+                 FROM agent_turn_admissions WHERE turn_id=?1",
                 params![turn_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(|_| "turn_admission_unavailable")?;
-        let Some((state, stored_code)) = existing else {
+        let Some((request_id, state, stored_code)) = existing else {
             return Ok(AgentTurnAdmissionFailure::Completed);
         };
         if state == "cancelled" {
@@ -3478,12 +3568,26 @@ impl AgentControlStore {
         let changed = transaction
             .execute(
                 "UPDATE agent_turn_admissions
-                 SET terminal_code=?1,sealed_request=X'',logical_bytes=?2
-                 WHERE turn_id=?3 AND state='active' AND terminal_code IS NULL",
-                params![terminal_code, logical_bytes, turn_id],
+                 SET terminal_code=?1,sealed_request=X'',created_at_ms=?2,logical_bytes=?3
+                 WHERE turn_id=?4 AND state='active' AND terminal_code IS NULL",
+                params![
+                    terminal_code,
+                    u64_to_i64(terminal_at_ms)?,
+                    logical_bytes,
+                    turn_id
+                ],
             )
             .map_err(|_| "turn_admission_unavailable")?;
         if changed != 1 {
+            return Err("turn_admission_unavailable".into());
+        }
+        let bound = transaction
+            .execute(
+                "UPDATE product_request_bindings SET expires_at_ms=?1 WHERE request_id=?2",
+                params![binding_expires_at_ms, request_id],
+            )
+            .map_err(|_| "turn_admission_unavailable")?;
+        if bound != 1 {
             return Err("turn_admission_unavailable".into());
         }
         transaction
@@ -3494,7 +3598,19 @@ impl AgentControlStore {
         Ok(AgentTurnAdmissionFailure::Failed)
     }
 
+    #[cfg(test)]
     pub(crate) fn agent_turn_admission_terminal(
+        &self,
+        request_id: &str,
+        request_scope: &str,
+    ) -> Result<Option<(isyncyou_agent::RequestPhase, Option<String>)>, String> {
+        match self.agent_turn_admission_status(request_id, request_scope)? {
+            Some((isyncyou_agent::RequestPhase::Accepted, None)) | None => Ok(None),
+            Some(status) => Ok(Some(status)),
+        }
+    }
+
+    pub(crate) fn agent_turn_admission_status(
         &self,
         request_id: &str,
         request_scope: &str,
@@ -3519,7 +3635,9 @@ impl AgentControlStore {
             Some((state, Some(code))) if state == "active" && valid_turn_terminal_code(&code) => {
                 Ok(Some((isyncyou_agent::RequestPhase::Failed, Some(code))))
             }
-            Some((state, None)) if state == "active" => Ok(None),
+            Some((state, None)) if state == "active" => {
+                Ok(Some((isyncyou_agent::RequestPhase::Accepted, None)))
+            }
             None => Ok(None),
             _ => Err("turn_admission_unavailable".into()),
         }
@@ -3548,15 +3666,6 @@ fn bind_product_request_transaction(
             && stored_scope == identity.request_scope
             && stored_digest == identity.payload_digest
         {
-            if expires_at_ms == i64::MAX {
-                transaction
-                    .execute(
-                        "UPDATE product_request_bindings SET expires_at_ms=?1
-                         WHERE request_id=?2 AND expires_at_ms<?1",
-                        params![expires_at_ms, identity.request_id],
-                    )
-                    .map_err(|_| "request_store_unavailable")?;
-            }
             Ok(ProductRequestBinding::Existing)
         } else {
             Ok(ProductRequestBinding::Conflict)
@@ -4519,6 +4628,7 @@ fn migrate_agent_turn_admissions_v2(
     transaction: &Transaction<'_>,
     row_wrap_key: &[u8; 32],
     installation_principal: &str,
+    product_request_expiry: i64,
 ) -> Result<(), String> {
     let rows = {
         let mut statement = transaction
@@ -4586,7 +4696,7 @@ fn migrate_agent_turn_admissions_v2(
         match bind_product_request_transaction(
             transaction,
             &identity,
-            i64::MAX,
+            product_request_expiry,
             installation_principal,
         )
         .map_err(|_| "control_store_migration_failed")?
@@ -4675,7 +4785,7 @@ fn initialize_metadata(
         }
         match schema.parse::<i64>() {
             Ok(SCHEMA_VERSION) => {}
-            Ok(1..=10) if SCHEMA_VERSION == 11 => {
+            Ok(1..=11) if SCHEMA_VERSION == 12 => {
                 connection
                     .execute(
                         "UPDATE control_metadata SET value=?1 WHERE key='schema_version'",
@@ -5121,6 +5231,14 @@ fn presence_action_hash(kind: &str, binding_digest: &str, expires_at_ms: u64) ->
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn product_request_expiry(now_ms: u64) -> Result<i64, String> {
+    u64_to_i64(
+        now_ms
+            .checked_add(PRODUCT_REQUEST_RECEIPT_TTL_MS)
+            .ok_or_else(|| "request_store_unavailable".to_string())?,
+    )
 }
 
 fn u64_to_i64(value: u64) -> Result<i64, String> {
@@ -5901,6 +6019,122 @@ mod tests {
     }
 
     #[test]
+    fn turn_admission_bindings_and_terminal_tombstones_have_bounded_retention() {
+        let root = temp_root("agent-turn-admission-retention");
+        let credential_store = credential_store(&root);
+        let control =
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let failed = isyncyou_webui::AgentTurnRequest {
+            request_id: "019f0000-0000-4000-8000-000000000315".into(),
+            session_id: "01JSESSION00000000000000015".into(),
+            account: "controlled".into(),
+            prompt: "Bound terminal retention".into(),
+        };
+        control
+            .begin_agent_turn_admission(
+                &failed,
+                "01JTURN0000000000000000015",
+                "1515151515151515151515151515151515151515151515151515151515151515",
+            )
+            .unwrap();
+        let terminal_before_ms = crate::unix_now_ms();
+        control
+            .fail_agent_turn_admission(
+                "01JTURN0000000000000000015",
+                "session_transport_unavailable",
+            )
+            .unwrap();
+        let (terminal_at_ms, binding_expires_at_ms): (i64, i64) = control
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT admission.created_at_ms,binding.expires_at_ms
+                 FROM agent_turn_admissions admission
+                 JOIN product_request_bindings binding
+                   ON binding.request_id=admission.request_id
+                 WHERE admission.request_id=?1",
+                params![failed.request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(terminal_at_ms >= u64_to_i64(terminal_before_ms).unwrap());
+        assert!(binding_expires_at_ms >= product_request_expiry(terminal_before_ms).unwrap());
+        assert!(binding_expires_at_ms <= product_request_expiry(crate::unix_now_ms()).unwrap());
+
+        {
+            let connection = control.connection.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE agent_turn_admissions SET created_at_ms=1 WHERE request_id=?1",
+                    params![failed.request_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE product_request_bindings SET expires_at_ms=1 WHERE request_id=?1",
+                    params![failed.request_id],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            control
+                .reap_expired(PRODUCT_REQUEST_RECEIPT_TTL_MS + 2, 256)
+                .unwrap(),
+            2
+        );
+
+        let active = isyncyou_webui::AgentTurnRequest {
+            request_id: "019f0000-0000-4000-8000-000000000316".into(),
+            session_id: "01JSESSION00000000000000016".into(),
+            account: "controlled".into(),
+            prompt: "Active admission remains fenced".into(),
+        };
+        control
+            .begin_agent_turn_admission(
+                &active,
+                "01JTURN0000000000000000016",
+                "1616161616161616161616161616161616161616161616161616161616161616",
+            )
+            .unwrap();
+        control
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE product_request_bindings SET expires_at_ms=1 WHERE request_id=?1",
+                params![active.request_id],
+            )
+            .unwrap();
+        assert_eq!(
+            control
+                .reap_expired(PRODUCT_REQUEST_RECEIPT_TTL_MS + 2, 256)
+                .unwrap(),
+            0
+        );
+        control
+            .complete_agent_turn_admission(&active.request_id)
+            .unwrap();
+        let (admission_exists, active_binding_expiry): (bool, i64) = control
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT
+                   EXISTS(SELECT 1 FROM agent_turn_admissions WHERE request_id=?1),
+                   (SELECT expires_at_ms FROM product_request_bindings WHERE request_id=?1)",
+                params![active.request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(!admission_exists);
+        assert!(active_binding_expiry > u64_to_i64(crate::unix_now_ms()).unwrap());
+
+        drop(control);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn agent_turn_admission_v10_migration_adds_terminal_code_without_losing_active_turn() {
         let root = temp_root("agent-turn-admission-v10-migration");
         let credential_store = credential_store(&root);
@@ -5928,32 +6162,37 @@ mod tests {
                 .unwrap()
                 .execute_batch(
                     "ALTER TABLE agent_turn_admissions DROP COLUMN terminal_code;
+                     UPDATE product_request_bindings SET expires_at_ms=9223372036854775807;
                      UPDATE control_metadata SET value='10' WHERE key='schema_version';",
                 )
                 .unwrap();
         }
 
+        let before_reopen_ms = crate::unix_now_ms();
         let control =
             AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
         let recovered = control.recover_agent_turn_admissions(8).unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].turn_id, turn_id);
         assert_eq!(recovered[0].request, request);
-        let (terminal_code, schema): (Option<String>, String) = control
+        let (terminal_code, schema, expires_at_ms): (Option<String>, String, i64) = control
             .connection
             .lock()
             .unwrap()
             .query_row(
-                "SELECT a.terminal_code,m.value
+                "SELECT a.terminal_code,m.value,b.expires_at_ms
                  FROM agent_turn_admissions a
                  JOIN control_metadata m ON m.key='schema_version'
+                 JOIN product_request_bindings b ON b.request_id=a.request_id
                  WHERE a.request_id=?1",
                 params![request.request_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
         assert_eq!(terminal_code, None);
         assert_eq!(schema, SCHEMA_VERSION.to_string());
+        assert!(expires_at_ms >= product_request_expiry(before_reopen_ms).unwrap());
+        assert!(expires_at_ms <= product_request_expiry(crate::unix_now_ms()).unwrap());
         drop(control);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -6016,6 +6255,7 @@ mod tests {
                 .unwrap();
         }
 
+        let before_reopen_ms = crate::unix_now_ms();
         let control =
             AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
         let recovered = control.recover_agent_turn_admissions(8).unwrap();
@@ -6036,7 +6276,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(scope, format!("session_id:{}", request.session_id));
-        assert_eq!(expires_at_ms, i64::MAX);
+        assert!(expires_at_ms >= product_request_expiry(before_reopen_ms).unwrap());
+        assert!(expires_at_ms <= product_request_expiry(crate::unix_now_ms()).unwrap());
     }
 
     #[test]
@@ -6245,7 +6486,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_turn_request_binding_is_not_removed_by_time_based_reaping() {
+    fn agent_turn_request_binding_expires_after_bounded_replay_window() {
         let root = temp_root("agent-turn-request-retention");
         let credential_store = credential_store(&root);
         let control =
@@ -6263,18 +6504,42 @@ mod tests {
             ProductRequestBinding::Inserted
         );
 
-        control.reap_expired(i64::MAX as u64 - 1, 256).unwrap();
+        let expires_at_ms: i64 = control
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT expires_at_ms FROM product_request_bindings WHERE request_id=?1",
+                params![request_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let expires_at_ms = u64::try_from(expires_at_ms).unwrap();
+        control.reap_expired(expires_at_ms, 256).unwrap();
         assert_eq!(
             control.bind_product_request(&identity).unwrap(),
             ProductRequestBinding::Existing
         );
-        let mut changed = identity;
+        let mut changed = identity.clone();
         changed.payload_digest =
             "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into();
         assert_eq!(
             control.bind_product_request(&changed).unwrap(),
             ProductRequestBinding::Conflict
         );
+
+        assert_eq!(control.reap_expired(expires_at_ms + 1, 256).unwrap(), 1);
+        assert_eq!(
+            control.bind_product_request(&identity).unwrap(),
+            ProductRequestBinding::Inserted
+        );
+        assert_eq!(
+            control.bind_product_request(&changed).unwrap(),
+            ProductRequestBinding::Conflict
+        );
+
+        drop(control);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -8651,6 +8916,20 @@ mod tests {
         assert_eq!(hashes.len(), 3);
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn user_presence_binding_digest_length_prefixes_every_field() {
+        let left = UserPresenceBinding::PairingReveal {
+            session_id: "ab".into(),
+            pair_id: "c".into(),
+        };
+        let right = UserPresenceBinding::PairingReveal {
+            session_id: "a".into(),
+            pair_id: "bc".into(),
+        };
+
+        assert_ne!(left.public_binding_digest(), right.public_binding_digest());
     }
 
     #[test]

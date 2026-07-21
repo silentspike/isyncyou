@@ -459,7 +459,8 @@ class MainActivity : FragmentActivity() {
             // #onedrive-mobile 0.6: the WebUI asks for a biometric before a destructive op.
             // We show BiometricPrompt HERE (native, WebView-unreachable) and only on success
             // arm the server's per-action token via nativeConfirmAction. The reply carries no
-            // token — just whether the human confirmed — so the WebView re-issues with `_pat`.
+            // token — just whether the human confirmed — so the WebView re-issues with the
+            // public pending handle in X-Per-Action-Token.
             "bio" -> {
                 val reqId = validation.id
                 val pat = obj.optString("pat")

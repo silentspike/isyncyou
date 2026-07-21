@@ -160,6 +160,13 @@ fn product_session_index_gate() -> &'static std::sync::Mutex<()> {
     GATE.get_or_init(|| std::sync::Mutex::new(()))
 }
 
+struct ProductSessionIndexGuard {
+    // Fields are dropped in declaration order. Release the OS lock before waking
+    // another in-process writer through the mutex.
+    _file_guard: isyncyou_agent::FileLock,
+    _process_guard: std::sync::MutexGuard<'static, ()>,
+}
+
 pub struct ProductTurnRuntime {
     guard: SessionLeaseGuard<OneDriveSessionV2Transport>,
     session_id: String,
@@ -1091,9 +1098,7 @@ impl<'a> ProductSessionRegistry<'a> {
         Self { store }
     }
 
-    fn lock_index_rmw(
-        &self,
-    ) -> Result<(std::sync::MutexGuard<'static, ()>, isyncyou_agent::FileLock), String> {
+    fn lock_index_rmw(&self) -> Result<ProductSessionIndexGuard, String> {
         let process_guard = product_session_index_gate()
             .lock()
             .map_err(|_| "session_store_unavailable".to_string())?;
@@ -1102,7 +1107,10 @@ impl<'a> ProductSessionRegistry<'a> {
         )
         .map_err(|_| "session_store_unavailable".to_string())?
         .ok_or_else(|| "session_store_busy".to_string())?;
-        Ok((process_guard, file_guard))
+        Ok(ProductSessionIndexGuard {
+            _file_guard: file_guard,
+            _process_guard: process_guard,
+        })
     }
 
     pub fn create(
@@ -2310,39 +2318,40 @@ mod tests {
     fn product_session_index_rmw_serializes_concurrent_creates_without_lost_update() {
         let root = temp_root("concurrent-create");
         let store = credential_store(&root);
-        let first_registry = ProductSessionRegistry::new(&store);
-        let second_registry = ProductSessionRegistry::new(&store);
+        const WRITER_COUNT: usize = 16;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITER_COUNT));
         std::thread::scope(|scope| {
-            let first = scope.spawn(|| {
-                first_registry
-                    .create(
-                        "controlled",
-                        "019f0000-0000-4000-8000-000000000401",
-                        Some("First"),
-                        1,
-                    )
-                    .unwrap()
-            });
-            let second = scope.spawn(|| {
-                second_registry
-                    .create(
-                        "controlled",
-                        "019f0000-0000-4000-8000-000000000402",
-                        Some("Second"),
-                        2,
-                    )
-                    .unwrap()
-            });
-            assert_ne!(
-                first.join().unwrap().session_id,
-                second.join().unwrap().session_id
-            );
+            let handles = (0..WRITER_COUNT)
+                .map(|writer| {
+                    let barrier = barrier.clone();
+                    let store = &store;
+                    scope.spawn(move || {
+                        let registry = ProductSessionRegistry::new(store);
+                        let request_id = format!("019f0000-0000-4000-8000-{writer:012x}");
+                        barrier.wait();
+                        registry
+                            .create(
+                                "controlled",
+                                &request_id,
+                                Some("Concurrent"),
+                                writer as u64 + 1,
+                            )
+                            .unwrap()
+                            .session_id
+                    })
+                })
+                .collect::<Vec<_>>();
+            let session_ids = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(session_ids.len(), WRITER_COUNT);
         });
         let registry = ProductSessionRegistry::new(&store);
         let index = registry.load_index().unwrap();
-        assert_eq!(index.sessions.len(), 2);
-        assert_eq!(index.request_receipts.len(), 2);
-        assert_eq!(index.generation, 2);
+        assert_eq!(index.sessions.len(), WRITER_COUNT);
+        assert_eq!(index.request_receipts.len(), WRITER_COUNT);
+        assert_eq!(index.generation, WRITER_COUNT as u64);
     }
 
     #[test]

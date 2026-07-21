@@ -4497,9 +4497,8 @@ impl Router {
         // Mobile/standalone profile (#89/#721): the data API is fully session-token
         // gated. The static shell (`/`, `/app.js`, `/app.css`, fonts, `/sfx/*`) stays
         // open so the WebView can bootstrap — it carries no user data and no token.
-        // The current Android WebView path injects the trusted session natively; `_st`
-        // remains accepted only for legacy/non-WebView callers. No-op on the desktop
-        // daemon (session_token = None).
+        // The Android WebView path injects the trusted session natively. Query-carried
+        // session authority is rejected. The gate is off on the desktop daemon.
         if req.path.starts_with("/api/v1/") {
             if req.q("_st").is_some() {
                 return ApiResponse::error(400, "session token query is not allowed");
