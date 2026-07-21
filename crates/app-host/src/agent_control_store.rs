@@ -109,6 +109,7 @@ pub(crate) enum AgentTurnAdmissionBegin {
     Existing,
     Cancelled,
     Failed(String),
+    OutcomeUnknown(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -627,7 +628,7 @@ impl AgentControlStore {
         };
         if terminal_codes
             .iter()
-            .any(|code| !valid_turn_terminal_code(code))
+            .any(|code| !valid_persisted_turn_terminal_code(code))
         {
             return Err("control_store_migration_failed".into());
         }
@@ -3222,8 +3223,16 @@ impl AgentControlStore {
                 return Err("request_id_conflict".into());
             }
             return match (state.as_str(), terminal_code) {
-                ("active", Some(code)) if valid_turn_terminal_code(&code) => {
-                    Ok(AgentTurnAdmissionBegin::Failed(code))
+                ("active", Some(code)) => {
+                    if let Some(diagnostic) = decode_ambiguous_turn_diagnostic(&code) {
+                        Ok(AgentTurnAdmissionBegin::OutcomeUnknown(
+                            diagnostic.to_owned(),
+                        ))
+                    } else if valid_turn_terminal_code(&code) {
+                        Ok(AgentTurnAdmissionBegin::Failed(code))
+                    } else {
+                        Err("turn_admission_unavailable".into())
+                    }
                 }
                 ("active", None) => Ok(AgentTurnAdmissionBegin::Existing),
                 ("cancelled", None) => Ok(AgentTurnAdmissionBegin::Cancelled),
@@ -3523,6 +3532,28 @@ impl AgentControlStore {
         if !valid_turn_terminal_code(terminal_code) {
             return Err("turn_admission_unavailable".into());
         }
+        self.terminal_agent_turn_admission(turn_id, terminal_code)
+    }
+
+    pub(crate) fn outcome_unknown_agent_turn_admission(
+        &self,
+        turn_id: &str,
+        diagnostic_code: &str,
+    ) -> Result<AgentTurnAdmissionFailure, String> {
+        if !valid_ambiguous_turn_diagnostic(diagnostic_code) {
+            return Err("turn_admission_unavailable".into());
+        }
+        self.terminal_agent_turn_admission(
+            turn_id,
+            &format!("{OUTCOME_UNKNOWN_TERMINAL_PREFIX}{diagnostic_code}"),
+        )
+    }
+
+    fn terminal_agent_turn_admission(
+        &self,
+        turn_id: &str,
+        terminal_code: &str,
+    ) -> Result<AgentTurnAdmissionFailure, String> {
         let terminal_at_ms = crate::unix_now_ms();
         let binding_expires_at_ms = product_request_expiry(terminal_at_ms)
             .map_err(|_| "turn_admission_unavailable".to_string())?;
@@ -3552,7 +3583,9 @@ impl AgentControlStore {
             return Err("turn_admission_unavailable".into());
         }
         if let Some(stored_code) = stored_code {
-            return if stored_code == terminal_code && valid_turn_terminal_code(&stored_code) {
+            return if stored_code == terminal_code
+                && valid_persisted_turn_terminal_code(&stored_code)
+            {
                 Ok(AgentTurnAdmissionFailure::Failed)
             } else {
                 Err("turn_admission_unavailable".into())
@@ -3632,8 +3665,17 @@ impl AgentControlStore {
             Some((state, None)) if state == "cancelled" => {
                 Ok(Some((isyncyou_agent::RequestPhase::Cancelled, None)))
             }
-            Some((state, Some(code))) if state == "active" && valid_turn_terminal_code(&code) => {
-                Ok(Some((isyncyou_agent::RequestPhase::Failed, Some(code))))
+            Some((state, Some(code))) if state == "active" => {
+                if let Some(diagnostic) = decode_ambiguous_turn_diagnostic(&code) {
+                    Ok(Some((
+                        isyncyou_agent::RequestPhase::OutcomeUnknown,
+                        Some(diagnostic.to_owned()),
+                    )))
+                } else if valid_turn_terminal_code(&code) {
+                    Ok(Some((isyncyou_agent::RequestPhase::Failed, Some(code))))
+                } else {
+                    Err("turn_admission_unavailable".into())
+                }
             }
             Some((state, None)) if state == "active" => {
                 Ok(Some((isyncyou_agent::RequestPhase::Accepted, None)))
@@ -4975,6 +5017,69 @@ fn valid_turn_terminal_code(value: &str) -> bool {
     )
 }
 
+const OUTCOME_UNKNOWN_TERMINAL_PREFIX: &str = "outcome_unknown:";
+
+fn valid_persisted_turn_terminal_code(value: &str) -> bool {
+    valid_turn_terminal_code(value) || decode_ambiguous_turn_diagnostic(value).is_some()
+}
+
+fn decode_ambiguous_turn_diagnostic(value: &str) -> Option<&str> {
+    value
+        .strip_prefix(OUTCOME_UNKNOWN_TERMINAL_PREFIX)
+        .filter(|diagnostic| valid_ambiguous_turn_diagnostic(diagnostic))
+}
+
+fn valid_ambiguous_turn_diagnostic(value: &str) -> bool {
+    matches!(
+        value,
+        "assistant_archive_unavailable"
+            | "assistant_archive_query_failed"
+            | "assistant_archive_body_unavailable"
+            | "assistant_tool_arguments_invalid"
+            | "assistant_tool_response_invalid"
+            | "provider_authorization_rejected"
+            | "provider_reasoning_context_rejected"
+            | "provider_function_call_pairing_rejected"
+            | "provider_context_limit_reached"
+            | "provider_rate_limited"
+            | "provider_service_unavailable"
+            | "provider_response_invalid"
+            | "provider_response_incomplete"
+            | "provider_stream_failed"
+            | "provider_request_rejected"
+            | "provider_harness_rejected"
+            | "provider_connect_timed_out"
+            | "provider_response_timed_out"
+            | "provider_stream_idle_timed_out"
+            | "provider_tls_failed"
+            | "provider_name_resolution_failed"
+            | "provider_connect_failed"
+            | "provider_stream_read_failed"
+            | "provider_stream_ended_without_event"
+            | "provider_response_read_failed"
+            | "provider_transport_failed"
+            | "provider_generation_changed"
+            | "provider_step_limit_reached"
+            | "session_store_unavailable"
+            | "session_transport_unavailable"
+            | "session_transport_timed_out"
+            | "session_name_resolution_failed"
+            | "session_tls_failed"
+            | "session_connect_failed"
+            | "session_storage_response_invalid"
+            | "session_writer_reconnect_required"
+            | "session_storage_permission_denied"
+            | "session_storage_request_rejected"
+            | "session_state_invalid"
+            | "session_limit_reached"
+            | "request_id_conflict"
+            | "turn_state_invalid"
+            | "turn_outcome_unknown"
+            | "lease_lost"
+            | "provider_request_failed"
+    )
+}
+
 fn require_mutation_free_space(required: u64, available: u64) -> Result<(), String> {
     (available >= required)
         .then_some(())
@@ -5956,13 +6061,13 @@ mod tests {
             );
             assert_eq!(
                 control
-                    .fail_agent_turn_admission(turn_id, "session_transport_unavailable")
+                    .fail_agent_turn_admission(turn_id, "provider_generation_changed")
                     .unwrap(),
                 AgentTurnAdmissionFailure::Failed
             );
             assert_eq!(
                 control
-                    .fail_agent_turn_admission(turn_id, "session_transport_unavailable")
+                    .fail_agent_turn_admission(turn_id, "provider_generation_changed")
                     .unwrap(),
                 AgentTurnAdmissionFailure::Failed
             );
@@ -5981,7 +6086,7 @@ mod tests {
                     .unwrap(),
                 Some((
                     isyncyou_agent::RequestPhase::Failed,
-                    Some("session_transport_unavailable".into()),
+                    Some("provider_generation_changed".into()),
                 ))
             );
             assert!(control.recover_agent_turn_admissions(8).unwrap().is_empty());
@@ -5997,7 +6102,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(state, "active");
-            assert_eq!(terminal_code, "session_transport_unavailable");
+            assert_eq!(terminal_code, "provider_generation_changed");
             assert_eq!(sealed_bytes, 0);
             assert_eq!(
                 control.cancel_agent_turn_admission(turn_id).unwrap_err(),
@@ -6012,7 +6117,68 @@ mod tests {
             control
                 .begin_agent_turn_admission(&request, turn_id, digest)
                 .unwrap(),
-            AgentTurnAdmissionBegin::Failed("session_transport_unavailable".into())
+            AgentTurnAdmissionBegin::Failed("provider_generation_changed".into())
+        );
+        drop(control);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_turn_admission_preserves_closed_diagnostic_without_replay() {
+        let root = temp_root("agent-turn-admission-outcome-unknown");
+        let credential_store = credential_store(&root);
+        let request = isyncyou_webui::AgentTurnRequest {
+            request_id: "019f0000-0000-4000-8000-000000000318".into(),
+            session_id: "01JSESSION00000000000000018".into(),
+            account: "controlled".into(),
+            prompt: "Ambiguous provider outcome".into(),
+        };
+        let turn_id = "01JTURN0000000000000000018";
+        let digest = "1818181818181818181818181818181818181818181818181818181818181818";
+        {
+            let control =
+                AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1)
+                    .unwrap();
+            assert_eq!(
+                control
+                    .begin_agent_turn_admission(&request, turn_id, digest)
+                    .unwrap(),
+                AgentTurnAdmissionBegin::Inserted
+            );
+            assert_eq!(
+                control
+                    .outcome_unknown_agent_turn_admission(turn_id, "raw transport detail")
+                    .unwrap_err(),
+                "turn_admission_unavailable"
+            );
+            assert_eq!(
+                control
+                    .outcome_unknown_agent_turn_admission(turn_id, "provider_generation_changed",)
+                    .unwrap(),
+                AgentTurnAdmissionFailure::Failed
+            );
+            assert_eq!(
+                control
+                    .agent_turn_admission_terminal(
+                        &request.request_id,
+                        &format!("session_id:{}", request.session_id),
+                    )
+                    .unwrap(),
+                Some((
+                    isyncyou_agent::RequestPhase::OutcomeUnknown,
+                    Some("provider_generation_changed".into()),
+                ))
+            );
+            assert!(control.recover_agent_turn_admissions(8).unwrap().is_empty());
+        }
+
+        let control =
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        assert_eq!(
+            control
+                .begin_agent_turn_admission(&request, turn_id, digest)
+                .unwrap(),
+            AgentTurnAdmissionBegin::OutcomeUnknown("provider_generation_changed".into())
         );
         drop(control);
         std::fs::remove_dir_all(root).unwrap();

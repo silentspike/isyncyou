@@ -545,9 +545,7 @@ fn agent_safe_outcome_diagnostic(code: &str) -> &'static str {
         "assistant_tool_response_invalid" => "assistant_tool_response_invalid",
         "provider_authorization_rejected" => "provider_authorization_rejected",
         "provider_reasoning_context_rejected" => "provider_reasoning_context_rejected",
-        "provider_function_call_pairing_rejected" => {
-            "provider_function_call_pairing_rejected"
-        }
+        "provider_function_call_pairing_rejected" => "provider_function_call_pairing_rejected",
         "provider_context_limit_reached" => "provider_context_limit_reached",
         "provider_rate_limited" => "provider_rate_limited",
         "provider_service_unavailable" => "provider_service_unavailable",
@@ -1342,6 +1340,26 @@ impl DurableTurnAdmissionLease {
         if !self.completed {
             self.store.complete_agent_turn_admission(&self.request_id)?;
             self.completed = true;
+        }
+        Ok(())
+    }
+
+    fn outcome_unknown(&mut self, turn_id: &str, diagnostic_code: &str) -> Result<(), String> {
+        if !self.completed {
+            match self
+                .store
+                .outcome_unknown_agent_turn_admission(turn_id, diagnostic_code)?
+            {
+                agent_control_store::AgentTurnAdmissionFailure::Failed => {
+                    self.completed = true;
+                }
+                agent_control_store::AgentTurnAdmissionFailure::Cancelled => {
+                    return Err("turn_cancelled".into());
+                }
+                agent_control_store::AgentTurnAdmissionFailure::Completed => {
+                    return Err("turn_admission_unavailable".into());
+                }
+            }
         }
         Ok(())
     }
@@ -9281,7 +9299,7 @@ impl DaemonAgent {
                                 isyncyou_agent::RequestPhase::Failed,
                             )
                         };
-                        let persisted = product_turn.map_or(Ok(()), |runtime| {
+                        let mut persisted = product_turn.map_or(Ok(()), |runtime| {
                             cache_product_session_context(
                                 &hot_session_history,
                                 runtime.finish_terminal(
@@ -9296,6 +9314,13 @@ impl DaemonAgent {
                                 ),
                             )
                         });
+                        if persisted.is_ok() && provider_outcome_ambiguous {
+                            if let Err(error) =
+                                durable_admission.outcome_unknown(&tid, &diagnostic_code)
+                            {
+                                persisted = Err(error);
+                            }
+                        }
                         terminal_persisted = persisted.is_ok();
                         cache_persisted_request_phase(
                             &hot_request_statuses,
@@ -10666,6 +10691,18 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                         &turn_id,
                         product_session::ProductTurnReplay {
                             phase: isyncyou_agent::RequestPhase::Failed,
+                            final_text: None,
+                            error_code: Some(code),
+                        },
+                    );
+                    drop(reserved);
+                    return Ok(turn_id);
+                }
+                agent_control_store::AgentTurnAdmissionBegin::OutcomeUnknown(code) => {
+                    self.emit_product_turn_replay(
+                        &turn_id,
+                        product_session::ProductTurnReplay {
+                            phase: isyncyou_agent::RequestPhase::OutcomeUnknown,
                             final_text: None,
                             error_code: Some(code),
                         },
@@ -25382,6 +25419,60 @@ fn active_turn_admission_survives_hot_status_eviction() {
         request_status_json(isyncyou_agent::RequestPhase::Accepted)
     );
 
+    drop(agent);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+#[test]
+fn ambiguous_turn_admission_overrides_hot_phase_with_closed_diagnostic() {
+    let root =
+        std::env::temp_dir().join(format!("isyncyou-durable-unknown-status-{}", unix_now_ms()));
+    let _ = std::fs::remove_dir_all(&root);
+    let agent = DaemonAgent::new(Config::default(), root.clone());
+    let request = isyncyou_webui::AgentTurnRequest {
+        request_id: "019f0000-0000-4000-8000-000000000319".into(),
+        session_id: "01JSESSION00000000000000019".into(),
+        account: "controlled".into(),
+        prompt: "Ambiguous provider outcome remains closed".into(),
+    };
+    let turn_id = "01JTURN0000000000000000019";
+    let store = agent.control_store.as_ref().unwrap();
+    store
+        .begin_agent_turn_admission(
+            &request,
+            turn_id,
+            "1919191919191919191919191919191919191919191919191919191919191919",
+        )
+        .unwrap();
+    store
+        .outcome_unknown_agent_turn_admission(turn_id, "provider_request_rejected")
+        .unwrap();
+    agent.hot_request_statuses.insert(
+        &request.session_id,
+        &request.request_id,
+        isyncyou_agent::RequestPhase::Committed,
+    );
+
+    assert_eq!(
+        isyncyou_webui::AgentHandler::request_status(
+            &agent,
+            &request.session_id,
+            "agent_turn",
+            &request.request_id,
+        )
+        .unwrap(),
+        serde_json::json!({
+            "state": "outcome_unknown",
+            "code": "turn_outcome_unknown",
+            "terminal": true,
+            "resume_allowed": false,
+            "diagnostic_code": "provider_request_rejected",
+        })
+    );
     drop(agent);
     let _ = std::fs::remove_dir_all(root);
 }
