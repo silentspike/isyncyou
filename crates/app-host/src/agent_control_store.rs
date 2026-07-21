@@ -1838,8 +1838,8 @@ impl AgentControlStore {
                 Err(_) => return Err("mutation_intent_failed".into()),
             }
         }
-        match std::fs::remove_dir(&intent_dir) {
-            Ok(()) => {}
+        match std::fs::symlink_metadata(&intent_dir) {
+            Ok(_) => remove_private_tree_no_follow(&intent_dir)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err("mutation_intent_failed".into()),
         }
@@ -8431,8 +8431,8 @@ mod tests {
     }
 
     #[test]
-    fn mutation_cancel_retries_incomplete_staging_cleanup() {
-        let root = temp_root("mutation-cancel-cleanup-retry");
+    fn mutation_cancel_removes_private_unindexed_staging_files_idempotently() {
+        let root = temp_root("mutation-cancel-unindexed-cleanup");
         let credential_store = credential_store(&root);
         let store =
             AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
@@ -8454,25 +8454,24 @@ mod tests {
         let intent_dir = root
             .join("agent-control/mutation-staging")
             .join(&info.intent_id);
-        let blocker = intent_dir.join("unexpected");
-        std::fs::write(&blocker, b"block cleanup").unwrap();
+        let orphan = intent_dir.join("unindexed-crash-orphan.chunk");
+        std::fs::write(&orphan, b"unindexed crash orphan").unwrap();
+        secure_file_mode(&orphan).unwrap();
         let cancel_request = "019f0000-0000-4000-8000-000000000135";
-        assert_eq!(
-            store.cancel_mutation_intent("owner-a", cancel_request, &info.intent_id),
-            Err("mutation_intent_failed".into())
-        );
-        std::fs::remove_file(blocker).unwrap();
         store
             .cancel_mutation_intent("owner-a", cancel_request, &info.intent_id)
             .unwrap();
         assert!(!intent_dir.exists());
+        store
+            .cancel_mutation_intent("owner-a", cancel_request, &info.intent_id)
+            .unwrap();
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn mutation_reaper_keeps_intent_active_until_staging_cleanup_succeeds() {
-        let root = temp_root("mutation-reaper-cleanup-retry");
+    fn mutation_reaper_removes_private_unindexed_crash_orphan_without_cross_intent_cleanup() {
+        let root = temp_root("mutation-reaper-unindexed-cleanup");
         let credential_store = credential_store(&root);
         let store =
             AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
@@ -8498,27 +8497,32 @@ mod tests {
         let intent_dir = root
             .join("agent-control/mutation-staging")
             .join(&info.intent_id);
-        let blocker = intent_dir.join("unexpected");
-        std::fs::write(&blocker, b"block cleanup").unwrap();
-        let expired_at = 1_000 + MUTATION_INTENT_TTL_MS + 1;
-
-        assert_eq!(
-            store.reap_expired(expired_at, 16),
-            Err("mutation_intent_failed".into())
-        );
-        let state: String = store
-            .connection
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT state FROM mutation_intents WHERE intent_id=?1",
-                params![info.intent_id],
-                |row| row.get(0),
+        let orphan = intent_dir.join("unindexed-crash-orphan.chunk");
+        std::fs::write(&orphan, b"unindexed crash orphan").unwrap();
+        secure_file_mode(&orphan).unwrap();
+        let retained = store
+            .create_mutation_intent(
+                &mutation_create("019f0000-0000-4000-8000-000000000149", "owner-b", payload),
+                1_001,
             )
             .unwrap();
-        assert_eq!(state, "active");
+        store
+            .put_mutation_chunk(
+                "owner-b",
+                "019f0000-0000-4000-8000-000000000150",
+                &retained.intent_id,
+                0,
+                0,
+                &sha256_hex(payload),
+                payload,
+                1_002,
+            )
+            .unwrap();
+        let retained_dir = root
+            .join("agent-control/mutation-staging")
+            .join(&retained.intent_id);
+        let expired_at = 1_000 + MUTATION_INTENT_TTL_MS + 1;
 
-        std::fs::remove_file(blocker).unwrap();
         assert_eq!(store.reap_expired(expired_at, 16).unwrap(), 1);
         let state: String = store
             .connection
@@ -8532,6 +8536,7 @@ mod tests {
             .unwrap();
         assert_eq!(state, "expired");
         assert!(!intent_dir.exists());
+        assert!(retained_dir.exists());
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
