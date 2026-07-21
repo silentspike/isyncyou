@@ -61,7 +61,9 @@ verify_feature_matrix() {
 
 verify_release_exclusion() {
   cd "$ROOT"
-  cargo remote -c -- build --release -p isyncyou-daemon
+  mkdir -p target/release
+  cargo remote --no-copy-lock -d 1.95.0 -c release/isyncyoud -- \
+    build --locked --release -p isyncyou-daemon
   [[ -x target/release/isyncyoud ]] || die "release daemon is unavailable"
   scan_binary target/release/isyncyoud
 

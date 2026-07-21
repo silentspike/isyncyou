@@ -2944,6 +2944,8 @@ enum AgentStartTurnError {
     /// The selected product provider is not host-verified ready (no valid activated credential),
     /// and no experimental fallback applies. Closed wire code `product_not_ready` -> HTTP 409.
     ProductNotReady,
+    /// Another turn, refresh, or lifecycle mutation currently owns the provider lease.
+    ProviderBusy,
 }
 
 #[cfg(any(
@@ -2954,6 +2956,7 @@ impl AgentStartTurnError {
     fn wire(self) -> &'static str {
         match self {
             Self::ProductNotReady => "product_not_ready",
+            Self::ProviderBusy => "provider_busy",
         }
     }
 }
@@ -3364,6 +3367,18 @@ impl DaemonAgent {
             #[cfg(test)]
             test_provider_script: None,
         };
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        if agent.lifecycle_initialized
+            && agent
+                .bind_existing_product_credential_generations()
+                .is_err()
+        {
+            agent.lifecycle_initialized = false;
+            agent.control_store_state = "recovery_required";
+        }
         // #639 T8: recover any product onboarding interrupted by a crash before the durable
         // authority (bundle + activation + terminal journal entry) was fully written.
         #[cfg(any(
@@ -3388,6 +3403,56 @@ impl DaemonAgent {
     ))]
     fn shared_control_store(&self) -> Option<Arc<agent_control_store::AgentControlStore>> {
         self.control_store.clone()
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn bind_existing_product_credential_generations(&self) -> Result<(), String> {
+        for provider in ProductProviderId::ALL {
+            let operation_id = account_lifecycle::mint_operation_id()
+                .map_err(|_| "lifecycle_unavailable".to_string())?;
+            let _provider = self
+                .provider_leases
+                .acquire_exclusive(
+                    &self.oauth_dir,
+                    provider,
+                    operation_id,
+                    account_lifecycle::ProviderOperationKind::Maintenance,
+                )
+                .map_err(|_| "provider_busy".to_string())?;
+            let _runtime = self
+                .product_runtime_gate
+                .lock()
+                .map_err(|_| "lifecycle_unavailable".to_string())?;
+            let _snapshot = acquire_product_runtime_file_lock(&self.oauth_dir)?;
+            let repository = account_lifecycle_repository(&self.oauth_dir)?;
+            let context = repository
+                .load_existing()
+                .map_err(|error| error.wire().to_string())?
+                .ok_or_else(|| "lifecycle_unavailable".to_string())?;
+            // An active lifecycle operation owns this provider's generation transition. Its
+            // recovery path either retires the old etag or publishes the candidate etag before
+            // releasing authority; startup migration must not race or pre-empt that operation.
+            if context.authority.active_operations.contains_key(&provider) {
+                continue;
+            }
+            let credential_id = match provider {
+                ProductProviderId::Claude => SUBSCRIPTION_CREDENTIAL_ID,
+                ProductProviderId::Codex => CODEX_CREDENTIAL_ID,
+            };
+            let Some(meta) = load_product_bundle_meta(&self.oauth_dir, credential_id) else {
+                continue;
+            };
+            if !self.provider_activation_valid_for_meta(provider, &meta) {
+                continue;
+            }
+            repository
+                .bind_current_credential_generation(provider, &meta.generation)
+                .map_err(|error| error.wire().to_string())?;
+        }
+        Ok(())
     }
 
     #[cfg(any(
@@ -3599,7 +3664,9 @@ impl DaemonAgent {
         feature = "agent-subscription-experimental"
     ))]
     fn provider_ready(&self, provider: ProductProviderId) -> bool {
-        if self.lifecycle_provider_blocked(provider) {
+        if self.lifecycle_provider_blocked(provider)
+            || !self.lifecycle_credential_generation_bound(provider)
+        {
             return false;
         }
         match provider {
@@ -3633,6 +3700,29 @@ impl DaemonAgent {
                     .map_err(|_| "lifecycle_unavailable".to_string())
             })
             .unwrap_or(true)
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn lifecycle_credential_generation_bound(&self, provider: ProductProviderId) -> bool {
+        account_lifecycle_repository(&self.oauth_dir)
+            .and_then(|repository| {
+                repository
+                    .load_existing()
+                    .map_err(|_| "lifecycle_unavailable".to_string())
+            })
+            .ok()
+            .flatten()
+            .and_then(|context| {
+                context
+                    .authority
+                    .current_credential_etags
+                    .get(&provider)
+                    .cloned()
+            })
+            .is_some_and(|etag| !etag.is_empty())
     }
 
     /// #639 (F3): the DURABLE product activation is valid — a valid Active V2 bundle whose OWN policy
@@ -3940,7 +4030,7 @@ impl DaemonAgent {
                 operation_id.clone(),
                 account_lifecycle::ProviderOperationKind::Refresh,
             )
-            .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+            .map_err(|_| AgentStartTurnError::ProviderBusy)?;
 
         let (settings, meta, turn_fence, credential) = {
             let _gate = self
@@ -3999,7 +4089,7 @@ impl DaemonAgent {
                                         operation_id,
                                         account_lifecycle::ProviderOperationKind::Turn,
                                     )
-                                    .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+                                    .map_err(|_| AgentStartTurnError::ProviderBusy)?;
                                 let still_absent = {
                                     let _gate = self
                                         .product_runtime_gate
@@ -4086,7 +4176,7 @@ impl DaemonAgent {
                                         operation_id,
                                         account_lifecycle::ProviderOperationKind::Turn,
                                     )
-                                    .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+                                    .map_err(|_| AgentStartTurnError::ProviderBusy)?;
                                 let still_absent = {
                                     let _gate = self
                                         .product_runtime_gate
@@ -4179,7 +4269,7 @@ impl DaemonAgent {
                 operation_id,
                 account_lifecycle::ProviderOperationKind::Turn,
             )
-            .map_err(|_| AgentStartTurnError::ProductNotReady)?;
+            .map_err(|_| AgentStartTurnError::ProviderBusy)?;
         let provider = {
             let _gate = self
                 .product_runtime_gate
@@ -6714,6 +6804,19 @@ fn activate_product(
     provider: ProductProviderId,
     generation: &str,
 ) -> Result<(), String> {
+    persist_product_activation(oauth_dir, provider, generation)?;
+    bind_product_credential_generation(oauth_dir, provider, generation)
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn persist_product_activation(
+    oauth_dir: &Path,
+    provider: ProductProviderId,
+    generation: &str,
+) -> Result<(), String> {
     let credential_id = match provider {
         ProductProviderId::Claude => SUBSCRIPTION_CREDENTIAL_ID,
         ProductProviderId::Codex => CODEX_CREDENTIAL_ID,
@@ -6741,6 +6844,25 @@ fn activate_product(
         harness_contract_version: isyncyou_agent::HARNESS_CONTRACT_VERSION,
     };
     store_product_activation(oauth_dir, provider, &activation)
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn bind_product_credential_generation(
+    oauth_dir: &Path,
+    provider: ProductProviderId,
+    generation: &str,
+) -> Result<(), String> {
+    let repository = account_lifecycle_repository(oauth_dir)?;
+    repository
+        .initialize()
+        .map_err(|error| error.wire().to_string())?;
+    repository
+        .bind_current_credential_generation(provider, generation)
+        .map(|_| ())
+        .map_err(|error| error.wire().to_string())
 }
 
 /// Load the V2 metadata for a persisted product credential (#639); `None` if absent or legacy.
@@ -7398,7 +7520,7 @@ fn commit_codex_oauth_candidate(
         },
         &meta,
     )?;
-    activate_product(
+    persist_product_activation(
         &runtime.oauth_dir,
         ProductProviderId::Codex,
         &meta.generation,
@@ -8290,7 +8412,7 @@ p{color:#9aa3b2;line-height:1.5}</style></head><body><div class=c>\
                 &meta,
             )?,
         }
-        activate_product(&self.oauth_dir, provider, &meta.generation)?;
+        persist_product_activation(&self.oauth_dir, provider, &meta.generation)?;
         let default_model = match provider {
             ProductProviderId::Claude => DEFAULT_MODEL,
             ProductProviderId::Codex => CODEX_MODELS[0].id,
@@ -26192,7 +26314,7 @@ mod tests {
             &meta,
         )
         .unwrap();
-        activate_product(&root, ProductProviderId::Codex, &meta.generation).unwrap();
+        persist_product_activation(&root, ProductProviderId::Codex, &meta.generation).unwrap();
         store_agent_provider_selection(
             &root,
             "codex",
@@ -26334,7 +26456,7 @@ mod tests {
                 &meta,
             )
             .unwrap();
-        activate_product(&root, ProductProviderId::Claude, &meta.generation).unwrap();
+        persist_product_activation(&root, ProductProviderId::Claude, &meta.generation).unwrap();
         store_agent_provider_selection(&root, "claude", DEFAULT_MODEL).unwrap();
         assert_eq!(
             repo.load_candidate(&candidate_id).unwrap().unwrap().state,
@@ -26458,7 +26580,8 @@ mod tests {
                     .unwrap();
             }
             if publication_count >= 2 {
-                activate_product(&root, ProductProviderId::Claude, &meta.generation).unwrap();
+                persist_product_activation(&root, ProductProviderId::Claude, &meta.generation)
+                    .unwrap();
             }
             drop(agent);
 
@@ -27011,6 +27134,77 @@ mod tests {
                 .principal(),
             principal
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn startup_binds_pre_lifecycle_active_generation_before_readiness() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("startup-generation-binding");
+        let _ = std::fs::remove_dir_all(&root);
+        drop(DaemonAgent::new(Config::default(), root.clone()));
+
+        let meta = ProductBundleMeta::fresh(ProductProviderId::Codex).unwrap();
+        store_codex_bundle(
+            &root,
+            &CodexStoredCredential {
+                access_token: "synthetic-codex-access".into(),
+                refresh_token: "synthetic-codex-refresh".into(),
+                account_id: "synthetic-codex-account".into(),
+                expires_at_ms: u64::MAX,
+            },
+            &meta,
+        )
+        .unwrap();
+        persist_product_activation(&root, ProductProviderId::Codex, &meta.generation).unwrap();
+        store_agent_provider_selection(&root, "codex", "gpt-5.6-sol").unwrap();
+        assert!(!account_lifecycle_repository(&root)
+            .unwrap()
+            .load_existing()
+            .unwrap()
+            .unwrap()
+            .authority
+            .current_credential_etags
+            .contains_key(&ProductProviderId::Codex));
+
+        let restarted = DaemonAgent::new(Config::default(), root.clone());
+        assert!(restarted.provider_ready(ProductProviderId::Codex));
+        assert!(restarted.lifecycle_credential_generation_bound(ProductProviderId::Codex));
+        drop(restarted);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn turn_reports_provider_busy_when_lifecycle_lease_is_held() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("turn-provider-busy");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        seed_claude_lifecycle_fixture(&agent);
+        let _lease = agent
+            .provider_leases
+            .acquire_exclusive(
+                &root,
+                ProductProviderId::Claude,
+                "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into(),
+                account_lifecycle::ProviderOperationKind::Maintenance,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            agent.product_runtime_gate("system"),
+            Err(AgentStartTurnError::ProviderBusy)
+        ));
+        drop(_lease);
+        drop(agent);
         std::fs::remove_dir_all(root).unwrap();
     }
 
