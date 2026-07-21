@@ -936,7 +936,7 @@ async function main() {
 
     await page.locator('[data-testid="agent-model-picker"] .mdl-trigger').click();
     await page.locator('[data-agent-model-option="claude|claude-opus-4"]').click();
-    await page.waitForFunction(() => document.querySelector('[data-testid="agent-model-picker"]')?.innerText.includes("Claude Opus 4"), null, { timeout: 10000 });
+    await page.waitForFunction(() => document.querySelector('[data-testid="agent-model-picker"] .mdl-cur')?.innerText.includes("Claude Opus 4"), null, { timeout: 10000 });
     assert(evidence, "model picker posts model change", fixture.state.modelPosts.length === 1 && fixture.state.modelPosts[0].model === "claude-opus-4", fixture.state.modelPosts);
     assert(evidence, "usage chip shows unavailable state", (await page.locator('[data-testid="agent-usage"]').innerText()).includes("Usage unavailable"));
 
@@ -971,10 +971,10 @@ async function main() {
       && await page.locator('[data-agent-model-option="codex|gpt-5.6-terra"]').isVisible()
       && await page.locator('[data-agent-model-option="codex|gpt-5.6-luna"]').isVisible());
     await page.locator('[data-agent-model-option="codex|gpt-5.6-terra"]').click();
-    await page.waitForFunction(() => document.querySelector('[data-testid="agent-model-picker"]')?.innerText.includes("GPT-5.6 Terra"), null, { timeout: 10000 });
+    await page.waitForFunction(() => document.querySelector('[data-testid="agent-model-picker"] .mdl-cur')?.innerText.includes("GPT-5.6 Terra"), null, { timeout: 10000 });
     await page.locator('[data-testid="agent-model-picker"] .mdl-trigger').click();
     await page.locator('[data-agent-effort-option="high"]').click();
-    await page.waitForFunction(() => document.querySelector('[data-testid="agent-model-picker"]')?.innerText.includes("GPT-5.6 Terra · High"), null, { timeout: 10000 });
+    await page.waitForFunction(() => document.querySelector('[data-testid="agent-model-picker"] .mdl-cur')?.innerText.includes("GPT-5.6 Terra · High"), null, { timeout: 10000 });
     const codexSelection = fixture.state.modelPosts.at(-1);
     assert(evidence, "ChatGPT effort posts with the selected GPT-5.6 model",
       codexSelection?.provider === "codex"
