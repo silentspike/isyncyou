@@ -536,6 +536,60 @@ fn product_turn_terminal_error(
     feature = "agent-subscription-experimental",
     test
 ))]
+fn agent_safe_outcome_diagnostic(code: &str) -> &'static str {
+    match code {
+        "assistant_archive_unavailable" => "assistant_archive_unavailable",
+        "assistant_archive_query_failed" => "assistant_archive_query_failed",
+        "assistant_archive_body_unavailable" => "assistant_archive_body_unavailable",
+        "assistant_tool_arguments_invalid" => "assistant_tool_arguments_invalid",
+        "assistant_tool_response_invalid" => "assistant_tool_response_invalid",
+        "provider_authorization_rejected" => "provider_authorization_rejected",
+        "provider_reasoning_context_rejected" => "provider_reasoning_context_rejected",
+        "provider_function_call_pairing_rejected" => {
+            "provider_function_call_pairing_rejected"
+        }
+        "provider_context_limit_reached" => "provider_context_limit_reached",
+        "provider_rate_limited" => "provider_rate_limited",
+        "provider_service_unavailable" => "provider_service_unavailable",
+        "provider_response_invalid" => "provider_response_invalid",
+        "provider_response_incomplete" => "provider_response_incomplete",
+        "provider_stream_failed" => "provider_stream_failed",
+        "provider_request_rejected" => "provider_request_rejected",
+        "provider_harness_rejected" => "provider_harness_rejected",
+        "provider_connect_timed_out" => "provider_connect_timed_out",
+        "provider_response_timed_out" => "provider_response_timed_out",
+        "provider_stream_idle_timed_out" => "provider_stream_idle_timed_out",
+        "provider_tls_failed" => "provider_tls_failed",
+        "provider_name_resolution_failed" => "provider_name_resolution_failed",
+        "provider_connect_failed" => "provider_connect_failed",
+        "provider_stream_read_failed" => "provider_stream_read_failed",
+        "provider_stream_ended_without_event" => "provider_stream_ended_without_event",
+        "provider_response_read_failed" => "provider_response_read_failed",
+        "provider_transport_failed" => "provider_transport_failed",
+        "provider_generation_changed" => "provider_generation_changed",
+        "provider_step_limit_reached" => "provider_step_limit_reached",
+        "session_store_unavailable" => "session_store_unavailable",
+        "session_transport_unavailable" => "session_transport_unavailable",
+        "session_transport_timed_out" => "session_transport_timed_out",
+        "session_name_resolution_failed" => "session_name_resolution_failed",
+        "session_tls_failed" => "session_tls_failed",
+        "session_connect_failed" => "session_connect_failed",
+        "session_storage_response_invalid" => "session_storage_response_invalid",
+        "session_writer_reconnect_required" => "session_writer_reconnect_required",
+        "session_storage_permission_denied" => "session_storage_permission_denied",
+        "session_storage_request_rejected" => "session_storage_request_rejected",
+        "session_state_invalid" => "session_state_invalid",
+        "turn_state_invalid" => "turn_state_invalid",
+        "lease_lost" => "lease_lost",
+        _ => "provider_request_failed",
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental",
+    test
+))]
 fn agent_safe_turn_start_error(error: &str) -> &'static str {
     match error {
         "product_not_ready" => "product_not_ready",
@@ -1150,12 +1204,23 @@ fn request_status_json_with_terminal_code(
         ),
         isyncyou_agent::RequestPhase::Cancelled => ("cancelled", "turn_cancelled", true, false),
     };
-    serde_json::json!({
+    let mut status = serde_json::json!({
         "state": state,
         "code": code,
         "terminal": terminal,
         "resume_allowed": resume_allowed,
-    })
+    });
+    if matches!(
+        phase,
+        isyncyou_agent::RequestPhase::ProviderStepStarted
+            | isyncyou_agent::RequestPhase::OutcomeUnknown
+    ) {
+        if let Some(diagnostic) = terminal_code {
+            status["diagnostic_code"] =
+                serde_json::Value::String(agent_safe_outcome_diagnostic(diagnostic).into());
+        }
+    }
+    status
 }
 
 #[cfg(any(
@@ -9199,12 +9264,12 @@ impl DaemonAgent {
                         }
                     }
                     Err(error) => {
-                        let safe_error = product_turn_terminal_error(
-                            &error,
-                            product_turn.as_ref().is_some_and(
-                                product_session::ProductTurnRuntime::provider_outcome_is_ambiguous,
-                            ),
+                        let provider_outcome_ambiguous = product_turn.as_ref().is_some_and(
+                            product_session::ProductTurnRuntime::provider_outcome_is_ambiguous,
                         );
+                        let diagnostic_code = agent_safe_turn_error(&error).to_owned();
+                        let safe_error =
+                            product_turn_terminal_error(&error, provider_outcome_ambiguous);
                         let (terminal_status, phase) = if safe_error == "turn_outcome_unknown" {
                             (
                                 isyncyou_agent::TurnTerminalStatus::OutcomeUnknown,
@@ -9221,7 +9286,11 @@ impl DaemonAgent {
                                 &hot_session_history,
                                 runtime.finish_terminal(
                                     terminal_status,
-                                    Some(safe_error.clone()),
+                                    Some(if provider_outcome_ambiguous {
+                                        diagnostic_code.clone()
+                                    } else {
+                                        safe_error.clone()
+                                    }),
                                     phase,
                                     unix_now_ms(),
                                 ),
@@ -25200,6 +25269,26 @@ fn agent_request_status_prefers_bounded_hot_terminal_state() {
             Some("raw private transport detail"),
         )["code"],
         "turn_start_failed"
+    );
+    assert_eq!(
+        request_status_json_with_terminal_code(
+            isyncyou_agent::RequestPhase::OutcomeUnknown,
+            Some("provider_authorization_rejected"),
+        ),
+        serde_json::json!({
+            "state": "outcome_unknown",
+            "code": "turn_outcome_unknown",
+            "terminal": true,
+            "resume_allowed": false,
+            "diagnostic_code": "provider_authorization_rejected",
+        })
+    );
+    assert_eq!(
+        request_status_json_with_terminal_code(
+            isyncyou_agent::RequestPhase::OutcomeUnknown,
+            Some("raw private transport detail"),
+        )["diagnostic_code"],
+        "provider_request_failed"
     );
 }
 
