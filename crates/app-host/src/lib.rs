@@ -10980,20 +10980,10 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             let registry = product_session::ProductSessionRegistry::new(&credential_store);
             if let Some(control_store) = self.control_store.as_ref() {
                 let maintenance_now_ms = unix_now_ms();
+                // Pairing creation is a local intent mutation. Remote descriptor cleanup is
+                // owned by the startup/interval maintenance worker so this route cannot block
+                // behind provider I/O before it returns the source handle.
                 let _ = control_store.reap_expired(maintenance_now_ms, 256);
-                cleanup_pairing_claim_descriptors_once(
-                    &self.cfg,
-                    control_store,
-                    maintenance_now_ms,
-                );
-                if let Ok(targets) = registry.maintenance_targets() {
-                    cleanup_pairing_descriptors_once(
-                        &self.cfg,
-                        control_store,
-                        &targets,
-                        maintenance_now_ms,
-                    );
-                }
             }
             registry.account_for(&request.session_id)?;
             let payload = registry.pairing_payload(&request.session_id)?;
@@ -24811,6 +24801,28 @@ mod tests {
             assert!(!run.summary.contains("synthetic-claude-refresh"));
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn pairing_create_runs_only_local_bounded_reaper_before_intent() {
+        let host = include_str!("lib.rs");
+        let create = host
+            .split("fn session_pairing_create(")
+            .nth(1)
+            .unwrap()
+            .split("fn session_pairing_reveal(")
+            .next()
+            .unwrap();
+        assert!(create.contains("reap_expired(maintenance_now_ms, 256)"));
+        assert!(create.contains("create_pairing_source"));
+        assert!(!create.contains("cleanup_pairing_claim_descriptors_once"));
+        assert!(!create.contains("cleanup_pairing_descriptors_once"));
+        assert!(!create.contains("OneDrivePairingTransportV2"));
+        assert!(!create.contains("resolve_cached_sync_token"));
     }
 
     #[cfg(any(
