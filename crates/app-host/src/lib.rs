@@ -4081,6 +4081,10 @@ impl DaemonAgent {
                         }
                         ProductCredentialState::Absent => {
                             #[cfg(feature = "agent-subscription-experimental")]
+                            #[expect(
+                                clippy::manual_option_zip,
+                                reason = "experimental provider construction must remain lazy until the absent-product fence is captured"
+                            )]
                             if let Some((provider, experimental_fence)) = self
                                 .capture_absent_product_refresh_fence(selected)
                                 .ok()
@@ -4168,6 +4172,10 @@ impl DaemonAgent {
                         }
                         ProductCredentialState::Absent => {
                             #[cfg(feature = "agent-subscription-experimental")]
+                            #[expect(
+                                clippy::manual_option_zip,
+                                reason = "experimental provider construction must remain lazy until the absent-product fence is captured"
+                            )]
                             if let Some((provider, experimental_fence)) = self
                                 .capture_absent_product_refresh_fence(selected)
                                 .ok()
@@ -16212,9 +16220,9 @@ mod tests {
         ))
     }
 
-    #[cfg(any(
+    #[cfg(all(
         feature = "agent-oauth-providers",
-        feature = "agent-subscription-experimental"
+        not(feature = "agent-subscription-experimental")
     ))]
     fn bind_test_product_refresh_authority(root: &Path, provider: ProductProviderId, fill: char) {
         let repository = account_lifecycle_repository(root).unwrap();
