@@ -2162,7 +2162,7 @@ fn run_account_maintenance_once(
     }
     reap_onboarding_journals_at(&context.oauth_dir, now_ms());
     let maintenance_now_ms = unix_now_ms();
-    if product_session_maintenance_due(
+    if product_session_maintenance_due_for_pass(
         &context.session_maintenance_last_ms,
         maintenance_now_ms,
         recover_interrupted_exchange,
@@ -2178,6 +2178,22 @@ fn run_account_maintenance_once(
         now_ms(),
         recover_interrupted_exchange,
     );
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn product_session_maintenance_due_for_pass(
+    last_ms: &AtomicU64,
+    now_ms: u64,
+    startup_recovery: bool,
+) -> bool {
+    // Provider-backed session compaction and pairing descriptor cleanup can involve
+    // multiple bounded network requests. The owned maintenance thread runs its first
+    // pass immediately, so construction performs only fail-closed local/account
+    // lifecycle recovery and cannot delay binding the product listener.
+    !startup_recovery && product_session_maintenance_due(last_ms, now_ms, false)
 }
 
 #[cfg(any(
@@ -24823,6 +24839,24 @@ mod tests {
         assert!(!create.contains("cleanup_pairing_descriptors_once"));
         assert!(!create.contains("OneDrivePairingTransportV2"));
         assert!(!create.contains("resolve_cached_sync_token"));
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn startup_defers_remote_product_session_maintenance_to_owned_worker() {
+        let last = AtomicU64::new(0);
+        let now_ms = PRODUCT_SESSION_MAINTENANCE_INTERVAL_MS + 1_000;
+        assert!(!product_session_maintenance_due_for_pass(
+            &last, now_ms, true,
+        ));
+        assert_eq!(last.load(Ordering::Acquire), 0);
+        assert!(product_session_maintenance_due_for_pass(
+            &last, now_ms, false,
+        ));
+        assert_eq!(last.load(Ordering::Acquire), now_ms);
     }
 
     #[cfg(any(
