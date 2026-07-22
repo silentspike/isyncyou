@@ -9180,6 +9180,23 @@ impl Router {
         };
         let (rel, bytes, name) = match self.read_archived(account, service, id) {
             Ok(v) => v,
+            Err(e) if e.status == 404 => {
+                // Search/list results may legitimately refer to metadata-only items (for
+                // example an online-only OneDrive file). Keep those source citations
+                // resolvable without fetching remote content: render only the canonical
+                // stored metadata through the same escaped, CSP-locked viewer.
+                let store = match self.open(Some(account)) {
+                    Ok(store) => store,
+                    Err(error) => return error,
+                };
+                let item = match store.get_item(account, service, id) {
+                    Ok(Some(item)) => item,
+                    Ok(None) => return e,
+                    Err(_) => return ApiResponse::error(500, "store_query_failed"),
+                };
+                let page = view::render_item(service, &item_json(&item));
+                return ApiResponse::html_with_csp(&page, view::VIEWER_CSP);
+            }
             Err(e) => return e,
         };
         if rel.ends_with(".json") {
@@ -19698,6 +19715,9 @@ Content-Type: text/html; charset=utf-8\r\n\
             let mut m = Item::new("a", "mail", "m1", "Hi", "message");
             m.local_path = Some("mail/cc/dd/m.eml".into());
             store.upsert_item(&m).unwrap();
+            let metadata_only =
+                Item::new("a", "onedrive", "d1", "<script>alert(2)</script>", "file");
+            store.upsert_item(&metadata_only).unwrap();
         }
         let cfg = Config {
             accounts: vec![AccountConfig {
@@ -19744,6 +19764,21 @@ Content-Type: text/html; charset=utf-8\r\n\
             .headers
             .iter()
             .any(|(k, _)| k == "Content-Security-Policy"));
+
+        // A metadata-only item remains a resolvable source without fetching remote
+        // content, and its stored name is escaped under the same strict CSP.
+        let metadata = router.route(&ApiRequest::get(
+            "/api/v1/view?account=a&service=onedrive&id=d1",
+        ));
+        assert_eq!(metadata.status, 200);
+        assert!(metadata.content_type.starts_with("text/html"));
+        let html = String::from_utf8_lossy(&metadata.body);
+        assert!(html.contains("&lt;script&gt;alert(2)&lt;/script&gt;"));
+        assert!(!html.contains("<script>alert(2)"));
+        assert!(metadata
+            .headers
+            .iter()
+            .any(|(k, val)| k == "Content-Security-Policy" && val.contains("default-src 'none'")));
 
         // unknown item -> 404
         assert_eq!(
