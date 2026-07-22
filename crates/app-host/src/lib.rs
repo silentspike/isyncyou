@@ -24094,11 +24094,18 @@ mod tests {
             .split("fn commit_claude_oauth_success")
             .next()
             .unwrap();
+        let fallback = gate
+            .split("// Provider I/O runs with only the provider-exclusive lifecycle lease held.")
+            .next()
+            .unwrap();
 
-        assert_eq!(gate.matches("experimental_fence").count(), 4);
-        assert_eq!(gate.matches("ProductCredentialState::Absent").count(), 4);
-        assert_eq!(gate.matches("let still_absent").count(), 2);
-        assert_eq!(gate.matches("product_refresh_fence_matches").count(), 3);
+        assert_eq!(fallback.matches("experimental_fence").count(), 4);
+        assert_eq!(
+            fallback.matches("ProductCredentialState::Absent").count(),
+            4
+        );
+        assert_eq!(fallback.matches("let still_absent").count(), 2);
+        assert_eq!(fallback.matches("product_refresh_fence_matches").count(), 2);
     }
 
     #[cfg(any(
