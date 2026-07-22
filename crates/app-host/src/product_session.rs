@@ -548,7 +548,7 @@ impl ProductTurnRuntime {
         // Releasing the lease increments the manifest generation. A snapshot
         // tagged with the pre-release value is stale immediately and forces the
         // next turn to re-read all visible records from OneDrive.
-        let manifest_generation = self.guard.release().unwrap_or(u64::MAX);
+        let manifest_generation = self.guard.release().map_err(map_session_error)?;
         let mut records = self.context_records;
         records.push(self.intent_record);
         records.extend(terminal_records);
@@ -1639,7 +1639,7 @@ impl<'a> ProductSessionRegistry<'a> {
             )
             .map(|bytes| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
             .map_err(|_| "session_store_unavailable")?;
-        let guard = store
+        let mut guard = store
             .acquire_lease(&owner.session_id, &lease_id, &holder_binding)
             .map_err(map_session_error)?;
         let current = guard.manifest_snapshot().map_err(map_session_error)?;
@@ -1660,16 +1660,19 @@ impl<'a> ProductSessionRegistry<'a> {
             }
         }
         if state_exists {
+            guard.release().map_err(map_session_error)?;
             return Ok(());
         }
         let Some(pending_record_id) = pending_record_id else {
             // Cancellation only reduces authority. If pending publication never
             // became visible, there is no transcript operation left to cancel.
-            return if code == "cancelled" {
+            let result = if code == "cancelled" {
                 Ok(())
             } else {
                 Err("session_state_invalid".into())
             };
+            guard.release().map_err(map_session_error)?;
+            return result;
         };
         let record_id = new_ulid().map_err(|_| "session_store_unavailable")?;
         let lease = guard.binding().map_err(map_session_error)?;
@@ -1688,7 +1691,9 @@ impl<'a> ProductSessionRegistry<'a> {
                 request_objects: vec![],
                 uuid_bindings: vec![],
             })
-            .map_err(map_session_error)
+            .map_err(map_session_error)?;
+        guard.release().map_err(map_session_error)?;
+        Ok(())
     }
 
     pub fn begin_turn(&self, request: ProductTurnRequest<'_>) -> Result<ProductTurnStart, String> {
@@ -3064,6 +3069,30 @@ mod tests {
         }
         assert!(source.contains("pub(crate) fn maintain_remote_session("));
         assert!(source.contains("guard\n                .compact_terminal_request"));
+    }
+
+    #[test]
+    fn terminal_and_pending_state_paths_propagate_lease_release_failures() {
+        let source = include_str!("product_session.rs");
+        let terminal = source
+            .split("fn context_snapshot_after_publish(")
+            .nth(1)
+            .and_then(|source| source.split("pub fn finish_pending(").next())
+            .expect("terminal release path");
+        assert!(terminal.contains("self.guard.release().map_err(map_session_error)?"));
+        assert!(!terminal.contains("unwrap_or(u64::MAX)"));
+
+        let pending = source
+            .split("pub fn append_pending_operation_state(")
+            .nth(1)
+            .and_then(|source| source.split("pub fn begin_turn(").next())
+            .expect("pending operation-state path");
+        assert_eq!(
+            pending
+                .matches("guard.release().map_err(map_session_error)?")
+                .count(),
+            3
+        );
     }
 
     #[test]

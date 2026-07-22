@@ -897,6 +897,14 @@ async function main() {
       sessionTransportText.includes("Check your Microsoft 365 connection and try again.")
       && !sessionTransportText.includes("SQLITE")
       && !sessionTransportText.includes("database_open_failed"));
+    assert(evidence, "session transport failure blocks turns until explicit retry",
+      await page.locator('[data-testid="agent-input"]').isDisabled()
+      && await page.getByRole("button", { name: "Retry shared session" }).isVisible());
+    await page.getByRole("button", { name: "Retry shared session" }).click();
+    await page.waitForFunction(() => {
+      const input = document.querySelector('[data-testid="agent-input"]');
+      return input && !input.disabled;
+    });
 
     await page.locator('[data-testid="agent-input"]').fill("Find the quarterly brief");
     await page.locator('[data-testid="agent-send"]').click();

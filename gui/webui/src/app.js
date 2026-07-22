@@ -5480,6 +5480,7 @@ const AssistantState = {
   sessionHydrationPromise: null,
   sessionHydrationSeq: 0,
   sessionHistoryRefreshing: false,
+  sessionHydrationError: null,
 };
 
 function closeAssistantStream(_reason) {
@@ -5653,7 +5654,11 @@ async function renderAssistantView(view) {
   rememberAssistantStatus(st);
   let selectedSession = null;
   if (assistantSelectedReady(st)) {
-    try { selectedSession = await loadSelectedAgentSession(); } catch (_) {}
+    try {
+      selectedSession = await loadSelectedAgentSession();
+    } catch (_) {
+      AssistantState.sessionHydrationError = "session_transport_unavailable";
+    }
   }
   clear(body);
   // #639 T7/T10: `connected` is now host-verified per-provider readiness (provider_ready of the
@@ -5673,14 +5678,20 @@ async function renderAssistantView(view) {
       el("button", { class: "btn sm", type: "button", onclick: () => renderAssistantView($("#view")) },
         icon("refresh-cw", "icon-sm"), "Retry"))));
   }
-  if (selectedSession && AssistantState.sessionHydratedId !== selectedSession.session_id) {
+  if (selectedSession && AssistantState.sessionHydratedId !== selectedSession.session_id
+      && !AssistantState.sessionHydrationError) {
     void hydrateAgentSession(selectedSession.session_id).then(() => {
       if (App.route === "assistant"
           && !AssistantState.busy
           && AssistantState.selectedSessionId === selectedSession.session_id) {
         void renderAssistantView($("#view"));
       }
-    }).catch(() => {});
+    }).catch(() => {
+      if (App.route === "assistant"
+          && AssistantState.selectedSessionId === selectedSession.session_id) {
+        void renderAssistantView($("#view"));
+      }
+    });
   }
   const claudeReady = assistantProviderReady(st, "claude");
   if (OAUTH_ATTEMPTS.has("claude") && !claudeReady) showCodeStep();
@@ -5824,13 +5835,31 @@ function renderAssistantChat(body, st) {
   }
 }
 
+function assistantComposerDisabledReason(st) {
+  const provider = agentActiveProvider(st || AssistantState.status);
+  const sessionNotHydrated = !!AssistantState.selectedSessionId
+    && AssistantState.sessionHydratedId !== AssistantState.selectedSessionId;
+  if (!CAP.agent) return "Assistant unavailable";
+  if (!App.account) return "Select an account first";
+  if (!assistantSelectedReady(st || AssistantState.status)) return "Reconnect your AI account";
+  if (!agentPrivacyConsentAccepted(provider)) return "Review privacy consent first";
+  if (AssistantState.sessionHydrationError) return "Shared session unavailable";
+  if (sessionNotHydrated || AssistantState.sessionHistoryRefreshing
+      || AssistantState.sessionHydrationPromise) return "Loading shared session";
+  return AssistantState.busy ? "Wait for the active turn" : "";
+}
+
 function renderAssistantComposer(_st) {
-  const provider = agentActiveProvider(_st || AssistantState.status);
-  const disabledReason = !CAP.agent ? "Assistant unavailable"
-    : (!App.account ? "Select an account first"
-      : (!assistantSelectedReady(_st || AssistantState.status) ? "Reconnect your AI account"
-        : (!agentPrivacyConsentAccepted(provider) ? "Review privacy consent first"
-          : (AssistantState.busy ? "Wait for the active turn" : ""))));
+  const disabledReason = assistantComposerDisabledReason(_st);
+  const hydrationRetry = AssistantState.sessionHydrationError
+    ? el("button", {
+      class: "btn ghost sm",
+      type: "button",
+      title: "Retry shared session",
+      "aria-label": "Retry shared session",
+      onclick: retryAgentSessionHydration,
+    }, icon("refresh-cw", "icon-sm"), "Retry")
+    : null;
   const input = el("textarea", {
     id: "asst-input",
     class: "input assistant-input",
@@ -5862,7 +5891,8 @@ function renderAssistantComposer(_st) {
   }
   return el("div", { class: "assistant-composer", "data-agent-composer": "1", "data-testid": "agent-composer" },
     el("div", { class: "asst-inputrow" }, input, send, stop),
-    disabledReason ? el("div", { class: "dim assistant-composer-note", text: disabledReason }) : null);
+    disabledReason ? el("div", { class: "dim assistant-composer-note" },
+      el("span", { text: disabledReason }), hydrationRetry) : null);
 }
 
 function syncAssistantComposerControls() {
@@ -5870,12 +5900,13 @@ function syncAssistantComposerControls() {
   const send = $('[data-testid="agent-send"]');
   const stop = $('[data-testid="agent-stop"]');
   const active = AssistantState.busy && !!AssistantState.activeTurnId && AssistantState.turnStreamReady;
+  const disabledReason = assistantComposerDisabledReason(AssistantState.status);
   if (input) {
-    input.disabled = AssistantState.busy;
-    input.placeholder = AssistantState.busy ? "Wait for the active turn" : "Ask about your mail, files, calendar…";
+    input.disabled = !!disabledReason;
+    input.placeholder = disabledReason || "Ask about your mail, files, calendar…";
   }
   if (send) {
-    send.disabled = AssistantState.busy;
+    send.disabled = !!disabledReason;
     send.hidden = active;
   }
   if (stop) {
@@ -6629,6 +6660,9 @@ async function hydrateAgentSession(sessionId) {
     return AssistantState.sessionHydrationPromise;
   }
   const sequence = ++AssistantState.sessionHydrationSeq;
+  AssistantState.sessionHydrationError = null;
+  AssistantState.sessionHistoryRefreshing = true;
+  syncAssistantComposerControls();
   const hydration = (async () => {
     let cursor = null;
     const records = [];
@@ -6661,12 +6695,42 @@ async function hydrateAgentSession(sessionId) {
   AssistantState.sessionHydrationPromise = hydration;
   try {
     await hydration;
-  } finally {
-    AssistantState.sessionHistoryRefreshing = false;
     if (AssistantState.sessionHydrationSeq === sequence) {
+      AssistantState.sessionHydrationError = null;
+    }
+  } catch (error) {
+    if (AssistantState.sessionHydrationSeq === sequence) {
+      AssistantState.sessionHydrationError = "session_transport_unavailable";
+    }
+    throw error;
+  } finally {
+    if (AssistantState.sessionHydrationSeq === sequence) {
+      AssistantState.sessionHistoryRefreshing = false;
       AssistantState.sessionHydrationId = null;
       AssistantState.sessionHydrationPromise = null;
+      syncAssistantComposerControls();
     }
+  }
+}
+
+async function retryAgentSessionHydration() {
+  const sessionId = AssistantState.selectedSessionId;
+  if (AssistantState.busy || AssistantState.sessionHydrationPromise) return;
+  AssistantState.sessionHydrationError = null;
+  if (!sessionId) {
+    await renderAssistantView($("#view"));
+    return;
+  }
+  AssistantState.sessionHydratedId = null;
+  syncAssistantComposerControls();
+  try {
+    await hydrateAgentSession(sessionId);
+    if (App.route === "assistant" && AssistantState.selectedSessionId === sessionId) {
+      await renderAssistantView($("#view"));
+    }
+  } catch (_) {
+    toast(agentSafeErrorCopy("session_transport_unavailable"), "err");
+    syncAssistantComposerControls();
   }
 }
 
@@ -6678,6 +6742,10 @@ async function loadSelectedAgentSession() {
   let selected = sessions.find((entry) => entry.session_id === page.selected_session_id);
   if (!selected) selected = sessions.find((entry) => !entry.archived);
   if (!selected) return null;
+  if (AssistantState.selectedSessionId !== selected.session_id) {
+    AssistantState.sessionHydratedId = null;
+    AssistantState.sessionHydrationError = null;
+  }
   AssistantState.selectedSessionId = selected.session_id;
   AssistantState.selectedSessionAccount = App.account;
   return selected;
@@ -6740,6 +6808,7 @@ async function selectAgentSession(sessionId, overlay) {
   AssistantState.selectedSessionId = sessionId;
   AssistantState.selectedSessionAccount = App.account;
   AssistantState.sessionHydratedId = null;
+  AssistantState.sessionHydrationError = null;
   AssistantState.transcript = [];
   await hydrateAgentSession(sessionId);
   closeAgentDialog(overlay);
@@ -6756,6 +6825,7 @@ async function createAgentSession(overlay) {
   AssistantState.selectedSessionId = session.session_id;
   AssistantState.selectedSessionAccount = App.account;
   AssistantState.sessionHydratedId = session.session_id;
+  AssistantState.sessionHydrationError = null;
   AssistantState.transcript = [];
   closeAgentDialog(overlay);
   await renderAssistantView($("#view"));
@@ -6769,6 +6839,7 @@ async function archiveAgentSession(sessionId, overlay) {
   });
   AssistantState.selectedSessionId = null;
   AssistantState.sessionHydratedId = null;
+  AssistantState.sessionHydrationError = null;
   AssistantState.transcript = [];
   closeAgentDialog(overlay);
   await renderAssistantView($("#view"));
@@ -6833,6 +6904,7 @@ async function importAgentSession(pairingCode, overlay) {
   AssistantState.selectedSessionId = claimed.session_id;
   AssistantState.selectedSessionAccount = App.account;
   AssistantState.sessionHydratedId = null;
+  AssistantState.sessionHydrationError = null;
   AssistantState.transcript = [];
   await hydrateAgentSession(claimed.session_id);
   closeAgentDialog(overlay);
@@ -6880,6 +6952,44 @@ async function agentSend(text) {
   if (!agentPrivacyConsentAccepted(provider)) {
     toast("Review privacy consent for " + agentProviderLabel(provider), "err");
     renderAssistantView($("#view"));
+    return;
+  }
+  let sessionId = null;
+  let hydration = AssistantState.sessionHydrationPromise;
+  if (hydration) {
+    try {
+      while (hydration) {
+        await hydration;
+        hydration = AssistantState.sessionHydrationPromise;
+      }
+    } catch (_) {
+      toast(agentSafeErrorCopy("session_transport_unavailable"), "err");
+      return;
+    }
+    if (AssistantState.busy) {
+      toast("Wait for the active turn", "err");
+      return;
+    }
+  }
+  if (AssistantState.selectedSessionId
+      && AssistantState.sessionHydratedId !== AssistantState.selectedSessionId) {
+    const code = AssistantState.sessionHydrationError || "session_transport_unavailable";
+    toast(agentSafeErrorCopy(code), "err");
+    return;
+  }
+  try {
+    sessionId = await ensureAgentSession();
+    if (AssistantState.sessionHydratedId !== sessionId) {
+      await hydrateAgentSession(sessionId);
+    }
+  } catch (_) {
+    AssistantState.sessionHydrationError = "session_transport_unavailable";
+    toast(agentSafeErrorCopy("session_transport_unavailable"), "err");
+    renderAssistantView($("#view"));
+    return;
+  }
+  if (AssistantState.sessionHydratedId !== sessionId) {
+    toast(agentSafeErrorCopy("session_transport_unavailable"), "err");
     return;
   }
   closeAssistantStream("new-turn");
@@ -6986,7 +7096,6 @@ async function agentSend(text) {
   };
 
   let turn;
-  let sessionId = null;
   const requestId = crypto.randomUUID();
   let startingGuardId = null;
   let turnStartPosted = false;
@@ -7010,7 +7119,6 @@ async function agentSend(text) {
     startingGuardId = await beginNetworkGuard("agent_turn");
     if (BRIDGE && !startingGuardId) throw new Error("network_guard_unavailable");
     await runConnectivityPreflight(provider, "turn_start", startingGuardId);
-    sessionId = await ensureAgentSession();
     turnStartPosted = true;
     const r = await postJson("/api/v1/agent/turn", CAP.agent, {
       request_id: requestId,

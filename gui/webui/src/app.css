@@ -1734,6 +1734,10 @@ a.note-meta-chip:hover { color: var(--accent); }
   max-height: 160px;
 }
 .assistant-composer-note {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
   font-size: var(--fs-sm);
   padding-bottom: var(--sp-1);
 }

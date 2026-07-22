@@ -9,6 +9,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class AgentExperimentalBoundaryTest(unittest.TestCase):
+    def test_feature_matrix_captures_cargo_tree_through_a_pipe(self) -> None:
+        source = (ROOT / "tools/verify-agent-experimental-boundary.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('| cat >"$TMP_ROOT/default-tree.txt"', source)
+        self.assertIn('| cat >"$TMP_ROOT/experimental-tree.txt"', source)
+
     def test_release_boundary_copies_the_exact_remote_daemon_artifact(self) -> None:
         source = (ROOT / "tools/verify-agent-experimental-boundary.sh").read_text(
             encoding="utf-8"

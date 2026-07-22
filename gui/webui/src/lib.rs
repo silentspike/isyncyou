@@ -12805,6 +12805,45 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn assistant_turn_waits_for_shared_session_hydration_before_admission() {
+        let send = APP_JS
+            .split("async function agentSend(text)")
+            .nth(1)
+            .unwrap()
+            .split("function renderAssistantView")
+            .next()
+            .unwrap();
+        let hydration = send
+            .find("let hydration = AssistantState.sessionHydrationPromise;")
+            .expect("turn hydration gate");
+        let admission = send
+            .find("runConnectivityPreflight(provider, \"turn_start\"")
+            .expect("turn admission");
+        assert!(hydration < admission);
+        let ensure = send
+            .find("sessionId = await ensureAgentSession();")
+            .expect("session selection");
+        let ui_turn = send
+            .find("closeAssistantStream(\"new-turn\")")
+            .expect("local turn state");
+        assert!(ensure < ui_turn);
+        assert!(ensure < admission);
+        assert!(send.contains("while (hydration)"));
+        assert!(send.contains("await hydration;"));
+        assert!(send.contains("await hydrateAgentSession(sessionId);"));
+        assert!(send.contains("hydration = AssistantState.sessionHydrationPromise;"));
+        assert!(
+            send.contains("AssistantState.sessionHydratedId !== AssistantState.selectedSessionId")
+        );
+        assert!(send.contains("agentSafeErrorCopy(\"session_transport_unavailable\")"));
+        assert!(APP_JS.contains("AssistantState.sessionHistoryRefreshing = true;"));
+        assert!(APP_JS
+            .contains("AssistantState.sessionHydrationError = \"session_transport_unavailable\";"));
+        assert!(APP_JS.contains("async function retryAgentSessionHydration()"));
+        assert!(APP_JS.contains("const disabledReason = assistantComposerDisabledReason("));
+    }
+
+    #[test]
     fn assistant_history_hydrates_only_closed_redacted_operation_state() {
         let hydrate = APP_JS
             .split("function sessionRecordsToTranscript(records)")

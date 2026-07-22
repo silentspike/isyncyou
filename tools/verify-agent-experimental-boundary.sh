@@ -25,10 +25,11 @@ scan_binary() {
 verify_feature_matrix() {
   cd "$ROOT"
   cargo metadata --no-deps --format-version 1 >"$TMP_ROOT/metadata.json"
+  # This toolchain emits no tree when cargo writes directly to a regular file.
   cargo tree -p isyncyou-daemon -e normal -f '{p} features={f}' \
-    >"$TMP_ROOT/default-tree.txt"
+    | cat >"$TMP_ROOT/default-tree.txt"
   cargo tree -p isyncyou-daemon --features agent-subscription-experimental \
-    -e normal -f '{p} features={f}' >"$TMP_ROOT/experimental-tree.txt"
+    -e normal -f '{p} features={f}' | cat >"$TMP_ROOT/experimental-tree.txt"
 
   if rg -q 'agent-subscription-experimental' "$TMP_ROOT/default-tree.txt"; then
     die "default daemon resolves the experimental feature"
