@@ -59,6 +59,63 @@ class BridgeMessagePolicyTest {
     }
 
     @Test
+    fun envelopeRejectsDuplicateTrailingUnknownAndWrongTypedFieldsBeforeSanitizing() {
+        for (message in listOf(
+            """{"t":"req","id":"r1","method":"GET","path":"/a","path":"/b"}""",
+            """{"t":"req","id":"r2","method":"GET","path":"/a","headers":{"A":"1","A":"2"}}""",
+            """{"t":"req","id":"r2b","method":"GET","path":"/a","headers":{"A":"1","\u0041":"2"}}""",
+            """{"t":"req","id":"r3","method":"GET","path":"/a"} trailing""",
+            """{"t":"req","id":"r4","method":"GET","path":"/a","unexpected":true}""",
+            """{"t":"req","id":"r5","method":"GET","path":"/a","headers":{"Accept":7}}""",
+            """{"t":"req","id":"r6","method":"GET","path":"/a","body":{}}""",
+            """{"t":"req","id":"r7","method":"PUT","path":"/a"}""",
+            """{"t":"req","id":"r8","method":"GET","path":"//a"}""",
+            """{"t":"req","id":"r9","method":"GET","path":"/a#fragment"}""",
+            """{"t":"req","id":"\ud800","method":"GET","path":"/a"}""",
+        )) {
+            assertFalse(
+                "accepted raw envelope: $message",
+                BridgeMessagePolicy.validateEnvelope(message).ok,
+            )
+        }
+    }
+
+    @Test
+    fun requestEnvelopeRejectsAmbiguousOrLegacyHeaders() {
+        for (headers in listOf(
+            JSONObject().put("Content-Type", "application/json").put("content-type", "text/plain"),
+            JSONObject().put("X-Body-Encoding", "base64"),
+            JSONObject().put("Bad Header", "value"),
+        )) {
+            val message = JSONObject()
+                .put("t", "req")
+                .put("id", "request")
+                .put("method", "POST")
+                .put("path", "/api/v1/agent/oauth/start")
+                .put("headers", headers)
+                .put("body", "{}")
+                .toString()
+            assertInvalid(BridgeMessagePolicy.validateEnvelope(message), "invalid_headers")
+        }
+    }
+
+    @Test
+    fun nativeEnvelopeRejectsUnknownPayloadFieldsAndCoercedTypes() {
+        assertInvalid(
+            BridgeMessagePolicy.validateEnvelope(
+                """{"t":"native","id":"n1","op":"beginNetworkGuard","payload":{"reason":"oauth","extra":true}}""",
+            ),
+            "missing_or_unknown_guard_reason",
+        )
+        assertInvalid(
+            BridgeMessagePolicy.validateEnvelope(
+                """{"t":"native","id":"n2","op":"endNetworkGuard","payload":{"guard_id":7}}""",
+            ),
+            "missing_guard_id",
+        )
+    }
+
+    @Test
     fun nativeMessagesRequireTypedPayloadsAndKnownExternalKinds() {
         assertInvalid(
             BridgeMessagePolicy.validateEnvelope(JSONObject().put("t", "native").put("id", "n1").put("payload", JSONObject()).toString()),
@@ -194,14 +251,40 @@ class BridgeMessagePolicyTest {
             .put("X-Session-Token", "attacker-1")
             .put("x-session-token", "attacker-2")
             .put("x-SeSsIoN-ToKeN", "attacker-3")
+            .put("x-storage-not-low", "true")
             .put("Accept", "application/json")
 
-        val sanitized = BridgeMessagePolicy.sanitizeHeaders(headers, "trusted")
+        val sanitized = BridgeMessagePolicy.sanitizeHeaders(headers, "trusted", false)
         assertEquals("trusted", sanitized.getString("X-Session-Token"))
         assertEquals("application/json", sanitized.getString("Accept"))
         assertFalse(sanitized.has("x-session-token"))
         assertFalse(sanitized.has("x-SeSsIoN-ToKeN"))
-        assertEquals(2, sanitized.length())
+        assertEquals("false", sanitized.getString("X-Storage-Not-Low"))
+        assertEquals(3, sanitized.length())
+    }
+
+    @Test
+    fun mutationIntentCreateChunkAndCommitRequireTrustedStorageState() {
+        assertTrue(BridgeMessagePolicy.requiresTrustedStorageNotLow("/api/v1/mutation-intent/create"))
+        assertTrue(BridgeMessagePolicy.requiresTrustedStorageNotLow("/api/v1/mutation-intent/chunk"))
+        assertTrue(BridgeMessagePolicy.requiresTrustedStorageNotLow("/api/v1/mutation-intent/commit"))
+        assertFalse(BridgeMessagePolicy.requiresTrustedStorageNotLow("/api/v1/mutation-intent/cancel"))
+        assertFalse(BridgeMessagePolicy.requiresTrustedStorageNotLow("/api/v1/items"))
+    }
+
+    @Test
+    fun android_bridge_ignores_cookie_authority_and_injects_native_session_header() {
+        val headers = JSONObject()
+            .put("Cookie", "isy_session=webview-controlled")
+            .put("x-session-token", "webview-controlled")
+            .put("X-Capability-Token", "agent-capability")
+
+        val sanitized = BridgeMessagePolicy.sanitizeHeaders(headers, "native-session")
+
+        assertEquals("native-session", sanitized.getString("X-Session-Token"))
+        assertEquals("agent-capability", sanitized.getString("X-Capability-Token"))
+        assertFalse(sanitized.has("x-session-token"))
+        assertEquals("isy_session=webview-controlled", sanitized.getString("Cookie"))
     }
 
     @Test

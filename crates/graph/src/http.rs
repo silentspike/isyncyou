@@ -11,6 +11,12 @@ use std::time::Duration;
 
 const GRAPH: &str = "https://graph.microsoft.com/v1.0";
 
+#[derive(Debug, Clone)]
+pub struct ServerTimeSample {
+    pub server_unix_ms: u64,
+    pub received_at_monotonic: std::time::Instant,
+}
+
 /// One binary data part for a OneNote multipart page-create request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OneNotePagePart {
@@ -37,6 +43,14 @@ pub enum ConflictBehavior {
     Fail,
     Replace,
     Rename,
+}
+
+/// Result of a streamed OneDrive content mutation. A create name collision and a stale
+/// replace ETag are policy outcomes, not transport failures.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamUploadOutcome {
+    Applied(serde_json::Value),
+    Conflict,
 }
 
 impl ConflictBehavior {
@@ -155,15 +169,28 @@ fn push_unique_nonempty(out: &mut Vec<String>, value: &str) {
 }
 
 /// Errors from the live upload/delete path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphTransportFailure {
+    NameResolution,
+    Tls,
+    Connect,
+    Other,
+}
+
 #[derive(Debug)]
 pub enum UploadError {
     Http {
         status: u16,
         body: String,
     },
-    Transport(String),
+    Transport {
+        failure: GraphTransportFailure,
+        detail: String,
+    },
     Timeout(String),
     Parse(String),
+    /// The response exceeded the caller's explicit body limit.
+    TooLarge,
     /// The session ended without a completion response.
     Incomplete,
 }
@@ -172,9 +199,10 @@ impl std::fmt::Display for UploadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             UploadError::Http { status, body } => write!(f, "HTTP {status}: {body}"),
-            UploadError::Transport(e) => write!(f, "transport error: {e}"),
+            UploadError::Transport { detail, .. } => write!(f, "transport error: {detail}"),
             UploadError::Timeout(e) => write!(f, "timeout: {e}"),
             UploadError::Parse(e) => write!(f, "parse error: {e}"),
+            UploadError::TooLarge => write!(f, "response body exceeded limit"),
             UploadError::Incomplete => write!(f, "upload ended without completion"),
         }
     }
@@ -193,23 +221,77 @@ impl UploadError {
         if error.is_timeout() {
             Self::Timeout(error.to_string())
         } else {
-            Self::Transport(error.to_string())
+            Self::Transport {
+                failure: classify_reqwest_transport_failure(&error),
+                detail: error.to_string(),
+            }
+        }
+    }
+
+    fn transport(detail: impl Into<String>) -> Self {
+        Self::Transport {
+            failure: GraphTransportFailure::Other,
+            detail: detail.into(),
         }
     }
 
     pub fn transient_failure(&self) -> Option<GraphTransientFailure> {
         match self {
             Self::Timeout(_) => Some(GraphTransientFailure::Timeout),
-            Self::Transport(_) => Some(GraphTransientFailure::Network),
+            Self::Transport { .. } => Some(GraphTransientFailure::Network),
             Self::Http { status, .. } if matches!(*status, 408 | 425 | 429 | 500..=599) => {
                 Some(GraphTransientFailure::Http(*status))
             }
-            Self::Http { .. } | Self::Parse(_) | Self::Incomplete => None,
+            Self::Http { .. } | Self::Parse(_) | Self::TooLarge | Self::Incomplete => None,
         }
     }
 }
 
+fn error_source_is_tls(error: &(dyn std::error::Error + 'static)) -> bool {
+    if error.is::<rustls::Error>() {
+        return true;
+    }
+    if let Some(io) = error.downcast_ref::<std::io::Error>() {
+        if io
+            .get_ref()
+            .is_some_and(|inner| inner.is::<rustls::Error>())
+        {
+            return true;
+        }
+    }
+    error.source().is_some_and(error_source_is_tls)
+}
+
+fn error_source_is_dns(error: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(io) = error.downcast_ref::<std::io::Error>() {
+        if matches!(
+            io.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::AddrNotAvailable
+        ) {
+            return true;
+        }
+    }
+    error.source().is_some_and(error_source_is_dns)
+}
+
+fn classify_transport_failure_source(
+    error: &(dyn std::error::Error + 'static),
+) -> GraphTransportFailure {
+    if error_source_is_tls(error) {
+        GraphTransportFailure::Tls
+    } else if error_source_is_dns(error) {
+        GraphTransportFailure::NameResolution
+    } else {
+        GraphTransportFailure::Connect
+    }
+}
+
+fn classify_reqwest_transport_failure(error: &reqwest::Error) -> GraphTransportFailure {
+    classify_transport_failure_source(error)
+}
+
 /// A Microsoft Graph HTTP client carrying a bearer access token.
+#[derive(Clone)]
 pub struct GraphClient {
     client: reqwest::blocking::Client,
     token: String,
@@ -219,10 +301,16 @@ pub struct GraphClient {
     /// When set, GETs send `Prefer: IdType="ImmutableId", outlook.timezone="UTC"`
     /// (the Outlook immutable-ID policy, plan §6).
     prefer_immutable_id: bool,
+    /// Optional process-local operation deadline used by short interactive
+    /// workflows. It is never serialized or derived from device wall time.
+    operation_deadline: Option<std::time::Instant>,
 }
 
 /// The `Prefer` header value for the Outlook immutable-ID policy (plan §6).
 const PREFER_IMMUTABLE_ID: &str = r#"IdType="ImmutableId", outlook.timezone="UTC""#;
+
+const GRAPH_BATCH_REQUEST_LIMIT: usize = 20;
+const TODO_DELETE_BATCH_PARALLELISM: usize = 4;
 
 /// The default HTTP client for Graph calls (#0.4): a request timeout so a hung
 /// connection can never wedge a sync/read pass, plus a connect timeout. Falls back to
@@ -242,7 +330,49 @@ impl GraphClient {
             token: access_token.into(),
             base: GRAPH.into(),
             prefer_immutable_id: false,
+            operation_deadline: None,
         }
+    }
+
+    /// Build a Graph client with caller-owned request and connect deadlines.
+    ///
+    /// Interactive product flows use a substantially shorter budget than bulk
+    /// sync jobs. Keeping that distinction in the client construction prevents
+    /// one stalled Graph request from inheriting the sync worker's 60-second
+    /// deadline while preserving the same authentication and response handling.
+    pub fn with_timeouts(
+        access_token: impl Into<String>,
+        request_timeout: Duration,
+        connect_timeout: Duration,
+    ) -> Result<Self, UploadError> {
+        let client = bounded_client(request_timeout, connect_timeout)?;
+        Ok(Self::with_client(client, access_token))
+    }
+
+    /// Clone this authenticated client while replacing only its HTTP deadlines.
+    ///
+    /// Interactive callers use this to shrink each request to the remaining
+    /// operation budget without changing the reviewed Graph origin or request
+    /// policy carried by the original client.
+    pub fn clone_with_deadline(
+        &self,
+        deadline: std::time::Instant,
+        maximum_request_timeout: Duration,
+        maximum_connect_timeout: Duration,
+    ) -> Result<Self, UploadError> {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| UploadError::Timeout("operation deadline elapsed".into()))?;
+        let request_timeout = remaining.min(maximum_request_timeout);
+        let connect_timeout = request_timeout.min(maximum_connect_timeout);
+        Ok(Self {
+            client: bounded_client(request_timeout, connect_timeout)?,
+            token: self.token.clone(),
+            base: self.base.clone(),
+            prefer_immutable_id: self.prefer_immutable_id,
+            operation_deadline: Some(deadline),
+        })
     }
 
     /// Build with a custom reqwest client (timeouts, proxy, …).
@@ -252,6 +382,7 @@ impl GraphClient {
             token: access_token.into(),
             base: GRAPH.into(),
             prefer_immutable_id: false,
+            operation_deadline: None,
         }
     }
 
@@ -272,6 +403,31 @@ impl GraphClient {
             format!("{}{url}", self.base)
         }
     }
+
+    fn remaining_operation_budget(&self) -> Result<Option<Duration>, UploadError> {
+        self.operation_deadline
+            .map(|deadline| {
+                deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or_else(|| UploadError::Timeout("operation deadline elapsed".into()))
+            })
+            .transpose()
+    }
+}
+
+fn bounded_client(
+    request_timeout: Duration,
+    connect_timeout: Duration,
+) -> Result<reqwest::blocking::Client, UploadError> {
+    if request_timeout.is_zero() || connect_timeout.is_zero() || connect_timeout > request_timeout {
+        return Err(UploadError::Parse("invalid Graph timeout policy".into()));
+    }
+    reqwest::blocking::Client::builder()
+        .timeout(request_timeout)
+        .connect_timeout(connect_timeout)
+        .build()
+        .map_err(UploadError::from_reqwest)
 }
 
 fn parse_retry_after(resp: &reqwest::blocking::Response) -> Option<Duration> {
@@ -405,12 +561,7 @@ impl GraphClient {
             url.push_str("?$select=");
             url.push_str(&select.join(","));
         }
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(&self.token)
-            .send()
-            .map_err(UploadError::from_reqwest)?;
+        let resp = self.get_with_retry(&url)?;
         match resp.status().as_u16() {
             200 => Ok(Some(
                 resp.json::<serde_json::Value>()
@@ -422,6 +573,36 @@ impl GraphClient {
                 body: resp.text().unwrap_or_default().chars().take(300).collect(),
             }),
         }
+    }
+
+    /// Read trusted server time from a successful authenticated Graph response. Callers use the
+    /// process-local monotonic receipt instant only to reject stale samples; it is never persisted.
+    pub fn server_time_sample(&self) -> Result<ServerTimeSample, UploadError> {
+        let url = format!("{}/me/drive/root?$select=id", self.base);
+        let response = self.get_with_retry(&url)?;
+        if !response.status().is_success() {
+            return Err(UploadError::Http {
+                status: response.status().as_u16(),
+                body: String::new(),
+            });
+        }
+        let value = response
+            .headers()
+            .get(reqwest::header::DATE)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| UploadError::Parse("missing server time".into()))?;
+        let time = httpdate::parse_http_date(value)
+            .map_err(|_| UploadError::Parse("invalid server time".into()))?;
+        let server_unix_ms = time
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| UploadError::Parse("invalid server time".into()))?
+            .as_millis()
+            .try_into()
+            .map_err(|_| UploadError::Parse("invalid server time".into()))?;
+        Ok(ServerTimeSample {
+            server_unix_ms,
+            received_at_monotonic: std::time::Instant::now(),
+        })
     }
 
     /// Open a resumable upload session for `dest_path` (`total` = file size).
@@ -448,6 +629,171 @@ impl GraphClient {
             UploadError::Parse("createUploadSession response had no uploadUrl".into())
         })?;
         Ok(UploadSession::new(upload_url, total))
+    }
+
+    fn create_target_upload_session(
+        &self,
+        url: String,
+        total: u64,
+        behavior: ConflictBehavior,
+        if_match: Option<&str>,
+    ) -> Result<Option<UploadSession>, UploadError> {
+        let mut request = self
+            .client
+            .post(url)
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({
+                "item": {
+                    "@microsoft.graph.conflictBehavior": behavior.as_graph(),
+                    "fileSize": total,
+                }
+            }));
+        if let Some(etag) = if_match {
+            request = request.header(reqwest::header::IF_MATCH, etag);
+        }
+        let response = request.send().map_err(UploadError::from_reqwest)?;
+        match response.status().as_u16() {
+            200 | 201 => {
+                let value = response
+                    .json::<serde_json::Value>()
+                    .map_err(|error| UploadError::Parse(error.to_string()))?;
+                let upload_url = value
+                    .get("uploadUrl")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        UploadError::Parse("createUploadSession response had no uploadUrl".into())
+                    })?;
+                Ok(Some(UploadSession::new(upload_url, total)))
+            }
+            409 | 412 => Ok(None),
+            status => Err(UploadError::Http {
+                status,
+                body: String::new(),
+            }),
+        }
+    }
+
+    fn upload_session_from_ranges<F>(
+        &self,
+        mut session: UploadSession,
+        mut read_range: F,
+    ) -> Result<serde_json::Value, UploadError>
+    where
+        F: FnMut(u64, usize) -> Result<Vec<u8>, UploadError>,
+    {
+        while let Some(plan) = session.next_chunk(CHUNK_ALIGN) {
+            let expected = usize::try_from(plan.len)
+                .map_err(|_| UploadError::Parse("upload range too large".into()))?;
+            let bytes = read_range(plan.start, expected)?;
+            if bytes.len() != expected {
+                return Err(UploadError::Parse(
+                    "upload source returned a short range".into(),
+                ));
+            }
+            let response = self
+                .client
+                .put(&session.upload_url)
+                .header(reqwest::header::CONTENT_RANGE, &plan.content_range)
+                .body(bytes)
+                .send()
+                .map_err(UploadError::from_reqwest)?;
+            match response.status().as_u16() {
+                202 => {
+                    let value = response.json::<serde_json::Value>().ok();
+                    let ranges = value
+                        .as_ref()
+                        .and_then(|value| value.get("nextExpectedRanges"))
+                        .and_then(|value| value.as_array())
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(|value| value.as_str().map(String::from))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    if ranges.is_empty() {
+                        session.advance(plan.len);
+                    } else {
+                        session.apply_next_expected(&ranges);
+                    }
+                }
+                200 | 201 => {
+                    return response
+                        .json::<serde_json::Value>()
+                        .map_err(|error| UploadError::Parse(error.to_string()));
+                }
+                status => {
+                    return Err(UploadError::Http {
+                        status,
+                        body: String::new(),
+                    });
+                }
+            }
+        }
+        Err(UploadError::Incomplete)
+    }
+
+    /// Upload a new child from a bounded random-access source without materializing the whole
+    /// body. `conflictBehavior=fail` preserves the ledger's probe-and-adopt recovery rule.
+    pub fn upload_to_parent_streaming<F>(
+        &self,
+        parent_id: &str,
+        name: &str,
+        total: u64,
+        read_range: F,
+    ) -> Result<StreamUploadOutcome, UploadError>
+    where
+        F: FnMut(u64, usize) -> Result<Vec<u8>, UploadError>,
+    {
+        let url = if parent_id.is_empty() {
+            format!(
+                "{}/me/drive/root:/{}:/createUploadSession",
+                self.base,
+                enc(name)
+            )
+        } else {
+            format!(
+                "{}/me/drive/items/{}:/{}:/createUploadSession",
+                self.base,
+                parent_id,
+                enc(name)
+            )
+        };
+        let Some(session) =
+            self.create_target_upload_session(url, total, ConflictBehavior::Fail, None)?
+        else {
+            return Ok(StreamUploadOutcome::Conflict);
+        };
+        match self.upload_session_from_ranges(session, read_range) {
+            Ok(value) => Ok(StreamUploadOutcome::Applied(value)),
+            Err(UploadError::Http { status: 409, .. }) => Ok(StreamUploadOutcome::Conflict),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Replace one item from a bounded random-access source. The ETag is checked before an
+    /// upload session is issued, so stale content never starts transferring.
+    pub fn replace_content_streaming_if_match<F>(
+        &self,
+        item_id: &str,
+        etag: &str,
+        total: u64,
+        read_range: F,
+    ) -> Result<StreamUploadOutcome, UploadError>
+    where
+        F: FnMut(u64, usize) -> Result<Vec<u8>, UploadError>,
+    {
+        let url = format!("{}/me/drive/items/{item_id}/createUploadSession", self.base);
+        let Some(session) =
+            self.create_target_upload_session(url, total, ConflictBehavior::Replace, Some(etag))?
+        else {
+            return Ok(StreamUploadOutcome::Conflict);
+        };
+        match self.upload_session_from_ranges(session, read_range) {
+            Ok(value) => Ok(StreamUploadOutcome::Applied(value)),
+            Err(UploadError::Http { status: 412, .. }) => Ok(StreamUploadOutcome::Conflict),
+            Err(error) => Err(error),
+        }
     }
 
     /// Upload `data` to `dest_path`. Small files go via a single PUT; larger ones
@@ -1042,10 +1388,24 @@ impl GraphClient {
         loop {
             attempt += 1;
             let mut req = self.client.get(url).bearer_auth(&self.token);
+            if let Some(remaining) = self.remaining_operation_budget()? {
+                req = req.timeout(remaining);
+            }
             if self.prefer_immutable_id {
                 req = req.header("Prefer", PREFER_IMMUTABLE_ID);
             }
-            let resp = req.send().map_err(UploadError::from_reqwest)?;
+            let resp = match req.send() {
+                Ok(resp) => resp,
+                Err(error) => {
+                    let error = UploadError::from_reqwest(error);
+                    if matches!(error, UploadError::Transport { .. }) && attempt < MAX_GET_ATTEMPTS
+                    {
+                        self.sleep_for_get_retry(backoff_delay(attempt))?;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
             let status = resp.status().as_u16();
             if let Some(rid) = resp
                 .headers()
@@ -1059,11 +1419,22 @@ impl GraphClient {
                 let wait = parse_retry_after(&resp)
                     .unwrap_or_else(|| backoff_delay(attempt))
                     .min(MAX_RETRY_WAIT);
-                std::thread::sleep(wait);
+                self.sleep_for_get_retry(wait)?;
                 continue;
             }
             return Ok(resp);
         }
+    }
+
+    fn sleep_for_get_retry(&self, wait: Duration) -> Result<(), UploadError> {
+        let wait = wait.min(MAX_RETRY_WAIT);
+        if let Some(remaining) = self.remaining_operation_budget()? {
+            if wait >= remaining {
+                return Err(UploadError::Timeout("operation deadline elapsed".into()));
+            }
+        }
+        std::thread::sleep(wait);
+        Ok(())
     }
 
     pub fn get_bytes(&self, url: &str) -> Result<Vec<u8>, UploadError> {
@@ -1078,7 +1449,49 @@ impl GraphClient {
         }
         resp.bytes()
             .map(|b| b.to_vec())
-            .map_err(|e| UploadError::Transport(e.to_string()))
+            .map_err(|e| UploadError::transport(e.to_string()))
+    }
+
+    /// Reads a response body up to an explicit caller-owned limit. The limit is
+    /// checked against both Content-Length and streamed bytes.
+    pub fn get_bytes_bounded(&self, url: &str, max_bytes: usize) -> Result<Vec<u8>, UploadError> {
+        use std::io::Read;
+
+        let url = self.abs(url);
+        let mut resp = self.get_with_retry(&url)?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(UploadError::Http {
+                status,
+                body: resp.text().unwrap_or_default().chars().take(300).collect(),
+            });
+        }
+        if resp
+            .content_length()
+            .is_some_and(|length| length > max_bytes as u64)
+        {
+            return Err(UploadError::TooLarge);
+        }
+        let initial_capacity = resp
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or(0)
+            .min(max_bytes);
+        let mut out = Vec::with_capacity(initial_capacity);
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            let read = resp
+                .read(&mut chunk)
+                .map_err(|error| UploadError::transport(error.to_string()))?;
+            if read == 0 {
+                break;
+            }
+            if out.len().saturating_add(read) > max_bytes {
+                return Err(UploadError::TooLarge);
+            }
+            out.extend_from_slice(&chunk[..read]);
+        }
+        Ok(out)
     }
 
     /// Like [`get_bytes`](Self::get_bytes), but **streams** the body and reports the cumulative
@@ -1105,7 +1518,7 @@ impl GraphClient {
         loop {
             let n = resp
                 .read(&mut buf)
-                .map_err(|e| UploadError::Transport(e.to_string()))?;
+                .map_err(|e| UploadError::transport(e.to_string()))?;
             if n == 0 {
                 break;
             }
@@ -1349,7 +1762,7 @@ impl GraphClient {
     ) -> Result<(), UploadError> {
         let url = format!("{}/me/onenote/pages/{page_id}/content", self.base);
         let body =
-            serde_json::to_vec(commands).map_err(|e| UploadError::Transport(e.to_string()))?;
+            serde_json::to_vec(commands).map_err(|e| UploadError::transport(e.to_string()))?;
         let resp = self
             .client
             .patch(&url)
@@ -1703,6 +2116,101 @@ impl GraphClient {
         ))
     }
 
+    /// Delete tasks through bounded Microsoft Graph JSON batches.
+    ///
+    /// Graph accepts at most 20 subrequests in one batch. Large user-confirmed
+    /// selections are sent in bounded parallel waves so the mobile bridge does
+    /// not serialize hundreds of HTTP round trips. DELETE and 404 are both
+    /// successful outcomes, making a whole-batch retry idempotent.
+    pub fn delete_tasks_batch(&self, items: &[(String, String)]) -> Result<(), UploadError> {
+        for wave in items.chunks(GRAPH_BATCH_REQUEST_LIMIT * TODO_DELETE_BATCH_PARALLELISM) {
+            std::thread::scope(|scope| {
+                let handles = wave
+                    .chunks(GRAPH_BATCH_REQUEST_LIMIT)
+                    .map(|chunk| {
+                        let client = self.clone();
+                        scope.spawn(move || client.delete_tasks_batch_chunk(chunk))
+                    })
+                    .collect::<Vec<_>>();
+                for handle in handles {
+                    handle.join().map_err(|_| UploadError::Transport {
+                        failure: GraphTransportFailure::Other,
+                        detail: "batch worker failed".into(),
+                    })??;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn delete_tasks_batch_chunk(&self, items: &[(String, String)]) -> Result<(), UploadError> {
+        if items.is_empty() || items.len() > GRAPH_BATCH_REQUEST_LIMIT {
+            return Err(UploadError::Parse("invalid Graph batch size".into()));
+        }
+        let requests = items
+            .iter()
+            .enumerate()
+            .map(|(index, (list_id, task_id))| {
+                serde_json::json!({
+                    "id": index.to_string(),
+                    "method": "DELETE",
+                    "url": format!(
+                        "/me/todo/lists/{}/tasks/{}",
+                        encode_id(list_id),
+                        encode_id(task_id)
+                    ),
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = self
+            .client
+            .post(format!("{}/$batch", self.base))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "requests": requests }))
+            .send()
+            .map_err(UploadError::from_reqwest)?;
+        let value = json_or_err(response)?;
+        let responses = value
+            .get("responses")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| UploadError::Parse("Graph batch response missing responses".into()))?;
+        if responses.len() != items.len() {
+            return Err(UploadError::Parse(
+                "Graph batch response count mismatch".into(),
+            ));
+        }
+        let mut seen = vec![false; items.len()];
+        for response in responses {
+            let index = response
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|index| *index < items.len())
+                .ok_or_else(|| UploadError::Parse("invalid Graph batch response id".into()))?;
+            if std::mem::replace(&mut seen[index], true) {
+                return Err(UploadError::Parse(
+                    "duplicate Graph batch response id".into(),
+                ));
+            }
+            let status = response
+                .get("status")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|status| u16::try_from(status).ok())
+                .ok_or_else(|| UploadError::Parse("invalid Graph batch response status".into()))?;
+            if !(200..300).contains(&status) && status != 404 {
+                return Err(UploadError::Http {
+                    status,
+                    body: String::new(),
+                });
+            }
+        }
+        if seen.iter().any(|value| !value) {
+            return Err(UploadError::Parse("incomplete Graph batch response".into()));
+        }
+        Ok(())
+    }
+
     /// Add a checklist item to a task (`POST .../tasks/{id}/checklistItems`).
     pub fn create_checklist_item(
         &self,
@@ -2011,9 +2519,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn graph_client_rejects_invalid_caller_timeout_policy() {
+        assert!(matches!(
+            GraphClient::with_timeouts("token", Duration::ZERO, Duration::from_secs(1)),
+            Err(UploadError::Parse(_))
+        ));
+        assert!(matches!(
+            GraphClient::with_timeouts("token", Duration::from_secs(1), Duration::from_secs(2)),
+            Err(UploadError::Parse(_))
+        ));
+        GraphClient::with_timeouts("token", Duration::from_secs(2), Duration::from_secs(1))
+            .expect("valid caller deadlines");
+    }
+
+    #[test]
+    fn graph_client_deadline_clone_preserves_origin_and_rejects_elapsed_budget() {
+        let client = GraphClient::new("token").with_base_url("http://127.0.0.1:32123");
+        let bounded = client
+            .clone_with_deadline(
+                std::time::Instant::now() + Duration::from_secs(2),
+                Duration::from_secs(8),
+                Duration::from_secs(4),
+            )
+            .expect("active operation deadline");
+        assert_eq!(bounded.base, client.base);
+        assert!(bounded.operation_deadline.is_some());
+        assert!(matches!(
+            client.clone_with_deadline(
+                std::time::Instant::now() - Duration::from_millis(1),
+                Duration::from_secs(8),
+                Duration::from_secs(4),
+            ),
+            Err(UploadError::Timeout(_))
+        ));
+    }
+
+    #[test]
     fn graph_transient_failure_is_structured_without_message_matching() {
         assert_eq!(
-            UploadError::Transport("arbitrary".into()).transient_failure(),
+            UploadError::transport("arbitrary").transient_failure(),
             Some(GraphTransientFailure::Network)
         );
         assert_eq!(
@@ -2240,6 +2784,28 @@ mod tests {
     }
 
     #[test]
+    fn graph_transport_classifies_dns_tls_and_connect_without_error_text() {
+        let dns = std::io::Error::new(std::io::ErrorKind::NotFound, "private dns detail");
+        assert_eq!(
+            classify_transport_failure_source(&dns),
+            GraphTransportFailure::NameResolution
+        );
+        let tls = rustls::Error::General("private certificate detail".into());
+        assert_eq!(
+            classify_transport_failure_source(&tls),
+            GraphTransportFailure::Tls
+        );
+        let connect = std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "private connection detail",
+        );
+        assert_eq!(
+            classify_transport_failure_source(&connect),
+            GraphTransportFailure::Connect
+        );
+    }
+
+    #[test]
     fn get_json_retries_on_429_then_succeeds() {
         // Central retry policy (#0.4): an idempotent GET honors Retry-After and retries.
         let (base, server) = serve(vec![
@@ -2251,6 +2817,18 @@ mod tests {
         assert_eq!(v["ok"], true);
         let seen = server.join().unwrap();
         assert_eq!(seen.len(), 2, "must have retried the 429 exactly once");
+    }
+
+    #[test]
+    fn get_json_retries_transport_failure_then_succeeds() {
+        let (base, server) = serve(vec![
+            String::new(),
+            http_response(200, "OK", "", r#"{"ok":true}"#),
+        ]);
+        let client = GraphClient::new("tok");
+        let value = client.get_json(&base).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(server.join().unwrap().len(), 2);
     }
 
     #[test]
@@ -2529,6 +3107,24 @@ mod tests {
     }
 
     #[test]
+    fn get_bytes_bounded_rejects_declared_and_streamed_overflow() {
+        let (base, _server) = serve(vec![http_response(200, "OK", "", "12345")]);
+        let error = GraphClient::new("tok")
+            .with_base_url(&base)
+            .get_bytes_bounded("/bounded", 4)
+            .unwrap_err();
+        assert!(matches!(error, UploadError::TooLarge));
+
+        let response = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n12345".to_owned();
+        let (base, _server) = serve(vec![response]);
+        let error = GraphClient::new("tok")
+            .with_base_url(&base)
+            .get_bytes_bounded("/bounded", 4)
+            .unwrap_err();
+        assert!(matches!(error, UploadError::TooLarge));
+    }
+
+    #[test]
     fn create_upload_session_parses_upload_url_and_rejects_missing_one() {
         let (base, _s) = serve(vec![http_response(
             200,
@@ -2650,6 +3246,32 @@ mod tests {
             "unexpected request: {}",
             seen[0]
         );
+    }
+
+    #[test]
+    fn session_manifest_reads_and_server_time_use_bounded_get_retry() {
+        let (base, server) = serve(vec![
+            http_response(503, "Service Unavailable", "Retry-After: 0\r\n", "{}"),
+            http_response(200, "OK", "", "{\"id\":\"manifest\"}"),
+        ]);
+        let item = GraphClient::new("tok")
+            .with_base_url(&base)
+            .get_drive_item_by_path("Apps/iSyncYou/agent/v2/session/manifest.json", &["id"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(item["id"], "manifest");
+        assert_eq!(server.join().unwrap().len(), 2);
+
+        let (base, server) = serve(vec![
+            http_response(503, "Service Unavailable", "Retry-After: 0\r\n", "{}"),
+            http_response(200, "OK", "Date: Wed, 01 Jan 2025 00:00:00 GMT\r\n", "{}"),
+        ]);
+        let sample = GraphClient::new("tok")
+            .with_base_url(&base)
+            .server_time_sample()
+            .unwrap();
+        assert!(sample.server_unix_ms > 0);
+        assert_eq!(server.join().unwrap().len(), 2);
     }
 
     #[test]
@@ -3347,6 +3969,42 @@ mod tests {
         assert!(seen[5].starts_with("DELETE /me/todo/lists/L1/tasks/t1"));
         assert!(seen[6].starts_with("POST /me/todo/lists"));
         assert!(seen[7].starts_with("DELETE /me/todo/lists/L9"));
+    }
+
+    #[test]
+    fn todo_delete_batch_uses_graph_batch_and_accepts_not_found() {
+        let (base, server) = serve(vec![http_response(
+            200,
+            "OK",
+            "",
+            r#"{"responses":[{"id":"1","status":404},{"id":"0","status":204}]}"#,
+        )]);
+        GraphClient::new("tok")
+            .with_base_url(&base)
+            .delete_tasks_batch(&[
+                ("list+/=".into(), "task-1".into()),
+                ("list-2".into(), "task+/=".into()),
+            ])
+            .unwrap();
+        let seen = server.join().unwrap();
+        assert!(seen[0].starts_with("POST /$batch"));
+        assert!(seen[0].contains("/me/todo/lists/list%2B%2F%3D/tasks/task-1"));
+        assert!(seen[0].contains("/me/todo/lists/list-2/tasks/task%2B%2F%3D"));
+    }
+
+    #[test]
+    fn todo_delete_batch_rejects_failed_subrequest() {
+        let (base, _server) = serve(vec![http_response(
+            200,
+            "OK",
+            "",
+            r#"{"responses":[{"id":"0","status":403}]}"#,
+        )]);
+        let error = GraphClient::new("tok")
+            .with_base_url(&base)
+            .delete_tasks_batch(&[("list".into(), "task".into())])
+            .unwrap_err();
+        assert!(matches!(error, UploadError::Http { status: 403, .. }));
     }
 
     #[test]

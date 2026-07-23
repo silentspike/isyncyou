@@ -8,8 +8,15 @@ name: Release
 # deliberate act: dispatch an RC from the target commit, then tag that same commit.
 on:
   push:
-    tags: ['v*']
+    tags:
+      - 'v*'
+      - '!v*-*'
   workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: Exact approved 40-character main commit
+        required: true
+        type: string
 
 # Least-privilege default for the whole workflow; the build job below elevates to
 # exactly what it needs (publish the release, sign keylessly, attest).
@@ -21,6 +28,102 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  preflight:
+    name: classify ref and verify release preconditions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.contract.outputs.mode }}
+      release_tag: ${{ steps.contract.outputs.release_tag }}
+      matching_rc: ${{ steps.remote.outputs.matching_rc }}
+    steps:
+      - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.0
+        with:
+          fetch-depth: 0
+      - id: contract
+        name: Classify the triggering ref before any build
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_SHA: ${{ github.sha }}
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: |
+          result=$(python3 tools/release_workflow_contract.py classify \
+            --event "$EVENT_NAME" --ref "$RELEASE_REF" --sha "$RELEASE_SHA" \
+            --expected-commit "$EXPECTED_COMMIT")
+          mode=$(jq -r .mode <<<"$result")
+          if [ "$mode" = rc ]; then
+            release_tag="v1.0.0-rc.${GITHUB_RUN_NUMBER}"
+          else
+            release_tag=$(jq -r .tag <<<"$result")
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+      - id: remote
+        name: Reject existing or unqualified release objects
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ steps.contract.outputs.mode }}
+          RELEASE_TAG: ${{ steps.contract.outputs.release_tag }}
+        run: |
+          api_status() {
+            curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+              --header 'Accept: application/vnd.github+json' \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com/$1"
+          }
+          if ! release_status=$(api_status \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG"); then
+            echo "::error::release existence check unavailable"
+            exit 1
+          fi
+          python3 tools/release_workflow_contract.py require-absent \
+            --status "$release_status" --resource release
+          if [ "$MODE" = rc ]; then
+            if ! tag_status=$(api_status \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG"); then
+              echo "::error::tag existence check unavailable"
+              exit 1
+            fi
+            python3 tools/release_workflow_contract.py require-absent \
+              --status "$tag_status" --resource tag
+            echo "matching_rc=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "::error::stable tag commit is not on main"
+            exit 1
+          }
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" | \
+            jq -s 'add' > "$RUNNER_TEMP/releases.json"
+          python3 tools/release_workflow_contract.py candidate-rc-tags \
+            --json "$RUNNER_TEMP/releases.json" --sha "$GITHUB_SHA" \
+            > "$RUNNER_TEMP/rc-tags.txt"
+          printf '{}\n' > "$RUNNER_TEMP/rc-tag-commits.json"
+          while IFS= read -r rc; do
+            test -n "$rc" || continue
+            git fetch --force --no-tags origin "refs/tags/$rc:refs/tags/$rc"
+            commit=$(git rev-list -n1 "$rc")
+            jq --arg tag "$rc" --arg commit "$commit" \
+              '. + {($tag): $commit}' "$RUNNER_TEMP/rc-tag-commits.json" \
+              > "$RUNNER_TEMP/rc-tag-commits.next.json"
+            mv "$RUNNER_TEMP/rc-tag-commits.next.json" "$RUNNER_TEMP/rc-tag-commits.json"
+          done < "$RUNNER_TEMP/rc-tags.txt"
+          matching_rc=$(python3 tools/release_workflow_contract.py select-rc \
+            --json "$RUNNER_TEMP/releases.json" \
+            --tag-commits-json "$RUNNER_TEMP/rc-tag-commits.json" \
+            --sha "$GITHUB_SHA" 2>/dev/null || true)
+          if [ -z "$matching_rc" ]; then
+            echo "::error::stable release requires a matching non-draft RC and signed APK assets"
+            exit 1
+          fi
+          echo "matching_rc=$matching_rc" >> "$GITHUB_OUTPUT"
+
   build:
     name: build & publish
     # GitHub-hosted only. No self-hosted runner is used anywhere once the repo is public:
@@ -30,7 +133,7 @@ jobs:
     runs-on: ubuntu-latest
     # The signed Android APK is built once (android-apk job) and reused here, so the
     # bytes published are exactly the bytes apksigner-verified there (REQ-AND-005).
-    needs: [android-apk]
+    needs: [preflight, android-apk]
     permissions:
       contents: write # publish the RC/release + upload assets
       id-token: write # cosign keyless (OIDC) + provenance
@@ -116,24 +219,15 @@ jobs:
           name: isyncyou-android-apk
           path: dist
       - name: Reuse the matching RC's APK on a stable tag (REQ-AND-005)
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: needs.preflight.outputs.mode == 'stable'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           # The stable tag must point at the exact commit an RC was built from. Find
           # that RC prerelease and download its APK, replacing the one rebuilt this run,
           # then verify the checksum — guaranteeing identical bytes (build-once).
-          sha="${{ github.sha }}"
-          rc=""
-          while read -r tag; do
-            tsha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" -q '.object.sha' 2>/dev/null || true)
-            if [ "$tsha" = "$sha" ]; then rc="$tag"; break; fi
-          done < <(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-                     -q '.[] | select(.prerelease==true) | .tag_name')
-          if [ -z "$rc" ]; then
-            echo "::error::No RC prerelease was built from $sha — tag the exact commit an RC was built from (build-once / promote-many, REQ-AND-005)."
-            exit 1
-          fi
+          rc="${{ needs.preflight.outputs.matching_rc }}"
+          test -n "$rc"
           echo "reusing the signed APK from prerelease $rc"
           rm -f dist/isyncyou-android-arm64.apk dist/isyncyou-android-arm64.apk.sha256
           gh release download "$rc" --repo "$GITHUB_REPOSITORY" \
@@ -253,17 +347,17 @@ jobs:
       - name: Publish RC prerelease (manual dispatch from main)
         # workflow_dispatch from `main` sets github.ref to refs/heads/main; a tag push is
         # handled by the stable-release step below, so the two never both fire.
-        if: github.ref == 'refs/heads/main'
+        if: needs.preflight.outputs.mode == 'rc'
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
-          tag_name: v1.0.0-rc.${{ github.run_number }}
+          tag_name: ${{ needs.preflight.outputs.release_tag }}
           # Pin the RC tag to the exact commit this run built (the push-to-main SHA).
           # Without this, softprops creates the tag on the default branch (dev), so the
           # RC tag points at a dev commit that is only tree-identical to main — and the
           # stable-tag APK-reuse step (which matches a stable tag's commit to an RC tag's
           # commit) could never find it. With this, v1.0.0-rc.<run> == the main commit.
           target_commitish: ${{ github.sha }}
-          name: iSyncYou v1.0.0-rc.${{ github.run_number }}
+          name: iSyncYou ${{ needs.preflight.outputs.release_tag }}
           prerelease: true
           files: |
             dist/isyncyou-linux-x86_64.tar.gz
@@ -291,7 +385,7 @@ jobs:
             ```
 
       - name: Publish release (on tag)
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: needs.preflight.outputs.mode == 'stable'
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
           # The git tag ref is already authoritative for provenance, but pin the
@@ -313,6 +407,20 @@ jobs:
             dist/*.cosign.bundle
           generate_release_notes: true
 
+      - name: Verify the published release object
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ needs.preflight.outputs.mode }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$RUNNER_TEMP/release.json"
+          python3 tools/release_workflow_contract.py validate-release \
+            --json "$RUNNER_TEMP/release.json" --mode "$MODE" \
+            --tag "$RELEASE_TAG" --sha "$GITHUB_SHA"
+          git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          test "$(git rev-list -n1 "$RELEASE_TAG")" = "$GITHUB_SHA"
+          curl -fsSI "https://github.com/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG" >/dev/null
+
   # Build the SIGNED release APK exactly once (REQ-AND-002/003/005). The build job
   # depends on this and attaches the produced APK to the RC prerelease; a stable tag
   # reuses the byte-identical APK from the matching RC. Token-free except for the
@@ -321,6 +429,7 @@ jobs:
   android-apk:
     name: android signed APK (build-once)
     runs-on: ubuntu-latest
+    needs: [preflight]
     permissions:
       contents: read
     steps:
@@ -328,24 +437,42 @@ jobs:
         with:
           egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.0
+      - name: Reuse the preflight-qualified RC APK on stable promotion
+        if: needs.preflight.outputs.mode == 'stable'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MATCHING_RC: ${{ needs.preflight.outputs.matching_rc }}
+        run: |
+          mkdir -p out
+          gh release download "$MATCHING_RC" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'isyncyou-android-arm64.apk*' --dir out
+          (cd out && sha256sum -c isyncyou-android-arm64.apk.sha256)
       - uses: actions/setup-java@1bcf9fb12cf4aa7d266a90ae39939e61372fe520 # v5.4.0
+        if: needs.preflight.outputs.mode == 'rc'
         with:
           distribution: temurin
           java-version: "17"
       - uses: gradle/actions/wrapper-validation@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
+        if: needs.preflight.outputs.mode == 'rc'
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        if: needs.preflight.outputs.mode == 'rc'
         with:
           toolchain: "1.95.0"
           targets: aarch64-linux-android
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
+        if: needs.preflight.outputs.mode == 'rc'
       - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        if: needs.preflight.outputs.mode == 'rc'
         with:
           tool: cargo-ndk
       - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        if: needs.preflight.outputs.mode == 'rc'
       - name: Install the pinned NDK + build-tools (NDK matches android.ndkVersion)
+        if: needs.preflight.outputs.mode == 'rc'
         run: |
           yes | sdkmanager --install "ndk;27.3.13750724" "build-tools;34.0.0"
       - name: Materialize release signing material from secrets (REQ-AND-003)
+        if: needs.preflight.outputs.mode == 'rc'
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
           STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -370,7 +497,9 @@ jobs:
           } > android/signing.properties
           printf '%s' "$GOOGLE_SERVICES_JSON" > android/app/google-services.json
       - name: Build the signed release APK, versioned from the RC (REQ-AND-002)
+        if: needs.preflight.outputs.mode == 'rc'
         env:
+          ISY_ANDROID_NATIVE_BUILDER: github-actions
           ISY_REQUIRE_RELEASE_SIGNING: "1"
           ISY_VERSION_CODE: ${{ github.run_number }}
         run: |
@@ -378,8 +507,10 @@ jobs:
           # monotonic CI run number. No literal "1"/"0.1" reaches the manifest.
           ver=$(awk '/^\[workspace\.package\]/{f=1} f&&/^version[[:space:]]*=/{gsub(/[" ]/,"",$3); print $3; exit}' Cargo.toml)
           echo "workspace version: $ver  versionCode: $ISY_VERSION_CODE"
+          tools/build-android-native.sh
           (cd android && ISY_VERSION_NAME="$ver" ./gradlew :app:assembleRelease)
       - name: Verify the APK is signed with the release key (REQ-AND-003)
+        if: needs.preflight.outputs.mode == 'rc'
         run: |
           shopt -s nullglob
           apks=(android/app/build/outputs/apk/release/*.apk)
@@ -391,7 +522,7 @@ jobs:
           cp "$apk" out/isyncyou-android-arm64.apk
           (cd out && sha256sum isyncyou-android-arm64.apk > isyncyou-android-arm64.apk.sha256)
       - name: Scrub signing material
-        if: always()
+        if: always() && needs.preflight.outputs.mode == 'rc'
         run: rm -f android/release.jks android/signing.properties android/app/google-services.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

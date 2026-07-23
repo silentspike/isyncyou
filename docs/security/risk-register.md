@@ -43,7 +43,7 @@ README's [Known limitations](../../README.md#known-limitations).
 |---|---|
 | **Risk** | The tool holds Microsoft 365 access/refresh tokens; an over-broad scope or a leaked token widens the blast radius. |
 | **Impact** | High. |
-| **Mitigation** | Separate read and write/restore app registrations with least-privilege scopes; the write/restore scope is only requested when a restore is actually performed; tokens are never logged; public-client OAuth (PKCE / device-code) with no client secret on the desktop/CLI. |
+| **Mitigation** | Separate Reader and Writer app registrations use least-privilege scopes and independent encrypted caches. Product UI connects them explicitly per account, verifies the same stable Graph object identity before pairing them, never substitutes Writer for Reader cache refresh, and never logs tokens. Public-client OAuth uses PKCE in the desktop/mobile product flow and retains device-code only for the explicit headless CLI workflow; neither path uses a client secret. |
 | **Status** | **Mitigated** for handling; at-rest protection tracked under R2. |
 
 ## R5 — Malicious mail content in the viewer
@@ -112,6 +112,17 @@ README's [Known limitations](../../README.md#known-limitations).
 | **Impact** | High — an apparently disconnected account can remain authorized, credentials can become unrecoverable, duplicate grants can survive, or the UI can misrepresent which account is active. |
 | **Mitigation** | #645 uses provider-scoped operation leases, a durable cross-process fence, stable installation-bound idempotency, encrypted lifecycle journals/candidates, separate active/candidate revoke legs, and fail-closed recovery. Provider revoke success is persisted before provider-scoped local cleanup. Ambiguous outcomes and grant-bearing candidates are retained non-ready. Reconnect revokes the prior generation before OAuth; Codex Switch requires a strictly validated signed subject and Claude Switch remains unavailable without one. Android revoke legs use the bounded #640 foreground-guard/snapshot contract; default artifacts exclude lifecycle hooks. |
 | **Status** | **Mitigated / monitored** — host, UI, Android contract, hook-isolation, real Claude/Codex Disconnect/Reconnect, post-Reconnect turns, same-account rejection, and a physical two-account Codex Switch are recorded in [the #645 manifest](../evidence/issue-645-manifest.json). AC-3 is closed and REQ-AGENT-015 is implemented. Residual provider revoke-scope and identity-contract drift remains monitored. Design: [ADR-007](../adr/007-agent-architecture.md). |
+
+---
+
+## R12 — Shared Agent session replay and cross-device authority
+
+| | |
+|---|---|
+| **Risk** | A transport retry duplicates a provider call or cloud effect, a stale session lease publishes after takeover, a request resumes under a different provider generation, or a one-time pairing transfer is reused. |
+| **Impact** | High — duplicate mutation, transcript fork, authority confusion, or session disclosure across devices. |
+| **Mitigation** | #628 adds route/session/payload-bound durable request IDs, bounded encrypted provider-step journals, provider-generation and harness binding, renewed server-time session leases, staged immutable objects with fenced manifest publication, host-owned cancellation/terminal ordering, and confirmation-gated one-time Pairing V2. Strict JSON and sealed mutation chunks remove mutable secrets and large bodies from URLs. |
+| **Status** | **Mitigated in the pre-RC candidate** — exact-commit host, live-provider, Android, and cross-device evidence is recorded in the #628 pre-RC manifest and REQ-AGENT-016 is implemented. Protected review, promotion, RC publication, final-RC artifact verification, and explicit issue closure remain outstanding release controls. Design: [ADR-007](../adr/007-agent-architecture.md). |
 
 ---
 

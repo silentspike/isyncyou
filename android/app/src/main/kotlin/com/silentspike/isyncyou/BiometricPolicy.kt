@@ -35,6 +35,25 @@ internal class BiometricPendingRegistry<T : Any> {
 
 /** Pure policy decisions kept outside MainActivity so API-level behavior is unit-testable. */
 object BiometricPolicy {
+    fun chooseForOperation(
+        operation: String,
+        strongAvailable: Boolean,
+        cryptoAvailable: Boolean,
+        credentialAvailable: Boolean,
+    ): BiometricDecision? {
+        if (operation == "user-presence" || operation == "bulk") {
+            return if (credentialAvailable) {
+                BiometricDecision(
+                    BiometricMode.DeviceCredential,
+                    BiometricManager.Authenticators.DEVICE_CREDENTIAL,
+                )
+            } else {
+                null
+            }
+        }
+        return choose(strongAvailable, cryptoAvailable, credentialAvailable)
+    }
+
     fun choose(
         strongAvailable: Boolean,
         cryptoAvailable: Boolean,
@@ -94,6 +113,24 @@ object BiometricPolicy {
     }
 }
 
+object BiometricErrorPolicy {
+    fun closedCode(errorCode: Int): String = when (errorCode) {
+        BiometricPrompt.ERROR_USER_CANCELED,
+        BiometricPrompt.ERROR_NEGATIVE_BUTTON,
+        BiometricPrompt.ERROR_CANCELED,
+        -> "cancelled"
+        BiometricPrompt.ERROR_LOCKOUT,
+        BiometricPrompt.ERROR_LOCKOUT_PERMANENT,
+        -> "lockout"
+        BiometricPrompt.ERROR_TIMEOUT -> "timeout"
+        BiometricPrompt.ERROR_HW_NOT_PRESENT,
+        BiometricPrompt.ERROR_HW_UNAVAILABLE,
+        BiometricPrompt.ERROR_NO_BIOMETRICS,
+        -> "not_available"
+        else -> "authentication_failed"
+    }
+}
+
 object BiometricLabelPolicy {
     private val verbs = mapOf(
         "delete" to "Delete",
@@ -108,6 +145,7 @@ object BiometricLabelPolicy {
         "mode-switch-offline-large" to "Make folder offline",
         "conflict-keep-mine" to "Keep local version",
         "bulk" to "Bulk change",
+        "user-presence" to "Confirm session action",
     )
     private val services = mapOf(
         "onedrive" to "OneDrive",
@@ -121,6 +159,7 @@ object BiometricLabelPolicy {
     )
 
     fun label(op: String, service: String): String? {
+        if (op == "bulk" && service == "todo") return "Delete selected tasks in To Do"
         val verb = verbs[op] ?: return null
         val serviceName = services[service] ?: return null
         return "$verb in $serviceName"

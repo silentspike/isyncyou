@@ -9,6 +9,21 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class AgentExperimentalBoundaryTest(unittest.TestCase):
+    def test_feature_matrix_captures_cargo_tree_through_a_pipe(self) -> None:
+        source = (ROOT / "tools/verify-agent-experimental-boundary.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('| cat >"$TMP_ROOT/default-tree.txt"', source)
+        self.assertIn('| cat >"$TMP_ROOT/experimental-tree.txt"', source)
+
+    def test_release_boundary_copies_the_exact_remote_daemon_artifact(self) -> None:
+        source = (ROOT / "tools/verify-agent-experimental-boundary.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("-c release/isyncyoud --", source)
+        self.assertIn("build --locked --release -p isyncyou-daemon", source)
+        self.assertNotIn("cargo remote -c -- build --release", source)
+
     def test_release_build_excludes_agent_subscription_experimental(self) -> None:
         workflows = (
             ".github/workflows/release.yml",

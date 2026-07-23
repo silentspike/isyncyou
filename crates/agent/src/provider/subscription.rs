@@ -181,7 +181,7 @@ struct ClaudeStreamState {
     active_tools: BTreeMap<u64, (String, String)>,
     tools: Vec<(String, Value)>,
     usage: Usage,
-    failure: Option<String>,
+    failed: bool,
 }
 
 fn apply_claude_sse_event(
@@ -192,8 +192,8 @@ fn apply_claude_sse_event(
     if data.is_empty() || data == "[DONE]" {
         return Ok(None);
     }
-    let v: Value = serde_json::from_str(data)
-        .map_err(|e| AgentError::Provider(format!("subscription: invalid SSE JSON: {e}")))?;
+    let v: Value =
+        serde_json::from_str(data).map_err(|_| closed_subscription_failure("parse_failure"))?;
     match v.get("type").and_then(|t| t.as_str()) {
         Some("message_start") => {
             if let Some(u) = v.get("message").and_then(|m| m.get("usage")) {
@@ -266,13 +266,7 @@ fn apply_claude_sse_event(
             }
         }
         Some("error") => {
-            state.failure = Some(
-                v.get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("stream error")
-                    .to_string(),
-            );
+            state.failed = true;
         }
         _ => {}
     }
@@ -299,8 +293,8 @@ fn sse_event_advances_turn(data: &str) -> bool {
 fn finish_claude_stream(
     state: ClaudeStreamState,
 ) -> Result<(Vec<AssistantBlock>, Usage), AgentError> {
-    if let Some(e) = state.failure {
-        return Err(AgentError::Provider(format!("subscription: {e}")));
+    if state.failed {
+        return Err(closed_subscription_failure("stream_failure"));
     }
     let mut blocks = Vec::new();
     if !state.text.is_empty() {
@@ -312,6 +306,10 @@ fn finish_claude_stream(
     Ok((blocks, state.usage))
 }
 
+fn closed_subscription_failure(code: &str) -> AgentError {
+    AgentError::Provider(format!("subscription_safe:{code}"))
+}
+
 impl LlmProvider for SubscriptionProvider {
     fn name(&self) -> &str {
         "subscription"
@@ -321,6 +319,15 @@ impl LlmProvider for SubscriptionProvider {
         &mut self,
         history: &[Message],
         emit: &mut dyn FnMut(StreamEvent),
+    ) -> Result<Vec<AssistantBlock>, AgentError> {
+        self.next_cancellable(history, emit, None)
+    }
+
+    fn next_cancellable(
+        &mut self,
+        history: &[Message],
+        emit: &mut dyn FnMut(StreamEvent),
+        cancellation: Option<&crate::CancellationToken>,
     ) -> Result<Vec<AssistantBlock>, AgentError> {
         // #639: build + attest the exact request for THIS round's history, then send only the
         // attested object — the transport's product path accepts nothing un-attested.
@@ -339,34 +346,32 @@ impl LlmProvider for SubscriptionProvider {
         )?;
         let mut state = ClaudeStreamState::default();
         let mut parse_error: Option<AgentError> = None;
-        let response = self.http.post_attested_sse(&attested, &mut |event| {
-            if parse_error.is_some() {
-                return false;
-            }
-            let advances_turn = sse_event_advances_turn(&event.data);
-            match apply_claude_sse_event(&event.data, &mut state) {
-                Ok(Some(delta)) => emit(StreamEvent::Token(delta)),
-                Ok(None) => {}
-                Err(e) => parse_error = Some(e),
-            }
-            advances_turn
-        })?;
+        let response = self.http.post_attested_sse_cancellable(
+            &attested,
+            &mut |event| {
+                if parse_error.is_some() {
+                    return false;
+                }
+                let advances_turn = sse_event_advances_turn(&event.data);
+                match apply_claude_sse_event(&event.data, &mut state) {
+                    Ok(Some(delta)) => emit(StreamEvent::Token(delta)),
+                    Ok(None) => {}
+                    Err(e) => parse_error = Some(e),
+                }
+                advances_turn
+            },
+            cancellation,
+        )?;
         if response.status == 401 || response.status == 403 {
-            return Err(AgentError::Provider(
-                "subscription: unauthorized — connect Claude again".into(),
-            ));
+            return Err(closed_subscription_failure("authorization_rejected"));
         }
         if response.status >= 400 {
-            let detail = response.body_preview.unwrap_or_default();
-            return Err(AgentError::Provider(format!(
-                "subscription: backend status {}{}",
-                response.status,
-                if detail.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {detail}")
-                }
-            )));
+            let code = match response.status {
+                408 | 425 | 429 => "http_rate_limited",
+                500..=599 => "http_server_failure",
+                _ => "http_request_rejected",
+            };
+            return Err(closed_subscription_failure(code));
         }
         if let Some(e) = parse_error {
             return Err(e);
@@ -521,10 +526,19 @@ mod tests {
         )
         .unwrap();
 
-        assert!(finish_claude_stream(state)
+        let error = finish_claude_stream(state).unwrap_err().to_string();
+        assert_eq!(error, "provider error: subscription_safe:stream_failure");
+        assert!(!error.contains("subscription rejected"));
+    }
+
+    #[test]
+    fn claude_parse_errors_do_not_expose_provider_frames() {
+        let secret_frame = "not-json-provider-secret";
+        let error = apply_claude_sse_event(secret_frame, &mut ClaudeStreamState::default())
             .unwrap_err()
-            .to_string()
-            .contains("subscription rejected"));
+            .to_string();
+        assert_eq!(error, "provider error: subscription_safe:parse_failure");
+        assert!(!error.contains(secret_frame));
     }
 
     #[test]

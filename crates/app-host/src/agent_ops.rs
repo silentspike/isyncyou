@@ -173,10 +173,10 @@ pub(crate) fn run_mobile_backup_account(
         Ok(run) => ("ok", run.summary.as_str()),
         Err(_) => ("error", "mobile backup failed"),
     };
-    if let Err(error) =
+    if let Err(_error) =
         LiveBackupRuntime.record_run(cfg, account, &started, &finished, status, summary)
     {
-        eprintln!("isyncyou: could not record mobile backup run for {account}: {error}");
+        eprintln!("isyncyou: mobile_backup_run_record_failed");
     }
     result
 }
@@ -334,10 +334,10 @@ fn run_backup_account_with_runtime<R: BackupRuntime>(
     let finished = crate::unix_now();
     let (status, summary) = match &result {
         Ok(run) => ("ok", run.summary.as_str()),
-        Err(error) => ("error", error.as_str()),
+        Err(_) => ("error", "backup failed"),
     };
-    if let Err(e) = runtime.record_run(cfg, account, &started, &finished, status, summary) {
-        eprintln!("isyncyou: could not record backup run for {account}: {e}");
+    if let Err(_error) = runtime.record_run(cfg, account, &started, &finished, status, summary) {
+        eprintln!("isyncyou: backup_run_record_failed");
     }
     result
 }
@@ -626,6 +626,48 @@ impl AgentLiveWriteIntent {
             | Self::OneNote(OneNoteLiveWrite::Create { .. }) => "new item",
             Self::Todo(TodoLiveWrite::ListDelete { .. }) => "list",
             _ => "existing item",
+        }
+    }
+
+    fn confirmation_copy(&self) -> &'static str {
+        match self {
+            Self::Mail(MailLiveWrite::SetRead { is_read: true, .. }) => "Mark this email as read",
+            Self::Mail(MailLiveWrite::SetRead { is_read: false, .. }) => {
+                "Mark this email as unread"
+            }
+            Self::Mail(MailLiveWrite::SetFlag { .. }) => "Update the follow-up flag on this email",
+            Self::Mail(MailLiveWrite::SetCategories { .. }) => {
+                "Update the categories on this email"
+            }
+            Self::Mail(MailLiveWrite::Move { .. }) => "Move this email",
+            Self::Mail(MailLiveWrite::CreateDraft { .. }) => "Create an email draft",
+            Self::Mail(MailLiveWrite::SendDraft { .. }) => "Send this email draft",
+            Self::Calendar(CalendarLiveWrite::Create { .. }) => "Create a calendar event",
+            Self::Calendar(CalendarLiveWrite::Update { .. }) => "Update this calendar event",
+            Self::Calendar(CalendarLiveWrite::Delete { .. }) => "Delete this calendar event",
+            Self::Calendar(CalendarLiveWrite::Respond { .. }) => {
+                "Respond to this calendar invitation"
+            }
+            Self::Contacts(ContactLiveWrite::Create { .. }) => "Create a contact",
+            Self::Contacts(ContactLiveWrite::Update { .. }) => "Update this contact",
+            Self::Contacts(ContactLiveWrite::Delete { .. }) => "Delete this contact",
+            Self::Todo(TodoLiveWrite::Create { .. }) => "Create a task",
+            Self::Todo(TodoLiveWrite::Update { .. }) => "Update this task",
+            Self::Todo(TodoLiveWrite::Complete { .. }) => "Mark this task as complete",
+            Self::Todo(TodoLiveWrite::Delete { .. }) => "Delete this task",
+            Self::Todo(TodoLiveWrite::ChecklistAdd { .. }) => "Add a checklist item to this task",
+            Self::Todo(TodoLiveWrite::ChecklistToggle { checked: true, .. }) => {
+                "Mark this checklist item as complete"
+            }
+            Self::Todo(TodoLiveWrite::ChecklistToggle { checked: false, .. }) => {
+                "Mark this checklist item as incomplete"
+            }
+            Self::Todo(TodoLiveWrite::ChecklistDelete { .. }) => "Delete this checklist item",
+            Self::Todo(TodoLiveWrite::ListCreate { .. }) => "Create a task list",
+            Self::Todo(TodoLiveWrite::ListDelete { .. }) => "Delete this task list",
+            Self::OneNote(OneNoteLiveWrite::Create { .. }) => "Create a OneNote page",
+            Self::OneNote(OneNoteLiveWrite::Delete { .. }) => "Delete this OneNote page",
+            Self::OneNote(OneNoteLiveWrite::Append { .. }) => "Add content to this OneNote page",
         }
     }
 }
@@ -1417,52 +1459,74 @@ pub(crate) fn preview_for_pending_action(
         return Err(format!("not_confirmable: {}", action.op()));
     }
     match action {
-        isyncyou_agent::ToolAction::Backup { account, services } => {
+        isyncyou_agent::ToolAction::Backup { services, .. } => {
             validate_services("backup", services, BACKUP_SERVICES)?;
-            let scope = if services.is_empty() {
-                "all supported services".to_string()
+            let copy = if services.is_empty() {
+                "Back up all supported Microsoft 365 data".to_string()
             } else {
-                format!("{} selected service(s)", services.len())
+                let count = services.len();
+                format!(
+                    "Back up {count} selected {} of Microsoft 365 data",
+                    if count == 1 { "category" } else { "categories" }
+                )
+            };
+            Ok(PendingOperationPreview::destructive(copy))
+        }
+        isyncyou_agent::ToolAction::RestoreCloud { service, .. } => {
+            validate_service("restore-cloud", service, RESTORE_CLOUD_SERVICES)?;
+            let item = match service.as_str() {
+                "mail" => "email",
+                "calendar" => "calendar event",
+                "contacts" => "contact",
+                "todo" => "task",
+                "onenote" => "OneNote page",
+                _ => "item",
             };
             Ok(PendingOperationPreview::destructive(format!(
-                "Run backup for account {account} ({scope})"
+                "Restore this archived {item} to Microsoft 365"
             )))
         }
-        isyncyou_agent::ToolAction::RestoreCloud {
-            account,
-            service,
-            id,
-        } => {
-            validate_service("restore-cloud", service, RESTORE_CLOUD_SERVICES)?;
-            Ok(PendingOperationPreview::destructive(format!(
-                "Restore archived {service} item {id} to Microsoft 365 for account {account}"
-            )))
-        }
-        isyncyou_agent::ToolAction::LiveWrite {
-            account, service, ..
-        } => {
+        isyncyou_agent::ToolAction::LiveWrite { .. } => {
             let intent = validate_live_write_action(action)?;
-            let verb = intent.verb();
-            let target = intent.target_label();
-            Ok(PendingOperationPreview::destructive(format!(
-                "Apply {service} {verb} to {target} for account {}",
-                redact_agent_operation_text(account)
-            )))
+            Ok(PendingOperationPreview::destructive(
+                intent.confirmation_copy().to_string(),
+            ))
         }
-        isyncyou_agent::ToolAction::Share { account, id, .. } => {
+        isyncyou_agent::ToolAction::Share { .. } => {
             let intent = validate_share_action(action)?;
             match intent {
-                AgentShareIntent::Invite { recipients, .. } => Ok(
-                    PendingOperationPreview::destructive(format!(
-                        "Invite {} recipient(s) to OneDrive item {id} for account {account}",
-                        recipients.len()
-                    )),
-                ),
-                AgentShareIntent::Link { link_type, scope } => Ok(
-                    PendingOperationPreview::destructive(format!(
-                        "Create {scope} {link_type} sharing link for OneDrive item {id} for account {account}"
-                    )),
-                ),
+                AgentShareIntent::Invite { recipients, role } => {
+                    let count = recipients.len();
+                    let access = if role == "write" { "edit" } else { "view" };
+                    Ok(PendingOperationPreview::destructive(format!(
+                        "Give {count} {} {access} access to this OneDrive item",
+                        if count == 1 {
+                            "recipient"
+                        } else {
+                            "recipients"
+                        }
+                    )))
+                }
+                AgentShareIntent::Link { link_type, scope } => {
+                    let access = match link_type.as_str() {
+                        "edit" => "edit",
+                        "embed" => "embedded-view",
+                        _ => "view-only",
+                    };
+                    let copy = match scope.as_str() {
+                        "anonymous" => {
+                            format!("Create a public {access} link for this OneDrive item")
+                        }
+                        "organization" => format!(
+                            "Create an organization-wide {access} link for this OneDrive item"
+                        ),
+                        "users" => format!(
+                            "Create a {access} link for specific people to this OneDrive item"
+                        ),
+                        _ => format!("Create a restricted {access} link for this OneDrive item"),
+                    };
+                    Ok(PendingOperationPreview::destructive(copy))
+                }
             }
         }
         isyncyou_agent::ToolAction::Search { .. }
@@ -1588,8 +1652,58 @@ where
                 account,
                 service,
                 id,
-            } => self.restore_local(account, service, id),
+            } => self.restore_local(account, service, id, None, None),
             _ => self.delegate.execute_read(action),
+        }
+    }
+
+    fn execute_read_bound(
+        &self,
+        action: &isyncyou_agent::ToolAction,
+        binding: &isyncyou_agent::ReadExecutionBinding,
+    ) -> Result<String, isyncyou_agent::AgentError> {
+        match action {
+            isyncyou_agent::ToolAction::RestoreLocal {
+                account,
+                service,
+                id,
+            } => self.restore_local(account, service, id, Some(binding), None),
+            _ => self.delegate.execute_read_bound(action, binding),
+        }
+    }
+
+    fn prepare_read_effect(
+        &self,
+        action: &isyncyou_agent::ToolAction,
+        binding: &isyncyou_agent::ReadExecutionBinding,
+    ) -> Result<Option<isyncyou_agent::LocalEffectCheckpointV1>, isyncyou_agent::AgentError> {
+        match action {
+            isyncyou_agent::ToolAction::RestoreLocal {
+                account,
+                service,
+                id,
+            } => self
+                .planned_local_effect(account, service, id, binding)
+                .map(Some),
+            _ => self.delegate.prepare_read_effect(action, binding),
+        }
+    }
+
+    fn execute_read_prepared(
+        &self,
+        action: &isyncyou_agent::ToolAction,
+        binding: &isyncyou_agent::ReadExecutionBinding,
+        local_effect: Option<&isyncyou_agent::LocalEffectCheckpointV1>,
+    ) -> Result<String, isyncyou_agent::AgentError> {
+        match action {
+            isyncyou_agent::ToolAction::RestoreLocal {
+                account,
+                service,
+                id,
+            } => self.restore_local(account, service, id, Some(binding), local_effect),
+            _ => self
+                .delegate
+                .execute_read_prepared(action, binding, local_effect),
         }
     }
 
@@ -1619,6 +1733,8 @@ where
         account: &str,
         service: &str,
         id: &str,
+        binding: Option<&isyncyou_agent::ReadExecutionBinding>,
+        local_effect: Option<&isyncyou_agent::LocalEffectCheckpointV1>,
     ) -> Result<String, isyncyou_agent::AgentError> {
         if account != self.source.account() {
             return Err(isyncyou_agent::AgentError::ToolArgs(format!(
@@ -1638,11 +1754,38 @@ where
         ensure_under_root(&self.restore_root, &service_dir)?;
 
         let file_name = restore_file_name(&item.name, &item.id);
-        let path = allocate_restore_path(&service_dir, &file_name)?;
+        let path = binding.map_or_else(
+            || allocate_restore_path(&service_dir, &file_name),
+            |binding| {
+                Ok(deterministic_restore_path(
+                    &service_dir,
+                    &file_name,
+                    service,
+                    id,
+                    binding,
+                ))
+            },
+        )?;
+        if let Some(binding) = binding {
+            let planned = self.planned_local_effect(account, service, id, binding)?;
+            if local_effect.is_some_and(|checkpoint| {
+                checkpoint.relative_path != planned.relative_path
+                    || checkpoint.source_sha256 != planned.source_sha256
+                    || checkpoint.expected_file_sha256 != planned.expected_file_sha256
+            }) {
+                return Err(isyncyou_agent::AgentError::Provider(
+                    "outcome_unknown".into(),
+                ));
+            }
+        }
         ensure_under_root(&self.restore_root, path.parent().unwrap_or(&service_dir))?;
-        write_owner_only_atomic(&path, &bytes).map_err(|e| {
-            isyncyou_agent::AgentError::Provider(format!("restore-local write: {e}"))
-        })?;
+        if path.exists() {
+            adopt_matching_owner_only_file(&path, &bytes)?;
+        } else {
+            write_owner_only_atomic(&path, &bytes).map_err(|e| {
+                isyncyou_agent::AgentError::Provider(format!("restore-local write: {e}"))
+            })?;
+        }
 
         Ok(serde_json::json!({
             "service": item.service,
@@ -1657,6 +1800,46 @@ where
             }
         })
         .to_string())
+    }
+
+    fn planned_local_effect(
+        &self,
+        account: &str,
+        service: &str,
+        id: &str,
+        binding: &isyncyou_agent::ReadExecutionBinding,
+    ) -> Result<isyncyou_agent::LocalEffectCheckpointV1, isyncyou_agent::AgentError> {
+        if account != self.source.account() {
+            return Err(isyncyou_agent::AgentError::ToolArgs(
+                "account mismatch".into(),
+            ));
+        }
+        let item = self
+            .source
+            .get(service, id)?
+            .ok_or_else(|| isyncyou_agent::AgentError::ToolArgs("item not found".into()))?;
+        let bytes = self.source.read_body(service, id)?;
+        let service_dir = self.restore_root.join(safe_path_segment(service));
+        let path = deterministic_restore_path(
+            &service_dir,
+            &restore_file_name(&item.name, &item.id),
+            service,
+            id,
+            binding,
+        );
+        let relative_path = path
+            .strip_prefix(&self.restore_root)
+            .map_err(|_| isyncyou_agent::AgentError::Provider("outcome_unknown".into()))?
+            .to_str()
+            .ok_or_else(|| isyncyou_agent::AgentError::Provider("outcome_unknown".into()))?
+            .to_owned();
+        let digest = content_sha256(&bytes);
+        Ok(isyncyou_agent::LocalEffectCheckpointV1 {
+            relative_path,
+            source_sha256: digest.clone(),
+            expected_file_sha256: digest,
+            state: isyncyou_agent::LocalEffectState::Planned,
+        })
     }
 }
 
@@ -1708,6 +1891,83 @@ fn restore_file_name(name: &str, id: &str) -> String {
     } else {
         safe_name
     }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn deterministic_restore_path(
+    dir: &Path,
+    file_name: &str,
+    service: &str,
+    source_item_id: &str,
+    binding: &isyncyou_agent::ReadExecutionBinding,
+) -> PathBuf {
+    let mut material = Vec::new();
+    material.extend_from_slice(b"isyncyou-restore-local-v1");
+    for value in [
+        binding.session_id.as_str(),
+        binding.request_id.as_str(),
+        binding.tool_use_id.as_str(),
+        service,
+        source_item_id,
+    ] {
+        material.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        material.extend_from_slice(value.as_bytes());
+    }
+    let digest = ring::digest::digest(&ring::digest::SHA256, &material);
+    let stem = digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let (_, extension) = split_extension(file_name);
+    let extension = if extension.len() <= 17 {
+        extension
+    } else {
+        String::new()
+    };
+    dir.join(format!("{stem}{extension}"))
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn content_sha256(bytes: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, bytes)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn adopt_matching_owner_only_file(
+    path: &Path,
+    expected: &[u8],
+) -> Result<(), isyncyou_agent::AgentError> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| isyncyou_agent::AgentError::Provider("outcome_unknown".into()))?;
+    if !metadata.file_type().is_file() || std::fs::read(path).ok().as_deref() != Some(expected) {
+        return Err(isyncyou_agent::AgentError::Provider(
+            "outcome_unknown".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            return Err(isyncyou_agent::AgentError::Provider(
+                "outcome_unknown".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(any(
@@ -2677,11 +2937,40 @@ mod tests {
         let run = run_recorded_live_write(&action, &runtime);
         let text = format!("{} {}", preview.text, run.summary);
 
-        assert!(preview.text.contains("create_draft"));
+        assert_eq!(preview.text, "Create an email draft");
+        assert!(!preview.text.contains("owner@example.com"));
+        assert!(!preview.text.contains("live-write"));
+        assert!(!preview.text.contains("create_draft"));
         assert!(!text.contains("raw-body-sentinel"));
         assert!(!text.contains("recipient@example.com"));
         assert!(!text.contains("private subject"));
-        assert!(text.contains("<redacted-email>"));
+        for internal in ["live-write", "create_draft", "owner@example.com"] {
+            assert!(!preview.text.contains(internal));
+        }
+    }
+
+    #[test]
+    fn agent_live_write_confirmation_uses_plain_language_without_internal_fields() {
+        for (is_read, expected) in [
+            (true, "Mark this email as read"),
+            (false, "Mark this email as unread"),
+        ] {
+            let action = isyncyou_agent::parse_action(&json!({
+                "op": "live-write",
+                "account": "me",
+                "service": "mail",
+                "target": "private-item-id",
+                "change": { "verb": "set_read", "is_read": is_read }
+            }))
+            .unwrap();
+
+            let preview = preview_for_pending_action(&action).unwrap();
+
+            assert_eq!(preview.text, expected);
+            for internal in ["live-write", "set_read", "account", "private-item-id"] {
+                assert!(!preview.text.contains(internal));
+            }
+        }
     }
 
     #[test]
@@ -2713,8 +3002,13 @@ mod tests {
 
         let preview = preview_for_pending_action(&action).unwrap();
 
-        assert!(preview.text.contains("Invite 1 recipient"));
+        assert_eq!(
+            preview.text,
+            "Give 1 recipient view access to this OneDrive item"
+        );
         assert!(!preview.text.contains("recipient@example.com"));
+        assert!(!preview.text.contains("file-1"));
+        assert!(!preview.text.contains("account"));
         assert_eq!(preview.risk, "destructive");
     }
 
@@ -2769,7 +3063,12 @@ mod tests {
 
         let preview = preview_for_pending_action(&action).unwrap();
 
-        assert!(preview.text.contains("organization edit sharing link"));
+        assert_eq!(
+            preview.text,
+            "Create an organization-wide edit link for this OneDrive item"
+        );
+        assert!(!preview.text.contains("item-1"));
+        assert!(!preview.text.contains("account"));
         assert_eq!(preview.risk, "destructive");
     }
 
@@ -2868,7 +3167,10 @@ mod tests {
         let gate = Arc::new(Mutex::new(()));
         let run = run_share_with_runtime(&Config::default(), &action, &gate, &runtime).unwrap();
 
-        assert!(preview.text.contains("Invite 1 recipient"));
+        assert_eq!(
+            preview.text,
+            "Give 1 recipient view access to this OneDrive item"
+        );
         assert!(!preview.text.contains("recipient@example.com"));
         assert_eq!(run.recipient_count, 1);
         assert!(!run.summary.contains("recipient@example.com"));
@@ -2915,6 +3217,28 @@ mod tests {
         assert_eq!(state.recorded.len(), 1);
         assert_eq!(state.recorded[0].0, "ok");
         assert!(state.recorded[0].1.contains("mail:"));
+    }
+
+    #[test]
+    fn agent_backup_failure_records_only_closed_summary() {
+        let sensitive = "refresh failed for user@example.invalid at https://provider.invalid/token";
+        let runtime = RecordingBackupRuntime::failing_read(sensitive);
+        let gate = Arc::new(Mutex::new(()));
+
+        let error = run_backup_account_with_runtime(
+            &Config::default(),
+            "private-alias",
+            &gate,
+            &[],
+            &runtime,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, sensitive);
+        assert_eq!(
+            runtime.state().recorded,
+            vec![("error".to_string(), "backup failed".to_string())]
+        );
     }
 
     #[test]

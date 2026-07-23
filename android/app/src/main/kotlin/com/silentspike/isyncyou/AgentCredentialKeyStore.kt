@@ -64,7 +64,7 @@ object AgentCredentialKeyStore {
                 Result(data, true, evidence)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "agent credential storage setup failed; local data was not opened", e)
+            Log.e(TAG, "agent_credential_storage_setup_failed")
             throw EncryptedStorageSetupException("Agent credential storage setup failed", e)
         }
     }

@@ -25,10 +25,11 @@ scan_binary() {
 verify_feature_matrix() {
   cd "$ROOT"
   cargo metadata --no-deps --format-version 1 >"$TMP_ROOT/metadata.json"
+  # This toolchain emits no tree when cargo writes directly to a regular file.
   cargo tree -p isyncyou-daemon -e normal -f '{p} features={f}' \
-    >"$TMP_ROOT/default-tree.txt"
+    | cat >"$TMP_ROOT/default-tree.txt"
   cargo tree -p isyncyou-daemon --features agent-subscription-experimental \
-    -e normal -f '{p} features={f}' >"$TMP_ROOT/experimental-tree.txt"
+    -e normal -f '{p} features={f}' | cat >"$TMP_ROOT/experimental-tree.txt"
 
   if rg -q 'agent-subscription-experimental' "$TMP_ROOT/default-tree.txt"; then
     die "default daemon resolves the experimental feature"
@@ -61,10 +62,13 @@ verify_feature_matrix() {
 
 verify_release_exclusion() {
   cd "$ROOT"
-  cargo remote -c -- build --release -p isyncyou-daemon
+  mkdir -p target/release
+  cargo remote --no-copy-lock -d 1.95.0 -c release/isyncyoud -- \
+    build --locked --release -p isyncyou-daemon
   [[ -x target/release/isyncyoud ]] || die "release daemon is unavailable"
   scan_binary target/release/isyncyoud
 
+  env -u ISY_CARGO_FEATURES tools/build-android-native.sh
   (cd android && env -u ISY_CARGO_FEATURES ./gradlew clean :app:assembleDebug)
   local apk=android/app/build/outputs/apk/debug/app-debug.apk
   [[ -f "$apk" ]] || die "default debug APK is unavailable"

@@ -21,6 +21,10 @@ serde_json = { workspace = true }
 serde = { workspace = true }
 base64 = "0.22"
 ring = "0.17"
+rusqlite = { workspace = true }
+libc = "0.2"
+fs2 = "0.4"
+zeroize = "1"
 
 [dev-dependencies]
 filetime = "0.2"
@@ -49,6 +53,7 @@ plain-store = [
 # part of this feature.
 agent-oauth-providers = [
     "isyncyou-agent/agent-oauth-providers",
+    "isyncyou-agent/onedrive",
     "isyncyou-agent/retrieval",
 ]
 # EXPERIMENTAL, default-OFF, personal-build only (risk R8/#627): local CLI

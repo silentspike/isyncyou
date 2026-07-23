@@ -315,9 +315,12 @@ mod live {
 
     /// Compiled policy for product provider traffic. Callers cannot override these values.
     pub const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-    pub const PROVIDER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
-    pub const PROVIDER_SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+    pub const PROVIDER_CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+    pub const PROVIDER_STREAM_START_TIMEOUT: Duration = Duration::from_secs(180);
+    pub const PROVIDER_SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(240);
     pub const PROVIDER_TURN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+    pub const PREFLIGHT_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+    pub const PREFLIGHT_NETWORK_TIMEOUT: Duration = Duration::from_secs(10);
     pub const PREFLIGHT_TOTAL_TIMEOUT: Duration = Duration::from_secs(12);
 
     /// A minimal blocking JSON-over-HTTPS client (reqwest + rustls). Providers build
@@ -339,8 +342,8 @@ mod live {
                     AgentError::Transport("provider_transport_initialization_failed".into())
                 })?;
             let probe_client = reqwest::blocking::Client::builder()
-                .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
-                .timeout(PREFLIGHT_TOTAL_TIMEOUT)
+                .connect_timeout(PREFLIGHT_CONNECT_TIMEOUT)
+                .timeout(PREFLIGHT_NETWORK_TIMEOUT)
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|_| {
@@ -388,8 +391,33 @@ mod live {
         /// Run one unauthenticated, no-redirect provider reachability probe. The target
         /// table is closed and neither the URL nor raw reqwest error leaves this module.
         pub fn probe(&self, target: ProbeTarget) -> Result<ProbeObservation, AgentError> {
+            self.probe_with_timeout(target, PREFLIGHT_NETWORK_TIMEOUT)
+        }
+
+        /// Include one-time transport initialization in the public preflight budget.
+        /// The shorter network deadline leaves room for routing and bridge framing.
+        pub fn probe_shared(target: ProbeTarget) -> Result<ProbeObservation, AgentError> {
+            let started = std::time::Instant::now();
+            let transport = Self::shared()?;
+            let Some(remaining) = PREFLIGHT_TOTAL_TIMEOUT.checked_sub(started.elapsed()) else {
+                return Ok(ProbeObservation::ConnectTimedOut);
+            };
+            transport.probe_with_timeout(target, remaining.min(PREFLIGHT_NETWORK_TIMEOUT))
+        }
+
+        fn probe_with_timeout(
+            &self,
+            target: ProbeTarget,
+            timeout: Duration,
+        ) -> Result<ProbeObservation, AgentError> {
             Self::ensure_test_network_allowed()?;
-            let mut request = self.probe_client.get(probe_target_url(target));
+            if timeout.is_zero() {
+                return Ok(ProbeObservation::ConnectTimedOut);
+            }
+            let mut request = self
+                .probe_client
+                .request(probe_request_method(), probe_target_url(target))
+                .timeout(timeout);
             for (name, value) in probe_request_headers() {
                 request = request.header(name, value);
             }
@@ -455,7 +483,7 @@ mod live {
             let mut req = self
                 .client
                 .post(url)
-                .timeout(PROVIDER_RESPONSE_TIMEOUT)
+                .timeout(PROVIDER_CONTROL_RESPONSE_TIMEOUT)
                 .json(body);
             for (k, v) in headers {
                 req = req.header(k.as_str(), v.as_str());
@@ -468,12 +496,24 @@ mod live {
             Ok((status, text))
         }
 
+        #[cfg(test)]
         pub(super) fn post_json_sse(
             &self,
             url: &str,
             headers: &[(String, String)],
             body: &serde_json::Value,
             on_event: &mut dyn FnMut(SseEvent) -> bool,
+        ) -> Result<ProviderHttpResponse, AgentError> {
+            self.post_json_sse_cancellable(url, headers, body, on_event, None)
+        }
+
+        pub(super) fn post_json_sse_cancellable(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            body: &serde_json::Value,
+            on_event: &mut dyn FnMut(SseEvent) -> bool,
+            cancellation: Option<&crate::CancellationToken>,
         ) -> Result<ProviderHttpResponse, AgentError> {
             Self::ensure_test_network_allowed()?;
             let mut req = self.sse_client.post(url).json(body);
@@ -483,12 +523,16 @@ mod live {
             self.sse_runtime.block_on(async {
                 let started_at = tokio::time::Instant::now();
                 let deadline = started_at + PROVIDER_TURN_TIMEOUT;
-                let first_event_deadline = started_at + PROVIDER_RESPONSE_TIMEOUT;
-                let response =
-                    within_deadline(first_event_deadline, PROVIDER_RESPONSE_TIMEOUT, req.send())
-                        .await
-                        .map_err(|_| provider_timeout("provider_response_timed_out"))?
-                        .map_err(safe_reqwest_transport_error)?;
+                let first_event_deadline = started_at + PROVIDER_STREAM_START_TIMEOUT;
+                let response = within_deadline_cancellable(
+                    first_event_deadline,
+                    PROVIDER_STREAM_START_TIMEOUT,
+                    cancellation,
+                    req.send(),
+                )
+                .await
+                .map_err(|failure| provider_wait_error(failure, "provider_response_timed_out"))?
+                .map_err(safe_reqwest_transport_error)?;
                 let status = response.status().as_u16();
                 let headers = filter_provider_header_pairs(
                     response
@@ -497,7 +541,8 @@ mod live {
                         .filter_map(|(k, v)| v.to_str().ok().map(|value| (k.as_str(), value))),
                 );
                 if !(200..=299).contains(&status) {
-                    let body_preview = read_body_preview_async(response, deadline).await?;
+                    let body_preview =
+                        read_body_preview_async(response, deadline, cancellation).await?;
                     return Ok(ProviderHttpResponse {
                         status,
                         headers,
@@ -512,9 +557,14 @@ mod live {
                 loop {
                     let phase_deadline = deadline.min(event_deadline);
                     let (phase_timeout, timeout_code) = provider_stream_wait_policy(saw_progress);
-                    let next = within_deadline(phase_deadline, phase_timeout, stream.next())
-                        .await
-                        .map_err(|_| provider_timeout(timeout_code))?;
+                    let next = within_deadline_cancellable(
+                        phase_deadline,
+                        phase_timeout,
+                        cancellation,
+                        stream.next(),
+                    )
+                    .await
+                    .map_err(|failure| provider_wait_error(failure, timeout_code))?;
                     let Some(chunk) = next else {
                         break;
                     };
@@ -558,7 +608,7 @@ mod live {
             let resp = self
                 .client
                 .post(url)
-                .timeout(PROVIDER_RESPONSE_TIMEOUT)
+                .timeout(PROVIDER_CONTROL_RESPONSE_TIMEOUT)
                 .form(form)
                 .send()
                 .map_err(safe_reqwest_transport_error)?;
@@ -618,13 +668,19 @@ mod live {
             })
         }
 
-        pub(crate) fn post_attested_sse(
+        pub(crate) fn post_attested_sse_cancellable(
             &self,
             request: &crate::provider::AttestedProviderRequest,
             on_event: &mut dyn FnMut(SseEvent) -> bool,
+            cancellation: Option<&crate::CancellationToken>,
         ) -> Result<ProviderHttpResponse, AgentError> {
-            self.inner
-                .post_json_sse(request.url(), request.headers(), request.body(), on_event)
+            self.inner.post_json_sse_cancellable(
+                request.url(),
+                request.headers(),
+                request.body(),
+                on_event,
+                cancellation,
+            )
         }
     }
 
@@ -641,6 +697,10 @@ mod live {
 
     pub(super) fn probe_request_headers() -> [(&'static str, &'static str); 1] {
         [("accept", "application/json")]
+    }
+
+    pub(super) fn probe_request_method() -> reqwest::Method {
+        reqwest::Method::HEAD
     }
 
     fn async_sse_client_builder() -> reqwest::ClientBuilder {
@@ -714,6 +774,7 @@ mod live {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn within_deadline<T>(
         deadline: tokio::time::Instant,
         limit: Duration,
@@ -728,6 +789,46 @@ mod live {
         tokio::time::timeout(timeout, future).await.map_err(|_| ())
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ProviderWaitError {
+        TimedOut,
+        Cancelled,
+    }
+
+    pub(super) async fn within_deadline_cancellable<T>(
+        deadline: tokio::time::Instant,
+        limit: Duration,
+        cancellation: Option<&crate::CancellationToken>,
+        future: impl std::future::Future<Output = T>,
+    ) -> Result<T, ProviderWaitError> {
+        let started = tokio::time::Instant::now();
+        let effective_deadline = deadline.min(started + limit);
+        tokio::pin!(future);
+        loop {
+            if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+                return Err(ProviderWaitError::Cancelled);
+            }
+            let now = tokio::time::Instant::now();
+            if now >= effective_deadline {
+                return Err(ProviderWaitError::TimedOut);
+            }
+            let poll = effective_deadline
+                .duration_since(now)
+                .min(Duration::from_millis(50));
+            match tokio::time::timeout(poll, &mut future).await {
+                Ok(value) => return Ok(value),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    fn provider_wait_error(failure: ProviderWaitError, timeout_code: &'static str) -> AgentError {
+        match failure {
+            ProviderWaitError::TimedOut => provider_timeout(timeout_code),
+            ProviderWaitError::Cancelled => AgentError::Cancelled,
+        }
+    }
+
     fn provider_timeout(code: &'static str) -> AgentError {
         AgentError::Transport(code.into())
     }
@@ -736,21 +837,27 @@ mod live {
         if saw_event {
             (PROVIDER_SSE_IDLE_TIMEOUT, "provider_stream_idle_timed_out")
         } else {
-            (PROVIDER_RESPONSE_TIMEOUT, "provider_response_timed_out")
+            (PROVIDER_STREAM_START_TIMEOUT, "provider_response_timed_out")
         }
     }
 
     async fn read_body_preview_async(
         response: reqwest::Response,
         deadline: tokio::time::Instant,
+        cancellation: Option<&crate::CancellationToken>,
     ) -> Result<Option<String>, AgentError> {
         let mut stream = response.bytes_stream();
         let mut bytes = Vec::with_capacity(MAX_PROVIDER_BODY_PREVIEW_BYTES);
         let mut truncated = false;
         loop {
-            let next = within_deadline(deadline, PROVIDER_SSE_IDLE_TIMEOUT, stream.next())
-                .await
-                .map_err(|_| provider_timeout("provider_stream_idle_timed_out"))?;
+            let next = within_deadline_cancellable(
+                deadline,
+                PROVIDER_SSE_IDLE_TIMEOUT,
+                cancellation,
+                stream.next(),
+            )
+            .await
+            .map_err(|failure| provider_wait_error(failure, "provider_stream_idle_timed_out"))?;
             let Some(chunk) = next else {
                 break;
             };
@@ -953,10 +1060,12 @@ mod tests {
     #[test]
     fn provider_transport_timeout_policy_has_distinct_response_idle_and_turn_bounds() {
         assert_eq!(live::PROVIDER_CONNECT_TIMEOUT.as_secs(), 10);
-        assert_eq!(live::PROVIDER_RESPONSE_TIMEOUT.as_secs(), 60);
-        assert_eq!(live::PROVIDER_SSE_IDLE_TIMEOUT.as_secs(), 120);
+        assert_eq!(live::PROVIDER_CONTROL_RESPONSE_TIMEOUT.as_secs(), 60);
+        assert_eq!(live::PROVIDER_STREAM_START_TIMEOUT.as_secs(), 180);
+        assert_eq!(live::PROVIDER_SSE_IDLE_TIMEOUT.as_secs(), 240);
         assert_eq!(live::PROVIDER_TURN_TIMEOUT.as_secs(), 20 * 60);
-        assert!(live::PROVIDER_RESPONSE_TIMEOUT < live::PROVIDER_SSE_IDLE_TIMEOUT);
+        assert!(live::PROVIDER_CONTROL_RESPONSE_TIMEOUT < live::PROVIDER_STREAM_START_TIMEOUT);
+        assert!(live::PROVIDER_STREAM_START_TIMEOUT < live::PROVIDER_SSE_IDLE_TIMEOUT);
         assert!(live::PROVIDER_SSE_IDLE_TIMEOUT < live::PROVIDER_TURN_TIMEOUT);
     }
 
@@ -1014,7 +1123,7 @@ mod tests {
         assert_eq!(
             live::provider_stream_wait_policy(false),
             (
-                live::PROVIDER_RESPONSE_TIMEOUT,
+                live::PROVIDER_STREAM_START_TIMEOUT,
                 "provider_response_timed_out"
             )
         );
@@ -1048,12 +1157,46 @@ mod tests {
 
     #[cfg(feature = "http")]
     #[test]
+    fn provider_transport_cancellation_interrupts_pending_wait() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let cancellation = crate::CancellationToken::default();
+        let cancel_from_thread = cancellation.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cancel_from_thread.cancel();
+        });
+        let started = std::time::Instant::now();
+        let result = runtime.block_on(live::within_deadline_cancellable(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(10),
+            Some(&cancellation),
+            std::future::pending::<()>(),
+        ));
+        canceller.join().unwrap();
+        assert_eq!(result, Err(live::ProviderWaitError::Cancelled));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
     fn preflight_transport_never_sends_authorization_or_cookie() {
         for (name, _) in live::probe_request_headers() {
             let name = name.to_ascii_lowercase();
             assert_ne!(name, "authorization");
             assert_ne!(name, "cookie");
         }
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn connectivity_preflight_reserves_bridge_budget_and_uses_head() {
+        assert_eq!(live::probe_request_method(), reqwest::Method::HEAD);
+        assert!(live::PREFLIGHT_CONNECT_TIMEOUT < live::PREFLIGHT_NETWORK_TIMEOUT);
+        assert!(live::PREFLIGHT_NETWORK_TIMEOUT < live::PREFLIGHT_TOTAL_TIMEOUT);
+        assert!(live::PREFLIGHT_TOTAL_TIMEOUT < std::time::Duration::from_secs(15));
     }
 
     #[cfg(feature = "http")]

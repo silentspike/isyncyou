@@ -1,3 +1,4 @@
+import java.security.MessageDigest
 import java.util.Properties
 
 plugins {
@@ -94,8 +95,8 @@ val requestedCargoTestFeatures = System.getenv("ISY_CARGO_FEATURES")
 android {
     namespace = "com.silentspike.isyncyou"
     compileSdk = 34
-    // Single source of truth for the NDK; cargoNdkBuild references android.ndkVersion.
-    // AGP fetches/validates this exact NDK, so the cross-compile is reproducible.
+    // Single source of truth for the NDK used by the separate native build step.
+    // Gradle never invokes Cargo or rustc; it only packages a validated artifact.
     ndkVersion = System.getenv("ISY_NDK_VERSION") ?: "27.3.13750724"
 
     defaultConfig {
@@ -168,30 +169,93 @@ dependencies {
     androidTestImplementation("androidx.test:runner:1.6.2")
 }
 
-// #89: build the embedded Rust engine (libisyncyou_mobile.so) with cargo-ndk into
-// app/src/main/jniLibs before assembling the APK. The Rust workspace is the parent
-// of android/. The cargo binary, MSRV toolchain and NDK are overridable via env for
-// CI reproducibility; defaults match the documented local setup (cargo via rustup so
-// `+1.95.0` resolves, NDK r27d pinned by android.ndkVersion above).
-val cargoNdkBuild by tasks.registering(Exec::class) {
-    workingDir = rootProject.projectDir.parentFile
-    val home = System.getProperty("user.home")
-    val cargo = System.getenv("CARGO") ?: "$home/.cargo/bin/cargo"
-    val toolchain = System.getenv("ISY_RUST_TOOLCHAIN") ?: "1.95.0"
-    environment("ANDROID_NDK_HOME", "${android.sdkDirectory}/ndk/${android.ndkVersion}")
-    // One -t per ABI; cargo-ndk maps arm64-v8a -> aarch64-linux-android and
-    // x86_64 -> x86_64-linux-android, building each requested target's .so.
-    val targetFlags = androidAbis.flatMap { listOf("-t", it) }
-    // Only the validated JNI/device evidence hooks above may be forwarded. The #623
-    // product app-OAuth runtime is in the mobile default feature set; #627 is desktop-only.
-    val featureFlags = if (requestedCargoTestFeatures.isNotEmpty()) {
-        listOf("--features", requestedCargoTestFeatures.joinToString(","))
-    } else {
-        emptyList()
+fun sha256(file: File): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    file.inputStream().buffered().use { input ->
+        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            digest.update(buffer, 0, count)
+        }
     }
-    commandLine(
-        listOf(cargo, "+$toolchain", "ndk") + targetFlags +
-            listOf("-o", "android/app/src/main/jniLibs", "build", "-p", "isyncyou-mobile", "--release") + featureFlags,
-    )
+    return digest.digest().joinToString("") { "%02x".format(it) }
 }
-tasks.named("preBuild") { dependsOn(cargoNdkBuild) }
+
+fun gitOutput(vararg args: String): String {
+    val process = ProcessBuilder(listOf("git") + args)
+        .directory(rootProject.projectDir.parentFile)
+        .redirectErrorStream(true)
+        .start()
+    val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
+    if (process.waitFor() != 0) {
+        throw GradleException("Unable to validate the remote native artifact against Git: $output")
+    }
+    return output
+}
+
+// Rust compilation is deliberately outside Gradle. Local builds use
+// tools/build-android-native.sh, whose default backend is cargo remote; GitHub Actions
+// may opt into its runner-only backend. This task fails closed on missing, stale, or
+// mismatched native output and never starts Cargo or rustc itself.
+val validateRemoteNativeArtifact by tasks.registering {
+    val nativeDir = file("src/main/jniLibs")
+    val manifestFile = nativeDir.resolve("isyncyou-native.properties")
+    inputs.files(manifestFile, androidAbis.map { nativeDir.resolve("$it/libisyncyou_mobile.so") })
+
+    doLast {
+        if (!manifestFile.isFile) {
+            throw GradleException(
+                "Remote native artifact is missing. Run tools/build-android-native.sh from the repository root.",
+            )
+        }
+
+        val nativeInputs = listOf("Cargo.toml", "Cargo.lock", "crates", "gui/webui")
+        val dirtyInputs = gitOutput("status", "--porcelain", "--untracked-files=all", "--", *nativeInputs.toTypedArray())
+        if (dirtyInputs.isNotEmpty()) {
+            throw GradleException(
+                "Rust/WebUI inputs changed after the native artifact boundary. Commit them, then rebuild with " +
+                    "tools/build-android-native.sh.",
+            )
+        }
+
+        val manifest = Properties().apply {
+            manifestFile.inputStream().use { load(it) }
+        }
+        val expectedCommit = gitOutput("rev-parse", "HEAD")
+        val expectedAbis = androidAbis.sorted().joinToString(",")
+        val expectedFeatures = requestedCargoTestFeatures.sorted().joinToString(",")
+        val expectedNdk = android.ndkVersion
+
+        val bindings = mapOf(
+            "schema" to "1",
+            "source_commit" to expectedCommit,
+            "abis" to expectedAbis,
+            "features" to expectedFeatures,
+            "ndk_version" to expectedNdk,
+        )
+        bindings.forEach { (key, expected) ->
+            val actual = manifest.getProperty(key)
+            if (actual != expected) {
+                throw GradleException(
+                    "Remote native artifact binding '$key' is '$actual', expected '$expected'. " +
+                        "Rebuild it with tools/build-android-native.sh.",
+                )
+            }
+        }
+
+        androidAbis.forEach { abi ->
+            val library = nativeDir.resolve("$abi/libisyncyou_mobile.so")
+            if (!library.isFile || library.length() == 0L) {
+                throw GradleException("Remote native library is missing or empty for ABI '$abi'.")
+            }
+            val expectedHash = manifest.getProperty("sha256.$abi")
+            val actualHash = sha256(library)
+            if (expectedHash == null || !actualHash.equals(expectedHash, ignoreCase = true)) {
+                throw GradleException("Remote native library hash mismatch for ABI '$abi'.")
+            }
+        }
+    }
+}
+
+tasks.named("preBuild") { dependsOn(validateRemoteNativeArtifact) }

@@ -99,3 +99,50 @@ mod tests {
     assert!(production.contains(".claude/.credentials.json"));
     assert!(!production.contains(".codex/auth.json"));
 }
+
+#[test]
+fn product_agent_feature_enables_onedrive_session_transport() {
+    let cargo = read_repo("crates/app-host/Cargo.toml");
+    let feature = cargo
+        .split("agent-oauth-providers = [")
+        .nth(1)
+        .expect("product Agent feature")
+        .split(']')
+        .next()
+        .expect("closed feature list");
+    assert!(feature.contains("isyncyou-agent/onedrive"));
+}
+
+#[test]
+fn product_session_never_uses_offline_unleased_append() {
+    for path in [
+        "crates/app-host/src/lib.rs",
+        "crates/app-host/src/product_session.rs",
+    ] {
+        let source = read_repo(path);
+        assert!(
+            !source.contains("append_offline"),
+            "forbidden offline write in {path}"
+        );
+        assert!(
+            !source.contains("OfflineUnleased"),
+            "forbidden offline mode in {path}"
+        );
+    }
+}
+
+#[test]
+fn pairing_v1_is_not_exposed_as_short_lived_product_code() {
+    for path in ["gui/webui/src/app.js", "gui/webui/src/lib.rs"] {
+        let source = read_repo(path);
+        assert!(
+            !source.contains("PairingPayload"),
+            "legacy payload exposed in {path}"
+        );
+        assert!(
+            !source.contains("wire-v1"),
+            "legacy pairing wire exposed in {path}"
+        );
+    }
+    assert!(read_repo("crates/agent/src/pairing_v2.rs").contains("isy2."));
+}

@@ -15,9 +15,12 @@ isyncyou-store = { path = "../../crates/store", default-features = false }
 # MIME HTML extraction for the mail viewer (no `http` feature → no reqwest).
 isyncyou-connectors = { path = "../../crates/connectors", default-features = false }
 # Battle-tested allowlist HTML sanitizer for the mail viewer (MIT).
-ammonia = "4"
+ammonia = "4.1.4"
 # Decode base64 request bodies over the JSON bridge (#657 in-app upload/replace).
 base64 = "0.22"
+ring = "0.17"
+# Fixed-buffer HTTP/1 parsing for the loopback adapter.
+httparse = "1.10"
 
 [features]
 # Forward the store at-rest-encryption profile (default-on for desktop). The

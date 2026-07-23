@@ -34,6 +34,7 @@ isyncyou-connectors = { path = "../connectors", default-features = false, option
 # model + crypto (tested over an in-memory transport) stay light. The caller passes a
 # pre-resolved Files.ReadWrite token, so no engine dependency is needed here.
 isyncyou-graph = { path = "../graph", default-features = false, optional = true }
+time = { version = "0.3", features = ["parsing"], optional = true }
 # non-optional: the encrypted-store bounded reader (`get_bounded`, #639) needs `O_NOFOLLOW`
 # in the default product build, not only under the experimental feature. libc is already in
 # the workspace graph transitively; making it direct here is minimal.
@@ -52,7 +53,7 @@ required-features = ["agent-subscription-experimental"]
 
 [features]
 http = ["dep:reqwest", "dep:rustls", "dep:tokio", "dep:futures-util"]
-onedrive = ["dep:isyncyou-graph", "isyncyou-graph/http"]
+onedrive = ["dep:isyncyou-graph", "isyncyou-graph/http", "dep:time"]
 # Match the desktop encrypted profile so store's rusqlite bundling resolves and unifies
 # with the rest of the workspace (everyone on encrypted-store → no bundling conflict).
 retrieval = ["dep:isyncyou-store", "dep:isyncyou-core", "dep:isyncyou-connectors", "isyncyou-store/encrypted-store"]

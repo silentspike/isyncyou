@@ -780,22 +780,66 @@ impl LifecycleRepository {
         provider: ProductProviderId,
         generation: &str,
     ) -> Result<String, LifecycleRecordError> {
-        if !is_uuid_v4(generation) {
-            return Err(LifecycleRecordError::Invalid);
-        }
         let context = self
             .load_existing()?
             .ok_or(LifecycleRecordError::MissingInstallationPrincipal)?;
         let lifecycle_epoch = next_epoch(context.authority.lifecycle_epoch)?;
+        self.credential_etag_for_epoch(&context.principal, provider, generation, lifecycle_epoch)
+    }
+
+    fn credential_etag_for_epoch(
+        &self,
+        principal: &str,
+        provider: ProductProviderId,
+        generation: &str,
+        lifecycle_epoch: u64,
+    ) -> Result<String, LifecycleRecordError> {
+        if !is_uuid_v4(generation) {
+            return Err(LifecycleRecordError::Invalid);
+        }
         self.derive_tag(
             b"isyncyou/account-lifecycle-credential-etag/v1",
             &[
-                context.principal.as_bytes(),
+                principal.as_bytes(),
                 provider.wire().as_bytes(),
                 generation.as_bytes(),
                 &lifecycle_epoch.to_be_bytes(),
             ],
         )
+    }
+
+    /// Bind a pre-lifecycle active credential to the durable provider fence. Startup calls this
+    /// only after validating the encrypted bundle and matching product activation while holding
+    /// the provider-exclusive and product-runtime file locks.
+    pub(crate) fn bind_current_credential_generation(
+        &self,
+        provider: ProductProviderId,
+        generation: &str,
+    ) -> Result<String, LifecycleRecordError> {
+        if !is_uuid_v4(generation) {
+            return Err(LifecycleRecordError::Invalid);
+        }
+        let mut context = self
+            .load_existing()?
+            .ok_or(LifecycleRecordError::MissingInstallationPrincipal)?;
+        if context.authority.active_operations.contains_key(&provider) {
+            return Err(LifecycleRecordError::Busy);
+        }
+        if let Some(existing) = context.authority.current_credential_etags.get(&provider) {
+            return Ok(existing.clone());
+        }
+        let etag = self.credential_etag_for_epoch(
+            &context.principal,
+            provider,
+            generation,
+            context.authority.lifecycle_epoch,
+        )?;
+        context
+            .authority
+            .current_credential_etags
+            .insert(provider, etag.clone());
+        self.put_authority(&context.principal, &context.authority)?;
+        Ok(etag)
     }
 
     pub(crate) fn put_authority(
@@ -1209,14 +1253,11 @@ impl LifecycleRepository {
         )?;
         let credential_etag = generation
             .map(|generation| {
-                self.derive_tag(
-                    b"isyncyou/account-lifecycle-credential-etag/v1",
-                    &[
-                        context.principal.as_bytes(),
-                        provider.wire().as_bytes(),
-                        generation.as_bytes(),
-                        &lifecycle_epoch.to_be_bytes(),
-                    ],
+                self.credential_etag_for_epoch(
+                    &context.principal,
+                    provider,
+                    generation,
+                    lifecycle_epoch,
                 )
             })
             .transpose()?;
@@ -1912,6 +1953,16 @@ impl LifecycleRepository {
         {
             return Err(LifecycleRecordError::StaleFence);
         }
+        let result_credential_etag = result_generation
+            .map(|generation| {
+                self.credential_etag_for_epoch(
+                    &context.principal,
+                    journal.prepared.provider,
+                    generation,
+                    journal.prepared.lifecycle_epoch,
+                )
+            })
+            .transpose()?;
         let receipt = AccountLifecycleReceiptV1 {
             version: SCHEMA_VERSION,
             operation_id: journal.prepared.operation_id.clone(),
@@ -1972,6 +2023,12 @@ impl LifecycleRepository {
             self.put_receipt_index(&receipt_id, &index)?;
             receipt
         };
+        if let Some(etag) = result_credential_etag {
+            context
+                .authority
+                .current_credential_etags
+                .insert(journal.prepared.provider, etag);
+        }
         context
             .authority
             .active_operations
@@ -3679,10 +3736,26 @@ mod tests {
 
         repo.finish_oauth_operation(&terminal, Some(generation), "connected", 6_000)
             .unwrap();
-        assert!(repo
-            .active_operation(ProductProviderId::Codex)
-            .unwrap()
-            .is_none());
+        let context = repo.load_existing().unwrap().unwrap();
+        assert!(!context
+            .authority
+            .active_operations
+            .contains_key(&ProductProviderId::Codex));
+        let expected_etag = repo
+            .credential_etag_for_epoch(
+                context.principal(),
+                ProductProviderId::Codex,
+                generation,
+                terminal.prepared.lifecycle_epoch,
+            )
+            .unwrap();
+        assert_eq!(
+            context
+                .authority
+                .current_credential_etags
+                .get(&ProductProviderId::Codex),
+            Some(&expected_etag)
+        );
         assert!(repo.load_candidate(&candidate_id).unwrap().is_some());
         assert!(repo
             .load_journal(&operation.journal_record_id)
@@ -4017,5 +4090,42 @@ mod tests {
     #[test]
     fn agent_oauth_lifecycle_resume_retries_same_revoked_grant_reference_only() {
         reconnect_and_switch_track_active_and_candidate_revoke_as_distinct_legs();
+    }
+
+    #[test]
+    fn canonical_installation_principal_is_stable_and_not_account_derived() {
+        installation_principal_survives_webview_restart_and_is_never_public();
+    }
+
+    #[test]
+    fn parallel_lifecycle_and_control_store_initialization_converges_on_one_principal() {
+        parallel_first_lifecycle_migration_creates_exactly_one_installation_principal();
+    }
+
+    #[test]
+    fn missing_shared_principal_with_lifecycle_or_control_residue_fails_closed() {
+        missing_or_corrupt_installation_principal_fails_closed_without_new_operation_identity();
+    }
+
+    #[test]
+    fn canonical_installation_principal_changes_only_after_explicit_profile_reset() {
+        let root = temp_root("principal-profile-reset");
+        let original = repository(&root)
+            .initialize()
+            .unwrap()
+            .principal()
+            .to_owned();
+        assert_eq!(
+            repository(&root).initialize().unwrap().principal(),
+            original
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        let replacement = repository(&root)
+            .initialize()
+            .unwrap()
+            .principal()
+            .to_owned();
+        assert_ne!(replacement, original);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -29,10 +29,25 @@ impl DoneReason {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressPhase {
+    ProviderStarted,
+}
+
+impl ProgressPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderStarted => "provider_started",
+        }
+    }
+}
+
 /// One streamed event produced while a turn runs. This is the typed event set the
 /// `AgentStreamHub` will carry to the UI (REQ-AGENT-007); here it is emitted via a sink.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
+    /// Closed lifecycle progress. It carries no provider text or request metadata.
+    Progress { phase: ProgressPhase },
     /// A chunk of assistant text.
     Token(String),
     /// The model invoked the `isyncyou` tool.
@@ -87,6 +102,7 @@ impl StreamEvent {
 
     pub fn event_name(&self) -> &'static str {
         match self {
+            Self::Progress { .. } => "progress",
             Self::Token(_) => "token",
             Self::ToolCall { .. } => "tool_call",
             Self::ToolResult { .. } => "tool_result",
@@ -103,6 +119,9 @@ impl StreamEvent {
     /// the raw destructive action until Task 2 registers a canonical PendingAction.
     pub fn to_public_json(&self) -> serde_json::Value {
         match self {
+            Self::Progress { phase } => {
+                serde_json::json!({ "event": "progress", "phase": phase.as_str() })
+            }
             Self::Token(t) => serde_json::json!({ "event": "token", "text": t }),
             Self::ToolCall { id, name, input } => {
                 serde_json::json!({ "event": "tool_call", "id": id, "name": name, "input": input })
@@ -179,6 +198,15 @@ pub trait LlmProvider {
         history: &[crate::turn::Message],
         emit: &mut dyn FnMut(StreamEvent),
     ) -> Result<Vec<AssistantBlock>, crate::AgentError>;
+
+    fn next_cancellable(
+        &mut self,
+        history: &[crate::turn::Message],
+        emit: &mut dyn FnMut(StreamEvent),
+        _cancellation: Option<&crate::CancellationToken>,
+    ) -> Result<Vec<AssistantBlock>, crate::AgentError> {
+        self.next(history, emit)
+    }
 
     fn last_usage(&self) -> Option<Usage> {
         None
@@ -329,6 +357,7 @@ pub(crate) enum ProviderRequestBinding<'a> {
         access_token: &'a str,
         account_id: &'a str,
         model: &'a str,
+        reasoning_effort: codex::CodexReasoningEffort,
         instructions: &'a str,
     },
 }
@@ -484,7 +513,19 @@ fn attest_product_harness(
         .ok_or_else(|| harness_violation("request body must be an object"))?;
     let keys: std::collections::BTreeSet<&str> = obj.keys().map(|k| k.as_str()).collect();
     let stream_true = obj.get("stream") == Some(&serde_json::Value::Bool(true));
-    attest_single_isyncyou_tool(provider, obj.get("tools"))?;
+    let responses_lite = matches!(
+        binding,
+        ProviderRequestBinding::Codex { model, .. } if codex::uses_responses_lite(model)
+    );
+    let tools = if responses_lite {
+        obj.get("input")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|input| input.first())
+            .and_then(|item| item.get("tools"))
+    } else {
+        obj.get("tools")
+    };
+    attest_single_isyncyou_tool(provider, tools)?;
     match provider {
         HarnessProvider::Claude => {
             let ProviderRequestBinding::Claude {
@@ -625,6 +666,7 @@ fn attest_product_harness(
                 access_token,
                 account_id,
                 model,
+                reasoning_effort,
                 instructions,
             } = binding
             else {
@@ -645,18 +687,35 @@ fn attest_product_harness(
                     "codex request URL is not the official endpoint",
                 ));
             }
-            let allowed: std::collections::BTreeSet<&str> = [
-                "input",
-                "instructions",
-                "model",
-                "parallel_tool_calls",
-                "store",
-                "stream",
-                "tool_choice",
-                "tools",
-            ]
-            .into_iter()
-            .collect();
+            let allowed: std::collections::BTreeSet<&str> = if responses_lite {
+                [
+                    "input",
+                    "include",
+                    "model",
+                    "parallel_tool_calls",
+                    "reasoning",
+                    "store",
+                    "stream",
+                    "tool_choice",
+                ]
+                .into_iter()
+                .collect()
+            } else {
+                [
+                    "input",
+                    "instructions",
+                    "include",
+                    "model",
+                    "parallel_tool_calls",
+                    "reasoning",
+                    "store",
+                    "stream",
+                    "tool_choice",
+                    "tools",
+                ]
+                .into_iter()
+                .collect()
+            };
             if keys != allowed {
                 return Err(harness_violation(
                     "codex request has non-allowlisted top-level keys",
@@ -665,11 +724,44 @@ fn attest_product_harness(
             if obj.get("store") != Some(&serde_json::Value::Bool(false)) {
                 return Err(harness_violation("codex store must be false"));
             }
+            let reasoning = obj
+                .get("reasoning")
+                .and_then(|value| value.as_object())
+                .ok_or_else(|| harness_violation("codex reasoning shape is invalid"))?;
+            let input = obj
+                .get("input")
+                .and_then(|value| value.as_array())
+                .ok_or_else(|| harness_violation("codex input shape is invalid"))?;
+            let expected_tool_choice = codex::tool_choice_for_input(input);
+            let expected_reasoning_len = if responses_lite { 2 } else { 1 };
+            let lite_prefix_matches = !responses_lite
+                || input.first().is_some_and(|value| {
+                    value
+                        == &serde_json::json!({
+                            "type": "additional_tools",
+                            "role": "developer",
+                            "tools": codex::responses_tools(),
+                        })
+                }) && input.get(1).is_some_and(|value| {
+                    value
+                        == &serde_json::json!({
+                            "type": "message",
+                            "role": "developer",
+                            "content": [{"type": "input_text", "text": instructions}],
+                        })
+                });
             if obj.get("model").and_then(|v| v.as_str()) != Some(*model)
-                || obj.get("instructions").and_then(|v| v.as_str()) != Some(*instructions)
-                || !obj.get("input").is_some_and(|v| v.is_array())
+                || (!responses_lite
+                    && obj.get("instructions").and_then(|v| v.as_str()) != Some(*instructions))
+                || reasoning.len() != expected_reasoning_len
+                || reasoning.get("effort").and_then(|v| v.as_str())
+                    != Some(reasoning_effort.as_str())
+                || (responses_lite
+                    && reasoning.get("context").and_then(|v| v.as_str()) != Some("all_turns"))
+                || obj.get("include") != Some(&serde_json::json!(["reasoning.encrypted_content"]))
                 || obj.get("parallel_tool_calls") != Some(&serde_json::Value::Bool(false))
-                || obj.get("tool_choice").and_then(|v| v.as_str()) != Some("auto")
+                || obj.get("tool_choice").and_then(|v| v.as_str()) != Some(expected_tool_choice)
+                || !lite_prefix_matches
             {
                 return Err(harness_violation(
                     "codex protocol fields differ from the request binding",
@@ -678,20 +770,23 @@ fn attest_product_harness(
             if !stream_true {
                 return Err(harness_violation("codex stream must be true"));
             }
-            require_exact_headers(
-                headers,
-                vec![
-                    ("authorization".into(), format!("Bearer {access_token}")),
-                    ("chatgpt-account-id".into(), (*account_id).to_string()),
-                    ("originator".into(), codex::ORIGINATOR.into()),
-                    ("openai-beta".into(), codex::OPENAI_BETA.into()),
-                    (
-                        "user-agent".into(),
-                        format!("{}/{}", codex::ORIGINATOR, codex::DEFAULT_CLI_VERSION),
-                    ),
-                    ("accept".into(), "text/event-stream".into()),
-                ],
-            )?;
+            let mut expected_headers = vec![
+                ("authorization".into(), format!("Bearer {access_token}")),
+                ("chatgpt-account-id".into(), (*account_id).to_string()),
+                ("originator".into(), codex::ORIGINATOR.into()),
+                (
+                    "user-agent".into(),
+                    format!("{}/{}", codex::ORIGINATOR, codex::DEFAULT_CLI_VERSION),
+                ),
+                ("accept".into(), "text/event-stream".into()),
+            ];
+            if responses_lite {
+                expected_headers.push((
+                    "x-openai-internal-codex-responses-lite".into(),
+                    "true".into(),
+                ));
+            }
+            require_exact_headers(headers, expected_headers)?;
         }
     }
     Ok(())
@@ -768,12 +863,14 @@ pub fn attest_static_product_harness(
                     access_token: "static-attestation-probe",
                     account_id: "static-account-binding",
                     model: &codex::CodexConfig::default().model,
+                    reasoning_effort: codex::CodexConfig::default().reasoning_effort,
                     instructions: expected_system,
                 },
                 codex::RESPONSES_URL,
                 &p.request_headers(),
                 &codex::build_request(
                     &codex::CodexConfig::default().model,
+                    codex::CodexConfig::default().reasoning_effort,
                     expected_system,
                     &history,
                 ),
@@ -851,8 +948,12 @@ mod tests {
         )
         .unwrap()
         .request_body(&history);
-        let codex =
-            codex::build_request("codex-test", "iSyncYou controlled system prompt", &history);
+        let codex = codex::build_request(
+            "codex-test",
+            codex::CodexReasoningEffort::Medium,
+            "iSyncYou controlled system prompt",
+            &history,
+        );
         (claude, codex)
     }
 
@@ -982,11 +1083,21 @@ mod tests {
                 "authorization",
                 "chatgpt-account-id",
                 "originator",
-                "openai-beta",
                 "user-agent",
                 "accept",
+                "x-openai-internal-codex-responses-lite",
             ]
         );
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn codex_static_product_harness_accepts_responses_lite_shape() {
+        attest_static_product_harness(HarnessProvider::Codex, "iSyncYou controlled system prompt")
+            .expect("the shipped default Codex harness must remain ready");
     }
 
     #[cfg(any(
@@ -1027,9 +1138,11 @@ mod tests {
             codex_keys,
             BTreeSet::from([
                 "input".into(),
+                "include".into(),
                 "instructions".into(),
                 "model".into(),
                 "parallel_tool_calls".into(),
+                "reasoning".into(),
                 "store".into(),
                 "stream".into(),
                 "tool_choice".into(),
@@ -1076,6 +1189,7 @@ mod tests {
             "iSyncYou controlled system prompt",
             codex::CodexConfig {
                 account_id: "codex-account-identity".into(),
+                model: "codex-test".into(),
                 ..Default::default()
             },
         )
@@ -1083,7 +1197,12 @@ mod tests {
         (
             codex::RESPONSES_URL.to_string(),
             provider.request_headers(),
-            codex::build_request("codex-test", "iSyncYou controlled system prompt", &history),
+            codex::build_request(
+                "codex-test",
+                codex::CodexReasoningEffort::Medium,
+                "iSyncYou controlled system prompt",
+                &history,
+            ),
         )
     }
 
@@ -1110,6 +1229,7 @@ mod tests {
                 access_token: "codex-oauth-token",
                 account_id: "codex-account-identity",
                 model: "codex-test",
+                reasoning_effort: codex::CodexReasoningEffort::Medium,
                 instructions: "iSyncYou controlled system prompt",
             },
         };
@@ -1216,6 +1336,29 @@ mod tests {
         assert!(
             attest_test_request(HarnessProvider::Codex, url, mutated_headers, body).is_err(),
             "mutated headers must fail re-attestation"
+        );
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn codex_reasoning_effort_is_bound_into_request_attestation() {
+        let (url, headers, body) = valid_codex_request("controlled user request");
+        attest_test_request(
+            HarnessProvider::Codex,
+            url.clone(),
+            headers.clone(),
+            body.clone(),
+        )
+        .expect("baseline reasoning effort attests");
+
+        let mut mutated = body;
+        mutated["reasoning"]["effort"] = json!("xhigh");
+        assert!(
+            attest_test_request(HarnessProvider::Codex, url, headers, mutated).is_err(),
+            "reasoning effort must match the prepared provider binding"
         );
     }
 
@@ -1354,6 +1497,13 @@ mod tests {
         assert!(attest(h, b).is_err(), "changed tool schema must fail");
 
         let (_, h, mut b) = base();
+        b["tool_choice"] = json!("required");
+        assert!(
+            attest(h, b).is_err(),
+            "the product must not force a tool call for ordinary chat"
+        );
+
+        let (_, h, mut b) = base();
         b["instructions"] = json!("different instructions");
         assert!(attest(h, b).is_err(), "changed instructions must fail");
 
@@ -1463,6 +1613,9 @@ mod tests {
     #[test]
     fn agent_stream_event_json_is_single_line_and_stable() {
         let events = [
+            StreamEvent::Progress {
+                phase: ProgressPhase::ProviderStarted,
+            },
             StreamEvent::Token("hello".into()),
             StreamEvent::ToolCall {
                 id: "t1".into(),
@@ -1490,6 +1643,7 @@ mod tests {
             StreamEvent::done(DoneReason::Cancelled),
         ];
         let names: Vec<_> = events.iter().map(StreamEvent::event_name).collect();
+        assert!(names.contains(&"progress"));
         assert!(names.contains(&"token"));
         assert!(names.contains(&"tool_call"));
         assert!(names.contains(&"tool_result"));
@@ -1506,6 +1660,8 @@ mod tests {
             assert_eq!(parsed["event"], event.event_name());
             if event.event_name() == "done" {
                 assert_eq!(parsed["reason"], "cancelled");
+            } else if event.event_name() == "progress" {
+                assert_eq!(parsed["phase"], "provider_started");
             }
         }
     }

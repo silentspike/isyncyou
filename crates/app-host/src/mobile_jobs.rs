@@ -1469,11 +1469,14 @@ mod tests {
 
     #[test]
     fn live_restore_errors_map_structurally_without_text_matching() {
-        use isyncyou_graph::http::UploadError;
+        use isyncyou_graph::http::{GraphTransportFailure, UploadError};
 
         let graph_cases = [
             (
-                UploadError::Transport("unrelated text".into()),
+                UploadError::Transport {
+                    failure: GraphTransportFailure::Other,
+                    detail: "unrelated text".into(),
+                },
                 MobileJobRetryCode::Network,
             ),
             (
