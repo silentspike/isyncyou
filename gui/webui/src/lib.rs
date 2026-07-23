@@ -946,6 +946,7 @@ fn agent_session_error_status(error: &str) -> u16 {
         "invalid_cursor"
         | "invalid_request_id"
         | "invalid_request_route"
+        | "pairing_invalid_code"
         | "pairing_invalid_session"
         | "presence_invalid_request"
         | "invalid_session_name"
@@ -955,20 +956,27 @@ fn agent_session_error_status(error: &str) -> u16 {
         }
         "presence_action_mismatch" | "presence_token_invalid" => 403,
         "manifest_conflict"
+        | "pairing_already_claimed"
         | "pairing_expired"
+        | "pairing_invalid_descriptor"
         | "pairing_outcome_unknown"
         | "pairing_revoked"
+        | "pairing_wrong_claim"
         | "presence_expired"
         | "presence_not_authorized"
         | "provider_generation_changed"
         | "request_id_conflict"
+        | "session_account_mismatch"
         | "session_limit_reached"
         | "session_request_capacity_reached"
         | "session_upgrade_required"
         | "stale_cursor" => 409,
         "history_page_too_large" | "session_budget_exceeded" => 413,
         "session_account_selection_required" => 409,
-        "pairing_unavailable"
+        "pairing_crypto_unavailable"
+        | "pairing_identity_unavailable"
+        | "pairing_transport_unavailable"
+        | "pairing_unavailable"
         | "presence_unavailable"
         | "session_account_unavailable"
         | "session_store_unavailable"
@@ -20631,5 +20639,53 @@ Content-Type: text/html; charset=utf-8\r\n\
         let source = include_str!("app.js");
         assert!(source.contains("code.value = pairingCode;"));
         assert!(!source.contains("value: pairingCode,"));
+    }
+
+    #[test]
+    fn agent_pairing_failures_remain_closed_typed_and_visible() {
+        let cases = [
+            ("pairing_invalid_code", 400),
+            ("pairing_invalid_descriptor", 409),
+            ("pairing_already_claimed", 409),
+            ("pairing_expired", 409),
+            ("pairing_outcome_unknown", 409),
+            ("pairing_revoked", 409),
+            ("pairing_wrong_claim", 409),
+            ("session_account_mismatch", 409),
+            ("pairing_crypto_unavailable", 503),
+            ("pairing_identity_unavailable", 503),
+            ("pairing_transport_unavailable", 503),
+            ("pairing_unavailable", 503),
+        ];
+        for (code, status) in cases {
+            let response = agent_session_error_response(code);
+            assert_eq!(response.status, status, "{code}");
+            assert_eq!(body_json(&response)["error"], code, "{code}");
+        }
+
+        let source = include_str!("app.js");
+        for code in [
+            "pairing_invalid_code",
+            "pairing_invalid_descriptor",
+            "pairing_already_claimed",
+            "pairing_expired",
+            "pairing_revoked",
+            "pairing_wrong_claim",
+            "pairing_outcome_unknown",
+            "pairing_transport_unavailable",
+            "pairing_crypto_unavailable",
+            "pairing_identity_unavailable",
+            "pairing_unavailable",
+            "session_account_mismatch",
+        ] {
+            assert!(
+                source.contains(&format!("{code}:")),
+                "missing safe UI copy for {code}"
+            );
+        }
+        assert!(source.contains("async function runAgentSessionUiAction(action)"));
+        assert!(source.contains(
+            "void runAgentSessionUiAction(() => importAgentSession(importInput.value, overlay))"
+        ));
     }
 }

@@ -6483,6 +6483,18 @@ function agentSafeErrorCopy(code) {
     session_writer_reconnect_required: "iSyncYou Writer needs to be reconnected before shared sessions can be updated.",
     session_storage_permission_denied: "iSyncYou Writer does not have permission to update shared sessions.",
     session_storage_request_rejected: "Shared session storage rejected this request. Update iSyncYou and try again.",
+    pairing_invalid_code: "This session transfer code is invalid.",
+    pairing_invalid_descriptor: "This session transfer is unavailable. Check that both devices use the same Microsoft 365 account.",
+    pairing_already_claimed: "This session transfer has already been claimed.",
+    pairing_expired: "This session transfer has expired. Create a new transfer.",
+    pairing_revoked: "This session transfer was revoked.",
+    pairing_wrong_claim: "This session transfer belongs to another import attempt.",
+    pairing_outcome_unknown: "The session transfer outcome could not be verified. Do not retry it automatically.",
+    pairing_transport_unavailable: "Session transfer storage is unavailable. Check that both devices use the same Microsoft 365 account.",
+    pairing_crypto_unavailable: "Session transfer encryption is temporarily unavailable.",
+    pairing_identity_unavailable: "Session transfer identity is unavailable. Reopen iSyncYou and try again.",
+    pairing_unavailable: "Session transfer is temporarily unavailable.",
+    session_account_mismatch: "This shared session belongs to a different local Microsoft 365 account.",
   };
   return known[code] || "The assistant could not complete this request.";
 }
@@ -6911,6 +6923,14 @@ async function importAgentSession(pairingCode, overlay) {
   await renderAssistantView($("#view"));
 }
 
+async function runAgentSessionUiAction(action) {
+  try {
+    await action();
+  } catch (error) {
+    toast(agentSafeErrorCopy(error && (error.code || error.message)), "err");
+  }
+}
+
 async function openAgentSessionDialog() {
   try {
     const page = await request("GET", "/api/v1/agent/session/list?limit=100", { capToken: CAP.agent });
@@ -6923,16 +6943,16 @@ async function openAgentSessionDialog() {
         el("b", { text: session.display_name || "Assistant" }),
         el("span", { class: "dim", text: session.archived ? "Archived" : "Available" })),
       el("div", { class: "assistant-session-actions" },
-        !session.archived ? el("button", { class: "btn ghost sm", type: "button", onclick: () => selectAgentSession(session.session_id, overlay), title: "Open session" }, icon("folder-open", "icon-sm")) : null,
-        !session.archived ? el("button", { class: "btn ghost sm", type: "button", onclick: () => exportAgentSession(session.session_id, overlay), title: "Transfer session" }, icon("share-2", "icon-sm")) : null,
-        !session.archived ? el("button", { class: "btn ghost sm", type: "button", onclick: () => archiveAgentSession(session.session_id, overlay), title: "Archive session" }, icon("archive", "icon-sm")) : null)));
+        !session.archived ? el("button", { class: "btn ghost sm", type: "button", onclick: () => void runAgentSessionUiAction(() => selectAgentSession(session.session_id, overlay)), title: "Open session" }, icon("folder-open", "icon-sm")) : null,
+        !session.archived ? el("button", { class: "btn ghost sm", type: "button", onclick: () => void runAgentSessionUiAction(() => exportAgentSession(session.session_id, overlay)), title: "Transfer session" }, icon("share-2", "icon-sm")) : null,
+        !session.archived ? el("button", { class: "btn ghost sm", type: "button", onclick: () => void runAgentSessionUiAction(() => archiveAgentSession(session.session_id, overlay)), title: "Archive session" }, icon("archive", "icon-sm")) : null)));
     const panel = el("section", { class: "assistant-lifecycle-dialog assistant-session-dialog", role: "dialog", "aria-modal": "true", "aria-label": "Assistant sessions" },
       el("h2", { text: "Assistant sessions" }),
       el("div", { class: "assistant-session-list" }, rows.length ? rows : el("p", { class: "dim", text: "No sessions yet." })),
       el("div", { class: "assistant-session-import" }, importInput,
-        el("button", { class: "btn", type: "button", onclick: () => importAgentSession(importInput.value, overlay) }, icon("log-in", "icon-sm"), "Import")),
+        el("button", { class: "btn", type: "button", onclick: () => void runAgentSessionUiAction(() => importAgentSession(importInput.value, overlay)) }, icon("log-in", "icon-sm"), "Import")),
       el("div", { class: "assistant-lifecycle-dialog-actions" },
-        el("button", { class: "btn", type: "button", onclick: () => createAgentSession(overlay) }, icon("plus", "icon-sm"), "New session"),
+        el("button", { class: "btn", type: "button", onclick: () => void runAgentSessionUiAction(() => createAgentSession(overlay)) }, icon("plus", "icon-sm"), "New session"),
         el("button", { class: "btn ghost", type: "button", onclick: close }, "Close")));
     overlay.append(el("div", { class: "scrim", onclick: close }), panel);
     document.body.append(overlay);
