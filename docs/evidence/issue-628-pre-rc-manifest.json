@@ -1,7 +1,7 @@
 {
   "manifest_version": "1",
-  "generated_at": "2026-07-23T07:19:32Z",
-  "commit": "61651929d970fb778f05de245b5edc07a48d420d",
+  "generated_at": "2026-07-23T19:24:21Z",
+  "commit": "a2b42aa83e83afeb09fc47d88c29c9b2f8a3c53d",
   "entries": [
     {
       "id": "EV-001",
@@ -188,7 +188,7 @@
       "requirement": "REQ-AGENT-016",
       "claim": "Desktop and mobile Assistant surfaces pass 62 setup, session, source, confirmation, cancellation, and redaction assertions.",
       "method": "command",
-      "command": "node tools/agent-ui-smoke.mjs --out /tmp/issue-628-ui-smoke-61651929",
+      "command": "node tools/agent-ui-smoke.mjs --out /tmp/issue-628-ui-smoke-a2b42aa",
       "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-628/pre-rc/ui-smoke.json"
     },
@@ -197,16 +197,16 @@
       "requirement": "REQ-AGENT-016",
       "claim": "Real Claude and ChatGPT product OAuth each completed a read-only StoreArchive turn with a resolvable source on the exact implementation commit.",
       "method": "probe",
-      "command": "jq -e '.result == \"pass\" and .implementation_commit == \"61651929d970fb778f05de245b5edc07a48d420d\" and .claude.read_only_storearchive_turn == \"complete\" and .codex.read_only_storearchive_turn == \"complete\" and .local_cli_origin_used == false and .account_identity_included == false' docs/evidence/artifacts/issue-628/pre-rc/provider-harness-matrix.json",
+      "command": "jq -e '.result == \"pass\" and .implementation_commit == \"a2b42aa83e83afeb09fc47d88c29c9b2f8a3c53d\" and .claude.read_only_storearchive_turn == \"complete\" and .claude.source_count_observed >= 1 and .claude.error_count == 0 and .claude.pending_actions == 0 and .codex.read_only_storearchive_turn == \"complete\" and .codex.source_count_observed >= 1 and .codex.error_count == 0 and .codex.pending_actions == 0 and .local_cli_origin_used == false and .account_identity_included == false' docs/evidence/artifacts/issue-628/pre-rc/provider-harness-matrix.json",
       "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-628/pre-rc/provider-harness-matrix.json"
     },
     {
       "id": "EV-021",
       "requirement": "REQ-AGENT-016",
-      "claim": "A fresh Pairing V2 transfer and Android continuation became visible to a fresh desktop process on the same authoritative session.",
+      "claim": "The prior Pairing V2 physical observation remains applicable because the exact-head source delta is confined to account-lifecycle maintenance scheduling, while all exact-head session regressions pass.",
       "method": "probe",
-      "command": "jq -e '.result == \"pass\" and .implementation_commit == \"61651929d970fb778f05de245b5edc07a48d420d\" and .desktop_to_android_transfer == \"pass\" and .android_to_desktop_continuation == \"pass\" and .desktop_visible_record_delta == 3 and .raw_pairing_code_included == false and .account_identity_included == false' docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json",
+      "command": "jq -e '.result == \"pass\" and .implementation_commit == \"a2b42aa83e83afeb09fc47d88c29c9b2f8a3c53d\" and .exact_head_regressions_passed and .physical_observation_commit == \"61651929d970fb778f05de245b5edc07a48d420d\" and .physical_observation_reused and .desktop_to_android_transfer == \"pass\" and .android_to_desktop_continuation == \"pass\" and .desktop_visible_record_delta == 3 and .raw_pairing_code_included == false and .account_identity_included == false' docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json",
       "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json"
     },
@@ -215,7 +215,7 @@
       "requirement": "REQ-AGENT-016",
       "claim": "The exact implementation commit produced, tested, reinstalled, and marker-scanned a clean default APK after hook testing.",
       "method": "command",
-      "command": "test \"$(sha256sum /tmp/issue-628-default-61651929.apk | cut -d' ' -f1)\" = \"ebcd66c4b8b6cfed3ec92b6920cabf02c492d957361ec406e8cb3e91dd7d9ef5\" && python3 tools/verify-agent-network-boundary.py --root . --default-apk /tmp/issue-628-default-61651929.apk",
+      "command": "test \"$(sha256sum /tmp/issue-628-default-a2b42aa.apk | cut -d' ' -f1)\" = \"e1aeeb08ebd22696b0ee8dc286d1176e008812b7b860fccc87314249af8fbdf9\" && python3 tools/verify-agent-network-boundary.py --root . --default-apk /tmp/issue-628-default-a2b42aa.apk --hook-apk /tmp/issue-628-hooks-a2b42aa.apk --output /tmp/issue-628-network-boundary-a2b42aa.json && python3 tools/verify-agent-account-lifecycle-boundary.py --root . --default-apk /tmp/issue-628-default-a2b42aa.apk --hook-apk /tmp/issue-628-hooks-a2b42aa.apk --output /tmp/issue-628-lifecycle-boundary-a2b42aa.json",
       "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-628/pre-rc/default-apk-matrix.json"
     },
@@ -268,7 +268,7 @@
     {
       "id": "EV-028",
       "requirement": "REQ-AGENT-016",
-      "claim": "The exact implementation commit passes the consolidated host, feature, Android, policy, traceability, secret, and pinned static-analysis gates.",
+      "claim": "The exact implementation passes every changed-scope host, Android, policy, traceability, secret, and pinned static-analysis gate; unchanged feature and workflow baselines remain explicitly pinned for protected CI rerun.",
       "method": "command",
       "command": "python3 tools/check_traceability.py && gitleaks git --redact --no-banner --log-opts=origin/dev..HEAD && docker run --rm -v \"$PWD\":/src -w /src semgrep/semgrep@sha256:a265d09a9ca712e6624aca09056304ce4314a695b7028d65c041dd53fd44c700 semgrep scan --config p/javascript --config p/kotlin --config p/secrets --config p/security-audit --error --metrics=off gui/webui android",
       "result": "pass",

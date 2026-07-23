@@ -3,8 +3,8 @@
 ## Identity and boundary
 
 The implementation commit is
-`61651929d970fb778f05de245b5edc07a48d420d`, with tree
-`dd00134d7a66bbb100a615e38570ef77160f39e3`. The pre-RC manifest pins only
+`a2b42aa83e83afeb09fc47d88c29c9b2f8a3c53d`, with tree
+`77abb7b8c737b34472ab93bb69ebdd638d045b30`. The pre-RC manifest pins only
 that existing commit. It does not contain a candidate commit/tree, release
 commit, final evidence commit, or self-reference.
 
@@ -40,11 +40,12 @@ turn with a resolvable source on the exact implementation commit. The controlled
 Reader and Writer M365 roles remained connected, and desktop/mobile OneDrive
 quota observations matched across all five compared fields.
 
-A fresh Pairing V2 transfer moved one selected encrypted session from desktop
-to the default Pixel build after native user presence. Android rehydrated the
-history and completed a new nonempty assistant turn without an error, pending
-action, or tool call. A fresh desktop process then observed the same
-authoritative session grow by one three-record turn group.
+The physical Pairing V2 and cross-device continuation observation remains pinned
+to `61651929d970fb778f05de245b5edc07a48d420d`. It is reused rather than
+relabeled: the only later production-source change is the account-lifecycle
+maintenance-pass scheduler and its regression test. Session manifests, pairing,
+transfer, and publication code are unchanged, and their full exact-head
+regression suite passes.
 
 The clean default APK and the separate hook APK are pinned by SHA-256 in their
 matrix files. Hook-only tests are not provider or product evidence. The default
@@ -66,11 +67,12 @@ current replacement test passed in the exact-head workspace run.
 
 ## Gates
 
-The exact implementation commit passes the full remote workspace and feature
-test matrices, workspace and feature Clippy, remote formatting, Cargo deny,
-Actionlint, Shellcheck, the nonempty-filter self-test, JavaScript/Python
+The exact implementation commit passes the full remote workspace test matrix,
+workspace and feature Clippy, remote formatting, Cargo deny, JavaScript/Python
 contracts, UI smoke, traceability, Android JVM/lint/instrumentation, pinned
-Semgrep, Gitleaks, and product boundary scans.
+Semgrep, Gitleaks, and product boundary scans. Actionlint remains valid from the
+immediately preceding implementation because its workflow scope did not change;
+protected PR CI reruns it before merge.
 
 No account identity, OAuth value, callback query, token, cookie, device serial,
 raw provider frame, raw platform log, prompt/answer body, pairing code, or

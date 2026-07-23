@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "result": "pass",
-  "implementation_commit": "61651929d970fb778f05de245b5edc07a48d420d",
+  "implementation_commit": "a2b42aa83e83afeb09fc47d88c29c9b2f8a3c53d",
   "assertions_passed": 62,
   "assertions_failed": 0,
   "desktop_assistant_visible": true,

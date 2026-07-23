@@ -1,7 +1,11 @@
 {
   "schema_version": 1,
   "result": "pass",
-  "implementation_commit": "61651929d970fb778f05de245b5edc07a48d420d",
+  "implementation_commit": "a2b42aa83e83afeb09fc47d88c29c9b2f8a3c53d",
+  "exact_head_regressions_passed": true,
+  "physical_observation_commit": "61651929d970fb778f05de245b5edc07a48d420d",
+  "physical_observation_reused": true,
+  "physical_observation_reuse_scope": "The exact-head source delta changes only account-lifecycle maintenance scheduling and its regression test; session and pairing code is unchanged.",
   "encrypted_manifest": true,
   "manifest_cas_heads_atomic": true,
   "uuid_reuse_cross_route_rejected": true,

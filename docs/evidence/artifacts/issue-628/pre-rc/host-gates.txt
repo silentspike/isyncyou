@@ -1,29 +1,29 @@
 issue=628
-implementation_commit=61651929d970fb778f05de245b5edc07a48d420d
-workspace_tests=PASS passed=1978 ignored=38
+implementation_commit=a2b42aa83e83afeb09fc47d88c29c9b2f8a3c53d
+workspace_tests=PASS passed=1979 ignored=38
 workspace_clippy=PASS
-agent_product_tests=PASS passed=376 ignored=1
-agent_product_clippy=PASS
-app_host_product_tests=PASS passed=534 ignored=6
+agent_product_tests=PASS passed=376 ignored=1 baseline_commit=61651929d970fb778f05de245b5edc07a48d420d unchanged_scope=true
+agent_product_clippy=PASS baseline_commit=61651929d970fb778f05de245b5edc07a48d420d unchanged_scope=true
+app_host_product_tests=PASS lib_passed=527 lib_ignored=6 boundary_passed=6
 app_host_product_clippy=PASS
-agent_experimental_tests=PASS passed=412 ignored=1
-agent_experimental_clippy=PASS
-app_host_experimental_tests=PASS passed=513 ignored=6
-app_host_experimental_clippy=PASS
+agent_experimental_tests=PASS passed=412 ignored=1 baseline_commit=61651929d970fb778f05de245b5edc07a48d420d unchanged_scope=true
+agent_experimental_clippy=PASS baseline_commit=61651929d970fb778f05de245b5edc07a48d420d unchanged_scope=true
+app_host_experimental_tests=PASS baseline_passed=513 baseline_ignored=6 exact_delta_test=PASS
+app_host_experimental_clippy=PASS baseline_commit=61651929d970fb778f05de245b5edc07a48d420d exact_workspace_clippy=PASS
 mobile_default_tests=PASS passed=32
 mobile_default_clippy=PASS
 mobile_hook_tests=PASS passed=36
 mobile_hook_clippy=PASS
 remote_format=PASS
 cargo_deny=PASS
-actionlint=PASS
+actionlint=PASS baseline_commit=61651929d970fb778f05de245b5edc07a48d420d unchanged_scope=true
 shellcheck=PASS
 nonempty_cargo_filter_self_test=PASS
 python_contract_tests=PASS
 javascript_syntax=PASS
 npm_ci=PASS vulnerabilities=0
 ui_smoke=PASS assertions=62
-traceability=PASS requirements=72 implemented=71 planned=1
+traceability=PASS requirements=72 implemented=72 planned=0
 android_jvm_tests=PASS passed=65
 android_lint=PASS
 android_default_instrumentation=PASS tests=11 failures=0 skipped=6

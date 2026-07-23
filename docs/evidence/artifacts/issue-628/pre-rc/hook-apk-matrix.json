@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
   "result": "pass",
-  "implementation_commit": "61651929d970fb778f05de245b5edc07a48d420d",
-  "apk_sha256": "48115ec09b2e5d9ecbd079af256ddfa328e94f6be8314c218ab72909bd463407",
-  "apk_bytes": 22291704,
+  "implementation_commit": "a2b42aa83e83afeb09fc47d88c29c9b2f8a3c53d",
+  "apk_sha256": "0cc1efdfc3ed0036f2af714e01e8a7dda9ca7e61369660e180d3e6eec6beb2b1",
+  "apk_bytes": 22292104,
   "artifact_role": "test_only",
   "separate_from_default_apk": true,
   "features": [
