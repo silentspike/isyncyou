@@ -122,7 +122,7 @@ README's [Known limitations](../../README.md#known-limitations).
 | **Risk** | A transport retry duplicates a provider call or cloud effect, a stale session lease publishes after takeover, a request resumes under a different provider generation, or a one-time pairing transfer is reused. |
 | **Impact** | High — duplicate mutation, transcript fork, authority confusion, or session disclosure across devices. |
 | **Mitigation** | #628 adds route/session/payload-bound durable request IDs, bounded encrypted provider-step journals, provider-generation and harness binding, renewed server-time session leases, staged immutable objects with fenced manifest publication, host-owned cancellation/terminal ordering, and confirmation-gated one-time Pairing V2. Strict JSON and sealed mutation chunks remove mutable secrets and large bodies from URLs. |
-| **Status** | **In progress; pre-RC evidence invalidated** — the prior #628 package mixed observations from different implementation commits and was withdrawn. REQ-AGENT-016 remains planned until all host, live-provider, Android, and cross-device evidence is regenerated against one frozen implementation commit. Protected review, promotion, RC publication, final-RC artifact verification, and explicit issue closure remain outstanding release controls. Design: [ADR-007](../adr/007-agent-architecture.md). |
+| **Status** | **Mitigated in the pre-RC candidate** — exact-commit host, live-provider, Android, and cross-device evidence is recorded in the #628 pre-RC manifest and REQ-AGENT-016 is implemented. Protected review, promotion, RC publication, final-RC artifact verification, and explicit issue closure remain outstanding release controls. Design: [ADR-007](../adr/007-agent-architecture.md). |
 
 ---
 

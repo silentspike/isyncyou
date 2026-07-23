@@ -1,0 +1,278 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-07-23T07:19:32Z",
+  "commit": "61651929d970fb778f05de245b5edc07a48d420d",
+  "entries": [
+    {
+      "id": "EV-001",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Session V2 round-trips only bounded visible user, assistant, source, and terminal records.",
+      "method": "test",
+      "command": "env CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo remote -c -- test --workspace -j1",
+      "test": "session_v2_round_trips_user_assistant_sources_and_terminal_state",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/host-gates.txt"
+    },
+    {
+      "id": "EV-002",
+      "requirement": "REQ-AGENT-016",
+      "claim": "One fenced manifest CAS advances visible, request, and UUID-binding heads together.",
+      "method": "test",
+      "command": "env CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo remote -c -- test --workspace -j1",
+      "test": "manifest_cas_atomically_advances_visible_request_and_uuid_binding_heads",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json"
+    },
+    {
+      "id": "EV-003",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Turn admission atomically publishes the lease, intent, and first provider-step boundary.",
+      "method": "test",
+      "command": "env CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo remote -c -- test --workspace -j1",
+      "test": "turn_admission_cas_atomically_publishes_lease_intent_and_provider_start",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json"
+    },
+    {
+      "id": "EV-004",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Recovery validates the complete ordered chain for all sixteen bounded provider steps.",
+      "method": "test",
+      "command": "env CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo remote -c -- test --workspace -j1",
+      "test": "request_journal_recovers_all_sixteen_provider_steps_in_order",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json"
+    },
+    {
+      "id": "EV-005",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Rejected tool input can resume only with the exact supported help schema and digest.",
+      "method": "test",
+      "command": "env CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo remote -c -- test --workspace -j1",
+      "test": "rejected_tool_help_digest_or_unknown_version_fails_closed",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/host-gates.txt"
+    },
+    {
+      "id": "EV-006",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Duplicate tool-use IDs fail before any action from that provider step executes.",
+      "method": "test",
+      "command": "env CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo remote -c -- test --workspace -j1",
+      "test": "duplicate_tool_use_ids_fail_closed_before_execution",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/host-gates.txt"
+    },
+    {
+      "id": "EV-007",
+      "requirement": "REQ-AGENT-016",
+      "claim": "A quiet provider turn renews its authoritative session lease without stream events.",
+      "method": "test",
+      "command": "env CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo remote -c -- test --workspace -j1",
+      "test": "lease_renews_while_provider_emits_no_events",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json"
+    },
+    {
+      "id": "EV-008",
+      "requirement": "REQ-AGENT-016",
+      "claim": "A repeated terminal request ID returns one durable result without a second provider call.",
+      "method": "test",
+      "command": "env CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo remote -c -- test --workspace -j1",
+      "test": "same_request_id_same_terminal_result_does_not_call_provider_twice",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/confirmation-and-operations.json"
+    },
+    {
+      "id": "EV-009",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Recovery rejects provider, model, credential-generation, policy, harness, or installation drift.",
+      "method": "test",
+      "command": "env CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo remote -c -- test --workspace -j1",
+      "test": "provider_generation_recovery_rejects_every_authority_binding_change",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/account-lifecycle.json"
+    },
+    {
+      "id": "EV-010",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Turn cancellation before persistence discards late provider output.",
+      "method": "test",
+      "command": "env CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo remote -c -- test --workspace -j1",
+      "test": "turn_cancel_before_persist_ignores_late_provider_result",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/confirmation-and-operations.json"
+    },
+    {
+      "id": "EV-011",
+      "requirement": "REQ-AGENT-016",
+      "claim": "The host emits done complete only after durable terminal publication.",
+      "method": "test",
+      "command": "env CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo remote -c -- test --workspace -j1",
+      "test": "done_complete_is_emitted_only_after_terminal_record_commit",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/host-gates.txt"
+    },
+    {
+      "id": "EV-012",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Pairing claim, local installation, and remote finalization resume idempotently across restart boundaries.",
+      "method": "test",
+      "command": "env CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo remote -c -- test --workspace -j1",
+      "test": "pairing_claim_install_and_finalize_are_restart_safe_and_idempotent",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json"
+    },
+    {
+      "id": "EV-013",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Strict JSON rejects recursive duplicate members and trailing input.",
+      "method": "test",
+      "command": "env CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo remote -c -- test --workspace -j1",
+      "test": "strict_json_rejects_recursive_duplicate_keys_and_trailing_data",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/security-scan.txt"
+    },
+    {
+      "id": "EV-014",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Mutation-intent commit verifies total length, digest, expiry, and binding before an effect.",
+      "method": "test",
+      "command": "env CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo remote -c -- test --workspace -j1",
+      "test": "mutation_intent_commit_verifies_total_hash_length_expiry_and_binding",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/confirmation-and-operations.json"
+    },
+    {
+      "id": "EV-015",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Session and user-presence routes require trusted session, Agent capability, strict JSON, and no-store responses.",
+      "method": "test",
+      "command": "env CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo remote -c -- test --workspace -j1",
+      "test": "user_presence_and_agent_session_routes_require_session_cap_strict_json_and_no_store",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/security-scan.txt"
+    },
+    {
+      "id": "EV-016",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Typed semantic validation completes before a product request UUID is durably bound.",
+      "method": "test",
+      "command": "env CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo remote -c -- test --workspace -j1",
+      "test": "product_request_policy_validation_precedes_uuid_binding",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/confirmation-and-operations.json"
+    },
+    {
+      "id": "EV-017",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Global request receipts reject sensitive route response persistence.",
+      "method": "test",
+      "command": "env CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo remote -c -- test --workspace -j1",
+      "test": "product_request_store_rejects_sensitive_route_response_persistence",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/confirmation-and-operations.json"
+    },
+    {
+      "id": "EV-018",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Startup recovery errors block a new turn before session or provider work begins.",
+      "method": "test",
+      "command": "env CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo remote -c -- test --workspace -j1",
+      "test": "startup_turn_recovery_error_blocks_new_turn_before_session_or_provider_work",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/host-gates.txt"
+    },
+    {
+      "id": "EV-019",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Desktop and mobile Assistant surfaces pass 62 setup, session, source, confirmation, cancellation, and redaction assertions.",
+      "method": "command",
+      "command": "node tools/agent-ui-smoke.mjs --out /tmp/issue-628-ui-smoke-61651929",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/ui-smoke.json"
+    },
+    {
+      "id": "EV-020",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Real Claude and ChatGPT product OAuth each completed a read-only StoreArchive turn with a resolvable source on the exact implementation commit.",
+      "method": "probe",
+      "command": "jq -e '.result == \"pass\" and .implementation_commit == \"61651929d970fb778f05de245b5edc07a48d420d\" and .claude.read_only_storearchive_turn == \"complete\" and .codex.read_only_storearchive_turn == \"complete\" and .local_cli_origin_used == false and .account_identity_included == false' docs/evidence/artifacts/issue-628/pre-rc/provider-harness-matrix.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/provider-harness-matrix.json"
+    },
+    {
+      "id": "EV-021",
+      "requirement": "REQ-AGENT-016",
+      "claim": "A fresh Pairing V2 transfer and Android continuation became visible to a fresh desktop process on the same authoritative session.",
+      "method": "probe",
+      "command": "jq -e '.result == \"pass\" and .implementation_commit == \"61651929d970fb778f05de245b5edc07a48d420d\" and .desktop_to_android_transfer == \"pass\" and .android_to_desktop_continuation == \"pass\" and .desktop_visible_record_delta == 3 and .raw_pairing_code_included == false and .account_identity_included == false' docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json"
+    },
+    {
+      "id": "EV-022",
+      "requirement": "REQ-AGENT-016",
+      "claim": "The exact implementation commit produced, tested, reinstalled, and marker-scanned a clean default APK after hook testing.",
+      "method": "command",
+      "command": "test \"$(sha256sum /tmp/issue-628-default-61651929.apk | cut -d' ' -f1)\" = \"ebcd66c4b8b6cfed3ec92b6920cabf02c492d957361ec406e8cb3e91dd7d9ef5\" && python3 tools/verify-agent-network-boundary.py --root . --default-apk /tmp/issue-628-default-61651929.apk",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/default-apk-matrix.json"
+    },
+    {
+      "id": "EV-023",
+      "requirement": "REQ-AGENT-016",
+      "claim": "The separate exact-head hook APK exposes only bounded test controls and passes its one-shot lifecycle instrumentation.",
+      "method": "test",
+      "command": "(cd android && ISY_CARGO_FEATURES=agent-account-lifecycle-device-test-hooks,agent-credential-store-self-test,agent-network-device-test-hooks,mobile-job-device-test-hooks ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.silentspike.isyncyou.AgentCredentialKeyStoreInstrumentedTest,com.silentspike.isyncyou.MobileJobWorkerInstrumentedTest,com.silentspike.isyncyou.NetworkPreflightHookInstrumentedTest,com.silentspike.isyncyou.AgentAccountLifecycleHookInstrumentedTest)",
+      "test": "lifecycleHookIsFeatureGatedOwnerOnlyClosedAndOneShot",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/hook-apk-matrix.json"
+    },
+    {
+      "id": "EV-024",
+      "requirement": "REQ-AGENT-016",
+      "claim": "All release-blocking predecessors are merged and current replacements for superseded historical test names pass at the exact head.",
+      "method": "command",
+      "command": "jq -e '.dependencies[\"627\"].ancestor and .dependencies[\"639\"].ancestor and .dependencies[\"640\"].ancestor and .dependencies[\"645\"].ancestor and .historical_manifest_readback.current_tests_present_and_passed and .blocking_feature_pull_requests == 0' docs/evidence/artifacts/issue-628/pre-rc/dependency-and-scope.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/dependency-and-scope.json"
+    },
+    {
+      "id": "EV-025",
+      "requirement": "REQ-AGENT-016",
+      "claim": "The merged account-lifecycle baseline remains valid and the exact candidate accepts only the reviewed credential-revoke preflight target.",
+      "method": "command",
+      "command": "python3 tools/check_evidence.py --manifest docs/evidence/issue-645-manifest.json && jq -e '.result == \"pass\" and .credential_revoke_preflight_accepts_reviewed_target and .identity_included == false' docs/evidence/artifacts/issue-628/pre-rc/account-lifecycle.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/account-lifecycle.json"
+    },
+    {
+      "id": "EV-026",
+      "requirement": "REQ-AGENT-016",
+      "claim": "Merged live operation baselines validate and exact-head request, cancellation, confirmation, and mutation-intent regressions pass without creating unnecessary destructive fixtures.",
+      "method": "command",
+      "command": "python3 tools/check_evidence.py --manifest docs/evidence/issue-624-manifest.json && python3 tools/check_evidence.py --manifest docs/evidence/issue-625-manifest.json && python3 tools/check_evidence.py --manifest docs/evidence/issue-626-manifest.json && jq -e '.result == \"pass\" and .merged_live_baseline_manifests_valid and .unconfirmed_cloud_mutations == 0 and .duplicate_cloud_effects == 0' docs/evidence/artifacts/issue-628/pre-rc/confirmation-and-operations.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/confirmation-and-operations.json"
+    },
+    {
+      "id": "EV-027",
+      "requirement": "REQ-AGENT-016",
+      "claim": "The release workflow accepts only exact stable SemVer tags for the stable path.",
+      "method": "command",
+      "command": "python3 -m unittest tools.test_release_workflow_contract",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/host-gates.txt"
+    },
+    {
+      "id": "EV-028",
+      "requirement": "REQ-AGENT-016",
+      "claim": "The exact implementation commit passes the consolidated host, feature, Android, policy, traceability, secret, and pinned static-analysis gates.",
+      "method": "command",
+      "command": "python3 tools/check_traceability.py && gitleaks git --redact --no-banner --log-opts=origin/dev..HEAD && docker run --rm -v \"$PWD\":/src -w /src semgrep/semgrep@sha256:a265d09a9ca712e6624aca09056304ce4314a695b7028d65c041dd53fd44c700 semgrep scan --config p/javascript --config p/kotlin --config p/secrets --config p/security-audit --error --metrics=off gui/webui android",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-628/pre-rc/security-scan.txt"
+    }
+  ]
+}

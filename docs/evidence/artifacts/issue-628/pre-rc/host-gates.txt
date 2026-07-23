@@ -1,0 +1,34 @@
+issue=628
+implementation_commit=61651929d970fb778f05de245b5edc07a48d420d
+workspace_tests=PASS passed=1978 ignored=38
+workspace_clippy=PASS
+agent_product_tests=PASS passed=376 ignored=1
+agent_product_clippy=PASS
+app_host_product_tests=PASS passed=534 ignored=6
+app_host_product_clippy=PASS
+agent_experimental_tests=PASS passed=412 ignored=1
+agent_experimental_clippy=PASS
+app_host_experimental_tests=PASS passed=513 ignored=6
+app_host_experimental_clippy=PASS
+mobile_default_tests=PASS passed=32
+mobile_default_clippy=PASS
+mobile_hook_tests=PASS passed=36
+mobile_hook_clippy=PASS
+remote_format=PASS
+cargo_deny=PASS
+actionlint=PASS
+shellcheck=PASS
+nonempty_cargo_filter_self_test=PASS
+python_contract_tests=PASS
+javascript_syntax=PASS
+npm_ci=PASS vulnerabilities=0
+ui_smoke=PASS assertions=62
+traceability=PASS requirements=72 implemented=71 planned=1
+android_jvm_tests=PASS passed=65
+android_lint=PASS
+android_default_instrumentation=PASS tests=11 failures=0 skipped=6
+android_hook_instrumentation=PASS tests=5 failures=0 skipped=0
+predecessor_manifests_current=PASS issues=619,620,622,624,625,626,639,640,645
+predecessor_manifest_supersession_mapped=PASS issues=618,621,623,627
+secret_values_included=false
+raw_logs_included=false

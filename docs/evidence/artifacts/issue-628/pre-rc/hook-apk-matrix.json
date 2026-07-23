@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "result": "pass",
+  "implementation_commit": "61651929d970fb778f05de245b5edc07a48d420d",
+  "apk_sha256": "48115ec09b2e5d9ecbd079af256ddfa328e94f6be8314c218ab72909bd463407",
+  "apk_bytes": 22291704,
+  "artifact_role": "test_only",
+  "separate_from_default_apk": true,
+  "features": [
+    "agent-account-lifecycle-device-test-hooks",
+    "agent-credential-store-self-test",
+    "agent-network-device-test-hooks",
+    "mobile-job-device-test-hooks"
+  ],
+  "instrumentation_tests": 5,
+  "instrumentation_failures": 0,
+  "instrumentation_skipped": 0,
+  "credential_store_self_test": "pass",
+  "work_manager_process_binding": "pass",
+  "network_hook_one_shot": "pass",
+  "account_lifecycle_hook_one_shot": "pass",
+  "expected_markers_present": true,
+  "used_as_product_oauth_evidence": false,
+  "used_as_real_provider_evidence": false,
+  "secrets_included": false,
+  "device_serial_included": false
+}
