@@ -2119,16 +2119,22 @@ impl LifecycleMaintenanceRuntime {
         let join = std::thread::Builder::new()
             .name("agent-account-lifecycle-maintenance".into())
             .spawn(move || {
-                run_account_maintenance_once(&context, false);
+                run_account_maintenance_once(
+                    &context,
+                    AccountMaintenancePass::DeferredWorkerStartup,
+                );
                 loop {
                     match rx.recv_timeout(interval) {
                         Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            run_account_maintenance_once(&context, false);
+                            run_account_maintenance_once(
+                                &context,
+                                AccountMaintenancePass::Periodic,
+                            );
                         }
                     }
                 }
-                run_account_maintenance_once(&context, false);
+                run_account_maintenance_once(&context, AccountMaintenancePass::Periodic);
             })
             .ok();
         Self {
@@ -2142,10 +2148,36 @@ impl LifecycleMaintenanceRuntime {
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
+#[derive(Clone, Copy)]
+enum AccountMaintenancePass {
+    StartupRecovery,
+    DeferredWorkerStartup,
+    Periodic,
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+impl AccountMaintenancePass {
+    fn recover_interrupted_exchange(self) -> bool {
+        matches!(self, Self::StartupRecovery)
+    }
+
+    fn includes_lifecycle_recovery(self) -> bool {
+        !matches!(self, Self::DeferredWorkerStartup)
+    }
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn run_account_maintenance_once(
     context: &LifecycleMaintenanceContext,
-    recover_interrupted_exchange: bool,
+    pass: AccountMaintenancePass,
 ) {
+    let recover_interrupted_exchange = pass.recover_interrupted_exchange();
     let _ = context.oauth.reap_expired();
     if let Some(store) = &context.control_store {
         let _ = store.reap_expired(unix_now_ms(), 256);
@@ -2169,15 +2201,17 @@ fn run_account_maintenance_once(
     ) {
         run_product_session_maintenance_once(context);
     }
-    run_lifecycle_maintenance_once_at_with_recovery(
-        &context.cfg,
-        &context.oauth_dir,
-        &context.provider_leases,
-        &context.product_runtime_gate,
-        &context.last_usage,
-        now_ms(),
-        recover_interrupted_exchange,
-    );
+    if pass.includes_lifecycle_recovery() {
+        run_lifecycle_maintenance_once_at_with_recovery(
+            &context.cfg,
+            &context.oauth_dir,
+            &context.provider_leases,
+            &context.product_runtime_gate,
+            &context.last_usage,
+            now_ms(),
+            recover_interrupted_exchange,
+        );
+    }
 }
 
 #[cfg(any(
@@ -3406,7 +3440,10 @@ impl DaemonAgent {
             recover_interrupted_onboarding_attempts(&agent.oauth_dir);
             agent.recover_product_onboarding();
             let maintenance_context = agent.lifecycle_maintenance_context();
-            run_account_maintenance_once(&maintenance_context, true);
+            run_account_maintenance_once(
+                &maintenance_context,
+                AccountMaintenancePass::StartupRecovery,
+            );
             agent.lifecycle_maintenance =
                 Some(LifecycleMaintenanceRuntime::spawn(maintenance_context));
         }
@@ -25309,6 +25346,61 @@ mod tests {
 
         drop(control_store);
         drop(credential_store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn deferred_worker_startup_pass_does_not_recover_new_lifecycle_operation() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("maintenance-deferred-startup");
+        let mut agent = DaemonAgent::new(Config::default(), root.clone());
+        agent.lifecycle_maintenance.take();
+        seed_claude_lifecycle_fixture(&agent);
+        let meta = load_product_bundle_meta(&root, SUBSCRIPTION_CREDENTIAL_ID).unwrap();
+        let repository = account_lifecycle_repository(&root).unwrap();
+        let operation = repository
+            .begin_disconnect(
+                ProductProviderId::Claude,
+                "123e4567-e89b-42d3-a456-426614174127",
+                &meta.generation,
+                None,
+                isyncyou_agent::oauth::RevokeRequestTarget::RefreshToken,
+                isyncyou_agent::oauth::RevokeScopeGuarantee::ObservedTokenSession,
+                1_000,
+            )
+            .unwrap();
+        repository
+            .start_active_revoke(&operation.journal_record_id, 2_000)
+            .unwrap();
+        repository
+            .publish_revoke_outcome(
+                &operation.journal_record_id,
+                true,
+                "revoke_confirmed",
+                3_000,
+            )
+            .unwrap();
+        let context = agent.lifecycle_maintenance_context();
+
+        run_account_maintenance_once(&context, AccountMaintenancePass::DeferredWorkerStartup);
+        assert!(
+            load_agent_credential_blob(&root, SUBSCRIPTION_CREDENTIAL_ID)
+                .unwrap()
+                .is_some()
+        );
+
+        run_account_maintenance_once(&context, AccountMaintenancePass::Periodic);
+        assert!(
+            load_agent_credential_blob(&root, SUBSCRIPTION_CREDENTIAL_ID)
+                .unwrap()
+                .is_none()
+        );
+
+        drop(agent);
         let _ = std::fs::remove_dir_all(root);
     }
 
