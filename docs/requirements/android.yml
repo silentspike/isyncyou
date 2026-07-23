@@ -223,17 +223,29 @@ requirements:
       - test: base_live_router_wires_share_but_omits_restore_until_mobile_job_wrapper
       - test: share_is_biometric_gated_on_mobile
   - id: REQ-AND-014
-    title: A single device-code login fills the on-device cache
+    title: Reader and Writer grants remain separate on device
     statement: >
-      A fresh phone signs in once (device-code, write/restore scopes). The read-only
-      cache-refresh resolves reads via that write/restore token (its *.ReadWrite scopes
-      are read-capable), so the local store fills without a separate read login.
+      Every configured Microsoft account slot exposes independent iSyncYou Reader and
+      iSyncYou Writer connections. Authorization Code + PKCE opens Microsoft's account
+      picker in the system browser. Cache refresh requires the dedicated Reader grant;
+      Writer authority is used only for scoped sync, mutation, backup, and restore paths
+      and is never substituted for a missing Reader grant. When both grants exist, their
+      stable Microsoft Graph object identifiers must match before the second credential
+      is persisted.
     status: implemented
     acceptance:
-      - The cache-refresh token resolver prefers the read token, else the write token.
-      - With neither cached it surfaces the write-token error (proving the fallback ran).
+      - Reader and Writer use distinct reviewed clients, scopes, and encrypted cache records.
+      - The cache-refresh resolver fails closed when Reader is absent and never uses Writer.
+      - Disconnecting one role preserves the other role.
+      - Android opens only the exact allowlisted client/scope authorization contract.
+      - Account status exposes only closed role state and identity-verification booleans.
     verified_by:
-      - test: cache_refresh_token_prefers_read_then_falls_back_to_write
+      - test: cache_refresh_token_requires_the_dedicated_reader_connection
+      - test: account_role_sign_out_preserves_the_other_connection
+      - test: account_auth_routes_require_closed_reader_or_writer_role
+      - test: microsoft_account_roles_use_separate_clients_caches_and_safe_status
+      - test: microsoft_account_identity_accepts_profile_or_drive_owner_subject_only
+      - test: accountAuthorizeRequiresExactPkceAccountPickerContract
   - id: REQ-AND-015
     title: No Google service-account ships in the APK
     statement: >

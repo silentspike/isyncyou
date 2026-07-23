@@ -186,8 +186,8 @@ jobs:
 
   # Android debug APK build gate (REQ-AND-001 / D1b). Token-free: assembleDebug builds
   # without a Firebase config (the google-services plugin is applied only when present)
-  # and cross-compiles the embedded Rust engine via cargo-ndk. assembleRelease (the
-  # keystore path) stays out — only the build itself is gated here.
+  # and cross-compiles the embedded Rust engine before Gradle packages it.
+  # assembleRelease (the keystore path) stays out — only the build itself is gated here.
   android-build:
     name: android-build
     runs-on: ubuntu-latest
@@ -212,7 +212,11 @@ jobs:
       - name: Install the pinned NDK (matches android.ndkVersion)
         run: yes | sdkmanager --install "ndk;27.3.13750724"
       - name: Build the debug APK
-        run: cd android && ./gradlew :app:assembleDebug
+        env:
+          ISY_ANDROID_NATIVE_BUILDER: github-actions
+        run: |
+          tools/build-android-native.sh
+          cd android && ./gradlew :app:assembleDebug
 
   # DAST: OWASP ZAP baseline against the served fixture UI, on top of the functional
   # serve-smoke — the active runtime-security pass dev/main don't have. Builds + serves
@@ -290,7 +294,9 @@ jobs:
       - name: Build the x86_64 debug APK for the emulator
         env:
           ISY_ANDROID_ABIS: x86_64
+          ISY_ANDROID_NATIVE_BUILDER: github-actions
         run: |
+          tools/build-android-native.sh
           cd android && ./gradlew :app:assembleDebug
           # The embedded engine .so must be packaged for this ABI, or NativeEngine's
           # System.loadLibrary fails at runtime and the engine thread dies silently.

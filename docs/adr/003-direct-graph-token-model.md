@@ -58,5 +58,6 @@ seam, and the server-side HTML sanitization + item shaping would have to be
 reimplemented (and re-secured) in JS — a thinner product that also discards the backup
 engine. The embed path reuses everything and exposes **no** Graph token to JS.
 **This ADR's direct-Graph-JS token model is therefore not used by #89** (retained only
-as the abandoned direct-mode design). #89's on-device model is the existing device-code
-login + the per-process session-token gate (REQ-AND-012/014).
+as the abandoned direct-mode design). The current on-device model uses Rust-owned
+Authorization Code + PKCE with separate Reader and Writer grants, the #640 OAuth guard,
+and the per-process session-token gate (REQ-AND-012/014).

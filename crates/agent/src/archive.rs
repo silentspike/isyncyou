@@ -82,6 +82,14 @@ mod store_backed {
     use isyncyou_store::{Item, Store};
     use std::path::PathBuf;
 
+    fn literal_fts_query(query: &str) -> Option<String> {
+        let terms = query
+            .split_whitespace()
+            .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+            .collect::<Vec<_>>();
+        (!terms.is_empty()).then(|| terms.join(" OR "))
+    }
+
     fn to_ref(it: Item) -> ItemRef {
         ItemRef {
             service: it.service,
@@ -111,7 +119,7 @@ mod store_backed {
             // Repo-specific WAL read-query handle: no .lock, no create/migration.
             // It is intentionally not a raw SQLite READ_ONLY connection.
             Store::open_readonly(self.archive_root.join(".isyncyou-store.db"))
-                .map_err(|e| AgentError::Provider(format!("store open: {e}")))
+                .map_err(|_| AgentError::Provider("archive_store_unavailable".into()))
         }
 
         fn body_path(&self, rel: &str) -> Result<PathBuf, AgentError> {
@@ -119,10 +127,10 @@ mod store_backed {
             let root = self
                 .archive_root
                 .canonicalize()
-                .map_err(|e| AgentError::Provider(format!("archive root: {e}")))?;
+                .map_err(|_| AgentError::Provider("archive_body_unavailable".into()))?;
             let path = joined
                 .canonicalize()
-                .map_err(|e| AgentError::Provider(format!("body path: {e}")))?;
+                .map_err(|_| AgentError::Provider("archive_body_unavailable".into()))?;
             if !path.starts_with(&root) {
                 return Err(AgentError::ToolArgs(format!("path escape rejected: {rel}")));
             }
@@ -136,27 +144,33 @@ mod store_backed {
         }
 
         fn search_names(&self, query: &str) -> Result<Vec<ItemRef>, AgentError> {
+            let Some(query) = literal_fts_query(query) else {
+                return Ok(Vec::new());
+            };
             let store = self.open_readonly()?;
             Ok(store
-                .search_names(&self.account, query)
-                .map_err(|e| AgentError::Provider(e.to_string()))?
+                .search_names(&self.account, &query)
+                .map_err(|_| AgentError::Provider("archive_query_failed".into()))?
                 .into_iter()
                 .map(to_ref)
                 .collect())
         }
 
         fn search_bodies(&self, query: &str) -> Result<Vec<(String, String)>, AgentError> {
+            let Some(query) = literal_fts_query(query) else {
+                return Ok(Vec::new());
+            };
             let store = self.open_readonly()?;
             store
-                .search_bodies(&self.account, query)
-                .map_err(|e| AgentError::Provider(e.to_string()))
+                .search_bodies(&self.account, &query)
+                .map_err(|_| AgentError::Provider("archive_query_failed".into()))
         }
 
         fn get(&self, service: &str, id: &str) -> Result<Option<ItemRef>, AgentError> {
             let store = self.open_readonly()?;
             Ok(store
                 .get_item(&self.account, service, id)
-                .map_err(|e| AgentError::Provider(e.to_string()))?
+                .map_err(|_| AgentError::Provider("archive_query_failed".into()))?
                 .map(to_ref))
         }
 
@@ -169,7 +183,7 @@ mod store_backed {
             })?;
             let path = self.body_path(&rel)?;
             isyncyou_core::envelope::read_body(&path)
-                .map_err(|e| AgentError::Provider(format!("read body: {e}")))
+                .map_err(|_| AgentError::Provider("archive_body_unavailable".into()))
         }
 
         fn list_page(
@@ -181,7 +195,7 @@ mod store_backed {
             let store = self.open_readonly()?;
             let items = store
                 .items_by_service_page(&self.account, service, limit, offset)
-                .map_err(|e| AgentError::Provider(e.to_string()))?;
+                .map_err(|_| AgentError::Provider("archive_query_failed".into()))?;
             Ok(items.into_iter().map(to_ref).collect())
         }
 
@@ -189,7 +203,7 @@ mod store_backed {
             let store = self.open_readonly()?;
             Ok(store
                 .roots(&self.account, service)
-                .map_err(|e| AgentError::Provider(e.to_string()))?
+                .map_err(|_| AgentError::Provider("archive_query_failed".into()))?
                 .into_iter()
                 .map(to_ref)
                 .collect())
@@ -199,7 +213,7 @@ mod store_backed {
             let store = self.open_readonly()?;
             Ok(store
                 .children(&self.account, service, Some(parent))
-                .map_err(|e| AgentError::Provider(e.to_string()))?
+                .map_err(|_| AgentError::Provider("archive_query_failed".into()))?
                 .into_iter()
                 .map(to_ref)
                 .collect())
@@ -209,7 +223,7 @@ mod store_backed {
             let store = self.open_readonly()?;
             store
                 .count_by_service(&self.account, service)
-                .map_err(|e| AgentError::Provider(e.to_string()))
+                .map_err(|_| AgentError::Provider("archive_query_failed".into()))
         }
     }
 }
@@ -255,7 +269,7 @@ impl BodyKeyTestGuard {
         let guard = BODY_KEY_TEST_LOCK
             .get_or_init(|| std::sync::Mutex::new(()))
             .lock()
-            .unwrap();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         isyncyou_core::envelope::reset_body_keys_for_tests();
         Self { _guard: guard }
     }
@@ -315,7 +329,7 @@ mod store_archive_tests {
         let archive = StoreArchive::new("me", dir.path());
         let err = archive.read_body("mail", "m1").unwrap_err();
         assert!(
-            err.to_string().contains("no body key"),
+            err.to_string().contains("archive_body_unavailable"),
             "missing key must fail closed, got {err}"
         );
     }
@@ -331,6 +345,28 @@ mod store_archive_tests {
         let archive = StoreArchive::new("me", dir.path());
         let item = archive.get("mail", "m1").unwrap().unwrap();
         assert_eq!(item.name, "Mail item");
+    }
+
+    #[test]
+    fn store_archive_treats_model_search_as_literal_fts_terms() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join(".isyncyou-store.db")).unwrap();
+        store
+            .upsert_item(&Item::new(
+                "me",
+                "mail",
+                "m1",
+                "Quarterly report",
+                "message",
+            ))
+            .unwrap();
+        drop(store);
+
+        let archive = StoreArchive::new("me", dir.path());
+        assert_eq!(archive.search_names("quarterly report").unwrap().len(), 1);
+        assert!(archive.search_names("*").unwrap().is_empty());
+        assert!(archive.search_names("\"").unwrap().is_empty());
+        assert!(archive.search_names("   ").unwrap().is_empty());
     }
 
     #[test]

@@ -1189,6 +1189,10 @@ pub fn recover_cloud_write_op<S: OneDriveWriteSink + OneDriveShareSink>(
         .and_then(|v| v.as_str())
         .map(PathBuf::from);
 
+    if intent.get("source_kind").and_then(|value| value.as_str()) == Some("mutation_intent") {
+        return Err("mutation_intent_resume_required".into());
+    }
+
     let outcome = match kind {
         // 404 == already gone → success. The only blind-replay-safe kind.
         CloudOpKind::Delete => {
@@ -1296,6 +1300,21 @@ fn cloud_write_body_source_missing(op: &CloudWriteOp) -> bool {
         CloudOpKind::parse(&op.op_kind),
         Some(CloudOpKind::Upload) | Some(CloudOpKind::Replace)
     ) {
+        return false;
+    }
+    if op
+        .intent_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .and_then(|value| {
+            value
+                .get("source_kind")
+                .and_then(|kind| kind.as_str())
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some("mutation_intent")
+    {
         return false;
     }
     match op
@@ -1504,6 +1523,173 @@ pub fn replace_via_ledger(
         };
         run_cloud_write(store, account, &w, sink, secret, now_secs())
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn streamed_body_via_ledger<F>(
+    cfg: &Config,
+    account: &str,
+    kind: CloudOpKind,
+    target_id: &str,
+    name: &str,
+    etag: Option<&str>,
+    total_bytes: u64,
+    content_sha256: &str,
+    mut read_range: F,
+) -> Result<WriteOutcome, String>
+where
+    F: FnMut(u64, usize) -> Result<Vec<u8>, String>,
+{
+    with_ledger(cfg, account, |store, sink, secret| {
+        let write = CloudWrite {
+            kind,
+            target_id: target_id.to_string(),
+            name: name.to_string(),
+            new_parent_id: None,
+            if_match: etag.map(str::to_string),
+            local_path: None,
+            content_tag: Some(content_sha256.to_string()),
+        };
+        let (op_id, key) = write.keys(secret, account);
+        let op = CloudWriteOp {
+            op_id: op_id.clone(),
+            account_id: account.to_string(),
+            service: SERVICE.to_string(),
+            op_kind: kind.as_str().to_string(),
+            target_id: Some(target_id.to_string()),
+            idempotency_key: key.clone(),
+            if_match_etag: etag.map(str::to_string),
+            state: "pending".into(),
+            result_id: None,
+            intent_json: Some(
+                serde_json::json!({
+                    "name": name,
+                    "new_parent_id": null,
+                    "local_path": null,
+                    "source_kind": "mutation_intent",
+                    "total_bytes": total_bytes,
+                    "content_sha256": content_sha256,
+                })
+                .to_string(),
+            ),
+            attempts: 0,
+            last_error: None,
+        };
+        if !store
+            .record_cloud_write(&op, now_secs())
+            .map_err(|error| error.to_string())?
+        {
+            let existing = store
+                .cloud_write_by_key(account, &key)
+                .map_err(|error| error.to_string())?
+                .ok_or("streaming ledger row vanished")?;
+            if existing.state == "applied" {
+                return Ok(WriteOutcome::Applied(
+                    existing.result_id.unwrap_or_default(),
+                ));
+            }
+            if existing.state == "conflict" {
+                return Ok(WriteOutcome::Conflict);
+            }
+            if kind == CloudOpKind::Upload {
+                if let Some(id) = sink.find_child(target_id, name)? {
+                    store
+                        .set_cloud_write_state(&op_id, "applied", Some(&id), None, now_secs())
+                        .map_err(|error| error.to_string())?;
+                    return Ok(WriteOutcome::Applied(id));
+                }
+            }
+        }
+        store
+            .set_cloud_write_state(&op_id, "inflight", None, None, now_secs())
+            .map_err(|error| error.to_string())?;
+        let outcome = match kind {
+            CloudOpKind::Upload => {
+                sink.upload_to_parent_streaming(target_id, name, total_bytes, |offset, len| {
+                    read_range(offset, len).map_err(isyncyou_graph::UploadError::Parse)
+                })
+            }
+            CloudOpKind::Replace => sink.replace_content_streaming_if_match(
+                target_id,
+                etag.unwrap_or(""),
+                total_bytes,
+                |offset, len| read_range(offset, len).map_err(isyncyou_graph::UploadError::Parse),
+            ),
+            _ => return Err("unsupported streaming cloud-write kind".into()),
+        }
+        .map_err(|error| error.to_string())?;
+        match outcome {
+            isyncyou_graph::StreamUploadOutcome::Applied(value) => {
+                let id = value
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                store
+                    .set_cloud_write_state(&op_id, "applied", non_empty(&id), None, now_secs())
+                    .map_err(|error| error.to_string())?;
+                Ok(WriteOutcome::Applied(id))
+            }
+            isyncyou_graph::StreamUploadOutcome::Conflict => {
+                store
+                    .set_cloud_write_state(&op_id, "conflict", None, None, now_secs())
+                    .map_err(|error| error.to_string())?;
+                Ok(WriteOutcome::Conflict)
+            }
+        }
+    })
+}
+
+pub fn upload_streaming_via_ledger<F>(
+    cfg: &Config,
+    account: &str,
+    parent_id: &str,
+    name: &str,
+    total_bytes: u64,
+    content_sha256: &str,
+    read_range: F,
+) -> Result<String, String>
+where
+    F: FnMut(u64, usize) -> Result<Vec<u8>, String>,
+{
+    streamed_body_via_ledger(
+        cfg,
+        account,
+        CloudOpKind::Upload,
+        parent_id,
+        name,
+        None,
+        total_bytes,
+        content_sha256,
+        read_range,
+    )
+    .map(applied_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn replace_streaming_via_ledger<F>(
+    cfg: &Config,
+    account: &str,
+    item_id: &str,
+    etag: &str,
+    total_bytes: u64,
+    content_sha256: &str,
+    read_range: F,
+) -> Result<WriteOutcome, String>
+where
+    F: FnMut(u64, usize) -> Result<Vec<u8>, String>,
+{
+    streamed_body_via_ledger(
+        cfg,
+        account,
+        CloudOpKind::Replace,
+        item_id,
+        "",
+        Some(etag),
+        total_bytes,
+        content_sha256,
+        read_range,
+    )
 }
 
 /// Create or return a OneDrive sharing link through the crash-safe cloud-write ledger.

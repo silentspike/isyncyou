@@ -673,15 +673,21 @@ a:hover { text-decoration: underline; }
    z-index:auto and the positioned scrim paints on top of it, swallowing every tap on
    the menu's buttons (reconnect / sign-out were unclickable; only the curl-driven API
    path was ever exercised). Found on-device while wiring standalone sign-in (#89). */
-.acct-menu { z-index: 71; position: fixed; left: var(--sp-3); bottom: 72px; width: 320px; max-width: calc(100vw - 24px); max-height: 70vh; overflow: auto;
+.acct-menu { z-index: 71; position: fixed; left: var(--sp-3); bottom: 72px; width: 360px; max-width: calc(100vw - 24px); max-height: 70vh; overflow: auto;
   background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--r-md, 12px); box-shadow: 0 12px 40px rgba(0,0,0,.5); }
 .acct-menu-head { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3); font-weight: 600; border-bottom: 1px solid var(--line); }
 .acct-menu-body { padding: var(--sp-2); display: flex; flex-direction: column; gap: 2px; }
-.acct-row { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2); border-radius: var(--r-sm); }
+.acct-row { display: flex; flex-direction: column; align-items: stretch; gap: var(--sp-2); padding: var(--sp-2); border-radius: var(--r-sm); }
 .acct-row.active { background: color-mix(in oklab, var(--accent) 12%, transparent); }
 .acct-row:hover { background: var(--bg-2); }
+.acct-main { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
 .acct-pick { display: flex; flex-direction: column; align-items: flex-start; text-align: left; background: transparent; border: 0; color: inherit; cursor: pointer; min-width: 0; }
 .acct-acts { display: flex; gap: 4px; flex: none; }
+.acct-roles { display: flex; flex-direction: column; gap: 1px; margin-left: 42px; }
+.acct-role { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; align-items: center; gap: var(--sp-2); min-height: 38px; padding: 4px 0; }
+.acct-role-icon { display: grid; place-items: center; color: var(--text-mid); }
+.acct-role-copy { display: flex; flex-direction: column; min-width: 0; font-size: var(--fs-xs); }
+.acct-role-copy b, .acct-role-copy span { overflow-wrap: anywhere; }
 .acct-note { padding: var(--sp-2) var(--sp-3); font-size: var(--fs-xs); line-height: 1.5; border-top: 1px solid var(--line); margin-top: var(--sp-1); }
 .acct-dc { padding: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-2); align-items: flex-start; }
 .acct-dc-title { font-weight: 600; }
@@ -826,7 +832,8 @@ a:hover { text-decoration: underline; }
    .view (OneDrive/Calendar/ToDo) so it drops its own side padding + divider. */
 .con-metrics-row.inset { padding: 0; border-bottom: 0; margin-bottom: var(--sp-5); }
 /* thin right-aligned action strip for views without a toolbar (ToDo/OneNote) */
-.view-actions { display: flex; justify-content: flex-end; margin-bottom: var(--sp-4); }
+.view-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: var(--sp-2); margin-bottom: var(--sp-4); }
+.view-actions [hidden] { display: none !important; }
 /* KPI cards in the top band are glassy → the constellation shimmers through them */
 .con-metrics-row .con-metric.card { background: color-mix(in oklab, var(--bg-1) 62%, transparent); backdrop-filter: blur(7px); -webkit-backdrop-filter: blur(7px); }
 .con-metric { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-3) var(--sp-4); flex: 1 1 150px; min-width: 0; }
@@ -957,6 +964,8 @@ a:hover { text-decoration: underline; }
   background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r-md); padding: var(--sp-2) var(--sp-3);
   color: var(--text-hi); margin-bottom: 6px; transition: border-color var(--t-fast) var(--ease); }
 .todo-task:hover { border-color: var(--line-2); background: var(--bg-hover); }
+.todo-task.selected { border-color: var(--accent); background: var(--accent-soft); }
+.todo-task.selected .todo-check { color: var(--accent); }
 .todo-check { flex: none; color: var(--text-lo); margin-top: 1px; }
 .todo-check.prog { color: var(--warn); }
 .todo-check.done { color: var(--ok); }
@@ -1072,14 +1081,6 @@ a.note-meta-chip:hover { color: var(--accent); }
   .nav-item.active::before { display: none; }
   .view { padding: var(--sp-4); padding-bottom: 76px; }
   .view-title { font-size: var(--fs-xl); }
-  .assistant-view { min-height: calc(100dvh - 76px - (2 * var(--sp-4))); }
-  .assistant-body { min-height: auto; }
-  .assistant-toolbar { gap: var(--sp-1); margin-bottom: var(--sp-2); }
-  .assistant-transcript { flex: none; min-height: 220px; overflow: visible; padding-bottom: 5.5rem; }
-  .assistant-pending-host { padding-bottom: 5.5rem; }
-  .assistant-message .asst-bubble { max-width: 92%; }
-  .assistant-composer { position: static; bottom: auto; padding-bottom: env(safe-area-inset-bottom, 0px); }
-  .asst-inputrow { align-items: flex-end; }
   /* the topbar (route name + global-search + settings) duplicates the per-view
      content + bottom nav on a phone — hide it. Settings is reachable from the
      Overview tab's Settings button; each view has its own search. */
@@ -1407,6 +1408,52 @@ a.note-meta-chip:hover { color: var(--accent); }
   justify-content: flex-end;
   gap: var(--sp-2);
 }
+.assistant-session-dialog {
+  max-height: min(42rem, calc(100vh - 2rem));
+  overflow-y: auto;
+}
+.assistant-session-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+.assistant-session-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: var(--sp-2) 0;
+  border-bottom: 1px solid var(--line);
+}
+.assistant-session-name {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.assistant-session-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: var(--sp-1);
+}
+.assistant-session-actions .btn {
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+}
+.assistant-session-import {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+.assistant-pairing-code {
+  width: 100%;
+  margin-bottom: var(--sp-3);
+  resize: none;
+  overflow-wrap: anywhere;
+}
 @media (max-width: 720px) {
   .assistant-lifecycle-row {
     align-items: stretch;
@@ -1414,6 +1461,12 @@ a.note-meta-chip:hover { color: var(--accent); }
   }
   .assistant-lifecycle-actions {
     justify-content: flex-start;
+  }
+  .assistant-session-row {
+    align-items: flex-start;
+  }
+  .assistant-session-import {
+    grid-template-columns: 1fr;
   }
 }
 /* #639 T10: the ordered first-run handoff steps. */
@@ -1501,6 +1554,8 @@ a.note-meta-chip:hover { color: var(--accent); }
   text-align: left;
 }
 .assistant-toolbar {
+  position: relative;
+  z-index: 2;
   display: flex;
   align-items: center;
   flex-wrap: wrap;
@@ -1666,6 +1721,7 @@ a.note-meta-chip:hover { color: var(--accent); }
   padding: var(--sp-2) 0 0;
   background: linear-gradient(180deg, transparent, var(--bg-0) 32%);
 }
+.assistant-composer [hidden] { display: none !important; }
 .asst-inputrow {
   display: flex;
   gap: var(--sp-2);
@@ -1678,12 +1734,27 @@ a.note-meta-chip:hover { color: var(--accent); }
   max-height: 160px;
 }
 .assistant-composer-note {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
   font-size: var(--fs-sm);
   padding-bottom: var(--sp-1);
+}
+@media (max-width: 720px) {
+  .assistant-view { min-height: calc(100dvh - 76px - (2 * var(--sp-4))); }
+  .assistant-body { min-height: auto; }
+  .assistant-toolbar { gap: var(--sp-1); margin-bottom: var(--sp-2); }
+  .assistant-transcript { flex: none; min-height: 220px; overflow: visible; padding-bottom: 5.5rem; }
+  .assistant-pending-host { padding-bottom: 5.5rem; }
+  .assistant-message .asst-bubble { max-width: 92%; }
+  .assistant-composer { position: static; bottom: auto; padding-bottom: env(safe-area-inset-bottom, 0px); }
+  .asst-inputrow { align-items: flex-end; }
 }
 
 /* ── Assistant model picker: in-UI dropdown with spring unfold ───────────── */
 .mdl { position: relative; display: inline-block; }
+.mdl.open { z-index: 61; }
 .mdl-trigger {
   display: inline-flex; align-items: center; gap: var(--sp-1);
   font-size: var(--fs-sm); font-weight: 500; color: var(--text-hi);
@@ -1723,6 +1794,21 @@ a.note-meta-chip:hover { color: var(--accent); }
 .mdl-dot { width: 8px; height: 8px; border-radius: var(--r-full); background: var(--text-lo); opacity: .45; flex: none; transition: background .13s; }
 .mdl-item.active .mdl-dot { background: var(--grad-accent); opacity: 1; box-shadow: 0 0 8px color-mix(in oklab, var(--accent) 70%, transparent); }
 .mdl-lbl { flex: 1; }
+.mdl-efforts {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px;
+  padding: 4px 6px 7px;
+}
+.mdl-effort {
+  min-width: 0; padding: 7px 8px; border: 1px solid var(--glass-border);
+  border-radius: var(--r-md); background: transparent; color: var(--text-mid);
+  font-size: var(--fs-sm); cursor: pointer;
+}
+.mdl-effort:hover { background: var(--accent-soft); color: var(--text-hi); }
+.mdl-effort.active {
+  border-color: var(--accent-line);
+  background: color-mix(in oklab, var(--accent) 18%, transparent);
+  color: var(--text-hi); font-weight: 600;
+}
 .mdl-connect { color: var(--accent-2); font-weight: 500; }
 .mdl-plus { width: 8px; text-align: center; font-weight: 700; flex: none; }
 /* staggered fade-in of each row when the panel opens */

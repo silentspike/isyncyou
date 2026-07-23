@@ -58,7 +58,7 @@ object BodyKeyStore {
                 Result(KEY_ID, data, true)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "encrypted storage setup failed; local data was not opened", e)
+            Log.e(TAG, "encrypted_storage_setup_failed")
             throw EncryptedStorageSetupException("Encrypted storage setup failed", e)
         }
     }

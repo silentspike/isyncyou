@@ -19,6 +19,7 @@ const OUT_DIR = outFlag >= 0
   ? path.resolve(REPO, process.argv[outFlag + 1])
   : path.join(REPO, "docs/evidence/artifacts/issue-622");
 const AGENT_CAP = "fixture-agent-cap";
+const ACCOUNT_CAP = "fixture-account-cap";
 const ACCOUNT = "fixture";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -27,7 +28,8 @@ const readText = (p) => fs.readFileSync(path.join(REPO, p), "utf8");
 function fixtureAppJs() {
   return readText("gui/webui/src/app.js").replace(
     /__([A-Z0-9_]+_CAP_TOKEN)__/g,
-    (_m, token) => (token === "AGENT_CAP_TOKEN" ? AGENT_CAP : ""),
+    (_m, token) => token === "AGENT_CAP_TOKEN" ? AGENT_CAP
+      : token === "ACCOUNT_CAP_TOKEN" ? ACCOUNT_CAP : "",
   );
 }
 
@@ -53,6 +55,18 @@ function text(res, status, body, contentType) {
 
 function checkAgentCap(req) {
   return req.headers["x-capability-token"] === AGENT_CAP;
+}
+
+function checkAccountCap(req) {
+  return req.headers["x-capability-token"] === ACCOUNT_CAP;
+}
+
+async function readJson(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const body = Buffer.concat(chunks);
+  if (body.length > 64 * 1024) throw new Error("fixture body too large");
+  return JSON.parse(body.toString("utf8"));
 }
 
 function sendSseMessage(res, obj) {
@@ -117,7 +131,7 @@ async function sendStream(res, scenario, turn) {
       pending_id: `pending-${turn}`,
       token: `fixture-token-${turn}`,
       action_hash: `fixture-hash-${turn}`,
-      preview: "Delete archived fixture item",
+      preview: "Delete this archived item",
       risk: "destructive",
       expires_at_ms: Date.now() + 600000,
     });
@@ -136,17 +150,28 @@ function makeFixtureServer(evidence) {
   let agentConnected = false;
   let agentProvider = "claude";
   let agentModel = "claude-sonnet-4";
+  let agentReasoningEffort = "medium";
   let onboardingMode = "not_started";
   let oauthAttemptSeq = 0;
   let turnSeq = 0;
+  let selectedSessionId = null;
+  let failNextSessionCreate = false;
+  const sessions = new Map();
   const turns = new Map();
+  const activeTurnStreams = new Map();
+  const requestScenarios = new Map();
   const state = {
+    accountLoginStarts: [],
+    accountLoginCancels: [],
+    accountLoginPollState: "pending",
     oauthStarts: [],
     modelPosts: [],
     confirmPosts: [],
     cancelPosts: [],
+    turnCancelPosts: [],
     viewHits: [],
     streamScenarios: [],
+    requestStatusReads: [],
   };
 
   // #639 T10: the host onboarding projection the wizard renders (per-provider readiness + steps).
@@ -168,6 +193,13 @@ function makeFixtureServer(evidence) {
     connected: agentConnected,
     provider: agentProvider,
     model: agentModel,
+    reasoning_effort: agentProvider === "codex" ? agentReasoningEffort : "",
+    reasoning_efforts: [
+      { id: "low", label: "Light" },
+      { id: "medium", label: "Medium" },
+      { id: "high", label: "High" },
+      { id: "xhigh", label: "Extra High" },
+    ],
     claude: agentConnected && agentProvider === "claude",
     codex: agentConnected && agentProvider === "codex",
     onboarding: {
@@ -184,7 +216,9 @@ function makeFixtureServer(evidence) {
         { id: "claude-opus-4", label: "Claude Opus 4" },
       ],
       codex: [
-        { id: "gpt-5-codex", label: "GPT-5 Codex" },
+        { id: "gpt-5.6-sol", label: "GPT-5.6 Sol" },
+        { id: "gpt-5.6-terra", label: "GPT-5.6 Terra" },
+        { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
       ],
     },
   });
@@ -209,7 +243,14 @@ function makeFixtureServer(evidence) {
         res.writeHead(204);
         res.end();
       } else if (req.method === "GET" && url.pathname === "/api/v1/accounts") {
-        json(res, 200, { accounts: [{ id: ACCOUNT, username: "Fixture account" }] });
+        json(res, 200, { accounts: [{
+          id: ACCOUNT,
+          username: "Fixture account",
+          auth: {
+            reader: { state: "connected", identity_verified: true },
+            writer: { state: "connected", identity_verified: true },
+          },
+        }] });
       } else if (req.method === "GET" && url.pathname === "/api/v1/status") {
         json(res, 200, {
           services: [
@@ -237,14 +278,44 @@ function makeFixtureServer(evidence) {
         res.write(": fixture-ready\n\n");
       } else if (req.method === "GET" && url.pathname === "/api/v1/agent/status") {
         json(res, 200, statusBody());
+      } else if (req.method === "POST" && url.pathname === "/api/v1/account/login/start") {
+        if (!checkAccountCap(req)) return json(res, 403, { error: "bad capability" });
+        const body = await readJson(req);
+        const sequence = state.accountLoginStarts.length + 1;
+        const loginId = `fixture-login-${sequence}`;
+        const authorizationUri = `http://${req.headers.host}/fixture-account-auth?prompt=select_account&state=${"s".repeat(42)}${sequence}&attempt=${sequence}`;
+        state.accountLoginStarts.push({ account: body.account, role: body.role, loginId, authorizationUri });
+        json(res, 200, {
+          flow: "authorization_code_pkce",
+          role: body.role,
+          login_id: loginId,
+          authorization_uri: authorizationUri,
+        });
+      } else if (req.method === "POST" && url.pathname === "/api/v1/account/login/poll") {
+        if (!checkAccountCap(req)) return json(res, 403, { error: "bad capability" });
+        await readJson(req);
+        const role = state.accountLoginStarts.at(-1)?.role || "reader";
+        json(res, 200, state.accountLoginPollState === "error"
+          ? { state: "error", code: "account_authorization_failed", role }
+          : { state: state.accountLoginPollState, role });
+      } else if (req.method === "POST" && url.pathname === "/api/v1/account/login/cancel") {
+        if (!checkAccountCap(req)) return json(res, 403, { error: "bad capability" });
+        const body = await readJson(req);
+        state.accountLoginCancels.push({
+          matched: state.accountLoginStarts.some((attempt) => attempt.loginId === body.id),
+        });
+        json(res, 200, { cancelled: true });
+      } else if (req.method === "GET" && url.pathname === "/fixture-account-auth") {
+        text(res, 200, "<!doctype html><title>Account picker fixture</title>", "text/html; charset=utf-8");
       } else if (req.method === "POST" && url.pathname === "/api/v1/agent/connectivity/preflight") {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
         json(res, 200, { status: "ready", code: "ready", retryable: false, settings_hint: "none" });
       } else if (req.method === "POST" && url.pathname === "/api/v1/agent/oauth/start") {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
-        state.oauthStarts.push(Object.fromEntries(url.searchParams.entries()));
+        const body = await readJson(req);
+        state.oauthStarts.push(body);
         agentConnected = true;
-        agentProvider = url.searchParams.get("provider") === "codex" ? "codex" : "claude";
+        agentProvider = body.provider === "codex" ? "codex" : "claude";
         onboardingMode = "ready";
         json(res, 200, {
           authorize_url: `http://${req.headers.host}/fixture-auth-complete`,
@@ -262,33 +333,101 @@ function makeFixtureServer(evidence) {
         );
       } else if (req.method === "POST" && url.pathname === "/api/v1/agent/model") {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
-        state.modelPosts.push(Object.fromEntries(url.searchParams.entries()));
-        agentProvider = url.searchParams.get("provider") || agentProvider;
-        agentModel = url.searchParams.get("model") || agentModel;
+        const body = await readJson(req);
+        state.modelPosts.push(body);
+        agentProvider = body.provider || agentProvider;
+        agentModel = body.model || agentModel;
+        if (agentProvider === "codex") agentReasoningEffort = body.reasoning_effort || "medium";
         json(res, 200, { ok: true });
+      } else if (req.method === "GET" && url.pathname === "/api/v1/agent/session/list") {
+        if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
+        json(res, 200, {
+          sessions: [...sessions.values()].map(({ records: _records, ...session }) => session),
+          selected_session_id: selectedSessionId,
+          next_cursor: null,
+        });
+      } else if (req.method === "POST" && url.pathname === "/api/v1/agent/session/create") {
+        if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
+        await readJson(req);
+        if (failNextSessionCreate) {
+          failNextSessionCreate = false;
+          return json(res, 200, { session: null });
+        }
+        const sessionId = `session-${sessions.size + 1}`;
+        const session = { session_id: sessionId, display_name: "Assistant", archived: false };
+        sessions.set(sessionId, { ...session, records: [] });
+        selectedSessionId = sessionId;
+        json(res, 200, { session });
+      } else if (req.method === "POST" && url.pathname === "/api/v1/agent/session/select") {
+        if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
+        const body = await readJson(req);
+        if (!sessions.has(body.session_id)) return json(res, 404, { error: "session_not_found" });
+        selectedSessionId = body.session_id;
+        json(res, 200, { selected: true });
+      } else if (req.method === "GET" && url.pathname === "/api/v1/agent/session/history") {
+        if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
+        const session = sessions.get(url.searchParams.get("session_id"));
+        if (!session) return json(res, 404, { error: "session_not_found" });
+        json(res, 200, { records: session.records, next_cursor: null });
+      } else if (req.method === "GET" && url.pathname === "/api/v1/agent/request/status") {
+        if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
+        const requestId = url.searchParams.get("request_id") || "";
+        const scenario = requestScenarios.get(requestId);
+        state.requestStatusReads.push({ matched: Boolean(scenario) });
+        if (!scenario) return json(res, 404, { error: "request_not_found" });
+        json(res, 200, scenario === "error"
+          ? { state: "outcome_unknown", code: "turn_outcome_unknown", terminal: true, resume_allowed: false }
+          : { state: "committed", code: "ok", terminal: true, resume_allowed: false });
       } else if (req.method === "POST" && url.pathname === "/api/v1/agent/turn") {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
-        const prompt = url.searchParams.get("prompt") || "";
+        const body = await readJson(req);
+        const prompt = body.prompt || "";
         const turn = `turn-${++turnSeq}`;
         const lower = prompt.toLowerCase();
-        const scenario = lower.includes("error") ? "error"
+        const scenario = lower.includes("slow cancellation") ? "slow-cancel"
+          : lower.includes("error") ? "error"
           : lower.includes("cancel") ? "pending-cancel"
             : lower.includes("delete") || lower.includes("confirm") ? "pending-confirm"
               : "normal";
         turns.set(turn, scenario);
+        requestScenarios.set(body.request_id, scenario);
         json(res, 200, { turn });
       } else if (req.method === "GET" && url.pathname === "/api/v1/agent/stream") {
         const turn = url.searchParams.get("turn") || "";
         const scenario = turns.get(turn) || "normal";
         state.streamScenarios.push({ turn, scenario });
-        await sendStream(res, scenario, turn);
+        if (scenario === "slow-cancel") {
+          res.writeHead(200, {
+            "content-type": "text/event-stream; charset=utf-8",
+            "cache-control": "no-cache, no-transform",
+            connection: "keep-alive",
+          });
+          res.write(": ready\n\n");
+          activeTurnStreams.set(turn, res);
+          res.on("close", () => activeTurnStreams.delete(turn));
+        } else {
+          await sendStream(res, scenario, turn);
+        }
+      } else if (req.method === "POST" && url.pathname === "/api/v1/agent/turn/cancel") {
+        if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
+        const body = await readJson(req);
+        state.turnCancelPosts.push(body);
+        json(res, 200, { ok: true });
+        const stream = activeTurnStreams.get(body.turn_id);
+        if (stream) {
+          sendSseMessage(stream, { event: "done", reason: "cancelled" });
+          stream.end();
+          activeTurnStreams.delete(body.turn_id);
+        }
       } else if (req.method === "POST" && url.pathname === "/api/v1/agent/confirm") {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
-        state.confirmPosts.push(Object.fromEntries(url.searchParams.entries()));
-        json(res, 200, { result: "Confirmed by fixture" });
-      } else if (req.method === "POST" && url.pathname === "/api/v1/agent/cancel") {
+        state.confirmPosts.push(await readJson(req));
+        json(res, 200, {
+          result: '{"status":"ok","op":"live-write","account":"me","service":"mail","verb":"set_read"}',
+        });
+      } else if (req.method === "POST" && url.pathname === "/api/v1/agent/pending/cancel") {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
-        state.cancelPosts.push(Object.fromEntries(url.searchParams.entries()));
+        state.cancelPosts.push(await readJson(req));
         json(res, 200, { ok: true });
       } else if (req.method === "GET" && url.pathname === "/api/v1/view") {
         state.viewHits.push(Object.fromEntries(url.searchParams.entries()));
@@ -314,6 +453,40 @@ function makeFixtureServer(evidence) {
     setOnboardingMode(mode) {
       onboardingMode = mode;
       agentConnected = mode === "ready";
+    },
+    setAgent(provider, model, reasoningEffort = "medium") {
+      agentConnected = true;
+      onboardingMode = "ready";
+      agentProvider = provider;
+      agentModel = model;
+      agentReasoningEffort = reasoningEffort;
+    },
+    failNextSessionCreate() {
+      failNextSessionCreate = true;
+    },
+    seedSelectedSessionHistory() {
+      const session = sessions.get(selectedSessionId);
+      if (!session) throw new Error("fixture session is unavailable");
+      session.records = [
+        {
+          kind: {
+            kind: "turn_intent",
+            user_text: "Persisted fixture question",
+          },
+        },
+        {
+          kind: {
+            kind: "assistant_result",
+            text: "Persisted fixture answer",
+            sources: [{
+              service: "mail",
+              item_id: "mail-1",
+              label: "Quarterly brief",
+            }],
+            usage: null,
+          },
+        },
+      ];
     },
   };
 }
@@ -354,6 +527,9 @@ function evidenceForWrite(evidence, state) {
   const closedModels = state.modelPosts
     .map((row) => row.model)
     .filter((model) => typeof model === "string" && /^[a-z0-9-]{1,64}$/.test(model));
+  const closedEfforts = state.modelPosts
+    .map((row) => row.reasoning_effort)
+    .filter((effort) => ["low", "medium", "high", "xhigh"].includes(effort));
 
   return {
     evidence_version: 2,
@@ -389,9 +565,14 @@ function evidenceForWrite(evidence, state) {
       oauth_providers: closedProviders,
       model_post_count: state.modelPosts.length,
       models: closedModels,
+      reasoning_efforts: closedEfforts,
       confirm_post_count: state.confirmPosts.length,
       cancel_post_count: state.cancelPosts.length,
+      turn_cancel_post_count: state.turnCancelPosts.length,
+      account_login_start_count: state.accountLoginStarts.length,
+      account_login_cancel_count: state.accountLoginCancels.length,
       view_hit_count: state.viewHits.length,
+      request_status_count: state.requestStatusReads.length,
       stream_scenarios: state.streamScenarios.map(({ scenario }) => scenario),
     },
     screenshots: evidence.screenshots,
@@ -462,7 +643,10 @@ async function main() {
     evidence.fixture_origin = origin;
 
     browser = await chromium.launch();
-    const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    const page = await browser.newPage({
+      viewport: { width: 1280, height: 900 },
+      reducedMotion: "reduce",
+    });
     page.on("console", (msg) => {
       if (msg.type() === "error") evidence.console_errors.push(msg.text());
     });
@@ -487,6 +671,11 @@ async function main() {
       const nativeFetch = window.fetch;
       window.fetch = (...args) => {
         record("fetch", args[0]);
+        const requestUrl = new URL(String(args[0]), location.href);
+        if (window.__agentSmokeFailNextStatus && requestUrl.pathname === "/api/v1/agent/status") {
+          window.__agentSmokeFailNextStatus = false;
+          return Promise.reject(new Error("fixture status unavailable"));
+        }
         return nativeFetch(...args);
       };
       const nativeOpen = XMLHttpRequest.prototype.open;
@@ -516,16 +705,78 @@ async function main() {
       }
     });
 
-    await page.goto(`${origin}/`, { waitUntil: "domcontentloaded" });
-    await page.waitForSelector('.nav-item[data-service="assistant"]', { timeout: 10000 });
+    await page.goto(`${origin}/#/settings`, { waitUntil: "domcontentloaded" });
+    const chooseAccount = page.locator("#view").getByRole("button", { name: "Choose Microsoft account" });
+    await chooseAccount.waitFor({ state: "visible" });
+    await chooseAccount.click();
+    const readerRole = page.locator(".acct-role").filter({ hasText: "iSyncYou Reader" });
+    const writerRole = page.locator(".acct-role").filter({ hasText: "iSyncYou Writer" });
+    assert(evidence, "account menu exposes independent Reader and Writer roles",
+      await readerRole.getByText("Connected").isVisible()
+      && await writerRole.getByText("Connected").isVisible());
+    await readerRole.getByTitle("Reconnect iSyncYou Reader").click();
+    await page.locator(".acct-menu .acct-dc-title").waitFor();
+    const accountMenuText = await page.locator(".acct-menu").innerText();
+    assert(evidence, "account reconnect renders picker flow without device code",
+      accountMenuText.includes("Connect iSyncYou Reader")
+      && accountMenuText.includes("Open Microsoft account picker")
+      && !accountMenuText.includes("enter this code"));
+    const accountPickerPopupPromise = page.waitForEvent("popup", { timeout: 2000 }).catch(() => null);
+    await page.locator(".acct-menu").getByRole("button", { name: "Open Microsoft account picker" }).click();
+    const accountPickerPopup = await accountPickerPopupPromise;
+    if (accountPickerPopup) {
+      await accountPickerPopup.waitForURL((value) => value.pathname === "/fixture-account-auth", { timeout: 5000 });
+      const pickerUrl = new URL(accountPickerPopup.url());
+      assert(evidence, "account picker launch uses select_account without verifier",
+        pickerUrl.searchParams.get("prompt") === "select_account"
+        && pickerUrl.searchParams.has("state")
+        && !pickerUrl.searchParams.has("code_verifier"));
+      await accountPickerPopup.close();
+    } else {
+      assert(evidence, "account picker launch uses select_account without verifier", false);
+    }
+    await page.locator(".acct-menu").getByRole("button", { name: "Cancel" }).click();
+    await page.waitForFunction(() => !document.querySelector(".acct-menu .acct-dc"));
+    assert(evidence, "account picker cancel closes exact backend attempt",
+      fixture.state.accountLoginStarts.length === 1
+      && fixture.state.accountLoginStarts[0].role === "reader"
+      && fixture.state.accountLoginCancels.length === 1
+      && fixture.state.accountLoginCancels[0].matched === true);
+    fixture.state.accountLoginPollState = "error";
+    await readerRole.getByTitle("Reconnect iSyncYou Reader").click();
+    await page.locator(".acct-menu .acct-dc-title").waitFor();
+    const stalePicker = page.locator(".acct-menu").getByRole("button", { name: "Open Microsoft account picker" });
+    await page.locator(".acct-menu").getByRole("button", { name: "Start sign-in again" }).waitFor({ timeout: 10000 });
+    assert(evidence, "terminal account attempt disables stale authorization url",
+      await stalePicker.isDisabled());
+    const endedAuthorizationUri = fixture.state.accountLoginStarts.at(-1).authorizationUri;
+    fixture.state.accountLoginPollState = "pending";
+    await page.locator(".acct-menu").getByRole("button", { name: "Start sign-in again" }).click();
+    await page.locator(".acct-menu").getByRole("button", { name: "Open Microsoft account picker" }).waitFor();
+    assert(evidence, "account sign-in retry creates a fresh backend attempt before browser launch",
+      fixture.state.accountLoginStarts.length === 3
+      && fixture.state.accountLoginStarts.at(-1).authorizationUri !== endedAuthorizationUri);
+    await page.locator(".acct-menu").getByRole("button", { name: "Cancel" }).click();
+    await page.waitForFunction(() => !document.querySelector(".acct-menu .acct-dc"));
+    await page.locator(".acct-menu-wrap .scrim").click({ position: { x: 1, y: 1 } });
+    await page.locator(".acct-menu").waitFor({ state: "detached" });
+    await page.goto(`${origin}/#/assistant`, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector('[data-testid="agent-setup"]', { timeout: 10000 });
     const assistantNavVisible = await page.locator('.nav-item[data-service="assistant"]').first().isVisible();
     assert(evidence, "desktop Assistant nav visible", assistantNavVisible);
-    await page.locator('.nav-item[data-service="assistant"]').first().click();
-    await page.waitForSelector('[data-testid="agent-setup"]', { timeout: 10000 });
     assert(evidence, "setup consent panel visible", await page.locator('[data-testid="agent-consent"]').isVisible());
     assert(evidence, "connect disabled before consent", await page.locator('[data-testid="agent-connect-codex"]').isDisabled());
     assert(evidence, "BYO key row absent", await page.locator('[data-agent-byo-key="unavailable"]').count() === 0);
     assert(evidence, "no editable secret input in setup", await page.locator('input[type="password"], input[name*="key" i], textarea[name*="key" i]').count() === 0);
+    const setupSessions = page.locator('[data-testid="agent-setup"] [data-agent-sessions="1"]');
+    assert(evidence, "session import remains available before provider sign-in", await setupSessions.isVisible());
+    await setupSessions.click();
+    const setupSessionDialog = page.getByRole("dialog", { name: "Assistant sessions" });
+    await setupSessionDialog.waitFor({ state: "visible", timeout: 10000 });
+    assert(evidence, "pre-sign-in session command opens the import dialog",
+      await setupSessionDialog.isVisible()
+      && await page.getByRole("textbox", { name: "Session transfer code" }).isVisible());
+    await setupSessionDialog.getByRole("button", { name: "Close" }).click();
     // #639 T10: the first-run handoff wizard renders the ordered official-sign-in -> ready steps.
     const wizardStepCount = await page.locator('[data-testid="agent-wizard-steps"] [data-agent-wizard-step]').count();
     assert(evidence, "handoff wizard renders 8 ordered steps", wizardStepCount === 8, { wizardStepCount });
@@ -626,6 +877,35 @@ async function main() {
     assert(evidence, "handoff DOM console and storage exclude capability and attempt secrets",
       !secretSurfaceText.includes(AGENT_CAP) && !secretSurfaceText.includes("fixture-attempt-"));
 
+    await page.evaluate(() => {
+      window.__agentSmokeFailNextStatus = true;
+      return renderAssistantView(document.querySelector("#view"));
+    });
+    await page.waitForSelector('[data-agent-status-unavailable="1"]', { timeout: 10000 });
+    assert(evidence, "transient status failure preserves the last verified connected surface",
+      await page.locator('[data-testid="agent-transcript"]').isVisible()
+      && await page.locator('[data-testid="agent-setup"]').count() === 0);
+    await page.locator('[data-agent-status-unavailable="1"]').getByRole("button", { name: "Retry" }).click();
+    await page.waitForFunction(() => !document.querySelector('[data-agent-status-unavailable="1"]'));
+
+    fixture.failNextSessionCreate();
+    await page.locator('[data-testid="agent-input"]').fill("Check shared session storage");
+    await page.locator('[data-testid="agent-send"]').click();
+    await page.waitForFunction(() => document.body.innerText.includes("Shared session storage is unavailable."), null, { timeout: 10000 });
+    const sessionTransportText = await pageText(page);
+    assert(evidence, "session transport failure renders safe actionable copy",
+      sessionTransportText.includes("Check your Microsoft 365 connection and try again.")
+      && !sessionTransportText.includes("SQLITE")
+      && !sessionTransportText.includes("database_open_failed"));
+    assert(evidence, "session transport failure blocks turns until explicit retry",
+      await page.locator('[data-testid="agent-input"]').isDisabled()
+      && await page.getByRole("button", { name: "Retry shared session" }).isVisible());
+    await page.getByRole("button", { name: "Retry shared session" }).click();
+    await page.waitForFunction(() => {
+      const input = document.querySelector('[data-testid="agent-input"]');
+      return input && !input.disabled;
+    });
+
     await page.locator('[data-testid="agent-input"]').fill("Find the quarterly brief");
     await page.locator('[data-testid="agent-send"]').click();
     await page.waitForFunction(() => document.body.innerText.includes("Here is "), null, { timeout: 10000 });
@@ -633,6 +913,20 @@ async function main() {
     assert(evidence, "first token appears incrementally", firstTokenText.includes("Here is ") && !firstTokenText.includes("a source-backed answer."));
     await page.waitForFunction(() => document.body.innerText.includes("a source-backed answer."), null, { timeout: 10000 });
     await page.waitForSelector('[data-agent-citation="view"]', { timeout: 10000 });
+    const toolCallText = await page.locator('[data-agent-tool-row="tool_call"]').first().innerText();
+    assert(evidence, "tool call UI uses product copy and hides internal operation fields",
+      toolCallText === "Searching your Microsoft 365 archive"
+      && !toolCallText.includes("archive.search")
+      && !toolCallText.includes("quarterly brief")
+      && !toolCallText.includes("limit")
+      && !toolCallText.includes("Tool call"));
+    const toolResultTitle = await page.locator('[data-agent-tool-row="tool_result"] .asst-tool-title').first().innerText();
+    const toolResultDetail = await page.locator('[data-agent-tool-row="tool_result"] .asst-tool-detail').first().innerText();
+    assert(evidence, "tool result UI exposes only source count and never raw result content",
+      toolResultTitle === "Sources checked"
+      && toolResultDetail === "1 source"
+      && !toolResultDetail.includes("items")
+      && !toolResultDetail.includes("mail-1"));
     const citationHref = await page.locator('[data-agent-citation="view"]').first().getAttribute("href");
     assert(evidence, "citation href same-origin path", citationHref && citationHref.startsWith("/api/v1/view?"), { citationHref });
     const popupPromise = page.waitForEvent("popup");
@@ -643,11 +937,62 @@ async function main() {
     await popup.close();
     evidence.screenshots.stream_citations = await screenshot(page, "stream-citations.png");
 
+    fixture.seedSelectedSessionHistory();
+    await page.goto(`${origin}/?session-hydration-smoke=1#/assistant`, { waitUntil: "domcontentloaded" });
+    await page.waitForFunction(() => document.body.innerText.includes("Persisted fixture answer"), null, { timeout: 10000 });
+    const hydratedTranscript = await page.locator('[data-testid="agent-transcript"]').innerText();
+    assert(evidence, "V2 tagged session history rehydrates question answer and source",
+      hydratedTranscript.includes("Persisted fixture question")
+      && hydratedTranscript.includes("Persisted fixture answer")
+      && await page.locator('[data-agent-citation="view"]').count() === 1);
+
     await page.locator('[data-testid="agent-model-picker"] .mdl-trigger').click();
     await page.locator('[data-agent-model-option="claude|claude-opus-4"]').click();
-    await page.waitForFunction(() => document.querySelector('[data-testid="agent-model-picker"]')?.innerText.includes("Claude Opus 4"), null, { timeout: 10000 });
+    await page.waitForFunction(() => document.querySelector('[data-testid="agent-model-picker"] .mdl-cur')?.innerText.includes("Claude Opus 4"), null, { timeout: 10000 });
     assert(evidence, "model picker posts model change", fixture.state.modelPosts.length === 1 && fixture.state.modelPosts[0].model === "claude-opus-4", fixture.state.modelPosts);
     assert(evidence, "usage chip shows unavailable state", (await page.locator('[data-testid="agent-usage"]').innerText()).includes("Usage unavailable"));
+
+    await page.locator('[data-testid="agent-input"]').fill("Run slow cancellation fixture");
+    await page.locator('[data-testid="agent-send"]').click();
+    const stopButton = page.locator('[data-testid="agent-stop"]');
+    await stopButton.waitFor({ state: "visible", timeout: 10000 });
+    const activeTurnControls = {
+      stop_enabled: await stopButton.isEnabled(),
+      input_disabled: await page.locator('[data-testid="agent-input"]').isDisabled(),
+      send_hidden: await page.locator('[data-testid="agent-send"]').isHidden(),
+    };
+    assert(evidence, "active turn exposes one stop command and locks the composer",
+      activeTurnControls.stop_enabled
+      && activeTurnControls.input_disabled
+      && activeTurnControls.send_hidden,
+      activeTurnControls);
+    await stopButton.click();
+    await page.waitForFunction(() => document.body.innerText.includes("Cancelled"), null, { timeout: 10000 });
+    assert(evidence, "turn stop posts once and restores the composer only after terminal cancellation",
+      fixture.state.turnCancelPosts.length === 1
+      && fixture.state.turnCancelPosts[0].turn_id?.startsWith("turn-")
+      && await stopButton.isHidden()
+      && await page.locator('[data-testid="agent-input"]').isEnabled());
+
+    fixture.setAgent("codex", "gpt-5.6-sol", "medium");
+    await page.goto(`${origin}/?codex-model-smoke=1#/assistant`, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector('[data-testid="agent-transcript"]', { timeout: 10000 });
+    await page.locator('[data-testid="agent-model-picker"] .mdl-trigger').click();
+    assert(evidence, "ChatGPT picker exposes Sol Terra and Luna",
+      await page.locator('[data-agent-model-option="codex|gpt-5.6-sol"]').isVisible()
+      && await page.locator('[data-agent-model-option="codex|gpt-5.6-terra"]').isVisible()
+      && await page.locator('[data-agent-model-option="codex|gpt-5.6-luna"]').isVisible());
+    await page.locator('[data-agent-model-option="codex|gpt-5.6-terra"]').click();
+    await page.waitForFunction(() => document.querySelector('[data-testid="agent-model-picker"] .mdl-cur')?.innerText.includes("GPT-5.6 Terra"), null, { timeout: 10000 });
+    await page.locator('[data-testid="agent-model-picker"] .mdl-trigger').click();
+    await page.locator('[data-agent-effort-option="high"]').click();
+    await page.waitForFunction(() => document.querySelector('[data-testid="agent-model-picker"] .mdl-cur')?.innerText.includes("GPT-5.6 Terra · High"), null, { timeout: 10000 });
+    const codexSelection = fixture.state.modelPosts.at(-1);
+    assert(evidence, "ChatGPT effort posts with the selected GPT-5.6 model",
+      codexSelection?.provider === "codex"
+      && codexSelection?.model === "gpt-5.6-terra"
+      && codexSelection?.reasoning_effort === "high",
+      fixture.state.modelPosts);
 
     await page.locator('[data-testid="agent-input"]').fill("Please delete the stale fixture item");
     await page.locator('[data-testid="agent-send"]').click();
@@ -662,11 +1007,20 @@ async function main() {
       && !pendingHtml.includes("pending-turn-2"));
     evidence.screenshots.pending_confirm = await screenshot(page, "pending-confirm.png");
     await confirmCard.getByRole("button", { name: "Confirm" }).click();
-    await page.waitForFunction(() => document.body.innerText.includes("Confirmed by fixture"), null, { timeout: 10000 });
+    await page.waitForFunction(() => document.body.innerText.includes("Completed successfully."), null, { timeout: 10000 });
     assert(evidence, "confirm posts once with pending token action_hash", fixture.state.confirmPosts.length === 1
       && fixture.state.confirmPosts[0].pending
       && fixture.state.confirmPosts[0].token?.startsWith("fixture-token-")
       && fixture.state.confirmPosts[0].action_hash?.startsWith("fixture-hash-"), fixture.state.confirmPosts);
+    assert(evidence, "confirmed action is terminal and exposes no stale controls",
+      (await confirmCard.getByRole("button").count()) === 0
+      && (await confirmCard.innerText()).includes("Action confirmed")
+      && (await confirmCard.innerText()).includes("Completed successfully.")
+      && !(await confirmCard.innerText()).includes("live-write")
+      && !(await confirmCard.innerText()).includes("set_read")
+      && !(await confirmCard.innerText()).includes("account")
+      && !(await confirmCard.innerText()).includes("Risk:")
+      && !(await confirmCard.innerText()).includes("Expires"));
 
     await page.locator('[data-testid="agent-input"]').fill("Please cancel the delete fixture item");
     await page.locator('[data-testid="agent-send"]').click();
@@ -674,16 +1028,47 @@ async function main() {
     const cancelCard = page.locator('[data-agent-pending-card="1"]').last();
     await cancelCard.getByRole("button", { name: "Cancel" }).click();
     await page.waitForFunction(() => Array.from(document.querySelectorAll('[data-agent-pending-card="1"]')).at(-1)?.classList.contains("cancelled"), null, { timeout: 10000 });
-    assert(evidence, "cancel posts once for separate turn", fixture.state.cancelPosts.length === 1 && fixture.state.cancelPosts[0].turn, fixture.state.cancelPosts);
+    assert(evidence, "pending cancel posts once for separate turn", fixture.state.cancelPosts.length === 1
+      && fixture.state.cancelPosts[0].pending?.startsWith("pending-turn-"), fixture.state.cancelPosts);
+    assert(evidence, "cancelled action is terminal and exposes no stale controls",
+      (await cancelCard.getByRole("button").count()) === 0
+      && (await cancelCard.innerText()).includes("Action cancelled")
+      && (await cancelCard.innerText()).includes("No changes were made.")
+      && !(await cancelCard.innerText()).includes("Risk:")
+      && !(await cancelCard.innerText()).includes("Expires"));
     evidence.screenshots.pending_cancel = await screenshot(page, "pending-cancel.png");
 
     await page.locator('[data-testid="agent-input"]').fill("trigger error");
     await page.locator('[data-testid="agent-send"]').click();
-    await page.waitForFunction(() => document.body.innerText.includes("The assistant could not complete this request."), null, { timeout: 10000 });
+    await page.waitForFunction(() => document.body.innerText.includes("The turn may have reached the provider"), null, { timeout: 10000 });
     const errorText = await pageText(page);
-    assert(evidence, "error stream renders only redacted safe copy",
-      errorText.includes("The assistant could not complete this request.")
+    assert(evidence, "ambiguous provider outcome is reconciled without automatic replay",
+      errorText.includes("The turn may have reached the provider")
+      && fixture.state.requestStatusReads.length >= 1
+      && fixture.state.requestStatusReads.every((entry) => entry.matched === true)
       && !errorText.includes("raw-fixture-provider-error"));
+
+    const desktopScroll = await page.evaluate(async () => {
+      const transcript = document.querySelector("#asst-log");
+      const view = document.querySelector("#view");
+      const probe = document.createElement("div");
+      probe.style.cssText = "height:2000px;flex:none";
+      transcript.append(probe);
+      transcript.scrollTop = 0;
+      view.scrollTop = 0;
+      scrollAssistantToEnd();
+      await new Promise(requestAnimationFrame);
+      await new Promise(requestAnimationFrame);
+      const result = {
+        transcript_overflow: getComputedStyle(transcript).overflowY,
+        transcript_at_end: Math.abs(transcript.scrollHeight - transcript.clientHeight - transcript.scrollTop) <= 2,
+      };
+      probe.remove();
+      return result;
+    });
+    assert(evidence, "desktop Assistant auto-scrolls its transcript container",
+      desktopScroll.transcript_overflow !== "visible" && desktopScroll.transcript_at_end,
+      desktopScroll);
 
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto(`${origin}/?mobile-smoke=1#/assistant`, { waitUntil: "domcontentloaded" });
@@ -696,6 +1081,30 @@ async function main() {
       scrollWidth: document.documentElement.scrollWidth,
       clientWidth: document.documentElement.clientWidth,
     })));
+    const mobileScroll = await page.evaluate(async () => {
+      const transcript = document.querySelector("#asst-log");
+      const view = document.querySelector("#view");
+      const probe = document.createElement("div");
+      probe.style.cssText = "height:2000px;flex:none";
+      transcript.append(probe);
+      transcript.scrollTop = 0;
+      view.scrollTop = 0;
+      scrollAssistantToEnd();
+      await new Promise(requestAnimationFrame);
+      await new Promise(requestAnimationFrame);
+      const result = {
+        transcript_overflow: getComputedStyle(transcript).overflowY,
+        view_scrollable: view.scrollHeight > view.clientHeight,
+        view_at_end: Math.abs(view.scrollHeight - view.clientHeight - view.scrollTop) <= 2,
+      };
+      probe.remove();
+      return result;
+    });
+    assert(evidence, "mobile Assistant auto-scrolls the view container",
+      mobileScroll.transcript_overflow === "visible"
+      && mobileScroll.view_scrollable
+      && mobileScroll.view_at_end,
+      mobileScroll);
     evidence.screenshots.mobile_assistant = await screenshot(page, "mobile-assistant.png");
 
     evidence.runtime_transports = await page.evaluate(() => window.__agentSmokeTransport || []);
@@ -718,7 +1127,7 @@ async function main() {
     assert(evidence, "no page errors", evidence.page_errors.length === 0, evidence.page_errors);
     assert(evidence, "no non-fixture-origin WebView requests", evidence.non_fixture_origin_requests.length === 0, evidence.non_fixture_origin_requests);
     assert(evidence, "fixture routes complete", evidence.fixture404.length === 0 && evidence.fixtureErrors.length === 0, { fixture404: evidence.fixture404, fixtureErrors: evidence.fixtureErrors });
-    assert(evidence, "normal pending error streams exercised", ["normal", "pending-confirm", "pending-cancel", "error"].every((s) => fixture.state.streamScenarios.some((row) => row.scenario === s)), fixture.state.streamScenarios);
+    assert(evidence, "normal pending error and cancellation streams exercised", ["normal", "slow-cancel", "pending-confirm", "pending-cancel", "error"].every((s) => fixture.state.streamScenarios.some((row) => row.scenario === s)), fixture.state.streamScenarios);
 
     evidence.fixture_state = fixture.state;
     evidence.ok = true;

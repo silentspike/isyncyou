@@ -45,8 +45,9 @@ fn android_info(message: &str) {
     eprintln!("{message}");
 }
 
-/// The single configured account id on the phone. The user signs in to it via the
-/// account menu's device-code flow; its token cache + store live under `filesDir`.
+/// The single configured account id on the phone. The account menu connects its
+/// independent Reader and Writer grants through Authorization Code + PKCE; encrypted
+/// token caches and the local store live under `filesDir`.
 const ACCOUNT: &str = "me";
 
 struct EngineState {
@@ -532,8 +533,10 @@ pub fn asset_request(path: &str, cookie: Option<String>) -> Vec<u8> {
             target: path,
             cap_token: None,
             session_token: None,
+            per_action_token: None,
             cookie,
             content_type: None,
+            storage_not_low: None,
             body: Vec::new(),
         },
     );
@@ -885,8 +888,8 @@ fn start_inner(
 /// One mobile scoped OneDrive pass under the store-access gate (#655/#718): Sync scopes ingest
 /// metadata; Offline scopes additionally materialize and mirror local edits back over the ledger.
 /// Returns whether UI-visible data changed. Skips quietly with no explicit Sync/Offline scopes
-/// configured or no cached sync/write token (not signed in). `progress` is the shared tracker the
-/// router surfaces. Token policy is unchanged: the scoped pass still uses `resolve_cached_sync_token`.
+/// configured or no cached Writer token (not signed in). `progress` is the shared tracker the
+/// router surfaces. Reader remains independently required by the cache-refresh pass.
 fn run_onedrive_scoped_pass(
     cfg: &Config,
     gate: &Arc<Mutex<()>>,
@@ -1583,6 +1586,21 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeDescribe
 #[no_mangle]
 pub static ISY_AGENT_NETWORK_DEVICE_HOOK_MARKER: &[u8] = b"ISY_AGENT_NETWORK_DEVICE_HOOK_V1";
 
+/// #625 mobile-job fault-injection marker. The hook remains app-private and JNI-internal;
+/// this symbol exists only so artifact scans can prove the exact hook build composition.
+#[cfg(feature = "mobile-job-device-test-hooks")]
+#[used]
+#[no_mangle]
+pub static ISY_MOBILE_JOB_DEVICE_HOOK_MARKER: &[u8] = b"ISY_MOBILE_JOB_DEVICE_HOOK_V1";
+
+/// #620 encrypted credential-store self-test marker. The feature exposes no WebView,
+/// bridge, or HTTP operation and is excluded from default product builds.
+#[cfg(feature = "agent-credential-store-self-test")]
+#[used]
+#[no_mangle]
+pub static ISY_AGENT_CREDENTIAL_STORE_SELF_TEST_MARKER: &[u8] =
+    b"ISY_AGENT_CREDENTIAL_STORE_SELF_TEST_V1";
+
 /// #645 evidence marker. The feature-enabled APK exposes only JNI-internal closed
 /// checkpoints; product WebView/HTTP/bridge code has no path to this marker or control.
 #[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
@@ -1722,6 +1740,10 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeNetworkD
     _env: jni::EnvUnowned<'local>,
     _class: jni::objects::JClass<'local>,
 ) -> jni::sys::jboolean {
+    #[cfg(feature = "mobile-job-device-test-hooks")]
+    std::hint::black_box(ISY_MOBILE_JOB_DEVICE_HOOK_MARKER);
+    #[cfg(feature = "agent-credential-store-self-test")]
+    std::hint::black_box(ISY_AGENT_CREDENTIAL_STORE_SELF_TEST_MARKER);
     #[cfg(feature = "agent-network-device-test-hooks")]
     {
         // Keep the marker referenced in the executable path so binary scans can prove the
@@ -2010,6 +2032,12 @@ mod tests {
         cap
     }
 
+    fn strict_json_post(path: &str, body: serde_json::Value) -> isyncyou_webui::ApiRequest {
+        isyncyou_webui::ApiRequest::new("POST", path)
+            .with_content_type(Some("application/json".into()))
+            .with_body(serde_json::to_vec(&body).unwrap())
+    }
+
     fn restore_enabled_mobile_config(files_dir: &std::path::Path) {
         let mut cfg = Config::default();
         cfg.restore.cloud_restore_enabled = true;
@@ -2021,7 +2049,7 @@ mod tests {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[cfg(feature = "agent-session-kdf-bench")]
@@ -2045,6 +2073,10 @@ mod tests {
     #[cfg(feature = "agent-credential-store-self-test")]
     #[test]
     fn agent_credential_store_self_test_json_is_structured_and_redacted() {
+        assert_eq!(
+            ISY_AGENT_CREDENTIAL_STORE_SELF_TEST_MARKER,
+            b"ISY_AGENT_CREDENTIAL_STORE_SELF_TEST_V1"
+        );
         let _guard = mobile_key_test_guard();
         reset_mobile_agent_credential_ready_for_tests();
         assert!(install_mobile_agent_credential_key(&[8u8; 32]));
@@ -2074,6 +2106,15 @@ mod tests {
         assert_eq!(
             value["wrapped_key_file"].as_str(),
             Some("agent_credential.key")
+        );
+    }
+
+    #[cfg(feature = "mobile-job-device-test-hooks")]
+    #[test]
+    fn mobile_job_hook_apk_contains_deliberate_marker() {
+        assert_eq!(
+            ISY_MOBILE_JOB_DEVICE_HOOK_MARKER,
+            b"ISY_MOBILE_JOB_DEVICE_HOOK_V1"
         );
     }
 
@@ -2607,7 +2648,7 @@ mod tests {
         // Data route without the session token → 401 (the Android-exposure gate, now over
         // the bridge rather than an open port).
         let no_tok = bridge_request(
-            r#"{"method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{}}"#,
+            r#"{"t":"req","id":"standalone-denied","method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{}}"#,
         );
         assert!(
             no_tok.contains("\"status\":401"),
@@ -2615,7 +2656,7 @@ mod tests {
         );
         // With the session token → reaches the handler (not a 401).
         let with_tok = bridge_request(&format!(
-            r#"{{"method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{{"X-Session-Token":"{tok}"}}}}"#
+            r#"{{"t":"req","id":"standalone-authorized","method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{{"X-Session-Token":"{tok}"}}}}"#
         ));
         assert!(
             !with_tok.contains("\"status\":401"),
@@ -2623,16 +2664,47 @@ mod tests {
         );
         // Restore/backup are now present in the mobile full-node profile, but still gated by
         // the injected cap token and then the native per-action biometric token.
-        let restore_no_cap = bridge_request(&format!(
-            r#"{{"method":"POST","path":"/api/v1/restore?account=me&service=mail&id=x","headers":{{"X-Session-Token":"{tok}"}}}}"#
-        ));
+        let restore_no_cap = bridge_request(
+            &serde_json::json!({
+                "t": "req",
+                "id": "standalone-restore",
+                "method": "POST",
+                "path": "/api/v1/restore",
+                "headers": {
+                    "X-Session-Token": tok.clone(),
+                    "Content-Type": "application/json"
+                },
+                "body": serde_json::json!({
+                    "request_id": "00000000-0000-4000-8000-000000000003",
+                    "account": "me",
+                    "service": "mail",
+                    "id": "x"
+                }).to_string()
+            })
+            .to_string(),
+        );
         assert!(
             restore_no_cap.contains("\"status\":401"),
             "restore must be wired and cap-gated, not absent: {restore_no_cap}"
         );
-        let backup_no_cap = bridge_request(&format!(
-            r#"{{"method":"POST","path":"/api/v1/backup?account=me&services=mail","headers":{{"X-Session-Token":"{tok}"}}}}"#
-        ));
+        let backup_no_cap = bridge_request(
+            &serde_json::json!({
+                "t": "req",
+                "id": "standalone-backup",
+                "method": "POST",
+                "path": "/api/v1/backup",
+                "headers": {
+                    "X-Session-Token": tok,
+                    "Content-Type": "application/json"
+                },
+                "body": serde_json::json!({
+                    "request_id": "00000000-0000-4000-8000-000000000004",
+                    "account": "me",
+                    "services": "mail"
+                }).to_string()
+            })
+            .to_string(),
+        );
         assert!(
             backup_no_cap.contains("\"status\":401"),
             "backup must be wired and cap-gated, not absent: {backup_no_cap}"
@@ -2693,14 +2765,17 @@ mod tests {
             )
         };
 
+        let restore_body = serde_json::json!({
+            "request_id": "00000000-0000-4000-8000-000000000001",
+            "account": "me",
+            "service": "mail",
+            "id": "restore-src-1"
+        });
         let restore_challenge = api_json(
             router.route(
-                &isyncyou_webui::ApiRequest::new(
-                    "POST",
-                    "/api/v1/restore?account=me&service=mail&id=restore-src-1",
-                )
-                .with_session_token(Some(tok.clone()))
-                .with_cap_token(Some(restore_cap.clone())),
+                &strict_json_post("/api/v1/restore", restore_body.clone())
+                    .with_session_token(Some(tok.clone()))
+                    .with_cap_token(Some(restore_cap.clone())),
             ),
         );
         assert_eq!(
@@ -2716,23 +2791,28 @@ mod tests {
         assert!(router.confirm_biometric(restore_pat));
         let restore_ok = api_json(
             router.route(
-                &isyncyou_webui::ApiRequest::new(
-                    "POST",
-                    &format!(
-                    "/api/v1/restore?account=me&service=mail&id=restore-src-1&_pat={restore_pat}"
-                ),
-                )
-                .with_session_token(Some(tok.clone()))
-                .with_cap_token(Some(restore_cap)),
+                &strict_json_post("/api/v1/restore", restore_body)
+                    .with_session_token(Some(tok.clone()))
+                    .with_cap_token(Some(restore_cap))
+                    .with_per_action_token(Some(restore_pat.to_owned())),
             ),
         );
-        assert_eq!(restore_ok["queued"].as_bool(), Some(true));
+        assert_eq!(
+            restore_ok["queued"].as_bool(),
+            Some(true),
+            "restore response: {restore_ok}"
+        );
         assert_eq!(restore_ok["kind"].as_str(), Some("restore-cloud"));
         assert_eq!(restore_ok["state"].as_str(), Some("queued"));
 
+        let backup_body = serde_json::json!({
+            "request_id": "00000000-0000-4000-8000-000000000002",
+            "account": "me",
+            "services": "mail"
+        });
         let backup_challenge = api_json(
             router.route(
-                &isyncyou_webui::ApiRequest::new("POST", "/api/v1/backup?account=me&services=mail")
+                &strict_json_post("/api/v1/backup", backup_body.clone())
                     .with_session_token(Some(tok.clone()))
                     .with_cap_token(Some(backup_cap.clone())),
             ),
@@ -2750,12 +2830,10 @@ mod tests {
         assert!(router.confirm_biometric(backup_pat));
         let backup_ok = api_json(
             router.route(
-                &isyncyou_webui::ApiRequest::new(
-                    "POST",
-                    &format!("/api/v1/backup?account=me&services=mail&_pat={backup_pat}"),
-                )
-                .with_session_token(Some(tok.clone()))
-                .with_cap_token(Some(backup_cap)),
+                &strict_json_post("/api/v1/backup", backup_body)
+                    .with_session_token(Some(tok.clone()))
+                    .with_cap_token(Some(backup_cap))
+                    .with_per_action_token(Some(backup_pat.to_owned())),
             ),
         );
         assert_eq!(backup_ok["queued"].as_bool(), Some(true));
@@ -2830,7 +2908,7 @@ mod tests {
         let tok = session_token().expect("token");
         // No session token → 401 envelope (the loopback-exposure gate applies here too).
         let denied = bridge_request(
-            r#"{"method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{}}"#,
+            r#"{"t":"req","id":"routing-denied","method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{}}"#,
         );
         assert!(
             denied.contains("\"status\":401"),
@@ -2838,7 +2916,7 @@ mod tests {
         );
         // With the token → reaches the handler (not a 401).
         let ok = bridge_request(&format!(
-            r#"{{"method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{{"X-Session-Token":"{tok}"}}}}"#
+            r#"{{"t":"req","id":"routing-authorized","method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{{"X-Session-Token":"{tok}"}}}}"#
         ));
         assert!(
             !ok.contains("\"status\":401"),

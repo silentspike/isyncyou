@@ -21,6 +21,74 @@ class BiometricPolicyTest {
     }
 
     @Test
+    fun userPresenceAlwaysUsesDeviceCredentialWhenAvailable() {
+        val decision = BiometricPolicy.chooseForOperation(
+            operation = "user-presence",
+            strongAvailable = true,
+            cryptoAvailable = true,
+            credentialAvailable = true,
+        )
+        assertEquals(BiometricMode.DeviceCredential, decision?.mode)
+        assertEquals(BiometricManager.Authenticators.DEVICE_CREDENTIAL, decision?.authenticators)
+    }
+
+    @Test
+    fun userPresenceFailsClosedWithoutDeviceCredential() {
+        assertNull(
+            BiometricPolicy.chooseForOperation(
+                operation = "user-presence",
+                strongAvailable = true,
+                cryptoAvailable = true,
+                credentialAvailable = false,
+            ),
+        )
+    }
+
+    @Test
+    fun bulkOperationUsesOneDeviceCredentialPromptWhenAvailable() {
+        val decision = BiometricPolicy.chooseForOperation(
+            operation = "bulk",
+            strongAvailable = true,
+            cryptoAvailable = true,
+            credentialAvailable = true,
+        )
+        assertEquals(BiometricMode.DeviceCredential, decision?.mode)
+        assertEquals(BiometricManager.Authenticators.DEVICE_CREDENTIAL, decision?.authenticators)
+    }
+
+    @Test
+    fun destructiveOperationRetainsStrongCryptoPreference() {
+        val decision = BiometricPolicy.chooseForOperation(
+            operation = "delete",
+            strongAvailable = true,
+            cryptoAvailable = true,
+            credentialAvailable = true,
+        )
+        assertEquals(BiometricMode.StrongCrypto, decision?.mode)
+    }
+
+    @Test
+    fun authenticationErrorsMapOnlyToClosedCodes() {
+        assertEquals(
+            "cancelled",
+            BiometricErrorPolicy.closedCode(androidx.biometric.BiometricPrompt.ERROR_USER_CANCELED),
+        )
+        assertEquals(
+            "lockout",
+            BiometricErrorPolicy.closedCode(androidx.biometric.BiometricPrompt.ERROR_LOCKOUT),
+        )
+        assertEquals(
+            "timeout",
+            BiometricErrorPolicy.closedCode(androidx.biometric.BiometricPrompt.ERROR_TIMEOUT),
+        )
+        assertEquals(
+            "not_available",
+            BiometricErrorPolicy.closedCode(androidx.biometric.BiometricPrompt.ERROR_HW_UNAVAILABLE),
+        )
+        assertEquals("authentication_failed", BiometricErrorPolicy.closedCode(Int.MAX_VALUE))
+    }
+
+    @Test
     fun noAvailableFactorFailsClosed() {
         assertNull(BiometricPolicy.choose(false, false, false))
     }
@@ -42,6 +110,7 @@ class BiometricPolicyTest {
     fun labelsComeOnlyFromKnownRustEnums() {
         assertEquals("Delete in OneDrive", BiometricLabelPolicy.label("delete", "onedrive"))
         assertEquals("Make folder offline in OneDrive", BiometricLabelPolicy.label("mode-switch-offline-large", "onedrive"))
+        assertEquals("Delete selected tasks in To Do", BiometricLabelPolicy.label("bulk", "todo"))
         assertNull(BiometricLabelPolicy.label("unknown", "unknown"))
         assertNull(BiometricLabelPolicy.label("delete", "unknown"))
     }

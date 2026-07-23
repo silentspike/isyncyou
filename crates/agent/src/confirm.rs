@@ -47,8 +47,62 @@ pub struct PendingActionBinding {
 struct Pending {
     action: ToolAction,
     token: String,
+    preview: String,
     action_hash: String,
+    risk: String,
     expires_at_ms: u64,
+    owner: PendingOwnerBinding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingOwnerBinding {
+    pub account: String,
+    pub session_id: String,
+    pub request_id: String,
+    pub turn_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersistedPendingAction {
+    pub id: String,
+    pub action: ToolAction,
+    pub preview: String,
+    pub token_hash: [u8; 32],
+    pub action_hash: String,
+    pub risk: String,
+    pub created_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub owner: PendingOwnerBinding,
+}
+
+pub trait PendingPersistence: Send + Sync {
+    fn insert(&self, pending: PersistedPendingAction) -> Result<(), ConfirmError>;
+    fn confirm(
+        &self,
+        pending_id: &str,
+        token_hash: &[u8; 32],
+        action_hash: &str,
+        now_ms: u64,
+    ) -> Result<ToolAction, ConfirmError>;
+    fn binding(
+        &self,
+        pending_id: &str,
+        action_hash: &str,
+        now_ms: u64,
+    ) -> Result<PendingActionBinding, ConfirmError>;
+    fn cancel(
+        &self,
+        pending_id: &str,
+        action_hash: &str,
+        now_ms: u64,
+    ) -> Result<PendingOwnerBinding, ConfirmError>;
+    fn reissue_for_owner(
+        &self,
+        owner: &PendingOwnerBinding,
+        token_hash: &[u8; 32],
+        now_ms: u64,
+    ) -> Result<Option<PendingAction>, ConfirmError>;
+    fn has_pending_for_turn(&self, turn_id: &str, now_ms: u64) -> Result<bool, ConfirmError>;
 }
 
 /// Why a confirmation failed.
@@ -62,12 +116,23 @@ pub enum ConfirmError {
     BadToken,
     /// The caller's action hash does not match the registered action binding.
     ActionMismatch,
+    /// The durable confirmation store could not complete the transition.
+    Unavailable,
 }
 
 /// Registry of pending destructive actions, keyed by pending id.
-#[derive(Default)]
 pub struct PendingRegistry {
     inner: Mutex<HashMap<String, Pending>>,
+    persistence: Option<std::sync::Arc<dyn PendingPersistence>>,
+}
+
+impl Default for PendingRegistry {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            persistence: None,
+        }
+    }
 }
 
 fn random_b64(n: usize) -> Result<String, AgentError> {
@@ -97,6 +162,13 @@ fn hex(bytes: &[u8]) -> String {
         out.push_str(&format!("{b:02x}"));
     }
     out
+}
+
+fn confirmation_token_hash(token: &str) -> [u8; 32] {
+    let mut context = digest::Context::new(&digest::SHA256);
+    context.update(b"isyncyou-confirmation-token-v1\0");
+    context.update(token.as_bytes());
+    context.finish().as_ref().try_into().expect("sha256 length")
 }
 
 pub fn action_hash(action: &ToolAction, expires_at_ms: u64) -> Result<String, AgentError> {
@@ -130,6 +202,17 @@ impl PendingRegistry {
         Self::default()
     }
 
+    pub fn with_persistence(persistence: std::sync::Arc<dyn PendingPersistence>) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            persistence: Some(persistence),
+        }
+    }
+
+    pub fn is_persistent(&self) -> bool {
+        self.persistence.is_some()
+    }
+
     /// Register a destructive action and return its [`PendingAction`] plus the one-time
     /// confirmation token (give the token to the UI; never to the model).
     pub fn register(
@@ -139,25 +222,67 @@ impl PendingRegistry {
         now_ms: u64,
         ttl_ms: u64,
     ) -> Result<(PendingAction, String), AgentError> {
+        self.register_bound(
+            action,
+            preview,
+            now_ms,
+            ttl_ms,
+            PendingOwnerBinding {
+                account: String::new(),
+                session_id: String::new(),
+                request_id: String::new(),
+                turn_id: String::new(),
+            },
+        )
+    }
+
+    pub fn register_bound(
+        &self,
+        action: ToolAction,
+        preview: impl Into<String>,
+        now_ms: u64,
+        ttl_ms: u64,
+        owner: PendingOwnerBinding,
+    ) -> Result<(PendingAction, String), AgentError> {
         let id = random_b64(16)?;
         let token = random_b64(32)?;
         let expires_at_ms = now_ms.saturating_add(ttl_ms);
         let action_hash = action_hash(&action, expires_at_ms)?;
         let risk = "destructive".to_string();
-        self.inner.lock().unwrap().insert(
-            id.clone(),
-            Pending {
-                action: action.clone(),
-                token: token.clone(),
-                action_hash: action_hash.clone(),
-                expires_at_ms,
-            },
-        );
+        let preview = preview.into();
+        if let Some(persistence) = &self.persistence {
+            persistence
+                .insert(PersistedPendingAction {
+                    id: id.clone(),
+                    action: action.clone(),
+                    preview: preview.clone(),
+                    token_hash: confirmation_token_hash(&token),
+                    action_hash: action_hash.clone(),
+                    risk: risk.clone(),
+                    created_at_ms: now_ms,
+                    expires_at_ms,
+                    owner,
+                })
+                .map_err(|_| AgentError::Provider("confirmation_unavailable".into()))?;
+        } else {
+            self.inner.lock().unwrap().insert(
+                id.clone(),
+                Pending {
+                    action: action.clone(),
+                    token: token.clone(),
+                    preview: preview.clone(),
+                    action_hash: action_hash.clone(),
+                    risk: risk.clone(),
+                    expires_at_ms,
+                    owner,
+                },
+            );
+        }
         Ok((
             PendingAction {
                 id,
                 action,
-                preview: preview.into(),
+                preview,
                 action_hash,
                 risk,
                 expires_at_ms,
@@ -175,9 +300,17 @@ impl PendingRegistry {
         action_hash: &str,
         now_ms: u64,
     ) -> Result<ToolAction, ConfirmError> {
+        if let Some(persistence) = &self.persistence {
+            return persistence.confirm(
+                pending_id,
+                &confirmation_token_hash(token),
+                action_hash,
+                now_ms,
+            );
+        }
         let mut map = self.inner.lock().unwrap();
         let pending = map.get(pending_id).ok_or(ConfirmError::NotFound)?;
-        if now_ms > pending.expires_at_ms {
+        if now_ms >= pending.expires_at_ms {
             map.remove(pending_id);
             return Err(ConfirmError::Expired);
         }
@@ -200,9 +333,12 @@ impl PendingRegistry {
         action_hash: &str,
         now_ms: u64,
     ) -> Result<PendingActionBinding, ConfirmError> {
+        if let Some(persistence) = &self.persistence {
+            return persistence.binding(pending_id, action_hash, now_ms);
+        }
         let mut map = self.inner.lock().unwrap();
         let pending = map.get(pending_id).ok_or(ConfirmError::NotFound)?;
-        if now_ms > pending.expires_at_ms {
+        if now_ms >= pending.expires_at_ms {
             map.remove(pending_id);
             return Err(ConfirmError::Expired);
         }
@@ -216,6 +352,84 @@ impl PendingRegistry {
             item: biometric_binding_item(pending_id, action_hash),
             expires_at_ms: pending.expires_at_ms,
         })
+    }
+
+    /// Cancel exactly the pending action bound to the supplied public action hash.
+    /// Cancellation reduces authority and therefore never consumes a confirmation token.
+    pub fn cancel(
+        &self,
+        pending_id: &str,
+        action_hash: &str,
+        now_ms: u64,
+    ) -> Result<PendingOwnerBinding, ConfirmError> {
+        if let Some(persistence) = &self.persistence {
+            return persistence.cancel(pending_id, action_hash, now_ms);
+        }
+        let mut map = self.inner.lock().unwrap();
+        let pending = map.get(pending_id).ok_or(ConfirmError::NotFound)?;
+        if now_ms >= pending.expires_at_ms {
+            map.remove(pending_id);
+            return Err(ConfirmError::Expired);
+        }
+        if !ct_eq(action_hash.as_bytes(), pending.action_hash.as_bytes()) {
+            return Err(ConfirmError::ActionMismatch);
+        }
+        Ok(map.remove(pending_id).expect("present").owner)
+    }
+
+    /// Rotate the one-time confirmation token for the exact durable pending action
+    /// owned by a replayed turn. The raw token is never persisted; a lost stream can
+    /// therefore recover authority only by invalidating the old hash and returning a
+    /// freshly generated token to the same session/request binding.
+    pub fn reissue_for_owner(
+        &self,
+        owner: &PendingOwnerBinding,
+        now_ms: u64,
+    ) -> Result<Option<(PendingAction, String)>, ConfirmError> {
+        let token = random_b64(32).map_err(|_| ConfirmError::Unavailable)?;
+        let token_hash = confirmation_token_hash(&token);
+        if let Some(persistence) = &self.persistence {
+            return persistence
+                .reissue_for_owner(owner, &token_hash, now_ms)
+                .map(|pending| pending.map(|pending| (pending, token)));
+        }
+
+        let mut map = self.inner.lock().map_err(|_| ConfirmError::Unavailable)?;
+        map.retain(|_, pending| now_ms < pending.expires_at_ms);
+        let matching = map
+            .iter()
+            .filter(|(_, pending)| &pending.owner == owner)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let [pending_id] = matching.as_slice() else {
+            return if matching.is_empty() {
+                Ok(None)
+            } else {
+                Err(ConfirmError::Unavailable)
+            };
+        };
+        let pending = map.get_mut(pending_id).ok_or(ConfirmError::Unavailable)?;
+        pending.token.clone_from(&token);
+        Ok(Some((
+            PendingAction {
+                id: pending_id.clone(),
+                action: pending.action.clone(),
+                preview: pending.preview.clone(),
+                action_hash: pending.action_hash.clone(),
+                risk: pending.risk.clone(),
+                expires_at_ms: pending.expires_at_ms,
+            },
+            token,
+        )))
+    }
+
+    pub fn has_pending_for_turn(&self, turn_id: &str, now_ms: u64) -> Result<bool, ConfirmError> {
+        if let Some(persistence) = &self.persistence {
+            return persistence.has_pending_for_turn(turn_id, now_ms);
+        }
+        let mut map = self.inner.lock().unwrap();
+        map.retain(|_, pending| now_ms < pending.expires_at_ms);
+        Ok(map.values().any(|pending| pending.owner.turn_id == turn_id))
     }
 
     /// Number of outstanding pending actions (for tests/metrics).
@@ -375,5 +589,90 @@ mod tests {
             action_hash(&restore, 60_000).unwrap(),
             action_hash(&restore, 60_001).unwrap()
         );
+    }
+
+    #[test]
+    fn pending_cancel_makes_confirm_binding_and_replay_fail() {
+        let reg = PendingRegistry::new();
+        let (pending, token) = reg
+            .register_bound(
+                backup(),
+                "p",
+                1_000,
+                60_000,
+                PendingOwnerBinding {
+                    account: "me".into(),
+                    session_id: "session".into(),
+                    request_id: "request".into(),
+                    turn_id: "turn".into(),
+                },
+            )
+            .unwrap();
+        assert!(reg.has_pending_for_turn("turn", 2_000).unwrap());
+        let owner = reg
+            .cancel(&pending.id, &pending.action_hash, 2_000)
+            .unwrap();
+        assert_eq!(owner.session_id, "session");
+        assert_eq!(owner.request_id, "request");
+        assert_eq!(owner.turn_id, "turn");
+        assert!(!reg.has_pending_for_turn("turn", 2_001).unwrap());
+        assert_eq!(
+            reg.binding(&pending.id, &pending.action_hash, 2_001),
+            Err(ConfirmError::NotFound)
+        );
+        assert_eq!(
+            reg.confirm(&pending.id, &token, &pending.action_hash, 2_001),
+            Err(ConfirmError::NotFound)
+        );
+    }
+
+    #[test]
+    fn pending_replay_reissues_for_exact_owner_and_invalidates_old_token() {
+        let reg = PendingRegistry::new();
+        let owner = PendingOwnerBinding {
+            account: "me".into(),
+            session_id: "session".into(),
+            request_id: "request".into(),
+            turn_id: "turn".into(),
+        };
+        let (pending, old_token) = reg
+            .register_bound(backup(), "p", 1_000, 60_000, owner.clone())
+            .unwrap();
+
+        let (reissued, new_token) = reg
+            .reissue_for_owner(&owner, 2_000)
+            .unwrap()
+            .expect("durable pending replay");
+        assert_eq!(reissued.id, pending.id);
+        assert_eq!(reissued.action_hash, pending.action_hash);
+        assert_ne!(new_token, old_token);
+        assert_eq!(
+            reg.confirm(&pending.id, &old_token, &pending.action_hash, 2_001),
+            Err(ConfirmError::BadToken)
+        );
+        assert!(reg
+            .confirm(&pending.id, &new_token, &pending.action_hash, 2_002)
+            .is_ok());
+    }
+
+    #[test]
+    fn pending_replay_rejects_wrong_owner_and_exact_expiry() {
+        let reg = PendingRegistry::new();
+        let owner = PendingOwnerBinding {
+            account: "me".into(),
+            session_id: "session".into(),
+            request_id: "request".into(),
+            turn_id: "turn".into(),
+        };
+        reg.register_bound(backup(), "p", 1_000, 60_000, owner.clone())
+            .unwrap();
+        let mut wrong_owner = owner.clone();
+        wrong_owner.request_id = "other-request".into();
+        assert!(reg
+            .reissue_for_owner(&wrong_owner, 2_000)
+            .unwrap()
+            .is_none());
+        assert!(reg.reissue_for_owner(&owner, 61_000).unwrap().is_none());
+        assert!(!reg.has_pending_for_turn("turn", 61_000).unwrap());
     }
 }

@@ -1,5 +1,5 @@
 //! OAuth for personal Microsoft accounts: a persisted token cache (always
-//! available, pure) and the device-code / refresh network flow (feature `http`).
+//! available, pure) and the authorization-code PKCE, device-code, and refresh network flows.
 //!
 //! Personal accounts use the `consumers` authority and a public client (no
 //! secret). The interactive device-code login needs a human once; afterwards the
@@ -44,6 +44,9 @@ pub struct TokenCache {
     pub refresh_token: Option<String>,
     /// Unix seconds at which the access token should be considered expired.
     pub expires_at: u64,
+    /// Stable Microsoft Graph `/me` object id used only to bind Reader and Writer locally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_subject: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +74,7 @@ impl TokenCache {
             access_token: r.access_token.clone(),
             refresh_token: r.refresh_token.clone(),
             expires_at: now_unix.saturating_add(r.expires_in.saturating_sub(60)),
+            account_subject: None,
         }
     }
 
@@ -606,6 +610,149 @@ fn write_token_cache(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(feature = "http")]
 pub mod flow {
     use super::*;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use ring::digest;
+    use std::io::Read;
+    use std::time::Duration;
+
+    const OAUTH_RESPONSE_LIMIT: usize = 64 * 1024;
+
+    #[derive(Debug, Clone)]
+    pub struct AuthorizationCodeStart {
+        pub authorization_uri: String,
+        pub verifier: String,
+        pub state: String,
+    }
+
+    /// Create a Microsoft authorization-code request that always presents the account picker.
+    pub fn start_authorization_code(
+        client_id: &str,
+        scopes: &[&str],
+        redirect_uri: &str,
+    ) -> Result<AuthorizationCodeStart, String> {
+        if client_id.is_empty() || scopes.is_empty() || !is_loopback_redirect(redirect_uri) {
+            return Err("invalid_authorization_request".into());
+        }
+        let verifier =
+            URL_SAFE_NO_PAD.encode(random_bytes(32).map_err(|_| "authorization_rng_failed")?);
+        let state =
+            URL_SAFE_NO_PAD.encode(random_bytes(32).map_err(|_| "authorization_rng_failed")?);
+        let challenge =
+            URL_SAFE_NO_PAD.encode(digest::digest(&digest::SHA256, verifier.as_bytes()));
+        let mut url = reqwest::Url::parse(&format!("{AUTHORITY}/authorize"))
+            .map_err(|_| "authorization_url_failed")?;
+        url.query_pairs_mut()
+            .append_pair("client_id", client_id)
+            .append_pair("response_type", "code")
+            .append_pair("response_mode", "query")
+            .append_pair("redirect_uri", redirect_uri)
+            .append_pair("scope", &scopes.join(" "))
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("state", &state)
+            .append_pair("prompt", "select_account");
+        Ok(AuthorizationCodeStart {
+            authorization_uri: url.into(),
+            verifier,
+            state,
+        })
+    }
+
+    fn is_loopback_redirect(value: &str) -> bool {
+        let Ok(url) = reqwest::Url::parse(value) else {
+            return false;
+        };
+        url.scheme() == "http"
+            && url.host_str() == Some("localhost")
+            && url.port().is_some()
+            && url.path() == "/"
+            && url.query().is_none()
+            && url.fragment().is_none()
+    }
+
+    pub fn exchange_authorization_code(
+        client_id: &str,
+        scopes: &[&str],
+        redirect_uri: &str,
+        code: &str,
+        verifier: &str,
+        now_unix: u64,
+    ) -> Result<TokenCache, String> {
+        if client_id.is_empty()
+            || scopes.is_empty()
+            || code.is_empty()
+            || verifier.len() < 43
+            || !is_loopback_redirect(redirect_uri)
+        {
+            return Err("invalid_authorization_exchange".into());
+        }
+        let mut response = authorization_code_client()?
+            .post(format!("{AUTHORITY}/token"))
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("client_id", client_id),
+                ("code", code),
+                ("redirect_uri", redirect_uri),
+                ("code_verifier", verifier),
+                ("scope", &scopes.join(" ")),
+            ])
+            .send()
+            .map_err(|_| "authorization_exchange_unavailable")?;
+        if !response.status().is_success() {
+            return Err("authorization_exchange_failed".into());
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > OAUTH_RESPONSE_LIMIT as u64)
+        {
+            return Err("authorization_exchange_invalid".into());
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        if !content_type
+            .split(';')
+            .next()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+        {
+            return Err("authorization_exchange_invalid".into());
+        }
+        let mut body = Vec::with_capacity(response.content_length().unwrap_or(0) as usize);
+        response
+            .by_ref()
+            .take((OAUTH_RESPONSE_LIMIT + 1) as u64)
+            .read_to_end(&mut body)
+            .map_err(|_| "authorization_exchange_invalid")?;
+        if body.len() > OAUTH_RESPONSE_LIMIT {
+            return Err("authorization_exchange_invalid".into());
+        }
+        let token = serde_json::from_slice::<TokenResponse>(&body)
+            .map_err(|_| "authorization_exchange_invalid")?;
+        if !authorization_code_token_is_complete(&token) {
+            return Err("authorization_exchange_invalid".into());
+        }
+        Ok(TokenCache::from_response(&token, now_unix))
+    }
+
+    pub(crate) fn authorization_code_token_is_complete(token: &TokenResponse) -> bool {
+        !token.access_token.is_empty()
+            && token.expires_in > 60
+            && token
+                .refresh_token
+                .as_deref()
+                .is_some_and(|refresh_token| !refresh_token.is_empty())
+    }
+
+    fn authorization_code_client() -> Result<reqwest::blocking::Client, String> {
+        reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
+            .build()
+            .map_err(|_| "authorization_exchange_unavailable".into())
+    }
 
     /// Device-code start response — show `message`/`user_code` to the user.
     #[derive(Debug, Clone, Deserialize)]
@@ -755,11 +902,13 @@ pub mod flow {
             .clone()
             .ok_or("cached token expired and no refresh token; run the device-code login")?;
         let resp = refresh(client_id, &rt, scopes)?;
+        let account_subject = cache.account_subject.clone();
         cache = TokenCache::from_response(&resp, now_unix);
         // Graph does not always return a fresh refresh token; keep the old one.
         if cache.refresh_token.is_none() {
             cache.refresh_token = Some(rt);
         }
+        cache.account_subject = account_subject;
         cache.save(cache_path).map_err(|e| e.to_string())?;
         Ok(cache.access_token)
     }
@@ -843,6 +992,95 @@ mod tests {
             classify_poll(true, &json!({"access_token": "x", "expires_in": 3600})),
             PollOutcome::Token(_)
         ));
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn authorization_code_start_uses_pkce_state_account_picker_and_exact_loopback_redirect() {
+        let redirect = "http://localhost:43123";
+        let start = super::flow::start_authorization_code(
+            "public-client",
+            &["User.Read", "offline_access"],
+            redirect,
+        )
+        .unwrap();
+        let url = reqwest::Url::parse(&start.authorization_uri).unwrap();
+        let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(
+            url.as_str().split('?').next().unwrap(),
+            format!("{AUTHORITY}/authorize")
+        );
+        assert_eq!(
+            query.get("prompt").map(String::as_str),
+            Some("select_account")
+        );
+        assert_eq!(query.get("response_type").map(String::as_str), Some("code"));
+        assert_eq!(
+            query.get("response_mode").map(String::as_str),
+            Some("query")
+        );
+        assert_eq!(
+            query.get("redirect_uri").map(String::as_str),
+            Some(redirect)
+        );
+        assert_eq!(
+            query.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert_eq!(start.verifier.len(), 43);
+        assert_eq!(start.state.len(), 43);
+        assert_ne!(start.verifier, start.state);
+        assert!(!start.authorization_uri.contains(&start.verifier));
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn authorization_code_start_rejects_non_loopback_or_wrong_callback_redirect() {
+        for redirect in [
+            "https://example.com",
+            "http://127.0.0.1:43123",
+            "http://localhost",
+            "http://localhost:43123/other",
+            "http://localhost:43123/oauth/microsoft/callback",
+            "http://localhost:43123?x=1",
+        ] {
+            assert!(
+                super::flow::start_authorization_code("public-client", &["User.Read"], redirect,)
+                    .is_err(),
+                "{redirect}"
+            );
+        }
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn authorization_code_token_requires_finite_access_and_refresh_authority() {
+        let valid = TokenResponse {
+            access_token: "access".into(),
+            refresh_token: Some("refresh".into()),
+            expires_in: 3600,
+        };
+        assert!(super::flow::authorization_code_token_is_complete(&valid));
+        for invalid in [
+            TokenResponse {
+                access_token: String::new(),
+                ..valid.clone()
+            },
+            TokenResponse {
+                refresh_token: None,
+                ..valid.clone()
+            },
+            TokenResponse {
+                refresh_token: Some(String::new()),
+                ..valid.clone()
+            },
+            TokenResponse {
+                expires_in: 60,
+                ..valid.clone()
+            },
+        ] {
+            assert!(!super::flow::authorization_code_token_is_complete(&invalid));
+        }
     }
 
     #[cfg(feature = "desktop-keyring")]
@@ -1002,6 +1240,7 @@ mod tests {
             access_token: "ACCESS-TOKEN-SECRET".into(),
             refresh_token: Some("REFRESH-TOKEN-SECRET".into()),
             expires_at: 1234,
+            account_subject: Some("stable-subject".into()),
         };
 
         c.save_encrypted_with_secret(&p, b"correct horse battery staple")
@@ -1011,11 +1250,13 @@ mod tests {
         assert!(raw.contains(TOKEN_CACHE_MAGIC));
         assert!(!raw.contains("ACCESS-TOKEN-SECRET"), "raw cache: {raw}");
         assert!(!raw.contains("REFRESH-TOKEN-SECRET"), "raw cache: {raw}");
+        assert!(!raw.contains("stable-subject"), "raw cache: {raw}");
         let back =
             TokenCache::load_encrypted_with_secret(&p, b"correct horse battery staple").unwrap();
         assert_eq!(back.access_token, c.access_token);
         assert_eq!(back.refresh_token, c.refresh_token);
         assert_eq!(back.expires_at, c.expires_at);
+        assert_eq!(back.account_subject, c.account_subject);
 
         #[cfg(unix)]
         {
@@ -1078,6 +1319,7 @@ mod tests {
                 access_token: "ACCESS-TOKEN-IN-KEYRING".into(),
                 refresh_token: Some("REFRESH-TOKEN-IN-KEYRING".into()),
                 expires_at: 4242,
+                account_subject: Some("stable-subject".into()),
             };
 
             c.save_to_keyring(&p).unwrap();
@@ -1090,11 +1332,13 @@ mod tests {
                 !raw.contains("REFRESH-TOKEN-IN-KEYRING"),
                 "raw cache: {raw}"
             );
+            assert!(!raw.contains("stable-subject"), "raw cache: {raw}");
 
             let back = TokenCache::load(&p).unwrap();
             assert_eq!(back.access_token, c.access_token);
             assert_eq!(back.refresh_token, c.refresh_token);
             assert_eq!(back.expires_at, c.expires_at);
+            assert_eq!(back.account_subject, c.account_subject);
 
             #[cfg(unix)]
             {
@@ -1121,6 +1365,7 @@ mod tests {
                 access_token: "OLD".into(),
                 refresh_token: Some("OLD-RT".into()),
                 expires_at: 1,
+                account_subject: None,
             }
             .save_to_keyring(&p)
             .unwrap();
@@ -1129,6 +1374,7 @@ mod tests {
                 access_token: "NEW".into(),
                 refresh_token: Some("NEW-RT".into()),
                 expires_at: 999,
+                account_subject: None,
             };
             renewed.save(&p).unwrap();
 
@@ -1165,6 +1411,7 @@ mod tests {
             access_token: "GOOD".into(),
             refresh_token: Some("RT".into()),
             expires_at: 10_000,
+            account_subject: Some("stable-subject".into()),
         }
         .save(&p)
         .unwrap();
@@ -1175,6 +1422,7 @@ mod tests {
             access_token: String::new(),
             refresh_token: None,
             expires_at: 0,
+            account_subject: None,
         }
         .save(&p)
         .unwrap();
@@ -1207,6 +1455,7 @@ mod tests {
             access_token: String::new(),
             refresh_token: Some(rt),
             expires_at: 0,
+            account_subject: None,
         }
         .save(&p)
         .unwrap();

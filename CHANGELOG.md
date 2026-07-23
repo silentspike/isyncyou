@@ -8,6 +8,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+**Agent shared-session and closeout contract (#628)**
+- `agent`+`app-host`+`webui`+`android`: added encrypted V2 shared sessions,
+  provider-generation-bound request recovery, renewed fenced publication, durable
+  cancellation and user-presence state, one-time Pairing V2, strict JSON and sealed
+  mutation chunks, plus fail-closed RC workflow classification and closeout tooling.
+
 **Reversible Agent account lifecycle (#645)**
 - `agent`+`app-host`+`webui`+`android`: added provider-revoked Disconnect and
   Reconnect, verified-identity Codex account switching, encrypted crash-recovery

@@ -89,16 +89,15 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
     /// item has no archived body or the read fails.
     fn hit_json(&self, it: &ItemRef) -> serde_json::Value {
         let mut v = Self::source_ref(it);
-        let preview = if it.path.is_some() {
-            self.source
-                .read_body(&it.service, &it.id)
-                .ok()
-                .map(|b| Self::body_preview(&it.service, &b))
-                .unwrap_or_default()
-        } else {
-            String::new()
+        let (preview, body_available) = match it.path.as_ref() {
+            Some(_) => match self.source.read_body(&it.service, &it.id) {
+                Ok(body) => (Self::body_preview(&it.service, &body), true),
+                Err(_) => (String::new(), false),
+            },
+            None => (String::new(), false),
         };
         v["snippet"] = serde_json::Value::String(preview);
+        v["body_available"] = serde_json::Value::Bool(body_available);
         v
     }
 
@@ -1059,6 +1058,15 @@ mod tests {
         let ex = fixture();
         let err = ex.read("onedrive", "f1", None).unwrap_err();
         assert!(err.to_string().contains("no body onedrive/f1"));
+    }
+
+    #[test]
+    fn search_marks_unreadable_body_as_unavailable() {
+        let ex = fixture();
+        let out: serde_json::Value =
+            serde_json::from_str(&ex.search(&[], "spotify-logo", None).unwrap()).unwrap();
+        assert_eq!(out["results"][0]["body_available"], false);
+        assert_eq!(out["results"][0]["snippet"], "");
     }
 
     #[cfg(feature = "retrieval")]

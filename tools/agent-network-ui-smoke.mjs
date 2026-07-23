@@ -95,6 +95,13 @@ async function main() {
               },
               models: { claude: [{ id: "claude-sonnet-4", label: "Claude" }], codex: [] },
             };
+            else if (url.pathname === "/api/v1/agent/session/list") value = {
+              sessions: [{ session_id: "session-fixture", display_name: "Assistant", archived: false }],
+              selected_session_id: "session-fixture",
+            };
+            else if (url.pathname === "/api/v1/agent/session/history") value = {
+              records: [], next_cursor: null,
+            };
             else if (url.pathname === "/api/v1/agent/connectivity/preflight") {
               state.preflight += 1;
               value = state.preflight === 1

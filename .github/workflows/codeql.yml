@@ -76,7 +76,11 @@ jobs:
 
       - name: Manual build (Kotlin)
         if: matrix.language == 'java-kotlin'
-        run: cd android && ./gradlew :app:assembleDebug
+        env:
+          ISY_ANDROID_NATIVE_BUILDER: github-actions
+        run: |
+          tools/build-android-native.sh
+          cd android && ./gradlew :app:assembleDebug
 
       - uses: github/codeql-action/analyze@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
         with:

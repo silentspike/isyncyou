@@ -60,6 +60,40 @@ pub(crate) struct SessionKey {
     bytes: [u8; KEY_LEN],
 }
 
+/// Derived session object codec used by the V2 manifest/index store. Object class
+/// and identity are authenticated as AAD so ciphertext cannot be moved between
+/// visible transcript, request-journal, and UUID-binding namespaces.
+#[derive(Clone)]
+pub struct SessionObjectCrypto {
+    config: SessionCryptoConfig,
+    key: SessionKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionObjectClass {
+    Manifest,
+    VisibleRecord,
+    VisibleIndex,
+    RequestState,
+    RequestIndex,
+    UuidBinding,
+    UuidBindingIndex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedSessionObjectV1 {
+    v: u32,
+    alg: String,
+    kdf: KdfProfile,
+    session_id: String,
+    object_class: SessionObjectClass,
+    object_id: String,
+    nonce: String,
+    ct: String,
+}
+
 /// In-memory setup payload that can be encoded for pairing another device. Storage of
 /// the secret is intentionally out of scope for #619; #620 owns Keystore/CredentialStore.
 #[derive(Clone, PartialEq, Eq)]
@@ -165,6 +199,115 @@ impl SessionKey {
     fn bytes_for_test(&self) -> &[u8; KEY_LEN] {
         &self.bytes
     }
+}
+
+impl SessionObjectCrypto {
+    pub fn new(pairing_secret: &[u8], config: SessionCryptoConfig) -> Result<Self, AgentError> {
+        let key = SessionKey::derive(pairing_secret, &config)?;
+        Ok(Self { config, key })
+    }
+
+    pub fn seal(
+        &self,
+        session_id: &str,
+        object_class: SessionObjectClass,
+        object_id: &str,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, AgentError> {
+        validate_object_identity(session_id, object_id)?;
+        let rng = SystemRandom::new();
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        rng.fill(&mut nonce_bytes)
+            .map_err(|_| crypto_err("rng object nonce"))?;
+        let unbound = aead::UnboundKey::new(&aead::AES_256_GCM, &self.key.bytes)
+            .map_err(|_| crypto_err("object sealing key"))?;
+        let sealing = aead::LessSafeKey::new(unbound);
+        let mut ciphertext = plaintext.to_vec();
+        sealing
+            .seal_in_place_append_tag(
+                aead::Nonce::assume_unique_for_key(nonce_bytes),
+                aead::Aad::from(object_aad(session_id, object_class, object_id)),
+                &mut ciphertext,
+            )
+            .map_err(|_| crypto_err("object seal"))?;
+        let envelope = SealedSessionObjectV1 {
+            v: 1,
+            alg: "AES-256-GCM".into(),
+            kdf: self.config.profile().clone(),
+            session_id: session_id.into(),
+            object_class,
+            object_id: object_id.into(),
+            nonce: B64.encode(nonce_bytes),
+            ct: B64.encode(ciphertext),
+        };
+        serde_json::to_vec(&envelope).map_err(|_| crypto_err("object envelope json"))
+    }
+
+    pub fn open(
+        &self,
+        session_id: &str,
+        object_class: SessionObjectClass,
+        object_id: &str,
+        bytes: &[u8],
+    ) -> Result<Vec<u8>, AgentError> {
+        validate_object_identity(session_id, object_id)?;
+        let envelope: SealedSessionObjectV1 =
+            serde_json::from_slice(bytes).map_err(|_| crypto_err("object envelope json"))?;
+        if envelope.v != 1
+            || envelope.alg != "AES-256-GCM"
+            || envelope.kdf != *self.config.profile()
+            || envelope.session_id != session_id
+            || envelope.object_class != object_class
+            || envelope.object_id != object_id
+        {
+            return Err(crypto_err("object envelope binding"));
+        }
+        let nonce = fixed_b64::<NONCE_LEN>(&envelope.nonce, "object nonce")?;
+        let mut ciphertext = B64
+            .decode(&envelope.ct)
+            .map_err(|_| crypto_err("object ciphertext"))?;
+        let unbound = aead::UnboundKey::new(&aead::AES_256_GCM, &self.key.bytes)
+            .map_err(|_| crypto_err("object opening key"))?;
+        let opening = aead::LessSafeKey::new(unbound);
+        let plaintext = opening
+            .open_in_place(
+                aead::Nonce::assume_unique_for_key(nonce),
+                aead::Aad::from(object_aad(session_id, object_class, object_id)),
+                &mut ciphertext,
+            )
+            .map_err(|_| crypto_err("object open"))?;
+        Ok(plaintext.to_vec())
+    }
+}
+
+fn validate_object_identity(session_id: &str, object_id: &str) -> Result<(), AgentError> {
+    if session_id.is_empty()
+        || session_id.len() > 128
+        || object_id.is_empty()
+        || object_id.len() > 256
+        || object_id.bytes().any(|byte| byte == 0)
+    {
+        return Err(crypto_err("object identity"));
+    }
+    Ok(())
+}
+
+fn object_aad(session_id: &str, object_class: SessionObjectClass, object_id: &str) -> Vec<u8> {
+    let class = match object_class {
+        SessionObjectClass::Manifest => b"manifest".as_slice(),
+        SessionObjectClass::VisibleRecord => b"visible_record".as_slice(),
+        SessionObjectClass::VisibleIndex => b"visible_index".as_slice(),
+        SessionObjectClass::RequestState => b"request_state".as_slice(),
+        SessionObjectClass::RequestIndex => b"request_index".as_slice(),
+        SessionObjectClass::UuidBinding => b"uuid_binding".as_slice(),
+        SessionObjectClass::UuidBindingIndex => b"uuid_binding_index".as_slice(),
+    };
+    let mut aad = b"isyncyou-session-object-v1".to_vec();
+    for component in [session_id.as_bytes(), class, object_id.as_bytes()] {
+        aad.extend_from_slice(&(component.len() as u64).to_be_bytes());
+        aad.extend_from_slice(component);
+    }
+    aad
 }
 
 impl PairingPayload {

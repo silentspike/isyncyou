@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "result": "pass",
+  "implementation_commit": "a2b42aa83e83afeb09fc47d88c29c9b2f8a3c53d",
+  "claude": {
+    "product_oauth_connected": true,
+    "read_only_storearchive_turn": "complete",
+    "source_count_at_least": 1,
+    "source_count_observed": 50,
+    "error_count": 0,
+    "pending_actions": 0
+  },
+  "codex": {
+    "product_oauth_connected": true,
+    "read_only_storearchive_turn": "complete",
+    "source_count_at_least": 1,
+    "source_count_observed": 100,
+    "error_count": 0,
+    "pending_actions": 0
+  },
+  "m365_reader_writer_roles_connected": true,
+  "quota_observation_commit": "61651929d970fb778f05de245b5edc07a48d420d",
+  "quota_observation_reused": true,
+  "quota_observation_reuse_reason": "The exact-head source delta changes only account-lifecycle maintenance scheduling; provider quota projection code is unchanged and exact-head provider turns passed.",
+  "desktop_mobile_quota_fields_compared": 5,
+  "desktop_mobile_quota_fields_matched": 5,
+  "default_harness_components_present": false,
+  "local_cli_origin_used": false,
+  "raw_provider_frames_included": false,
+  "source_titles_or_content_included": false,
+  "account_identity_included": false,
+  "oauth_values_included": false
+}
