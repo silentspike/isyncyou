@@ -140,7 +140,7 @@ jobs:
       - name: No dependency/deny changes — skip cargo-deny
         if: needs.changes.outputs.code != 'true'
         run: echo "No Cargo/deny.toml changes in this PR — cargo-deny skipped."
-      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.14
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.0.14
         if: needs.changes.outputs.code == 'true'
         with:
           command: check

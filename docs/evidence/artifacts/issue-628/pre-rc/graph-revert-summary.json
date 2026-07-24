@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "result": "pass",
+  "evidence_mode": "validated_merged_operation_manifests",
+  "baseline_issues": [
+    624,
+    625,
+    626
+  ],
+  "controlled_mutations_only": true,
+  "revert_attempted_for_every_baseline_mutation": true,
+  "unreverted_controlled_fixtures": 0,
+  "new_destructive_fixture_created_for_closeout": false,
+  "opaque_identifiers_included": false,
+  "account_identity_included": false,
+  "personal_content_included": false
+}

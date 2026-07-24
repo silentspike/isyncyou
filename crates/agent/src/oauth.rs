@@ -1,5 +1,4 @@
-//! EXPERIMENTAL device OAuth login (S-AG.12 / #627) — UNSUPPORTED, personal-build only,
-//! behind the default-off `agent-subscription-experimental` feature.
+//! Agent provider OAuth login support.
 //!
 //! Flow (RFC 8252 native-app, PKCE): the app asks [`start`] for an authorize URL; the
 //! WebView hands it to the **system browser**; the operator logs in to their own account
@@ -7,19 +6,24 @@
 //! engine's loopback `redirect_uri`; [`exchange`] swaps the code for a token (PKCE
 //! verifier), which is then stored in the [`crate::CredentialStore`].
 //!
-//! **Recipe-out-of-repo:** `authorize_url` / `token_url` / `client_id` / `scopes` come
-//! from a local, uncommitted [`OAuthConfig`]; nothing provider-specific is hardcoded here.
+//! Product defaults are non-secret public OAuth client metadata. The app-host product
+//! path accepts only this compiled official endpoint/client/scope tuple; a local file
+//! cannot replace it.
 
 use crate::AgentError;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use base64::Engine;
 use ring::rand::{SecureRandom, SystemRandom};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+const PENDING_LOGIN_TTL: Duration = Duration::from_secs(8 * 60);
 
 /// OAuth endpoints/client. Defaults to the public Claude OAuth client (PKCE public
-/// client — these are not secrets); an operator may override via a local config file.
+/// client — these are not secrets). Product callers must enforce this exact tuple.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct OAuthConfig {
@@ -118,6 +122,7 @@ pub fn build_authorize_url(
 struct PendingLogin {
     verifier: String,
     redirect_uri: String,
+    expires_at: Instant,
 }
 
 /// Tracks in-flight logins between [`AgentOAuth::start`] and the browser callback.
@@ -157,11 +162,25 @@ impl AgentOAuth {
 
     /// Take the pending login for `state` (single-use), returning (verifier, redirect_uri).
     pub fn take(&self, state: &str) -> Option<(String, String)> {
-        self.pending
-            .lock()
-            .unwrap()
-            .remove(state)
-            .map(|p| (p.verifier, p.redirect_uri))
+        let now = Instant::now();
+        let mut pending = self.pending.lock().unwrap();
+        pending.retain(|_, login| login.expires_at > now);
+        pending.remove(state).map(|p| (p.verifier, p.redirect_uri))
+    }
+
+    /// Forget one pending login without exchanging it. The opaque browser-facing state
+    /// never leaves the host; callers use this only after matching their own attempt id.
+    pub fn cancel(&self, state: &str) -> bool {
+        self.pending.lock().unwrap().remove(state).is_some()
+    }
+
+    /// Remove expired verifier/state pairs without exposing their values.
+    pub fn reap_expired(&self) -> usize {
+        let now = Instant::now();
+        let mut pending = self.pending.lock().unwrap();
+        let before = pending.len();
+        pending.retain(|_, login| login.expires_at > now);
+        before.saturating_sub(pending.len())
     }
 }
 
@@ -171,11 +190,15 @@ trait PendingInsert {
 }
 impl PendingInsert for Mutex<HashMap<String, PendingLogin>> {
     fn borrow_insert(&self, state: &str, verifier: String, redirect_uri: &str) {
-        self.lock().unwrap().insert(
+        let now = Instant::now();
+        let mut pending = self.lock().unwrap();
+        pending.retain(|_, login| login.expires_at > now);
+        pending.insert(
             state.to_string(),
             PendingLogin {
                 verifier,
                 redirect_uri: redirect_uri.to_string(),
+                expires_at: now + PENDING_LOGIN_TTL,
             },
         );
     }
@@ -297,8 +320,8 @@ pub fn refresh(
 }
 
 // ---------------------------------------------------------------------------------------
-// EXPERIMENTAL Codex/ChatGPT (OpenAI) device OAuth. Captured from the `codex` CLI
-// (auth.openai.com). Loopback flow on the fixed port the client registers; the token
+// Codex/ChatGPT (OpenAI) OAuth. Captured from the `codex` CLI (auth.openai.com).
+// Loopback flow on the fixed port the client registers; the token
 // endpoint wants form-urlencoding (not JSON), and the ChatGPT account id lives in the
 // id_token's `https://api.openai.com/auth` claim.
 // ---------------------------------------------------------------------------------------
@@ -329,22 +352,27 @@ impl Default for CodexOAuthConfig {
     }
 }
 
-/// Build the Codex authorize URL (PKCE S256) the system browser opens. NOTE: we deliberately
-/// do **not** send `codex_cli_simplified_flow` — that makes the consent hand the code to the
-/// loopback server over a JS `fetch` (CORS) handshake the CLI's own server implements; we use
-/// the plain redirect flow instead, so the browser just navigates to `redirect_uri?code=…`.
-/// `id_token_add_organizations` is kept so the id_token carries the ChatGPT account id.
+/// Required public-client identity used by the official Codex OAuth flow.
+pub const CODEX_OAUTH_ORIGINATOR: &str = "codex_cli_rs";
+pub const CODEX_OAUTH_SIMPLIFIED_FLOW: &str = "true";
+
+/// Build the Codex authorize URL (PKCE S256) the system browser opens. The simplified-flow and
+/// originator fields are part of the current official Codex public-client request. The official
+/// client still receives the authorization code through the ordinary loopback redirect, so our
+/// callback server can consume the same `redirect_uri?code=...&state=...` request.
 pub fn codex_build_authorize_url(cfg: &CodexOAuthConfig, challenge: &str, state: &str) -> String {
     format!(
         "{base}?response_type=code&client_id={cid}&redirect_uri={ru}&scope={sc}\
-         &code_challenge={ch}&code_challenge_method=S256&state={st}\
-         &id_token_add_organizations=true",
+         &code_challenge={ch}&code_challenge_method=S256&id_token_add_organizations=true\
+         &codex_cli_simplified_flow={simplified}&state={st}&originator={originator}",
         base = cfg.authorize_url,
         cid = pct(&cfg.client_id),
         ru = pct(&cfg.redirect_uri),
         sc = pct(&cfg.scope),
         ch = pct(challenge),
         st = pct(state),
+        simplified = CODEX_OAUTH_SIMPLIFIED_FLOW,
+        originator = CODEX_OAUTH_ORIGINATOR,
     )
 }
 
@@ -354,6 +382,8 @@ pub struct CodexTokens {
     pub access_token: String,
     pub refresh_token: String,
     pub account_id: String,
+    /// Used only for immediate OIDC validation. Callers must not persist or log it.
+    pub id_token: String,
     pub expires_in: u64,
 }
 
@@ -394,13 +424,18 @@ fn codex_parse_tokens(text: &str, fallback_refresh: &str) -> Result<CodexTokens,
         .and_then(|t| t.as_str())
         .unwrap_or(fallback_refresh)
         .to_string();
-    let account_id =
-        codex_account_id_from_id_token(v.get("id_token").and_then(|t| t.as_str()).unwrap_or(""));
+    let id_token = v
+        .get("id_token")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    let account_id = codex_account_id_from_id_token(&id_token);
     let expires_in = v.get("expires_in").and_then(|t| t.as_u64()).unwrap_or(0);
     Ok(CodexTokens {
         access_token,
         refresh_token,
         account_id,
+        id_token,
         expires_in,
     })
 }
@@ -456,9 +491,271 @@ pub fn codex_refresh(
     codex_parse_tokens(&text, refresh_token)
 }
 
+// ---------------------------------------------------------------------------------------
+// Product credential revocation. Endpoints, client identities, token selection and
+// deadlines are compiled policy; callers can provide credentials but cannot override the
+// reviewed provider contract.
+// ---------------------------------------------------------------------------------------
+
+const CLAUDE_REVOKE_TIMEOUT: Duration = Duration::from_secs(5);
+const CODEX_REVOKE_TIMEOUT: Duration = Duration::from_secs(10);
+const CODEX_REVOKE_URL: &str = "https://auth.openai.com/oauth/revoke";
+
+/// Which credential authority was sent to the provider revoke endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevokeRequestTarget {
+    RefreshToken,
+    AccessToken,
+}
+
+/// What the reviewed provider contract allows the product to claim about revocation scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevokeScopeGuarantee {
+    GuaranteedTokenSession,
+    ObservedTokenSession,
+    Unknown,
+    FullGrant,
+}
+
+/// Closed public failure codes for one provider revoke attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokeFailureCode {
+    InvalidCredential,
+    ConnectTimedOut,
+    NameResolutionFailed,
+    TlsFailed,
+    ConnectFailed,
+    RateLimited,
+    ProviderUnavailable,
+    Rejected,
+}
+
+/// Result of one provider revoke request. No provider body or raw error is retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokeOutcome {
+    Confirmed {
+        request_target: RevokeRequestTarget,
+        scope_guarantee: RevokeScopeGuarantee,
+    },
+    Retryable {
+        code: RevokeFailureCode,
+    },
+    Terminal {
+        code: RevokeFailureCode,
+    },
+}
+
+/// Product credential material accepted by the closed revoke builder.
+#[derive(Clone, Default)]
+pub struct RevokeCredential {
+    pub access_token: Option<crate::Secret>,
+    pub refresh_token: Option<crate::Secret>,
+}
+
+impl fmt::Debug for RevokeCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RevokeCredential")
+            .field("access_token_present", &self.access_token.is_some())
+            .field("refresh_token_present", &self.refresh_token.is_some())
+            .finish()
+    }
+}
+
+/// Immutable provider request. Its custom Debug implementation exposes policy metadata only.
+pub struct ProductRevokeRequest {
+    url: &'static str,
+    body: crate::Secret,
+    timeout: Duration,
+    request_target: RevokeRequestTarget,
+    scope_guarantee: RevokeScopeGuarantee,
+}
+
+impl ProductRevokeRequest {
+    pub fn url(&self) -> &'static str {
+        self.url
+    }
+
+    pub fn body(&self) -> &crate::Secret {
+        &self.body
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+}
+
+impl fmt::Debug for ProductRevokeRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProductRevokeRequest")
+            .field("provider_endpoint", &"[compiled provider endpoint]")
+            .field("body", &"[redacted]")
+            .field("timeout", &self.timeout)
+            .field("request_target", &self.request_target)
+            .field("scope_guarantee", &self.scope_guarantee)
+            .finish()
+    }
+}
+
+/// Injected transport used by host code and deterministic unit tests.
+pub trait ProductRevokeTransport {
+    fn send(
+        &self,
+        request: &ProductRevokeRequest,
+    ) -> Result<u16, crate::http::SecretJsonTransportError>;
+}
+
+#[cfg(feature = "http")]
+impl ProductRevokeTransport for crate::http::HttpTransport {
+    fn send(
+        &self,
+        request: &ProductRevokeRequest,
+    ) -> Result<u16, crate::http::SecretJsonTransportError> {
+        self.post_secret_json_no_redirect(request.url(), request.body(), request.timeout())
+    }
+}
+
+fn secret_text(secret: &crate::Secret) -> Result<&str, RevokeFailureCode> {
+    let value =
+        std::str::from_utf8(secret.expose()).map_err(|_| RevokeFailureCode::InvalidCredential)?;
+    if value.trim().is_empty() {
+        return Err(RevokeFailureCode::InvalidCredential);
+    }
+    Ok(value)
+}
+
+fn encode_revoke_body(fields: &[(&str, &str)]) -> Result<crate::Secret, RevokeFailureCode> {
+    let object: serde_json::Map<String, serde_json::Value> = fields
+        .iter()
+        .map(|(name, value)| {
+            (
+                (*name).to_string(),
+                serde_json::Value::String((*value).to_string()),
+            )
+        })
+        .collect();
+    serde_json::to_vec(&object)
+        .map(crate::Secret::new)
+        .map_err(|_| RevokeFailureCode::InvalidCredential)
+}
+
+fn build_product_revoke_request(
+    provider: crate::ProductProviderId,
+    credential: &RevokeCredential,
+) -> Result<ProductRevokeRequest, RevokeFailureCode> {
+    let claude_cfg = OAuthConfig::default();
+    let codex_cfg = CodexOAuthConfig::default();
+    match provider {
+        crate::ProductProviderId::Claude => {
+            let token = credential
+                .refresh_token
+                .as_ref()
+                .ok_or(RevokeFailureCode::InvalidCredential)
+                .and_then(secret_text)?;
+            let url = match claude_cfg.token_url.as_str() {
+                "https://platform.claude.com/v1/oauth/token" => {
+                    "https://platform.claude.com/v1/oauth/token/revoke"
+                }
+                _ => return Err(RevokeFailureCode::InvalidCredential),
+            };
+            let body = encode_revoke_body(&[
+                ("token", token),
+                ("token_type_hint", "refresh_token"),
+                ("client_id", &claude_cfg.client_id),
+            ])?;
+            Ok(ProductRevokeRequest {
+                url,
+                body,
+                timeout: CLAUDE_REVOKE_TIMEOUT,
+                request_target: RevokeRequestTarget::RefreshToken,
+                scope_guarantee: RevokeScopeGuarantee::ObservedTokenSession,
+            })
+        }
+        crate::ProductProviderId::Codex => {
+            let (secret, target, hint, include_client) =
+                if let Some(refresh) = credential.refresh_token.as_ref() {
+                    (
+                        secret_text(refresh)?,
+                        RevokeRequestTarget::RefreshToken,
+                        "refresh_token",
+                        true,
+                    )
+                } else if let Some(access) = credential.access_token.as_ref() {
+                    (
+                        secret_text(access)?,
+                        RevokeRequestTarget::AccessToken,
+                        "access_token",
+                        false,
+                    )
+                } else {
+                    return Err(RevokeFailureCode::InvalidCredential);
+                };
+            let mut fields = vec![("token", secret), ("token_type_hint", hint)];
+            if include_client {
+                fields.push(("client_id", &codex_cfg.client_id));
+            }
+            Ok(ProductRevokeRequest {
+                url: CODEX_REVOKE_URL,
+                body: encode_revoke_body(&fields)?,
+                timeout: CODEX_REVOKE_TIMEOUT,
+                request_target: target,
+                scope_guarantee: RevokeScopeGuarantee::ObservedTokenSession,
+            })
+        }
+    }
+}
+
+/// Revoke one product credential according to the compiled provider contract.
+pub fn revoke_product_credential(
+    transport: &dyn ProductRevokeTransport,
+    provider: crate::ProductProviderId,
+    credential: &RevokeCredential,
+) -> RevokeOutcome {
+    let request = match build_product_revoke_request(provider, credential) {
+        Ok(request) => request,
+        Err(code) => return RevokeOutcome::Terminal { code },
+    };
+    match transport.send(&request) {
+        Ok(200..=299) => RevokeOutcome::Confirmed {
+            request_target: request.request_target,
+            scope_guarantee: request.scope_guarantee,
+        },
+        Ok(408 | 425 | 429) => RevokeOutcome::Retryable {
+            code: RevokeFailureCode::RateLimited,
+        },
+        Ok(500..=599) => RevokeOutcome::Retryable {
+            code: RevokeFailureCode::ProviderUnavailable,
+        },
+        Ok(_) => RevokeOutcome::Terminal {
+            code: RevokeFailureCode::Rejected,
+        },
+        Err(crate::http::SecretJsonTransportError::ConnectTimedOut) => RevokeOutcome::Retryable {
+            code: RevokeFailureCode::ConnectTimedOut,
+        },
+        Err(crate::http::SecretJsonTransportError::NameResolutionFailed) => {
+            RevokeOutcome::Retryable {
+                code: RevokeFailureCode::NameResolutionFailed,
+            }
+        }
+        Err(crate::http::SecretJsonTransportError::TlsFailed) => RevokeOutcome::Retryable {
+            code: RevokeFailureCode::TlsFailed,
+        },
+        Err(
+            crate::http::SecretJsonTransportError::ConnectFailed
+            | crate::http::SecretJsonTransportError::InitializationFailed,
+        ) => RevokeOutcome::Retryable {
+            code: RevokeFailureCode::ConnectFailed,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
 
     fn cfg() -> OAuthConfig {
         OAuthConfig {
@@ -521,5 +818,323 @@ mod tests {
         let (c2, s2) = parse_pasted_code("onlycode");
         assert_eq!(c2, "onlycode");
         assert_eq!(s2, None);
+    }
+
+    #[test]
+    fn codex_authorize_url_retains_official_simplified_flow_and_originator() {
+        let cfg = CodexOAuthConfig::default();
+        let url = codex_build_authorize_url(&cfg, "challenge", "state");
+        let (_, query) = url.split_once('?').expect("authorize URL has query");
+        let ordered_keys: Vec<&str> = query
+            .split('&')
+            .map(|field| field.split_once('=').expect("query field has value").0)
+            .collect();
+        let fields: std::collections::BTreeMap<&str, &str> = query
+            .split('&')
+            .map(|field| field.split_once('=').expect("query field has value"))
+            .collect();
+
+        assert_eq!(
+            fields.len(),
+            10,
+            "no default-client query field may drift in"
+        );
+        assert_eq!(
+            ordered_keys,
+            [
+                "response_type",
+                "client_id",
+                "redirect_uri",
+                "scope",
+                "code_challenge",
+                "code_challenge_method",
+                "id_token_add_organizations",
+                "codex_cli_simplified_flow",
+                "state",
+                "originator",
+            ]
+        );
+        assert_eq!(
+            fields.get("codex_cli_simplified_flow"),
+            Some(&CODEX_OAUTH_SIMPLIFIED_FLOW)
+        );
+        assert_eq!(fields.get("originator"), Some(&CODEX_OAUTH_ORIGINATOR));
+        assert_eq!(fields.get("code_challenge_method"), Some(&"S256"));
+        assert_eq!(fields.get("id_token_add_organizations"), Some(&"true"));
+        assert_eq!(fields.get("state"), Some(&"state"));
+    }
+
+    struct RevokeMock {
+        result: Result<u16, crate::http::SecretJsonTransportError>,
+        seen: StdMutex<Vec<(String, Duration, serde_json::Value)>>,
+    }
+
+    impl RevokeMock {
+        fn status(status: u16) -> Self {
+            Self {
+                result: Ok(status),
+                seen: StdMutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ProductRevokeTransport for RevokeMock {
+        fn send(
+            &self,
+            request: &ProductRevokeRequest,
+        ) -> Result<u16, crate::http::SecretJsonTransportError> {
+            let body = serde_json::from_slice(request.body().expose()).expect("valid JSON body");
+            self.seen
+                .lock()
+                .unwrap()
+                .push((request.url().to_string(), request.timeout(), body));
+            self.result
+        }
+    }
+
+    fn secret(value: &str) -> crate::Secret {
+        crate::Secret::new(value.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn claude_revoke_uses_refresh_token_hint_client_id_and_token_endpoint_suffix() {
+        let transport = RevokeMock::status(204);
+        let outcome = revoke_product_credential(
+            &transport,
+            crate::ProductProviderId::Claude,
+            &RevokeCredential {
+                access_token: Some(secret("unused-access")),
+                refresh_token: Some(secret("claude-refresh-sentinel")),
+            },
+        );
+        assert_eq!(
+            outcome,
+            RevokeOutcome::Confirmed {
+                request_target: RevokeRequestTarget::RefreshToken,
+                scope_guarantee: RevokeScopeGuarantee::ObservedTokenSession,
+            }
+        );
+        let seen = transport.seen.lock().unwrap();
+        assert_eq!(
+            seen[0].0,
+            "https://platform.claude.com/v1/oauth/token/revoke"
+        );
+        assert_eq!(seen[0].1, Duration::from_secs(5));
+        assert_eq!(seen[0].2["token"], "claude-refresh-sentinel");
+        assert_eq!(seen[0].2["token_type_hint"], "refresh_token");
+        assert_eq!(seen[0].2["client_id"], OAuthConfig::default().client_id);
+        assert_eq!(seen[0].2.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn codex_revoke_prefers_refresh_token_and_includes_client_id() {
+        let request = build_product_revoke_request(
+            crate::ProductProviderId::Codex,
+            &RevokeCredential {
+                access_token: Some(secret("access-sentinel")),
+                refresh_token: Some(secret("refresh-sentinel")),
+            },
+        )
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(request.body().expose()).unwrap();
+        assert_eq!(request.url(), CODEX_REVOKE_URL);
+        assert_eq!(request.timeout(), Duration::from_secs(10));
+        assert_eq!(body["token"], "refresh-sentinel");
+        assert_eq!(body["token_type_hint"], "refresh_token");
+        assert_eq!(body["client_id"], CodexOAuthConfig::default().client_id);
+        assert_eq!(body.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn codex_revoke_falls_back_to_access_token_without_client_id() {
+        let request = build_product_revoke_request(
+            crate::ProductProviderId::Codex,
+            &RevokeCredential {
+                access_token: Some(secret("access-sentinel")),
+                refresh_token: None,
+            },
+        )
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(request.body().expose()).unwrap();
+        assert_eq!(body["token"], "access-sentinel");
+        assert_eq!(body["token_type_hint"], "access_token");
+        assert!(body.get("client_id").is_none());
+        assert_eq!(body.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn revoke_rejects_empty_or_unsupported_credential_shape() {
+        for (provider, credential) in [
+            (
+                crate::ProductProviderId::Claude,
+                RevokeCredential::default(),
+            ),
+            (
+                crate::ProductProviderId::Claude,
+                RevokeCredential {
+                    access_token: Some(secret("access-only")),
+                    refresh_token: None,
+                },
+            ),
+            (
+                crate::ProductProviderId::Codex,
+                RevokeCredential {
+                    access_token: Some(secret("  ")),
+                    refresh_token: None,
+                },
+            ),
+        ] {
+            assert_eq!(
+                revoke_product_credential(&RevokeMock::status(204), provider, &credential),
+                RevokeOutcome::Terminal {
+                    code: RevokeFailureCode::InvalidCredential
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn revoke_does_not_follow_redirects() {
+        let outcome = revoke_product_credential(
+            &RevokeMock::status(302),
+            crate::ProductProviderId::Codex,
+            &RevokeCredential {
+                access_token: Some(secret("access")),
+                refresh_token: None,
+            },
+        );
+        assert_eq!(
+            outcome,
+            RevokeOutcome::Terminal {
+                code: RevokeFailureCode::Rejected
+            }
+        );
+        let transport_source = include_str!("http.rs");
+        assert!(transport_source.contains("redirect(reqwest::redirect::Policy::none())"));
+        assert!(transport_source
+            .contains("header(reqwest::header::CONTENT_TYPE, \"application/json\")"));
+    }
+
+    #[test]
+    fn revoke_maps_timeout_dns_tls_429_and_5xx_to_closed_typed_failures() {
+        let credential = RevokeCredential {
+            access_token: Some(secret("access")),
+            refresh_token: None,
+        };
+        for (result, expected) in [
+            (
+                Err(crate::http::SecretJsonTransportError::ConnectTimedOut),
+                RevokeFailureCode::ConnectTimedOut,
+            ),
+            (
+                Err(crate::http::SecretJsonTransportError::NameResolutionFailed),
+                RevokeFailureCode::NameResolutionFailed,
+            ),
+            (
+                Err(crate::http::SecretJsonTransportError::TlsFailed),
+                RevokeFailureCode::TlsFailed,
+            ),
+            (Ok(429), RevokeFailureCode::RateLimited),
+            (Ok(503), RevokeFailureCode::ProviderUnavailable),
+        ] {
+            let transport = RevokeMock {
+                result,
+                seen: StdMutex::new(Vec::new()),
+            };
+            assert_eq!(
+                revoke_product_credential(&transport, crate::ProductProviderId::Codex, &credential),
+                RevokeOutcome::Retryable { code: expected }
+            );
+        }
+    }
+
+    #[test]
+    fn revoke_maps_unreviewed_4xx_to_terminal_without_response_body() {
+        let outcome = revoke_product_credential(
+            &RevokeMock::status(418),
+            crate::ProductProviderId::Codex,
+            &RevokeCredential {
+                access_token: Some(secret("body-must-not-escape")),
+                refresh_token: None,
+            },
+        );
+        assert_eq!(
+            outcome,
+            RevokeOutcome::Terminal {
+                code: RevokeFailureCode::Rejected
+            }
+        );
+        assert!(!format!("{outcome:?}").contains("body-must-not-escape"));
+    }
+
+    #[test]
+    fn revoke_success_exposes_scope_and_kind_but_never_token_or_body() {
+        let token = "success-secret-sentinel";
+        let credential = RevokeCredential {
+            access_token: Some(secret(token)),
+            refresh_token: None,
+        };
+        let outcome = revoke_product_credential(
+            &RevokeMock::status(200),
+            crate::ProductProviderId::Codex,
+            &credential,
+        );
+        assert_eq!(
+            outcome,
+            RevokeOutcome::Confirmed {
+                request_target: RevokeRequestTarget::AccessToken,
+                scope_guarantee: RevokeScopeGuarantee::ObservedTokenSession,
+            }
+        );
+        assert!(!format!("{outcome:?} {credential:?}").contains(token));
+    }
+
+    #[test]
+    fn refresh_token_request_target_does_not_imply_guaranteed_session_scope() {
+        let outcome = revoke_product_credential(
+            &RevokeMock::status(200),
+            crate::ProductProviderId::Claude,
+            &RevokeCredential {
+                access_token: None,
+                refresh_token: Some(secret("refresh")),
+            },
+        );
+        assert_eq!(
+            outcome,
+            RevokeOutcome::Confirmed {
+                request_target: RevokeRequestTarget::RefreshToken,
+                scope_guarantee: RevokeScopeGuarantee::ObservedTokenSession,
+            }
+        );
+    }
+
+    #[test]
+    fn product_revoke_specs_reject_endpoint_or_client_override() {
+        let source = include_str!("oauth.rs");
+        let signature = source
+            .split("pub fn revoke_product_credential(")
+            .nth(1)
+            .unwrap()
+            .split(") -> RevokeOutcome")
+            .next()
+            .unwrap();
+        assert!(!signature.contains("url"));
+        assert!(!signature.contains("client_id"));
+        assert!(!signature.contains("OAuthConfig"));
+    }
+
+    #[test]
+    fn revoke_debug_and_display_are_secret_free() {
+        let secret_value = "debug-secret-sentinel";
+        let credential = RevokeCredential {
+            access_token: Some(secret(secret_value)),
+            refresh_token: None,
+        };
+        let request =
+            build_product_revoke_request(crate::ProductProviderId::Codex, &credential).unwrap();
+        let rendered = format!("{credential:?} {request:?}");
+        assert!(!rendered.contains(secret_value));
+        assert!(!rendered.contains(CODEX_REVOKE_URL));
+        assert!(rendered.contains("[redacted]"));
     }
 }

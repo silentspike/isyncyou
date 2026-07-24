@@ -1,0 +1,95 @@
+# Issue #620 Host And Device Gates
+
+Evidence commit under test: b50bd143c001ceac5090c0dbebcdb3da97e2ff8a
+Final runtime/test code commit audited: 99d1e3c70ad33631ad9804064440af55957800d4
+Captured: 2026-07-09
+
+PASS cargo +1.95.0 test -p isyncyou-agent secrets -- --nocapture
+- Final Task 5 run passed 23 secret-store tests.
+- Covered typed class round-trips, empty-secret rejection, envelope class/id/version
+  mutation rejection, delimiter-safe AAD, ciphertext sentinel scan, owner-only
+  create/rewrite, resolver ordering, provider secret ids, and redaction.
+
+PASS cargo +1.95.0 test -p isyncyou-app-host --features agent-subscription-experimental credential -- --nocapture
+- Passed app-host credential helper tests including subscription/codex round-trips,
+  credential-store precedence over desktop CLI fallback, and stored credential error
+  redaction.
+
+PASS cargo +1.95.0 test -p isyncyou-mobile --features agent-credential-store-self-test -- --nocapture
+- Passed mobile tests for agent credential key install success/failure, fail-closed
+  mobile startup when the key is absent, and the feature-gated JNI-only self-test JSON.
+
+PASS cargo +1.95.0 clippy -p isyncyou-agent --all-targets --features http,agent-subscription-experimental -- -D warnings
+PASS cargo +1.95.0 clippy -p isyncyou-app-host --all-targets --features agent-subscription-experimental -- -D warnings
+PASS cargo +1.95.0 clippy -p isyncyou-mobile --all-targets --features agent-credential-store-self-test -- -D warnings
+PASS cargo +1.95.0 fmt --all --check
+PASS (cd android && ./gradlew :app:testDebugUnitTest)
+
+PASS exposure grep
+- No WebView/gui/app-host/bridge production path exposes nativeSetAgentCredentialKey,
+  nativeAgentCredentialStoreSelfTest, AgentCredentialKeyStore, agent_credential.key,
+  or ISYNCYOU_AGENT_CRED_KEY.
+
+PASS Pixel 8 Pro instrumentation
+- Command:
+  (cd android && ISY_CARGO_FEATURES=agent-credential-store-self-test ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.silentspike.isyncyou.AgentCredentialKeyStoreInstrumentedTest)
+- Result:
+  tests=1 failures=0 errors=0 skipped=0
+- Extracted evidence is stored in docs/evidence/artifacts/issue-620/android-keystore.json.
+- Fresh rerun during final review:
+  tests=1 failures=0 errors=0 skipped=0 on Pixel 8 Pro at b50bd14.
+- Android fallback decision:
+  the mobile path deliberately has no default encrypted-file fallback for the
+  agent credential key. If Android Keystore unwrap or JNI install is unavailable,
+  startup fails closed before nativeStart opens local data.
+
+## Final Plan Audit
+
+Final runtime/test code commit audited: 99d1e3c test(mobile): serialize key installer tests
+
+Finding during Task 8:
+- The first final `cargo +1.95.0 test -p isyncyou-mobile --features agent-credential-store-self-test -- --nocapture`
+  run exposed a parallel-test race in the mobile BodyKey/AgentCredentialKey panic-injection
+  flags. The production path was unaffected, but the #620 test gate was not stable enough
+  to call complete. Fixed in 99d1e3c by serializing tests that mutate the shared installer
+  readiness/failure state.
+
+Final rerun results after the fix:
+- PASS cargo +1.95.0 fmt --all --check
+- PASS cargo +1.95.0 test -p isyncyou-agent --features http,agent-subscription-experimental secrets -- --nocapture
+  - 23 passed; 0 failed.
+- PASS cargo +1.95.0 test -p isyncyou-agent --features http,agent-subscription-experimental credential -- --nocapture
+  - 6 passed; 0 failed.
+- PASS cargo +1.95.0 test -p isyncyou-app-host --features agent-subscription-experimental credential -- --nocapture
+  - 4 passed; 0 failed.
+- PASS cargo +1.95.0 test -p isyncyou-mobile --features agent-credential-store-self-test -- --nocapture
+  - 24 passed; 0 failed. The visible panic lines are expected catch_unwind failure-injection probes.
+- PASS cargo +1.95.0 clippy -p isyncyou-agent --all-targets --features http,agent-subscription-experimental -- -D warnings
+- PASS cargo +1.95.0 clippy -p isyncyou-app-host --all-targets --features agent-subscription-experimental -- -D warnings
+- PASS cargo +1.95.0 clippy -p isyncyou-mobile --all-targets --features agent-credential-store-self-test -- -D warnings
+- PASS (cd android && ./gradlew :app:testDebugUnitTest)
+- PASS python3 tools/check_traceability.py
+- PASS python3 tools/check_evidence.py --manifest docs/evidence/issue-620-manifest.json
+- PASS git diff --check origin/dev...HEAD
+- PASS (final review) cargo +1.95.0 test -p isyncyou-agent --features http,agent-subscription-experimental secrets -- --nocapture
+  - 23 passed; 0 failed.
+- PASS (final review) cargo +1.95.0 test -p isyncyou-agent --features http,agent-subscription-experimental credential -- --nocapture
+  - 6 passed; 0 failed.
+- PASS (final review) cargo +1.95.0 test -p isyncyou-app-host --features agent-subscription-experimental credential -- --nocapture
+  - 4 passed; 0 failed.
+- PASS (final review) cargo +1.95.0 test -p isyncyou-mobile --features agent-credential-store-self-test -- --nocapture
+  - 24 passed; 0 failed.
+- PASS (final review) cargo +1.95.0 clippy -p isyncyou-agent --all-targets --features http,agent-subscription-experimental -- -D warnings
+- PASS (final review) cargo +1.95.0 clippy -p isyncyou-app-host --all-targets --features agent-subscription-experimental -- -D warnings
+- PASS (final review) cargo +1.95.0 clippy -p isyncyou-mobile --all-targets --features agent-credential-store-self-test -- -D warnings
+- PASS (final review) (cd android && ./gradlew :app:testDebugUnitTest)
+- PASS (final review) (cd android && ISY_CARGO_FEATURES=agent-credential-store-self-test ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.silentspike.isyncyou.AgentCredentialKeyStoreInstrumentedTest)
+  - 1 test on Pixel 8 Pro; 0 failures, 0 errors, 0 skipped.
+
+Final scope checks:
+- Branch: feature/ag-620
+- Diff scope: 16 files, all within agent credential store, app-host credential consumers,
+  mobile/android key installation/tests, requirements, changelog, and #620 evidence.
+- Untracked docs/security/issue-*.md plan files are intentionally not staged.
+- device-lock status after on-device proof: pixel8pro FREE.
+- No push, PR, staging/main promotion, release workflow, RC, or tag was created.

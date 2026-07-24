@@ -1,0 +1,14 @@
+Physical device: Pixel 8 Pro, Android API 36, USB ADB
+
+PASS MobileJobWorkerInstrumentedTest: 1/1
+  - Activity-facing instrumentation PID equals WorkManager Worker PID.
+  - Runtime process names match.
+
+PASS AgentCredentialKeyStoreInstrumentedTest: 2/2
+  - Android Keystore wrapping key installs the Rust credential key.
+  - CredentialStore sealed round trip succeeds without plaintext sentinel on disk.
+  - A corrupt wrapped key fails closed and is not silently replaced.
+
+The tests were executed with their required build features. The final installed APK was
+then replaced by the independently built default APK whose native library has no test-hook
+strings.

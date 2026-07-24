@@ -1,0 +1,47 @@
+# Issue #624 Plan Verification
+
+Generated at: 2026-07-10T15:41:55+02:00
+Branch: feature/ag-624
+Code anchor: 47264c00b7b51a6b6b46d5416986913febe06450
+Issue state checked with gh: OPEN
+
+Plan source reloaded:
+
+- docs/security/issue-624-desktop-operations-agent-plan.md
+- line count: 924
+
+Verification method:
+
+- The full saved #624 plan was re-read after implementation work.
+- The live GitHub issue state was checked with `gh issue view 624 --repo silentspike/isyncyou`.
+- The worktree was checked for staged/unstaged scope.
+- Rust verification was interpreted under the repo rule that Rust commands must use `cargo remote -c -- ...`; formatting must use `cargo-remote-fmt` / `cargo-remote-fmt --check`.
+- The plan's older local `cargo +1.95.0 ...` command examples were not treated as valid gates for this worktree.
+
+Implemented plan coverage:
+
+- Desktop production Agent confirmation uses the real confirmed executor.
+- Mobile destructive Agent confirmation remains fail-closed for #624.
+- RestoreLocal writes through the controlled local restore root.
+- Backup routes through the shared app-host backup runner.
+- RestoreCloud routes through the existing restore-cloud runtime.
+- LiveWrite routes through existing app-host service writer dispatch.
+- Share routes through the existing ledger-backed share handler path.
+- Destructive tool_call stream input is redacted before public emission.
+- Confirm replay, wrong-token/hash, read-class action, malformed action, and mobile-policy paths are covered by host tests.
+- Ignored live probes prove confirmed Agent execution against real Microsoft Graph for Mail create_draft, OneDrive share link, Mail backup, and Mail restore-cloud, with cleanup where applicable.
+
+Live AC honesty:
+
+- LiveWrite: PASS live probe, reverted by deleting created draft.
+- Share: PASS live probe, reverted by deleting created permission and temporary item.
+- Backup: PASS live probe; confirmed PendingAction ran the shared backup runner against real Microsoft Graph mail access and recorded an ok backup run.
+- RestoreCloud: PASS live probe; confirmed PendingAction restored a synthetic archived mail item, verified Graph readback, committed restore ledger evidence, and deleted the restored message.
+- RestoreLocal: host fixture evidence only.
+- Invite: not tested live; plan already treats controlled-recipient invite as optional.
+
+Residual status:
+
+- The remaining live-evidence exception is deliberate: RestoreLocal is host-fixture backed because it is local file recovery, and invite is not live-claimed without a controlled recipient.
+- No push, RC, tag, release workflow, staging promotion, or main promotion was performed.
+- Untracked docs/security/issue-*.md plan files were not staged.

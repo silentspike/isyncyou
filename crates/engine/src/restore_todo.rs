@@ -17,7 +17,9 @@
 //! recovery are unit-tested deterministically; `GraphClient` is the real impl.
 
 use crate::restore_key::{idempotency_key, load_or_create_secret, todo_marker};
-use crate::restore_recovery::{recover_restore_op, run_restore_op, RestoreSink};
+use crate::restore_recovery::{
+    recover_restore_op, run_restore_op, RestoreError, RestoreResult, RestoreSink,
+};
 use isyncyou_core::Config;
 use isyncyou_store::{RestoreState, Store};
 use serde_json::Value;
@@ -31,6 +33,19 @@ pub trait ToDoApi {
     /// Find a task in `list_id` whose body contains `marker` by listing tasks (all
     /// pages) and scanning their bodies; returns its cloud id if present.
     fn find_by_marker(&self, list_id: &str, marker: &str) -> Result<Option<String>, String>;
+
+    fn create_task_for_restore(&self, list_id: &str, body: &Value) -> RestoreResult<String> {
+        self.create_task(list_id, body)
+            .map_err(RestoreError::internal)
+    }
+    fn find_by_marker_for_restore(
+        &self,
+        list_id: &str,
+        marker: &str,
+    ) -> RestoreResult<Option<String>> {
+        self.find_by_marker(list_id, marker)
+            .map_err(RestoreError::internal)
+    }
 }
 
 impl ToDoApi for isyncyou_graph::GraphClient {
@@ -64,6 +79,45 @@ impl ToDoApi for isyncyou_graph::GraphClient {
                 }
             }
             match page.get("@odata.nextLink").and_then(|l| l.as_str()) {
+                Some(next) => url = next.to_string(),
+                None => return Ok(None),
+            }
+        }
+    }
+
+    fn create_task_for_restore(&self, list_id: &str, body: &Value) -> RestoreResult<String> {
+        let v = self
+            .post_json(&format!("/me/todo/lists/{list_id}/tasks"), body)
+            .map_err(RestoreError::from_graph)?;
+        v.get("id")
+            .and_then(|i| i.as_str())
+            .map(String::from)
+            .ok_or_else(|| RestoreError::invalid("created task response has no id"))
+    }
+
+    fn find_by_marker_for_restore(
+        &self,
+        list_id: &str,
+        marker: &str,
+    ) -> RestoreResult<Option<String>> {
+        let mut url = format!("/me/todo/lists/{list_id}/tasks?$top=100");
+        loop {
+            let page = self.get_json(&url).map_err(RestoreError::from_graph)?;
+            if let Some(tasks) = page.get("value").and_then(|v| v.as_array()) {
+                for task in tasks {
+                    let body = task
+                        .get("body")
+                        .and_then(|b| b.get("content"))
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("");
+                    if body.contains(marker) {
+                        if let Some(id) = task.get("id").and_then(|i| i.as_str()) {
+                            return Ok(Some(id.to_string()));
+                        }
+                    }
+                }
+            }
+            match page.get("@odata.nextLink").and_then(|link| link.as_str()) {
                 Some(next) => url = next.to_string(),
                 None => return Ok(None),
             }
@@ -105,18 +159,18 @@ fn embed_marker_in_body(body: &mut Value, marker: &str) {
 }
 
 impl<A: ToDoApi> RestoreSink for ToDoSink<'_, A> {
-    fn create(&self, marker: &str, payload: &[u8]) -> Result<String, String> {
+    fn create(&self, marker: &str, payload: &[u8]) -> RestoreResult<String> {
         let task: Value = serde_json::from_slice(payload)
-            .map_err(|e| format!("archived task is not JSON: {e}"))?;
+            .map_err(|e| RestoreError::invalid(format!("archived task is not JSON: {e}")))?;
         let mut body = isyncyou_connectors::sanitize_task(&task);
         if !body.is_object() {
-            return Err("sanitized task is not a JSON object".to_string());
+            return Err(RestoreError::invalid("sanitized task is not a JSON object"));
         }
         embed_marker_in_body(&mut body, marker);
-        self.api.create_task(&self.list_id, &body)
+        self.api.create_task_for_restore(&self.list_id, &body)
     }
-    fn find_by_marker(&self, marker: &str) -> Result<Option<String>, String> {
-        self.api.find_by_marker(&self.list_id, marker)
+    fn find_by_marker(&self, marker: &str) -> RestoreResult<Option<String>> {
+        self.api.find_by_marker_for_restore(&self.list_id, marker)
     }
 }
 
@@ -144,19 +198,30 @@ pub fn restore_todo_via_ledger(
     id: &str,
     token: String,
 ) -> Result<String, String> {
+    restore_todo_via_ledger_classified(cfg, account, id, token).map_err(|error| error.to_string())
+}
+
+pub(crate) fn restore_todo_via_ledger_classified(
+    cfg: &Config,
+    account: &str,
+    id: &str,
+    token: String,
+) -> RestoreResult<String> {
     let acc = cfg
         .accounts
         .iter()
         .find(|a| a.id == account)
-        .ok_or_else(|| format!("no account '{account}' in config"))?;
-    let (item, bytes) = crate::read_archived_body(cfg, account, "todo", id)?;
-    let list_id = list_id_of(&item)?;
-    let secret = load_or_create_secret(&acc.archive_root.join(".isyncyou-restore-secret"))?;
+        .ok_or_else(|| RestoreError::invalid(format!("no account '{account}' in config")))?;
+    let (item, bytes) =
+        crate::read_archived_body(cfg, account, "todo", id).map_err(RestoreError::invalid)?;
+    let list_id = list_id_of(&item).map_err(RestoreError::invalid)?;
+    let secret = load_or_create_secret(&acc.archive_root.join(".isyncyou-restore-secret"))
+        .map_err(RestoreError::internal)?;
     let key = idempotency_key(&secret, account, "todo", id, &bytes);
     let op_id = format!("{account}:{key}");
     let marker = todo_marker(&key);
-    let store =
-        Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    let store = Store::open(acc.archive_root.join(".isyncyou-store.db"))
+        .map_err(|e| RestoreError::internal(e.to_string()))?;
     let client = isyncyou_graph::GraphClient::new(token);
     let sink = ToDoSink {
         api: &client,
@@ -187,29 +252,29 @@ fn finish_todo_restore<S: RestoreSink>(
     payload: &[u8],
     sink: &S,
     now: i64,
-) -> Result<String, String> {
+) -> RestoreResult<String> {
     match store
         .get_restore_operation(op_id)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| RestoreError::internal(e.to_string()))?
     {
         // Already done: return the recorded id (no second create).
         Some(op) if op.state == RestoreState::Committed => op
             .new_cloud_id
-            .ok_or_else(|| "committed operation has no cloud id".to_string()),
+            .ok_or_else(|| RestoreError::internal("committed operation has no cloud id")),
         // Interrupted earlier: recover (scan for the body marker, or resume).
         Some(_) => {
             recover_restore_op(store, op_id, payload, sink, now)?;
             store
                 .get_restore_operation(op_id)
-                .map_err(|e| e.to_string())?
+                .map_err(|e| RestoreError::internal(e.to_string()))?
                 .and_then(|o| o.new_cloud_id)
-                .ok_or_else(|| "recovery did not record a cloud id".to_string())
+                .ok_or_else(|| RestoreError::internal("recovery did not record a cloud id"))
         }
         // Fresh: record intent, then drive the happy path.
         None => {
             store
                 .create_restore_operation(op_id, account, "todo", source_id, key, now)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| RestoreError::internal(e.to_string()))?;
             let (new_id, _) = run_restore_op(store, op_id, marker, payload, sink, now)?;
             Ok(new_id)
         }
@@ -274,7 +339,9 @@ pub fn recover_pending_todo_restores_with<A: ToDoApi>(
     for op in ops.into_iter().filter(|o| o.service == "todo") {
         let res = archived_todo(&store, acc, &op.source_item_id).and_then(|(list_id, bytes)| {
             let sink = ToDoSink { api, list_id };
-            recover_restore_op(&store, &op.op_id, &bytes, &sink, now).map(|_| ())
+            recover_restore_op(&store, &op.op_id, &bytes, &sink, now)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         });
         match res {
             Ok(()) => ok += 1,

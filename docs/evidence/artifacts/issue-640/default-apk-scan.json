@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "scope": "issue_640_default_product_apk",
+  "observed_at": "2026-07-13T10:53:13Z",
+  "implementation_commit": "7c5ff3699c27e7212abf0d9ed2d915b095243125",
+  "apk_sha256": "6ba938e173b16d9c713fcbee43d8fb187fd0151d9f3db68bc7f0a2a0b8075a49",
+  "build_variant": "debug_default_features",
+  "hook_marker_present": false,
+  "local_cli_fallback_markers_present": false,
+  "subscription_import_marker_present": false,
+  "installed_after_hook_probe": true,
+  "same_sha256_installed_on_device": true,
+  "instrumentation_cleanup_preceded_live_evidence": true,
+  "product_credentials_preserved_after_hook_and_default_reinstall": true,
+  "product_credentials_loaded_after_process_restart": true,
+  "final_codex_credential_state": "connected",
+  "final_claude_credential_state": "connected",
+  "final_idle_guard_active": false,
+  "final_idle_codex_listener_active": false,
+  "raw_scan_retained": false,
+  "result": "pass"
+}

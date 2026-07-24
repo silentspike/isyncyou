@@ -18,57 +18,127 @@
 //! REQ-AGENT-004).
 //!
 //! # Providers
-//! [`provider::FakeProvider`] is a deterministic, scripted provider — the only provider
-//! used in CI (no real LLM tokens, REQ-AGENT-008). Official + experimental providers
-//! implement [`provider::LlmProvider`] in later stories.
+//! [`provider::FakeProvider`] is a deterministic, scripted provider for isolated tests.
+//! The product Claude/Codex OAuth provider runtime is compiled by
+//! `agent-oauth-providers`; #627's local CLI fallback/capture surface remains behind
+//! `agent-subscription-experimental`.
 
 pub mod archive;
 pub mod confirm;
+pub mod connectivity;
+#[cfg(feature = "agent-subscription-experimental")]
+pub mod drift_capture;
 mod error;
 pub mod http;
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 pub mod oauth;
+pub mod pairing_v2;
+pub mod product_provider;
 pub mod provider;
 pub mod retrieval;
+pub mod runtime_lock;
 pub mod secrets;
 pub mod session;
 mod session_crypto;
 mod session_ids;
+pub mod session_v2;
 pub mod stream;
 pub mod tool;
 pub mod turn;
 
 pub use archive::{ArchiveSource, ItemRef};
-pub use confirm::{ConfirmError, PendingAction, PendingRegistry};
+pub use confirm::{
+    action_hash, ConfirmError, PendingAction, PendingActionBinding, PendingOwnerBinding,
+    PendingPersistence, PendingRegistry, PersistedPendingAction,
+};
+pub use connectivity::{
+    classify, target_for, AndroidNetworkSnapshot, ConnectivityPreflightCode, ConnectivityProvider,
+    ConnectivityPurpose, ProbeLimiter, ProbeObservation, RestrictBackgroundStatus,
+};
 pub use error::AgentError;
-pub use provider::{AssistantBlock, FakeProvider, LlmProvider, StreamEvent, Usage};
+#[cfg(feature = "onedrive")]
+pub use pairing_v2::{OneDrivePairingTransportV2, VersionedPairingDescriptorV2};
+pub use pairing_v2::{
+    PairingClaimV2, PairingCodeV2, PairingDescriptorV2, PairingRemoteStateV2,
+    PairingSourceSecretV2, PairingV2Error,
+};
+pub use product_provider::ProductProviderId;
+pub use provider::{
+    AssistantBlock, DoneReason, FakeProvider, LlmProvider, ProgressPhase, StreamEvent, Usage,
+};
 pub use retrieval::RetrievalExecutor;
-pub use secrets::{AtRestKey, CredentialStore, LocalKey, ProvidedKey, Secret, SecretClass};
+pub use runtime_lock::FileLock;
+pub use secrets::{
+    provider_api_key_secret_id, provider_oauth_refresh_secret_id, set_process_credential_key,
+    AgentCredentialStore, AtRestKey, CredentialKeySource, CredentialStore, CredentialStoreConfig,
+    CredentialStoreResolver, LocalKey, ProvidedKey, ProviderCredentialResolver, Secret,
+    SecretClass,
+};
 pub use session::{
     detect_fork, new_ulid, ActiveTurn, FileSessionCache, InMemoryTransport, LeaseRecord,
     LoadedSession, LocalSessionCache, MemorySessionCache, PutTurnOutcome, Session, SessionFork,
     SessionTransport, Turn, TurnLeaseState,
 };
-pub use session_crypto::{KdfProfile, PairingPayload, SessionCryptoConfig};
-pub use session_ids::{DeviceId, LeaseId, SessionId, TurnId};
-pub use stream::AgentStreamHub;
-pub use tool::{
-    help_text, parse_action, registry_tool_names, tool_schema, ToolAction, ToolClass, TOOL_NAME,
+pub use session_crypto::{
+    KdfProfile, PairingPayload, SessionCryptoConfig, SessionObjectClass, SessionObjectCrypto,
 };
-pub use turn::{run_turn, Message, Role, ToolExecutor, ToolUseRef, TurnOutcome};
+pub use session_ids::{DeviceId, LeaseId, SessionId, TurnId};
+pub use session_v2::{
+    payload_digest, request_key, request_object_digest, select_provider_context,
+    session_write_policy, tool_result_digest, ContextBudget, HistoryCursorCodec, HistoryPageV1,
+    IdempotencyTombstoneV1, ImmutableIndexEntryV1, ImmutableIndexPageV1,
+    InMemorySessionV2Transport, IndexPageRef, InputTokenCounter, LocalEffectCheckpointV1,
+    LocalEffectState, ManifestDelta, ManifestLease, NormalizedAssistantBlock,
+    PersistedLeaseBinding, ProviderAttemptBindingV1, ReadToolCheckpointV1, RequestJournalV1,
+    RequestPhase, RequestReplayV1, RequestRouteDomain, RequestStatusV1, RequestStepOutcomeV1,
+    RequestStepRef, RequestUuidBindingV1, SanitizedUsage, SessionCommitV1, SessionLeaseGuard,
+    SessionManifestV1, SessionRecordKind, SessionRecordV2, SessionV2Error, SessionV2Store,
+    SessionV2Transport, SessionWritePolicy, SourceRef, TurnTerminalStatus, VersionedManifest,
+    VisibleContextMessage, DUPLICATE_TOOL_USE_ID_CODE, MAX_CONTEXT_BYTES, MAX_CONTEXT_MESSAGES,
+    MAX_TOOL_CHECKPOINTS, REQUEST_JOURNAL_VERSION, SESSION_RECORD_VERSION,
+    UNKNOWN_MODEL_INPUT_TOKENS,
+};
+pub use stream::{AgentStreamHub, CancellationToken};
+pub use tool::{
+    help_text, parse_action, registry_tool_names, tool_schema, RecoveryPolicy, ToolAction,
+    ToolClass, TOOL_NAME,
+};
+pub use turn::{
+    run_turn, run_turn_cancellable, run_turn_observed, Message, ReadExecutionBinding, Role,
+    ToolExecutor, ToolUseRef, TurnObserver, TurnOutcome,
+};
 
 #[cfg(feature = "retrieval")]
 pub use archive::StoreArchive;
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 pub use oauth::{AgentOAuth, OAuthConfig, StartedLogin};
-#[cfg(feature = "agent-subscription-experimental")]
-pub use provider::codex::{CodexConfig, CodexProvider};
-#[cfg(feature = "agent-subscription-experimental")]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+pub use provider::codex::{CodexConfig, CodexProvider, CodexReasoningEffort};
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 pub use provider::subscription::{SubscriptionConfig, SubscriptionProvider};
-#[cfg(feature = "http")]
+#[cfg(feature = "byo-api-providers")]
 pub use provider::{anthropic::AnthropicProvider, openai::OpenAiProvider};
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+pub use provider::{attest_static_product_harness, HarnessProvider, HARNESS_CONTRACT_VERSION};
 #[cfg(feature = "onedrive")]
 pub use session::OneDriveTransport;
+#[cfg(feature = "onedrive")]
+pub use session_v2::OneDriveSessionV2Transport;
 
 #[cfg(test)]
 mod tests {
@@ -96,5 +166,23 @@ mod tests {
             .expect("session impl block");
         assert!(!session_impl.contains("pub fn append("));
         assert!(!session.contains("append_lease_free_for_test"));
+    }
+
+    #[test]
+    fn product_oauth_feature_does_not_export_byo_api_providers() {
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains(
+            "#[cfg(feature = \"byo-api-providers\")]\npub use provider::{anthropic::AnthropicProvider, openai::OpenAiProvider};"
+        ));
+        assert!(
+            !lib.contains(
+                "#[cfg(feature = \"http\")]\npub use provider::{anthropic::AnthropicProvider, openai::OpenAiProvider};"
+            ),
+            "http/agent-oauth-providers must not re-export BYO API-key provider types"
+        );
+
+        let provider = include_str!("provider.rs");
+        assert!(provider
+            .contains("#[cfg(any(feature = \"byo-api-providers\", test))]\npub mod openai;"));
     }
 }

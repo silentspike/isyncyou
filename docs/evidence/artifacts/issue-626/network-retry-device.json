@@ -1,0 +1,14 @@
+{
+  "issue": 626,
+  "device": "Pixel 8 Pro",
+  "method": "debug-only deterministic app network failure hook while USB ADB remained connected",
+  "validated_network_before": true,
+  "first_execution": "retryable_network_error",
+  "ledger_after_first_execution": "queued_without_lease_owner",
+  "fault_removed": true,
+  "second_execution": "succeeded",
+  "validated_network_after": true,
+  "automatic_duplicate_effect": false,
+  "os_network_disabled": false,
+  "notes": "The user explicitly selected application-level network fault injection so USB ADB remained available. This proves typed retry and recovery, not loss of Android's validated network."
+}

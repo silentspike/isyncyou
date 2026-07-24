@@ -1,0 +1,13 @@
+PASS: first-run wizard renders 8 steps
+PASS: wizard steps are the ordered handoff sequence
+PASS: wizard chat surface absent on first run
+PASS: reconnect flow condenses the full step list
+PASS: reconnect wizard state is reconnect_required
+PASS: reconnect surfaces a reconnect affordance
+PASS: manual code input is type=password
+PASS: pasted code is not serialized into the DOM
+PASS: pasted code is not in localStorage/sessionStorage
+PASS: no secret in console output
+PASS: code input is cleared
+
+11/11 wizard assertions passed

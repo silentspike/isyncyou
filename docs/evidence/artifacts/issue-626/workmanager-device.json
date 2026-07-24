@@ -1,0 +1,27 @@
+{
+  "issue": 626,
+  "device": "Pixel 8 Pro",
+  "worker_process_contract": "same_process_pass",
+  "foreground_service": {
+    "system_service": "androidx.work.impl.foreground.SystemForegroundService",
+    "is_foreground": true,
+    "type": "dataSync",
+    "channel": "mobile_jobs",
+    "notification_id": 62001,
+    "title": "iSyncYou",
+    "text": "backup in progress",
+    "progress_indeterminate": true,
+    "visible_before_native_job_execution": true
+  },
+  "real_backup": {
+    "m365_account_token_used_on_device": true,
+    "store_items_observed": 200,
+    "result": "succeeded"
+  },
+  "screenshot": {
+    "path": "docs/evidence/artifacts/issue-626/notification-cropped-redacted.png",
+    "sha256": "9214f6f000e0fff15802027afea28d462fac313f6fbd94aa51d58d52fde96bb3",
+    "contains_only_isyncyou_notification": true,
+    "metadata_profiles": []
+  }
+}
