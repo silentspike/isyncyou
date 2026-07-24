@@ -56,8 +56,11 @@ staging Android build and emulator smoke pass.
 
 The refreeze tree produced a clean default APK with SHA-256
 `e07599cef819445921314b5687c744f27b12785e97161366f412a779a9c2c698`.
-Both default-APK boundary scans pass. A physical reinstall was not repeated
-because no ADB device was available; the earlier physical default/hook
+Both default-APK boundary scans pass. That exact APK was installed on the
+physical Pixel with `adb install -r`; the installed APK hash matched, existing
+app data remained available, and a cold launch reached the Assistant surface
+without a crash or ANR. The check performed no login, logout, revoke, account
+switch, or other account-lifecycle action. Earlier broad physical default/hook
 observations remain separately pinned and are not relabeled. Hook-only tests are
 not provider or product evidence.
 
