@@ -1,0 +1,64 @@
+#639 S-AG.14 — host verification gates (feature/ag-639). Regenerated after the owner-review fixes.
+Historical implementation commit: c0e5a2a4368599d5cef7274bc747f40f9f924bc8.
+
+PROVENANCE: this is the earlier c0e5a2a-era gate record. It is retained for audit history and does
+not attest the later implementation commit. See current-tree-recheck.txt for the a84b286 recheck.
+
+All Rust commands run via `cargo remote -c` / `cargo-remote-fmt` (rustbuild); Node local; semgrep via
+the digest-pinned Docker image; Android via ./gradlew.
+
+RUST GATES
+----------
+cargo remote -c -- test --workspace --no-fail-fast .......................... PASS (0 failed)
+cargo remote -c -- test -p isyncyou-agent --features http,agent-oauth-providers . PASS (199 passed)
+cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers .... PASS (151 passed)
+cargo remote -c -- test -p isyncyou-app-host --features agent-subscription-experimental PASS (142 passed)
+cargo remote -c -- test -p isyncyou-webui ....................................... PASS (207 passed)
+cargo remote -c -- clippy --workspace --all-targets -- -D warnings ............... PASS
+cargo remote -c -- clippy -p isyncyou-app-host --all-targets --features agent-oauth-providers -- -D warnings ......... PASS
+cargo remote -c -- clippy -p isyncyou-app-host --all-targets --features agent-subscription-experimental -- -D warnings PASS
+cargo remote -c -- clippy -p isyncyou-agent --all-targets --features http,agent-oauth-providers -- -D warnings ....... PASS
+cargo remote -c -- clippy -p isyncyou-agent --all-targets --features http,byo-api-providers -- -D warnings ........... PASS
+cargo remote -c -- clippy -p isyncyou-webui --all-targets -- -D warnings ......... PASS
+cargo remote -c -- clippy -p isyncyou-mobile --all-targets --no-default-features -- -D warnings ...................... PASS
+cargo-remote-fmt --check ........................................................ CLEAN (CI fmt will pass)
+
+JS / UI GATES
+-------------
+node --check gui/webui/src/app.js / tools/agent-ui-smoke.mjs / tools/agent-wizard-smoke.mjs ... OK
+node tools/agent-wizard-smoke.mjs .............................................. PASS (11/11 assertions)
+
+BOUNDARY / SUPPLY / SECRETS GATES
+---------------------------------
+bash tools/verify-agent-experimental-boundary.sh feature-matrix ................ PASS
+bash tools/verify-agent-experimental-boundary.sh public-surface ................ PASS
+bash tools/verify-agent-experimental-boundary.sh release-exclusion ............. PASS (default APK sha256 bab36ef09b50027b9a0374387f9faa74dcae27a58ca259e9c3d3ddbb6b28defb; no experimental markers)
+cargo deny check ............................................................... PASS (advisories/bans/licenses/sources ok; only pre-existing duplicate warnings)
+gitleaks git --no-banner --redact .............................................. PASS (no leaks found)
+python3 tools/check_traceability.py ............................................ PASS (REQ-AGENT-014 planned)
+python3 tools/check_evidence.py --manifest docs/evidence/issue-639-manifest.json  PASS
+
+semgrep (digest-pinned, RAN):
+docker run --rm semgrep/semgrep@sha256:a265d09a9ca712e6624aca09056304ce4314a695b7028d65c041dd53fd44c700
+  semgrep scan --config p/javascript --config p/kotlin --config p/secrets --config p/security-audit
+  --error --metrics=off gui/webui android
+  -> RAN 136 rules on 90 files: 0 findings (exit 0). NOTE: 1 rule
+  (typescript.react.security.audit.react-unsanitized-method) timed out on app.js (partial analysis,
+  no finding); 10 files >1MB and .semgrepignore'd files were skipped.
+
+ANDROID GATES (host; default product features, ISY_CARGO_FEATURES unset)
+-----------------------------------------------------------------------
+(cd android && env -u ISY_CARGO_FEATURES ./gradlew :app:lintDebug) ............... BUILD SUCCESSFUL
+(cd android && env -u ISY_CARGO_FEATURES ./gradlew :app:testDebugUnitTest) ....... BUILD SUCCESSFUL
+:app:assembleDebug (default product APK) ........................................ built by release-exclusion (sha above)
+
+DEVICE INSTRUMENTATION (on Pixel 8 Pro, device-lock ag-639)
+-----------------------------------------------------------
+(cd android && ./gradlew :app:connectedDebugAndroidTest -P...class=AgentCredentialKeyStoreInstrumentedTest)
+  -> BUILD SUCCESSFUL, "Finished 3 tests on Pixel 8 Pro".
+(cd android && ./gradlew :app:connectedDebugAndroidTest -P...class=NetworkCriticalGuardInstrumentedTest)
+  -> BUILD SUCCESSFUL, "Finished 1 tests on Pixel 8 Pro".
+Plus the live official OAuth -> ready handoff for BOTH providers (device/device-handoff.txt).
+NOTE: #639 adds no NEW instrumentation classes; these representative non-interactive classes
+(from #625/#640) demonstrate the #639 default APK passes on-device instrumentation. The full
+connectedDebugAndroidTest suite includes interactive biometric classes not run headless here.

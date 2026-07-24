@@ -8,6 +8,96 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+**Agent shared-session and closeout contract (#628)**
+- `agent`+`app-host`+`webui`+`android`: added encrypted V2 shared sessions,
+  provider-generation-bound request recovery, renewed fenced publication, durable
+  cancellation and user-presence state, one-time Pairing V2, strict JSON and sealed
+  mutation chunks, plus fail-closed RC workflow classification and closeout tooling.
+
+**Reversible Agent account lifecycle (#645)**
+- `agent`+`app-host`+`webui`+`android`: added provider-revoked Disconnect and
+  Reconnect, verified-identity Codex account switching, encrypted crash-recovery
+  journals and candidates, provider-scoped operation leases, strict lifecycle
+  routes and recovery controls, and a separate default-off Android lifecycle hook.
+
+**Network-critical Agent flow boundary (#640)**
+- `android`+`agent`+`app-host`+`webui`: added acknowledged, service-owned foreground
+  guards for provider OAuth and streamed turns, strict redacted connectivity preflight,
+  side-effect-free credential status with explicit fail-closed refresh, cancellable Codex
+  callback attempts, and a separate default-off diagnostic hook artifact.
+
+**Experimental local Agent credential boundary**
+- `agent`+`app-host`: isolated #627's unsupported Linux desktop local-client
+  credential fallback behind an explicit default-off daemon feature, removed the
+  HTTP/WebView credential-import surface, excluded the fallback from mobile and
+  product artifacts, and added privacy-bounded Claude/Codex drift summaries plus
+  retained-versus-removed custom-harness regression evidence.
+
+**Android mobile-job execution boundary (#626)**
+- `android`: added a WorkManager-backed foreground worker for durable mobile jobs.
+  Work requests carry only bounded `job_id` and `kind`; notification, strict device
+  snapshot, encrypted engine bootstrap, and native execution happen in that order.
+  Notification denial fails closed without a retry loop, and exact successful queue
+  routes reconcile the durable Rust plan. Default-off recovery hooks and a state-safe
+  ADB probe support process-death evidence. Pixel 8 Pro closeout verified physical
+  native-prompt cancel/approval, hardware-backed Keystore credential sealing,
+  notification-denied fail-closed behavior, visible `dataSync` foreground work,
+  process-death adoption, and deterministic network-error recovery with Graph/store
+  cross-checks and reverts. The device run also found and fixed Android 14 foreground
+  service typing, live-write store-gate starvation, audit target leakage, and min-SDK
+  compatibility defects.
+
+**Agent mobile full-node server contract**
+- `mobile`+`app-host`+`webui`+`store`: added #625's server-side mobile
+  full-node contract. Mobile now wires restore-cloud, backup, share, and the
+  allowed live-write subset through the shared router, queues restore-cloud and
+  backup as durable `mobile_jobs`, recovers queued/expired-lease jobs on app
+  start, binds Agent confirm to the per-action biometric-token gate before
+  consuming the Agent one-time token, and keeps unsupported mobile live-write
+  verbs fail-closed. #626 completes the native Android BiometricPrompt/Keystore,
+  foreground-job presentation, and physical-device closeout.
+
+**Agent confirmed desktop operations**
+- `agent`+`app-host`: completed #624's desktop confirmed-operation path for
+  `restore-local`, `backup`, `restore-cloud`, `live-write`, and `share`.
+  Destructive operations now revalidate the stored PendingAction before
+  execution, reuse the existing daemon/engine/writer/ledger runtime paths, keep
+  mobile destructive Agent execution fail-closed, and redact API/audit summaries
+  for body HTML/text, share URLs, OAuth material, provider tokens, and emails.
+
+**Agent Claude/Codex OAuth providers**
+- `agent`+`app-host`+`webui`+`mobile`: advanced #623's Claude/Codex
+  app-OAuth provider path with product feature wiring, encrypted CredentialStore
+  provider selection, incremental Claude/Codex streaming, sanitized usage status,
+  StoreArchive executor binding, strict `claude`/`codex` WebUI provider IDs,
+  BYO API-key quarantine, and non-live test isolation from local CLI auth,
+  provider env vars, and unexpected provider network POSTs. #623's live app-OAuth
+  StoreArchive roundtrips are recorded in its committed evidence package.
+
+**Agent Assistant UI**
+- `webui`: added #622's capability-gated Assistant tab with streaming
+  transcript rendering, source citations, PendingAction confirm/cancel cards,
+  model and usage status, provider-egress consent, and deterministic
+  desktop/mobile Playwright evidence with no external WebView network.
+
+**Agent API and confirmation backend**
+- `agent`+`app-host`+`webui`: completed #621's AgentStreamHub/PendingAction
+  backend with typed per-turn events (`token`, `tool_call`, `tool_result`,
+  `confirmation_required`, `error`, `done.reason`), bounded backpressure,
+  cancel semantics, `/api/v1/agent/{turn,chat,confirm,cancel,status,stream}`,
+  action-hash-bound one-time confirmation tokens, exactly-once confirmed-action
+  executor and durable audit seams, mobile session gating for POST and SSE paths,
+  unopened-stream cleanup, FakeProvider end-to-end coverage, and explicit
+  no-token-leak tests for model history, public token events, errors, and audit.
+  Real destructive operations still land in #624 behind the new executor seam.
+
+**Agent credential storage**
+- `agent`+`app-host`+`mobile`+`android`: added #620 typed encrypted
+  CredentialStore coverage for provider API keys, provider OAuth refresh tokens, and
+  session pairing keys, with canonical envelope metadata binding, owner-only Unix
+  writes, app-host resolver usage, provider credential seams, and a separate Android
+  Keystore-wrapped agent credential key proven by a JNI-only Pixel 8 Pro self-test.
+
 **Agent encrypted sessions**
 - `agent`+`graph`+`mobile`: hardened #619 cross-device OneDrive session storage with
   Argon2id/HKDF pairing-key derivation, immutable per-turn ULID files, ETag-aware

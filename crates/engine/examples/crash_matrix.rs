@@ -28,7 +28,7 @@ impl FakeCloud {
     }
 }
 impl RestoreSink for FakeCloud {
-    fn create(&self, marker: &str, _payload: &[u8]) -> Result<String, String> {
+    fn create(&self, marker: &str, _payload: &[u8]) -> isyncyou_engine::RestoreResult<String> {
         *self.calls.borrow_mut() += 1;
         let mut s = self.seq.borrow_mut();
         *s += 1;
@@ -38,7 +38,7 @@ impl RestoreSink for FakeCloud {
             .push((marker.to_string(), id.clone()));
         Ok(id)
     }
-    fn find_by_marker(&self, marker: &str) -> Result<Option<String>, String> {
+    fn find_by_marker(&self, marker: &str) -> isyncyou_engine::RestoreResult<Option<String>> {
         Ok(self
             .items
             .borrow()

@@ -1,0 +1,59 @@
+{
+  "artifact": "issue-623-codex-oauth-live-storearchive-trace",
+  "assertions": {
+    "done_reason": "complete",
+    "final_contains_fixture_sentinel": true,
+    "final_contains_m_live": true,
+    "saw_provider_tool_call": true,
+    "saw_storearchive_tool_result": true
+  },
+  "events": [
+    {
+      "event": "tool_call",
+      "input": {
+        "account": "me",
+        "limit": 10,
+        "op": "search",
+        "query": "isyncyou623productlivesentinel",
+        "service": "mail"
+      },
+      "name": "isyncyou"
+    },
+    {
+      "contains_fixture_sentinel": true,
+      "contains_m_live": true,
+      "event": "tool_result",
+      "untrusted": true
+    },
+    {
+      "event": "tool_call",
+      "input": {
+        "account": "me",
+        "id": "m-live",
+        "op": "read",
+        "service": "mail"
+      },
+      "name": "isyncyou"
+    },
+    {
+      "contains_fixture_sentinel": true,
+      "contains_m_live": true,
+      "event": "tool_result",
+      "untrusted": true
+    },
+    {
+      "event": "done",
+      "reason": "complete"
+    }
+  ],
+  "provider": "codex",
+  "secrets_included": false,
+  "source": "ignored product OAuth live gate with local credential seed persisted through encrypted CredentialStore",
+  "usage": {
+    "input_tokens_present": true,
+    "model": "gpt-5.5",
+    "output_tokens_present": true,
+    "provider": "codex",
+    "request_id_present": false
+  }
+}

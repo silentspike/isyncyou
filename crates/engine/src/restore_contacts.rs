@@ -13,7 +13,9 @@
 //! unit-tested deterministically without a network; `GraphClient` is the real impl.
 
 use crate::restore_key::{contact_marker, idempotency_key, load_or_create_secret};
-use crate::restore_recovery::{recover_restore_op, run_restore_op, RestoreSink};
+use crate::restore_recovery::{
+    recover_restore_op, run_restore_op, RestoreError, RestoreResult, RestoreSink,
+};
 use isyncyou_core::Config;
 use isyncyou_store::{RestoreState, Store};
 use serde_json::Value;
@@ -32,6 +34,13 @@ pub trait ContactApi {
     fn create_contact(&self, body: &Value) -> Result<String, String>;
     /// Find a contact by its marker extended property; returns its cloud id if present.
     fn find_by_marker(&self, marker: &str) -> Result<Option<String>, String>;
+
+    fn create_contact_for_restore(&self, body: &Value) -> RestoreResult<String> {
+        self.create_contact(body).map_err(RestoreError::internal)
+    }
+    fn find_by_marker_for_restore(&self, marker: &str) -> RestoreResult<Option<String>> {
+        self.find_by_marker(marker).map_err(RestoreError::internal)
+    }
 }
 
 impl ContactApi for isyncyou_graph::GraphClient {
@@ -55,6 +64,35 @@ impl ContactApi for isyncyou_graph::GraphClient {
             encode_filter_value(&filter)
         );
         let v = self.get_json(&url).map_err(|e| e.to_string())?;
+        Ok(v.get("value")
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first())
+            .and_then(|m| m.get("id"))
+            .and_then(|i| i.as_str())
+            .map(String::from))
+    }
+
+    fn create_contact_for_restore(&self, body: &Value) -> RestoreResult<String> {
+        let v = self
+            .post_json("/me/contacts", body)
+            .map_err(RestoreError::from_graph)?;
+        v.get("id")
+            .and_then(|i| i.as_str())
+            .map(String::from)
+            .ok_or_else(|| RestoreError::invalid("created contact response has no id"))
+    }
+
+    fn find_by_marker_for_restore(&self, marker: &str) -> RestoreResult<Option<String>> {
+        let filter = format!(
+            "singleValueExtendedProperties/any(ep: ep/id eq '{}' and ep/value eq '{}')",
+            encode_filter_value(MARKER_PROP_ID),
+            encode_filter_value(marker)
+        );
+        let url = format!(
+            "/me/contacts?$filter={}&$select=id&$top=1",
+            encode_filter_value(&filter)
+        );
+        let v = self.get_json(&url).map_err(RestoreError::from_graph)?;
         Ok(v.get("value")
             .and_then(|a| a.as_array())
             .and_then(|a| a.first())
@@ -90,23 +128,23 @@ pub struct ContactSink<'a, A: ContactApi> {
 }
 
 impl<A: ContactApi> RestoreSink for ContactSink<'_, A> {
-    fn create(&self, marker: &str, payload: &[u8]) -> Result<String, String> {
+    fn create(&self, marker: &str, payload: &[u8]) -> RestoreResult<String> {
         let contact: Value = serde_json::from_slice(payload)
-            .map_err(|e| format!("archived contact is not JSON: {e}"))?;
+            .map_err(|e| RestoreError::invalid(format!("archived contact is not JSON: {e}")))?;
         let mut body = isyncyou_connectors::sanitize_contact(&contact);
         // The sanitizer keeps only writable contact fields (and drops photo metadata
         // per REQ-RST-008), so stamp the marker extended property afterwards.
         let obj = body
             .as_object_mut()
-            .ok_or_else(|| "sanitized contact is not a JSON object".to_string())?;
+            .ok_or_else(|| RestoreError::invalid("sanitized contact is not a JSON object"))?;
         obj.insert(
             "singleValueExtendedProperties".to_string(),
             serde_json::json!([{ "id": MARKER_PROP_ID, "value": marker }]),
         );
-        self.api.create_contact(&body)
+        self.api.create_contact_for_restore(&body)
     }
-    fn find_by_marker(&self, marker: &str) -> Result<Option<String>, String> {
-        self.api.find_by_marker(marker)
+    fn find_by_marker(&self, marker: &str) -> RestoreResult<Option<String>> {
+        self.api.find_by_marker_for_restore(marker)
     }
 }
 
@@ -127,18 +165,30 @@ pub fn restore_contacts_via_ledger(
     id: &str,
     token: String,
 ) -> Result<String, String> {
+    restore_contacts_via_ledger_classified(cfg, account, id, token)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn restore_contacts_via_ledger_classified(
+    cfg: &Config,
+    account: &str,
+    id: &str,
+    token: String,
+) -> RestoreResult<String> {
     let acc = cfg
         .accounts
         .iter()
         .find(|a| a.id == account)
-        .ok_or_else(|| format!("no account '{account}' in config"))?;
-    let (_item, bytes) = crate::read_archived_body(cfg, account, "contacts", id)?;
-    let secret = load_or_create_secret(&acc.archive_root.join(".isyncyou-restore-secret"))?;
+        .ok_or_else(|| RestoreError::invalid(format!("no account '{account}' in config")))?;
+    let (_item, bytes) =
+        crate::read_archived_body(cfg, account, "contacts", id).map_err(RestoreError::invalid)?;
+    let secret = load_or_create_secret(&acc.archive_root.join(".isyncyou-restore-secret"))
+        .map_err(RestoreError::internal)?;
     let key = idempotency_key(&secret, account, "contacts", id, &bytes);
     let op_id = format!("{account}:{key}");
     let marker = contact_marker(&key);
-    let store =
-        Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    let store = Store::open(acc.archive_root.join(".isyncyou-store.db"))
+        .map_err(|e| RestoreError::internal(e.to_string()))?;
     let client = isyncyou_graph::GraphClient::new(token);
     let sink = ContactSink { api: &client };
     finish_contacts_restore(
@@ -166,29 +216,29 @@ fn finish_contacts_restore<S: RestoreSink>(
     payload: &[u8],
     sink: &S,
     now: i64,
-) -> Result<String, String> {
+) -> RestoreResult<String> {
     match store
         .get_restore_operation(op_id)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| RestoreError::internal(e.to_string()))?
     {
         // Already done: return the recorded id (no second create).
         Some(op) if op.state == RestoreState::Committed => op
             .new_cloud_id
-            .ok_or_else(|| "committed operation has no cloud id".to_string()),
+            .ok_or_else(|| RestoreError::internal("committed operation has no cloud id")),
         // Interrupted earlier: recover (reconcile by marker, or resume) — never blind-retry.
         Some(_) => {
             recover_restore_op(store, op_id, payload, sink, now)?;
             store
                 .get_restore_operation(op_id)
-                .map_err(|e| e.to_string())?
+                .map_err(|e| RestoreError::internal(e.to_string()))?
                 .and_then(|o| o.new_cloud_id)
-                .ok_or_else(|| "recovery did not record a cloud id".to_string())
+                .ok_or_else(|| RestoreError::internal("recovery did not record a cloud id"))
         }
         // Fresh: record intent, then drive the happy path.
         None => {
             store
                 .create_restore_operation(op_id, account, "contacts", source_id, key, now)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| RestoreError::internal(e.to_string()))?;
             let (new_id, _) = run_restore_op(store, op_id, marker, payload, sink, now)?;
             Ok(new_id)
         }
@@ -249,8 +299,11 @@ pub fn recover_pending_contacts_restores_with<S: RestoreSink>(
     let now = now_secs();
     let (mut ok, mut failed) = (0usize, 0usize);
     for op in ops.into_iter().filter(|o| o.service == "contacts") {
-        let res = archived_contact_bytes(&store, acc, &op.source_item_id)
-            .and_then(|bytes| recover_restore_op(&store, &op.op_id, &bytes, sink, now).map(|_| ()));
+        let res = archived_contact_bytes(&store, acc, &op.source_item_id).and_then(|bytes| {
+            recover_restore_op(&store, &op.op_id, &bytes, sink, now)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
         match res {
             Ok(()) => ok += 1,
             Err(_) => failed += 1,

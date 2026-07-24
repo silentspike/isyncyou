@@ -72,6 +72,8 @@ const ICONS = {
   building: "M6 22V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v18M6 22H2M18 22h4M9 6h.01M15 6h.01M9 10h.01M15 10h.01M9 14h.01M15 14h.01M10 22v-4h4v4",
   flag: "M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1zM4 22v-7",
   circle: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20",
+  "circle-check": "M22 11.08V12a10 10 0 1 1-5.93-9.14M22 4L12 14.01l-3-3",
+  "circle-x": "M15 9l-6 6M9 9l6 6M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20",
   check: "M20 6L9 17l-5-5",
   settings: "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z",
   shield: "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z",
@@ -302,6 +304,8 @@ function activityChart(runs, days = 14) {
 /* ---------------------------------------------------------------- api + util */
 const CAP = {
   restore: "__RESTORE_CAP_TOKEN__",
+  backup: "__BACKUP_CAP_TOKEN__",
+  mobileJobs: "__MOBILE_JOB_CAP_TOKEN__",
   sync: "__SYNC_CAP_TOKEN__",
   share: "__SHARE_CAP_TOKEN__",
   verify: "__VERIFY_CAP_TOKEN__",
@@ -312,6 +316,7 @@ const CAP = {
   todowrite: "__TASKWRITE_CAP_TOKEN__",
   onenotewrite: "__ONENOTEWRITE_CAP_TOKEN__",
   onedrivewrite: "__ONEDRIVEWRITE_CAP_TOKEN__",
+  mutationIntent: "__MUTATION_INTENT_CAP_TOKEN__",
   account: "__ACCOUNT_CAP_TOKEN__",
   push: "__PUSH_CAP_TOKEN__",
   agent: "__AGENT_CAP_TOKEN__",
@@ -330,7 +335,11 @@ let _bridgeSeq = 0;
 const BRIDGE_TIMEOUT_MS = 15000;
 const NATIVE_TIMEOUT_MS = 5000;
 const BIO_TIMEOUT_MS = 120000;
-const BRIDGE_STREAM_TIMEOUT_MS = BRIDGE_TIMEOUT_MS;
+const MUTATION_COMMIT_TIMEOUT_MS = 125000;
+// Provider transport permits 60s to first response and 120s of SSE read idleness.
+// Keep the bridge watchdog just beyond that policy; the native stream also emits
+// 20-second pings, so a healthy long turn remains observable while backgrounded.
+const BRIDGE_STREAM_TIMEOUT_MS = 125000;
 const _bridgePending = new Map(); // request/native id -> { resolve, reject, timer }
 const _bridgeStreams = new Map(); // stream id -> onEvent handler
 const _bioPending = new Map();    // biometric request id -> { resolve, timer } (#0.6)
@@ -343,9 +352,13 @@ if (BRIDGE) {
       const p = _bridgePending.get(m.id);
       if (p) { _bridgePending.delete(m.id); clearTimeout(p.timer); p.resolve({ status: m.status, body: m.body }); }
     } else if (m.t === "bio") {
-      // Native BiometricPrompt result (#0.6): {ok} tells us whether the human confirmed.
+      // Native confirmation returns only a boolean plus a closed diagnostic code.
       const p = _bioPending.get(m.id);
-      if (p) { _bioPending.delete(m.id); clearTimeout(p.timer); p.resolve(!!m.ok); }
+      if (p) {
+        _bioPending.delete(m.id);
+        clearTimeout(p.timer);
+        p.resolve({ ok: !!m.ok, code: typeof m.code === "string" ? m.code : "authentication_failed" });
+      }
     } else if (m.t === "evt") {
       const h = _bridgeStreams.get(m.id);
       _bridgeStats.events++;
@@ -382,10 +395,10 @@ function bridgeRoundTrip(msg, timeoutMs) {
     }
   });
 }
-function bridgeSend(method, path, headers, body) {
+function bridgeSend(method, path, headers, body, timeoutMs) {
   const id = "r" + (++_bridgeSeq);
   _bridgeStats.requests++;
-  return bridgeRoundTrip({ t: "req", id, method, path, headers, body: body ?? null }, BRIDGE_TIMEOUT_MS);
+  return bridgeRoundTrip({ t: "req", id, method, path, headers, body: body ?? null }, timeoutMs || BRIDGE_TIMEOUT_MS);
 }
 async function nativeCall(op, payload, timeoutMs) {
   const id = "n" + (++_bridgeSeq);
@@ -412,40 +425,65 @@ async function registerPushToken() {
     const d = await nativeCall("pushToken", {}, NATIVE_TIMEOUT_MS);
     const token = d && d.token;
     if (!token) return false;
-    await post(`/api/v1/push/register?${qs({ token })}`, CAP.push);
+    await postJson("/api/v1/push/register", CAP.push, {
+      request_id: crypto.randomUUID(), token,
+    });
     return true;
   } catch (_) { return false; } // best-effort: never block UI load on push
 }
 /* Ask the native side (#0.6) to run a BiometricPrompt and, on success, arm the server's
    per-action token for `pat`. Resolves true only if the human authenticated. Without the
    native bridge there is no biometric path, so a destructive op cannot be confirmed. */
-function runBiometricConfirm(pat, label) {
-  if (!BRIDGE) return Promise.resolve(false);
+function runBiometricConfirm(pat) {
+  if (!BRIDGE) return Promise.resolve({ ok: false, code: "not_available" });
   return new Promise((resolve) => {
     const id = "b" + (++_bridgeSeq);
     const timer = setTimeout(() => {
       _bioPending.delete(id);
-      resolve(false);
+      resolve({ ok: false, code: "timeout" });
     }, BIO_TIMEOUT_MS);
     _bioPending.set(id, { resolve, timer });
     _bridgeStats.bio++;
     try {
-      BRIDGE.postMessage(JSON.stringify({ t: "bio", id, pat, label }));
+      BRIDGE.postMessage(JSON.stringify({ t: "bio", id, pat }));
     } catch (_) {
       clearTimeout(timer);
       _bioPending.delete(id);
-      resolve(false);
+      resolve({ ok: false, code: "start_failed" });
     }
   });
 }
+function nativeConfirmationMessage(code) {
+  if (code === "cancelled") return "Confirmation cancelled";
+  if (code === "not_foreground") return "Keep iSyncYou open and try again";
+  if (code === "not_available") return "Set up a device screen lock and try again";
+  if (code === "lockout") return "Device confirmation is temporarily locked";
+  if (code === "timeout") return "Confirmation timed out";
+  if (code === "busy") return "Another confirmation is already open";
+  return "Could not confirm this action";
+}
 /* A short human label for the biometric sheet from the challenge payload (#0.6). */
+function biometricServiceLabel(service) {
+  return service === "onedrive" ? "OneDrive"
+    : service === "backup" || service === "agent" ? "iSyncYou"
+    : service === "mail" ? "Mail"
+    : service === "calendar" ? "Calendar"
+    : service === "contacts" ? "Contacts"
+    : service === "todo" ? "To Do"
+    : service === "onenote" ? "OneNote"
+    : service || "Microsoft 365";
+}
 function biometricLabel(d) {
   const verb = d.op === "delete" ? "Delete" : d.op === "share" ? "Share"
+    : d.op === "backup" ? "Start backup"
+    : d.op === "restore-cloud" ? "Restore to cloud"
+    : d.op === "live-write" ? "Run Agent write"
     : d.op === "move-out-of-protected" ? "Move out of offline folder"
     : d.op === "mode-switch-offline-large" ? "Make folder offline"
+    : d.op === "bulk" && d.service === "todo" ? "Delete selected tasks"
     : d.op === "bulk" ? "Bulk OneDrive change"
     : d.op ? d.op.charAt(0).toUpperCase() + d.op.slice(1) : "Confirm";
-  const service = d.service === "onedrive" ? "OneDrive" : d.service || "Microsoft 365";
+  const service = biometricServiceLabel(d.service);
   return `${verb} in ${service}`;
 }
 /* Open an SSE-style stream over the active transport (#0A). Mobile bridge mode uses
@@ -480,7 +518,6 @@ function openEventStream(path, onEvent, onError) {
   const es = new EventSource(path);
   es.onmessage = (e) => onEvent("message", e.data);
   es.addEventListener("change", () => onEvent("change", ""));
-  es.addEventListener("done", () => onEvent("done", ""));
   es.onerror = () => { if (onError) onError(); };
   return { close() { try { es.close(); } catch (_) {} } };
 }
@@ -489,15 +526,16 @@ async function request(method, path, opts) {
   const o = opts || {};
   const headers = {};
   if (o.capToken) headers["X-Capability-Token"] = o.capToken;
+  if (o.perActionToken) headers["X-Per-Action-Token"] = o.perActionToken;
   if (o.headers) {
     Object.entries(o.headers).forEach(([k, v]) => {
       if (BRIDGE && k.toLowerCase() === "x-session-token") return;
       headers[k] = v;
     });
-  } // #657: e.g. X-Body-Encoding: base64
+  }
   let status, d;
   if (BRIDGE) {
-    const res = await bridgeSend(method, path, headers, o.body);
+    const res = await bridgeSend(method, path, headers, o.body, o.timeoutMs);
     status = Number(res.status);
     d = {}; try { d = res.body ? JSON.parse(res.body) : {}; } catch (_) { d = {}; }
   } else {
@@ -510,31 +548,212 @@ async function request(method, path, opts) {
   // #onedrive-mobile 0.6: a destructive op the mobile router gated answers with a
   // confirmation_required challenge instead of acting. Run the native biometric and, on a
   // human confirm, re-issue exactly once with the per-action token. Guarded against loops:
-  // a request that already carries `_pat` is never re-challenged into another biometric.
+  // a request that already carries the public per-action handle is never re-challenged.
   if (status >= 200 && status < 300 && d && d.status === "confirmation_required"
-      && d.pending_action_id && !/[?&]_pat=/.test(path)) {
-    const ok = await runBiometricConfirm(d.pending_action_id, biometricLabel(d));
-    if (!ok) throw new Error("Confirmation cancelled");
-    const sep = path.includes("?") ? "&" : "?";
-    return request(method, `${path}${sep}_pat=${encodeURIComponent(d.pending_action_id)}`, opts);
+      && d.pending_action_id && !o.perActionToken) {
+    const confirmation = await runBiometricConfirm(d.pending_action_id);
+    if (!confirmation.ok) throw new Error(nativeConfirmationMessage(confirmation.code));
+    return request(method, path, { ...o, perActionToken: d.pending_action_id });
   }
-  if (!Number.isFinite(status) || status < 200 || status >= 300) throw new Error(d.error || status || "Request failed");
+  if (!Number.isFinite(status) || status < 200 || status >= 300) {
+    const error = new Error(d.error || status || "Request failed");
+    error.code = typeof d.error === "string" ? d.error : "request_failed";
+    error.responseReceived = true;
+    throw error;
+  }
   return d;
 }
 async function api(path) { return request("GET", path); }
-async function post(path, capToken, body) { return request("POST", path, { capToken, body }); }
-/* Base64-encode raw bytes (Uint8Array) in fromCharCode-safe chunks (#657). The mobile bridge
-   body is text-only, so a binary upload rides base64; serve.rs decodes on X-Body-Encoding. */
+const POST_NO_TRANSPORT_RETRY = new Set([
+  "/api/v1/account/login/start",
+  "/api/v1/agent/user-presence/start",
+]);
+async function postJson(path, capToken, value) {
+  const body = JSON.stringify(value);
+  const send = () => request("POST", path, {
+    capToken,
+    body,
+    headers: { "Content-Type": "application/json" },
+  });
+  try {
+    return await send();
+  } catch (error) {
+    if ((error && error.responseReceived) || POST_NO_TRANSPORT_RETRY.has(path)) throw error;
+    return send();
+  }
+}
+function isReplayedRequest(value) {
+  return !!value && value.code === "request_replayed" && value.status === "completed";
+}
+/* Base64-encode one bounded mutation-intent chunk for its strict JSON data_base64 field. */
 function bytesToBase64(bytes) {
   let bin = "";
   const chunk = 0x8000;
   for (let i = 0; i < bytes.length; i += chunk) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
   return btoa(bin);
 }
-/* POST a binary body base64-encoded, flagged X-Body-Encoding: base64 for serve.rs to decode.
-   Uniform across the native bridge and the desktop HTTP path (#657). */
-async function postBinary(path, capToken, bytes) {
-  return request("POST", path, { capToken, body: bytesToBase64(bytes), headers: { "X-Body-Encoding": "base64" } });
+async function sha256Hex(bytes) {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return Array.from(digest, b => b.toString(16).padStart(2, "0")).join("");
+}
+class IncrementalSha256 {
+  constructor() {
+    this.h = new Uint32Array([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+      0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
+    this.buffer = new Uint8Array(64); this.buffered = 0; this.bytes = 0;
+  }
+  update(input) {
+    const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+    this.bytes += bytes.length;
+    let offset = 0;
+    while (offset < bytes.length) {
+      const take = Math.min(64 - this.buffered, bytes.length - offset);
+      this.buffer.set(bytes.subarray(offset, offset + take), this.buffered);
+      this.buffered += take; offset += take;
+      if (this.buffered === 64) { this.compress(this.buffer); this.buffered = 0; }
+    }
+    return this;
+  }
+  compress(block) {
+    const k = IncrementalSha256.K, w = new Uint32Array(64);
+    for (let i = 0; i < 16; i++) {
+      const p = i * 4;
+      w[i] = ((block[p] << 24) | (block[p + 1] << 16) | (block[p + 2] << 8) | block[p + 3]) >>> 0;
+    }
+    for (let i = 16; i < 64; i++) {
+      const a = w[i - 15], b = w[i - 2];
+      const s0 = ((a >>> 7) | (a << 25)) ^ ((a >>> 18) | (a << 14)) ^ (a >>> 3);
+      const s1 = ((b >>> 17) | (b << 15)) ^ ((b >>> 19) | (b << 13)) ^ (b >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+    let [a, b, c, d, e, f, g, h] = this.h;
+    for (let i = 0; i < 64; i++) {
+      const s1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (h + s1 + ch + k[i] + w[i]) >>> 0;
+      const s0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (s0 + maj) >>> 0;
+      h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    const values = [a, b, c, d, e, f, g, h];
+    for (let i = 0; i < 8; i++) this.h[i] = (this.h[i] + values[i]) >>> 0;
+  }
+  hex() {
+    const bitHigh = Math.floor(this.bytes / 0x20000000) >>> 0;
+    const bitLow = (this.bytes << 3) >>> 0;
+    this.buffer[this.buffered++] = 0x80;
+    if (this.buffered > 56) {
+      this.buffer.fill(0, this.buffered); this.compress(this.buffer); this.buffered = 0;
+    }
+    this.buffer.fill(0, this.buffered, 56);
+    const view = new DataView(this.buffer.buffer);
+    view.setUint32(56, bitHigh); view.setUint32(60, bitLow); this.compress(this.buffer);
+    return Array.from(this.h, word => word.toString(16).padStart(8, "0")).join("");
+  }
+}
+IncrementalSha256.K = new Uint32Array([
+  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
+]);
+async function mutationSource(input) {
+  if (input instanceof Blob) {
+    return {
+      length: input.size,
+      read: async (start, end) => new Uint8Array(await input.slice(start, end).arrayBuffer()),
+    };
+  }
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  return { length: bytes.length, read: async (start, end) => bytes.subarray(start, end) };
+}
+async function hashMutationSource(source) {
+  const hash = new IncrementalSha256();
+  const block = 1024 * 1024;
+  for (let offset = 0; offset < source.length; offset += block) {
+    hash.update(await source.read(offset, Math.min(offset + block, source.length)));
+  }
+  return hash.hex();
+}
+async function mutationPostWithTransportRetry(path, value, timeoutMs) {
+  const send = () => request("POST", path, {
+    capToken: CAP.mutationIntent,
+    timeoutMs,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(value),
+  });
+  try {
+    return await send();
+  } catch (error) {
+    if (error && error.code === "mutation_intent_already_completed") {
+      return { status: "completed" };
+    }
+    if (error && error.responseReceived) throw error;
+    try {
+      return await send();
+    } catch (retryError) {
+      if (retryError && retryError.code === "mutation_intent_already_completed") {
+        return { status: "completed" };
+      }
+      throw retryError;
+    }
+  }
+}
+async function stageMutation(purpose, metadata, input) {
+  const source = await mutationSource(input);
+  const totalHash = await hashMutationSource(source);
+  const created = await mutationPostWithTransportRetry("/api/v1/mutation-intent/create", {
+    request_id: crypto.randomUUID(), purpose, metadata,
+    total_bytes: source.length, sha256: totalHash,
+  });
+  const chunkBytes = Number(created.chunk_bytes);
+  if (!created.intent_id || chunkBytes !== 8192) throw new Error("Invalid upload contract");
+  let commitAttempted = false;
+  try {
+    for (let offset = 0, index = 0; offset < source.length; offset += chunkBytes, index++) {
+      const chunk = await source.read(offset, Math.min(offset + chunkBytes, source.length));
+      await mutationPostWithTransportRetry("/api/v1/mutation-intent/chunk", {
+        request_id: crypto.randomUUID(), intent_id: created.intent_id,
+        index, offset, data_base64: bytesToBase64(chunk),
+        chunk_sha256: await sha256Hex(chunk),
+      });
+    }
+    commitAttempted = true;
+    return await mutationPostWithTransportRetry("/api/v1/mutation-intent/commit", {
+      request_id: crypto.randomUUID(), intent_id: created.intent_id,
+      total_bytes: source.length, sha256: totalHash,
+    }, MUTATION_COMMIT_TIMEOUT_MS);
+  } catch (error) {
+    if (!commitAttempted && error && error.responseReceived) {
+      await postJson("/api/v1/mutation-intent/cancel", CAP.mutationIntent, {
+        request_id: crypto.randomUUID(), intent_id: created.intent_id,
+      }).catch(() => {});
+    }
+    throw error;
+  }
+}
+
+async function deleteTodoBatch(items) {
+  if (!Array.isArray(items) || !items.length || items.length > 1000) {
+    throw new Error("Select between 1 and 1000 tasks");
+  }
+  const normalized = items.map((item) => ({
+    list: String(item.list || ""),
+    id: String(item.id || ""),
+  }));
+  if (normalized.some((item) => !item.list || !item.id)) {
+    throw new Error("Invalid task selection");
+  }
+  const payload = new TextEncoder().encode(JSON.stringify({ items: normalized }));
+  return stageMutation("todo_delete_batch", {
+    account: App.account,
+    item_count: normalized.length,
+  }, payload);
 }
 /* Confirm a destructive action before it is sent (#0.6). On the standalone phone the
    native biometric per-action gate IS the confirmation — a strictly stronger one shown
@@ -621,7 +840,11 @@ const SERVICES = [
   { id: "contacts", label: "Contacts", icon: "users" },
   { id: "todo", label: "To Do", icon: "check-square" },
   { id: "onenote", label: "OneNote", icon: "notebook" },
+  { id: "assistant", label: "Assistant", icon: "sparkles", cap: "agent", appOnly: true },
 ];
+const serviceVisible = (s) => !s.cap || !!CAP[s.cap];
+const visibleServices = () => SERVICES.filter(serviceVisible);
+const archiveServices = () => SERVICES.filter(s => !s.appOnly);
 const RESTORABLE = new Set(["mail", "calendar", "contacts", "todo", "onenote"]);
 const SHAREABLE = new Set(["onedrive"]);
 
@@ -1000,7 +1223,7 @@ function invadersGame(canvas) {
 function renderShell() {
   const acc = App.accounts.find(a => a.id === App.account) || {};
   const nav = el("nav", { class: "nav" },
-    SERVICES.map(s => {
+    visibleServices().map(s => {
       const cnt = App.counts[s.id];
       const connected = cnt != null && cnt > 0;
       const item = el("button", {
@@ -1053,8 +1276,6 @@ function renderShell() {
         el("span", { class: "nav-meta" }, el("span", { id: "alerts-badge", class: "count", text: "·" }))),
       el("button", { id: "nav-settings", class: "nav-item" + (App.route === "settings" ? " active" : ""), title: "Settings", onclick: () => go("settings") },
         icon("settings"), el("span", { class: "label", text: "Settings" })),
-      CAP.agent ? el("button", { id: "nav-assistant", class: "nav-item" + (App.route === "assistant" ? " active" : ""), title: "AI Assistant", onclick: () => go("assistant") },
-        icon("sparkles"), el("span", { class: "label", text: "Assistant" })) : null,
       eggOn() ? el("button", { id: "nav-ufo", class: "nav-item" + (App.route === "invaders" ? " active" : ""), title: "Invaders", onclick: () => go("invaders") },
         ufoGlyph(), el("span", { class: "label", text: "Invaders" })) : null),
     el("div", { id: "sync-widget", class: "sync-widget" }),
@@ -1099,21 +1320,25 @@ async function renderSyncWidget() {
   const days = 14, now = Date.now(), buckets = new Array(days).fill(0);
   runs.forEach(r => { const t = toDate(r.finished_at || r.started_at); if (!t) return; const d = Math.floor((now - t.getTime()) / 864e5); if (d >= 0 && d < days) buckets[days - 1 - d]++; });
   clear(box);
-  box.append(
-    el("div", { class: "sw-head" },
-      el("span", { class: "sw-title", text: "System health" }),
-      (st.enabled && CAP.sync) ? el("div", { class: "sw-actions" },
-        el("button", { onclick: () => syncCmd("now"), title: "Sync now" }, icon("refresh-cw", "icon-sm")),
-        st.paused ? el("button", { onclick: () => syncCmd("resume"), title: "Resume" }, icon("play", "icon-sm"))
-          : el("button", { onclick: () => syncCmd("pause"), title: "Pause" }, icon("pause", "icon-sm"))) : null),
+  const syncHead = el("div", { class: "sw-head" },
+    el("span", { class: "sw-title", text: "System health" }));
+  if (st.enabled && CAP.sync) {
+    syncHead.append(el("div", { class: "sw-actions" },
+      el("button", { onclick: () => syncCmd("now"), title: "Sync now" }, icon("refresh-cw", "icon-sm")),
+      st.paused ? el("button", { onclick: () => syncCmd("resume"), title: "Resume" }, icon("play", "icon-sm"))
+        : el("button", { onclick: () => syncCmd("pause"), title: "Pause" }, icon("pause", "icon-sm"))));
+  }
+  const syncNodes = [
+    syncHead,
     el("div", { class: "sw-health " + (runs.length ? (healthy ? "ok" : "warn") : "") },
       el("span", { class: "dot" }), el("b", { text: !runs.length ? "Ready" : healthy ? "Healthy" : `${failed} alert${failed > 1 ? "s" : ""}` })),
-    runs.length ? el("div", { class: "sw-spark " + (healthy ? "ok" : "warn") }, sparkline(buckets, 32)) : null,
-    el("div", { class: "sw-meta dim", text: last ? "Last sync " + fmtDate(last.finished_at) : "No syncs yet" }),
-  );
+  ];
+  if (runs.length) syncNodes.push(el("div", { class: "sw-spark " + (healthy ? "ok" : "warn") }, sparkline(buckets, 32)));
+  syncNodes.push(el("div", { class: "sw-meta dim", text: last ? "Last sync " + fmtDate(last.finished_at) : "No syncs yet" }));
+  box.append(...syncNodes);
 }
 async function syncCmd(cmd) {
-  try { await post(`/api/v1/sync/${cmd}`, CAP.sync); toast(`sync ${cmd}`); renderSyncWidget(); }
+  try { await postJson(`/api/v1/sync/${cmd}`, CAP.sync, { request_id: crypto.randomUUID() }); toast(`sync ${cmd}`); renderSyncWidget(); }
   catch (e) { toast("sync " + cmd + " failed: " + e.message, "err"); }
 }
 // Update sidebar nav count badges in place (rebuilding the shell would wipe the view).
@@ -1126,8 +1351,8 @@ function updateNavCounts() {
 
 /* ---------------------------------------------------------------- router */
 function go(route) { location.hash = "#/" + route; }
-const EXTRA_ROUTES = { search: "Search", settings: "Settings", assistant: "Assistant", invaders: "Invaders" };
-const routeLabel = (r) => (SERVICES.find(s => s.id === r) || {}).label || EXTRA_ROUTES[r] || "iSyncYou";
+const EXTRA_ROUTES = { search: "Search", settings: "Settings", invaders: "Invaders" };
+const routeLabel = (r) => (visibleServices().find(s => s.id === r) || {}).label || EXTRA_ROUTES[r] || "iSyncYou";
 function onRoute() {
   // Each navigation rebuilds the view from scratch; the view's render re-registers its
   // own live-update handler (or leaves it null). Reset it here so a stale handler from
@@ -1142,14 +1367,14 @@ function onRoute() {
   const raw = location.hash.replace(/^#\//, "") || "overview";
   App.route = raw.split("?")[0];
   App.query = (raw.split("?")[1] || "").replace(/^q=/, "");
-  if (!SERVICES.find(s => s.id === App.route) && !EXTRA_ROUTES[App.route]) App.route = "overview";
+  if (!visibleServices().find(s => s.id === App.route) && !EXTRA_ROUTES[App.route]) App.route = "overview";
   if (App.route === "invaders" && !eggOn()) App.route = "overview";   // egg-gated route
   // Close any open overlay (detail sheet / command palette) on a real navigation
   // so it can't leak across routes; a same-route refresh keeps it open.
   if (App.route !== prevRoute) {
     closeSheet(); closePalette();
     // Leaving the assistant: close any live token stream so it can't leak across routes.
-    if (prevRoute === "assistant" && AGENT_ES) { try { AGENT_ES.close(); } catch (_) {} AGENT_ES = null; }
+    if (prevRoute === "assistant") closeAssistantStream("route-exit");
   }
   renderShell();
   const view = $("#view");
@@ -1471,7 +1696,7 @@ async function renderMailView(view) {
           el("option", { value: "sender", text: "Sender A–Z" }))),
       el("button", { id: "mail-thread-toggle", class: "btn sm" + (Mail.threaded ? " active" : ""), title: "Group messages into conversations", onclick: (e) => { Mail.threaded = !Mail.threaded; e.currentTarget.classList.toggle("active", Mail.threaded); mailRender(); } }, icon("mail-open", "icon-sm"), "Conversations"),
       verifyButton(() => renderMailView(view)),
-      CAP.mailwrite ? el("button", { class: "btn sm primary", title: "Compose a new message", onclick: () => openCompose() }, icon("send", "icon-sm"), "Compose") : null,
+      CAP.mailwrite && CAP.mutationIntent ? el("button", { class: "btn sm primary", title: "Compose a new message", onclick: () => openCompose() }, icon("send", "icon-sm"), "Compose") : null,
       el("button", { class: "btn sm", title: "View sync log", onclick: () => go("overview") }, icon("clock", "icon-sm"), "Sync log")),
     // 2-pane: list | reader (filters live in the left sidebar under "Mail")
     el("div", { id: "mail-layout", class: "mail-layout" },
@@ -1655,7 +1880,7 @@ function mailBack() { Mail.selected = null; $("#mail-layout")?.classList.remove(
 // contenteditable the user authors and which is sent to Graph — it is never
 // rendered as untrusted, so editing HTML here carries no XSS risk.
 function openCompose(opts = {}) {
-  if (!CAP.mailwrite) return;
+  if (!CAP.mailwrite || !CAP.mutationIntent) return;
   const o = opts || {};
   const field = (label, input) => el("label", { class: "cmp-field" }, el("span", { class: "cmp-label", text: label }), input);
   const toIn = el("input", { class: "input", id: "cmp-to", placeholder: "name@example.com, …", value: (o.to || []).join(", ") });
@@ -1698,13 +1923,18 @@ async function composeSubmit(btn, asDraft) {
   btn.disabled = true;
   try {
     if (asDraft) {
-      await post("/api/v1/mail/draft?" + qs({ account: App.account, to, subject, body }), CAP.mailwrite);
+      await stageMutation("mail_body", {
+        account: App.account, operation: "draft", target: "",
+        recipients: splitEmails(to), cc: [], bcc: [], subject,
+        importance: null, read_receipt: false, all: false,
+      }, new TextEncoder().encode(body));
       toast("Draft saved");
     } else {
-      const params = { account: App.account, to, cc, bcc, subject, body };
-      if (importance && importance !== "normal") params.importance = importance;
-      if (rr) params.read_receipt = "1";
-      await post("/api/v1/mail/send?" + qs(params), CAP.mailwrite);
+      await stageMutation("mail_body", {
+        account: App.account, operation: "send", target: "",
+        recipients: splitEmails(to), cc: splitEmails(cc), bcc: splitEmails(bcc),
+        subject, importance: importance || null, read_receipt: rr, all: false,
+      }, new TextEncoder().encode(body));
       toast("Message sent");
     }
     closeSheet();
@@ -1722,7 +1952,7 @@ async function composeSubmit(btn, asDraft) {
 // content is sent; the daemon prepends it above the quoted original (Mail-1), so
 // the URL stays small and the full original is preserved + threaded.
 function openInlineComposer(it, mode) {
-  if (!CAP.mailwrite) return;
+  if (!CAP.mailwrite || !CAP.mutationIntent) return;
   const box = $("#mail-reader"); if (!box) return;
   const p = it.preview || {};
   const isFwd = mode === "forward";
@@ -1760,18 +1990,20 @@ function openInlineComposer(it, mode) {
 async function inlineComposerSend(btn, it, mode) {
   const editor = $("#cmp-editor"); if (!editor) return;
   const body = (editor.innerHTML || "").trim();
-  const params = { account: App.account, id: it.remote_id, body };
-  let path = "/api/v1/mail/reply";
+  let recipients = [];
+  let operation = "reply";
   if (mode === "forward") {
     const to = ($("#cmp-fwd-to").value || "").trim();
     if (!to) { toast("Add at least one recipient", "err"); return; }
-    params.to = to; path = "/api/v1/mail/forward";
-  } else {
-    params.all = mode === "replyAll" ? "1" : "0";
+    recipients = splitEmails(to); operation = "forward";
   }
   btn.disabled = true;
   try {
-    await post(path + "?" + qs(params), CAP.mailwrite);
+    await stageMutation("mail_body", {
+      account: App.account, operation, target: it.remote_id,
+      recipients, cc: [], bcc: [], subject: "", importance: null,
+      read_receipt: false, all: mode === "replyAll",
+    }, new TextEncoder().encode(body));
     toast(mode === "forward" ? "Forwarded" : "Reply sent");
     renderMailReader(it);
   } catch (e) { toast("Send failed: " + e.message, "err"); btn.disabled = false; }
@@ -1783,11 +2015,11 @@ function mailRerender(it) {
   mailRender();
   if (Mail.selected && Mail.selected.remote_id === it.remote_id) renderMailReader(it);
 }
-async function mailManage(it, optimistic, revert, path) {
+async function mailManage(it, optimistic, revert, path, values) {
   optimistic(it.preview = it.preview || {});
   mailRerender(it);
   try {
-    await post(path, CAP.mailwrite);
+    await postJson(path, CAP.mailwrite, { request_id: crypto.randomUUID(), ...values });
   } catch (e) {
     revert(it.preview);
     mailRerender(it);
@@ -1796,12 +2028,12 @@ async function mailManage(it, optimistic, revert, path) {
 }
 const mailSetRead = (it, isRead) => mailManage(
   it, p => { p.isRead = isRead; }, () => { (it.preview || {}).isRead = !isRead; },
-  "/api/v1/mail/read?" + qs({ account: App.account, id: it.remote_id, is_read: isRead ? "1" : "0" }));
+  "/api/v1/mail/read", { account: App.account, id: it.remote_id, is_read: isRead });
 const mailSetFlag = (it, status, due) => {
   const prev = (it.preview || {}).flag;
   const q = { account: App.account, id: it.remote_id, status };
   if (due) { q.due = due; q.tz = (Intl.DateTimeFormat().resolvedOptions().timeZone) || "UTC"; }
-  return mailManage(it, p => { p.flag = status; }, p => { p.flag = prev; }, "/api/v1/mail/flag?" + qs(q));
+  return mailManage(it, p => { p.flag = status; }, p => { p.flag = prev; }, "/api/v1/mail/flag", q);
 };
 // inline-animated follow-up menu (no popup): plain flag · due date · complete · clear
 function openFlagMenu(it, btn) {
@@ -1821,13 +2053,15 @@ function openFlagMenu(it, btn) {
 }
 const mailSetCategories = (it, cats) => { const prev = (it.preview || {}).categories; return mailManage(
   it, p => { p.categories = cats; }, p => { p.categories = prev; },
-  "/api/v1/mail/categories?" + qs({ account: App.account, id: it.remote_id, categories: cats.join(",") })); };
+  "/api/v1/mail/categories", { account: App.account, id: it.remote_id, categories: cats.join(",") }); };
 
 // Move changes the message id, so optimistically drop it from the current list;
 // the SSE refresh (B1) brings the authoritative state.
 async function mailMove(it, destination, label) {
   try {
-    await post("/api/v1/mail/move?" + qs({ account: App.account, id: it.remote_id, destination }), CAP.mailwrite);
+    await postJson("/api/v1/mail/move", CAP.mailwrite, {
+      request_id: crypto.randomUUID(), account: App.account, id: it.remote_id, destination,
+    });
     toast(`Moved to ${label}`);
     Mail.all = Mail.all.filter(x => x.remote_id !== it.remote_id);
     if (Mail.selected && Mail.selected.remote_id === it.remote_id) mailBack();
@@ -2069,7 +2303,7 @@ async function renderOnedriveView(view) {
       el("div", { id: "drive-crumbs", class: "drive-crumbs" }),
       el("div", { class: "spacer", style: "flex:1" }),
       el("label", { class: "tb-sort" }, icon("arrow-down-up", "icon-sm"), driveSortSelect()),
-      CAP.onedrivewrite ? el("button", { class: "btn ghost sm", title: "Upload a file into this folder", onclick: driveUpload }, icon("upload", "icon-sm"), "Upload") : null,
+      CAP.onedrivewrite && CAP.mutationIntent ? el("button", { class: "btn ghost sm", title: "Upload a file into this folder", onclick: driveUpload }, icon("upload", "icon-sm"), "Upload") : null,
       verifyButton(() => renderOnedriveView(view)),
       el("div", { class: "seg" },
         el("button", { id: "drive-grid", class: "seg-btn" + (Drive.layout === "grid" ? " active" : ""), title: "Grid view", onclick: () => setDriveLayout("grid") }, icon("layout-dashboard", "icon-sm")),
@@ -2389,7 +2623,9 @@ function transferRow(t) {
 }
 async function cancelTransfer(t) {
   try {
-    await post("/api/v1/onedrive/transfers/cancel?" + qs({ id: t.id }), CAP.transfers);
+    await postJson("/api/v1/onedrive/transfers/cancel", CAP.transfers, {
+      request_id: crypto.randomUUID(), id: t.id,
+    });
     // Optimistic: drop it from the panel now; the next poll confirms the engine skipped it.
     Drive.transfers = (Drive.transfers || []).filter(x => x.id !== t.id);
     renderTransfersPanel();
@@ -2398,7 +2634,9 @@ async function cancelTransfer(t) {
 }
 async function pauseTransfer(t) {
   try {
-    await post("/api/v1/onedrive/transfers/pause?" + qs({ id: t.id }), CAP.transfers);
+    await postJson("/api/v1/onedrive/transfers/pause", CAP.transfers, {
+      request_id: crypto.randomUUID(), id: t.id,
+    });
     // Optimistic: mark paused now; the next poll confirms it from the engine's pause-set.
     const row = (Drive.transfers || []).find(x => x.id === t.id); if (row) row.paused = true;
     renderTransfersPanel();
@@ -2407,7 +2645,9 @@ async function pauseTransfer(t) {
 }
 async function retryTransfer(t, verb) {
   try {
-    await post("/api/v1/onedrive/transfers/retry?" + qs({ id: t.id }), CAP.transfers);
+    await postJson("/api/v1/onedrive/transfers/retry", CAP.transfers, {
+      request_id: crypto.randomUUID(), id: t.id,
+    });
     const row = (Drive.transfers || []).find(x => x.id === t.id); if (row) { row.paused = false; row.retry_after_secs = 0; }
     renderTransfersPanel();
     toast((verb || "Retrying") + " " + (t.name || "transfer"));
@@ -2447,7 +2687,10 @@ function openModeSheet(folderId, name, effMode, explicit) {
 // indicator reflect the fresh server state (Drive.modes SSOT). Mirrors doShare's template.
 async function setFolderMode(folderId, mode) {
   try {
-    const resp = await post("/api/v1/onedrive/mode?" + qs({ account: App.account, folder: folderId, ...(mode ? { mode } : {}) }), CAP.onedriveMode);
+    const resp = await postJson("/api/v1/onedrive/mode", CAP.onedriveMode, {
+      request_id: crypto.randomUUID(), account: App.account, folder: folderId,
+      ...(mode ? { mode } : {}),
+    });
     toast(mode ? "Folder set to " + MODE_LABEL[mode] : "Folder reset to inherited");
     // #659 D1: switching a folder online runs the offline→online cleanup server-side; surface it.
     const c = resp && resp.cleanup;
@@ -2508,7 +2751,9 @@ async function resolveConflict(cf, resolution) {
   try {
     // keep-mine deletes the cloud copy → the mobile router raises the biometric gate, handled
     // automatically by request()'s confirmation_required flow.
-    await post("/api/v1/onedrive/conflict/resolve?" + qs({ account: App.account, id: cf.id, resolution }), CAP.onedriveManage);
+    await postJson("/api/v1/onedrive/conflict/resolve", CAP.onedriveManage, {
+      request_id: crypto.randomUUID(), account: App.account, id: cf.id, resolution,
+    });
     toast(RESOLUTION_LABEL[resolution] || "Resolved");
     closeSheet();
     await driveLoadConflicts();
@@ -2523,7 +2768,7 @@ function driveActions(it) {
   if (!folder && it.has_body) box.append(el("a", { class: "act", href: `/api/v1/body?${qs(q)}`, download: it.name || "", title: "Download", onclick: (e) => e.stopPropagation() }, icon("download", "icon-sm")));
   if (!folder && CAP.share) box.append(el("button", { class: "act", title: "Share", onclick: (e) => { e.stopPropagation(); doShare(it, e.currentTarget); } }, icon("share2", "icon-sm")));
   // #657: in-app write actions (cap-gated; destructive ops are biometric-gated on mobile).
-  if (!folder && CAP.onedrivewrite) box.append(el("button", { class: "act", title: "Replace contents", onclick: (e) => { e.stopPropagation(); driveReplace(it); } }, icon("refresh-cw", "icon-sm")));
+  if (!folder && CAP.onedrivewrite && CAP.mutationIntent) box.append(el("button", { class: "act", title: "Replace contents", onclick: (e) => { e.stopPropagation(); driveReplace(it); } }, icon("refresh-cw", "icon-sm")));
   if (CAP.onedrivewrite) {
     box.append(el("button", { class: "act", title: "Rename", onclick: (e) => { e.stopPropagation(); driveRename(it); } }, icon("pencil", "icon-sm")));
     box.append(el("button", { class: "act", title: "Move to folder", onclick: (e) => { e.stopPropagation(); driveMovePicker(it); } }, icon("folder-input", "icon-sm")));
@@ -2531,33 +2776,32 @@ function driveActions(it) {
   }
   return box;
 }
-// #657 in-app upload: pick a file and upload it into the CURRENT folder (read live at click
-// time). Bytes → base64 → POST /onedrive/upload; execution lands with #655 (placeholder Err
-// surfaces honestly until then). Cap-gated; biometric-gated on mobile.
+// In-app upload stages sealed 8 KiB chunks and commits one bounded mutation intent.
 function driveUpload() {
-  if (!CAP.onedrivewrite) return;
+  if (!CAP.onedrivewrite || !CAP.mutationIntent) return;
   const cur = Drive.stack[Drive.stack.length - 1].id;
   const inp = el("input", { type: "file" });
   inp.addEventListener("change", async () => {
     const file = inp.files && inp.files[0]; if (!file) return;
     try {
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      await postBinary("/api/v1/onedrive/upload?" + qs({ account: App.account, parent: cur === "root" ? "" : cur, name: file.name }), CAP.onedrivewrite, bytes);
+      await stageMutation("onedrive_upload", {
+        account: App.account, parent: cur === "root" ? "" : cur, name: file.name,
+      }, file);
       toast(`Uploaded ${file.name}`); driveLoad(); driveLoadMetrics();
     } catch (e) { toast("Upload failed: " + e.message, "err"); }
   });
   inp.click();
 }
-// #657 in-app replace: overwrite a file's content in place (If-Match its eTag; a 412 conflict
-// is surfaced, never clobbered). Bytes → base64 → POST /onedrive/replace.
+// In-app replace uses the same staged protocol and preserves the listed If-Match eTag.
 function driveReplace(it) {
-  if (!CAP.onedrivewrite) return;
+  if (!CAP.onedrivewrite || !CAP.mutationIntent) return;
   const inp = el("input", { type: "file" });
   inp.addEventListener("change", async () => {
     const file = inp.files && inp.files[0]; if (!file) return;
     try {
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      await postBinary("/api/v1/onedrive/replace?" + qs({ account: App.account, id: it.remote_id, etag: it.etag || "" }), CAP.onedrivewrite, bytes);
+      await stageMutation("onedrive_replace", {
+        account: App.account, id: it.remote_id, etag: it.etag || "",
+      }, file);
       toast(`Replaced ${it.name || "file"}`); driveLoad(); driveLoadMetrics();
     } catch (e) { toast("Replace failed: " + e.message, "err"); }
   });
@@ -2570,7 +2814,7 @@ function driveRename(it) {
   const submit = async () => {
     const name = inp.value.trim(); if (!name || name === it.name) { closeSheet(); return; }
     closeSheet();
-    try { await post("/api/v1/onedrive/rename?" + qs({ account: App.account, id: it.remote_id, name }), CAP.onedrivewrite); toast(`Renamed to ${name}`); driveLoad(); }
+    try { await postJson("/api/v1/onedrive/rename", CAP.onedrivewrite, { request_id: crypto.randomUUID(), account: App.account, id: it.remote_id, name }); toast(`Renamed to ${name}`); driveLoad(); }
     catch (e) { toast("Rename failed: " + e.message, "err"); }
   };
   inp.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
@@ -2610,7 +2854,7 @@ function driveMovePicker(it) {
   load();
 }
 async function driveMove(it, parent, parentName) {
-  try { await post("/api/v1/onedrive/move?" + qs({ account: App.account, id: it.remote_id, parent, name: it.name || "" }), CAP.onedrivewrite); toast(`Moved to ${parentName}`); driveLoad(); driveLoadMetrics(); }
+  try { await postJson("/api/v1/onedrive/move", CAP.onedrivewrite, { request_id: crypto.randomUUID(), account: App.account, id: it.remote_id, parent, name: it.name || "" }); toast(`Moved to ${parentName}`); driveLoad(); driveLoadMetrics(); }
   catch (e) { toast("Move failed: " + e.message, "err"); }
 }
 // #657 delete: confirmDestructive (desktop confirm(); on mobile the biometric gate IS the
@@ -2618,7 +2862,7 @@ async function driveMove(it, parent, parentName) {
 async function driveDelete(it) {
   if (!CAP.onedrivewrite) return;
   if (!confirmDestructive(`Delete "${it.name || "this item"}"? This removes it from OneDrive.`)) return;
-  try { await post("/api/v1/onedrive/delete?" + qs({ account: App.account, id: it.remote_id }), CAP.onedrivewrite); toast(`Deleted ${it.name || "item"}`); driveLoad(); driveLoadMetrics(); }
+  try { await postJson("/api/v1/onedrive/delete", CAP.onedrivewrite, { request_id: crypto.randomUUID(), account: App.account, id: it.remote_id }); toast(`Deleted ${it.name || "item"}`); driveLoad(); driveLoadMetrics(); }
   catch (e) { toast("Delete failed: " + e.message, "err"); }
 }
 // Item detail sheet (#564): facts + lazily-fetched "who has access" (one Graph
@@ -2693,7 +2937,9 @@ function driveRenderManage(box, it, row) {
 }
 async function freeUpItem(it) {
   try {
-    await post("/api/v1/onedrive/free-up?" + qs({ account: App.account, id: it.remote_id }), CAP.onedriveManage);
+    await postJson("/api/v1/onedrive/free-up", CAP.onedriveManage, {
+      request_id: crypto.randomUUID(), account: App.account, id: it.remote_id,
+    });
     toast("Freed up " + (it.name || "file"));
     closeSheet();
     driveLoad();
@@ -2701,8 +2947,14 @@ async function freeUpItem(it) {
 }
 async function downloadNowItem(it) {
   try {
-    const d = await post("/api/v1/onedrive/download-now?" + qs({ account: App.account, id: it.remote_id }), CAP.onedriveManage);
-    toast(d && d.downloaded === false ? "Not downloaded (blocked by policy)" : "Downloaded " + (it.name || "file"));
+    const d = await postJson("/api/v1/onedrive/download-now", CAP.onedriveManage, {
+      request_id: crypto.randomUUID(), account: App.account, id: it.remote_id,
+    });
+    toast(isReplayedRequest(d)
+      ? "Download request completed"
+      : d && d.downloaded === false
+        ? "Not downloaded (blocked by policy)"
+        : "Downloaded " + (it.name || "file"));
     closeSheet();
     driveLoad();
   } catch (e) { toast("Could not download: " + e.message, "err"); }
@@ -2813,7 +3065,7 @@ function driveRow(it) {
   if (!folder && CAP.share) acts.append(el("button", { class: "btn ghost sm", title: "Share", onclick: (e) => { e.stopPropagation(); doShare(it, e.currentTarget); } }, icon("share2", "icon-sm")));
   if (folder && MOBILE && CAP.onedriveMode) acts.append(driveModePill(it.remote_id, it.effective_mode, driveExplicit(it.remote_id), it.name));
   // #657: in-app write actions (cap-gated; destructive ops biometric-gated on mobile).
-  if (!folder && CAP.onedrivewrite) acts.append(el("button", { class: "btn ghost sm", title: "Replace contents", onclick: (e) => { e.stopPropagation(); driveReplace(it); } }, icon("refresh-cw", "icon-sm")));
+  if (!folder && CAP.onedrivewrite && CAP.mutationIntent) acts.append(el("button", { class: "btn ghost sm", title: "Replace contents", onclick: (e) => { e.stopPropagation(); driveReplace(it); } }, icon("refresh-cw", "icon-sm")));
   if (CAP.onedrivewrite) {
     acts.append(el("button", { class: "btn ghost sm", title: "Rename", onclick: (e) => { e.stopPropagation(); driveRename(it); } }, icon("pencil", "icon-sm")));
     acts.append(el("button", { class: "btn ghost sm", title: "Move to folder", onclick: (e) => { e.stopPropagation(); driveMovePicker(it); } }, icon("folder-input", "icon-sm")));
@@ -3221,7 +3473,7 @@ async function composeEventSubmit(btn, id) {
   if (id) params.id = id;
   btn.disabled = true;
   try {
-    await post((id ? "/api/v1/calendar/update?" : "/api/v1/calendar/create?") + qs(params), CAP.calendarwrite);
+    await postJson(id ? "/api/v1/calendar/update" : "/api/v1/calendar/create", CAP.calendarwrite, { request_id: crypto.randomUUID(), ...params });
     toast(id ? "Event updated" : "Event created");
     closeSheet(); calLoad();
   } catch (e) { toast("Failed: " + e.message, "err"); btn.disabled = false; }
@@ -3237,7 +3489,7 @@ function eventRespondInline(ev, response, host) {
   const doSend = async (withMsg) => {
     const comment = withMsg ? (ta.value || "").trim() : "";
     try {
-      await post("/api/v1/calendar/respond?" + qs({ account: App.account, id: ev.it.remote_id, response, comment }), CAP.calendarwrite);
+      await postJson("/api/v1/calendar/respond", CAP.calendarwrite, { request_id: crypto.randomUUID(), account: App.account, id: ev.it.remote_id, response, comment });
       toast(cap + " sent" + (comment ? " with a message" : "")); closeSheet(); calLoad();
     } catch (e) { toast("Failed: " + e.message, "err"); }
   };
@@ -3256,7 +3508,7 @@ function eventRespondInline(ev, response, host) {
 async function deleteEvent(ev) {
   if (!confirmDestructive("Delete this event? This removes it from your calendar.")) return;
   try {
-    await post("/api/v1/calendar/delete?" + qs({ account: App.account, id: ev.it.remote_id }), CAP.calendarwrite);
+    await postJson("/api/v1/calendar/delete", CAP.calendarwrite, { request_id: crypto.randomUUID(), account: App.account, id: ev.it.remote_id });
     toast("Event deleted"); closeSheet(); calLoad();
   } catch (e) { toast("Failed: " + e.message, "err"); }
 }
@@ -3313,8 +3565,10 @@ async function renderContactsView(view) {
 async function contactsVerify(btn) {
   btn.disabled = true;
   try {
-    const r = await post("/api/v1/verify?" + qs({ account: App.account }), CAP.verify);
-    toast(`Integrity: ${r.verified}/${r.checked} records verified`);
+    const r = await postJson("/api/v1/verify", CAP.verify, { request_id: crypto.randomUUID(), account: App.account });
+    toast(isReplayedRequest(r)
+      ? "Integrity check completed; refreshing results"
+      : `Integrity: ${r.verified}/${r.checked} records verified`);
     const [status, d] = await Promise.all([
       api("/api/v1/status?" + qs({ account: App.account })).catch(() => Contacts.status),
       api("/api/v1/items?" + qs({ account: App.account, service: "contacts", limit: 1000 })),
@@ -3394,7 +3648,7 @@ async function composeContactSubmit(btn, id) {
   if (id) params.id = id;
   btn.disabled = true;
   try {
-    await post((id ? "/api/v1/contact/update?" : "/api/v1/contact/create?") + qs(params), CAP.contactwrite);
+    await postJson(id ? "/api/v1/contact/update" : "/api/v1/contact/create", CAP.contactwrite, { request_id: crypto.randomUUID(), ...params });
     toast(id ? "Contact updated" : "Contact created");
     await contactsReload();
     // create leaves nothing selected → clear the inline form back to the empty
@@ -3405,7 +3659,7 @@ async function composeContactSubmit(btn, id) {
 async function deleteContact(it) {
   if (!confirmDestructive("Delete this contact? This removes it from your Microsoft 365 account.")) return;
   try {
-    await post("/api/v1/contact/delete?" + qs({ account: App.account, id: it.remote_id }), CAP.contactwrite);
+    await postJson("/api/v1/contact/delete", CAP.contactwrite, { request_id: crypto.randomUUID(), account: App.account, id: it.remote_id });
     toast("Contact deleted");
     if (Contacts.selected && Contacts.selected.remote_id === it.remote_id) contactBack();
     contactsReload();
@@ -3482,8 +3736,10 @@ function verifyButton(refreshFn) {
 async function runVerifyThen(btn, refreshFn) {
   btn.disabled = true;
   try {
-    const r = await post("/api/v1/verify?" + qs({ account: App.account }), CAP.verify);
-    toast(`Integrity: ${r.verified}/${r.checked} records verified`);
+    const r = await postJson("/api/v1/verify", CAP.verify, { request_id: crypto.randomUUID(), account: App.account });
+    toast(isReplayedRequest(r)
+      ? "Integrity check completed; refreshing results"
+      : `Integrity: ${r.verified}/${r.checked} records verified`);
     await refreshFn();
   } catch (e) { toast("Verify failed: " + e.message, "err"); } finally { btn.disabled = false; }
 }
@@ -3759,14 +4015,17 @@ async function renderContactDetail(it) {
 
 
 /* ---------------------------------------------------------------- todo (lists + checklists) */
-const Todo = { lists: [], tasks: [], stateFilter: "all" };
+const Todo = { lists: [], tasks: [], stateFilter: "all", selecting: false, selected: new Set() };
 const TODO_STATUS = { notStarted: { icon: "circle", cls: "" }, inProgress: { icon: "clock", cls: "prog" }, completed: { icon: "check-square", cls: "done" } };
 async function renderTodoView(view) {
   clear(view).append(el("div", { id: "todo-metrics-row", class: "con-metrics-row inset" }));
   const acts = el("div", { class: "view-actions" });
   if (CAP.todowrite) acts.append(
     el("button", { class: "btn sm primary", title: "Create a new task", onclick: () => openComposeTask() }, icon("check-square", "icon-sm"), "New task"),
-    el("button", { class: "btn sm", title: "Create a new list", onclick: () => newTodoList() }, icon("notebook", "icon-sm"), "New list"));
+    el("button", { class: "btn sm", title: "Create a new list", onclick: () => newTodoList() }, icon("notebook", "icon-sm"), "New list"),
+    el("button", { id: "todo-select-toggle", class: "btn sm", title: "Select tasks", onclick: toggleTodoSelection }, icon("list-checks", "icon-sm"), "Select"),
+    el("button", { id: "todo-select-all", class: "btn sm", title: "Select all visible tasks", hidden: "hidden", onclick: selectAllVisibleTodoTasks }, icon("check-check", "icon-sm"), "Select all"),
+    el("button", { id: "todo-delete-selected", class: "btn sm danger", title: "Delete selected tasks", hidden: "hidden", disabled: "disabled", onclick: deleteSelectedTodoTasks }, icon("trash-2", "icon-sm"), el("span", { id: "todo-selected-count", text: "Delete" })));
   if (CAP.verify) acts.append(verifyButton(() => renderTodoView(view)));
   if (acts.childElementCount) view.append(acts);
   const board = el("div", { id: "todo-board", class: "todo-board" });
@@ -3789,14 +4048,80 @@ async function renderTodoView(view) {
       lastActivityMetric(act.runs || []),
     ]);
     todoRender();
+    syncTodoSelectionActions();
   } catch (e) { clear(board).append(el("div", { class: "empty" }, el("h3", { text: "Could not load ToDo" }), el("p", { text: e.message }))); }
+}
+function visibleTodoTasks() {
+  return Todo.tasks.filter(t => todoTaskCanBeDeleted(t) && stateMatch(t, Todo.stateFilter));
+}
+function todoTaskCanBeDeleted(t) {
+  return !!(t && t.parent_remote_id && t.remote_id && stateKey(t) !== "backup_only");
+}
+function syncTodoSelectionActions() {
+  const toggle = $("#todo-select-toggle");
+  const all = $("#todo-select-all");
+  const remove = $("#todo-delete-selected");
+  const count = $("#todo-selected-count");
+  if (toggle) {
+    toggle.classList.toggle("active", Todo.selecting);
+    toggle.lastChild.textContent = Todo.selecting ? "Done" : "Select";
+  }
+  if (all) all.hidden = !Todo.selecting;
+  if (remove) {
+    remove.hidden = !Todo.selecting;
+    remove.disabled = Todo.selected.size === 0;
+  }
+  if (count) count.textContent = Todo.selected.size ? `Delete ${Todo.selected.size}` : "Delete";
+}
+function toggleTodoSelection() {
+  Todo.selecting = !Todo.selecting;
+  if (!Todo.selecting) Todo.selected.clear();
+  todoRender();
+  syncTodoSelectionActions();
+}
+function selectAllVisibleTodoTasks() {
+  const visible = visibleTodoTasks();
+  const allSelected = visible.length > 0 && visible.every(t => Todo.selected.has(t.remote_id));
+  visible.forEach(t => allSelected ? Todo.selected.delete(t.remote_id) : Todo.selected.add(t.remote_id));
+  todoRender();
+  syncTodoSelectionActions();
+}
+function toggleTodoTaskSelection(t) {
+  if (!todoTaskCanBeDeleted(t)) return;
+  if (Todo.selected.has(t.remote_id)) Todo.selected.delete(t.remote_id);
+  else Todo.selected.add(t.remote_id);
+  todoRender();
+  syncTodoSelectionActions();
+}
+async function deleteSelectedTodoTasks() {
+  const selected = Todo.tasks.filter(t => Todo.selected.has(t.remote_id) && todoTaskCanBeDeleted(t));
+  if (!selected.length) return;
+  if (!confirmDestructive(`Delete ${selected.length} selected task${selected.length === 1 ? "" : "s"} from your Microsoft 365 account?`)) return;
+  const button = $("#todo-delete-selected");
+  if (button) button.disabled = true;
+  try {
+    const result = await deleteTodoBatch(selected.map(t => ({ list: t.parent_remote_id, id: t.remote_id })));
+    const deleted = Number(result && result.deleted) || selected.length;
+    toast(`${deleted} task${deleted === 1 ? "" : "s"} deleted`);
+    Todo.selecting = false;
+    Todo.selected.clear();
+    await todoReload();
+  } catch (e) {
+    toast("Could not delete the selected tasks", "err");
+    if (button) button.disabled = false;
+  }
 }
 function todoRender() {
   const board = clear($("#todo-board"));
   // refresh the 4-state filter bar as a sibling just above the board
   const old = $("#todo-statebar"); if (old) old.remove();
   if (Todo.tasks.length) {
-    const bar = stateFilterBar(Todo.tasks, Todo.stateFilter, k => { Todo.stateFilter = k; todoRender(); });
+    const bar = stateFilterBar(Todo.tasks, Todo.stateFilter, k => {
+      Todo.stateFilter = k;
+      Todo.selected.clear();
+      todoRender();
+      syncTodoSelectionActions();
+    });
     bar.id = "todo-statebar"; board.parentNode.insertBefore(bar, board);
   }
   if (!Todo.lists.length && !Todo.tasks.length) { board.append(el("div", { class: "empty" }, emptyArt("empty-tasks"), el("h3", { text: "No tasks" }), el("p", { text: "Run a backup to populate your task lists." }))); return; }
@@ -3830,8 +4155,15 @@ function taskRow(t) {
   const p = t.preview || {};
   const st = TODO_STATUS[p.status] || TODO_STATUS.notStarted;
   const hasMeta = p.due || p.importance === "high" || p.steps_total > 0 || p.has_attachments;
-  return el("button", { class: "todo-task" + (p.status === "completed" ? " done" : ""), onclick: () => openTaskSheet(t) },
-    el("span", { class: "todo-check " + st.cls }, icon(st.icon, "icon-sm")),
+  const selectable = Todo.selecting && todoTaskCanBeDeleted(t);
+  const selected = selectable && Todo.selected.has(t.remote_id);
+  return el("button", {
+    class: "todo-task" + (p.status === "completed" ? " done" : "") + (selected ? " selected" : ""),
+    onclick: () => Todo.selecting ? toggleTodoTaskSelection(t) : openTaskSheet(t),
+    role: selectable ? "checkbox" : null,
+    "aria-checked": selectable ? String(selected) : null,
+  },
+    el("span", { class: "todo-check " + (selectable ? (selected ? "selected" : "") : st.cls) }, icon(selectable ? (selected ? "check-square" : "square") : st.icon, "icon-sm")),
     el("div", { class: "grow", style: "min-width:0" },
       el("div", { class: "todo-title truncate", text: t.name || "(untitled)" }),
       hasMeta ? el("div", { class: "todo-meta dim" },
@@ -3998,39 +4330,39 @@ async function composeTaskSubmit(btn, t) {
   if (t) params.id = t.remote_id;
   btn.disabled = true;
   try {
-    await post((t ? "/api/v1/todo/update?" : "/api/v1/todo/create?") + qs(params), CAP.todowrite);
+    await postJson(t ? "/api/v1/todo/update" : "/api/v1/todo/create", CAP.todowrite, { request_id: crypto.randomUUID(), ...params });
     toast(t ? "Task updated" : "Task created"); closeSheet(); todoReload();
   } catch (e) { toast("Failed: " + e.message, "err"); btn.disabled = false; }
 }
 async function newTodoList() {
   const name = prompt("New list name:");
   if (!name || !name.trim()) return;
-  try { await post("/api/v1/todo/list-create?" + qs({ account: App.account, name: name.trim() }), CAP.todowrite); toast("List created"); todoReload(); }
+  try { await postJson("/api/v1/todo/list-create", CAP.todowrite, { request_id: crypto.randomUUID(), account: App.account, name: name.trim() }); toast("List created"); todoReload(); }
   catch (e) { toast("Failed: " + e.message, "err"); }
 }
 async function completeTask(t) {
-  try { await post("/api/v1/todo/complete?" + qs({ account: App.account, list: t.parent_remote_id, id: t.remote_id }), CAP.todowrite); toast("Task completed"); closeSheet(); todoReload(); }
+  try { await postJson("/api/v1/todo/complete", CAP.todowrite, { request_id: crypto.randomUUID(), account: App.account, list: t.parent_remote_id, id: t.remote_id }); toast("Task completed"); closeSheet(); todoReload(); }
   catch (e) { toast("Failed: " + e.message, "err"); }
 }
 async function reopenTask(t) {
-  try { await post("/api/v1/todo/update?" + qs({ account: App.account, list: t.parent_remote_id, id: t.remote_id, status: "notStarted" }), CAP.todowrite); toast("Task reopened"); closeSheet(); todoReload(); }
+  try { await postJson("/api/v1/todo/update", CAP.todowrite, { request_id: crypto.randomUUID(), account: App.account, list: t.parent_remote_id, id: t.remote_id, status: "notStarted" }); toast("Task reopened"); closeSheet(); todoReload(); }
   catch (e) { toast("Failed: " + e.message, "err"); }
 }
 async function deleteTask(t) {
   if (!confirmDestructive("Delete this task from your Microsoft 365 account?")) return;
-  try { await post("/api/v1/todo/delete?" + qs({ account: App.account, list: t.parent_remote_id, id: t.remote_id }), CAP.todowrite); toast("Task deleted"); closeSheet(); todoReload(); }
+  try { await postJson("/api/v1/todo/delete", CAP.todowrite, { request_id: crypto.randomUUID(), account: App.account, list: t.parent_remote_id, id: t.remote_id }); toast("Task deleted"); closeSheet(); todoReload(); }
   catch (e) { toast("Failed: " + e.message, "err"); }
 }
 // checklist ops use optimistic UI (the daemon doesn't re-sync on a self-write)
 async function toggleStep(t, s, renderSteps, updateCount) {
   try {
-    await post("/api/v1/todo/checklist-toggle?" + qs({ account: App.account, list: t.parent_remote_id, task: t.remote_id, item: s.id, checked: s.isChecked ? "0" : "1" }), CAP.todowrite);
+    await postJson("/api/v1/todo/checklist-toggle", CAP.todowrite, { request_id: crypto.randomUUID(), account: App.account, list: t.parent_remote_id, task: t.remote_id, item: s.id, checked: !s.isChecked });
     s.isChecked = !s.isChecked; renderSteps(); updateCount();
   } catch (e) { toast("Failed: " + e.message, "err"); }
 }
 async function deleteStep(t, s, steps, renderSteps, updateCount) {
   try {
-    await post("/api/v1/todo/checklist-delete?" + qs({ account: App.account, list: t.parent_remote_id, task: t.remote_id, item: s.id }), CAP.todowrite);
+    await postJson("/api/v1/todo/checklist-delete", CAP.todowrite, { request_id: crypto.randomUUID(), account: App.account, list: t.parent_remote_id, task: t.remote_id, item: s.id });
     const i = steps.indexOf(s); if (i >= 0) steps.splice(i, 1); renderSteps(); updateCount();
   } catch (e) { toast("Failed: " + e.message, "err"); }
 }
@@ -4038,7 +4370,12 @@ async function addStep(t, inp, steps, renderSteps, updateCount) {
   const title = (inp.value || "").trim();
   if (!title) return;
   try {
-    const r = await post("/api/v1/todo/checklist-add?" + qs({ account: App.account, list: t.parent_remote_id, task: t.remote_id, title }), CAP.todowrite);
+    const r = await postJson("/api/v1/todo/checklist-add", CAP.todowrite, { request_id: crypto.randomUUID(), account: App.account, list: t.parent_remote_id, task: t.remote_id, title });
+    if (isReplayedRequest(r)) {
+      inp.value = "";
+      await todoReload();
+      return;
+    }
     steps.push({ id: r.id, displayName: title, isChecked: false }); inp.value = ""; renderSteps(); updateCount(); inp.focus();
   } catch (e) { toast("Failed: " + e.message, "err"); }
 }
@@ -4048,8 +4385,11 @@ async function todoReload() {
     const items = d.items || [];
     Todo.lists = items.filter(it => it.item_type === "list");
     Todo.tasks = items.filter(it => it.item_type === "task");
+    const liveIds = new Set(Todo.tasks.filter(todoTaskCanBeDeleted).map(t => t.remote_id));
+    Todo.selected = new Set([...Todo.selected].filter(id => liveIds.has(id)));
     App.counts.todo = d.total ?? items.length; updateNavCounts();
     todoRender();
+    syncTodoSelectionActions();
   } catch (e) { toast("Reload failed: " + e.message, "err"); }
 }
 
@@ -4062,7 +4402,7 @@ async function renderOnenoteView(view) {
   const tree = el("div", { id: "note-tree", class: "note-tree" });
   const reader = el("div", { id: "note-reader", class: "note-reader" });
   const acts = el("div", { class: "view-actions" });
-  if (CAP.onenotewrite) acts.append(el("button", { class: "btn sm primary", title: "Create a new page", onclick: () => openComposePage() }, icon("notebook", "icon-sm"), "New page"));
+  if (CAP.onenotewrite && CAP.mutationIntent) acts.append(el("button", { class: "btn sm primary", title: "Create a new page", onclick: () => openComposePage() }, icon("notebook", "icon-sm"), "New page"));
   if (CAP.verify) acts.append(verifyButton(() => renderOnenoteView(view)));
   view.append(el("div", { class: "note-page" },
     el("div", { id: "note-metrics-row", class: "con-metrics-row top" }),
@@ -4157,8 +4497,10 @@ function renderNoteReader(it) {
   const p = it.preview || {};
   const actions = el("div", { class: "note-reader-actions" },
     el("a", { class: "btn ghost sm", href: `/api/v1/view?${qs(q)}`, target: "_blank", rel: "noopener", title: "Open in new tab" }, icon("external-link", "icon-sm")));
-  if (CAP.onenotewrite) {
+  if (CAP.onenotewrite && CAP.mutationIntent) {
     actions.append(el("button", { class: "btn ghost sm", title: "Append a paragraph (best-effort)", onclick: () => appendPage(it) }, icon("plus", "icon-sm"), "Append"));
+  }
+  if (CAP.onenotewrite) {
     actions.append(el("button", { class: "btn ghost sm", style: "color:var(--danger,#f87171)", title: "Delete this page", onclick: () => deletePage(it) }, icon("trash-2", "icon-sm"), "Delete"));
   }
   // metadata strip from the page preview (created / section / notebook / tags / link)
@@ -4210,7 +4552,7 @@ function renderNoteReader(it) {
 }
 // #568: live OneNote write — create page (section picker) / delete / best-effort append, cap-gated
 async function openComposePage(presetSection) {
-  if (!CAP.onenotewrite) return;
+  if (!CAP.onenotewrite || !CAP.mutationIntent) return;
   const sections = Note.items.filter(it => it.item_type === "section");
   if (!sections.length) { toast("No section available — back up a notebook first", "err"); return; }
   const field = (label, input) => el("label", { class: "cmp-field" }, el("span", { class: "cmp-label", text: label }), input);
@@ -4233,14 +4575,16 @@ async function composePageSubmit(btn) {
   if (!title) { toast("Add a title", "err"); return; }
   btn.disabled = true;
   try {
-    await post("/api/v1/onenote/create?" + qs({ account: App.account, section, title, body: v("cpage-body") }), CAP.onenotewrite);
+    await stageMutation("onenote_body", {
+      account: App.account, operation: "create", section_or_page: section, title,
+    }, new TextEncoder().encode(v("cpage-body")));
     toast("Page created"); closeSheet(); noteReload();
   } catch (e) { toast("Failed: " + e.message, "err"); btn.disabled = false; }
 }
 async function deletePage(it) {
   if (!confirmDestructive("Delete this page from your Microsoft 365 account?")) return;
   try {
-    await post("/api/v1/onenote/delete?" + qs({ account: App.account, id: it.remote_id }), CAP.onenotewrite);
+    await postJson("/api/v1/onenote/delete", CAP.onenotewrite, { request_id: crypto.randomUUID(), account: App.account, id: it.remote_id });
     toast("Page deleted"); Note.selected = null; renderNoteReader(null); noteReload();
   } catch (e) { toast("Failed: " + e.message, "err"); }
 }
@@ -4259,7 +4603,9 @@ function appendPage(it) {
     if (!text) { ta.focus(); return; }
     btn.disabled = true; status.textContent = "Appending…";
     try {
-      await post("/api/v1/onenote/append?" + qs({ account: App.account, id: it.remote_id, text }), CAP.onenotewrite);
+      await stageMutation("onenote_body", {
+        account: App.account, operation: "append", section_or_page: it.remote_id, title: "",
+      }, new TextEncoder().encode(text));
       toast("Appended — OneNote may take a moment to reflect it");
       panel.remove();
     } catch (e) { status.textContent = ""; btn.disabled = false; toast("Append failed: " + e.message, "err"); }
@@ -4341,7 +4687,7 @@ async function doSearch(q) {
     const groups = {};
     hits.forEach(h => (groups[h.service] = groups[h.service] || []).push(h));
     box.append(el("div", { class: "dim", style: "margin-bottom:12px", text: `${hits.length} result${hits.length === 1 ? "" : "s"} for “${q}”` }));
-    SERVICES.forEach(s => {
+    archiveServices().forEach(s => {
       const g = groups[s.id]; if (!g || !g.length) return;
       box.append(el("h3", { class: "sb-section", style: "display:flex;align-items:center;gap:8px" }, icon(s.icon, "icon-sm"), `${s.label} (${g.length})`));
       const list = el("div", { class: "card", style: "padding:0;overflow:hidden;margin-bottom:16px" });
@@ -4379,11 +4725,11 @@ async function renderSettingsView(view) {
     const acctCard = el("div", { class: "card" }, el("h3", { class: "sb-section", text: "Account" }),
       kvList([["User", acc.username || App.account], ["Sync root", acc.sync_root], ["Archive root", acc.archive_root], ["Mount point", acc.mount_point || "—"]]));
     // The sidebar account chip (which opens sign-in / reconnect) is hidden in the phone
-    // bottom-nav layout, so surface the same device-code account menu here too —
+    // bottom-nav layout, so surface the same Microsoft account menu here too —
     // Settings is reachable on mobile. Without this a standalone phone (#89) would have
     // no way to sign in. Shown whenever account-auth is wired (mobile live + daemon).
     if (CAP.account) acctCard.append(el("button", { class: "btn", style: "margin-top:12px", onclick: openAccountSwitcher },
-      icon("rotate-ccw", "icon-sm"), "Sign in / reconnect account"));
+      icon("rotate-ccw", "icon-sm"), "Choose Microsoft account"));
     body.append(acctCard);
     // Diagnostics: a live perf overlay flag (CPU/RAM/disk-IO of the whole app process).
     const perfLbl = el("span", { text: localStorage.getItem("isy_perf") === "1" ? "Hide performance overlay" : "Show performance overlay" });
@@ -4408,7 +4754,7 @@ async function renderSettingsView(view) {
         oninput: (e) => { const s = POLL_STEPS[+e.target.value]; valLabel.textContent = pollLabel(s); setWarn(s); },
         onchange: async (e) => {
           const s = POLL_STEPS[+e.target.value];
-          try { await post("/api/v1/settings?" + qs({ poll_interval_secs: s }), CAP.settings); toast("Live-update interval: " + pollLabel(s)); }
+          try { await postJson("/api/v1/settings", CAP.settings, { request_id: crypto.randomUUID(), poll_interval_secs: s }); toast("Live-update interval: " + pollLabel(s)); }
           catch (err) { toast("Could not save interval: " + err.message, "err"); }
         },
       });
@@ -4431,23 +4777,63 @@ async function renderSettingsView(view) {
 async function doRestore(it, btn) {
   if (!confirm(`Restore this ${it.service} item to the cloud as a new copy?`)) return;
   btn.disabled = true;
-  try { const d = await post("/api/v1/restore?" + qs({ account: App.account, service: it.service, id: it.remote_id }), CAP.restore); toast(`Restored (new id ${String(d.new_id).slice(0, 8)}…)`); }
+  try {
+    const d = await postJson("/api/v1/restore", CAP.restore, { request_id: crypto.randomUUID(), account: App.account, service: it.service, id: it.remote_id });
+    if (isReplayedRequest(d)) {
+      toast("Restore request completed");
+    } else if (d.queued) {
+      toast(`Restore queued (${String(d.job_id || "job").slice(0, 12)}…)`);
+    } else {
+      toast(`Restored (new id ${String(d.new_id || "").slice(0, 8)}…)`);
+    }
+  }
   catch (e) { toast("Restore failed: " + e.message, "err"); } finally { btn.disabled = false; }
 }
 async function doShare(it, btn) {
   btn.disabled = true;
   try {
-    const d = await post("/api/v1/share?" + qs({ account: App.account, service: it.service, id: it.remote_id, type: "view", scope: "anonymous" }), CAP.share);
+    const d = await postJson("/api/v1/share", CAP.share, { request_id: crypto.randomUUID(), account: App.account, service: it.service, id: it.remote_id, type: "view", scope: "anonymous" });
     if (d.webUrl) { try { await navigator.clipboard.writeText(d.webUrl); } catch {} toast("Share link copied to clipboard"); }
   } catch (e) { toast("Share failed: " + e.message, "err"); } finally { btn.disabled = false; }
 }
 
 /* ---------------------------------------------------------------- account switcher */
 // Account menu (#68): switch between configured accounts, sign out (clear the
-// cached token), and sign in / reconnect via the device-code flow (cap-gated).
-let accountMenu = null, accountMenuPoll = null;
+// cached token), and sign in / reconnect through Microsoft's account picker (cap-gated).
+let accountMenu = null, accountMenuPoll = null, accountMenuLogin = null;
+let accountMenuCancelPromise = Promise.resolve(true);
+const ACCOUNT_LOGIN_GUARDS = new Map();
+async function finishAccountLoginGuard(loginId) {
+  const guardId = ACCOUNT_LOGIN_GUARDS.get(loginId);
+  ACCOUNT_LOGIN_GUARDS.delete(loginId);
+  await endNetworkGuard(guardId);
+}
+async function cancelAccountLogin(loginId = accountMenuLogin) {
+  if (!loginId || !CAP.account) return true;
+  try {
+    const result = await postJson("/api/v1/account/login/cancel", CAP.account, {
+      request_id: crypto.randomUUID(),
+      id: loginId,
+    });
+    if ((result && result.cancelled === true) || isReplayedRequest(result)) {
+      if (accountMenuLogin === loginId) accountMenuLogin = null;
+      await finishAccountLoginGuard(loginId);
+      return true;
+    }
+  } catch (_) {}
+  return false;
+}
+function queueAccountLoginCancel() {
+  const loginId = accountMenuLogin;
+  if (!loginId) return accountMenuCancelPromise;
+  accountMenuCancelPromise = accountMenuCancelPromise
+    .catch(() => false)
+    .then(() => cancelAccountLogin(loginId));
+  return accountMenuCancelPromise;
+}
 function closeAccountMenu() {
   if (accountMenuPoll) { clearInterval(accountMenuPoll); accountMenuPoll = null; }
+  void queueAccountLoginCancel();
   if (accountMenu) { accountMenu.remove(); accountMenu = null; }
 }
 function openAccountSwitcher() {
@@ -4464,9 +4850,16 @@ function openAccountSwitcher() {
 // to the system browser. Mobile uses typed native bridge ops; desktop keeps browser
 // navigation. The engine completes the callback/token exchange and the UI polls status.
 function openDesktopExternal(url, newTab) {
-  if (newTab && typeof window !== "undefined" && window.open) {
-    const w = window.open(url, "_blank", "noopener");
-    if (w) return;
+  if (newTab && typeof document !== "undefined") {
+    const link = document.createElement("a");
+    link.href = url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.style.display = "none";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    return;
   }
   location.href = url;
 }
@@ -4478,10 +4871,81 @@ async function openExternalAuth(url, kind, opts) {
   }
   openDesktopExternal(url, !!(opts && opts.newTab));
 }
-async function beginNetworkGuard() {
+async function beginNetworkGuard(reason) {
   if (!BRIDGE) return null;
-  const d = await nativeCall("beginNetworkGuard", {}, NATIVE_TIMEOUT_MS);
+  const d = await nativeCall("beginNetworkGuard", { reason }, NATIVE_TIMEOUT_MS);
   return d && d.guard_id ? d.guard_id : null;
+}
+async function captureNetworkSnapshot(guardId) {
+  if (!BRIDGE || !guardId) return null;
+  const d = await nativeCall("captureNetworkSnapshot", { guard_id: guardId }, NATIVE_TIMEOUT_MS);
+  return d && d.snapshot_id ? d.snapshot_id : null;
+}
+async function runConnectivityPreflight(provider, purpose, guardId) {
+  const body = { request_id: crypto.randomUUID(), provider, purpose };
+  if (BRIDGE) {
+    const snapshotId = await captureNetworkSnapshot(guardId);
+    if (!snapshotId) throw new Error("network_guard_unavailable");
+    body.snapshot_id = snapshotId;
+  }
+  const result = await postJson("/api/v1/agent/connectivity/preflight", CAP.agent, body);
+  if (!result || result.status !== "ready") {
+    const error = new Error((result && result.code) || "connectivity_unavailable");
+    error.connectivity = result || null;
+    throw error;
+  }
+  clearConnectivityIssue();
+  return result;
+}
+const CONNECTIVITY_COPY = {
+  no_validated_network: "Connect to the internet, then try again.",
+  restricted_metered_background: "Allow background data for iSyncYou, then try again.",
+  foreground_guard_unavailable: "iSyncYou could not keep this network action active.",
+  connect_failed: "The provider could not be reached.",
+  connect_timed_out: "The provider took too long to respond.",
+  tls_failed: "A secure connection to the provider could not be established.",
+  http_failed: "The provider is temporarily unavailable.",
+  name_resolution_failed: "The provider address could not be resolved.",
+  connectivity_unavailable: "Connectivity could not be verified.",
+};
+function rememberConnectivityIssue(error, retry) {
+  const d = error && error.connectivity;
+  const code = d && CONNECTIVITY_COPY[d.code] ? d.code : "connectivity_unavailable";
+  AssistantState.connectivityIssue = {
+    code,
+    retryable: !!(d && d.retryable),
+    settings_hint: d && d.settings_hint ? d.settings_hint : "none",
+    retry: typeof retry === "function" ? retry : null,
+  };
+}
+function clearConnectivityIssue() {
+  AssistantState.connectivityIssue = null;
+}
+async function openConnectivitySettings(hint) {
+  const allowed = ["internet_panel", "background_data", "app_details", "battery_settings"];
+  if (!BRIDGE || !allowed.includes(hint)) return;
+  try { await nativeCall("openNetworkSettings", { hint }, NATIVE_TIMEOUT_MS); }
+  catch (_) { toast("Settings are unavailable", "err"); }
+}
+function renderConnectivityDiagnostic() {
+  const issue = AssistantState.connectivityIssue;
+  if (!issue) return null;
+  const actions = [];
+  if (issue.retryable && issue.retry) {
+    actions.push(el("button", { class: "btn sm", type: "button", onclick: async () => {
+      const retry = issue.retry;
+      clearConnectivityIssue();
+      await retry();
+    }, "data-agent-connectivity-retry": "1" }, icon("refresh-cw", "icon-sm"), "Retry"));
+  }
+  if (BRIDGE && issue.settings_hint !== "none") {
+    actions.push(el("button", { class: "btn ghost sm", type: "button", onclick: () => openConnectivitySettings(issue.settings_hint), "data-agent-connectivity-settings": issue.settings_hint }, icon("settings", "icon-sm"), "Settings"));
+  }
+  return el("div", { class: "assistant-consent", "data-agent-connectivity": issue.code },
+    el("div", { class: "assistant-consent-text" },
+      el("b", { text: "Connection needs attention" }),
+      el("p", { class: "dim", text: CONNECTIVITY_COPY[issue.code] })),
+    actions.length ? el("div", { class: "assistant-consent-actions" }, actions) : null);
 }
 async function endNetworkGuard(guardId) {
   if (!BRIDGE || !guardId) return;
@@ -4490,6 +4954,8 @@ async function endNetworkGuard(guardId) {
 
 let AGENT_GUARD_ID = null;
 let CODEX_GUARD_ID = null;
+const TURN_GUARDS = new Map();
+const OAUTH_ATTEMPTS = new Map();
 async function finishAgentGuard() {
   const id = AGENT_GUARD_ID;
   AGENT_GUARD_ID = null;
@@ -4500,34 +4966,394 @@ async function finishCodexGuard() {
   CODEX_GUARD_ID = null;
   await endNetworkGuard(id);
 }
+async function finishOAuthGuard(provider) {
+  if (provider === "codex") await finishCodexGuard();
+  else await finishAgentGuard();
+}
+async function cancelOAuthAttempt(provider) {
+  const attemptId = OAUTH_ATTEMPTS.get(provider);
+  OAUTH_ATTEMPTS.delete(provider);
+  if (!attemptId) return;
+  try {
+    await postJson("/api/v1/agent/oauth/cancel", CAP.agent, {
+      request_id: crypto.randomUUID(),
+      provider,
+      attempt_id: attemptId,
+    });
+  } catch (_) {}
+}
+async function finishTurnGuard(turnId) {
+  const guardId = TURN_GUARDS.get(turnId);
+  TURN_GUARDS.delete(turnId);
+  await endNetworkGuard(guardId);
+}
+
+function agentCredentialState(st, provider) {
+  const states = st && st.credential_state;
+  return states && typeof states === "object" ? states[provider] : "";
+}
+
+function accountLifecycleNode(st, provider) {
+  const lifecycle = st && st.account_lifecycle;
+  const node = lifecycle && lifecycle[provider];
+  return node && typeof node === "object" ? node : null;
+}
+
+function lifecycleRequestId(key) {
+  const existing = AssistantState.lifecycleRequestIds.get(key);
+  if (existing) return existing;
+  const requestId = crypto.randomUUID();
+  AssistantState.lifecycleRequestIds.set(key, requestId);
+  return requestId;
+}
+
+function clearLifecycleRequestId(key) {
+  AssistantState.lifecycleRequestIds.delete(key);
+}
+
+function lifecycleProviderName(provider) {
+  return provider === "codex" ? "ChatGPT" : "Claude";
+}
+
+function lifecycleStateLabel(node) {
+  const labels = {
+    connected: "Connected",
+    reconnect_required: "Reconnect required",
+    revoke_unknown: "Revocation needs retry",
+    cleanup_pending: "Cleanup needs resume",
+    candidate_cleanup: "New sign-in needs cleanup",
+    exchange_outcome_unknown: "Sign-in outcome unknown",
+    awaiting_oauth_login: "Ready for sign-in",
+    disconnected: "Disconnected",
+    busy: "Account change in progress",
+    unavailable: "Lifecycle unavailable",
+  };
+  return labels[(node && node.state) || ""] || "Account status unavailable";
+}
+
+function confirmAccountLifecycle(provider, mode, scope, ackRequired) {
+  return new Promise((resolve) => {
+    const providerName = lifecycleProviderName(provider);
+    const action = mode === "disconnect" ? "Disconnect" : mode === "switch" ? "Switch" : "Reconnect";
+    const overlay = el("div", { class: "assistant-lifecycle-dialog-wrap", role: "presentation" });
+    const scrim = el("div", { class: "scrim" });
+    const ack = ackRequired ? el("input", { type: "checkbox", "data-agent-lifecycle-full-grant-ack": "1" }) : null;
+    const confirmButton = el("button", {
+      class: "btn primary",
+      type: "button",
+      disabled: ackRequired ? "disabled" : null,
+      "data-agent-lifecycle-confirm": mode,
+    }, action);
+    const close = (value) => { overlay.remove(); resolve(value); };
+    if (ack) ack.onchange = () => { confirmButton.disabled = !ack.checked; };
+    confirmButton.onclick = () => close({ acknowledgeFullGrant: !!(ack && ack.checked) });
+    scrim.onclick = () => close(null);
+    const scopeCopy = scope === "full_grant"
+      ? "This provider reports a shared grant. Revoking it may sign out other clients that use the same grant."
+      : scope === "guaranteed_token_session"
+        ? "The provider guarantees that revocation is limited to this app token session."
+        : scope === "observed_token_session"
+          ? "iSyncYou sends this app's token for revocation. The provider does not guarantee that the effect is limited to only this session."
+          : "The provider has not guaranteed the exact revocation scope.";
+    const panel = el("section", {
+      class: "assistant-lifecycle-dialog",
+      role: "dialog",
+      "aria-modal": "true",
+      "aria-label": `${action} ${providerName}`,
+      "data-agent-lifecycle-dialog": mode,
+    },
+    el("h2", { text: `${action} ${providerName}?` }),
+    el("p", { text: mode === "disconnect"
+      ? "iSyncYou will revoke its provider token before removing the local account state."
+      : mode === "switch"
+        ? "iSyncYou will revoke and remove the current account before opening a fresh sign-in."
+        : "iSyncYou will revoke and remove the current credential before reconnecting." }),
+    el("p", { class: "dim", text: scopeCopy }),
+    ack ? el("label", { class: "assistant-lifecycle-ack" }, ack, el("span", { text: "I understand that other clients may be signed out." })) : null,
+    el("div", { class: "assistant-lifecycle-dialog-actions" },
+      el("button", { class: "btn ghost", type: "button", onclick: () => close(null) }, "Cancel"),
+      confirmButton));
+    overlay.append(scrim, panel);
+    document.body.append(overlay);
+    confirmButton.focus();
+  });
+}
+
+async function withCredentialRevokeGuard(provider, operation) {
+  let guardId = null;
+  let operationStarted = false;
+  let releaseGuard = true;
+  try {
+    guardId = await beginNetworkGuard("credential_revoke");
+    if (BRIDGE && !guardId) throw new Error("network_guard_unavailable");
+    await runConnectivityPreflight(provider, "credential_revoke", guardId);
+    operationStarted = true;
+    return await operation();
+  } catch (error) {
+    if (operationStarted && error && error.responseReceived !== true) {
+      releaseGuard = false;
+    }
+    throw error;
+  } finally {
+    if (releaseGuard) await endNetworkGuard(guardId);
+  }
+}
+
+function lifecycleResumeAction(node) {
+  if (!node) return null;
+  if (node.state === "revoke_unknown" || node.state === "candidate_cleanup") return "retry_revoke";
+  if (node.state === "cleanup_pending") return "resume_cleanup";
+  if (node.state === "exchange_outcome_unknown") return "retry_exchange";
+  return null;
+}
+
+async function runLifecycleResume(provider, node, explicitAction) {
+  const action = explicitAction || lifecycleResumeAction(node);
+  const operationId = node && node.resume_operation_id;
+  const operationEtag = node && node.operation_etag;
+  if (!action || !operationId || !operationEtag) {
+    toast("Account recovery is unavailable", "err");
+    return null;
+  }
+  const key = `lifecycle-resume:${provider}:${operationId}:${action}`;
+  try {
+    const result = await withCredentialRevokeGuard(provider, () => postJson(
+      "/api/v1/agent/oauth/lifecycle/resume",
+      CAP.agent,
+      {
+        provider,
+        request_id: lifecycleRequestId(key),
+        operation_id: operationId,
+        operation_etag: operationEtag,
+        action,
+      },
+    ));
+    clearLifecycleRequestId(key);
+    return result;
+  } catch (error) {
+    if (error && error.connectivity) rememberConnectivityIssue(error, () => runLifecycleResume(provider, node, action));
+    else toast("Account recovery could not continue", "err");
+    return null;
+  }
+}
+
+async function startAccountLifecycle(provider, mode, node) {
+  if (!node || !node.credential_etag || node.busy) return;
+  const confirmation = await confirmAccountLifecycle(
+    provider,
+    mode,
+    node.revoke_scope_guarantee || "unknown",
+    node.ack_required === true,
+  );
+  if (!confirmation) return;
+  const key = `lifecycle-start:${provider}:${mode}:${node.credential_etag}`;
+  try {
+    const result = await withCredentialRevokeGuard(provider, () => postJson(
+      "/api/v1/agent/oauth/logout",
+      CAP.agent,
+      {
+        provider,
+        mode,
+        request_id: lifecycleRequestId(key),
+        credential_etag: node.credential_etag,
+        resume: null,
+        acknowledge_full_grant: confirmation.acknowledgeFullGrant,
+      },
+    ));
+    clearLifecycleRequestId(key);
+    if (result && result.state === "awaiting_oauth_login" && (mode === "reconnect" || mode === "switch")) {
+      await startAiLogin(provider, result.operation_id);
+      return;
+    }
+    if (mode === "disconnect" && result && result.state === "disconnected") {
+      AssistantState.lastUsage = null;
+      toast(`${lifecycleProviderName(provider)} disconnected`);
+    }
+    await renderAssistantView($("#view"));
+  } catch (error) {
+    if (error && error.connectivity) rememberConnectivityIssue(error, () => startAccountLifecycle(provider, mode, node));
+    else toast("Account change could not be completed", "err");
+    await renderAssistantView($("#view"));
+  }
+}
+
+async function continueLifecycleOAuth(provider, node) {
+  if (!node || node.state !== "awaiting_oauth_login" || !node.resume_operation_id) return;
+  await startAiLogin(provider, node.resume_operation_id);
+}
+
+async function resumeAccountLifecycle(provider, node, action) {
+  const result = await runLifecycleResume(provider, node, action);
+  if (!result) {
+    await renderAssistantView($("#view"));
+    return false;
+  }
+  if (result.state === "awaiting_oauth_login" && (result.mode === "reconnect" || result.mode === "switch")) {
+    await startAiLogin(provider, result.operation_id);
+    return true;
+  }
+  if (result.code === "same_account_selected") toast("The same account was selected; the account was not switched.", "err");
+  await renderAssistantView($("#view"));
+  return true;
+}
+
+async function handleCandidateCleanupStatus(status, provider) {
+  const node = accountLifecycleNode(status, provider);
+  if (!node || node.state !== "candidate_cleanup") return false;
+  const operationId = node.resume_operation_id;
+  if (!operationId || AssistantState.lifecycleAutoResume.has(operationId)) return true;
+  AssistantState.lifecycleAutoResume.add(operationId);
+  OAUTH_ATTEMPTS.delete(provider);
+  await finishOAuthGuard(provider);
+  toast(node.mode === "switch" ? "The selected account could not be activated. Cleaning up the new sign-in." : "The new sign-in could not be activated. Cleaning it up.", "err");
+  try {
+    // The callback can briefly retain its exclusive activation lease after publishing this
+    // state. Returning false keeps the status poll alive for an idempotent guarded retry.
+    return await resumeAccountLifecycle(provider, node, "retry_revoke");
+  } finally {
+    AssistantState.lifecycleAutoResume.delete(operationId);
+  }
+}
+
+function lifecycleActionButton(label, iconName, attrs, handler, disabled) {
+  return el("button", {
+    class: "btn ghost sm",
+    type: "button",
+    disabled: disabled ? "disabled" : null,
+    onclick: disabled ? null : handler,
+    ...attrs,
+  }, icon(iconName, "icon-sm"), label);
+}
+
+function renderAssistantLifecycleControls(st) {
+  const rows = ["claude", "codex"].map((provider) => {
+    const node = accountLifecycleNode(st, provider);
+    if (!node || node.state === "disconnected") return null;
+    const actions = [];
+    const resumeAction = lifecycleResumeAction(node);
+    if (resumeAction) {
+      const label = resumeAction === "retry_revoke" ? "Retry revoke"
+        : resumeAction === "resume_cleanup" ? "Resume cleanup" : "Retry exchange";
+      actions.push(lifecycleActionButton(label, "refresh-cw", {
+        "data-agent-lifecycle-resume": resumeAction,
+        "data-agent-lifecycle-provider": provider,
+      }, () => resumeAccountLifecycle(provider, node, resumeAction), false));
+    } else if (node.credential_etag) {
+      actions.push(lifecycleActionButton(`Disconnect ${lifecycleProviderName(provider)}`, "log-out", {
+        "data-agent-lifecycle-action": "disconnect",
+        "data-agent-lifecycle-provider": provider,
+      }, () => startAccountLifecycle(provider, "disconnect", node), node.busy));
+      actions.push(lifecycleActionButton(`Reconnect ${lifecycleProviderName(provider)}`, "refresh-cw", {
+        "data-agent-lifecycle-action": "reconnect",
+        "data-agent-lifecycle-provider": provider,
+      }, () => startAccountLifecycle(provider, "reconnect", node), node.busy));
+      if (node.switch_capability === "verified_subject") {
+        actions.push(lifecycleActionButton(`Switch ${lifecycleProviderName(provider)} account`, "users", {
+          "data-agent-lifecycle-action": "switch",
+          "data-agent-lifecycle-provider": provider,
+        }, () => startAccountLifecycle(provider, "switch", node), node.busy));
+      }
+    }
+    return el("div", {
+      class: "assistant-lifecycle-row",
+      "data-agent-lifecycle-provider": provider,
+      "data-agent-lifecycle-state": node.state,
+      "data-agent-switch-capability": node.switch_capability || "unavailable",
+    },
+    el("div", { class: "assistant-lifecycle-summary" },
+      el("b", { text: lifecycleProviderName(provider) }),
+      el("span", { class: "dim", text: lifecycleStateLabel(node) }),
+      node.switch_capability === "unavailable" && node.state !== "disconnected"
+        ? el("span", { class: "dim assistant-lifecycle-capability", text: "Account switching unavailable" }) : null),
+    el("div", { class: "assistant-lifecycle-actions" }, ...actions));
+  }).filter(Boolean);
+  if (!rows.length) return null;
+  return el("section", { class: "assistant-lifecycle", "data-agent-lifecycle-controls": "1" }, ...rows);
+}
+
+async function refreshAssistantCredentialIfRequired(st) {
+  const provider = agentActiveProvider(st);
+  if (!provider) return st;
+  if (agentCredentialState(st, provider) !== "refresh_required") return st;
+  let guardId = null;
+  try {
+    guardId = await beginNetworkGuard("credential_refresh");
+    if (BRIDGE && !guardId) throw new Error("network_guard_unavailable");
+    await runConnectivityPreflight(provider, "refresh", guardId);
+    await postJson("/api/v1/agent/credential/refresh", CAP.agent, {
+      request_id: crypto.randomUUID(),
+      provider,
+    });
+    return await api("/api/v1/agent/status");
+  } catch (error) {
+    if (error && error.connectivity) {
+      rememberConnectivityIssue(error, () => renderAssistantView($("#view")));
+      return st;
+    }
+    return await api("/api/v1/agent/status").catch(() => st);
+  } finally {
+    await endNetworkGuard(guardId);
+  }
+}
+
 function localCallbackRedirect(host) {
   return location.port ? `http://${host}:${location.port}/callback` : "";
 }
 
-async function startAiLogin(provider) {
+async function startAiLogin(provider, lifecycleOperationId) {
+  const consentProvider = agentProviderConsentId(provider);
+  if (!agentPrivacyConsentAccepted(consentProvider)) {
+    toast("Review privacy consent for " + agentProviderLabel(consentProvider), "err");
+    renderAssistantView($("#view"));
+    return;
+  }
   let guardId = null;
   try {
-    const params = { provider };
+    guardId = await beginNetworkGuard("oauth");
+    if (BRIDGE && !guardId) throw new Error("network_guard_unavailable");
+    if (provider === "codex") CODEX_GUARD_ID = guardId;
+    else AGENT_GUARD_ID = guardId;
+    await runConnectivityPreflight(provider, "oauth_start", guardId);
     const redirect = localCallbackRedirect("localhost");
-    if (redirect) params.redirect = redirect;
-    const d = await post("/api/v1/agent/oauth/start?" + qs(params), CAP.agent);
-    if (!d || !d.authorize_url) { toast("Could not start sign-in"); return; }
-    showWaitingStep();               // waiting UI + poll; completes when /callback fires
+    const manualCodeFlow = provider === "claude" && !redirect;
+    const requestKey = `oauth-start:${provider}:${lifecycleOperationId || "connect"}`;
+    const requestId = lifecycleRequestId(requestKey);
+    const d = await postJson("/api/v1/agent/oauth/start", CAP.agent, {
+      provider,
+      request_id: requestId,
+      lifecycle_operation_id: lifecycleOperationId || null,
+    });
+    // Remember a server-created attempt before validating the rest of the response so the
+    // common failure path can cancel it. Never return from here with the FGS lease live.
+    if (d && d.attempt_id) OAUTH_ATTEMPTS.set(provider, d.attempt_id);
+    if (!d || !d.authorize_url || !d.attempt_id) {
+      throw new Error("oauth_start_invalid_response");
+    }
+    clearLifecycleRequestId(requestKey);
+    if (manualCodeFlow) showCodeStep();
+    else showWaitingStep(provider);  // waiting UI + poll; completes when /callback fires
     toast("Opening sign-in in your browser…");
-    guardId = await beginNetworkGuard();
-    AGENT_GUARD_ID = guardId;
     await openExternalAuth(d.authorize_url, "agent_authorize");
   } catch (e) {
+    await cancelOAuthAttempt(provider);
     if (guardId) await endNetworkGuard(guardId);
     if (AGENT_GUARD_ID === guardId) AGENT_GUARD_ID = null;
-    toast("Sign-in unavailable: " + (e.message || e));
+    if (CODEX_GUARD_ID === guardId) CODEX_GUARD_ID = null;
+    if (e && e.connectivity) {
+      rememberConnectivityIssue(e, () => startAiLogin(provider, lifecycleOperationId));
+      renderAssistantView($("#view"));
+    } else {
+      toast("Sign-in unavailable", "err");
+    }
   }
 }
 
 // After the browser login the engine's /callback stores the token; poll status until
 // connected, then switch to the chat.
+const AGENT_OAUTH_POLL_INTERVAL_MS = 2_000;
+const AGENT_OAUTH_POLL_LIMIT = 240; // Match the host's eight-minute OAuth attempt window.
 let AGENT_POLL_ON = false;
-function showWaitingStep() {
+function showWaitingStep(provider) {
   const card = document.getElementById("asst-connect-card");
   if (card) {
     clear(card).append(
@@ -4537,30 +5363,62 @@ function showWaitingStep() {
       el("div", { class: "skel", style: "height:8px;width:60%;margin:0 auto;border-radius:4px" }),
     );
   }
-  if (!AGENT_POLL_ON) { AGENT_POLL_ON = true; pollAgentStatus(0); }
+  if (!AGENT_POLL_ON) { AGENT_POLL_ON = true; pollAgentStatus(0, provider); }
 }
-async function pollAgentStatus(n) {
-  if (App.route !== "assistant") { AGENT_POLL_ON = false; await finishAgentGuard(); return; }
+async function pollAgentStatus(n, provider) {
+  if (App.route !== "assistant") {
+    AGENT_POLL_ON = false;
+    await cancelOAuthAttempt(provider);
+    await finishOAuthGuard(provider);
+    return;
+  }
   try {
     const s = await api("/api/v1/agent/status");
-    if (s && s.connected) { AGENT_POLL_ON = false; await finishAgentGuard(); toast("Connected!"); renderAssistantView($("#view")); return; }
+    if (await handleCandidateCleanupStatus(s, provider)) {
+      AGENT_POLL_ON = false;
+      return;
+    }
+    const connected = assistantProviderReady(s, provider);
+    if (connected) {
+      AGENT_POLL_ON = false;
+      OAUTH_ATTEMPTS.delete(provider);
+      await finishOAuthGuard(provider);
+      toast("Connected!");
+      renderAssistantView($("#view"));
+      return;
+    }
   } catch (_) {}
-  if (n < 90) { setTimeout(() => pollAgentStatus(n + 1), 2000); }
-  else { AGENT_POLL_ON = false; await finishAgentGuard(); }
+  if (n < AGENT_OAUTH_POLL_LIMIT) {
+    setTimeout(() => pollAgentStatus(n + 1, provider), AGENT_OAUTH_POLL_INTERVAL_MS);
+  }
+  else {
+    AGENT_POLL_ON = false;
+    await cancelOAuthAttempt(provider);
+    await finishOAuthGuard(provider);
+  }
 }
 
 // Swap the connect card to the "paste your code" step.
 function showCodeStep() {
-  const card = document.getElementById("asst-connect-card");
-  if (!card) return;
+  let card = document.getElementById("asst-connect-card");
+  if (!card) {
+    const body = document.getElementById("asst-body");
+    if (!body) return;
+    card = el("div", {
+      id: "asst-connect-card",
+      class: "assistant-setup",
+      "data-agent-oauth-code-step": "claude",
+    });
+    body.prepend(card);
+  }
   clear(card).append(
     el("div", { style: "width:64px;height:64px;border-radius:18px;margin:0 auto 1.1rem;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#6366f1,#a371f7);color:#fff" }, icon("sparkles")),
     el("h2", { style: "margin:.3rem 0 .5rem", text: "Paste your code" }),
     el("p", { class: "dim", style: "line-height:1.55;margin:0 auto 1.3rem;max-width:27rem", text: "After you approve in the browser, copy the code it shows and paste it here to finish connecting." }),
-    el("input", { id: "asst-code", class: "input", placeholder: "Paste the code…", style: "max-width:24rem;margin:0 auto .8rem;display:block;width:100%", onkeydown: (e) => { if (e.key === "Enter") completeAiLogin(); } }),
+    el("input", { id: "asst-code", type: "password", autocomplete: "off", spellcheck: "false", class: "input", placeholder: "Paste the code…", style: "max-width:24rem;margin:0 auto .8rem;display:block;width:100%", onkeydown: (e) => { if (e.key === "Enter") completeAiLogin(); } }),
     el("div", { style: "display:flex;gap:.6rem;justify-content:center" },
       el("button", { class: "btn primary", onclick: completeAiLogin }, "Finish connecting"),
-      el("button", { class: "btn", onclick: () => renderAssistantView($("#view")) }, "Cancel"),
+      el("button", { class: "btn", onclick: async () => { await cancelOAuthAttempt("claude"); await finishAgentGuard(); renderAssistantView($("#view")); } }, "Cancel"),
     ),
   );
 }
@@ -4569,72 +5427,524 @@ async function completeAiLogin() {
   const inp = document.getElementById("asst-code");
   const code = inp && inp.value.trim();
   if (!code) { toast("Paste the code first"); return; }
+  const attemptId = OAUTH_ATTEMPTS.get("claude");
+  if (!attemptId) { toast("Start sign-in again.", "err"); return; }
+  // #639 T10: the pasted code crosses the boundary only in this strict-JSON body — never a URL/query
+  // param, never persisted. Clear the input immediately so it does not linger in the DOM.
+  if (inp) inp.value = "";
   try {
-    await post("/api/v1/agent/oauth/complete?" + qs({ code }), CAP.agent);
-    toast("Connected!");
-    renderAssistantView($("#view"));   // re-fetch status -> switches to chat
+    await postJson("/api/v1/agent/oauth/complete", CAP.agent, {
+      request_id: crypto.randomUUID(),
+      provider: "claude",
+      attempt_id: attemptId,
+      pasted_code: code,
+    });
+    OAUTH_ATTEMPTS.delete("claude");
+    await finishAgentGuard();
+    const status = await api("/api/v1/agent/status");
+    if (!(await handleCandidateCleanupStatus(status, "claude"))) {
+      if (assistantProviderReady(status, "claude")) toast("Connected!");
+      else toast("Sign-in needs attention", "err");
+      renderAssistantView($("#view"));
+    }
   } catch (e) {
-    toast("Couldn't connect: " + (e.message || e));
+    await cancelOAuthAttempt("claude");
+    await finishAgentGuard();
+    toast("Couldn't connect. Start sign-in again.", "err");
   }
 }
 
-let AGENT_ES = null;     // the active per-turn token stream (EventSource)
-let ASST_LOG = [];       // in-view transcript: [{role:'user'|'assistant', text, chips:[]}]
+const AssistantState = {
+  status: null,
+  transcript: [],       // [{role:'user'|'assistant', text, chips, stages, results}]
+  activeTurnId: null,
+  activeStream: null,
+  pendingCardsById: new Map(),
+  pendingCardNodesById: new Map(),
+  lastUsage: null,
+  model: null,
+  draft: "",
+  busy: false,
+  turnCancelPending: false,
+  turnStreamReady: false,
+  activeMessage: null,
+  connectivityIssue: null,
+  pendingConnectProvider: null,
+  pendingModelSelection: null,
+  lifecycleRequestIds: new Map(),
+  lifecycleAutoResume: new Set(),
+  selectedSessionId: null,
+  selectedSessionAccount: null,
+  sessionHydratedId: null,
+  sessionHydrationId: null,
+  sessionHydrationPromise: null,
+  sessionHydrationSeq: 0,
+  sessionHistoryRefreshing: false,
+  sessionHydrationError: null,
+};
 
-async function renderAssistantView(view) {
-  clear(view).append(
-    el("h1", { class: "view-title", text: "AI Assistant" }),
-    el("div", { id: "asst-body" }),
-  );
-  const body = $("#asst-body");
-  body.append(el("div", { class: "card", style: "max-width:36rem;margin:1.25rem auto;padding:1.4rem" },
-    el("div", { class: "skel", style: "height:20px;width:50%" })));
-  let st = {};
-  try { st = await api("/api/v1/agent/status"); } catch (_) { st = {}; }
-  clear(body);
-  if (st && st.connected) renderAssistantChat(body, st);
-  else renderAssistantConnect(body);
+function closeAssistantStream(_reason) {
+  const stream = AssistantState.activeStream;
+  const turn = AssistantState.activeTurnId;
+  AssistantState.activeStream = null;
+  AssistantState.activeTurnId = null;
+  AssistantState.activeMessage = null;
+  AssistantState.busy = false;
+  AssistantState.turnCancelPending = false;
+  AssistantState.turnStreamReady = false;
+  if (stream) {
+    try { stream.close(); } catch (_) {}
+  }
+  if (turn) void finishTurnGuard(turn);
+  syncAssistantComposerControls();
 }
 
-// The connect card (shown until an AI account is connected).
-function renderAssistantConnect(body) {
+function rememberAssistantStatus(st) {
+  AssistantState.status = st || {};
+  AssistantState.lastUsage = st && st.usage ? st.usage : null;
+  AssistantState.model = st && (st.provider || st.model)
+    ? { provider: st.provider || "", model: st.model || "" }
+    : null;
+}
+
+function assistantCanUse(st) {
+  return !!CAP.agent && !!App.account && assistantSelectedReady(st);
+}
+
+const AGENT_PRIVACY_CONSENT_KEY = "isy_agent_privacy_consent_v1";
+const AGENT_PRIVACY_CONSENT_VERSION = 2;
+function agentProviderConsentId(provider) {
+  if (provider === "claude") return "claude";
+  if (provider === "codex") return "codex";
+  return null;
+}
+function agentSelectedProvider(st) {
+  const onboardingProvider = st && st.onboarding && st.onboarding.selected_provider;
+  const candidate = onboardingProvider || (st && st.selected_provider);
+  return candidate === "claude" || candidate === "codex" ? candidate : null;
+}
+function agentActiveProvider(st) {
+  return agentSelectedProvider(st);
+}
+function assistantProviderReady(st, provider) {
+  const node = assistantOnboardingFor(st, provider);
+  return !!node && node.state === "ready";
+}
+function assistantSelectedReady(st) {
+  const provider = agentSelectedProvider(st);
+  return !!provider && assistantProviderReady(st, provider);
+}
+function readAgentPrivacyConsent() {
+  const empty = { version: AGENT_PRIVACY_CONSENT_VERSION, providers: {} };
+  try {
+    const stored = JSON.parse(localStorage.getItem(AGENT_PRIVACY_CONSENT_KEY) || "{}") || {};
+    const providers = {};
+    if (stored.version === AGENT_PRIVACY_CONSENT_VERSION && stored.providers && typeof stored.providers === "object") {
+      ["claude", "codex"].forEach((provider) => {
+        const entry = stored.providers[provider];
+        if (entry && entry.accepted === true) {
+          providers[provider] = { accepted: true, timestamp: String(entry.timestamp || "") };
+        }
+      });
+      return { version: AGENT_PRIVACY_CONSENT_VERSION, providers };
+    }
+    // Preserve the previously accepted provider when upgrading the original single-provider record.
+    if (stored.version === 1 && stored.accepted === true && ["claude", "codex"].includes(stored.provider)) {
+      providers[stored.provider] = { accepted: true, timestamp: String(stored.timestamp || "") };
+      return { version: AGENT_PRIVACY_CONSENT_VERSION, providers };
+    }
+    return empty;
+  } catch (_) { return empty; }
+}
+function agentPrivacyConsentAccepted(provider) {
+  const c = readAgentPrivacyConsent();
+  const entry = c.providers && c.providers[agentProviderConsentId(provider)];
+  return c.version === AGENT_PRIVACY_CONSENT_VERSION && !!entry && entry.accepted === true;
+}
+async function acceptAgentPrivacyConsent(provider) {
+  const consentProvider = agentProviderConsentId(provider);
+  if (!consentProvider) return;
+  const current = readAgentPrivacyConsent();
+  const record = {
+    version: AGENT_PRIVACY_CONSENT_VERSION,
+    providers: {
+      ...current.providers,
+      [consentProvider]: { accepted: true, timestamp: new Date().toISOString() },
+    },
+  };
+  try { localStorage.setItem(AGENT_PRIVACY_CONSENT_KEY, JSON.stringify(record)); } catch (_) {}
+  const pendingModel = AssistantState.pendingModelSelection;
+  const resumeModel = pendingModel && pendingModel.provider === consentProvider ? pendingModel : null;
+  const resumeConnect = !resumeModel && AssistantState.pendingConnectProvider === consentProvider;
+  AssistantState.pendingConnectProvider = null;
+  AssistantState.pendingModelSelection = null;
+  await renderAssistantView($("#view"));
+  if (resumeModel) await pickModel(resumeModel.provider, resumeModel.model, resumeModel.reasoning_effort);
+  else if (resumeConnect) await connectAgentProvider(consentProvider);
+}
+function resetAgentPrivacyConsent() {
+  AssistantState.pendingConnectProvider = null;
+  AssistantState.pendingModelSelection = null;
+  try { localStorage.removeItem(AGENT_PRIVACY_CONSENT_KEY); } catch (_) {}
+  renderAssistantView($("#view"));
+}
+
+function renderAssistantConsentPanel(providers) {
+  const ids = (providers || ["claude"]).map(agentProviderConsentId);
+  return el("div", { class: "assistant-consent", "data-agent-consent": "1", "data-testid": "agent-consent" },
+    el("div", { class: "assistant-consent-text" },
+      el("b", { text: "Privacy consent" }),
+      el("p", { class: "dim", text: "The assistant sends selected Microsoft 365 content to the selected provider to answer your question. Continue only if you want that provider to process the selected content." })),
+    el("div", { class: "assistant-consent-actions" },
+      ids.map(provider => {
+        const accepted = agentPrivacyConsentAccepted(provider);
+        return el("button", {
+          class: "btn sm assistant-consent-choice" + (accepted ? " is-accepted" : ""),
+          type: "button",
+          disabled: accepted ? "disabled" : null,
+          onclick: accepted ? null : () => acceptAgentPrivacyConsent(provider),
+          "aria-pressed": accepted ? "true" : "false",
+          "data-agent-consent-accept": provider,
+          "data-agent-consent-state": accepted ? "accepted" : "required",
+        }, icon(accepted ? "check" : "shield-check", "icon-sm"),
+        accepted ? agentProviderLabel(provider) + " allowed" : "Allow " + agentProviderLabel(provider));
+      }),
+      el("button", { class: "btn ghost sm", type: "button", onclick: resetAgentPrivacyConsent, "data-agent-consent-reset": "1" },
+        icon("x", "icon-sm"), "Reset")));
+}
+
+let ASSISTANT_SCROLL_FRAME = 0;
+function scrollAssistantToEnd() {
+  if (ASSISTANT_SCROLL_FRAME) cancelAnimationFrame(ASSISTANT_SCROLL_FRAME);
+  ASSISTANT_SCROLL_FRAME = requestAnimationFrame(() => {
+    ASSISTANT_SCROLL_FRAME = 0;
+    const transcript = $("#asst-log");
+    const view = $("#view");
+    const transcriptScrolls = transcript
+      && getComputedStyle(transcript).overflowY !== "visible"
+      && transcript.scrollHeight > transcript.clientHeight + 1;
+    const scroller = transcriptScrolls ? transcript : view;
+    if (scroller) scroller.scrollTop = scroller.scrollHeight;
+  });
+}
+
+let ASSISTANT_RENDER_SEQUENCE = 0;
+async function renderAssistantView(view) {
+  const renderSequence = ++ASSISTANT_RENDER_SEQUENCE;
+  const previousStatus = AssistantState.status;
+  clear(view).append(
+    el("section", { id: "assistant-view", class: "assistant-view", "data-testid": "assistant-view" },
+      el("h1", { class: "view-title", text: "Assistant" }),
+      el("div", { id: "asst-body", class: "assistant-body" }),
+    ),
+  );
+  const body = $("#asst-body");
+  body.append(el("div", { class: "assistant-loading" },
+    el("div", { class: "skel", style: "height:20px;width:50%" })));
+  let st = {};
+  let statusRefreshFailed = false;
+  try {
+    st = await api("/api/v1/agent/status");
+    st = await refreshAssistantCredentialIfRequired(st);
+  } catch (_) {
+    statusRefreshFailed = true;
+    st = previousStatus && Object.keys(previousStatus).length ? previousStatus : {};
+  }
+  if (renderSequence !== ASSISTANT_RENDER_SEQUENCE || App.route !== "assistant") return;
+  rememberAssistantStatus(st);
+  let selectedSession = null;
+  if (assistantSelectedReady(st)) {
+    try {
+      selectedSession = await loadSelectedAgentSession();
+    } catch (_) {
+      AssistantState.sessionHydrationError = "session_transport_unavailable";
+    }
+  }
+  clear(body);
+  // #639 T7/T10: `connected` is now host-verified per-provider readiness (provider_ready of the
+  // selected provider), so the chat vs. wizard split is driven by host readiness, not credential
+  // presence. The manual code step keys off the in-flight attempt + the per-provider onboarding state.
+  if (assistantSelectedReady(st)) renderAssistantChat(body, st);
+  else renderAssistantWizard(body, st);
+  if (statusRefreshFailed && Object.keys(st).length) {
+    body.prepend(el("div", {
+      class: "assistant-consent",
+      "data-agent-status-unavailable": "1",
+    },
+    el("div", { class: "assistant-consent-text" },
+      el("b", { text: "Status refresh unavailable" }),
+      el("p", { class: "dim", text: "The last verified assistant state is shown." })),
+    el("div", { class: "assistant-consent-actions" },
+      el("button", { class: "btn sm", type: "button", onclick: () => renderAssistantView($("#view")) },
+        icon("refresh-cw", "icon-sm"), "Retry"))));
+  }
+  if (selectedSession && AssistantState.sessionHydratedId !== selectedSession.session_id
+      && !AssistantState.sessionHydrationError) {
+    void hydrateAgentSession(selectedSession.session_id).then(() => {
+      if (App.route === "assistant"
+          && !AssistantState.busy
+          && AssistantState.selectedSessionId === selectedSession.session_id) {
+        void renderAssistantView($("#view"));
+      }
+    }).catch(() => {
+      if (App.route === "assistant"
+          && AssistantState.selectedSessionId === selectedSession.session_id) {
+        void renderAssistantView($("#view"));
+      }
+    });
+  }
+  const claudeReady = assistantProviderReady(st, "claude");
+  if (OAUTH_ATTEMPTS.has("claude") && !claudeReady) showCodeStep();
+}
+
+// #639 T10: the ordered official-sign-in -> custom-harness handoff steps the wizard proves. Keys
+// mirror the host onboarding wire states (status_json.onboarding.providers[p].steps).
+const AGENT_ONBOARDING_STEPS = [
+  ["official_oauth_completed", "Official sign-in"],
+  ["credential_encrypted", "Credential encrypted"],
+  ["retained_envelope_verified", "Provider identity retained"],
+  ["default_harness_removed", "Default assistant removed"],
+  ["m365_profile_activated", "iSyncYou M365 profile activated"],
+  ["isyncyou_tool_connected", "iSyncYou tool connected"],
+  ["subscription_identity_set", "Subscription identity set"],
+  ["ready", "Ready"],
+];
+
+// The per-provider onboarding projection from the host status (never trusts the client).
+function assistantOnboardingFor(st, provider) {
+  const ob = st && st.onboarding;
+  if (!ob || !ob.providers) return null;
+  return ob.providers[provider] || null;
+}
+
+// The provider whose handoff the wizard should surface: the host-selected one, else Claude.
+function assistantWizardProvider(st) {
+  const sel = st && st.onboarding && st.onboarding.selected_provider;
+  return sel === "codex" ? "codex" : "claude";
+}
+
+// The ordered step list, marking each complete from the host projection (condense-not-reorder).
+function renderAssistantWizardSteps(node) {
+  const steps = (node && Array.isArray(node.steps)) ? node.steps : [];
+  const completeByKey = {};
+  steps.forEach((s) => { if (s && s.key) completeByKey[s.key] = s.complete === true; });
+  return el("ol", { class: "assistant-wizard-steps", "data-testid": "agent-wizard-steps", "data-agent-wizard-steps": "1" },
+    AGENT_ONBOARDING_STEPS.map(([key, label], i) => {
+      const done = completeByKey[key] === true;
+      return el("li", {
+        class: "assistant-wizard-step" + (done ? " is-complete" : ""),
+        "data-agent-wizard-step": key,
+        "data-complete": done ? "1" : "0",
+      },
+        el("span", { class: "assistant-wizard-step-num", text: done ? "✓" : String(i + 1) }),
+        el("span", { class: "assistant-wizard-step-label", text: label }));
+    }));
+}
+
+// #639 T10: the state-driven first-run handoff wizard (replaces the old direct-connect card). It
+// reads only the host onboarding projection (per-provider readiness), never st.claude/st.codex.
+function renderAssistantWizard(body, st) {
+  const unavailable = !CAP.agent;
+  const claudeAllowed = agentPrivacyConsentAccepted("claude");
+  const codexAllowed = agentPrivacyConsentAccepted("codex");
+  const wizardProvider = assistantWizardProvider(st);
+  const node = assistantOnboardingFor(st, wizardProvider);
+  const state = node && node.state ? node.state : "not_started";
+  const reconnect = state === "reconnect_required";
+  const hint = unavailable
+    ? "Assistant is not available in this build."
+    : reconnect
+      ? "Your subscription needs to be reconnected. iSyncYou opens your device browser for the official login again."
+      : "Sign in with your existing Claude or ChatGPT subscription. iSyncYou opens your device browser for the official login, then hands off to the iSyncYou assistant.";
+  const claudeLifecycle = accountLifecycleNode(st, "claude");
+  const codexLifecycle = accountLifecycleNode(st, "codex");
+  const claudeContinuing = claudeLifecycle && claudeLifecycle.state === "awaiting_oauth_login";
+  const codexContinuing = codexLifecycle && codexLifecycle.state === "awaiting_oauth_login";
+  const claude = el("button", { id: "asst-connect-claude", class: "btn primary", onclick: () => connectAgentProvider("claude", claudeLifecycle), "data-testid": "agent-connect-claude" },
+    icon("sparkles", "icon-sm"), claudeContinuing ? "Continue Claude sign-in" : reconnect && wizardProvider === "claude" ? "Reconnect Claude" : "Connect Claude");
+  const codex = el("button", { id: "asst-connect-codex", class: "btn", onclick: () => connectAgentProvider("codex", codexLifecycle), "data-testid": "agent-connect-codex" },
+    icon("sparkles", "icon-sm"), codexContinuing ? "Continue ChatGPT sign-in" : reconnect && wizardProvider === "codex" ? "Reconnect ChatGPT" : "Connect ChatGPT");
+  if (unavailable || !claudeAllowed) {
+    claude.setAttribute("disabled", "disabled");
+  }
+  if (unavailable || !codexAllowed) {
+    codex.setAttribute("disabled", "disabled");
+  }
+  body.append(el("p", { class: "view-sub", text: "Ask questions about your Microsoft 365 archive and let the assistant act on it — all within iSyncYou." }));
+  const diagnostic = renderConnectivityDiagnostic();
+  if (diagnostic) body.append(diagnostic);
+  const lifecycleControls = renderAssistantLifecycleControls(st);
+  if (lifecycleControls) body.append(lifecycleControls);
+  // A reconnect is a shorter flow (same host invariants): condense the ordered steps to the
+  // official sign-in + ready endpoints rather than repeating the full first-run sequence.
+  const stepsPanel = reconnect ? null : renderAssistantWizardSteps(node);
   body.append(
-    el("p", { class: "view-sub", text: "Ask questions about your Microsoft 365 archive and let the assistant act on it — all within iSyncYou." }),
-    el("div", { id: "asst-connect-card", class: "card", style: "max-width:36rem;margin:1.25rem auto;text-align:center;padding:2.5rem 2rem" },
-      el("div", { style: "width:64px;height:64px;border-radius:18px;margin:0 auto 1.1rem;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#6366f1,#a371f7);color:#fff;box-shadow:0 8px 24px rgba(99,102,241,.35)" }, icon("sparkles")),
-      el("h2", { style: "margin:.3rem 0 .5rem", text: "Connect your AI account" }),
-      el("p", { class: "dim", style: "line-height:1.55;margin:0 auto 1.6rem;max-width:27rem", text: "Sign in with your existing Claude or ChatGPT subscription. iSyncYou opens your device browser for the official login — your credentials go only to the provider — and this device is then authorized." }),
-      el("div", { style: "display:flex;flex-direction:column;gap:.6rem;max-width:21rem;margin:0 auto" },
-        el("button", { id: "asst-connect-anthropic", class: "btn primary", onclick: () => startAiLogin("anthropic") }, icon("sparkles", "icon-sm"), "Connect Claude (Anthropic)"),
-        el("button", { id: "asst-connect-openai", class: "btn", onclick: () => startAiLogin("openai") }, icon("sparkles", "icon-sm"), "Connect ChatGPT (OpenAI)"),
-      ),
-      el("p", { class: "dim", style: "margin:1.3rem 0 0;font-size:.8rem", text: "Experimental — uses your own subscription. You can disconnect any time." }),
+    el("div", { id: "asst-connect-card", class: "assistant-setup assistant-wizard", "data-agent-setup": "1", "data-agent-wizard": state, "data-testid": "agent-setup" },
+      el("div", { class: "assistant-setup-icon" }, icon("sparkles")),
+      el("h2", { style: "margin:.3rem 0 .5rem", text: reconnect ? "Reconnect your AI account" : "Connect your AI account" }),
+      el("p", { class: "dim assistant-setup-copy", text: hint }),
+      stepsPanel,
+      renderAssistantConsentPanel(["claude", "codex"]),
+      el("div", { class: "assistant-setup-actions" }, claude, codex,
+        el("button", { class: "btn ghost", type: "button", onclick: openAgentSessionDialog, "data-agent-sessions": "1" },
+          icon("messages-square", "icon-sm"), "Sessions")),
+      st && st.error ? el("p", { class: "dim assistant-setup-note", text: "Status is temporarily unavailable." }) : null,
+      el("p", { class: "dim assistant-setup-note", text: "Uses your Claude or ChatGPT subscription. You can disconnect any time." }),
     ),
   );
 }
 
 // The chat surface (shown once connected). Streams tokens over the per-turn SSE.
 function renderAssistantChat(body, st) {
-  body.append(
-    el("div", { style: "display:flex;align-items:center;gap:.5rem;max-width:46rem;margin:.1rem auto .9rem" },
+  const provider = agentActiveProvider(st);
+  const hasConsent = agentPrivacyConsentAccepted(provider);
+  const chatNodes = [
+    el("div", { class: "assistant-toolbar" },
       el("span", { class: "chip ok" }, el("span", { class: "dot" }), "Connected"),
       agentModelSwitcher(st),
+      renderAssistantUsageChip(st),
+      el("button", { class: "btn ghost sm", type: "button", onclick: openAgentSessionDialog, "data-agent-sessions": "1" },
+        icon("messages-square", "icon-sm"), "Sessions"),
+      el("button", { class: "btn ghost sm", type: "button", onclick: resetAgentPrivacyConsent, "data-agent-consent-reset": "1" },
+        icon("shield", "icon-sm"), "Privacy"),
     ),
-    el("div", { id: "asst-log", style: "display:flex;flex-direction:column;gap:.8rem;max-width:46rem;margin:0 auto;width:100%;padding-bottom:1rem" }),
-    el("div", { style: "position:sticky;bottom:0;max-width:46rem;margin:0 auto;width:100%" },
-      el("div", { style: "display:flex;gap:.5rem;padding:.5rem 0", class: "asst-inputrow" },
-        el("textarea", { id: "asst-input", class: "input", rows: "1", placeholder: "Ask about your mail, files, calendar…", style: "flex:1;resize:none;min-height:46px;max-height:160px", onkeydown: agentKeydown }),
-        el("button", { class: "btn primary", title: "Send", onclick: agentSendFromInput }, icon("send", "icon-sm")),
-      ),
-    ),
-  );
+    el("div", { id: "asst-log", class: "assistant-transcript", "data-agent-transcript": "1", "data-testid": "agent-transcript" }),
+    el("div", { class: "assistant-pending-host", "data-agent-pending": "1", "data-testid": "agent-pending-actions" }),
+    renderAssistantComposer(st),
+  ];
+  if (!hasConsent) chatNodes.splice(1, 0, renderAssistantConsentPanel([provider]));
+  const pendingConnect = AssistantState.pendingConnectProvider;
+  if (pendingConnect && !agentPrivacyConsentAccepted(pendingConnect)) {
+    chatNodes.splice(1, 0, renderAssistantConsentPanel([pendingConnect]));
+  }
+  const pendingModel = AssistantState.pendingModelSelection;
+  if (pendingModel && !agentPrivacyConsentAccepted(pendingModel.provider)) {
+    chatNodes.splice(1, 0, renderAssistantConsentPanel([pendingModel.provider]));
+  }
+  const diagnostic = renderConnectivityDiagnostic();
+  if (diagnostic) body.append(diagnostic);
+  const lifecycleControls = renderAssistantLifecycleControls(st);
+  if (lifecycleControls) body.append(lifecycleControls);
+  body.append(...chatNodes);
   const log = $("#asst-log");
-  if (!ASST_LOG.length) {
+  if (!AssistantState.transcript.length) {
     log.append(el("div", { class: "dim", style: "text-align:center;padding:2.5rem 1rem", text: "Ask me anything about your Microsoft 365 — I'll read your archive and answer with sources." }));
   } else {
-    ASST_LOG.forEach(m => log.append(renderAsstMsg(m)));
-    requestAnimationFrame(() => { log.scrollTop = log.scrollHeight; });
+    AssistantState.transcript.forEach(m => log.append(renderAssistantMessage(m)));
+    scrollAssistantToEnd();
   }
+}
+
+function assistantComposerDisabledReason(st) {
+  const provider = agentActiveProvider(st || AssistantState.status);
+  const sessionNotHydrated = !!AssistantState.selectedSessionId
+    && AssistantState.sessionHydratedId !== AssistantState.selectedSessionId;
+  if (!CAP.agent) return "Assistant unavailable";
+  if (!App.account) return "Select an account first";
+  if (!assistantSelectedReady(st || AssistantState.status)) return "Reconnect your AI account";
+  if (!agentPrivacyConsentAccepted(provider)) return "Review privacy consent first";
+  if (AssistantState.sessionHydrationError) return "Shared session unavailable";
+  if (sessionNotHydrated || AssistantState.sessionHistoryRefreshing
+      || AssistantState.sessionHydrationPromise) return "Loading shared session";
+  return AssistantState.busy ? "Wait for the active turn" : "";
+}
+
+function renderAssistantComposer(_st) {
+  const disabledReason = assistantComposerDisabledReason(_st);
+  const hydrationRetry = AssistantState.sessionHydrationError
+    ? el("button", {
+      class: "btn ghost sm",
+      type: "button",
+      title: "Retry shared session",
+      "aria-label": "Retry shared session",
+      onclick: retryAgentSessionHydration,
+    }, icon("refresh-cw", "icon-sm"), "Retry")
+    : null;
+  const input = el("textarea", {
+    id: "asst-input",
+    class: "input assistant-input",
+    rows: "1",
+    placeholder: disabledReason || "Ask about your mail, files, calendar…",
+    onkeydown: agentKeydown,
+    oninput: (e) => { AssistantState.draft = e.target.value; },
+    "data-agent-input": "1",
+    "data-testid": "agent-input",
+  });
+  input.value = AssistantState.draft || "";
+  const send = el("button", { class: "btn primary", title: disabledReason || "Send", onclick: agentSendFromInput, "data-testid": "agent-send" },
+    icon("send", "icon-sm"));
+  const active = AssistantState.busy && !!AssistantState.activeTurnId && AssistantState.turnStreamReady;
+  const stop = el("button", {
+    class: "btn danger icon-only",
+    type: "button",
+    title: "Stop response",
+    "aria-label": "Stop response",
+    onclick: () => cancelAgentTurn(AssistantState.activeTurnId),
+    "data-testid": "agent-stop",
+  }, icon("square", "icon-sm"));
+  send.hidden = active;
+  stop.hidden = !active;
+  stop.disabled = AssistantState.turnCancelPending;
+  if (disabledReason) {
+    input.setAttribute("disabled", "disabled");
+    send.setAttribute("disabled", "disabled");
+  }
+  return el("div", { class: "assistant-composer", "data-agent-composer": "1", "data-testid": "agent-composer" },
+    el("div", { class: "asst-inputrow" }, input, send, stop),
+    disabledReason ? el("div", { class: "dim assistant-composer-note" },
+      el("span", { text: disabledReason }), hydrationRetry) : null);
+}
+
+function syncAssistantComposerControls() {
+  const input = $("#asst-input");
+  const send = $('[data-testid="agent-send"]');
+  const stop = $('[data-testid="agent-stop"]');
+  const active = AssistantState.busy && !!AssistantState.activeTurnId && AssistantState.turnStreamReady;
+  const disabledReason = assistantComposerDisabledReason(AssistantState.status);
+  if (input) {
+    input.disabled = !!disabledReason;
+    input.placeholder = disabledReason || "Ask about your mail, files, calendar…";
+  }
+  if (send) {
+    send.disabled = !!disabledReason;
+    send.hidden = active;
+  }
+  if (stop) {
+    stop.hidden = !active;
+    stop.disabled = AssistantState.turnCancelPending;
+    stop.title = AssistantState.turnCancelPending ? "Stopping response" : "Stop response";
+    stop.setAttribute("aria-label", stop.title);
+  }
+}
+
+function formatAssistantRateLimit(rateLimit) {
+  if (!rateLimit) return "";
+  if (typeof rateLimit === "string" || typeof rateLimit === "number") return String(rateLimit);
+  if (typeof rateLimit !== "object" || Array.isArray(rateLimit)) return "";
+  const entries = Object.entries(rateLimit).filter(([, value]) => value != null && value !== "");
+  if (!entries.length) return "";
+  const status = entries.find(([key, value]) => /status$/i.test(key) && typeof value === "string");
+  const utilization = entries.find(([key, value]) => /utilization$/i.test(key) && Number.isFinite(Number(value)));
+  const parts = [];
+  if (status) parts.push("limit " + status[1]);
+  if (utilization) parts.push(Math.round(Number(utilization[1]) * 100) + "%");
+  return parts.join(" · ");
+}
+
+function renderAssistantUsageChip(st) {
+  const usage = st && st.usage ? st.usage : AssistantState.lastUsage;
+  if (!usage) {
+    return el("span", { class: "chip muted assistant-usage", "data-agent-usage": "1", "data-testid": "agent-usage", title: "Usage unavailable" },
+      icon("info", "icon-sm"), "Usage unavailable");
+  }
+  const parts = [];
+  if (usage.request_id) parts.push("Request " + agentCompactValue(usage.request_id, 28));
+  if (usage.input_tokens != null) parts.push(`${usage.input_tokens} in`);
+  if (usage.output_tokens != null) parts.push(`${usage.output_tokens} out`);
+  const rateLimit = formatAssistantRateLimit(usage.rate_limit);
+  if (rateLimit) parts.push(rateLimit);
+  return el("span", { class: "chip assistant-usage", "data-agent-usage": "1", "data-testid": "agent-usage" },
+    icon("info", "icon-sm"), parts.join(" · ") || "Usage");
 }
 
 // Model switcher: pick any available Claude/Codex model. The choice is persisted
@@ -4642,38 +5952,77 @@ function renderAssistantChat(body, st) {
 // Custom in-UI model picker (no native <select>): a glass panel that unfolds with a
 // spring animation, models grouped by provider, active one highlighted. Falls back to a
 // plain label when nothing is connected.
+function agentProviderLabel(provider) {
+  if (provider === "claude") return "Claude";
+  if (provider === "codex") return "ChatGPT";
+  return "Assistant";
+}
 function agentModelSwitcher(st) {
   const models = st.models || {};
+  const efforts = st.reasoning_efforts || [];
+  const currentEffort = st.reasoning_effort || "medium";
   const cur = (st.provider || "") + "|" + (st.model || "");
   const curLabel = () => {
-    for (const [prov, tag] of [["claude", "Claude"], ["codex", "ChatGPT"]]) {
+    for (const prov of ["claude", "codex"]) {
+      const tag = agentProviderLabel(prov);
       const m = (models[prov] || []).find((x) => prov + "|" + x.id === cur);
-      if (m) return tag + " · " + m.label;
+      if (m) {
+        const effort = prov === "codex" ? efforts.find((x) => x.id === currentEffort) : null;
+        return tag + " · " + m.label + (effort ? " · " + effort.label : "");
+      }
     }
-    return st.model || "Select model";
+    return st.model ? agentProviderLabel(st.provider) + " · " + st.model : "Select model";
   };
   const rows = [];
-  const addGroup = (prov, connected, tag) => {
-    if (!connected) return;
+  const addGroup = (prov, connected) => {
+    const list = models[prov] || [];
+    if (!connected || !list.length) return;
+    const tag = agentProviderLabel(prov);
     rows.push(el("div", { class: "mdl-group" }, tag));
-    (models[prov] || []).forEach((m) => {
+    list.forEach((m) => {
       const val = prov + "|" + m.id;
-      rows.push(el("div",
-        { class: "mdl-item" + (val === cur ? " active" : ""), role: "option", onclick: () => pickModel(prov, m.id) },
+      rows.push(el("button",
+        { class: "mdl-item" + (val === cur ? " active" : ""), type: "button", role: "option", "data-agent-model-option": val, onclick: () => pickModel(prov, m.id, prov === "codex" ? currentEffort : null) },
         el("span", { class: "mdl-dot" }),
         el("span", { class: "mdl-lbl", text: tag + " · " + m.label })));
     });
   };
-  addGroup("claude", st.claude, "Claude");
-  addGroup("codex", st.codex, "ChatGPT");
-  if (!st.codex) {
-    rows.push(el("div", { class: "mdl-item mdl-connect", onclick: () => connectCodex() },
+  const claudeReady = assistantProviderReady(st, "claude");
+  const codexReady = assistantProviderReady(st, "codex");
+  addGroup("claude", claudeReady);
+  addGroup("codex", codexReady);
+  if (codexReady && st.provider === "codex" && st.model && efforts.length) {
+    rows.push(el("div", { class: "mdl-group" }, "Reasoning effort"));
+    rows.push(el("div", { class: "mdl-efforts", role: "group", "aria-label": "Reasoning effort" },
+      ...efforts.map((effort) => el("button", {
+        class: "mdl-effort" + (effort.id === currentEffort ? " active" : ""),
+        type: "button",
+        "data-agent-effort-option": effort.id,
+        onclick: () => pickModel("codex", st.model, effort.id),
+        text: effort.label,
+      }))));
+  }
+  if (!claudeReady) {
+    rows.push(el("button", { class: "mdl-item mdl-connect", type: "button", "data-agent-model-connect": "claude", onclick: () => connectAgentProvider("claude") },
+      el("span", { class: "mdl-plus" }, "＋"),
+      el("span", { class: "mdl-lbl", text: "Connect Claude…" })));
+  }
+  if (!codexReady) {
+    rows.push(el("button", { class: "mdl-item mdl-connect", type: "button", "data-agent-model-connect": "codex", onclick: () => connectAgentProvider("codex") },
       el("span", { class: "mdl-plus" }, "＋"),
       el("span", { class: "mdl-lbl", text: "Connect ChatGPT…" })));
   }
-  if (!rows.length) return el("span", { class: "dim", style: "font-size:.85rem", text: st.model || "" });
+  if (!rows.length) {
+    return el("span", {
+      class: "dim mdl-empty",
+      style: "font-size:.85rem",
+      "data-agent-model-picker": "1",
+      "data-testid": "agent-model-picker",
+      text: st.model || "No model available",
+    });
+  }
 
-  const wrap = el("div", { class: "mdl" });
+  const wrap = el("div", { class: "mdl", "data-agent-model-picker": "1", "data-testid": "agent-model-picker" });
   const closeOutside = (ev) => { if (!wrap.contains(ev.target)) close(); };
   const close = () => { wrap.classList.remove("open"); document.removeEventListener("pointerdown", closeOutside, true); };
   const trigger = el("button",
@@ -4687,45 +6036,64 @@ function agentModelSwitcher(st) {
   wrap.append(trigger, el("div", { class: "mdl-panel", role: "listbox" }, ...rows));
   return wrap;
 }
-async function pickModel(provider, model) {
+async function connectAgentProvider(provider, lifecycleNode = null) {
+  if (!agentPrivacyConsentAccepted(provider)) {
+    AssistantState.pendingConnectProvider = agentProviderConsentId(provider);
+    await renderAssistantView($("#view"));
+    return;
+  }
+  const lifecycle = lifecycleNode || accountLifecycleNode(AssistantState.status, provider);
+  if (lifecycle && lifecycle.state === "awaiting_oauth_login" && lifecycle.resume_operation_id) {
+    await continueLifecycleOAuth(provider, lifecycle);
+    return;
+  }
+  if (lifecycle && lifecycle.credential_etag) {
+    await startAccountLifecycle(provider, "reconnect", lifecycle);
+    return;
+  }
+  await startAiLogin(provider);
+}
+async function pickModel(provider, model, reasoningEffort = null) {
+  if (!agentPrivacyConsentAccepted(provider)) {
+    AssistantState.pendingModelSelection = {
+      provider: agentProviderConsentId(provider), model, reasoning_effort: reasoningEffort,
+    };
+    toast("Review privacy consent for " + agentProviderLabel(provider), "err");
+    renderAssistantView($("#view"));
+    return;
+  }
   try {
-    await post("/api/v1/agent/model?" + qs({ provider, model }), CAP.agent);
-    toast("Model: " + model);
+    const body = { request_id: crypto.randomUUID(), provider, model };
+    if (provider === "codex") body.reasoning_effort = reasoningEffort || "medium";
+    await postJson("/api/v1/agent/model", CAP.agent, body);
+    const st = await api("/api/v1/agent/status");
+    rememberAssistantStatus(st);
+    const effortLabel = provider === "codex"
+      ? (AssistantState.status?.reasoning_efforts || []).find((x) => x.id === (reasoningEffort || "medium"))?.label
+      : null;
+    toast("Model: " + agentProviderLabel(provider) + " · " + model + (effortLabel ? " · " + effortLabel : ""));
     renderAssistantView($("#view"));
   } catch (err) {
     toast("Could not switch model: " + (err.message || err));
   }
 }
 async function connectCodex() {
-  let guardId = null;
-  try {
-    const params = { provider: "codex" };
-    const redirect = localCallbackRedirect("127.0.0.1");
-    if (redirect) params.redirect = redirect;
-    const d = await post("/api/v1/agent/oauth/start?" + qs(params), CAP.agent);
-    if (!d || !d.authorize_url) { toast("Could not start ChatGPT sign-in"); return; }
-    toast("Opening ChatGPT sign-in…");
-    guardId = await beginNetworkGuard();
-    CODEX_GUARD_ID = guardId;
-    await openExternalAuth(d.authorize_url, "agent_authorize");
-    pollCodexStatus(0);
-  } catch (e) {
-    if (guardId) await endNetworkGuard(guardId);
-    if (CODEX_GUARD_ID === guardId) CODEX_GUARD_ID = null;
-    toast("ChatGPT sign-in unavailable: " + (e.message || e));
-  }
+  await connectAgentProvider("codex");
 }
 async function pollCodexStatus(n) {
   try {
     const s = await api("/api/v1/agent/status");
-    if (s && s.codex) { await finishCodexGuard(); toast("ChatGPT connected!"); renderAssistantView($("#view")); return; }
+    if (await handleCandidateCleanupStatus(s, "codex")) return;
+    if (assistantProviderReady(s, "codex")) { await finishCodexGuard(); toast("ChatGPT connected!"); renderAssistantView($("#view")); return; }
   } catch (_) {}
-  if (n < 90) setTimeout(() => pollCodexStatus(n + 1), 2000);
+  if (n < AGENT_OAUTH_POLL_LIMIT) {
+    setTimeout(() => pollCodexStatus(n + 1), AGENT_OAUTH_POLL_INTERVAL_MS);
+  }
   else await finishCodexGuard();
 }
 
 // Progressive-search rendering (S-AG.18/#643, S-AG.19/#644). Module-level so BOTH the live
-// stream (agentSend) and a re-render from ASST_LOG (renderAsstMsg, after a view switch) build
+// stream (agentSend) and a re-render from AssistantState.transcript build
 // identical cards — the transcript keeps its search stages + result cards, not just the text.
 const ASST_STAGE_LABEL = { names: "Fast search — subject", bodies: "Full-text — bodies", deep: "AI deep-read" };
 function asstSvcIcon(s) { return ({ mail: "mail", onedrive: "hard-drive", calendar: "calendar", contacts: "users", todo: "check-square", onenote: "notebook" })[s] || "file"; }
@@ -4736,10 +6104,89 @@ function asstSvcIcon(s) { return ({ mail: "mail", onedrive: "hard-drive", calend
 function asstViewerFrame(q) {
   return el("iframe", { class: "asst-result-frame", src: `/api/v1/view?${qs(q)}`, title: "Item preview", sandbox: "allow-same-origin" });
 }
+function normalizeAgentSource(value) {
+  if (!value || typeof value !== "object") return null;
+  const raw = value.source && typeof value.source === "object" ? value.source : value;
+  const service = String(raw.service || value.service || "").trim();
+  if (!service || !archiveServices().some(s => s.id === service)) return null;
+  const id = String(raw.id || raw.item_id || raw.remote_id
+    || value.id || value.item_id || value.remote_id || "").trim();
+  const path = raw.path || value.path || "";
+  if (!id && !path) return null;
+  return {
+    service,
+    id,
+    path: path ? String(path) : "",
+    name: String(raw.name || raw.label || value.name || value.label
+      || value.displayName || id || service),
+    item_type: String(raw.item_type || value.item_type || value.type || service),
+  };
+}
+function sourceViewQuery(source) {
+  if (!source || !App.account || !source.service || !source.id) return null;
+  return { account: App.account, service: source.service, id: source.id };
+}
+function sourceViewHref(source) {
+  const q = sourceViewQuery(source);
+  return q ? "/api/v1/view?" + qs(q) : null;
+}
+function agentSourceKey(source) {
+  return JSON.stringify([source.service, source.id || "", source.path || ""]);
+}
+function dedupeAgentSources(sources) {
+  const seen = new Set();
+  const out = [];
+  (sources || []).forEach((value) => {
+    const s = normalizeAgentSource(value);
+    if (!s) return;
+    const key = agentSourceKey(s);
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(s);
+  });
+  return out;
+}
+function extractAgentSources(event) {
+  const found = [];
+  const visit = (value, depth) => {
+    if (depth > 6 || value == null) return;
+    if (Array.isArray(value)) { value.forEach(v => visit(v, depth + 1)); return; }
+    if (typeof value !== "object") return;
+    const src = normalizeAgentSource(value);
+    if (src) found.push(src);
+    Object.entries(value).forEach(([k, v]) => {
+      if (["source", "sources", "results", "items", "result", "data"].includes(k)) visit(v, depth + 1);
+    });
+  };
+  if (!event || typeof event !== "object") return [];
+  if (event.event === "partial_result") visit(event.items || [], 0);
+  else if (event.event === "tool_result" && typeof event.content === "string") {
+    try { visit(JSON.parse(event.content), 0); } catch (_) {}
+  }
+  return dedupeAgentSources(found);
+}
+function renderAgentCitation(source) {
+  const label = source.name || source.id || source.service;
+  const href = sourceViewHref(source);
+  if (href) {
+    return el("a", { class: "asst-citation", href, target: "_blank", rel: "noopener", "data-agent-citation": "view" },
+      icon(asstSvcIcon(source.service), "icon-sm"),
+      el("span", { text: label }));
+  }
+  return el("button", { class: "asst-citation", type: "button", onclick: () => go(source.service), "data-agent-citation": "route" },
+    icon(asstSvcIcon(source.service), "icon-sm"),
+    el("span", { text: label }));
+}
+function renderAgentCitationBar(sources) {
+  const bar = el("div", { class: "asst-citations", "data-agent-citations": "1" });
+  dedupeAgentSources(sources).forEach(source => bar.append(renderAgentCitation(source)));
+  return bar;
+}
 // One typed result: header (name) + one-line preview; click → animated pull-down that
 // lazily embeds the real viewer for the body + a link to open it full-screen.
 function asstResultCard(it) {
-  const q = { account: App.account, service: it.service, id: it.id };
+  const source = normalizeAgentSource(it) || { service: it.service, id: it.id, path: it.path || "", name: it.name || "", item_type: it.item_type || it.service };
+  const viewQ = sourceViewQuery(source);
   const snip = (it.snippet || "").trim();
   const head = el("div", { class: "asst-result-head" },
     el("span", { class: "asst-result-ic", style: `--svc:var(--svc-${it.service})` }, icon(asstSvcIcon(it.service), "icon-sm")),
@@ -4756,10 +6203,15 @@ function asstResultCard(it) {
     row.classList.toggle("open");
     if (opening && !loaded) {   // lazy: only load the viewer when the user opens the card
       loaded = true;
-      panel.append(
-        asstViewerFrame(q),
-        el("a", { class: "asst-result-open", href: "/api/v1/view?" + qs(q), target: "_blank", rel: "noopener" },
-          icon("external-link", "icon-sm"), el("span", { text: "Open full " + (it.item_type || "item") })));
+      if (viewQ) {
+        panel.append(
+          asstViewerFrame(viewQ),
+          el("a", { class: "asst-result-open", href: "/api/v1/view?" + qs(viewQ), target: "_blank", rel: "noopener" },
+            icon("external-link", "icon-sm"), el("span", { text: "Open full " + (it.item_type || "item") })));
+      } else {
+        panel.append(el("button", { class: "asst-result-open", type: "button", onclick: () => go(source.service) },
+          icon("chevron-right", "icon-sm"), el("span", { text: "Open " + (source.service || "service") })));
+      }
     }
   });
   return row;
@@ -4786,17 +6238,339 @@ function asstSearchBlock(stages, results) {
   return frag;
 }
 
-function renderAsstMsg(m) {
+function agentCompactValue(v, max = 140) {
+  if (v == null) return "";
+  let s;
+  try { s = typeof v === "string" ? v : JSON.stringify(v); } catch (_) { s = String(v); }
+  s = s.replace(/\s+/g, " ").trim();
+  s = s.replace(/("?)(token|session|capability|action_hash)\1\s*[:=]\s*"?[^,"\s}]+/ig, "$2=[redacted]");
+  return s.length > max ? s.slice(0, max - 1) + "…" : s;
+}
+
+function agentToolCallCopy(name, input) {
+  const op = String(input && input.op ? input.op : name || "").toLowerCase();
+  if (op === "search" || op === "archive.search") return "Searching your Microsoft 365 archive";
+  if (op === "deep-search") return "Searching more broadly in your archive";
+  if (op === "read" || op === "archive.read") return "Reading an archived item";
+  if (op === "list" || op === "archive.list") return "Listing archived items";
+  if (op === "export") return "Preparing an archive export";
+  if (op === "restore-local") return "Restoring an archived item to this device";
+  if (op === "backup") return "Preparing a Microsoft 365 backup";
+  if (op === "restore-cloud") return "Preparing a Microsoft 365 restore";
+  if (op === "share") return "Preparing a OneDrive sharing action";
+  if (op === "live-write") {
+    const service = String(input && input.service ? input.service : "").toLowerCase();
+    const labels = {
+      mail: "Preparing an email update",
+      calendar: "Preparing a calendar update",
+      contacts: "Preparing a contact update",
+      todo: "Preparing a task update",
+      onenote: "Preparing a OneNote update",
+    };
+    return labels[service] || "Preparing a Microsoft 365 update";
+  }
+  return "Working with Microsoft 365";
+}
+
+function renderAgentToolRow(row) {
+  return el("div", { class: "asst-tool-row " + row.kind, "data-agent-tool-row": row.kind },
+    icon(row.kind === "tool_call" ? "corner-up-right" : "corner-up-left", "icon-sm"),
+    el("span", { class: "asst-tool-title", text: row.title }),
+    row.detail ? el("span", { class: "asst-tool-detail", text: row.detail }) : null,
+    row.untrusted ? el("span", { class: "chip muted asst-tool-boundary", text: "Source content" }) : null);
+}
+
+function renderAgentError(message) {
+  return el("div", { class: "asst-inline-error", "data-agent-stream-error": "1" },
+    icon("shield", "icon-sm"),
+    el("span", { text: message || "Stream error" }));
+}
+
+function pendingRecord(pendingId) {
+  return pendingId ? AssistantState.pendingCardsById.get(pendingId) : null;
+}
+
+function rerenderPendingCards(pendingId) {
+  const record = pendingRecord(pendingId);
+  const nodes = AssistantState.pendingCardNodesById.get(pendingId);
+  if (!record || !nodes) return;
+  const replacements = new Set();
+  nodes.forEach((node) => {
+    if (!node.isConnected) return;
+    const replacement = renderAgentPendingCard(record, false);
+    node.replaceWith(replacement);
+    replacements.add(replacement);
+  });
+  if (replacements.size) AssistantState.pendingCardNodesById.set(pendingId, replacements);
+  else AssistantState.pendingCardNodesById.delete(pendingId);
+}
+
+function pendingStatus(pending) {
+  const status = pending.status || "pending";
+  if (status === "pending" && pending.expires_at_ms && Date.now() >= Number(pending.expires_at_ms)) {
+    pending.status = "expired";
+    return "expired";
+  }
+  return status;
+}
+
+async function confirmAgentPending(pendingId) {
+  const record = pendingRecord(pendingId);
+  if (!record || !record.token || !record.action_hash) return;
+  record.status = "confirming";
+  record.error = "";
+  rerenderPendingCards(pendingId);
+  try {
+    const d = await postJson("/api/v1/agent/confirm", CAP.agent, {
+      request_id: crypto.randomUUID(), pending: pendingId,
+      token: record.token, action_hash: record.action_hash,
+    });
+    record.status = "confirmed";
+    record.result = "Completed successfully.";
+    record.token = "";
+    record.action_hash = "";
+  } catch (e) {
+    record.status = "error";
+    record.error = agentCompactValue(e.message || e, 180);
+  }
+  rerenderPendingCards(pendingId);
+}
+
+async function cancelAgentPending(pendingId) {
+  const record = pendingRecord(pendingId);
+  if (!record) return;
+  const turn = record.turn_id || AssistantState.activeTurnId;
+  if (!turn) {
+    record.status = "error";
+    record.error = "Missing turn id";
+    rerenderPendingCards(pendingId);
+    return;
+  }
+  record.status = "cancelling";
+  record.error = "";
+  rerenderPendingCards(pendingId);
+  try {
+    await postJson("/api/v1/agent/pending/cancel", CAP.agent, {
+      request_id: crypto.randomUUID(),
+      pending: pendingId,
+      action_hash: record.action_hash,
+    });
+    record.status = "cancelled";
+    record.token = "";
+    record.action_hash = "";
+    closeAssistantStream("pending-cancel");
+  } catch (e) {
+    record.status = "error";
+    record.error = agentCompactValue(e.message || e, 180);
+  }
+  rerenderPendingCards(pendingId);
+}
+
+async function cancelAgentTurn(turnId) {
+  if (!turnId || !AssistantState.turnStreamReady || AssistantState.turnCancelPending) return;
+  AssistantState.turnCancelPending = true;
+  syncAssistantComposerControls();
+  try {
+    await postJson("/api/v1/agent/turn/cancel", CAP.agent, {
+      request_id: crypto.randomUUID(),
+      turn_id: turnId,
+    });
+  } catch (error) {
+    AssistantState.turnCancelPending = false;
+    syncAssistantComposerControls();
+    toast(agentSafeErrorCopy(error && error.message), "err");
+  }
+}
+
+function renderAgentPendingCard(pending, trackNode = true) {
+  const status = pendingStatus(pending);
+  const risk = pending.risk ? `Risk: ${pending.risk}` : "Review required";
+  const done = status === "confirmed" || status === "cancelled";
+  const waiting = status === "confirming" || status === "cancelling";
+  const confirmDisabled = waiting || done || status === "expired";
+  const cancelDisabled = waiting || done;
+  const confirm = el("button", { class: "btn primary sm", type: "button", onclick: () => confirmAgentPending(pending.pending_id), "data-agent-pending-confirm": "1" },
+    icon("check", "icon-sm"), status === "confirming" ? "Confirming…" : "Confirm");
+  const cancel = el("button", { class: "btn sm", type: "button", onclick: () => cancelAgentPending(pending.pending_id), "data-agent-pending-cancel": "1" },
+    icon("x", "icon-sm"), status === "cancelling" ? "Cancelling…" : "Cancel");
+  if (confirmDisabled) confirm.setAttribute("disabled", "disabled");
+  if (cancelDisabled) cancel.setAttribute("disabled", "disabled");
+  const title = status === "confirmed" ? "Action confirmed"
+    : status === "cancelled" ? "Action cancelled"
+      : pending.preview || "Action requires confirmation";
+  const terminalResult = pending.result
+    || (status === "cancelled" ? "No changes were made." : "");
+  const card = el("div", {
+    class: "asst-pending-card " + status,
+    "data-agent-pending-card": "1",
+  },
+    el("div", { class: "asst-pending-head" },
+      icon(status === "confirmed" ? "circle-check" : status === "cancelled" ? "circle-x" : "shield-check", "icon-sm"),
+      el("span", { class: "asst-pending-title", text: title })),
+    done ? null : el("div", { class: "dim asst-pending-meta", text: risk }),
+    !done && pending.expires_at_ms ? el("div", { class: "dim asst-pending-meta", text: status === "expired" ? "Expired" : "Expires " + fmtDate(pending.expires_at_ms) }) : null,
+    terminalResult ? el("div", { class: "asst-pending-result", text: terminalResult }) : null,
+    pending.error ? el("div", { class: "asst-pending-error", text: pending.error }) : null,
+    done ? null : el("div", { class: "asst-pending-actions" }, confirm, cancel));
+  if (trackNode && pending.pending_id) {
+    const nodes = AssistantState.pendingCardNodesById.get(pending.pending_id) || new Set();
+    nodes.add(card);
+    AssistantState.pendingCardNodesById.set(pending.pending_id, nodes);
+  }
+  return card;
+}
+
+function renderAssistantMessage(m) {
   const isUser = m.role === "user";
   const bubble = el("div", {
     class: "card asst-bubble",
-    style: `max-width:82%;padding:.7rem .9rem;${isUser ? "background:linear-gradient(135deg,#6366f1,#7c5cff);color:#fff" : ""}`,
   }, el("div", { class: "asst-text", style: "white-space:pre-wrap;line-height:1.5", text: m.text || (isUser ? "" : "…") }));
   (m.chips || []).forEach(c => bubble.append(el("div", { class: "dim", dataset: { chip: "1" }, style: "font-size:.78rem;margin-top:.35rem", text: c })));
+  (m.tools || []).forEach(t => bubble.append(renderAgentToolRow(t)));
+  (m.errors || []).forEach(e => bubble.append(renderAgentError(e)));
+  if (m.pending) bubble.append(renderAgentPendingCard(m.pending));
+  if (m.citations && m.citations.length) bubble.append(renderAgentCitationBar(m.citations));
   // Re-render the turn's search stages + result cards (persisted in the message), so a view
   // switch brings the whole conversation back — not just the text (#644).
   if ((m.stages && m.stages.length) || (m.results && m.results.length)) bubble.append(asstSearchBlock(m.stages, m.results));
-  return el("div", { style: `display:flex;${isUser ? "justify-content:flex-end" : ""}` }, bubble);
+  return el("div", { class: "assistant-message" + (isUser ? " user" : ""), "data-agent-message": m.role || "assistant" }, bubble);
+}
+
+function agentSafeErrorCopy(code) {
+  const known = {
+    assistant_tool_arguments_invalid: "The assistant requested an invalid operation.",
+    provider_request_failed: "The provider could not complete this request.",
+    lease_lost: "The shared session changed while this turn was running. Try again.",
+    turn_outcome_unknown: "The turn may have reached the provider, so it was not repeated automatically.",
+    session_limit_reached: "This shared session is full. Start a new session to continue.",
+    session_state_invalid: "The shared session state could not be verified.",
+    assistant_tool_response_invalid: "The assistant returned an invalid tool response.",
+    assistant_archive_unavailable: "The local Microsoft 365 archive is temporarily unavailable.",
+    assistant_archive_query_failed: "The local Microsoft 365 archive could not complete the search.",
+    assistant_archive_body_unavailable: "The selected archived content is temporarily unavailable.",
+    turn_state_invalid: "The turn state could not be verified.",
+    provider_step_limit_reached: "The assistant reached the turn step limit.",
+    provider_harness_rejected: "The provider request did not match the approved assistant profile.",
+    provider_authorization_rejected: "The provider sign-in is no longer accepted. Connect it again.",
+    provider_reasoning_context_rejected: "The provider rejected the protected reasoning context.",
+    provider_function_call_pairing_rejected: "The provider rejected the tool result pairing.",
+    provider_context_limit_reached: "The provider context is too large for this request.",
+    provider_rate_limited: "The provider is temporarily rate limited. Try again shortly.",
+    provider_service_unavailable: "The provider service is temporarily unavailable.",
+    provider_request_rejected: "The provider rejected this request.",
+    provider_response_invalid: "The provider returned an invalid response.",
+    provider_stream_failed: "The provider could not finish this response.",
+    provider_connect_timed_out: "The provider took too long to respond.",
+    provider_response_timed_out: "The provider did not begin responding in time.",
+    provider_stream_idle_timed_out: "The provider stopped responding.",
+    provider_tls_failed: "A secure provider connection could not be established.",
+    provider_name_resolution_failed: "The provider address could not be resolved.",
+    provider_connect_failed: "The provider could not be reached.",
+    provider_stream_read_failed: "The provider stream ended unexpectedly.",
+    provider_stream_ended_without_event: "The provider returned no usable response.",
+    provider_response_read_failed: "The provider response could not be read.",
+    provider_response_incomplete: "The AI account stopped before finishing. Try again.",
+    provider_transport_failed: "The provider connection failed.",
+    confirmation_unavailable: "Confirmation is temporarily unavailable.",
+    session_busy: "This shared session is still in use. Try again shortly.",
+    session_store_unavailable: "Shared session state is temporarily unavailable. Try again.",
+    session_transport_unavailable: "Shared session storage is unavailable. Check your Microsoft 365 connection and try again.",
+    session_transport_timed_out: "Shared session storage did not respond in time. Try again.",
+    session_name_resolution_failed: "The shared session service address could not be resolved.",
+    session_tls_failed: "A secure connection to shared session storage could not be established.",
+    session_connect_failed: "Shared session storage could not be reached. Check your connection and try again.",
+    session_storage_response_invalid: "Shared session storage returned an invalid response. Update iSyncYou and try again.",
+    session_writer_reconnect_required: "iSyncYou Writer needs to be reconnected before shared sessions can be updated.",
+    session_storage_permission_denied: "iSyncYou Writer does not have permission to update shared sessions.",
+    session_storage_request_rejected: "Shared session storage rejected this request. Update iSyncYou and try again.",
+    pairing_invalid_code: "This session transfer code is invalid.",
+    pairing_invalid_descriptor: "This session transfer is unavailable. Check that both devices use the same Microsoft 365 account.",
+    pairing_already_claimed: "This session transfer has already been claimed.",
+    pairing_expired: "This session transfer has expired. Create a new transfer.",
+    pairing_revoked: "This session transfer was revoked.",
+    pairing_wrong_claim: "This session transfer belongs to another import attempt.",
+    pairing_outcome_unknown: "The session transfer outcome could not be verified. Do not retry it automatically.",
+    pairing_transport_unavailable: "Session transfer storage is unavailable. Check that both devices use the same Microsoft 365 account.",
+    pairing_crypto_unavailable: "Session transfer encryption is temporarily unavailable.",
+    pairing_identity_unavailable: "Session transfer identity is unavailable. Reopen iSyncYou and try again.",
+    pairing_unavailable: "Session transfer is temporarily unavailable.",
+    session_account_mismatch: "This shared session belongs to a different local Microsoft 365 account.",
+  };
+  return known[code] || "The assistant could not complete this request.";
+}
+
+function handleAgentEvent(message, turnState) {
+  const d = message || {};
+  switch (d.event) {
+    case "progress":
+      turnState.setProgress(d.phase);
+      break;
+    case "token":
+      turnState.setText(turnState.message.text + (d.text || ""));
+      break;
+    case "tool_call":
+      turnState.addToolRow({
+        kind: "tool_call",
+        title: agentToolCallCopy(d.name, d.input),
+      });
+      break;
+    case "tool_result":
+      {
+        const sources = extractAgentSources(d);
+        turnState.addToolRow({
+          kind: "tool_result",
+          title: sources.length ? "Sources checked" : "Step completed",
+          detail: sources.length
+            ? `${sources.length} source${sources.length === 1 ? "" : "s"}`
+            : "Completed",
+          untrusted: !!d.untrusted,
+        });
+        turnState.addCitations(sources);
+      }
+      break;
+    case "search_stage":
+      turnState.onSearchStage(d);
+      break;
+    case "partial_result":
+      turnState.onPartialResult(d);
+      turnState.addCitations(extractAgentSources(d));
+      break;
+    case "confirmation_required": {
+      const pending = {
+        pending_id: d.pending_id || d.id || d.tool_id || "",
+        preview: d.preview || "Action requires confirmation",
+        risk: d.risk || "",
+        expires_at_ms: d.expires_at_ms || null,
+        turn_id: AssistantState.activeTurnId || "",
+        status: "pending",
+        result: "",
+        error: "",
+        token: d.token || "",
+        action_hash: d.action_hash || "",
+      };
+      if (pending.pending_id) {
+        AssistantState.pendingCardsById.set(pending.pending_id, pending);
+      }
+      turnState.setPending(pending);
+      break;
+    }
+    case "error":
+      turnState.addError(agentSafeErrorCopy(d.message));
+      break;
+    case "done": {
+      const reason = d.reason || "complete";
+      const fallback = reason === "pending_confirmation" ? "Waiting for confirmation"
+        : reason === "cancelled" ? "Cancelled"
+        : reason === "error" ? "Turn ended with an error"
+        : "(no response)";
+      turnState.message.doneReason = reason;
+      turnState.finish(fallback, reason);
+      if (reason === "error" && typeof turnState.reconcileRequestStatus === "function") {
+        void turnState.reconcileRequestStatus();
+      }
+      break;
+    }
+  }
 }
 
 function agentKeydown(e) {
@@ -4809,16 +6583,449 @@ function agentSendFromInput() {
   agentSend(text);
 }
 
+async function ensureAgentSession() {
+  if (AssistantState.selectedSessionId && AssistantState.selectedSessionAccount === App.account) {
+    return AssistantState.selectedSessionId;
+  }
+  const page = await request("GET", "/api/v1/agent/session/list?limit=100", {
+    capToken: CAP.agent,
+  });
+  const sessions = Array.isArray(page.sessions) ? page.sessions : [];
+  let session = sessions.find((entry) => entry.session_id === page.selected_session_id);
+  if (!session) session = sessions.find((entry) => !entry.archived);
+  if (!session) {
+    const created = await postJson("/api/v1/agent/session/create", CAP.agent, {
+      request_id: crypto.randomUUID(),
+      display_name: "Assistant",
+    });
+    session = created && created.session;
+  }
+  if (!session || !session.session_id) throw new Error("session_transport_unavailable");
+  AssistantState.selectedSessionId = session.session_id;
+  AssistantState.selectedSessionAccount = App.account;
+  return session.session_id;
+}
+
+async function loadAgentRequestStatus(sessionId, requestId) {
+  if (!sessionId || !requestId) throw new Error("request_status_unavailable");
+  return request("GET", "/api/v1/agent/request/status?" + qs({
+    session_id: sessionId,
+    route: "agent_turn",
+    request_id: requestId,
+  }), { capToken: CAP.agent });
+}
+
+function sessionRecordsToTranscript(records) {
+  const transcript = [];
+  const operationMessages = new Map();
+  const operationCopy = (code) => {
+    const copy = {
+      confirmation_required: "Action awaiting confirmation.",
+      completed: "Action completed.",
+      cancelled: "Action cancelled. No changes were made.",
+      failed: "Action did not complete.",
+      outcome_unknown: "The action outcome could not be verified.",
+    };
+    return copy[code] || "Action status updated.";
+  };
+  (records || []).forEach((record) => {
+    if (!record || typeof record !== "object") return;
+    const payload = record.kind && typeof record.kind === "object" ? record.kind : record;
+    const kind = typeof record.kind === "string" ? record.kind : payload.kind;
+    if (kind === "turn_intent" && typeof payload.user_text === "string") {
+      transcript.push({ role: "user", text: payload.user_text });
+    } else if (kind === "assistant_result" && typeof payload.text === "string") {
+      transcript.push({
+        role: "assistant",
+        text: payload.text,
+        chips: [], stages: [], results: [], tools: [], errors: [],
+        citations: Array.isArray(payload.sources) ? payload.sources : [],
+        pending: null,
+        doneReason: "complete",
+      });
+    } else if (kind === "pending_operation" || kind === "operation_state") {
+      const turnId = typeof record.turn_id === "string" ? record.turn_id : "";
+      const code = typeof payload.code === "string" ? payload.code : "";
+      let message = turnId ? operationMessages.get(turnId) : null;
+      if (!message) {
+        message = {
+          role: "assistant",
+          text: operationCopy(code),
+          chips: [], stages: [], results: [], tools: [], errors: [],
+          citations: [], pending: null,
+          doneReason: kind === "pending_operation" ? "pending_confirmation" : code,
+        };
+        transcript.push(message);
+        if (turnId) operationMessages.set(turnId, message);
+      } else if (kind === "operation_state") {
+        message.text = operationCopy(code);
+        message.doneReason = code;
+      }
+    }
+  });
+  return transcript;
+}
+
+async function hydrateAgentSession(sessionId) {
+  if (!sessionId || AssistantState.busy || AssistantState.sessionHydratedId === sessionId) return;
+  if (AssistantState.sessionHydrationId === sessionId && AssistantState.sessionHydrationPromise) {
+    return AssistantState.sessionHydrationPromise;
+  }
+  const sequence = ++AssistantState.sessionHydrationSeq;
+  AssistantState.sessionHydrationError = null;
+  AssistantState.sessionHistoryRefreshing = true;
+  syncAssistantComposerControls();
+  const hydration = (async () => {
+    let cursor = null;
+    const records = [];
+    const deadline = Date.now() + 60_000;
+    while (records.length < 10000) {
+      const path = "/api/v1/agent/session/history?" + qs({
+        session_id: sessionId,
+        limit: 100,
+        ...(cursor ? { cursor } : {}),
+      });
+      const page = await request("GET", path, { capToken: CAP.agent });
+      if (page && page.refreshing === true) {
+        AssistantState.sessionHistoryRefreshing = true;
+        if (Date.now() >= deadline) throw new Error("session_transport_unavailable");
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        continue;
+      }
+      AssistantState.sessionHistoryRefreshing = false;
+      if (Array.isArray(page.records)) records.push(...page.records);
+      cursor = page.next_cursor || null;
+      if (!cursor) break;
+    }
+    if (AssistantState.sessionHydrationSeq !== sequence
+        || AssistantState.selectedSessionId !== sessionId
+        || AssistantState.busy) return;
+    AssistantState.transcript = sessionRecordsToTranscript(records);
+    AssistantState.sessionHydratedId = sessionId;
+  })();
+  AssistantState.sessionHydrationId = sessionId;
+  AssistantState.sessionHydrationPromise = hydration;
+  try {
+    await hydration;
+    if (AssistantState.sessionHydrationSeq === sequence) {
+      AssistantState.sessionHydrationError = null;
+    }
+  } catch (error) {
+    if (AssistantState.sessionHydrationSeq === sequence) {
+      AssistantState.sessionHydrationError = "session_transport_unavailable";
+    }
+    throw error;
+  } finally {
+    if (AssistantState.sessionHydrationSeq === sequence) {
+      AssistantState.sessionHistoryRefreshing = false;
+      AssistantState.sessionHydrationId = null;
+      AssistantState.sessionHydrationPromise = null;
+      syncAssistantComposerControls();
+    }
+  }
+}
+
+async function retryAgentSessionHydration() {
+  const sessionId = AssistantState.selectedSessionId;
+  if (AssistantState.busy || AssistantState.sessionHydrationPromise) return;
+  AssistantState.sessionHydrationError = null;
+  if (!sessionId) {
+    await renderAssistantView($("#view"));
+    return;
+  }
+  AssistantState.sessionHydratedId = null;
+  syncAssistantComposerControls();
+  try {
+    await hydrateAgentSession(sessionId);
+    if (App.route === "assistant" && AssistantState.selectedSessionId === sessionId) {
+      await renderAssistantView($("#view"));
+    }
+  } catch (_) {
+    toast(agentSafeErrorCopy("session_transport_unavailable"), "err");
+    syncAssistantComposerControls();
+  }
+}
+
+async function loadSelectedAgentSession() {
+  const page = await request("GET", "/api/v1/agent/session/list?limit=100", {
+    capToken: CAP.agent,
+  });
+  const sessions = Array.isArray(page.sessions) ? page.sessions : [];
+  let selected = sessions.find((entry) => entry.session_id === page.selected_session_id);
+  if (!selected) selected = sessions.find((entry) => !entry.archived);
+  if (!selected) return null;
+  if (AssistantState.selectedSessionId !== selected.session_id) {
+    AssistantState.sessionHydratedId = null;
+    AssistantState.sessionHydrationError = null;
+  }
+  AssistantState.selectedSessionId = selected.session_id;
+  AssistantState.selectedSessionAccount = App.account;
+  return selected;
+}
+
+function closeAgentDialog(overlay) {
+  if (overlay) overlay.remove();
+}
+
+function agentPresenceConfirmCopy(kind) {
+  if (kind === "session_archive") return "Archive this Assistant session?";
+  if (kind === "session_pairing_reveal") return "Reveal a one-time session transfer code?";
+  return "Import the shared Assistant session on this device?";
+}
+
+function confirmAgentUserPresence(kind) {
+  if (MOBILE) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const overlay = el("div", { class: "assistant-lifecycle-dialog-wrap", role: "presentation" });
+    const close = (value) => { closeAgentDialog(overlay); resolve(value); };
+    const panel = el("section", {
+      class: "assistant-lifecycle-dialog",
+      role: "dialog",
+      "aria-modal": "true",
+      "aria-label": "Confirm Assistant session action",
+    },
+    el("h2", { text: "Confirm session action" }),
+    el("p", { text: agentPresenceConfirmCopy(kind) }),
+    el("div", { class: "assistant-lifecycle-dialog-actions" },
+      el("button", { class: "btn ghost", type: "button", onclick: () => close(false) }, "Cancel"),
+      el("button", { class: "btn primary", type: "button", onclick: () => close(true) }, "Confirm")));
+    const scrim = el("div", { class: "scrim", onclick: () => close(false) });
+    overlay.append(scrim, panel);
+    document.body.append(overlay);
+  });
+}
+
+async function authorizeAgentUserPresence(kind, binding) {
+  const challenge = await postJson("/api/v1/agent/user-presence/start", CAP.agent, {
+    request_id: crypto.randomUUID(),
+    kind,
+    binding,
+  });
+  if (!(await confirmAgentUserPresence(kind))) throw new Error("presence_cancelled");
+  await postJson("/api/v1/agent/user-presence/confirm", CAP.agent, {
+    request_id: crypto.randomUUID(),
+    operation_id: challenge.operation_id,
+    intent_id: challenge.intent_id,
+    token: challenge.token,
+    action_hash: challenge.action_hash,
+  });
+  return challenge.operation_id;
+}
+
+async function selectAgentSession(sessionId, overlay) {
+  await postJson("/api/v1/agent/session/select", CAP.agent, {
+    request_id: crypto.randomUUID(),
+    session_id: sessionId,
+  });
+  AssistantState.selectedSessionId = sessionId;
+  AssistantState.selectedSessionAccount = App.account;
+  AssistantState.sessionHydratedId = null;
+  AssistantState.sessionHydrationError = null;
+  AssistantState.transcript = [];
+  await hydrateAgentSession(sessionId);
+  closeAgentDialog(overlay);
+  await renderAssistantView($("#view"));
+}
+
+async function createAgentSession(overlay) {
+  const created = await postJson("/api/v1/agent/session/create", CAP.agent, {
+    request_id: crypto.randomUUID(),
+    display_name: "Assistant",
+  });
+  const session = created && created.session;
+  if (!session || !session.session_id) throw new Error("session_store_unavailable");
+  AssistantState.selectedSessionId = session.session_id;
+  AssistantState.selectedSessionAccount = App.account;
+  AssistantState.sessionHydratedId = session.session_id;
+  AssistantState.sessionHydrationError = null;
+  AssistantState.transcript = [];
+  closeAgentDialog(overlay);
+  await renderAssistantView($("#view"));
+}
+
+async function archiveAgentSession(sessionId, overlay) {
+  const operationId = await authorizeAgentUserPresence("session_archive", { session_id: sessionId });
+  await postJson("/api/v1/agent/session/archive", CAP.agent, {
+    request_id: crypto.randomUUID(),
+    operation_id: operationId,
+  });
+  AssistantState.selectedSessionId = null;
+  AssistantState.sessionHydratedId = null;
+  AssistantState.sessionHydrationError = null;
+  AssistantState.transcript = [];
+  closeAgentDialog(overlay);
+  await renderAssistantView($("#view"));
+}
+
+function showPairingCodeDialog(pairingCode, operationId, parentOverlay) {
+  closeAgentDialog(parentOverlay);
+  const overlay = el("div", { class: "assistant-lifecycle-dialog-wrap", role: "presentation" });
+  const close = () => closeAgentDialog(overlay);
+  const code = el("textarea", {
+    class: "input assistant-pairing-code",
+    readOnly: "readonly",
+    rows: "3",
+    "aria-label": "One-time session transfer code",
+  });
+  code.value = pairingCode;
+  const revoke = async () => {
+    try {
+      await postJson("/api/v1/agent/session/pairing/revoke", CAP.agent, {
+        request_id: crypto.randomUUID(), operation_id: operationId,
+      });
+      code.value = "Revoked";
+      toast("Session transfer revoked");
+    } catch (_) { toast("Could not revoke the transfer", "err"); }
+  };
+  const panel = el("section", { class: "assistant-lifecycle-dialog", role: "dialog", "aria-modal": "true" },
+    el("h2", { text: "Session transfer code" }),
+    el("p", { class: "dim", text: "This code expires in five minutes and can be claimed once." }),
+    code,
+    el("div", { class: "assistant-lifecycle-dialog-actions" },
+      el("button", { class: "btn danger", type: "button", onclick: revoke }, icon("ban", "icon-sm"), "Revoke"),
+      el("button", { class: "btn primary", type: "button", onclick: close }, "Done")));
+  overlay.append(el("div", { class: "scrim", onclick: close }), panel);
+  document.body.append(overlay);
+  code.select();
+}
+
+async function exportAgentSession(sessionId, overlay) {
+  const source = await postJson("/api/v1/agent/session/pairing/create", CAP.agent, {
+    request_id: crypto.randomUUID(), session_id: sessionId,
+  });
+  const operationId = await authorizeAgentUserPresence("session_pairing_reveal", {
+    session_id: sessionId,
+    pair_id: source.pair_id,
+  });
+  const revealed = await postJson("/api/v1/agent/session/pairing/reveal", CAP.agent, {
+    request_id: crypto.randomUUID(), operation_id: operationId,
+  });
+  showPairingCodeDialog(revealed.pairing_code, operationId, overlay);
+}
+
+async function importAgentSession(pairingCode, overlay) {
+  const operationId = await authorizeAgentUserPresence("session_pairing_import", {
+    pairing_code: pairingCode.trim(),
+  });
+  const claimed = await postJson("/api/v1/agent/session/pairing/claim", CAP.agent, {
+    request_id: crypto.randomUUID(), operation_id: operationId,
+  });
+  await postJson("/api/v1/agent/session/pairing/finalize", CAP.agent, {
+    request_id: crypto.randomUUID(), operation_id: operationId,
+  });
+  AssistantState.selectedSessionId = claimed.session_id;
+  AssistantState.selectedSessionAccount = App.account;
+  AssistantState.sessionHydratedId = null;
+  AssistantState.sessionHydrationError = null;
+  AssistantState.transcript = [];
+  await hydrateAgentSession(claimed.session_id);
+  closeAgentDialog(overlay);
+  await renderAssistantView($("#view"));
+}
+
+async function runAgentSessionUiAction(action) {
+  try {
+    await action();
+  } catch (error) {
+    toast(agentSafeErrorCopy(error && (error.code || error.message)), "err");
+  }
+}
+
+async function openAgentSessionDialog() {
+  try {
+    const page = await request("GET", "/api/v1/agent/session/list?limit=100", { capToken: CAP.agent });
+    const sessions = Array.isArray(page.sessions) ? page.sessions : [];
+    const overlay = el("div", { class: "assistant-lifecycle-dialog-wrap", role: "presentation" });
+    const close = () => closeAgentDialog(overlay);
+    const importInput = el("input", { class: "input", type: "text", placeholder: "isy2 transfer code", "aria-label": "Session transfer code" });
+    const rows = sessions.map((session) => el("div", { class: "assistant-session-row", "data-session-id": session.session_id },
+      el("div", { class: "assistant-session-name" },
+        el("b", { text: session.display_name || "Assistant" }),
+        el("span", { class: "dim", text: session.archived ? "Archived" : "Available" })),
+      el("div", { class: "assistant-session-actions" },
+        !session.archived ? el("button", { class: "btn ghost sm", type: "button", onclick: () => void runAgentSessionUiAction(() => selectAgentSession(session.session_id, overlay)), title: "Open session" }, icon("folder-open", "icon-sm")) : null,
+        !session.archived ? el("button", { class: "btn ghost sm", type: "button", onclick: () => void runAgentSessionUiAction(() => exportAgentSession(session.session_id, overlay)), title: "Transfer session" }, icon("share-2", "icon-sm")) : null,
+        !session.archived ? el("button", { class: "btn ghost sm", type: "button", onclick: () => void runAgentSessionUiAction(() => archiveAgentSession(session.session_id, overlay)), title: "Archive session" }, icon("archive", "icon-sm")) : null)));
+    const panel = el("section", { class: "assistant-lifecycle-dialog assistant-session-dialog", role: "dialog", "aria-modal": "true", "aria-label": "Assistant sessions" },
+      el("h2", { text: "Assistant sessions" }),
+      el("div", { class: "assistant-session-list" }, rows.length ? rows : el("p", { class: "dim", text: "No sessions yet." })),
+      el("div", { class: "assistant-session-import" }, importInput,
+        el("button", { class: "btn", type: "button", onclick: () => void runAgentSessionUiAction(() => importAgentSession(importInput.value, overlay)) }, icon("log-in", "icon-sm"), "Import")),
+      el("div", { class: "assistant-lifecycle-dialog-actions" },
+        el("button", { class: "btn", type: "button", onclick: () => void runAgentSessionUiAction(() => createAgentSession(overlay)) }, icon("plus", "icon-sm"), "New session"),
+        el("button", { class: "btn ghost", type: "button", onclick: close }, "Close")));
+    overlay.append(el("div", { class: "scrim", onclick: close }), panel);
+    document.body.append(overlay);
+  } catch (_) { toast("Sessions are temporarily unavailable", "err"); }
+}
+
 // Start a turn and stream its tokens into a fresh assistant bubble.
 async function agentSend(text) {
   const log = $("#asst-log"); if (!log) return;
-  if (!ASST_LOG.length) clear(log);   // drop the empty-state hint
+  if (!assistantCanUse(AssistantState.status)) {
+    toast("Reconnect the selected AI account before sending", "err");
+    renderAssistantView($("#view"));
+    return;
+  }
+  if (AssistantState.busy) { toast("Wait for the active turn", "err"); return; }
+  const provider = agentActiveProvider(AssistantState.status);
+  if (!agentPrivacyConsentAccepted(provider)) {
+    toast("Review privacy consent for " + agentProviderLabel(provider), "err");
+    renderAssistantView($("#view"));
+    return;
+  }
+  let sessionId = null;
+  let hydration = AssistantState.sessionHydrationPromise;
+  if (hydration) {
+    try {
+      while (hydration) {
+        await hydration;
+        hydration = AssistantState.sessionHydrationPromise;
+      }
+    } catch (_) {
+      toast(agentSafeErrorCopy("session_transport_unavailable"), "err");
+      return;
+    }
+    if (AssistantState.busy) {
+      toast("Wait for the active turn", "err");
+      return;
+    }
+  }
+  if (AssistantState.selectedSessionId
+      && AssistantState.sessionHydratedId !== AssistantState.selectedSessionId) {
+    const code = AssistantState.sessionHydrationError || "session_transport_unavailable";
+    toast(agentSafeErrorCopy(code), "err");
+    return;
+  }
+  try {
+    sessionId = await ensureAgentSession();
+    if (AssistantState.sessionHydratedId !== sessionId) {
+      await hydrateAgentSession(sessionId);
+    }
+  } catch (_) {
+    AssistantState.sessionHydrationError = "session_transport_unavailable";
+    toast(agentSafeErrorCopy("session_transport_unavailable"), "err");
+    renderAssistantView($("#view"));
+    return;
+  }
+  if (AssistantState.sessionHydratedId !== sessionId) {
+    toast(agentSafeErrorCopy("session_transport_unavailable"), "err");
+    return;
+  }
+  closeAssistantStream("new-turn");
+  if (!AssistantState.transcript.length) clear(log);   // drop the empty-state hint
 
-  ASST_LOG.push({ role: "user", text });
-  log.append(renderAsstMsg(ASST_LOG[ASST_LOG.length - 1]));
-  const asst = { role: "assistant", text: "", chips: [], stages: [], results: [] };
-  ASST_LOG.push(asst);
-  const asstEl = renderAsstMsg(asst);
+  AssistantState.transcript.push({ role: "user", text });
+  log.append(renderAssistantMessage(AssistantState.transcript[AssistantState.transcript.length - 1]));
+  const asst = { role: "assistant", text: "", chips: [], stages: [], results: [], tools: [], errors: [], citations: [], pending: null, doneReason: null };
+  AssistantState.transcript.push(asst);
+  AssistantState.busy = true;
+  AssistantState.turnCancelPending = false;
+  AssistantState.turnStreamReady = false;
+  AssistantState.draft = "";
+  AssistantState.activeMessage = asst;
+  syncAssistantComposerControls();
+  const asstEl = renderAssistantMessage(asst);
   log.append(asstEl);
   const textEl = asstEl.querySelector(".asst-text");
   const bubble = asstEl.querySelector(".asst-bubble");
@@ -4827,13 +7034,48 @@ async function agentSend(text) {
   textEl.textContent = "";
   const thinkingEl = el("div", { class: "asst-thinking" },
     el("span", { class: "asst-thinking-dot" }), el("span", { class: "asst-thinking-dot" }), el("span", { class: "asst-thinking-dot" }),
-    el("span", { class: "asst-thinking-label dim", text: "Searching your Microsoft 365…" }));
+    el("span", { class: "asst-thinking-label dim", text: "Preparing secure session…" }));
   bubble.insertBefore(thinkingEl, textEl);
   let thinkingDone = false;
   const clearThinking = () => { if (!thinkingDone) { thinkingDone = true; thinkingEl.remove(); } };
-  log.scrollTop = log.scrollHeight;
-  const setText = (t) => { if (t) clearThinking(); asst.text = t; textEl.textContent = t || ""; log.scrollTop = log.scrollHeight; };
-  const addChip = (label) => { asst.chips.push(label); bubble.append(el("div", { class: "dim", dataset: { chip: "1" }, style: "font-size:.78rem;margin-top:.35rem", text: label })); log.scrollTop = log.scrollHeight; };
+  const setProgress = (phase) => {
+    if (thinkingDone) return;
+    const label = thinkingEl.querySelector(".asst-thinking-label");
+    if (label && phase === "provider_started") label.textContent = "Thinking…";
+    scrollAssistantToEnd();
+  };
+  scrollAssistantToEnd();
+  const setText = (t) => { if (t) clearThinking(); asst.text = t; textEl.textContent = t || ""; scrollAssistantToEnd(); };
+  const addToolRow = (row) => {
+    clearThinking();
+    asst.tools.push(row);
+    bubble.append(renderAgentToolRow(row));
+    scrollAssistantToEnd();
+  };
+  const addError = (message) => {
+    clearThinking();
+    asst.errors.push(message);
+    bubble.append(renderAgentError(message));
+    scrollAssistantToEnd();
+  };
+  const setPending = (pending) => {
+    clearThinking();
+    asst.pending = pending;
+    const old = bubble.querySelector("[data-agent-pending-card]");
+    if (old) old.remove();
+    bubble.append(renderAgentPendingCard(pending));
+    scrollAssistantToEnd();
+  };
+  let citationsBox = null;
+  const addCitations = (sources) => {
+    const merged = dedupeAgentSources([...(asst.citations || []), ...(sources || [])]);
+    if (merged.length === (asst.citations || []).length) return;
+    asst.citations = merged;
+    if (citationsBox) citationsBox.remove();
+    citationsBox = renderAgentCitationBar(asst.citations);
+    bubble.append(citationsBox);
+    scrollAssistantToEnd();
+  };
 
   // Progressive-search UI (S-AG.18/#643): a small plan with a live checkmark per stage
   // and a result list that grows as PartialResult events arrive.
@@ -4845,7 +7087,7 @@ async function agentSend(text) {
     searchBox = el("div", { class: "asst-search" });
     resultsBox = el("div", { class: "asst-results" });
     bubble.append(searchBox, resultsBox);
-    log.scrollTop = log.scrollHeight;
+    scrollAssistantToEnd();
   };
   const onSearchStage = (d) => {
     ensureSearchUI();
@@ -4862,7 +7104,7 @@ async function agentSend(text) {
       const e = asst.stages.find(s => s.stage === d.stage);   // persist final stage state
       if (e) e.hits = d.hits; else asst.stages.push({ stage: d.stage, hits: d.hits });
     }
-    log.scrollTop = log.scrollHeight;
+    scrollAssistantToEnd();
   };
   const onPartialResult = (d) => {
     ensureSearchUI();
@@ -4870,97 +7112,358 @@ async function agentSend(text) {
       asst.results.push(it);                 // persist so the cards survive a view switch
       resultsBox.append(asstResultCard(it));  // module-level builder (shared with re-render)
     });
-    log.scrollTop = log.scrollHeight;
+    scrollAssistantToEnd();
   };
 
-  if (AGENT_ES) { try { AGENT_ES.close(); } catch (_) {} AGENT_ES = null; }
   let turn;
+  const requestId = crypto.randomUUID();
+  let startingGuardId = null;
+  let turnStartPosted = false;
+  let finish = null;
+  const reconcileRequestStatus = async () => {
+    if (!sessionId) return null;
+    try {
+      const status = await loadAgentRequestStatus(sessionId, requestId);
+      asst.requestStatus = status;
+      if (status && status.terminal && status.code
+          && status.code !== "ok" && status.code !== "turn_cancelled") {
+        const copy = agentSafeErrorCopy(status.code);
+        if (!asst.errors.includes(copy)) addError(copy);
+      }
+      return status;
+    } catch (_) {
+      return null;
+    }
+  };
   try {
-    const r = await post("/api/v1/agent/turn?" + qs({ account: App.account, prompt: text }), CAP.agent);
+    startingGuardId = await beginNetworkGuard("agent_turn");
+    if (BRIDGE && !startingGuardId) throw new Error("network_guard_unavailable");
+    await runConnectivityPreflight(provider, "turn_start", startingGuardId);
+    turnStartPosted = true;
+    const r = await postJson("/api/v1/agent/turn", CAP.agent, {
+      request_id: requestId,
+      session_id: sessionId,
+      account: App.account,
+      prompt: text,
+    });
     turn = r && r.turn;
-  } catch (e) { setText("Error: " + (e.message || e)); return; }
-  if (!turn) { setText("Error: could not start the turn"); return; }
+  } catch (e) {
+    // A bridge timeout after dispatch is ambiguous: the host may have committed a turn and merely
+    // lost the response. Abandon JS ownership and let the native starting deadline reap the lease.
+    // A preflight failure or an HTTP response is unambiguous and releases immediately.
+    const ambiguousStart = turnStartPosted && (!e || e.responseReceived !== true);
+    if (!ambiguousStart) {
+      await endNetworkGuard(startingGuardId);
+    }
+    AssistantState.busy = false;
+    AssistantState.turnCancelPending = false;
+    AssistantState.turnStreamReady = false;
+    AssistantState.activeMessage = null;
+    syncAssistantComposerControls();
+    asst.doneReason = "error";
+    if (e && e.connectivity) {
+      rememberConnectivityIssue(e, () => agentSend(text));
+      setText(CONNECTIVITY_COPY[AssistantState.connectivityIssue.code]);
+      renderAssistantView($("#view"));
+    } else {
+      setText(agentSafeErrorCopy(ambiguousStart ? "turn_outcome_unknown" : (e && e.message)));
+    }
+    if (ambiguousStart) {
+      void reconcileRequestStatus();
+    }
+    return;
+  }
+  if (!turn) {
+    await endNetworkGuard(startingGuardId);
+    AssistantState.busy = false;
+    AssistantState.turnCancelPending = false;
+    AssistantState.turnStreamReady = false;
+    AssistantState.activeMessage = null;
+    syncAssistantComposerControls();
+    setText("Error: could not start the turn");
+    return;
+  }
+  AssistantState.activeTurnId = turn;
+  syncAssistantComposerControls();
+  if (BRIDGE && startingGuardId) {
+    // Own the starting lease immediately. Even an ambiguous native bind response must be released
+    // on terminal/error/route teardown rather than lingering until its deadline.
+    TURN_GUARDS.set(turn, startingGuardId);
+    try {
+      await nativeCall("bindNetworkGuard", { guard_id: startingGuardId, turn }, NATIVE_TIMEOUT_MS);
+    } catch (_) {
+      // A lost bind response is ambiguous; local ownership still guarantees terminal cleanup.
+    }
+  }
 
   const url = "/api/v1/agent/stream?" + qs({ turn });
   // Transport-abstracted (#0A): the native bridge push channel on the phone, EventSource on
-  // desktop. The agent's events arrive as `message` (a data line to JSON-parse); a `done`
-  // event or a stream drop ends the turn.
+  // desktop. The agent's events arrive as `message` (a data line to JSON-parse). Only a
+  // host-emitted JSON terminal event completes the turn; a transport drop is reconciled.
   let stream;
-  const finish = (msg) => { clearThinking(); try { stream.close(); } catch (_) {} if (AGENT_ES === stream) AGENT_ES = null; if (!asst.text && msg) setText(msg); };
-  stream = openEventStream(url, (name, data) => {
-    if (name === "done") { finish("(no response)"); return; }
-    if (name !== "message") return; // ignore ping heartbeats
-    let d; try { d = JSON.parse(data); } catch (_) { return; }
-    switch (d.event) {
-      case "token": setText(asst.text + (d.text || "")); break;
-      case "search_stage": onSearchStage(d); break;
-      case "partial_result": onPartialResult(d); break;
-      // Raw tool calls (search/read/…) are internal — the stage checkmarks + result cards
-      // already show what's happening, so we don't surface "→ isyncyou read" noise.
-      case "tool_call": break;
-      case "confirmation_required": addChip("Needs your confirmation: " + (d.preview || "action")); break;
-      case "error": clearThinking(); setText(asst.text + (asst.text ? "\n" : "") + "⚠ " + (d.message || "error")); break;
-      case "done": finish("(no response)"); break;
+  let terminalReplayAttempted = false;
+  finish = (msg, terminalReason) => {
+    clearThinking();
+    if (AssistantState.activeStream === stream) closeAssistantStream("turn-finish");
+    else {
+      try { stream.close(); } catch (_) {}
+      void finishTurnGuard(turn);
     }
-  }, () => finish("⚠ connection lost"));
-  AGENT_ES = stream;
+    void terminalReason;
+    if (!asst.text && msg) setText(msg);
+  };
+  const finishFromRequestStatus = (status) => {
+    if (!status || !status.terminal || AssistantState.activeMessage !== asst
+        || AssistantState.activeTurnId !== turn) return false;
+    let reason = "error";
+    let fallback = "Turn ended with an error";
+    if (status.state === "cancelled" || status.code === "turn_cancelled") {
+      reason = "cancelled";
+      fallback = "Cancelled";
+    } else if (status.state === "committed" && status.code === "ok") {
+      reason = "complete";
+      fallback = "Completed";
+    } else if (status.state === "pending_confirmation") {
+      reason = "pending_confirmation";
+      fallback = "Waiting for confirmation";
+    }
+    asst.doneReason = reason;
+    finish(fallback, reason);
+    return true;
+  };
+  const turnState = {
+    message: asst,
+    setProgress,
+    setText,
+    addToolRow,
+    addError,
+    setPending,
+    addCitations,
+    onSearchStage,
+    onPartialResult,
+    finish,
+    reconcileRequestStatus,
+  };
+  const openTurnStream = () => openEventStream(url, (name, data) => {
+    if (name !== "message") return; // ignore ping heartbeats
+    let d;
+    try { d = JSON.parse(data); }
+    catch (_) {
+      addError("Invalid stream payload");
+      finish("Stream error");
+      return;
+    }
+    handleAgentEvent(d, turnState);
+  }, () => {
+    void (async () => {
+      const status = await reconcileRequestStatus();
+      if (status && status.terminal && !terminalReplayAttempted
+          && AssistantState.activeMessage === asst && AssistantState.activeTurnId === turn) {
+        terminalReplayAttempted = true;
+        try {
+          const replay = await postJson("/api/v1/agent/turn", CAP.agent, {
+            request_id: requestId,
+            session_id: sessionId,
+            account: App.account,
+            prompt: text,
+          });
+          if (replay && replay.turn === turn
+              && AssistantState.activeMessage === asst && AssistantState.activeTurnId === turn) {
+            stream = openTurnStream();
+            AssistantState.activeStream = stream;
+            return;
+          }
+        } catch (_) {
+          // Fall through to the already persisted closed status.
+        }
+      }
+      if (finishFromRequestStatus(status)) return;
+      if (AssistantState.activeMessage !== asst || AssistantState.activeTurnId !== turn) return;
+      finish("⚠ connection lost");
+    })();
+  });
+  stream = openTurnStream();
+  AssistantState.activeStream = stream;
+  AssistantState.turnStreamReady = true;
+  syncAssistantComposerControls();
 }
 
+const ACCOUNT_ROLE_META = Object.freeze({
+  reader: { label: "iSyncYou Reader", icon: "notebook" },
+  writer: { label: "iSyncYou Writer", icon: "pencil" },
+});
+function accountRoleStatus(a, role) {
+  const value = a && a.auth && a.auth[role];
+  return value && ["connected", "disconnected", "reconnect_required"].includes(value.state)
+    ? value : { state: "disconnected", identity_verified: false };
+}
+function accountRoleStateLabel(status) {
+  if (status.state === "connected") return status.identity_verified ? "Connected" : "Connected · verification pending";
+  if (status.state === "reconnect_required") return "Reconnect required";
+  return "Not connected";
+}
+async function reloadAccounts() {
+  const current = App.account;
+  const data = await api("/api/v1/accounts");
+  App.accounts = data.accounts || [];
+  App.account = App.accounts.some((account) => account.id === current)
+    ? current : (App.accounts[0] && App.accounts[0].id) || null;
+}
 function renderAccountMenu(body) {
   if (accountMenuPoll) { clearInterval(accountMenuPoll); accountMenuPoll = null; }
   clear(body);
   App.accounts.forEach(a => {
     const active = a.id === App.account;
-    const row = el("div", { class: "acct-row" + (active ? " active" : "") },
+    const row = el("div", { class: "acct-row" + (active ? " active" : "") });
+    row.append(el("div", { class: "acct-main" },
       el("span", { class: "avatar mail-av", style: "--c:var(--accent)", text: initials(a.username || a.id) }),
       el("button", { class: "acct-pick grow", title: "Switch to this account", onclick: () => { if (!active) { App.account = a.id; toast("Switched to " + (a.username || a.id)); closeAccountMenu(); onRoute(); } } },
         el("div", { class: "truncate", text: a.username || a.id }),
         el("div", { class: "dim", style: "font-size:11px", text: active ? "Active" : a.id })),
-      active ? icon("check", "icon-sm") : null);
+      active ? icon("check", "icon-sm") : null));
     if (CAP.account) {
-      const acts = el("div", { class: "acct-acts" });
-      acts.append(el("button", { class: "btn ghost sm icon-only", title: "Sign in / reconnect (device code)", onclick: () => startDeviceLogin(a, body) }, icon("rotate-ccw", "icon-sm")));
-      acts.append(el("button", { class: "btn ghost sm icon-only", style: "color:var(--danger,#f87171)", title: "Sign out — clear cached token", onclick: () => accountSignOut(a, body) }, icon("trash-2", "icon-sm")));
-      row.append(acts);
+      const roles = el("div", { class: "acct-roles" });
+      for (const role of ["reader", "writer"]) {
+        const meta = ACCOUNT_ROLE_META[role], status = accountRoleStatus(a, role);
+        const acts = el("div", { class: "acct-acts" });
+        if (status.state === "connected") {
+          acts.append(el("button", { class: "btn ghost sm icon-only", title: `Reconnect ${meta.label}`, onclick: () => startAccountLogin(a, role, body) }, icon("refresh-cw", "icon-sm")));
+          acts.append(el("button", { class: "btn ghost sm icon-only", style: "color:var(--danger,#f87171)", title: `Disconnect ${meta.label}`, onclick: () => accountSignOut(a, role, body) }, icon("x", "icon-sm")));
+        } else {
+          acts.append(el("button", { class: "btn sm", onclick: () => startAccountLogin(a, role, body) }, icon(status.state === "reconnect_required" ? "refresh-cw" : "external-link", "icon-sm"), status.state === "reconnect_required" ? "Reconnect" : "Connect"));
+        }
+        roles.append(el("div", { class: "acct-role" },
+          el("span", { class: "acct-role-icon" }, icon(meta.icon, "icon-sm")),
+          el("span", { class: "acct-role-copy" }, el("b", { text: meta.label }), el("span", { class: "dim", text: accountRoleStateLabel(status) })),
+          acts));
+      }
+      row.append(roles);
     }
     body.append(row);
   });
   body.append(el("div", { class: "acct-note dim" }, CAP.account
-    ? "Reconnect re-runs device-code sign-in. Adding a brand-new account still needs `isyncyou setup` (live add is the remaining backend work)."
+    ? "Reader and Writer are connected separately for each Microsoft account."
     : "Read-only server — account switching only."));
 }
-async function accountSignOut(a, body) {
-  try { const d = await post("/api/v1/account/signout?account=" + encodeURIComponent(a.id), CAP.account); toast(d.message || "Signed out"); }
-  catch (e) { toast("Sign-out failed: " + e.message, "err"); }
+async function accountSignOut(a, role, body) {
+  try {
+    const d = await postJson("/api/v1/account/signout", CAP.account, { request_id: crypto.randomUUID(), account: a.id, role });
+    await reloadAccounts();
+    toast(d.message || `${ACCOUNT_ROLE_META[role].label} disconnected`);
+  }
+  catch (_) { toast("Disconnect failed. Try again.", "err"); }
   renderAccountMenu(body);
 }
-async function startDeviceLogin(a, body) {
-  clear(body).append(el("div", { class: "acct-dc" }, el("div", { class: "spinner" }), el("div", { class: "dim", text: "Starting sign-in…" })));
-  let dc;
-  try { dc = await post("/api/v1/account/login/start?account=" + encodeURIComponent(a.id), CAP.account); }
-  catch (e) { toast("Sign-in failed: " + e.message, "err"); renderAccountMenu(body); return; }
-  const openDeviceLogin = async () => {
-    try {
-      await openExternalAuth(dc.verification_uri, "account_device_code", { newTab: true });
-    } catch (e) {
-      toast("Could not open sign-in page: " + (e.message || e), "err");
+async function startAccountLogin(a, role, body) {
+  const roleMeta = ACCOUNT_ROLE_META[role];
+  if (!roleMeta) return;
+  await accountMenuCancelPromise.catch(() => false);
+  if (accountMenuLogin) {
+    toast("The previous sign-in is still completing. Try again shortly.", "err");
+    renderAccountMenu(body);
+    return;
+  }
+  if (accountMenuPoll) { clearInterval(accountMenuPoll); accountMenuPoll = null; }
+  clear(body).append(el("div", { class: "acct-dc" }, el("div", { class: "spinner" }), el("div", { class: "dim", text: `Starting ${roleMeta.label} sign-in…` })));
+  let guardId = null;
+  try {
+    guardId = await beginNetworkGuard("oauth");
+    if (BRIDGE && !guardId) throw new Error("network_guard_unavailable");
+  } catch (_) {
+    toast("Sign-in could not be kept active while the browser is open.", "err");
+    renderAccountMenu(body);
+    return;
+  }
+  let login;
+  try { login = await postJson("/api/v1/account/login/start", CAP.account, { request_id: crypto.randomUUID(), account: a.id, role }); }
+  catch (_) { await endNetworkGuard(guardId); toast("Sign-in could not be started. Try again.", "err"); renderAccountMenu(body); return; }
+  if (login.flow !== "authorization_code_pkce" || login.role !== role || !login.authorization_uri || !login.login_id) {
+    await endNetworkGuard(guardId);
+    toast("Sign-in could not be started. Try again.", "err");
+    renderAccountMenu(body);
+    return;
+  }
+  accountMenuLogin = login.login_id;
+  ACCOUNT_LOGIN_GUARDS.set(login.login_id, guardId);
+  let attemptEnded = false;
+  let retryButton = null;
+  let pickerButton = null;
+  const attemptIsActive = () => !attemptEnded && accountMenuLogin === login.login_id;
+  const endAttempt = async (message, releaseGuard) => {
+    attemptEnded = true;
+    if (accountMenuLogin === login.login_id) accountMenuLogin = null;
+    if (pickerButton) pickerButton.disabled = true;
+    if (releaseGuard) await finishAccountLoginGuard(login.login_id);
+    status.textContent = message;
+    if (!retryButton) {
+      retryButton = el("button", { class: "btn sm primary", type: "button", onclick: () => startAccountLogin(a, role, body) }, "Start sign-in again");
+      status.after(retryButton);
     }
   };
-  const status = el("div", { class: "acct-dc-status dim", text: "Waiting for you to sign in…" });
+  const openAccountPicker = async () => {
+    if (!attemptIsActive()) {
+      toast("This sign-in attempt has ended. Start sign-in again.", "err");
+      return;
+    }
+    try {
+      await openExternalAuth(login.authorization_uri, "account_authorize", { newTab: true });
+    } catch (_) {
+      toast("Could not open the Microsoft sign-in page.", "err");
+    }
+  };
+  const status = el("div", { class: "acct-dc-status dim", text: "Waiting for Microsoft sign-in…" });
+  pickerButton = el("button", { class: "btn sm primary", type: "button", onclick: openAccountPicker }, icon("external-link", "icon-sm"), "Open Microsoft account picker");
   clear(body).append(el("div", { class: "acct-dc" },
-    el("div", { class: "acct-dc-title", text: "Sign in to " + (a.username || a.id) }),
-    el("p", { class: "dim", text: "Open the page and enter this code:" }),
-    el("div", { class: "acct-dc-code", text: dc.user_code || "—" }),
-    el("button", { class: "btn sm primary", type: "button", onclick: openDeviceLogin }, icon("external-link", "icon-sm"), "Open sign-in page"),
+    el("div", { class: "acct-dc-title", text: `Connect ${roleMeta.label}` }),
+    el("p", { class: "dim", text: "Microsoft will show the available accounts and an option to use another one." }),
+    pickerButton,
     status,
-    el("button", { class: "btn ghost sm", style: "margin-top:8px", onclick: () => renderAccountMenu(body) }, "Cancel")));
-  accountMenuPoll = setInterval(async () => {
+    el("button", { class: "btn ghost sm", style: "margin-top:8px", onclick: async () => {
+      if (await cancelAccountLogin()) renderAccountMenu(body);
+      else status.textContent = "Completing Microsoft sign-in…";
+    } }, "Cancel")));
+  let consecutivePollFailures = 0;
+  const schedulePoll = () => {
+    if (!attemptIsActive()) return;
+    accountMenuPoll = setTimeout(pollOnce, 3000);
+  };
+  const pollOnce = async () => {
+    accountMenuPoll = null;
+    if (!attemptIsActive()) return;
     let r;
-    try { r = await post("/api/v1/account/login/poll?id=" + encodeURIComponent(dc.login_id), CAP.account); }
-    catch (e) { clearInterval(accountMenuPoll); accountMenuPoll = null; status.textContent = "Poll error: " + e.message; return; }
-    if (r.state === "done") { clearInterval(accountMenuPoll); accountMenuPoll = null; toast("Signed in to " + (a.username || a.id)); closeAccountMenu(); onRoute(); }
-    else if (r.state === "error") { clearInterval(accountMenuPoll); accountMenuPoll = null; status.textContent = "Sign-in failed: " + (r.error || "unknown"); }
-  }, 3000);
+    try {
+      r = await postJson("/api/v1/account/login/poll", CAP.account, { request_id: crypto.randomUUID(), id: login.login_id });
+      if (consecutivePollFailures > 0) status.textContent = "Waiting for Microsoft sign-in…";
+      consecutivePollFailures = 0;
+    } catch (_) {
+      consecutivePollFailures += 1;
+      if (consecutivePollFailures < 3) {
+        status.textContent = "Reconnecting to the sign-in status…";
+        schedulePoll();
+        return;
+      }
+      await endAttempt("Connection to the sign-in status was lost.", false);
+      return;
+    }
+    if (r.state === "done" && r.role === role) {
+      attemptEnded = true;
+      if (accountMenuLogin === login.login_id) accountMenuLogin = null;
+      pickerButton.disabled = true;
+      await finishAccountLoginGuard(login.login_id);
+      await reloadAccounts();
+      toast(`${roleMeta.label} connected`);
+      renderAccountMenu(body);
+    } else if (r.state === "error") {
+      const message = r.code === "account_login_expired" ? "Sign-in expired."
+        : r.code === "account_identity_mismatch" ? "Reader and Writer must use the same Microsoft account."
+          : r.code === "account_identity_unverified" ? "The Microsoft account could not be verified. Reconnect the other role first."
+            : "Sign-in failed.";
+      await endAttempt(message, true);
+    } else {
+      schedulePoll();
+    }
+  };
+  schedulePoll();
 }
 
 /* ---------------------------------------------------------------- command palette */
@@ -4985,7 +7488,7 @@ function openPalette() {
     });
   };
   const jumps = [
-    ...SERVICES.map(s => ({ label: "Go to " + s.label, icon: s.icon, run: () => { closePalette(); go(s.id); } })),
+    ...visibleServices().map(s => ({ label: "Go to " + s.label, icon: s.icon, run: () => { closePalette(); go(s.id); } })),
     { label: "Go to Settings", icon: "settings", run: () => { closePalette(); go("settings"); } },
     { label: "Sync now", icon: "refresh-cw", run: () => { closePalette(); syncCmd("now"); } },
     { label: "Pause sync", icon: "pause", run: () => { closePalette(); syncCmd("pause"); } },
@@ -5073,7 +7576,7 @@ function setupSwipe() {
     if (dt > 600 || Math.abs(dx) < 64 || Math.abs(dx) < Math.abs(dy) * 1.6) return;
     if (sheetEl || palette) return;                       // overlay owns the gesture
     if (dx > 0 && mobileBack()) return;                   // right-swipe → back from detail
-    const order = SERVICES.map((s) => s.id);
+    const order = visibleServices().map((s) => s.id);
     const i = order.indexOf(App.route);
     if (i < 0) return;
     if (dx < 0 && i < order.length - 1) go(order[i + 1]); // left → next tab
@@ -5153,9 +7656,7 @@ async function init() {
     else if (e.key === "Escape" && sheetEl) closeSheet();
   });
   try {
-    const d = await api("/api/v1/accounts");
-    App.accounts = d.accounts || [];
-    if (App.accounts.length) App.account = App.accounts[0].id;
+    await reloadAccounts();
   } catch {}
   onRoute();
   subscribeEvents();

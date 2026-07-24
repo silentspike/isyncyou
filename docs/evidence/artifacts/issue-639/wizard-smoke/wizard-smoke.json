@@ -1,0 +1,129 @@
+{
+  "issue": 639,
+  "task": "T10",
+  "assertions": [
+    {
+      "name": "first-run wizard renders 8 steps",
+      "ok": true,
+      "details": {
+        "count": 8
+      }
+    },
+    {
+      "name": "wizard steps are the ordered handoff sequence",
+      "ok": true,
+      "details": [
+        "official_oauth_completed",
+        "credential_encrypted",
+        "retained_envelope_verified",
+        "default_harness_removed",
+        "m365_profile_activated",
+        "isyncyou_tool_connected",
+        "subscription_identity_set",
+        "ready"
+      ]
+    },
+    {
+      "name": "wizard chat surface absent on first run",
+      "ok": true
+    },
+    {
+      "name": "reconnect flow condenses the full step list",
+      "ok": true,
+      "details": {
+        "stepsCount": 0
+      }
+    },
+    {
+      "name": "reconnect wizard state is reconnect_required",
+      "ok": true,
+      "details": {
+        "wizardState": "reconnect_required"
+      }
+    },
+    {
+      "name": "reconnect surfaces a reconnect affordance",
+      "ok": true,
+      "details": {
+        "connectLabel": "Reconnect Claude"
+      }
+    },
+    {
+      "name": "manual code input is type=password",
+      "ok": true,
+      "details": {
+        "inputType": "password"
+      }
+    },
+    {
+      "name": "pasted code is not serialized into the DOM",
+      "ok": true
+    },
+    {
+      "name": "pasted code is not in localStorage/sessionStorage",
+      "ok": true,
+      "details": {
+        "keys": []
+      }
+    },
+    {
+      "name": "no secret in console output",
+      "ok": true
+    },
+    {
+      "name": "completion path clears the code input",
+      "ok": true
+    },
+    {
+      "name": "completion posts one strict JSON body with no query secret",
+      "ok": true,
+      "details": {
+        "request_count": 1,
+        "contract": {
+          "route": "oauth_complete",
+          "json": true,
+          "provider": "claude",
+          "attempt_id_present": true,
+          "pasted_code_present": true,
+          "query_empty": true
+        }
+      }
+    },
+    {
+      "name": "invalid OAuth start response releases the exact guard",
+      "ok": true,
+      "details": {
+        "events": [
+          "begin",
+          "end:guard-invalid-response"
+        ],
+        "attempt_retained": false,
+        "guard_retained": false
+      }
+    },
+    {
+      "name": "invalid OAuth start response clears the server attempt",
+      "ok": true,
+      "details": {
+        "events": [
+          "begin",
+          "end:guard-invalid-response"
+        ],
+        "attempt_retained": false,
+        "guard_retained": false
+      }
+    },
+    {
+      "name": "invalid OAuth start response clears local guard ownership",
+      "ok": true,
+      "details": {
+        "events": [
+          "begin",
+          "end:guard-invalid-response"
+        ],
+        "attempt_retained": false,
+        "guard_retained": false
+      }
+    }
+  ]
+}

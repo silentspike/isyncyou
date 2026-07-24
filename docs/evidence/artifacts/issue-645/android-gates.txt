@@ -1,0 +1,12 @@
+Issue #645 Android gates for implementation commit 65c2126db3402d361e4bfe6e04f901759619b523
+
+PASS Android unit tests and lintDebug
+PASS default APK clean assembleDebug and final reinstall after hook testing
+PASS AgentAccountLifecycleInstrumentedTest: 1 test
+PASS AgentAccountLifecycleHookInstrumentedTest.lifecycleHookIsFeatureGatedOwnerOnlyClosedAndOneShot: OK (1 test)
+PASS default APK marker absent: sha256 3de9f65fe44700f67a3571b3a290630c2170aee3bbde7e9048d1092953ee5006
+PASS hook APK marker present: sha256 9a5561c934864cf0cd1a9f0e177c31f1ca8fc02293c1f9afafbb4b41acdae869
+PASS final post-hook default APK: real Codex Connect, read-only turn, Reconnect, and post-Reconnect turn
+PASS physical Codex Switch between two controlled accounts and post-Switch turn on implementation commit
+
+No OAuth, PIN, account identity, device serial, callback, or raw platform log is included.

@@ -1,0 +1,54 @@
+{
+  "issue": 624,
+  "commit_under_test": "c8712610e2837c5bb2bbd26a6baaf31c8deaf886",
+  "scope": "desktop_agent_confirmed_operations",
+  "release_actions": {
+    "release_workflow_run": false,
+    "manual_tag": false,
+    "staging_or_main_promotion": false
+  },
+  "operations": {
+    "restore_local": {
+      "class": "read",
+      "execution": "immediate",
+      "path": "StoreArchive -> controlled restore root",
+      "redaction": "output path and byte count only; no model-controlled path"
+    },
+    "backup": {
+      "class": "destructive",
+      "execution": "PendingAction confirmation",
+      "path": "shared run_backup_account refresh runner",
+      "gate": "store gate held before cached token resolution"
+    },
+    "restore_cloud": {
+      "class": "destructive",
+      "execution": "PendingAction confirmation",
+      "path": "existing engine cloud restore semantics",
+      "redaction": "account/source/new ids redacted in API summary"
+    },
+    "live_write": {
+      "class": "destructive",
+      "execution": "PendingAction confirmation",
+      "path": "existing app-host writer traits",
+      "parser": "service-specific verb and field validation before pending and before execution",
+      "redaction": "body HTML/text, subjects, and recipient emails omitted from preview/audit/API summaries"
+    },
+    "share": {
+      "class": "destructive",
+      "execution": "PendingAction confirmation",
+      "path": "DaemonShare -> ledger-backed engine share/invite handler",
+      "redaction": "recipient count only for invite; share URLs not persisted or returned by Agent summary"
+    }
+  },
+  "confirm_contract": {
+    "stored_action_revalidated_before_started_audit": true,
+    "read_class_actions_rejected_in_confirm_path": true,
+    "mobile_destructive_execution_disabled_for_issue_624": true,
+    "api_success_summary_redacted": true,
+    "audit_order": [
+      "started",
+      "execute",
+      "ok_or_error"
+    ]
+  }
+}

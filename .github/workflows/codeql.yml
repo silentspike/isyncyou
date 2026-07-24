@@ -58,7 +58,7 @@ jobs:
         with:
           toolchain: "1.95.0"
           targets: aarch64-linux-android
-      - uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3 # v2.82.9
+      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
         if: matrix.language == 'java-kotlin'
         with:
           tool: cargo-ndk
@@ -69,15 +69,19 @@ jobs:
         if: matrix.language == 'java-kotlin'
         run: yes | sdkmanager --install "ndk;27.3.13750724"
 
-      - uses: github/codeql-action/init@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
+      - uses: github/codeql-action/init@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
 
       - name: Manual build (Kotlin)
         if: matrix.language == 'java-kotlin'
-        run: cd android && ./gradlew :app:assembleDebug
+        env:
+          ISY_ANDROID_NATIVE_BUILDER: github-actions
+        run: |
+          tools/build-android-native.sh
+          cd android && ./gradlew :app:assembleDebug
 
-      - uses: github/codeql-action/analyze@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
+      - uses: github/codeql-action/analyze@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
         with:
           category: "/language:${{ matrix.language }}"

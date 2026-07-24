@@ -1,0 +1,51 @@
+#639 S-AG.14 — onboarding state trace (redacted: ordered wire STATE names only; the journal
+never stores OAuth state/PKCE-verifier/code/authorize-url or any token/account value).
+
+DURABLE SUCCESS CHAIN (generation-keyed journal, recorded on a committed official OAuth)
+---------------------------------------------------------------------------------------
+Ordered transitions, index → wire state:
+  0  official_oauth_completed
+  1  credential_encrypted
+  2  retained_envelope_verified
+  3  default_harness_removed
+  4  m365_profile_activated
+  5  isyncyou_tool_connected
+  6  subscription_identity_set
+  7  ready
+
+Proven orderings (index-strict):
+  official_oauth_completed  <  credential_encrypted  <  ready
+  credential_encrypted      <  m365_profile_activated
+  credential_encrypted      <  default_harness_removed
+  retained_envelope_verified <  ready
+  default_harness_removed    <  ready
+  subscription_identity_set  <  ready ; ready is the terminal (last) transition.
+Readiness is FALSE before the commit and TRUE only after it (activation authority).
+
+IN-FLIGHT / TERMINAL TRANSITIONS (attempt-keyed journal)
+--------------------------------------------------------
+  official_sign_in_started  — recorded at oauth_start (Claude + Codex).
+  error_redacted            — recorded on cancel and on a timed-out / stale callback
+                              (error_code "cancelled" / "interrupted"); never resumed.
+
+CRASH-WINDOW RECOVERY (startup, over the durable authority; no re-exchange)
+--------------------------------------------------------------------------
+  window 1 (nothing written)      → not ready; a new OAuth attempt is required.
+  window 2 (bundle, no activation)→ re-attest + activate the SAME generation (no re-OAuth).
+  window 3 (bundle + activation, terminal journal entry missing) → append the success chain.
+
+VERIFYING TESTS (all PASS; app-host product suite 146 passed)
+-------------------------------------------------------------
+  official_oauth_precedes_credential_encryption_and_harness_transformation
+  credential_encrypted_before_harness_activation
+  custom_harness_blocked_before_retained_envelope_verified
+  custom_harness_blocked_before_default_harness_removed
+  custom_harness_enabled_only_after_subscription_identity_set
+  crash_after_credential_write_resumes_activation_without_reexchange
+  crash_before_credential_write_leaves_provider_not_ready
+  crash_after_activation_recovers_terminal_journal_transition
+  interrupted_oauth_attempt_records_error_redacted
+  status_projection_correct_after_journal_ttl_expiry
+
+Command: cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers
+Result:  test result: ok. 146 passed.

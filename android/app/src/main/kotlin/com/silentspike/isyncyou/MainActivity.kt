@@ -1,7 +1,10 @@
 package com.silentspike.isyncyou
 
 import android.Manifest
+import android.app.Activity
+import android.app.KeyguardManager
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.os.BatteryManager
@@ -23,6 +26,7 @@ import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.Lifecycle
 import androidx.webkit.JavaScriptReplyProxy
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
@@ -46,6 +50,7 @@ class MainActivity : FragmentActivity() {
     private companion object {
         const val TAG = "iSyncYou"
         const val BIO_TIMEOUT_MS = 120_000L
+        const val DEVICE_CREDENTIAL_REQUEST_CODE = 640
 
         /** The stable app origin the WebView loads from (#0A) — WebView's reserved
          *  virtual host. GET assets/subresources are served in-process via
@@ -70,26 +75,41 @@ class MainActivity : FragmentActivity() {
      *  blocking `nativeStreamNext` never stalls the UI thread or another request. */
     private val bridgeExecutor = Executors.newCachedThreadPool()
 
+    private fun dispatchBridge(block: () -> Unit): Boolean {
+        val accepted = BridgeDispatch.execute(bridgeExecutor, block)
+        if (!accepted) {
+            android.util.Log.i(TAG, "bridge dispatch ignored after Activity teardown")
+        }
+        return accepted
+    }
+
     /** JS stream id -> native stream id, for `unsub`/teardown (#0A). */
     private val bridgeStreams = ConcurrentHashMap<String, Long>()
 
     /** Latches true on the first bridge message so we log the live data path once (#0A). */
     private val bridgeSeen = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    private val oauthGuards = OAuthGuardRegistry(
-        onStart = { OAuthGuardService.start(this@MainActivity) },
-        onStop = { OAuthGuardService.stop(this@MainActivity) },
-    )
-
     private data class PendingBio(
-        val prompt: BiometricPrompt,
+        val requestId: String,
+        val prompt: BiometricPrompt?,
         val timeout: Runnable,
+        val reply: JavaScriptReplyProxy,
     )
 
-    private val bioPending = ConcurrentHashMap<String, PendingBio>()
+    private data class PendingPromptDescriptor(
+        val operation: String,
+        val label: String,
+    )
+
+    /** One active native prompt per opaque PendingAction handle. */
+    private val bioPending = BiometricPendingRegistry<PendingBio>()
+
+    /** The system lock-screen confirmation supports only one foreground request. */
+    private var activeDeviceCredential: Pair<String, String>? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        NetworkCriticalGuardRuntime.initialize(applicationContext)
 
         // Debuggable builds only: expose the WebView to chrome://inspect / CDP for
         // on-device debugging and verification. The FLAG_DEBUGGABLE bit is unset in release
@@ -110,7 +130,7 @@ class MainActivity : FragmentActivity() {
         web.clearCache(true)
         expireLegacySessionCookie()
         web.webViewClient = object : WebViewClient() {
-            // The app-origin UI stays in the WebView. Typed, exact auth/device-code
+            // The app-origin UI stays in the WebView. Typed, exact authorization
             // destinations are handed to the system browser. Everything else is consumed
             // fail-closed rather than loaded in-app.
             override fun shouldOverrideUrlLoading(
@@ -148,8 +168,8 @@ class MainActivity : FragmentActivity() {
                 val path = (url.encodedPath ?: "/") + (url.encodedQuery?.let { "?$it" } ?: "")
                 return try {
                     decodeAssetResponse(NativeEngine.nativeAssetRequestWithSession(path, sessionToken))
-                } catch (e: Exception) {
-                    android.util.Log.w(TAG, "asset serve failed for ${url.encodedPath}", e)
+                } catch (_: Exception) {
+                    android.util.Log.w(TAG, "asset_serve_failed")
                     null
                 }
             }
@@ -158,7 +178,7 @@ class MainActivity : FragmentActivity() {
             // smoke (REQ-AND-004) and handy for on-device diagnostics.
             override fun onPageFinished(view: WebView, url: String) {
                 if (url.startsWith(APP_ORIGIN)) {
-                    android.util.Log.i(TAG, "shell loaded: $url")
+                    android.util.Log.i(TAG, "shell_loaded")
                 }
             }
         }
@@ -207,11 +227,11 @@ class MainActivity : FragmentActivity() {
             try {
                 val token = EngineBootstrap.ensureStarted(filesDir)
                 runOnUiThread { onEngineReady(if (token.isEmpty()) -1 else 1, token) }
-            } catch (t: EncryptedStorageSetupException) {
-                android.util.Log.e(TAG, "encrypted storage setup failed; local data was not opened", t)
+            } catch (_: EncryptedStorageSetupException) {
+                android.util.Log.e(TAG, "encrypted_storage_setup_failed")
                 runOnUiThread { onEncryptedStorageFailed() }
-            } catch (t: Throwable) {
-                android.util.Log.e(TAG, "engine thread crashed starting the native engine", t)
+            } catch (_: Throwable) {
+                android.util.Log.e(TAG, "engine_start_failed")
                 runOnUiThread { onEngineReady(-1, "") }
             }
         }.start()
@@ -244,6 +264,9 @@ class MainActivity : FragmentActivity() {
         // traffic rides the preflighted origin-bound WebMessage bridge.
         android.util.Log.i(TAG, "engine ready (in-process), loading $APP_ORIGIN")
         pushDeviceState()
+        if (MobileJobWakeupPolicy.shouldReconcileAfterEngineReady(sessionToken)) {
+            dispatchBridge { MobileJobScheduler.reconcile(this) }
+        }
         web.loadUrl("$APP_ORIGIN/")
     }
 
@@ -261,8 +284,8 @@ class MainActivity : FragmentActivity() {
             val charging = getSystemService(BatteryManager::class.java)?.isCharging ?: true
             val freeBytes = StatFs(filesDir.absolutePath).availableBytes
             NativeEngine.nativeDeviceState(metered, charging, freeBytes)
-        } catch (t: Throwable) {
-            android.util.Log.w(TAG, "pushDeviceState failed", t)
+        } catch (_: Throwable) {
+            android.util.Log.w(TAG, "device_state_update_failed")
         }
     }
 
@@ -271,6 +294,27 @@ class MainActivity : FragmentActivity() {
         // Refresh the device conditions on return to the foreground (cheap; the engine's offline
         // pass reads the latest each cycle). Safe before the engine is up — it only sets a global.
         pushDeviceState()
+        try {
+            if (NativeEngine.nativeNetworkDeviceHooksEnabled()) {
+                NativeEngine.nativeArmCodexRefreshDeviceTestHook(filesDir.absolutePath)
+            }
+        } catch (_: UnsatisfiedLinkError) {
+            // The default product library intentionally omits the refresh evidence hook.
+        }
+        if (sessionToken.isNotEmpty()) dispatchBridge { MobileJobScheduler.reconcile(this) }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 1 && sessionToken.isNotEmpty()) {
+            // Notification denial leaves jobs queued; a later permission callback is
+            // an explicit reconciliation point, not an automatic retry loop.
+            dispatchBridge { MobileJobScheduler.reconcile(this) }
+        }
     }
 
     private fun currentPushToken(): String {
@@ -285,8 +329,8 @@ class MainActivity : FragmentActivity() {
                 setCookie("$APP_ORIGIN/", "isy_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT")
                 flush()
             }
-        } catch (t: Throwable) {
-            android.util.Log.w(TAG, "legacy session cookie cleanup failed", t)
+        } catch (_: Throwable) {
+            android.util.Log.w(TAG, "legacy_session_cookie_cleanup_failed")
         }
     }
 
@@ -329,8 +373,8 @@ class MainActivity : FragmentActivity() {
                 registrationSucceeded = true,
                 forcedDebugFailure = false,
             )
-        } catch (e: Exception) {
-            android.util.Log.w(TAG, "bridge preflight failed (${BridgeStartupDecision.FailRegistration.name})", e)
+        } catch (_: Exception) {
+            android.util.Log.w(TAG, "bridge_registration_failed")
             BridgeStartupPolicy.decide(
                 webMessageListenerSupported = true,
                 registrationSucceeded = false,
@@ -385,28 +429,29 @@ class MainActivity : FragmentActivity() {
             android.util.Log.i(TAG, "bridge active: first message t=$t")
         }
         when (t) {
-            "req" -> bridgeExecutor.execute {
+            "req" -> dispatchBridge {
                 if (sessionToken.isBlank()) {
                     postBridgeError(reply, validation.id, 503, "session_not_ready", "session_not_ready")
-                    return@execute
+                    return@dispatchBridge
                 }
                 val requestJson = sanitizedBridgeRequest(obj)
                 val resp = try {
                     NativeEngine.nativeBridgeRequest(requestJson)
-                } catch (e: Exception) {
-                    android.util.Log.w(TAG, "bridge request failed", e)
+                } catch (_: Exception) {
+                    android.util.Log.w(TAG, "bridge_request_failed")
                     BridgeMessagePolicy.responseJson(
                         validation.id,
                         500,
                         JSONObject().put("error", "internal_error"),
                     )
                 }
+                reconcileMobileJobsAfterSuccess(obj, resp)
                 reply.postMessage(resp)
             }
             "sub" -> {
                 val jsId = validation.id
                 val path = obj.optString("path")
-                bridgeExecutor.execute { runBridgeStream(jsId, path, reply) }
+                dispatchBridge { runBridgeStream(jsId, path, reply) }
             }
             "unsub" -> {
                 bridgeStreams.remove(validation.id)?.let { NativeEngine.nativeStreamClose(it) }
@@ -414,12 +459,12 @@ class MainActivity : FragmentActivity() {
             // #onedrive-mobile 0.6: the WebUI asks for a biometric before a destructive op.
             // We show BiometricPrompt HERE (native, WebView-unreachable) and only on success
             // arm the server's per-action token via nativeConfirmAction. The reply carries no
-            // token — just whether the human confirmed — so the WebView re-issues with `_pat`.
+            // token — just whether the human confirmed — so the WebView re-issues with the
+            // public pending handle in X-Per-Action-Token.
             "bio" -> {
                 val reqId = validation.id
                 val pat = obj.optString("pat")
-                val label = obj.optString("label").ifEmpty { "Confirm this action" }
-                runOnUiThread { runBiometric(reqId, pat, label, reply) }
+                runOnUiThread { runBiometric(reqId, pat, reply) }
             }
             "native" -> {
                 handleNativeMessage(obj, validation.id, reply)
@@ -427,13 +472,35 @@ class MainActivity : FragmentActivity() {
         }
     }
 
+    private fun reconcileMobileJobsAfterSuccess(request: JSONObject, response: String) {
+        val method = request.optString("method", "")
+        val path = request.optString("path", "")
+        val status = runCatching { JSONObject(response).optInt("status", -1) }.getOrDefault(-1)
+        if (MobileJobWakeupPolicy.shouldReconcile(method, path, status)) {
+            MobileJobScheduler.reconcile(this)
+        }
+    }
+
     private fun sanitizedBridgeRequest(obj: JSONObject): String {
+        val path = obj.optString("path", "/")
+        val storageNotLow = if (BridgeMessagePolicy.requiresTrustedStorageNotLow(path)) {
+            registerReceiver(null, IntentFilter(Intent.ACTION_DEVICE_STORAGE_LOW)) == null
+        } else {
+            null
+        }
         val out = JSONObject()
             .put("t", "req")
             .put("id", obj.optString("id", ""))
             .put("method", obj.optString("method", "GET"))
-            .put("path", obj.optString("path", "/"))
-            .put("headers", BridgeMessagePolicy.sanitizeHeaders(obj.optJSONObject("headers"), sessionToken))
+            .put("path", path)
+            .put(
+                "headers",
+                BridgeMessagePolicy.sanitizeHeaders(
+                    obj.optJSONObject("headers"),
+                    sessionToken,
+                    storageNotLow,
+                ),
+            )
         if (obj.has("body") && !obj.isNull("body")) {
             out.put("body", obj.opt("body"))
         } else {
@@ -453,8 +520,13 @@ class MainActivity : FragmentActivity() {
                 JSONObject().put("token", currentPushToken()),
             )
             "beginNetworkGuard" -> {
-                bridgeExecutor.execute {
-                    val result = oauthGuards.begin()
+                dispatchBridge {
+                    val reason = NetworkGuardReason.fromWire(payload.optString("reason", ""))
+                    val result = if (reason == null) {
+                        NetworkGuardBeginResult(null, "invalid_reason")
+                    } else {
+                        NetworkCriticalGuardRuntime.begin(reason)
+                    }
                     if (result.ok) {
                         postBridgeResponse(
                             reply,
@@ -469,13 +541,79 @@ class MainActivity : FragmentActivity() {
                 }
             }
             "endNetworkGuard" -> {
-                val ended = oauthGuards.end(payload.optString("guard_id", ""))
+                val ended = NetworkCriticalGuardRuntime.end(payload.optString("guard_id", ""))
                 postBridgeResponse(
                     reply,
                     id,
                     200,
                     JSONObject().put("ok", true).put("ended", ended),
                 )
+            }
+            "bindNetworkGuard" -> {
+                val bound = NetworkCriticalGuardRuntime.bindTurn(
+                    payload.optString("guard_id", ""),
+                    payload.optString("turn", ""),
+                )
+                postBridgeResponse(reply, id, if (bound) 200 else 409, JSONObject().put("ok", bound))
+            }
+            "captureNetworkSnapshot" -> {
+                dispatchBridge {
+                    val guardId = payload.optString("guard_id", "")
+                    val lease = NetworkCriticalGuardRuntime.activeLease(guardId)
+                    if (lease == null) {
+                        postBridgeError(reply, id, 409, "unavailable", "network_guard_unavailable")
+                        return@dispatchBridge
+                    }
+                    val hook = NetworkDeviceTestHook.take(applicationContext)
+                    if (hook == NetworkDeviceTestHook.ForegroundGuardUnavailable) {
+                        postBridgeError(reply, id, 503, "unavailable", "network_guard_unavailable")
+                        return@dispatchBridge
+                    }
+                    val captured = NetworkSnapshotProvider.capture(applicationContext)
+                    val snapshot = if (hook == NetworkDeviceTestHook.NoValidatedNetwork) {
+                        captured.copy(validatedCapability = false)
+                    } else {
+                        captured
+                    }
+                    val transportHook = when (hook) {
+                        NetworkDeviceTestHook.ConnectTimeout,
+                        NetworkDeviceTestHook.TlsFailed,
+                        NetworkDeviceTestHook.HttpFailed,
+                        -> hook.wire
+                        else -> ""
+                    }
+                    val handle = NativeEngine.nativeRegisterNetworkSnapshot(
+                        guardId,
+                        lease.reason.wire,
+                        snapshot.activeNetwork,
+                        snapshot.internetCapability,
+                        snapshot.validatedCapability,
+                        snapshot.metered,
+                        snapshot.restrictBackground,
+                        snapshot.notificationsVisible,
+                        transportHook,
+                    )
+                    if (handle.isBlank()) {
+                        postBridgeError(reply, id, 503, "unavailable", "network_snapshot_unavailable")
+                    } else {
+                        postBridgeResponse(reply, id, 200, JSONObject().put("snapshot_id", handle))
+                    }
+                }
+            }
+            "openNetworkSettings" -> {
+                val hint = NetworkSettingsHint.fromWire(payload.optString("hint", ""))
+                if (hint == null) {
+                    postBridgeError(reply, id, 400, "bad_request", "missing_or_unknown_settings_hint")
+                    return
+                }
+                runOnUiThread {
+                    val opened = NetworkSettingsPolicy.open(this, hint)
+                    if (opened) {
+                        postBridgeResponse(reply, id, 200, JSONObject().put("ok", true))
+                    } else {
+                        postBridgeError(reply, id, 503, "unavailable", "settings_unavailable")
+                    }
+                }
             }
             "openExternal" -> openExternalFromBridge(payload, id, reply)
             else -> postBridgeError(reply, id, 400, "bad_request", "unknown_op")
@@ -499,8 +637,8 @@ class MainActivity : FragmentActivity() {
             try {
                 startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)))
                 postBridgeResponse(reply, id, 200, JSONObject().put("ok", true))
-            } catch (e: Exception) {
-                android.util.Log.w(TAG, "external auth launch failed (${decision.reason})", e)
+            } catch (_: Exception) {
+                android.util.Log.w(TAG, "external_auth_launch_failed")
                 postBridgeError(reply, id, 500, "external_launch_failed", "launch_failed")
             }
         }
@@ -564,50 +702,75 @@ class MainActivity : FragmentActivity() {
             kg.generateKey()
         }
         Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, key) }
-    } catch (e: KeyPermanentlyInvalidatedException) {
+    } catch (_: KeyPermanentlyInvalidatedException) {
         // Biometric set changed → the old key is dead; drop it so the next attempt recreates it.
-        android.util.Log.w(TAG, "bio confirm key invalidated by new enrollment; recreating", e)
+        android.util.Log.w(TAG, "biometric_key_invalidated")
         try {
             KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry(bioKeyAlias)
         } catch (_: Exception) {
         }
         null
-    } catch (e: Exception) {
-        android.util.Log.w(TAG, "bio confirm key/cipher unavailable", e)
+    } catch (_: Exception) {
+        android.util.Log.w(TAG, "biometric_key_unavailable")
         null
     }
 
-    /**
-     * Show a `BiometricPrompt` (#onedrive-mobile 0.6, #WP-8). Prefer a **crypto-bound
-     * strong-biometric** confirmation: on success, run a crypto op with the biometric-unlocked
-     * Keystore key ([bioConfirmCipher]) — proof of a real strong-biometric auth. When **no strong
-     * biometric is enrolled**, fall back to a **device-credential (PIN/pattern)** confirmation:
-     * a CryptoObject cannot ride a device credential (Android restriction on all API levels), so
-     * the fallback is a plain user-presence gate — far better than denying a legitimate destructive
-     * op (requiring STRONG only regressed PIN-only devices). Either way, arm the server-side
-     * per-action token over the JNI-only [NativeEngine.nativeConfirmAction] path (the WebView
-     * cannot reach it) and reply `{t:"bio",id,ok}`. Must be called on the UI thread.
-     */
-    private fun runBiometric(reqId: String, pat: String, label: String, reply: JavaScriptReplyProxy) {
-        fun done(ok: Boolean) = completeBiometric(reqId, reply, ok)
+    /** Show a native prompt using only the Rust-owned pending descriptor. */
+    private fun runBiometric(reqId: String, pat: String, reply: JavaScriptReplyProxy) {
+        val descriptor = try {
+            JSONObject(NativeEngine.nativeDescribePendingAction(pat)).let { result ->
+                if (result.optString("status") != "ok") {
+                    return reply.postMessage(bioReplyJson(reqId, false, "descriptor_unavailable"))
+                }
+                val op = result.optString("op")
+                val service = result.optString("service")
+                if (op.isBlank() || service.isBlank()) {
+                    return reply.postMessage(bioReplyJson(reqId, false, "descriptor_unavailable"))
+                }
+                val label = BiometricLabelPolicy.label(op, service)
+                    ?: return reply.postMessage(bioReplyJson(reqId, false, "descriptor_unavailable"))
+                PendingPromptDescriptor(op, label)
+            }
+        } catch (_: Exception) {
+            android.util.Log.w(TAG, "pending_action_descriptor_unavailable")
+            reply.postMessage(bioReplyJson(reqId, false, "descriptor_unavailable"))
+            return
+        }
+        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+            reply.postMessage(bioReplyJson(reqId, false, "not_foreground"))
+            return
+        }
         val mgr = BiometricManager.from(this)
         val strong = BiometricManager.Authenticators.BIOMETRIC_STRONG
-        // Crypto-bound path only when a strong biometric is actually enrolled; otherwise fall back
-        // to a device-credential confirmation (no CryptoObject — the successful auth is the proof).
-        val cipher =
-            if (mgr.canAuthenticate(strong) == BiometricManager.BIOMETRIC_SUCCESS) bioConfirmCipher() else null
-        val authenticators =
-            if (cipher != null) strong else strong or BiometricManager.Authenticators.DEVICE_CREDENTIAL
-        if (mgr.canAuthenticate(authenticators) != BiometricManager.BIOMETRIC_SUCCESS) {
-            android.util.Log.w(TAG, "no biometric or device credential available; destructive op denied")
-            reply.postMessage(bioReplyJson(reqId, false))
+        val strongAvailable = mgr.canAuthenticate(strong) == BiometricManager.BIOMETRIC_SUCCESS
+        val cipher = if (strongAvailable) bioConfirmCipher() else null
+        val credential = BiometricManager.Authenticators.DEVICE_CREDENTIAL
+        val credentialAvailable = BiometricPolicy.credentialAvailable(
+            apiLevel = Build.VERSION.SDK_INT,
+            biometricManagerAvailable = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                mgr.canAuthenticate(credential) == BiometricManager.BIOMETRIC_SUCCESS,
+            keyguardDeviceSecure = getSystemService(KeyguardManager::class.java)?.isDeviceSecure == true,
+        )
+        val decision = BiometricPolicy.chooseForOperation(
+            descriptor.operation,
+            strongAvailable,
+            cipher != null,
+            credentialAvailable,
+        )
+        if (decision == null) {
+            android.util.Log.w(TAG, "biometric confirmation unavailable or strong cipher failed")
+            reply.postMessage(bioReplyJson(reqId, false, "not_available"))
+            return
+        }
+        if (decision.mode == BiometricMode.DeviceCredential) {
+            runDeviceCredential(reqId, pat, descriptor.label, reply)
             return
         }
         lateinit var prompt: BiometricPrompt
         val timeout = Runnable {
-            bioPending.remove(reqId)?.let { pending ->
-                pending.prompt.cancelAuthentication()
-                reply.postMessage(bioReplyJson(reqId, false))
+            takePendingBiometric(pat, reqId)?.let { pending ->
+                pending.prompt?.cancelAuthentication()
+                reply.postMessage(bioReplyJson(reqId, false, "timeout"))
             }
         }
         prompt = BiometricPrompt(
@@ -615,61 +778,154 @@ class MainActivity : FragmentActivity() {
             ContextCompat.getMainExecutor(this),
             object : BiometricPrompt.AuthenticationCallback() {
                 override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    val pending = takePendingBiometric(pat, reqId) ?: return
+                    mainHandler.removeCallbacks(pending.timeout)
                     val armed = try {
-                        if (cipher != null) {
+                        if (decision.mode == BiometricMode.StrongCrypto) {
                             // Crypto path: the op must succeed under the biometric-unlocked key —
                             // fail-closed if the result carries no crypto object.
                             result.cryptoObject?.cipher?.doFinal(pat.toByteArray(Charsets.UTF_8))
                                 ?: throw IllegalStateException("no crypto object in auth result")
                         }
-                        // Device-credential fallback has no crypto object; the successful auth is
-                        // itself the user-presence proof.
                         NativeEngine.nativeConfirmAction(pat)
-                    } catch (e: Exception) {
-                        android.util.Log.w(TAG, "confirm crypto/arming failed", e)
+                    } catch (_: Exception) {
+                        android.util.Log.w(TAG, "confirmation_arming_failed")
                         false
                     }
-                    done(armed)
+                    reply.postMessage(
+                        bioReplyJson(reqId, armed, if (armed) "confirmed" else "arming_failed"),
+                    )
                 }
 
-                override fun onAuthenticationError(code: Int, msg: CharSequence) = done(false)
+                override fun onAuthenticationError(code: Int, msg: CharSequence) {
+                    val closedCode = BiometricErrorPolicy.closedCode(code)
+                    android.util.Log.i(TAG, "native confirmation ended: $closedCode")
+                    completeBiometric(pat, reqId, reply, false, closedCode)
+                }
 
                 // A single non-match keeps the prompt up; no reply until success/error/cancel.
                 override fun onAuthenticationFailed() {}
             },
         )
-        bioPending.put(reqId, PendingBio(prompt, timeout))?.let { old ->
-            mainHandler.removeCallbacks(old.timeout)
-            old.prompt.cancelAuthentication()
+        val pending = PendingBio(reqId, prompt, timeout, reply)
+        if (!bioPending.register(pat, pending)) {
+            reply.postMessage(bioReplyJson(reqId, false, "busy"))
+            return
         }
         mainHandler.postDelayed(timeout, BIO_TIMEOUT_MS)
-        val info = BiometricPrompt.PromptInfo.Builder()
-            .setTitle("Confirm action")
-            .setSubtitle(label)
-            .setAllowedAuthenticators(authenticators)
-            .build()
-        if (cipher != null) {
-            prompt.authenticate(info, BiometricPrompt.CryptoObject(cipher))
-        } else {
-            prompt.authenticate(info)
+        try {
+            val info = BiometricPolicy.buildPromptInfo(
+                Build.VERSION.SDK_INT,
+                decision,
+                "Confirm action",
+                descriptor.label,
+            )
+            if (decision.mode == BiometricMode.StrongCrypto) {
+                prompt.authenticate(info, BiometricPrompt.CryptoObject(checkNotNull(cipher)))
+            } else {
+                prompt.authenticate(info)
+            }
+        } catch (_: Exception) {
+            android.util.Log.w(TAG, "biometric_prompt_start_failed")
+            completeBiometric(pat, reqId, reply, false, "start_failed")
         }
     }
 
-    private fun completeBiometric(reqId: String, reply: JavaScriptReplyProxy, ok: Boolean) {
-        val pending = bioPending.remove(reqId) ?: return
-        mainHandler.removeCallbacks(pending.timeout)
-        reply.postMessage(bioReplyJson(reqId, ok))
+    @Suppress("DEPRECATION")
+    private fun runDeviceCredential(
+        reqId: String,
+        pat: String,
+        label: String,
+        reply: JavaScriptReplyProxy,
+    ) {
+        if (activeDeviceCredential != null) {
+            reply.postMessage(bioReplyJson(reqId, false, "busy"))
+            return
+        }
+        val intent = getSystemService(KeyguardManager::class.java)
+            ?.createConfirmDeviceCredentialIntent("Confirm action", label)
+        if (intent == null) {
+            reply.postMessage(bioReplyJson(reqId, false, "not_available"))
+            return
+        }
+        val key = pat to reqId
+        val timeout = Runnable {
+            if (activeDeviceCredential != key) return@Runnable
+            activeDeviceCredential = null
+            runCatching { finishActivity(DEVICE_CREDENTIAL_REQUEST_CODE) }
+            completeBiometric(pat, reqId, reply, false, "timeout")
+        }
+        val pending = PendingBio(reqId, null, timeout, reply)
+        if (!bioPending.register(pat, pending)) {
+            reply.postMessage(bioReplyJson(reqId, false, "busy"))
+            return
+        }
+        activeDeviceCredential = key
+        mainHandler.postDelayed(timeout, BIO_TIMEOUT_MS)
+        try {
+            startActivityForResult(intent, DEVICE_CREDENTIAL_REQUEST_CODE)
+        } catch (_: Exception) {
+            android.util.Log.w(TAG, "device_credential_prompt_start_failed")
+            activeDeviceCredential = null
+            completeBiometric(pat, reqId, reply, false, "start_failed")
+        }
     }
 
-    private fun bioReplyJson(reqId: String, ok: Boolean): String =
-        JSONObject().put("t", "bio").put("id", reqId).put("ok", ok).toString()
+    @Deprecated("Android activity-result callback required by the system credential intent")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != DEVICE_CREDENTIAL_REQUEST_CODE) return
+        val (pat, reqId) = activeDeviceCredential ?: return
+        activeDeviceCredential = null
+        val pending = takePendingBiometric(pat, reqId) ?: return
+        mainHandler.removeCallbacks(pending.timeout)
+        val armed = if (resultCode == Activity.RESULT_OK) {
+            runCatching { NativeEngine.nativeConfirmAction(pat) }.getOrElse {
+                android.util.Log.w(TAG, "device_credential_arming_failed")
+                false
+            }
+        } else {
+            false
+        }
+        pending.reply.postMessage(
+            bioReplyJson(
+                reqId,
+                armed,
+                if (armed) "confirmed" else if (resultCode == Activity.RESULT_OK) "arming_failed" else "cancelled",
+            ),
+        )
+    }
+
+    private fun completeBiometric(
+        pat: String,
+        reqId: String,
+        reply: JavaScriptReplyProxy,
+        ok: Boolean,
+        code: String,
+    ) {
+        val pending = takePendingBiometric(pat, reqId) ?: return
+        mainHandler.removeCallbacks(pending.timeout)
+        reply.postMessage(bioReplyJson(reqId, ok, code))
+    }
+
+    private fun takePendingBiometric(pat: String, reqId: String): PendingBio? {
+        return bioPending.take(pat) { it.requestId == reqId }
+    }
+
+    private fun bioReplyJson(reqId: String, ok: Boolean, code: String): String =
+        JSONObject()
+            .put("t", "bio")
+            .put("id", reqId)
+            .put("ok", ok)
+            .put("code", code)
+            .toString()
 
     private fun cancelPendingBiometrics() {
-        val pending = bioPending.values.toList()
-        bioPending.clear()
-        pending.forEach {
+        activeDeviceCredential = null
+        runCatching { finishActivity(DEVICE_CREDENTIAL_REQUEST_CODE) }
+        bioPending.drain().forEach {
             mainHandler.removeCallbacks(it.timeout)
-            it.prompt.cancelAuthentication()
+            it.prompt?.cancelAuthentication()
         }
     }
 
@@ -756,13 +1012,11 @@ class MainActivity : FragmentActivity() {
         return super.onKeyDown(keyCode, event)
     }
 
-    /** Safety net: never leak the sign-in network guard past the Activity's life. */
+    /** Activity recreation must not clear application-owned network guard leases. */
     override fun onDestroy() {
         cancelPendingBiometrics()
         bridgeStreams.values.forEach { NativeEngine.nativeStreamClose(it) }
         bridgeStreams.clear()
-        oauthGuards.clear()
-        OAuthGuardService.stop(this)
         bridgeExecutor.shutdownNow()
         super.onDestroy()
     }

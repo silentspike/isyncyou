@@ -23,6 +23,8 @@ import re
 import sys
 from pathlib import Path
 
+from test_discovery import test_exists
+
 try:
     import yaml
 except ImportError:  # pragma: no cover - environment guard
@@ -44,22 +46,6 @@ def find_rust_sources(root: Path) -> list[Path]:
         if base.is_dir():
             files.extend(base.rglob("*.rs"))
     return files
-
-
-def test_exists(name: str, sources: list[Path], _cache: dict[str, bool]) -> bool:
-    if name in _cache:
-        return _cache[name]
-    pat = re.compile(r"\bfn\s+" + re.escape(name) + r"\s*\(")
-    found = False
-    for f in sources:
-        try:
-            if pat.search(f.read_text(encoding="utf-8", errors="ignore")):
-                found = True
-                break
-        except OSError:
-            continue
-    _cache[name] = found
-    return found
 
 
 def check_requirement(req: dict, root: Path, sources: list[Path], cache: dict) -> list[str]:
@@ -97,7 +83,7 @@ def check_requirement(req: dict, root: Path, sources: list[Path], cache: dict) -
             continue
         kind, value = next(iter(entry.items()))
         if kind == "test":
-            if req["status"] == "implemented" and not test_exists(value, sources, cache):
+            if req["status"] == "implemented" and not test_exists(root, value):
                 errs.append(f"{rid}: verified_by test '{value}' not found in source tree")
         elif kind == "file":
             if not (root / value).exists():

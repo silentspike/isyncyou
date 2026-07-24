@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "result": "pass",
+  "evidence_mode": "merged_live_baselines_plus_exact_head_regressions",
+  "merged_live_baseline_manifests": [
+    "docs/evidence/issue-624-manifest.json",
+    "docs/evidence/issue-625-manifest.json",
+    "docs/evidence/issue-626-manifest.json"
+  ],
+  "merged_live_baseline_manifests_valid": true,
+  "exact_head_confirmation_preview_redacted": true,
+  "exact_head_pending_cancel_non_confirmable": true,
+  "exact_head_turn_cancel_terminal_truthful": true,
+  "exact_head_mutating_request_binding_durable": true,
+  "exact_head_request_uuid_reuse_conflicts": true,
+  "exact_head_mutation_intent_chunks_bounded": true,
+  "fresh_destructive_cloud_mutations_created_for_closeout": false,
+  "unconfirmed_cloud_mutations": 0,
+  "duplicate_cloud_effects": 0,
+  "raw_operation_payload_included": false,
+  "recipient_identity_included": false
+}

@@ -19,7 +19,10 @@ argon2 = "0.5"
 # Live LLM HTTP transport (the agent's OWN client, not GraphClient). Off by default so
 # the pure-logic build (loop, tools, FakeProvider) stays fast and dependency-light;
 # the retry/backoff classification is pure and tested without this feature.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "stream"], optional = true }
+rustls = { version = "0.23", default-features = false, optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "time"], optional = true }
+futures-util = { version = "0.3", optional = true }
 # Real archive retrieval (Store + Config + export). Optional/off by default so the
 # pure core (loop, tools, FakeProvider, ArchiveSource logic) stays light; pulling the
 # store also pulls SQLCipher. The executor logic is generic over `ArchiveSource` and is
@@ -31,19 +34,37 @@ isyncyou-connectors = { path = "../connectors", default-features = false, option
 # model + crypto (tested over an in-memory transport) stay light. The caller passes a
 # pre-resolved Files.ReadWrite token, so no engine dependency is needed here.
 isyncyou-graph = { path = "../graph", default-features = false, optional = true }
+time = { version = "0.3", features = ["parsing"], optional = true }
+# non-optional: the encrypted-store bounded reader (`get_bounded`, #639) needs `O_NOFOLLOW`
+# in the default product build, not only under the experimental feature. libc is already in
+# the workspace graph transitively; making it direct here is minimal.
+libc = { version = "0.2" }
+# Cross-platform advisory product-runtime lock. Unlike a create-new sentinel, the OS releases this
+# automatically after a process crash.
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
 
+[[example]]
+name = "reduce_local_drift"
+path = "examples/reduce_local_drift.rs"
+required-features = ["agent-subscription-experimental"]
+
 [features]
-http = ["dep:reqwest"]
-onedrive = ["dep:isyncyou-graph", "isyncyou-graph/http"]
+http = ["dep:reqwest", "dep:rustls", "dep:tokio", "dep:futures-util"]
+onedrive = ["dep:isyncyou-graph", "isyncyou-graph/http", "dep:time"]
 # Match the desktop encrypted profile so store's rusqlite bundling resolves and unifies
 # with the rest of the workspace (everyone on encrypted-store → no bundling conflict).
 retrieval = ["dep:isyncyou-store", "dep:isyncyou-core", "dep:isyncyou-connectors", "isyncyou-store/encrypted-store"]
-# EXPERIMENTAL, UNSUPPORTED, personal-build only (S-AG.12/#627). Off by default; never in
-# CI/release artifacts or the README. The operator logs in via the official OAuth
-# device-code flow first; this harness then uses that legitimately-obtained token. The
-# wire details (endpoint, identity/billing headers, system prefix) come from a local,
-# uncommitted config — no reproducible recipe lives in the repo.
+# Product Claude/Codex OAuth-compatible provider runtime (#623). This enables the
+# agent-owned HTTP stack but does not by itself authorize local CLI credential
+# fallback; callers must load product credentials from their encrypted store.
+agent-oauth-providers = ["http"]
+# Legacy/future BYO public API-key provider surface. Kept default-off and deliberately
+# separate from #623 product OAuth so app-host/mobile cannot instantiate API-key providers.
+byo-api-providers = ["http"]
+# EXPERIMENTAL, UNSUPPORTED, personal-build only (#627). Off by default; not part of
+# #623 product acceptance. This keeps local CLI credential fallback/capture separated
+# from the product app-OAuth provider runtime above.
 agent-subscription-experimental = ["http"]

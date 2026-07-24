@@ -17,9 +17,10 @@ isyncyou-store = { path = "../store", default-features = false }
 isyncyou-webui = { path = "../../gui/webui", default-features = false }
 isyncyou-app-host = { path = "../app-host", default-features = false }
 isyncyou-engine = { path = "../engine", default-features = false }
-isyncyou-agent = { path = "../agent", optional = true }
+isyncyou-agent = { path = "../agent" }
 serde_json = { workspace = true }
 jni = "0.22"
+libc = "0.2"
 
 [features]
 # Android ships SQLCipher (#0B): the vendored-OpenSSL arm64 cross-build works via
@@ -27,7 +28,7 @@ jni = "0.22"
 # hardware-backed (Android Keystore) key. Body files get their own AES-256-GCM
 # envelope (`isyncyou-core::envelope`). With no key installed the store still opens
 # plaintext (host tests), so only the on-device run is encrypted.
-default = ["encrypted-store"]
+default = ["encrypted-store", "agent-oauth-providers"]
 plain-store = [
     "isyncyou-store/plain-store",
     "isyncyou-webui/plain-store",
@@ -40,14 +41,30 @@ encrypted-store = [
     "isyncyou-app-host/encrypted-store",
     "isyncyou-engine/encrypted-store",
 ]
-# EXPERIMENTAL, default-OFF, personal-build only (risk R8): the in-app subscription
-# OAuth login + provider. Enabled only for the operator's own APK via
-# ISY_CARGO_FEATURES; never in CI/release artifacts.
-agent-subscription-experimental = ["isyncyou-app-host/agent-subscription-experimental"]
+# Product Claude/Codex app-OAuth provider path (#623). Enabled in the default mobile
+# product feature set; credentials still load from the encrypted app/host store.
+agent-oauth-providers = ["isyncyou-app-host/agent-oauth-providers"]
 # TEST/EVIDENCE ONLY, default-OFF: exposes a JNI-only Argon2id/HKDF session-key
 # benchmark for Pixel evidence in #619. It is not wired to WebView, HTTP, or the normal
 # bridge, and release/CI builds leave ISY_CARGO_FEATURES unset.
-agent-session-kdf-bench = ["dep:isyncyou-agent"]
+agent-session-kdf-bench = []
+# TEST/EVIDENCE ONLY, default-OFF: exposes a JNI-only provider credential store self-test
+# for #620. It is not wired to WebView, HTTP, bridge, or production UI.
+agent-credential-store-self-test = []
+# TEST/EVIDENCE ONLY, default-OFF: propagate bounded native mobile-job hold
+# points to app-host. Never enabled by product/release builds.
+mobile-job-device-test-hooks = ["isyncyou-app-host/mobile-job-device-test-hooks"]
+# TEST/EVIDENCE ONLY, default-OFF (#640): bounded JNI-only network diagnostic
+# branches. Product and release APKs never enable this feature.
+agent-network-device-test-hooks = [
+    "agent-oauth-providers",
+    "isyncyou-app-host/agent-network-device-test-hooks",
+]
+# TEST/EVIDENCE ONLY, default-OFF (#645): JNI-only account-lifecycle checkpoints.
+agent-account-lifecycle-device-test-hooks = [
+    "agent-oauth-providers",
+    "isyncyou-app-host/agent-account-lifecycle-device-test-hooks",
+]
 
 [dev-dependencies]
 tempfile = "3"

@@ -11,7 +11,9 @@
 //! unit-tested deterministically without a network; `GraphClient` is the real impl.
 
 use crate::restore_key::{idempotency_key, load_or_create_secret, mail_marker};
-use crate::restore_recovery::{recover_restore_op, run_restore_op, RestoreSink};
+use crate::restore_recovery::{
+    recover_restore_op, run_restore_op, RestoreError, RestoreResult, RestoreSink,
+};
 use isyncyou_core::Config;
 use isyncyou_store::{RestoreState, Store};
 
@@ -31,6 +33,28 @@ pub trait MailApi {
     fn set_categories(&self, id: &str, categories: &[String]) -> Result<(), String>;
     /// Restore a message's importance (`low` / `high`).
     fn set_importance(&self, id: &str, importance: &str) -> Result<(), String>;
+
+    fn create_message_for_restore(&self, mime: &[u8]) -> RestoreResult<String> {
+        self.create_message(mime).map_err(RestoreError::internal)
+    }
+    fn find_by_message_id_for_restore(&self, message_id: &str) -> RestoreResult<Option<String>> {
+        self.find_by_message_id(message_id)
+            .map_err(RestoreError::internal)
+    }
+    fn set_read_for_restore(&self, id: &str, is_read: bool) -> RestoreResult<()> {
+        self.set_read(id, is_read).map_err(RestoreError::internal)
+    }
+    fn set_flag_for_restore(&self, id: &str, status: &str) -> RestoreResult<()> {
+        self.set_flag(id, status).map_err(RestoreError::internal)
+    }
+    fn set_categories_for_restore(&self, id: &str, categories: &[String]) -> RestoreResult<()> {
+        self.set_categories(id, categories)
+            .map_err(RestoreError::internal)
+    }
+    fn set_importance_for_restore(&self, id: &str, importance: &str) -> RestoreResult<()> {
+        self.set_importance(id, importance)
+            .map_err(RestoreError::internal)
+    }
 }
 
 impl MailApi for isyncyou_graph::GraphClient {
@@ -76,6 +100,51 @@ impl MailApi for isyncyou_graph::GraphClient {
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
+
+    fn create_message_for_restore(&self, mime: &[u8]) -> RestoreResult<String> {
+        let v = self
+            .create_message_from_mime(mime)
+            .map_err(RestoreError::from_graph)?;
+        v.get("id")
+            .and_then(|i| i.as_str())
+            .map(String::from)
+            .ok_or_else(|| RestoreError::invalid("created message response has no id"))
+    }
+
+    fn find_by_message_id_for_restore(&self, message_id: &str) -> RestoreResult<Option<String>> {
+        let url = format!(
+            "/me/messages?$filter=internetMessageId eq '{}'&$select=id&$top=1",
+            encode_filter_value(message_id)
+        );
+        let v = self.get_json(&url).map_err(RestoreError::from_graph)?;
+        Ok(v.get("value")
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first())
+            .and_then(|m| m.get("id"))
+            .and_then(|i| i.as_str())
+            .map(String::from))
+    }
+
+    fn set_read_for_restore(&self, id: &str, is_read: bool) -> RestoreResult<()> {
+        isyncyou_graph::GraphClient::set_read(self, id, is_read)
+            .map(|_| ())
+            .map_err(RestoreError::from_graph)
+    }
+    fn set_flag_for_restore(&self, id: &str, status: &str) -> RestoreResult<()> {
+        isyncyou_graph::GraphClient::set_flag(self, id, status, None, "UTC")
+            .map(|_| ())
+            .map_err(RestoreError::from_graph)
+    }
+    fn set_categories_for_restore(&self, id: &str, categories: &[String]) -> RestoreResult<()> {
+        isyncyou_graph::GraphClient::set_categories(self, id, categories)
+            .map(|_| ())
+            .map_err(RestoreError::from_graph)
+    }
+    fn set_importance_for_restore(&self, id: &str, importance: &str) -> RestoreResult<()> {
+        isyncyou_graph::GraphClient::set_importance(self, id, importance)
+            .map(|_| ())
+            .map_err(RestoreError::from_graph)
+    }
 }
 
 /// The archived MAPI state a restore re-applies to the new message (#562), parsed
@@ -109,22 +178,22 @@ impl MailRestoreState {
 
     /// Re-apply the non-default fields to the freshly-created message via `api`.
     /// Idempotent (Graph PATCHes), so safe on a committed-restore replay.
-    pub fn apply<A: MailApi>(&self, api: &A, id: &str) -> Result<(), String> {
+    pub fn apply<A: MailApi>(&self, api: &A, id: &str) -> RestoreResult<()> {
         if !self.categories.is_empty() {
-            api.set_categories(id, &self.categories)?;
+            api.set_categories_for_restore(id, &self.categories)?;
         }
         // A MIME-created message starts unread; only an explicit read needs a PATCH.
         if self.is_read == Some(true) {
-            api.set_read(id, true)?;
+            api.set_read_for_restore(id, true)?;
         }
         if let Some(s) = self.flag_status.as_deref() {
             if s != "notFlagged" {
-                api.set_flag(id, s)?;
+                api.set_flag_for_restore(id, s)?;
             }
         }
         if let Some(imp) = self.importance.as_deref() {
             if imp != "normal" {
-                api.set_importance(id, imp)?;
+                api.set_importance_for_restore(id, imp)?;
             }
         }
         Ok(())
@@ -154,12 +223,12 @@ pub struct MailSink<'a, A: MailApi> {
 }
 
 impl<A: MailApi> RestoreSink for MailSink<'_, A> {
-    fn create(&self, marker: &str, payload: &[u8]) -> Result<String, String> {
+    fn create(&self, marker: &str, payload: &[u8]) -> RestoreResult<String> {
         let mime = isyncyou_connectors::set_message_id(payload, marker);
-        self.api.create_message(&mime)
+        self.api.create_message_for_restore(&mime)
     }
-    fn find_by_marker(&self, marker: &str) -> Result<Option<String>, String> {
-        self.api.find_by_message_id(marker)
+    fn find_by_marker(&self, marker: &str) -> RestoreResult<Option<String>> {
+        self.api.find_by_message_id_for_restore(marker)
     }
 }
 
@@ -180,18 +249,29 @@ pub fn restore_mail_via_ledger(
     id: &str,
     token: String,
 ) -> Result<String, String> {
+    restore_mail_via_ledger_classified(cfg, account, id, token).map_err(|error| error.to_string())
+}
+
+pub(crate) fn restore_mail_via_ledger_classified(
+    cfg: &Config,
+    account: &str,
+    id: &str,
+    token: String,
+) -> RestoreResult<String> {
     let acc = cfg
         .accounts
         .iter()
         .find(|a| a.id == account)
-        .ok_or_else(|| format!("no account '{account}' in config"))?;
-    let (item, bytes) = crate::read_archived_body(cfg, account, "mail", id)?;
-    let secret = load_or_create_secret(&acc.archive_root.join(".isyncyou-restore-secret"))?;
+        .ok_or_else(|| RestoreError::invalid(format!("no account '{account}' in config")))?;
+    let (item, bytes) =
+        crate::read_archived_body(cfg, account, "mail", id).map_err(RestoreError::invalid)?;
+    let secret = load_or_create_secret(&acc.archive_root.join(".isyncyou-restore-secret"))
+        .map_err(RestoreError::internal)?;
     let key = idempotency_key(&secret, account, "mail", id, &bytes);
     let op_id = format!("{account}:{key}");
     let marker = mail_marker(&key);
-    let store =
-        Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    let store = Store::open(acc.archive_root.join(".isyncyou-store.db"))
+        .map_err(|e| RestoreError::internal(e.to_string()))?;
     let client = isyncyou_graph::GraphClient::new(token);
     let sink = MailSink { api: &client };
     let new_id = finish_mail_restore(
@@ -241,29 +321,29 @@ fn finish_mail_restore<S: RestoreSink>(
     payload: &[u8],
     sink: &S,
     now: i64,
-) -> Result<String, String> {
+) -> RestoreResult<String> {
     match store
         .get_restore_operation(op_id)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| RestoreError::internal(e.to_string()))?
     {
         // Already done: return the recorded id (no second create).
         Some(op) if op.state == RestoreState::Committed => op
             .new_cloud_id
-            .ok_or_else(|| "committed operation has no cloud id".to_string()),
+            .ok_or_else(|| RestoreError::internal("committed operation has no cloud id")),
         // Interrupted earlier: recover (reconcile by marker, or resume) — never blind-retry.
         Some(_) => {
             recover_restore_op(store, op_id, payload, sink, now)?;
             store
                 .get_restore_operation(op_id)
-                .map_err(|e| e.to_string())?
+                .map_err(|e| RestoreError::internal(e.to_string()))?
                 .and_then(|o| o.new_cloud_id)
-                .ok_or_else(|| "recovery did not record a cloud id".to_string())
+                .ok_or_else(|| RestoreError::internal("recovery did not record a cloud id"))
         }
         // Fresh: record intent, then drive the happy path.
         None => {
             store
                 .create_restore_operation(op_id, account, "mail", source_id, key, now)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| RestoreError::internal(e.to_string()))?;
             let (new_id, _) = run_restore_op(store, op_id, marker, payload, sink, now)?;
             Ok(new_id)
         }
@@ -327,8 +407,11 @@ pub fn recover_pending_mail_restores_with<S: RestoreSink>(
     let now = now_secs();
     let (mut ok, mut failed) = (0usize, 0usize);
     for op in ops.into_iter().filter(|o| o.service == "mail") {
-        let res = archived_mail_bytes(&store, acc, &op.source_item_id)
-            .and_then(|bytes| recover_restore_op(&store, &op.op_id, &bytes, sink, now).map(|_| ()));
+        let res = archived_mail_bytes(&store, acc, &op.source_item_id).and_then(|bytes| {
+            recover_restore_op(&store, &op.op_id, &bytes, sink, now)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
         match res {
             Ok(()) => ok += 1,
             Err(_) => failed += 1,
