@@ -3,14 +3,17 @@
 ## Identity and boundary
 
 The implementation commit is
-`a2b42aa83e83afeb09fc47d88c29c9b2f8a3c53d`, with tree
-`77abb7b8c737b34472ab93bb69ebdd638d045b30`. The pre-RC manifest pins only
+`54374b8fd121832238e2ad2f7dd8df67945ba67c`, with tree
+`2f7ea5b0ebde774643838ab33aa7296d17059b65`. This empty refreeze commit
+identifies the exact post-review implementation tree after the protected staging
+gate fixes. The pre-RC manifest pins only
 that existing commit. It does not contain a candidate commit/tree, release
 commit, final evidence commit, or self-reference.
 
-This package verifies the product integration before protected review and RC
-publication. It does not claim that a PR was merged, a promotion ran, an RC was
-published, or Issue #628 was closed.
+This package verifies the product integration before RC publication. Protected
+review and the manual fallback promotion reached `dev`, `staging`, and `main`
+with the same implementation tree. It does not claim that an RC was published
+or Issue #628 was closed.
 
 ## Verified implementation
 
@@ -36,43 +39,52 @@ published, or Issue #628 was closed.
 ## Runtime observations
 
 Real Claude and ChatGPT product OAuth each completed a read-only StoreArchive
-turn with a resolvable source on the exact implementation commit. The controlled
-Reader and Writer M365 roles remained connected, and desktop/mobile OneDrive
-quota observations matched across all five compared fields.
+turn with a resolvable source on
+`a2b42aa83e83afeb09fc47d88c29c9b2f8a3c53d`. That observation is reused
+without relabeling because provider OAuth, the custom harness, StoreArchive, and
+turn source are unchanged in the refreeze tree. The controlled Reader and Writer
+M365 roles remained connected, and desktop/mobile OneDrive quota observations
+matched across all five compared fields.
 
 The physical Pairing V2 and cross-device continuation observation remains pinned
 to `61651929d970fb778f05de245b5edc07a48d420d`. It is reused rather than
-relabeled: the only later production-source change is the account-lifecycle
-maintenance-pass scheduler and its regression test. Session manifests, pairing,
-transfer, and publication code are unchanged, and their full exact-head
-regression suite passes.
+relabeled. The later Pairing V2 change replaces an initialized temporary buffer
+plus `SystemRandom::fill` with `ring::rand::generate` using the same
+`SystemRandom` source; protocol, state transitions, AAD, transfer payload, and
+publication are unchanged. All 26 exact-tree pairing tests and the protected
+staging Android build and emulator smoke pass.
 
-The clean default APK and the separate hook APK are pinned by SHA-256 in their
-matrix files. Hook-only tests are not provider or product evidence. The default
-APK is rebuilt after hook testing and excludes all deliberate hook and
-experimental-subscription markers.
+The refreeze tree produced a clean default APK with SHA-256
+`e07599cef819445921314b5687c744f27b12785e97161366f412a779a9c2c698`.
+Both default-APK boundary scans pass. A physical reinstall was not repeated
+because no ADB device was available; the earlier physical default/hook
+observations remain separately pinned and are not relabeled. Hook-only tests are
+not provider or product evidence.
 
 ## Predecessor evidence
 
-The merged #624, #625, and #626 manifests remain the live-operation baselines;
-the exact implementation commit reruns the integration and idempotency
-regressions without creating unnecessary new destructive cloud fixtures. The
+The merged #624, #625, and #626 manifests remain the live-operation baselines.
+The full-matrix observation reran the integration and idempotency regressions
+without creating unnecessary new destructive cloud fixtures; the exact
+refreeze tree then passed the protected CI matrix for its bounded delta. The
 #639, #640, and #645 manifests validate, and their merge commits are ancestors
 of the candidate.
 
 Historical manifests for #618, #621, #623, and #627 contain six test names that
 were superseded by later contracts. They are not rewritten retroactively.
-`dependency-and-scope.json` records each old-to-current mapping, and every
-current replacement test passed in the exact-head workspace run.
+`dependency-and-scope.json` records each old-to-current mapping. Every current
+replacement test passed in the full-matrix observation and remains in unchanged
+source covered by the protected refreeze-tree CI.
 
 ## Gates
 
-The exact implementation commit passes the full remote workspace test matrix,
-workspace and feature Clippy, remote formatting, Cargo deny, JavaScript/Python
-contracts, UI smoke, traceability, Android JVM/lint/instrumentation, pinned
-Semgrep, Gitleaks, and product boundary scans. Actionlint remains valid from the
-immediately preceding implementation because its workflow scope did not change;
-protected PR CI reruns it before merge.
+The full remote workspace, Clippy, formatting, Android, UI, and live matrix is
+pinned to the preceding implementation observation. The refreeze delta is
+bounded to CI action pins, the Pairing V2 random-array call form, and the
+loopback-session-aware serve smoke. The exact refreeze tree passes the 26 pairing
+tests, native/default APK build, default marker scans, traceability, protected
+dev/staging/main CodeQL and secret scans, staging E2E/DAST, Android build/emulator,
+release build, and main vulnerability scan.
 
 No account identity, OAuth value, callback query, token, cookie, device serial,
 raw provider frame, raw platform log, prompt/answer body, pairing code, or
@@ -80,6 +92,6 @@ ToolResult is included in this package.
 
 ## Remaining release work
 
-Protected `dev` review and CI remain outstanding. Promotion, RC dispatch,
-published-artifact verification, the final evidence cascade, and explicit issue
-closure remain separately approval-gated. No stable tag belongs to Issue #628.
+RC dispatch, published-artifact verification, the final evidence cascade, and
+explicit issue closure remain separately approval-gated. No stable tag belongs
+to Issue #628.
