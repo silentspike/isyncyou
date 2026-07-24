@@ -1,7 +1,7 @@
 {
   "manifest_version": "1",
-  "generated_at": "2026-07-23T19:24:21Z",
-  "commit": "a2b42aa83e83afeb09fc47d88c29c9b2f8a3c53d",
+  "generated_at": "2026-07-24T07:13:07Z",
+  "commit": "54374b8fd121832238e2ad2f7dd8df67945ba67c",
   "entries": [
     {
       "id": "EV-001",
@@ -186,43 +186,43 @@
     {
       "id": "EV-019",
       "requirement": "REQ-AGENT-016",
-      "claim": "Desktop and mobile Assistant surfaces pass 62 setup, session, source, confirmation, cancellation, and redaction assertions.",
+      "claim": "The 62-assertion desktop/mobile Assistant observation remains applicable because UI source is unchanged in the refreeze tree.",
       "method": "command",
-      "command": "node tools/agent-ui-smoke.mjs --out /tmp/issue-628-ui-smoke-a2b42aa",
+      "command": "jq -e '.result == \"pass\" and .implementation_commit == \"54374b8fd121832238e2ad2f7dd8df67945ba67c\" and .ui_observation_reused and .current_tree_ui_source_unchanged and .assertions_passed == 62 and .assertions_failed == 0' docs/evidence/artifacts/issue-628/pre-rc/ui-smoke.json",
       "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-628/pre-rc/ui-smoke.json"
     },
     {
       "id": "EV-020",
       "requirement": "REQ-AGENT-016",
-      "claim": "Real Claude and ChatGPT product OAuth each completed a read-only StoreArchive turn with a resolvable source on the exact implementation commit.",
+      "claim": "Real Claude and ChatGPT read-only StoreArchive observations remain applicable because provider OAuth, harness, StoreArchive, and turn source are unchanged in the refreeze tree.",
       "method": "probe",
-      "command": "jq -e '.result == \"pass\" and .implementation_commit == \"a2b42aa83e83afeb09fc47d88c29c9b2f8a3c53d\" and .claude.read_only_storearchive_turn == \"complete\" and .claude.source_count_observed >= 1 and .claude.error_count == 0 and .claude.pending_actions == 0 and .codex.read_only_storearchive_turn == \"complete\" and .codex.source_count_observed >= 1 and .codex.error_count == 0 and .codex.pending_actions == 0 and .local_cli_origin_used == false and .account_identity_included == false' docs/evidence/artifacts/issue-628/pre-rc/provider-harness-matrix.json",
+      "command": "jq -e '.result == \"pass\" and .implementation_commit == \"54374b8fd121832238e2ad2f7dd8df67945ba67c\" and .live_observation_commit == \"a2b42aa83e83afeb09fc47d88c29c9b2f8a3c53d\" and .live_observation_reused and .claude.read_only_storearchive_turn == \"complete\" and .claude.source_count_observed >= 1 and .claude.error_count == 0 and .claude.pending_actions == 0 and .codex.read_only_storearchive_turn == \"complete\" and .codex.source_count_observed >= 1 and .codex.error_count == 0 and .codex.pending_actions == 0 and .local_cli_origin_used == false and .account_identity_included == false' docs/evidence/artifacts/issue-628/pre-rc/provider-harness-matrix.json",
       "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-628/pre-rc/provider-harness-matrix.json"
     },
     {
       "id": "EV-021",
       "requirement": "REQ-AGENT-016",
-      "claim": "The prior Pairing V2 physical observation remains applicable because the exact-head source delta is confined to account-lifecycle maintenance scheduling, while all exact-head session regressions pass.",
+      "claim": "The prior Pairing V2 physical observation remains applicable after the bounded SystemRandom call-form change because protocol and state are unchanged and all 26 exact-tree pairing tests plus protected Android/emulator gates pass.",
       "method": "probe",
-      "command": "jq -e '.result == \"pass\" and .implementation_commit == \"a2b42aa83e83afeb09fc47d88c29c9b2f8a3c53d\" and .exact_head_regressions_passed and .physical_observation_commit == \"61651929d970fb778f05de245b5edc07a48d420d\" and .physical_observation_reused and .desktop_to_android_transfer == \"pass\" and .android_to_desktop_continuation == \"pass\" and .desktop_visible_record_delta == 3 and .raw_pairing_code_included == false and .account_identity_included == false' docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json",
+      "command": "jq -e '.result == \"pass\" and .implementation_commit == \"54374b8fd121832238e2ad2f7dd8df67945ba67c\" and .regressions_applicable_to_refreeze_tree and .exact_head_pairing_tests == 26 and .protected_staging_android_and_emulator_run == 30072376660 and .physical_observation_commit == \"61651929d970fb778f05de245b5edc07a48d420d\" and .physical_observation_reused and .desktop_to_android_transfer == \"pass\" and .android_to_desktop_continuation == \"pass\" and .desktop_visible_record_delta == 3 and .raw_pairing_code_included == false and .account_identity_included == false' docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json",
       "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-628/pre-rc/shared-session-matrix.json"
     },
     {
       "id": "EV-022",
       "requirement": "REQ-AGENT-016",
-      "claim": "The exact implementation commit produced, tested, reinstalled, and marker-scanned a clean default APK after hook testing.",
+      "claim": "The exact refreeze commit produces and marker-scans a clean default APK, while the earlier physical reinstall remains separately pinned and the protected exact-tree emulator passes.",
       "method": "command",
-      "command": "test \"$(sha256sum /tmp/issue-628-default-a2b42aa.apk | cut -d' ' -f1)\" = \"e1aeeb08ebd22696b0ee8dc286d1176e008812b7b860fccc87314249af8fbdf9\" && python3 tools/verify-agent-network-boundary.py --root . --default-apk /tmp/issue-628-default-a2b42aa.apk --hook-apk /tmp/issue-628-hooks-a2b42aa.apk --output /tmp/issue-628-network-boundary-a2b42aa.json && python3 tools/verify-agent-account-lifecycle-boundary.py --root . --default-apk /tmp/issue-628-default-a2b42aa.apk --hook-apk /tmp/issue-628-hooks-a2b42aa.apk --output /tmp/issue-628-lifecycle-boundary-a2b42aa.json",
+      "command": "test \"$(sha256sum /tmp/issue-628-default-54374b8.apk | cut -d' ' -f1)\" = \"e07599cef819445921314b5687c744f27b12785e97161366f412a779a9c2c698\" && python3 tools/verify-agent-network-boundary.py --root . --default-apk /tmp/issue-628-default-54374b8.apk --hook-apk /tmp/issue-628-hooks-a2b42aa.apk --output /tmp/issue-628-network-boundary-54374b8.json && python3 tools/verify-agent-account-lifecycle-boundary.py --root . --default-apk /tmp/issue-628-default-54374b8.apk --hook-apk /tmp/issue-628-hooks-a2b42aa.apk --output /tmp/issue-628-lifecycle-boundary-54374b8.json && jq -e '.implementation_commit == \"54374b8fd121832238e2ad2f7dd8df67945ba67c\" and .exact_tree_build == \"pass\" and .exact_tree_boundary_scans == \"pass\" and .exact_tree_protected_emulator_smoke == \"pass\" and .physical_observation_reused' docs/evidence/artifacts/issue-628/pre-rc/default-apk-matrix.json",
       "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-628/pre-rc/default-apk-matrix.json"
     },
     {
       "id": "EV-023",
       "requirement": "REQ-AGENT-016",
-      "claim": "The separate exact-head hook APK exposes only bounded test controls and passes its one-shot lifecycle instrumentation.",
+      "claim": "The separately pinned hook APK exposes only bounded test controls; hook-control source is unchanged in the refreeze tree and the artifact is never used as product evidence.",
       "method": "test",
       "command": "(cd android && ISY_CARGO_FEATURES=agent-account-lifecycle-device-test-hooks,agent-credential-store-self-test,agent-network-device-test-hooks,mobile-job-device-test-hooks ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.silentspike.isyncyou.AgentCredentialKeyStoreInstrumentedTest,com.silentspike.isyncyou.MobileJobWorkerInstrumentedTest,com.silentspike.isyncyou.NetworkPreflightHookInstrumentedTest,com.silentspike.isyncyou.AgentAccountLifecycleHookInstrumentedTest)",
       "test": "lifecycleHookIsFeatureGatedOwnerOnlyClosedAndOneShot",
@@ -268,7 +268,7 @@
     {
       "id": "EV-028",
       "requirement": "REQ-AGENT-016",
-      "claim": "The exact implementation passes every changed-scope host, Android, policy, traceability, secret, and pinned static-analysis gate; unchanged feature and workflow baselines remain explicitly pinned for protected CI rerun.",
+      "claim": "The exact refreeze tree passes every changed-scope pairing, Android, policy, traceability, secret, protected static-analysis, staging, and main gate; unchanged full-matrix and physical observations remain explicitly pinned.",
       "method": "command",
       "command": "python3 tools/check_traceability.py && gitleaks git --redact --no-banner --log-opts=origin/dev..HEAD && docker run --rm -v \"$PWD\":/src -w /src semgrep/semgrep@sha256:a265d09a9ca712e6624aca09056304ce4314a695b7028d65c041dd53fd44c700 semgrep scan --config p/javascript --config p/kotlin --config p/secrets --config p/security-audit --error --metrics=off gui/webui android",
       "result": "pass",
