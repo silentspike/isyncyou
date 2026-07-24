@@ -1,7 +1,10 @@
 {
   "schema_version": 1,
   "result": "pass",
-  "implementation_commit": "a2b42aa83e83afeb09fc47d88c29c9b2f8a3c53d",
+  "implementation_commit": "54374b8fd121832238e2ad2f7dd8df67945ba67c",
+  "live_observation_commit": "a2b42aa83e83afeb09fc47d88c29c9b2f8a3c53d",
+  "live_observation_reused": true,
+  "live_observation_reuse_reason": "Provider OAuth, custom harness, StoreArchive, and turn source are unchanged between the live observation and the refreeze tree.",
   "claude": {
     "product_oauth_connected": true,
     "read_only_storearchive_turn": "complete",
@@ -21,7 +24,7 @@
   "m365_reader_writer_roles_connected": true,
   "quota_observation_commit": "61651929d970fb778f05de245b5edc07a48d420d",
   "quota_observation_reused": true,
-  "quota_observation_reuse_reason": "The exact-head source delta changes only account-lifecycle maintenance scheduling; provider quota projection code is unchanged and exact-head provider turns passed.",
+  "quota_observation_reuse_reason": "Provider quota projection code is unchanged in the refreeze tree.",
   "desktop_mobile_quota_fields_compared": 5,
   "desktop_mobile_quota_fields_matched": 5,
   "default_harness_components_present": false,
