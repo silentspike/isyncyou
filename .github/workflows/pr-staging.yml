@@ -126,8 +126,8 @@ jobs:
 
   # Deploy + token-free E2E against a real build: serve the seeded fixture and assert
   # the served security contract (status/CSP/asset-headers/404) plus the headless-UI
-  # invariants. No Microsoft-365 tokens (the desktop profile is open over loopback;
-  # the mobile 401 gate is covered by the crates/mobile test in `cargo test`).
+  # invariants. No Microsoft-365 tokens are used; the smoke obtains the process-local
+  # HttpOnly session cookie from the app shell before calling loopback API routes.
   staging-e2e:
     name: staging-e2e
     runs-on: ubuntu-latest
