@@ -24,6 +24,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from test_discovery import rust_test_exists, test_exists
+
 try:
     import jsonschema
 except ImportError:  # pragma: no cover - environment guard
@@ -49,24 +51,6 @@ def requirement_ids(root: Path) -> set[str]:
 
 
 SOURCE_DIRS = ("crates", "bin", "gui")
-
-
-def rust_test_exists(root: Path, name: str) -> bool:
-    """Whether a `fn <name>(` is defined anywhere in the Rust source tree."""
-    import re
-
-    pat = re.compile(r"\bfn\s+" + re.escape(name) + r"\s*\(")
-    for d in SOURCE_DIRS:
-        base = root / d
-        if not base.is_dir():
-            continue
-        for f in base.rglob("*.rs"):
-            try:
-                if pat.search(f.read_text(encoding="utf-8", errors="ignore")):
-                    return True
-            except OSError:
-                continue
-    return False
 
 
 def git_head(root: Path) -> str | None:
@@ -165,7 +149,7 @@ def main() -> int:
                 tname = entry.get("test")
                 if not tname:
                     errors.append(f"{ev}: method 'test' requires a 'test' field naming the function")
-                elif not rust_test_exists(root, tname):
+                elif not test_exists(root, tname):
                     errors.append(f"{ev}: test '{tname}' not found in the source tree")
             # Any cited artifact that is a repo-relative file must exist.
             artifact = entry.get("artifact")

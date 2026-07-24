@@ -4,6 +4,7 @@
   "private": true,
   "description": "CI-only headless UI smoke tooling for the staging-e2e job. Not part of the shipped product (the web UI is hand-written vanilla JS embedded into the Rust daemon).",
   "scripts": {
+    "agent-ui-smoke": "node tools/agent-ui-smoke.mjs",
     "ui-smoke": "node tools/ci-ui-smoke.mjs"
   },
   "devDependencies": {

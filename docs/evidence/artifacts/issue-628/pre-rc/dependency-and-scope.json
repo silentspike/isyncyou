@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-07-23T06:59:01Z",
+  "issue": 628,
+  "issue_state": "open",
+  "issue_label": "status:in-progress",
+  "epic": 614,
+  "epic_state": "open",
+  "scope_normalized": true,
+  "dependencies": {
+    "627": {
+      "state": "closed",
+      "merge_commit": "c2e6daf179ea7f306f5de9ba8621ccbd23019630",
+      "ancestor": true
+    },
+    "639": {
+      "state": "closed",
+      "merge_commit": "3fb0c4be8f5b7af8a9d778efd46db4947918c4e5",
+      "ancestor": true
+    },
+    "640": {
+      "state": "closed",
+      "merge_commit": "f088d4c4e70b8a360281968afe3f27f2bc07c5eb",
+      "ancestor": true
+    },
+    "645": {
+      "state": "closed",
+      "merge_commit": "f91b925e81af9e34a7283bd055c596c27f7bf5e9",
+      "ancestor": true
+    },
+    "777": {
+      "state": "closed",
+      "merge_commit": "e7a0a5159d18cd66125928eca30c1ef5327a65a2",
+      "ancestor": true
+    }
+  },
+  "story_disposition": {
+    "615": "superseded_provenance",
+    "616": "current_docs_and_traceability_rechecked",
+    "617": "merged_and_exact_head_regression_passed",
+    "618": "merged_and_exact_head_regression_passed",
+    "619": "merged_and_exact_head_regression_passed",
+    "620": "merged_and_exact_head_regression_passed",
+    "621": "merged_and_exact_head_regression_passed",
+    "622": "merged_and_exact_head_regression_passed",
+    "623": "merged_and_exact_head_regression_passed",
+    "624": "merged_live_baseline_and_exact_head_regression_passed",
+    "625": "merged_live_baseline_and_exact_head_regression_passed",
+    "626": "merged_live_baseline_and_exact_head_regression_passed",
+    "627": "merged_and_product_exclusion_rechecked",
+    "628": "pre_rc_candidate",
+    "639": "merged_and_manifest_revalidated",
+    "640": "merged_and_manifest_revalidated",
+    "641": "post_rc",
+    "642": "post_rc",
+    "643": "post_rc",
+    "644": "post_rc",
+    "645": "merged_and_manifest_revalidated"
+  },
+  "historical_manifest_readback": {
+    "valid": [
+      619,
+      620,
+      622,
+      624,
+      625,
+      626,
+      639,
+      640,
+      645
+    ],
+    "superseded_test_references": [
+      {
+        "issue": 618,
+        "old_test": "experimental_agent_executor_reads_store_archive_fixture",
+        "current_test": "live_provider_agent_executor_reads_store_archive_fixture"
+      },
+      {
+        "issue": 621,
+        "old_test": "agent_chat_alias_matches_turn_route",
+        "current_test": "agent_chat_alias_and_legacy_turn_query_are_rejected"
+      },
+      {
+        "issue": 623,
+        "old_test": "build_request_uses_responses_shape_with_instructions_and_tool",
+        "current_test": "build_request_uses_responses_lite_shape_for_current_models"
+      },
+      {
+        "issue": 627,
+        "old_test": "corrupt_product_credential_streams_error_and_done_error",
+        "current_test": "corrupt_product_credential_rejects_turn_without_stream"
+      },
+      {
+        "issue": 627,
+        "old_test": "expired_product_credential_streams_error_and_done_error",
+        "current_test": "expired_product_credential_rejects_turn_without_stream"
+      },
+      {
+        "issue": 627,
+        "old_test": "codex_callback_diagnostics_persist_only_safe_booleans",
+        "current_test": "daemon_agent_startup_removes_legacy_codex_callback_diagnostics"
+      }
+    ],
+    "historical_manifests_rewritten": false,
+    "current_tests_present_and_passed": true
+  },
+  "open_pull_requests": 5,
+  "blocking_feature_pull_requests": 0,
+  "promotion_workflows": {
+    "promote": "disabled_manually",
+    "promote_watchdog": "disabled_manually"
+  },
+  "active_promotion_or_release_runs": 0,
+  "release_created": false
+}

@@ -13,6 +13,89 @@
 
 use isyncyou_store::{RestoreState, Store};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreFailureKind {
+    Network,
+    Timeout,
+    Http(u16),
+    Authentication,
+    Invalid,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreError {
+    pub kind: RestoreFailureKind,
+    message: String,
+}
+
+impl RestoreError {
+    pub fn invalid(message: impl Into<String>) -> Self {
+        Self {
+            kind: RestoreFailureKind::Invalid,
+            message: message.into(),
+        }
+    }
+
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self {
+            kind: RestoreFailureKind::Internal,
+            message: message.into(),
+        }
+    }
+
+    pub fn authentication() -> Self {
+        Self {
+            kind: RestoreFailureKind::Authentication,
+            message: "authentication required".to_string(),
+        }
+    }
+
+    pub fn from_graph(error: isyncyou_graph::http::UploadError) -> Self {
+        use isyncyou_graph::http::GraphTransientFailure;
+        let kind = match error.transient_failure() {
+            Some(GraphTransientFailure::Network) => RestoreFailureKind::Network,
+            Some(GraphTransientFailure::Timeout) => RestoreFailureKind::Timeout,
+            Some(GraphTransientFailure::Http(status)) => RestoreFailureKind::Http(status),
+            None => match error {
+                isyncyou_graph::http::UploadError::Http { status: 401, .. } => {
+                    RestoreFailureKind::Authentication
+                }
+                isyncyou_graph::http::UploadError::Http { status, .. } => {
+                    RestoreFailureKind::Http(status)
+                }
+                _ => RestoreFailureKind::Internal,
+            },
+        };
+        Self {
+            kind,
+            message: "Graph cloud restore failed".to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for RestoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RestoreError {}
+
+impl From<String> for RestoreError {
+    fn from(message: String) -> Self {
+        Self::internal(message)
+    }
+}
+
+impl From<&str> for RestoreError {
+    fn from(message: &str) -> Self {
+        Self::internal(message)
+    }
+}
+
+pub type RestoreResult<T> = Result<T, RestoreError>;
+
 /// The cloud side of a restore, abstracted so recovery can be tested with an injected
 /// crash. A real implementation calls Microsoft Graph.
 pub trait RestoreSink {
@@ -20,11 +103,11 @@ pub trait RestoreSink {
     /// This models a real `POST`: it is **not** idempotent — calling it twice creates
     /// two items. Safety comes from the ledger + [`RestoreSink::find_by_marker`], not
     /// from here. Returns the new cloud id.
-    fn create(&self, marker: &str, payload: &[u8]) -> Result<String, String>;
+    fn create(&self, marker: &str, payload: &[u8]) -> RestoreResult<String>;
 
     /// Find an already-created item by its marker; returns its cloud id if present.
     /// This is the probe that makes recovery safe after a crash.
-    fn find_by_marker(&self, marker: &str) -> Result<Option<String>, String>;
+    fn find_by_marker(&self, marker: &str) -> RestoreResult<Option<String>>;
 }
 
 /// What driving or recovering one restore operation did.
@@ -49,7 +132,7 @@ pub fn run_restore_op<S: RestoreSink>(
     payload: &[u8],
     sink: &S,
     now: i64,
-) -> Result<(String, RestoreOutcome), String> {
+) -> RestoreResult<(String, RestoreOutcome)> {
     tr_marker(
         store,
         op_id,
@@ -74,7 +157,7 @@ pub fn recover_restore_op<S: RestoreSink>(
     payload: &[u8],
     sink: &S,
     now: i64,
-) -> Result<RestoreOutcome, String> {
+) -> RestoreResult<RestoreOutcome> {
     let op = store
         .get_restore_operation(op_id)
         .map_err(|e| e.to_string())?
@@ -123,10 +206,10 @@ pub fn recover_restore_op<S: RestoreSink>(
     }
 }
 
-fn tr(store: &Store, op_id: &str, to: RestoreState, now: i64, detail: &str) -> Result<(), String> {
+fn tr(store: &Store, op_id: &str, to: RestoreState, now: i64, detail: &str) -> RestoreResult<()> {
     store
         .transition_restore(op_id, to, now, Some(detail), None, None)
-        .map_err(|e| e.to_string())
+        .map_err(|e| RestoreError::internal(e.to_string()))
 }
 
 fn tr_marker(
@@ -136,13 +219,13 @@ fn tr_marker(
     now: i64,
     detail: &str,
     marker: Option<&str>,
-) -> Result<(), String> {
+) -> RestoreResult<()> {
     store
         .transition_restore(op_id, to, now, Some(detail), None, marker)
-        .map_err(|e| e.to_string())
+        .map_err(|e| RestoreError::internal(e.to_string()))
 }
 
-fn commit(store: &Store, op_id: &str, now: i64, detail: &str, new_id: &str) -> Result<(), String> {
+fn commit(store: &Store, op_id: &str, now: i64, detail: &str, new_id: &str) -> RestoreResult<()> {
     store
         .transition_restore(
             op_id,
@@ -152,7 +235,7 @@ fn commit(store: &Store, op_id: &str, now: i64, detail: &str, new_id: &str) -> R
             Some(new_id),
             None,
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| RestoreError::internal(e.to_string()))
 }
 
 #[cfg(test)]
@@ -178,7 +261,7 @@ mod tests {
         }
     }
     impl RestoreSink for FakeCloud {
-        fn create(&self, marker: &str, _payload: &[u8]) -> Result<String, String> {
+        fn create(&self, marker: &str, _payload: &[u8]) -> RestoreResult<String> {
             *self.create_calls.borrow_mut() += 1;
             let mut seq = self.seq.borrow_mut();
             *seq += 1;
@@ -188,7 +271,7 @@ mod tests {
                 .push((marker.to_string(), id.clone()));
             Ok(id)
         }
-        fn find_by_marker(&self, marker: &str) -> Result<Option<String>, String> {
+        fn find_by_marker(&self, marker: &str) -> RestoreResult<Option<String>> {
             Ok(self
                 .items
                 .borrow()

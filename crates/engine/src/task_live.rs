@@ -26,6 +26,14 @@ pub trait TaskWriter {
     fn complete(&self, list_id: &str, task_id: &str) -> Result<(), String>;
     /// Delete a task.
     fn delete(&self, list_id: &str, task_id: &str) -> Result<(), String>;
+    /// Delete a validated selection. Implementations may use the provider's
+    /// bounded batch API; the default preserves compatibility for test fakes.
+    fn delete_batch(&self, items: &[(String, String)]) -> Result<(), String> {
+        for (list_id, task_id) in items {
+            self.delete(list_id, task_id)?;
+        }
+        Ok(())
+    }
     /// Add a checklist item (step) to a task; returns the new item id.
     fn checklist_add(&self, list_id: &str, task_id: &str, title: &str) -> Result<String, String>;
     /// Tick / untick a checklist item.
@@ -49,6 +57,13 @@ fn id_of(v: &Value, what: &str) -> Result<String, String> {
         .and_then(Value::as_str)
         .map(String::from)
         .ok_or_else(|| format!("{what} response has no id"))
+}
+
+fn normalize_task_delete(result: Result<(), isyncyou_graph::UploadError>) -> Result<(), String> {
+    match result {
+        Ok(()) | Err(isyncyou_graph::UploadError::Http { status: 404, .. }) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 // Inherent GraphClient methods share names with the trait (`create`/`update`/
@@ -78,7 +93,13 @@ impl TaskWriter for isyncyou_graph::GraphClient {
         .map_err(|e| e.to_string())
     }
     fn delete(&self, list_id: &str, task_id: &str) -> Result<(), String> {
-        isyncyou_graph::GraphClient::delete_task(self, list_id, task_id).map_err(|e| e.to_string())
+        normalize_task_delete(isyncyou_graph::GraphClient::delete_task(
+            self, list_id, task_id,
+        ))
+    }
+    fn delete_batch(&self, items: &[(String, String)]) -> Result<(), String> {
+        isyncyou_graph::GraphClient::delete_tasks_batch(self, items)
+            .map_err(|error| error.to_string())
     }
     fn checklist_add(&self, list_id: &str, task_id: &str, title: &str) -> Result<String, String> {
         let v = isyncyou_graph::GraphClient::create_checklist_item(
@@ -237,5 +258,41 @@ mod tests {
         assert_eq!(log[6], "list_create Groceries");
         assert_eq!(log[7], "delete list=L1 id=t1");
         assert_eq!(log[8], "list_delete L1");
+    }
+
+    #[test]
+    fn task_delete_treats_not_found_as_idempotent_success() {
+        assert!(
+            normalize_task_delete(Err(isyncyou_graph::UploadError::Http {
+                status: 404,
+                body: String::new(),
+            }))
+            .is_ok()
+        );
+        assert!(
+            normalize_task_delete(Err(isyncyou_graph::UploadError::Http {
+                status: 403,
+                body: String::new(),
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn task_delete_batch_default_is_bounded_to_selected_items() {
+        let tasks = FakeTasks::default();
+        tasks
+            .delete_batch(&[
+                ("list-1".into(), "task-1".into()),
+                ("list-2".into(), "task-2".into()),
+            ])
+            .unwrap();
+        assert_eq!(
+            tasks.log.borrow().as_slice(),
+            [
+                "delete list=list-1 id=task-1",
+                "delete list=list-2 id=task-2"
+            ]
+        );
     }
 }

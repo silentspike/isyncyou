@@ -375,6 +375,7 @@ mod tests {
     use super::*;
 
     const KEY: BodyKey = [7u8; 32];
+    static BODY_KEY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn on_disk_plaintext_len_reads_the_header_not_the_sealed_size() {
@@ -475,9 +476,11 @@ mod tests {
         ));
     }
 
-    // One test owns the process-global key registry (so parallel tests don't race it).
     #[test]
     fn body_io_seals_on_disk_reads_plaintext_passthrough_and_rotates() {
+        let _key_guard = BODY_KEY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         set_body_key(1, KEY);
         assert_eq!(active_key_id(), Some(1));
@@ -527,6 +530,9 @@ mod tests {
 
     #[test]
     fn sealed_body_required_rejects_plaintext_and_invalid_envelopes() {
+        let _key_guard = BODY_KEY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sealed.bin");
         let plaintext = b"android-body-sentinel".repeat(32);

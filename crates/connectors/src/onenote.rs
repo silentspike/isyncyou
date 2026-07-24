@@ -200,9 +200,7 @@ pub fn backup_onenote_hierarchy<F: JsonFetcher>(
     };
 
     // Notebooks — the roots of the tree.
-    let nbs = fetcher
-        .fetch_json("/me/onenote/notebooks?$top=100")
-        .map_err(SyncError::Remote)?;
+    let nbs = fetcher.fetch_json_for_sync("/me/onenote/notebooks?$top=100")?;
     for nb in values(&nbs) {
         let Some(id) = nb.get("id").and_then(Value::as_str) else {
             continue;
@@ -222,9 +220,7 @@ pub fn backup_onenote_hierarchy<F: JsonFetcher>(
     }
 
     // Section groups (optional intermediate level).
-    let sgs = fetcher
-        .fetch_json("/me/onenote/sectionGroups?$top=100")
-        .map_err(SyncError::Remote)?;
+    let sgs = fetcher.fetch_json_for_sync("/me/onenote/sectionGroups?$top=100")?;
     for sg in values(&sgs) {
         let Some(id) = sg.get("id").and_then(Value::as_str) else {
             continue;
@@ -245,9 +241,7 @@ pub fn backup_onenote_hierarchy<F: JsonFetcher>(
     }
 
     // Sections — pages hang off these (page.parent_remote_id == section.id).
-    let secs = fetcher
-        .fetch_json("/me/onenote/sections?$top=100")
-        .map_err(SyncError::Remote)?;
+    let secs = fetcher.fetch_json_for_sync("/me/onenote/sections?$top=100")?;
     for sec in values(&secs) {
         let Some(id) = sec.get("id").and_then(Value::as_str) else {
             continue;

@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 rusqlite = { workspace = true }
+sha2 = "0.10"
 thiserror = { workspace = true }
 fs2 = "0.4"
 

@@ -62,9 +62,7 @@ pub fn backup_calendar_flanks<F: JsonFetcher>(
 ) -> Result<ArchiveReport, SyncError> {
     let mut report = ArchiveReport::default();
 
-    let cals = fetcher
-        .fetch_json("/me/calendars?$top=100")
-        .map_err(SyncError::Remote)?;
+    let cals = fetcher.fetch_json_for_sync("/me/calendars?$top=100")?;
     for cal in cals
         .get("value")
         .and_then(Value::as_array)
@@ -95,9 +93,7 @@ pub fn backup_calendar_flanks<F: JsonFetcher>(
     }
 
     // Calendar groups (#565 B3) — one snapshot of the whole list.
-    let groups = fetcher
-        .fetch_json("/me/calendarGroups")
-        .map_err(SyncError::Remote)?;
+    let groups = fetcher.fetch_json_for_sync("/me/calendarGroups")?;
     report.bytes += archive_json_item(
         store,
         account,
