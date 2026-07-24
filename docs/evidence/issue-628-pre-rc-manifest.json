@@ -1,6 +1,6 @@
 {
   "manifest_version": "1",
-  "generated_at": "2026-07-24T07:13:07Z",
+  "generated_at": "2026-07-24T08:06:10Z",
   "commit": "54374b8fd121832238e2ad2f7dd8df67945ba67c",
   "entries": [
     {
@@ -213,9 +213,9 @@
     {
       "id": "EV-022",
       "requirement": "REQ-AGENT-016",
-      "claim": "The exact refreeze commit produces and marker-scans a clean default APK, while the earlier physical reinstall remains separately pinned and the protected exact-tree emulator passes.",
+      "claim": "The exact refreeze commit produces and marker-scans a clean default APK, the same APK is installed on the physical Pixel without clearing app data or invoking account lifecycle actions, and the protected exact-tree emulator passes.",
       "method": "command",
-      "command": "test \"$(sha256sum /tmp/issue-628-default-54374b8.apk | cut -d' ' -f1)\" = \"e07599cef819445921314b5687c744f27b12785e97161366f412a779a9c2c698\" && python3 tools/verify-agent-network-boundary.py --root . --default-apk /tmp/issue-628-default-54374b8.apk --hook-apk /tmp/issue-628-hooks-a2b42aa.apk --output /tmp/issue-628-network-boundary-54374b8.json && python3 tools/verify-agent-account-lifecycle-boundary.py --root . --default-apk /tmp/issue-628-default-54374b8.apk --hook-apk /tmp/issue-628-hooks-a2b42aa.apk --output /tmp/issue-628-lifecycle-boundary-54374b8.json && jq -e '.implementation_commit == \"54374b8fd121832238e2ad2f7dd8df67945ba67c\" and .exact_tree_build == \"pass\" and .exact_tree_boundary_scans == \"pass\" and .exact_tree_protected_emulator_smoke == \"pass\" and .physical_observation_reused' docs/evidence/artifacts/issue-628/pre-rc/default-apk-matrix.json",
+      "command": "test \"$(sha256sum /tmp/issue-628-default-54374b8.apk | cut -d' ' -f1)\" = \"e07599cef819445921314b5687c744f27b12785e97161366f412a779a9c2c698\" && python3 tools/verify-agent-network-boundary.py --root . --default-apk /tmp/issue-628-default-54374b8.apk --hook-apk /tmp/issue-628-hooks-a2b42aa.apk --output /tmp/issue-628-network-boundary-54374b8.json && python3 tools/verify-agent-account-lifecycle-boundary.py --root . --default-apk /tmp/issue-628-default-54374b8.apk --hook-apk /tmp/issue-628-hooks-a2b42aa.apk --output /tmp/issue-628-lifecycle-boundary-54374b8.json && jq -e '.implementation_commit == \"54374b8fd121832238e2ad2f7dd8df67945ba67c\" and .exact_tree_build == \"pass\" and .exact_tree_boundary_scans == \"pass\" and .exact_tree_protected_emulator_smoke == \"pass\" and .exact_tree_physical_install == \"pass\" and .exact_tree_install_mode == \"adb_install_r\" and .exact_tree_installed_apk_sha256 == \"e07599cef819445921314b5687c744f27b12785e97161366f412a779a9c2c698\" and .exact_tree_app_data_preserved == true and .exact_tree_cold_launch == \"pass\" and .exact_tree_crash_anr_count == 0 and .exact_tree_account_lifecycle_actions_performed == false and .physical_observation_reused' docs/evidence/artifacts/issue-628/pre-rc/default-apk-matrix.json",
       "result": "pass",
       "artifact": "docs/evidence/artifacts/issue-628/pre-rc/default-apk-matrix.json"
     },
