@@ -1,0 +1,26 @@
+{
+  "issue": 626,
+  "hook_apk": {
+    "path": "/tmp/isyncyou-issue-626-apks/isyncyou-626-hook-final-head.apk",
+    "features": "mobile-job-device-test-hooks",
+    "sha256": "bc29e992a8d4a3f8f78655a7311599de9b72508d19baa85979ded58e536d1be9",
+    "physically_tested_source_through": "8fbf916872d88eeed0cb4d570d24ab400719e1e7"
+  },
+  "default_apk": {
+    "path": "/tmp/isyncyou-issue-626-apks/isyncyou-626-default-final.apk",
+    "features": "",
+    "sha256": "ccde83caa20c8f780ff0da18c136bf2ac37d87cb1822918e3e045502d1210125",
+    "source_commit": "10a6fe79df12100743a09f9f37f65147b24870aa",
+    "hook_string_scan": "pass_no_matches",
+    "installed_after_feature_instrumentation": true,
+    "installed_and_product_backup_verified": true,
+    "installed_base_apk_readback_sha256": "ccde83caa20c8f780ff0da18c136bf2ac37d87cb1822918e3e045502d1210125"
+  },
+  "build_rule": "Hook and default APKs were built in separate clean no-daemon Gradle invocations. The default build used an unset ISY_CARGO_FEATURES environment.",
+  "post_device_host_only_changes": [
+    "5225aed9d8192ff500e627e46c86add2dfb32eb5 removes target identifiers from Agent confirm audit",
+    "fd1d2e8e3649a66b547ecbe42990d6954a8c95fd simplifies a clippy-only assertion",
+    "09a2d954e082afe7d6bc038d225e0a8969ee4d66 fixes minSdk compatibility and was rechecked on device with the default APK",
+    "10a6fe79df12100743a09f9f37f65147b24870aa allows the standalone mobile backup worker to use the installed write token when no read token exists; the exact final APK was reinstalled and a real mail backup succeeded"
+  ]
+}

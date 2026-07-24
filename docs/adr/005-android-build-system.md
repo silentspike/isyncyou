@@ -50,15 +50,18 @@ local-HTTP daemon. (Removed at #89 — see "Implementation status".)
 - **−** A Gradle toolchain to vendor, pin, and wire into CI — real maintenance weight;
   this is why it is a deliberate decision rather than a default.
 
-## Implementation status (2026-06-25, #89) — Accepted + partly built
+## Implementation status (updated 2026-07-16, #89/#628) — Accepted + built
 
 - **Build system: Gradle is implemented**, not just proposed (AGP 8.5.2, Kotlin 1.9.24,
   Gradle 8.7, signing + FCM). The standalone APK adds a `cargoNdkBuild` Gradle task that
   cross-compiles the embedded Rust engine (`libisyncyou_mobile.so`) into `jniLibs` via
   cargo-ndk (NDK r27d) — arm64 first; multi-arch is deferred hardening.
-- **On-device auth: device-code (not Auth-Code+PKCE/Custom-Tabs) for now.** The existing
-  device-code login already works on mobile with no redirect-URI registration; PKCE is a
-  later UX polish.
+- **On-device Microsoft auth: Authorization Code + PKCE in the system browser.** The
+  native URL policy accepts only the exact reviewed Reader or Writer client/scope set and
+  a root `http://localhost:<ephemeral-port>` callback. Reader and Writer are separate
+  grants for each account slot, and the app keeps the #640 OAuth foreground guard active
+  until callback completion or cancellation. CLI device-code support remains a separate
+  headless workflow and is not the Android product flow.
 - **`WebViewAssetLoader` is NOT the #89 path.** Because the engine runs in-process and
   serves the UI over loopback (the same `include_str!` assets the daemon serves), the app
   needs no asset-origin loader. `usesCleartextTraffic` is removed globally and scoped to

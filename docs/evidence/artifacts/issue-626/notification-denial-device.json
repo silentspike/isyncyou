@@ -1,0 +1,12 @@
+{
+  "issue": 626,
+  "device": "Pixel 8 Pro",
+  "notification_permission_denied": true,
+  "engine_started_before_permission_restore": false,
+  "job_lease_acquired_before_permission_restore": false,
+  "graph_effect_before_permission_restore": false,
+  "ledger_state_while_denied": "queued",
+  "permission_restored": true,
+  "same_job_reconciled": true,
+  "final_job_state": "succeeded"
+}

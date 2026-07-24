@@ -1,0 +1,361 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-07-14T08:02:50Z",
+  "commit": "1ad3d28e6d3b907f6d1017a8ed8281db3e93e3f0",
+  "entries": [
+    {
+      "id": "EV-001",
+      "requirement": "REQ-AGENT-014",
+      "claim": "Every provider round attests the request built from its current history.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features http,agent-oauth-providers",
+      "test": "every_provider_round_attests_its_current_history",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-002",
+      "requirement": "REQ-AGENT-014",
+      "claim": "The product transport accepts only an attested provider request.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features http,agent-oauth-providers",
+      "test": "transport_accepts_only_attested_provider_request",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-003",
+      "requirement": "REQ-AGENT-014",
+      "claim": "A mutated header or body fails re-attestation and cannot reach the wire.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features http,agent-oauth-providers",
+      "test": "attestation_cannot_be_reused_after_header_or_body_mutation",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-004",
+      "requirement": "REQ-AGENT-014",
+      "claim": "The retained provider identity envelope contains only required fields.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features http,agent-oauth-providers",
+      "test": "product_harness_retains_only_required_provider_identity_fields",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-005",
+      "requirement": "REQ-AGENT-014",
+      "claim": "A not-ready product turn returns a closed 409 and creates no turn state.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "product_not_ready_returns_409_without_creating_turn_state",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-006",
+      "requirement": "REQ-AGENT-014",
+      "claim": "The product gate never falls back to a non-selected provider.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "invalid_selected_provider_never_falls_back",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-007",
+      "requirement": "REQ-AGENT-014",
+      "claim": "An experimental local-CLI credential never sets product readiness.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-subscription-experimental",
+      "test": "experimental_credential_never_sets_product_readiness",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-008",
+      "requirement": "REQ-AGENT-014",
+      "claim": "Injected OAuth transition testing proves exchange before encrypted credential and activation.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "official_oauth_precedes_credential_encryption_and_harness_transformation",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-009",
+      "requirement": "REQ-AGENT-014",
+      "claim": "Startup recovery activates a stored generation without a second exchange.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "crash_after_credential_write_resumes_activation_without_reexchange",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-010",
+      "requirement": "REQ-AGENT-014",
+      "claim": "Startup closes an unresumable OAuth attempt as interrupted.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "startup_marks_unresumable_oauth_attempt_interrupted",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-011",
+      "requirement": "REQ-AGENT-014",
+      "claim": "Status and OAuth completion share the product-runtime gate.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "completion_and_status_share_the_product_runtime_gate",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-012",
+      "requirement": "REQ-AGENT-014",
+      "claim": "The ready status projection survives onboarding-journal TTL.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "status_projection_correct_after_journal_ttl_expiry",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-013",
+      "requirement": "REQ-AGENT-014",
+      "claim": "OAuth completion is attempt-state-bound and Claude-only.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "oauth_complete_rejects_wrong_attempt_state_and_codex",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-014",
+      "requirement": "REQ-AGENT-014",
+      "claim": "A non-official OAuth policy cannot satisfy the product handoff.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "product_oauth_override_cannot_satisfy_official_handoff",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-015",
+      "requirement": "REQ-AGENT-014",
+      "claim": "The wizard renders the ordered handoff, clears the pasted code, and releases an invalid-start foreground guard.",
+      "method": "command",
+      "command": "node tools/agent-wizard-smoke.mjs --out docs/evidence/artifacts/issue-639/wizard-smoke",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/wizard-smoke/wizard-smoke.json"
+    },
+    {
+      "id": "EV-016",
+      "requirement": "REQ-AGENT-014",
+      "claim": "Current-tree Rust, Clippy, format, UI, boundary, supply-chain, secret, and Android host gates pass.",
+      "method": "command",
+      "command": "see current-tree-recheck.txt",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-017",
+      "requirement": "REQ-AGENT-014",
+      "claim": "The current default product APK excludes experimental and diagnostic-hook markers.",
+      "method": "command",
+      "command": "bash tools/verify-agent-experimental-boundary.sh release-exclusion",
+      "result": "pass",
+      "evidence": "default APK sha256 9d8f4d1fc8bcb14a8c86999c77dcf9cbd99dfa94fe9deb9005fac514335ca6d6",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-018",
+      "requirement": "REQ-AGENT-014",
+      "claim": "A bundle minted under a different OAuth policy is never recovered to ready.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "mismatched_policy_bundle_is_never_recovered_to_ready",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-019",
+      "requirement": "REQ-AGENT-014",
+      "claim": "An activated credential needing refresh enters the refresh path instead of returning 409.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "activated_needs_refresh_credential_is_gate_admitted",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-020",
+      "requirement": "REQ-AGENT-014",
+      "claim": "Attestation binds URL, billing identity, and header integrity.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features http,agent-oauth-providers",
+      "test": "attestation_binds_url_exact_billing_and_header_integrity",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-021",
+      "requirement": "REQ-AGENT-014",
+      "claim": "Product providers send only attested requests.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent --features http,agent-oauth-providers",
+      "test": "product_providers_send_only_attested_requests",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-022",
+      "requirement": "REQ-AGENT-014",
+      "claim": "A failed Claude manual completion records error_redacted.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "claude_oauth_complete_records_error_redacted_on_failure",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-023",
+      "requirement": "REQ-AGENT-014",
+      "claim": "The onboarding journal is reaped after its TTL.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "onboarding_journal_expires_after_ttl",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-024",
+      "requirement": "REQ-AGENT-014",
+      "claim": "The onboarding projection counts only journal-recorded success-chain steps.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers",
+      "test": "onboarding_projection_counts_journal_recorded_steps",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-025",
+      "requirement": "REQ-AGENT-014",
+      "claim": "The cross-process runtime lock refuses a second holder and releases on drop.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-agent second_holder_is_refused_and_release_on_drop_allows_reacquire",
+      "test": "second_holder_is_refused_and_release_on_drop_allows_reacquire",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-026",
+      "requirement": "REQ-AGENT-014",
+      "claim": "The onboarding-journal cross-process lock refuses a competing write.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers onboarding_journal_cross_process_lock_refuses_competing_write",
+      "test": "onboarding_journal_cross_process_lock_refuses_competing_write",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-027",
+      "requirement": "REQ-AGENT-014",
+      "claim": "The journal reaper removes a crash-dangling index entry.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers onboarding_journal_reaper_removes_crash_dangling_index_entry",
+      "test": "onboarding_journal_reaper_removes_crash_dangling_index_entry",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-028",
+      "requirement": "REQ-AGENT-014",
+      "claim": "OAuth completion framing is rejected before route allocation.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-webui oauth_complete_strict_limit_and_framing_apply_before_routing",
+      "test": "oauth_complete_strict_limit_and_framing_apply_before_routing",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-029",
+      "requirement": "REQ-AGENT-014",
+      "claim": "Digest-pinned Semgrep completed the changed JavaScript path with no findings.",
+      "method": "command",
+      "command": "docker run semgrep/semgrep@sha256:a265d09a... semgrep scan --timeout 60 --config p/javascript --config p/secrets --config p/security-audit gui/webui/src/app.js",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-030",
+      "requirement": "REQ-AGENT-014",
+      "claim": "The evidence-tested tree has the same product inputs as the clean built and installed default APK; the previously tested Android/mobile paths are unchanged.",
+      "method": "command",
+      "command": "at 6febc23: cd android && env -u ISY_CARGO_FEATURES ./gradlew clean :app:assembleDebug; at 1ad3d28: git diff --name-only 6febc23..1ad3d28 -- android crates/mobile gui/webui crates",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-031",
+      "requirement": "REQ-AGENT-014",
+      "claim": "Both official provider activations and both independent consents are valid on the final default APK with no open OAuth attempt.",
+      "method": "command",
+      "command": "install final default APK; complete official handoffs; read back closed host/UI state",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt",
+      "notes": "No OAuth material, account identity, IP address, or device serial was recorded."
+    },
+    {
+      "id": "EV-032",
+      "requirement": "REQ-AGENT-014",
+      "claim": "The official Codex callback shape with an optional scope parameter is accepted.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers codex_callback_accepts_official_scope_parameter -- --nocapture",
+      "test": "codex_callback_accepts_official_scope_parameter",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-033",
+      "requirement": "REQ-AGENT-014",
+      "claim": "Duplicate, unknown, and ambiguous Codex callback parameters fail closed.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers codex_callback_rejects_duplicate_unknown_and_ambiguous_parameters -- --nocapture",
+      "test": "codex_callback_rejects_duplicate_unknown_and_ambiguous_parameters",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-034",
+      "requirement": "REQ-AGENT-014",
+      "claim": "A provider authorization-error callback terminates without token exchange and records only a closed redacted code.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers codex_authorization_error_callback_terminates_without_exchange -- --nocapture",
+      "test": "codex_authorization_error_callback_terminates_without_exchange",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/current-tree-recheck.txt"
+    },
+    {
+      "id": "EV-035",
+      "requirement": "REQ-AGENT-014",
+      "claim": "Claude and ChatGPT privacy consents migrate from V1 and persist independently with visible allowed states without launching OAuth.",
+      "method": "command",
+      "command": "node tools/agent-ui-smoke.mjs --out docs/evidence/artifacts/issue-639/wizard-smoke",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/wizard-smoke/agent-ui-smoke.json"
+    },
+    {
+      "id": "EV-036",
+      "requirement": "REQ-AGENT-014",
+      "claim": "The deterministic UI evidence self-check rejects complete request locations, addresses, raw assertion details, and fixture authority values before serialization.",
+      "method": "command",
+      "command": "node tools/agent-ui-smoke.mjs --out docs/evidence/artifacts/issue-639/wizard-smoke",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-639/wizard-smoke/agent-ui-smoke.json"
+    }
+  ]
+}

@@ -1,0 +1,93 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-07-10T20:36:03+02:00",
+  "commit": "783e1b562d06db0c4704974530dc7800257df2f3",
+  "entries": [
+    {
+      "id": "EV-001",
+      "requirement": "REQ-AND-016",
+      "claim": "The mobile full-node profile wires restore-cloud and backup as reachable routes, but keeps them session/cap gated before any handler work.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-mobile -- mobile_full_node --nocapture",
+      "result": "pass",
+      "test": "mobile_full_node_router_exposes_gated_restore_and_backup",
+      "evidence": "The mobile full-node route test proves missing session returns 401 and valid session without the correct cap still returns 401 for restore, backup, and jobs routes.",
+      "artifact": "docs/evidence/artifacts/issue-625/host-gates.txt"
+    },
+    {
+      "id": "EV-002",
+      "requirement": "REQ-AND-016",
+      "claim": "Mobile restore-cloud and backup require the per-action biometric token before jobs are enqueued.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-mobile -- mobile_full_node --nocapture",
+      "result": "pass",
+      "test": "mobile_full_node_restore_backup_do_not_run_without_biometric_token",
+      "evidence": "The mobile test observes confirmation_required with no queued job before the per-action token, then observes queued job responses only after the token is supplied.",
+      "artifact": "docs/evidence/artifacts/issue-625/mobile-job-contract.json"
+    },
+    {
+      "id": "EV-003",
+      "requirement": "REQ-AND-016",
+      "claim": "Agent confirmation on mobile binds the PendingAction before consuming the Agent one-time token and does not consume it on biometric failure.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-webui -- agent_confirm --nocapture",
+      "result": "pass",
+      "test": "mobile_agent_confirm_requires_biometric_before_agent_token_consumption",
+      "evidence": "The WebUI Agent confirm tests prove the mobile route challenges first, preserves the Agent token on bad biometric-token attempts, and consumes the Agent token only after valid per-action confirmation.",
+      "artifact": "docs/evidence/artifacts/issue-625/host-gates.txt"
+    },
+    {
+      "id": "EV-004",
+      "requirement": "REQ-AND-016",
+      "claim": "Backup and restore-cloud jobs are durable, leased, recoverable, and do not duplicate restore-cloud mutations after restart recovery.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --all-targets --features agent-oauth-providers -- mobile_job --nocapture",
+      "result": "pass",
+      "test": "mobile_job_worker_does_not_duplicate_restore_after_restart",
+      "evidence": "The AppHost mobile_job tests cover enqueue-only backup behavior, worker execution, expired running lease recovery, lease-owner-guarded failure, and restore-ledger reuse after restart recovery.",
+      "artifact": "docs/evidence/artifacts/issue-625/mobile-job-contract.json"
+    },
+    {
+      "id": "EV-005",
+      "requirement": "REQ-AND-016",
+      "claim": "Mobile Agent live-write is limited to the D4 metadata allowlist and unsupported verbs fail closed.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host -- mobile_live_write --nocapture",
+      "result": "pass",
+      "test": "mobile_live_write_disallowed_create_send_delete_append_verbs_fail_closed",
+      "evidence": "The AppHost tests accept only mail set_read/set_flag/set_categories and todo complete/checklist_toggle, while create/send/delete/append-style verbs are rejected before mutation.",
+      "artifact": "docs/evidence/artifacts/issue-625/mobile-job-contract.json"
+    },
+    {
+      "id": "EV-006",
+      "requirement": "REQ-AND-013",
+      "claim": "The shared base live router still omits restore-cloud until the mobile full-node job wrapper attaches it.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host -- base_live_router_wires_share_but_omits_restore_until_mobile_job_wrapper --nocapture",
+      "result": "pass",
+      "test": "base_live_router_wires_share_but_omits_restore_until_mobile_job_wrapper",
+      "evidence": "The base-router regression test proves restore-cloud is not accidentally exposed by build_live_router, while share and live-write remain wired and cap-gated.",
+      "artifact": "docs/evidence/artifacts/issue-625/host-gates.txt"
+    },
+    {
+      "id": "EV-007",
+      "requirement": "REQ-AND-016",
+      "claim": "The Android debug APK still builds after wiring the mobile full-node runtime.",
+      "method": "command",
+      "command": "(cd android && ./gradlew :app:assembleDebug)",
+      "result": "pass",
+      "evidence": "Gradle assembled the debug APK successfully after compiling the arm64-v8a Rust mobile library; BUILD SUCCESSFUL in 3m 33s.",
+      "artifact": "docs/evidence/artifacts/issue-625/host-gates.txt"
+    },
+    {
+      "id": "EV-008",
+      "requirement": "REQ-AND-016",
+      "claim": "REQ-AND-016 remains honestly non-final: #625 implements the server contract and #626 remains the native Android proof.",
+      "method": "command",
+      "command": "python3 tools/check_traceability.py",
+      "result": "pass",
+      "evidence": "Traceability reports 68 requirements, 66 implemented, 2 planned, and all implemented requirements traceable. REQ-AND-016 remains planned with server_contract implemented_by #625 and native proof pending #626.",
+      "artifact": "docs/evidence/artifacts/issue-625/host-gates.txt"
+    }
+  ]
+}

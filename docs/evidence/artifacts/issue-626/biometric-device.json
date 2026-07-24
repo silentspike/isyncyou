@@ -1,0 +1,26 @@
+{
+  "issue": 626,
+  "device": "Pixel 8 Pro",
+  "prompt_descriptor_source": "trusted Rust pending-action descriptor",
+  "cancel": {
+    "physical_user_cancelled": true,
+    "native_confirmation_armed": false,
+    "graph_or_store_effect": false
+  },
+  "approve": {
+    "physical_user_authentication": true,
+    "biometric_strong_crypto": false,
+    "device_credential_user_presence": true,
+    "native_confirmation_armed": true,
+    "expected_effect_verified": true,
+    "effect_reverted": true
+  },
+  "late_callback_or_timeout_armed_action": false,
+  "strong_crypto_path": {
+    "policy_builder_instrumentation": "pass",
+    "physical_prompt_execution": "not_executed_no_strong_biometric_enrolled",
+    "device_capability_result": "BIOMETRIC_ERROR_NONE_ENROLLED",
+    "device_credential_is_not_claimed_as_strong_crypto": true,
+    "notes": "The owner selected PIN/device credential and declined fingerprint enrollment. The product PIN path remains physically verified. StrongCrypto fails closed and its PromptInfo/CryptoObject construction is instrumentation-tested, but no physical StrongCrypto PASS is claimed."
+  }
+}

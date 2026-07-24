@@ -17,7 +17,9 @@
 //! recovery are unit-tested deterministically; `GraphClient` is the real impl.
 
 use crate::restore_key::{idempotency_key, load_or_create_secret, onenote_marker};
-use crate::restore_recovery::{recover_restore_op, run_restore_op, RestoreSink};
+use crate::restore_recovery::{
+    recover_restore_op, run_restore_op, RestoreError, RestoreResult, RestoreSink,
+};
 use isyncyou_connectors::OneNoteResourcePart;
 use isyncyou_core::Config;
 use isyncyou_store::{RestoreState, Store};
@@ -40,6 +42,19 @@ pub trait OneNoteApi {
     /// Find a page whose content contains `marker` by listing pages (all pages) and
     /// scanning each page's `/content`; returns its cloud id if present.
     fn find_by_marker(&self, marker: &str) -> Result<Option<String>, String>;
+
+    fn create_page_for_restore(
+        &self,
+        section_id: Option<&str>,
+        html: &[u8],
+        resources: &[OneNoteResourcePart],
+    ) -> RestoreResult<String> {
+        self.create_page(section_id, html, resources)
+            .map_err(RestoreError::internal)
+    }
+    fn find_by_marker_for_restore(&self, marker: &str) -> RestoreResult<Option<String>> {
+        self.find_by_marker(marker).map_err(RestoreError::internal)
+    }
 }
 
 impl OneNoteApi for isyncyou_graph::GraphClient {
@@ -106,6 +121,67 @@ impl OneNoteApi for isyncyou_graph::GraphClient {
             }
         }
     }
+
+    fn create_page_for_restore(
+        &self,
+        section_id: Option<&str>,
+        html: &[u8],
+        resources: &[OneNoteResourcePart],
+    ) -> RestoreResult<String> {
+        let parts: Vec<_> = resources
+            .iter()
+            .map(|resource| isyncyou_graph::http::OneNotePagePart {
+                name: resource.part_name.clone(),
+                content_type: resource.content_type.clone(),
+                bytes: resource.bytes.clone(),
+            })
+            .collect();
+        let do_create = |section: Option<&str>| match (section, parts.is_empty()) {
+            (Some(id), true) => self.create_onenote_page_in_section(id, html),
+            (Some(id), false) => self.create_onenote_page_in_section_multipart(id, html, &parts),
+            (None, true) => self.create_onenote_page(html),
+            (None, false) => self.create_onenote_page_multipart(html, &parts),
+        };
+        let created = match section_id {
+            Some(section) => match do_create(Some(section)) {
+                Ok(value) => value,
+                Err(isyncyou_graph::http::UploadError::Http { status: 404, .. }) => {
+                    do_create(None).map_err(RestoreError::from_graph)?
+                }
+                Err(error) => return Err(RestoreError::from_graph(error)),
+            },
+            None => do_create(None).map_err(RestoreError::from_graph)?,
+        };
+        created
+            .get("id")
+            .and_then(|id| id.as_str())
+            .map(String::from)
+            .ok_or_else(|| RestoreError::invalid("created page response has no id"))
+    }
+
+    fn find_by_marker_for_restore(&self, marker: &str) -> RestoreResult<Option<String>> {
+        let mut url = "/me/onenote/pages?$select=id&$top=100".to_string();
+        loop {
+            let page = self.get_json(&url).map_err(RestoreError::from_graph)?;
+            if let Some(pages) = page.get("value").and_then(|value| value.as_array()) {
+                for page in pages {
+                    let Some(id) = page.get("id").and_then(|value| value.as_str()) else {
+                        continue;
+                    };
+                    let content = self
+                        .get_bytes(&format!("/me/onenote/pages/{id}/content"))
+                        .map_err(RestoreError::from_graph)?;
+                    if String::from_utf8_lossy(&content).contains(marker) {
+                        return Ok(Some(id.to_string()));
+                    }
+                }
+            }
+            match page.get("@odata.nextLink").and_then(|link| link.as_str()) {
+                Some(next) => url = next.to_string(),
+                None => return Ok(None),
+            }
+        }
+    }
 }
 
 /// A [`RestoreSink`] for OneNote. `create` rewrites resource URLs to `name:<part>`,
@@ -147,13 +223,13 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
 }
 
 impl<A: OneNoteApi> RestoreSink for OneNoteSink<'_, A> {
-    fn create(&self, marker: &str, payload: &[u8]) -> Result<String, String> {
+    fn create(&self, marker: &str, payload: &[u8]) -> RestoreResult<String> {
         let html = prepare_html(payload, &self.rewrites, marker);
         self.api
-            .create_page(self.section.as_deref(), &html, &self.resources)
+            .create_page_for_restore(self.section.as_deref(), &html, &self.resources)
     }
-    fn find_by_marker(&self, marker: &str) -> Result<Option<String>, String> {
-        self.api.find_by_marker(marker)
+    fn find_by_marker(&self, marker: &str) -> RestoreResult<Option<String>> {
+        self.api.find_by_marker_for_restore(marker)
     }
 }
 
@@ -223,24 +299,36 @@ pub fn restore_onenote_via_ledger(
     id: &str,
     token: String,
 ) -> Result<String, String> {
+    restore_onenote_via_ledger_classified(cfg, account, id, token)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn restore_onenote_via_ledger_classified(
+    cfg: &Config,
+    account: &str,
+    id: &str,
+    token: String,
+) -> RestoreResult<String> {
     let acc = cfg
         .accounts
         .iter()
         .find(|a| a.id == account)
-        .ok_or_else(|| format!("no account '{account}' in config"))?;
-    let (item, bytes) = crate::read_archived_body(cfg, account, "onenote", id)?;
-    let html_local_path = item
-        .local_path
-        .clone()
-        .ok_or_else(|| format!("onenote item '{id}' has no archived body"))?;
+        .ok_or_else(|| RestoreError::invalid(format!("no account '{account}' in config")))?;
+    let (item, bytes) =
+        crate::read_archived_body(cfg, account, "onenote", id).map_err(RestoreError::invalid)?;
+    let html_local_path = item.local_path.clone().ok_or_else(|| {
+        RestoreError::invalid(format!("onenote item '{id}' has no archived body"))
+    })?;
     let section = item.parent_remote_id.clone();
-    let (resources, rewrites) = load_resources(&acc.archive_root, &html_local_path)?;
-    let secret = load_or_create_secret(&acc.archive_root.join(".isyncyou-restore-secret"))?;
+    let (resources, rewrites) =
+        load_resources(&acc.archive_root, &html_local_path).map_err(RestoreError::invalid)?;
+    let secret = load_or_create_secret(&acc.archive_root.join(".isyncyou-restore-secret"))
+        .map_err(RestoreError::internal)?;
     let key = idempotency_key(&secret, account, "onenote", id, &bytes);
     let op_id = format!("{account}:{key}");
     let marker = onenote_marker(&key);
-    let store =
-        Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    let store = Store::open(acc.archive_root.join(".isyncyou-store.db"))
+        .map_err(|e| RestoreError::internal(e.to_string()))?;
     let client = isyncyou_graph::GraphClient::new(token);
     let sink = OneNoteSink {
         api: &client,
@@ -273,26 +361,26 @@ fn finish_onenote_restore<S: RestoreSink>(
     payload: &[u8],
     sink: &S,
     now: i64,
-) -> Result<String, String> {
+) -> RestoreResult<String> {
     match store
         .get_restore_operation(op_id)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| RestoreError::internal(e.to_string()))?
     {
         Some(op) if op.state == RestoreState::Committed => op
             .new_cloud_id
-            .ok_or_else(|| "committed operation has no cloud id".to_string()),
+            .ok_or_else(|| RestoreError::internal("committed operation has no cloud id")),
         Some(_) => {
             recover_restore_op(store, op_id, payload, sink, now)?;
             store
                 .get_restore_operation(op_id)
-                .map_err(|e| e.to_string())?
+                .map_err(|e| RestoreError::internal(e.to_string()))?
                 .and_then(|o| o.new_cloud_id)
-                .ok_or_else(|| "recovery did not record a cloud id".to_string())
+                .ok_or_else(|| RestoreError::internal("recovery did not record a cloud id"))
         }
         None => {
             store
                 .create_restore_operation(op_id, account, "onenote", source_id, key, now)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| RestoreError::internal(e.to_string()))?;
             let (new_id, _) = run_restore_op(store, op_id, marker, payload, sink, now)?;
             Ok(new_id)
         }
@@ -354,7 +442,9 @@ pub fn recover_pending_onenote_restores_with<A: OneNoteApi>(
                 resources,
                 section,
             };
-            recover_restore_op(&store, &op.op_id, &bytes, &sink, now).map(|_| ())
+            recover_restore_op(&store, &op.op_id, &bytes, &sink, now)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         })();
         match res {
             Ok(()) => ok += 1,

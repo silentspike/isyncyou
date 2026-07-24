@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "scope": "issue_627_feature_reachability_only",
+  "tested_commit": "6f06ea548926165e630475c18a927822402ae3f6",
+  "raw_cargo_metadata_committed": false,
+  "builds": [
+    {
+      "build": "desktop_daemon_default",
+      "product_oauth_runtime": true,
+      "local_cli_fallback": false,
+      "capture_reducer": false,
+      "status": "pass"
+    },
+    {
+      "build": "linux_desktop_explicit_experimental",
+      "product_oauth_runtime": true,
+      "local_cli_fallback": true,
+      "capture_reducer": true,
+      "status": "pass"
+    },
+    {
+      "build": "mobile_default",
+      "product_oauth_runtime": true,
+      "local_cli_fallback": false,
+      "capture_reducer": false,
+      "status": "pass"
+    },
+    {
+      "build": "mobile_experimental_request",
+      "product_oauth_runtime": true,
+      "local_cli_fallback": false,
+      "capture_reducer": false,
+      "status": "rejected_before_artifact"
+    }
+  ],
+  "resolved_features": {
+    "daemon_default": [
+      "default"
+    ],
+    "app_host_default": [
+      "agent-oauth-providers",
+      "default",
+      "desktop-keyring",
+      "encrypted-store"
+    ],
+    "agent_default_via_daemon": [
+      "agent-oauth-providers",
+      "http",
+      "retrieval"
+    ],
+    "daemon_explicit": [
+      "agent-subscription-experimental",
+      "default"
+    ],
+    "app_host_explicit": [
+      "agent-oauth-providers",
+      "agent-subscription-experimental",
+      "default",
+      "desktop-keyring",
+      "encrypted-store"
+    ],
+    "agent_explicit_via_daemon": [
+      "agent-oauth-providers",
+      "agent-subscription-experimental",
+      "http",
+      "retrieval"
+    ]
+  },
+  "mobile_rejection": {
+    "exit_status": 101,
+    "reason": "isyncyou-mobile does not contain agent-subscription-experimental"
+  }
+}
