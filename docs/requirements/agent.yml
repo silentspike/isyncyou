@@ -45,7 +45,7 @@ requirements:
       On confirmation, the server mints and checks a one-time token bound to
       hash(action)+account+service+item-id+TTL. It is single-use (a replay is rejected),
       and a token that does not match the confirmed action is refused. (S-AG.6, #621)
-    status: planned
+    status: implemented
     design: docs/adr/007-agent-architecture.md
     acceptance:
       - Confirming a destructive action runs exactly one audited operation.
@@ -53,19 +53,28 @@ requirements:
       - A token bound to a different action/account/service/item is rejected.
     verified_by:
       - test: confirmation_token_is_single_use_and_action_bound
+      - test: confirm_rejects_action_hash_mismatch_without_consuming
+      - test: confirm_rejects_token_from_another_pending
+      - test: expired_confirmation_token_is_rejected_and_swept
+      - test: agent_confirm_audits_once_and_calls_executor_once
+      - test: agent_confirm_replay_rejected_and_executor_not_called_twice
+      - test: daemon_agent_confirm_runs_executor_once_and_replay_fails
   - id: REQ-AGENT-004
     title: The model never receives a capability or confirmation token
     statement: >
       No capability token or confirmation token ever appears in the model's prompt,
       tool inputs, or the streamed `token` events. The human-confirm path mints the
       token out of band on the server. (S-AG.6, #621)
-    status: planned
+    status: implemented
     design: docs/adr/007-agent-architecture.md
     acceptance:
       - The assembled model context contains no capability/confirmation token.
       - Streamed `token` events contain no capability/confirmation token.
     verified_by:
       - test: agent_context_contains_no_capability_token
+      - test: confirmation_required_event_not_in_provider_history
+      - test: agent_stream_token_events_contain_no_confirmation_token
+      - test: agent_error_and_audit_redact_confirmation_token
   - id: REQ-AGENT-005
     title: Prompt-injection boundary — retrieved content cannot trigger a tool action
     statement: >
@@ -121,7 +130,7 @@ requirements:
       (token/tool_call/tool_result/confirmation_required/error/done), with a cancel
       endpoint and backpressure/timeout — not the existing `change`-only SSE ping.
       On mobile every agent route is session-token gated. (S-AG.6, #621)
-    status: planned
+    status: implemented
     design: docs/adr/007-agent-architecture.md
     acceptance:
       - The hub emits the typed event set for a turn.
@@ -129,22 +138,81 @@ requirements:
       - A slow consumer is bounded (no unbounded buffer).
     verified_by:
       - test: agent_stream_hub_emits_typed_events_and_cancels
+      - test: agent_stream_hub_slow_consumer_times_out_without_unbounded_buffer
+      - test: agent_stream_event_json_is_single_line_and_stable
+      - test: daemon_agent_fake_turn_streams_tokens_to_subscriber
+      - test: daemon_agent_pending_turn_stream_closes_with_pending_confirmation_done
+      - test: daemon_agent_cancel_marks_registry_without_fabricating_terminal
+      - test: daemon_agent_unopened_stream_is_swept
+      - test: agent_chat_alias_and_legacy_turn_query_are_rejected
+      - test: mobile_agent_routes_require_session_token_even_with_cap_token
+      - test: agent_stream_sse_requires_session_token_on_mobile
+      - test: open_bridge_stream_gates_events_and_agent
   - id: REQ-AGENT-008
-    title: Provider policy — official default, FakeProvider-only CI, subscription experimental
+    title: Provider policy — Claude/Codex app OAuth product path, FakeProvider CI fallback
     statement: >
-      Official providers (Anthropic Messages, OpenAI Responses with store:false) are the
-      default; FakeProvider is the only provider built/used in CI (no real LLM tokens);
-      the Claude/Codex subscription provider exists only behind the default-off
-      `agent-subscription-experimental` feature, absent from release artifacts, CI, and
-      the README. (S-AG.2/#617, S-AG.8/#623, S-AG.12/#627)
-    status: planned
+      The product provider path is app-authorized Claude/Codex OAuth with tokens
+      loaded from encrypted host/mobile credential storage. Product builds must not
+      ask for BYO Anthropic/OpenAI API keys, must not use `ProviderApiKey` as the
+      product setup path, and must not read local `~/.claude` or `~/.codex` CLI auth.
+      FakeProvider is a deterministic test/fixture provider only — it is NOT an
+      unconfigured product turn: a not-ready product turn fails closed with a typed
+      ProductNotReady (#639), never a FakeProvider response. The local CLI credential
+      fallback and private wire-drift capture stay separated under #627/default-off
+      `agent-subscription-experimental`. (S-AG.2/#617, S-AG.8/#623, S-AG.12/#627,
+      S-AG.14/#639)
+    status: implemented
     design: docs/adr/007-agent-architecture.md
     acceptance:
-      - CI builds and tests use FakeProvider only (no real LLM token).
-      - The subscription feature is off by default and absent from release artifacts.
-      - The subscription provider is not referenced in the README.
+      - Desktop and mobile product feature wiring includes the app-OAuth provider runtime without requiring #627's local CLI fallback.
+      - Claude/Codex product auth loads encrypted CredentialStore OAuth material first and ignores local CLI auth files in non-experimental builds.
+      - Non-live provider tests isolate HOME, CODEX_HOME, CLAUDE_CONFIG_DIR, API-key env vars, provider overrides, and unexpected provider network access.
+      - Claude/Codex provider streams emit tokens before completion; Codex requests keep `store:false`.
+      - The WebUI setup posts product provider IDs (`claude`, `codex`) and exposes no BYO API-key setup row.
+      - #627 remains separate for local CLI fallback/capture and cannot be counted as #623 product-auth evidence.
+      - Local CLI reads are Linux desktop-only, bounded, default-off, never persisted, and cannot satisfy product onboarding/readiness.
+      - Default daemon/mobile/release feature graphs and built artifacts exclude the experimental fallback.
+      - The provider-required auth/billing/subscription identity envelope remains unchanged and in place while all default-client harness components are absent and exactly one `isyncyou` tool is installed.
+      - Reduced client-drift summaries contain no credentials, account identifiers, user content, raw hashes, local paths, or standalone wire recipe; unavailable visibility is reported honestly.
     verified_by:
-      - test: ci_uses_fake_provider_only
+      - test: product_oauth_feature_does_not_export_byo_api_providers
+      - test: app_host_product_code_does_not_reference_legacy_byo_provider_types
+      - test: app_host_product_source_has_no_credential_ingest_surface
+      - test: product_oauth_provider_does_not_read_desktop_cli_fallbacks
+      - test: product_build_does_not_read_dot_claude
+      - test: product_build_does_not_read_dot_codex
+      - test: non_live_provider_tests_clear_public_api_key_env
+      - test: non_live_provider_tests_fail_on_unexpected_network
+      - test: agent_provider_selection_uses_stored_claude_oauth_credential
+      - test: agent_provider_selection_uses_stored_codex_oauth_credential
+      - test: credential_store_preferred_over_desktop_cli_fallback
+      - test: corrupt_product_credential_does_not_fall_through_to_local_cli
+      - test: corrupt_product_credential_rejects_turn_without_stream
+      - test: expired_product_credential_rejects_turn_without_stream
+      - test: expired_product_credential_refresh_preserves_product_origin
+      - test: experimental_local_cli_does_not_satisfy_product_harness_readiness
+      - test: product_harness_requires_encrypted_app_oauth_credential
+      - test: product_oauth_config_rejects_endpoint_client_scope_override
+      - test: claude_sse_event_returns_text_delta_immediately
+      - test: apply_sse_event_returns_text_delta_immediately
+      - test: build_request_uses_responses_lite_shape_for_current_models
+      - test: claude_billing_block_remains_first_and_unchanged
+      - test: codex_subscription_identity_envelope_remains_unchanged
+      - test: custom_harness_replaces_only_non_auth_non_billing_sections
+      - test: custom_harness_removes_default_prompt_tools_skills_mcp_rules_and_history
+      - test: custom_harness_installs_only_isyncyou_prompt_and_tool
+      - test: product_harness_retains_only_required_provider_identity_fields
+      - test: product_harness_contains_no_default_client_agent_components
+      - test: experimental_capture_authorization_only_is_not_safely_observable
+      - test: experimental_capture_each_missing_claude_header_is_not_safely_observable
+      - test: experimental_capture_each_missing_codex_header_is_not_safely_observable
+      - test: experimental_capture_required_headers_match_runtime_builders
+      - test: experimental_capture_rejects_symlink_within_tmp
+      - test: daemon_agent_startup_removes_legacy_codex_callback_diagnostics
+      - test: product_source_scan_keeps_production_after_early_cfg_test_items
+      - test: mobile_product_has_no_local_cli_experimental_feature
+      - test: assistant_product_source_has_no_subscription_import_affordance
+      - file: docs/evidence/issue-627-manifest.json
   - id: REQ-AGENT-009
     title: Answers carry source citations and respect byte budgets
     statement: >
@@ -157,7 +225,7 @@ requirements:
       - A search/read result carries a {service, id, path} source reference.
       - A read over budget is truncated and flagged.
       - List and export results carry source identifiers for returned items.
-      - The app-host experimental agent build binds read-class actions to the real StoreArchive executor.
+      - The app-host product OAuth provider path binds read-class actions to the real StoreArchive executor.
     verified_by:
       - test: search_returns_source_tagged_hits_across_names_and_bodies
       - test: read_includes_source_object
@@ -166,4 +234,265 @@ requirements:
       - test: export_raw_passthrough_carries_source_ids
       - test: store_archive_reads_sealed_body_with_envelope_reader
       - test: store_archive_executor_covers_search_read_list_export_shapes
-      - test: experimental_agent_executor_reads_store_archive_fixture
+      - test: live_provider_agent_executor_reads_store_archive_fixture
+  - id: REQ-AGENT-010
+    title: Agent secrets are typed, encrypted at rest, and separated by class
+    statement: >
+      Provider API keys, provider OAuth refresh tokens, and agent session pairing keys
+      are persisted through one typed CredentialStore. Each stored envelope is
+      AES-256-GCM encrypted at rest, bound to version/class/id metadata with canonical
+      AAD, written owner-only on Unix, and keyed by a dedicated agent credential key.
+      On Android that key is a separate Android Keystore-wrapped data key installed
+      into Rust before nativeStart; it is not the body encryption key, a WebView token,
+      a session token, or a provider token. (S-AG.5, #620)
+    status: implemented
+    design: docs/adr/007-agent-architecture.md
+    acceptance:
+      - ProviderApiKey, ProviderOAuthRefresh, and SessionPairingKey round-trip only under the requested class and id.
+      - Empty secrets, wrong-class copies, envelope metadata mutation, and wrong-key opens fail closed without leaking secret bytes.
+      - Credential and local key files are ciphertext and owner-only on Unix create/rewrite paths.
+      - App-host credential consumers use the central resolver/helper rather than ad hoc LocalKey construction.
+      - Android installs a separate Keystore-wrapped agent credential key before nativeStart and proves the provider credential store with a JNI-only self-test.
+      - If the Android agent credential key cannot be unwrapped or installed, mobile startup fails closed before local data is opened; no default mobile encrypted-file fallback is used for this key.
+    verified_by:
+      - test: secrets_each_class_round_trips
+      - test: secrets_empty_secret_is_rejected
+      - test: secrets_wrong_class_file_copy_is_rejected
+      - test: secrets_envelope_class_mutation_is_rejected
+      - test: secrets_envelope_id_mutation_is_rejected
+      - test: secrets_envelope_version_mutation_is_rejected
+      - test: secrets_id_delimiter_collision_does_not_decrypt
+      - test: secrets_ciphertext_does_not_contain_plaintext_sentinel
+      - test: secrets_files_are_owner_only_on_create_and_rewrite
+      - test: secrets_debug_and_error_redact_secret_values
+      - test: credential_resolver_prefers_process_key_over_env_or_local
+      - test: credential_resolver_generates_owner_only_local_key
+      - test: provider_api_key_secret_id_is_stable
+      - test: provider_oauth_refresh_secret_id_is_stable
+      - test: provider_secret_id_rejects_path_segments_or_control_chars
+      - test: official_provider_resolver_reads_provider_api_key_from_store
+      - test: subscription_credential_round_trips_through_agent_credential_store
+      - test: codex_credential_round_trips_through_agent_credential_store
+      - test: credential_store_preferred_over_desktop_cli_fallback
+      - test: stored_credential_error_redaction_does_not_leak_tokens
+      - file: android/app/src/main/kotlin/com/silentspike/isyncyou/AgentCredentialKeyStore.kt
+      - file: android/app/src/test/kotlin/com/silentspike/isyncyou/AgentCredentialKeyStorePolicyTest.kt
+      - file: android/app/src/androidTest/kotlin/com/silentspike/isyncyou/AgentCredentialKeyStoreInstrumentedTest.kt
+      - file: docs/evidence/artifacts/issue-620/android-keystore.json
+  - id: REQ-AGENT-011
+    title: Assistant UI streams answers, cites sources, and gates destructive actions
+    statement: >
+      The WebUI Assistant tab is available on desktop and mobile when the agent
+      capability is enabled. It streams typed AgentStreamHub events into a
+      transcript, renders source-ID citations as same-origin item links, renders
+      confirmation_required events as PendingAction cards whose Confirm request
+      includes the one-time token and action_hash, exposes model and usage
+      status, and requires explicit provider-egress consent before setup or use.
+      (S-AG.7, #622)
+    status: implemented
+    design: docs/adr/007-agent-architecture.md
+    acceptance:
+      - Assistant appears in desktop and mobile primary navigation only when the agent capability is enabled.
+      - Streaming token, tool, result, search, pending, error, and done events render as typed UI rows without external WebView network requests.
+      - Source citations are source-ID based and same-origin clickable.
+      - PendingAction cards are the only UI path to destructive confirmation, and Confirm posts pending/token/action_hash exactly once after the user clicks.
+      - Setup requires explicit provider-egress consent and stores no secrets in browser storage.
+      - Model selection is status-driven, and the usage chip is honest when usage data is unavailable.
+    verified_by:
+      - test: assistant_nav_is_services_entry_and_cap_gated
+      - test: assistant_stream_renderer_handles_full_event_contract
+      - test: assistant_citations_are_typed_same_origin_and_deduped
+      - test: assistant_pending_action_cards_post_confirm_cancel_without_dom_secrets
+      - test: assistant_model_picker_and_usage_chip_are_status_driven
+      - test: assistant_setup_consent_is_required_and_non_secret
+      - file: tools/agent-ui-smoke.mjs
+      - file: docs/evidence/artifacts/issue-622/agent-ui-smoke.json
+      - file: docs/evidence/artifacts/issue-622/desktop-assistant.png
+      - file: docs/evidence/artifacts/issue-622/mobile-assistant.png
+  - id: REQ-AGENT-012
+    title: Confirmed desktop Agent operations reuse existing M365 runtime paths
+    statement: >
+      On desktop, restore-local runs as a controlled local restore, while backup,
+      restore-cloud, live-write, and share execute only after a valid PendingAction
+      confirmation. Confirmed operations reuse the existing daemon, engine, writer,
+      store, and ledger-backed M365 paths; mobile destructive Agent execution remains
+      disabled until the mobile security/job stories land. (S-AG.9, #624)
+    status: implemented
+    design: docs/adr/007-agent-architecture.md
+    acceptance:
+      - RestoreLocal writes archived bytes only under a controlled restore root.
+      - Destructive operations do not run before one-time confirmation.
+      - Confirmed backup, restore-cloud, live-write, and share route through existing app-host/engine runtime paths.
+      - Mobile destructive Agent confirmation fails closed for #624.
+      - Audit/API/evidence summaries are redacted and do not contain raw bodies, share URLs, OAuth material, or provider tokens.
+    verified_by:
+      - test: restore_local_writes_archived_body_to_controlled_restore_root
+      - test: agent_backup_confirm_runs_refresh_cache_and_records_backup_run
+      - test: agent_restore_cloud_confirm_routes_to_ledger_restore
+      - test: agent_live_write_mail_set_read_routes_existing_writer
+      - test: agent_share_link_confirm_routes_through_ledger_handler
+      - test: agent_confirm_mobile_policy_refuses_before_mutation
+      - test: agent_confirm_revalidates_action_before_execution
+      - test: agent_confirm_result_summary_is_json_and_redacted
+      - file: docs/evidence/issue-624-manifest.json
+  - id: REQ-AGENT-013
+    title: Network-critical product OAuth and streamed turns remain diagnosable on Android
+    statement: >
+      Android product OAuth, explicit credential refresh, and active streamed Agent turns
+      acquire an acknowledged, bounded dataSync foreground-service lease before their
+      network-critical work. A session- and capability-gated preflight returns only closed,
+      redacted diagnostic codes. Credential status is network-free; an explicit refresh
+      either atomically persists a complete encrypted product credential or returns a
+      reconnect-required error without local fallback or FakeProvider success. (S-AG.15, #640)
+    status: implemented
+    design: docs/adr/007-agent-architecture.md
+    acceptance:
+      - Foreground guards are service-owned, reason-bound, bounded, and survive Activity recreation.
+      - Preflight input is provider/purpose allowlisted, unauthenticated, bounded, and returns no host, URL, token, IP, or raw transport text.
+      - Mobile preflight consumes a one-shot native guard/session-bound snapshot; WebUI cannot supply raw device state.
+      - Status checks do not refresh credentials; explicit refresh persists only a complete encrypted product credential and fails closed on error.
+      - Codex callback attempts are loopback-only, cancellable, bounded, and never persist callback URLs or diagnostics.
+      - Default mobile artifacts exclude network diagnostic hooks; a separate hook artifact proves only diagnostic plumbing.
+    verified_by:
+      - test: reasonsShareOneForegroundServiceUntilLastLeaseEnds
+      - test: networkCriticalGuardStartsAndStopsDeclaredDataSyncService
+      - test: connectivity_preflight_selects_distinct_oauth_turn_and_refresh_targets
+      - test: connectivity_preflight_route_requires_cap_strict_json_and_no_store
+      - test: network_snapshot_registration_uses_engine_session_and_closed_guard_reason
+      - test: agent_status_keeps_selected_codex_provider_when_refresh_is_required
+      - test: product_credential_refresh_uses_injected_clock_and_finite_expiry
+      - test: partial_refresh_response_never_replaces_last_complete_encrypted_credential
+      - test: concurrent_refresh_for_one_provider_is_serialized
+      - test: codex_callback_blocking_accept_cannot_outlive_deadline
+      - test: codex_refresh_device_hook_is_one_shot_and_does_not_change_the_clock
+      - test: networkPreflightHookIsFeatureGatedOwnerOnlyAndOneShot
+      - file: docs/evidence/issue-640-manifest.json
+
+  - id: REQ-AGENT-014
+    title: First-run official OAuth → visible, host-enforced custom-harness handoff
+    statement: >
+      Product agent readiness is a durable, authenticated activation authority, not credential
+      presence. `provider_ready(p)` requires a valid Active V2 credential bundle, a
+      `ProductActivationV1` matching its credential generation + the official-OAuth policy
+      fingerprint + the harness contract version, and a passing static harness attestation; every
+      provider round additionally re-attests the actually-sent request. A single product-runtime gate
+      spans selection + readiness + provider construction and runs before any turn-id/stream/archive,
+      returning a typed `ProductNotReady` mapped to a closed 409. The official OAuth flow records an
+      ordered, authenticated onboarding journal (official sign-in → credential encrypted → retained
+      envelope verified → default harness removed → M365 profile activated → iSyncYou tool connected →
+      subscription identity set → ready), with defined crash-window recovery; a refresh is a V2
+      lifecycle event only. The first-run wizard renders that ordered handoff from the host onboarding
+      projection, and `/oauth/complete` is a strict-JSON, attempt-bound, Claude-only manual step.
+      FakeProvider is a test/fixture provider only and never a not-ready product turn. #627 experimental
+      stays compiled-opt-in only and never confers product readiness. (S-AG.14/#639)
+    status: implemented
+    design: docs/adr/007-agent-architecture.md
+    acceptance:
+      - Readiness derives from the durable ProductActivationV1 (generation + policy fingerprint + harness contract) plus a valid Active bundle and a passing static harness attestation, decoupled from provider selection.
+      - Every provider round builds and consumes a freshly attested request over its current history; the transport accepts only an attested request and rejects any header/body mutation.
+      - The single product-runtime gate runs before turn-id/stream/archive; a not-ready product turn returns a typed ProductNotReady → closed 409 and creates no turn state, with no cross-provider fallback.
+      - The OAuth flow records ordered onboarding-journal transitions; crash windows are defined and recovered (activation resumes without re-exchange; interrupted attempts become error_redacted and are never resumed); refresh never touches the attempt journal.
+      - The status onboarding projection survives journal TTL (a ready provider reports all steps from the activation) and carries Cache-Control no-store with no secrets; /oauth/complete is strict-JSON, attempt-state-bound, and Claude-only.
+      - The first-run wizard renders the ordered handoff steps from the host projection and keys all gating off host readiness, never credential-presence flags; the pasted code lives only transiently and is never persisted/logged/placed in a URL or HTML attribute.
+      - FakeProvider is never a not-ready product turn; #627 experimental never sets connected/activation/readiness.
+      - Live official Claude + Codex OAuth handoff evidence is captured on-device (S-AG.14 device task; device-lock ag-639), the default APK excludes the diagnostic hook, and the credential-store + network-guard instrumentation pass on-device.
+    verified_by:
+      - test: every_provider_round_attests_its_current_history
+      - test: transport_accepts_only_attested_provider_request
+      - test: attestation_cannot_be_reused_after_header_or_body_mutation
+      - test: product_not_ready_returns_409_without_creating_turn_state
+      - test: invalid_selected_provider_never_falls_back
+      - test: experimental_credential_never_sets_product_readiness
+      - test: crash_after_credential_write_resumes_activation_without_reexchange
+      - test: interrupted_oauth_attempt_records_error_redacted
+      - test: completion_and_status_share_the_product_runtime_gate
+      - test: status_projection_correct_after_journal_ttl_expiry
+      - test: oauth_complete_rejects_wrong_attempt_state_and_codex
+      - test: official_oauth_precedes_credential_encryption_and_harness_transformation
+      - test: activation_matches_requires_policy_and_contract_version
+      - test: product_oauth_override_cannot_satisfy_official_handoff
+      - test: codex_callback_accepts_official_scope_parameter
+      - test: codex_callback_rejects_duplicate_unknown_and_ambiguous_parameters
+      - test: codex_authorization_error_callback_terminates_without_exchange
+      - test: assistant_setup_consent_is_required_and_non_secret
+      - file: docs/evidence/issue-639-manifest.json
+
+  - id: REQ-AGENT-015
+    title: Product AI accounts have a reversible, server-revoked lifecycle
+    statement: >
+      Product Claude and Codex credentials can be disconnected or reconnected only through
+      a durable, idempotent lifecycle operation that blocks new provider work, revokes the
+      provider grant before matching local authority is removed, and recovers fail closed
+      after a crash. Account switching is available only when the provider identity is
+      cryptographically verified; every OAuth result is first retained as an encrypted,
+      non-ready candidate and cannot replace an existing credential before validation and
+      required cleanup complete. Android revoke work uses a bounded credential-revoke
+      foreground guard and one-shot native connectivity snapshot. (S-AG.20, #645)
+    status: implemented
+    design: docs/adr/007-agent-architecture.md
+    acceptance:
+      - Product operation leases prevent disconnect, reconnect, or switch from racing a turn or refresh for the same provider while leaving the other provider usable.
+      - Revoke success is persisted before provider-scoped credential, activation, usage, settings, and onboarding state are durably removed; ambiguous revoke outcomes remain encrypted and non-ready for explicit retry.
+      - Stable installation-bound idempotency, lifecycle fencing, and encrypted journals make every documented crash window resumable without duplicating revocation or silently losing grant authority.
+      - Reconnect revokes and cleans the old generation before OAuth; every exchanged credential is a non-ready encrypted candidate until identity and product activation succeed.
+      - Codex Switch requires a strictly validated signed subject; Claude reports switching unavailable unless an equivalent verified subject contract exists.
+      - Strict JSON lifecycle routes and the Assistant expose only closed states, capabilities, retry actions, and scope warnings, never tokens, identities, callback data, or raw provider errors.
+      - Android uses a distinct credential-revoke guard and one-shot snapshot; default artifacts exclude lifecycle device hooks and hook evidence never substitutes for real provider evidence.
+    verified_by:
+      - test: disconnect_revokes_server_token_before_local_credential_delete
+      - test: disconnect_ambiguous_response_enters_revoke_unknown_and_retries_same_operation
+      - test: provider_operation_lease_lives_until_actual_turn_thread_terminal_after_stream_open
+      - test: reconnect_existing_credential_revokes_before_replacement
+      - test: codex_switch_different_verified_subject_commits_through_normal_activation_and_completes
+      - test: switch_same_subject_revokes_candidate_and_remains_disconnected
+      - test: candidate_revoke_failure_never_loses_grant_authority
+      - test: agent_status_projects_account_lifecycle_without_identity_or_secret
+      - test: assistant_account_lifecycle_controls_are_capability_and_state_driven
+      - test: credential_revoke_snapshot_is_single_use_and_session_bound
+      - test: account_lifecycle_hook_apk_contains_deliberate_marker_and_closed_jni_only_controls
+      - test: agent_oauth_start_first_connect_resumes_bound_operation_after_restart
+      - test: agent_oauth_poll_keeps_loopback_alive_for_full_host_attempt_window
+      - test: agent_oauth_connectivity_retry_preserves_lifecycle_operation_binding
+      - file: tools/agent-account-lifecycle-ui-smoke.mjs
+      - file: docs/evidence/issue-645-manifest.json
+
+  - id: REQ-AGENT-016
+    title: Product shared-session integration and idempotent turn lifecycle
+    statement: >
+      Product Agent sessions use a versioned encrypted manifest and transcript with
+      bounded pagination, storage, and provider context. Every mutable request has a
+      route-, session-, and semantic-payload-bound UUID identity; provider steps,
+      recovery checkpoints, cancellation, confirmation, and terminal publication are
+      fenced so retries cannot duplicate provider calls or effects. Long turns renew
+      their authoritative session lease, remain bound to the exact provider credential
+      generation and product harness, and publish completion only after durable terminal
+      state. Cross-device transfer uses a confirmed, one-time, five-minute pairing
+      protocol with encrypted crash recovery. (S-AG.13, #628)
+    status: implemented
+    design: docs/adr/007-agent-architecture.md
+    acceptance:
+      - V2 sessions publish visible transcript, request state, and UUID bindings through one fenced manifest CAS and enforce combined record and encrypted-byte budgets.
+      - Request journals retain the complete bounded provider-step chain, reject ambiguous outbound-call recovery, and revalidate provider, model, credential generation, policy, harness, and installation binding before continuation.
+      - Cancellation and pending cancellation reduce authority; done(complete) is emitted only after terminal persistence and late provider or tool results cannot publish.
+      - Desktop and Android use the same strict session/capability/request contract; mutable values are JSON or bounded sealed chunks rather than URL parameters.
+      - Pairing is confirmation-gated, single-use, expires after five minutes, and cannot be taken over by another claimant after a durable claim.
+      - Pairing source and claim cleanup authority survives retention expiry until conditional remote deletion succeeds or remote absence is proven.
+    verified_by:
+      - test: session_v2_round_trips_user_assistant_sources_and_terminal_state
+      - test: manifest_cas_atomically_advances_visible_request_and_uuid_binding_heads
+      - test: request_journal_recovers_all_sixteen_provider_steps_in_order
+      - test: rejected_tool_help_digest_or_unknown_version_fails_closed
+      - test: duplicate_tool_use_ids_fail_closed_before_execution
+      - test: lease_renews_while_provider_emits_no_events
+      - test: same_request_id_same_terminal_result_does_not_call_provider_twice
+      - test: provider_generation_recovery_rejects_every_authority_binding_change
+      - test: turn_cancel_before_persist_ignores_late_provider_result
+      - test: done_complete_is_emitted_only_after_terminal_record_commit
+      - test: pairing_claim_install_and_finalize_are_restart_safe_and_idempotent
+      - test: strict_json_rejects_recursive_duplicate_keys_and_trailing_data
+      - test: mutation_intent_commit_verifies_total_hash_length_expiry_and_binding
+      - test: lost_lease_rejects_late_append_and_finalization
+      - test: turn_cancel_stops_before_read_tool_execution
+      - test: user_presence_and_agent_session_routes_require_session_cap_strict_json_and_no_store
+      - file: tools/agent-epic-closeout-probe.py
+      - file: docs/evidence/issue-628-pre-rc-manifest.json

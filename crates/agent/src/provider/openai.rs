@@ -1,16 +1,16 @@
-//! Official OpenAI provider (REQ-AGENT-008), Chat Completions wire format. BYO API key
-//! (`Authorization: Bearer`). `store` defaults to **false** for M365 content (the API
-//! retains by default otherwise). Request building + response parsing are pure
-//! (unit-tested, no network); the live call is behind the `http` feature and exercised
-//! only by a live-gated test — CI uses `FakeProvider` and never a real token.
+//! OpenAI Chat Completions request/response helpers plus the legacy BYO API-key provider.
+//! The BYO live type is quarantined behind `byo-api-providers` and is not part of the
+//! #623 Claude/Codex product OAuth path.
 
 use super::{AssistantBlock, Usage};
 use crate::tool::{tool_schema, TOOL_NAME};
 use crate::turn::{Message, Role};
 use crate::AgentError;
 use serde_json::{json, Value};
+#[cfg(feature = "byo-api-providers")]
+use std::sync::Arc;
 
-#[cfg(feature = "http")]
+#[cfg(feature = "byo-api-providers")]
 const OPENAI_URL: &str = "https://api.openai.com/v1/chat/completions";
 
 /// The single isyncyou tool in OpenAI's `{type:function, function:{...}}` shape.
@@ -81,7 +81,7 @@ pub(crate) fn build_request(model: &str, system: &str, history: &[Message], stor
     })
 }
 
-#[cfg(feature = "http")]
+#[cfg(feature = "byo-api-providers")]
 fn headers(api_key: &str) -> Vec<(String, String)> {
     vec![
         ("authorization".to_string(), format!("Bearer {api_key}")),
@@ -139,18 +139,19 @@ pub(crate) fn parse_response(v: &Value) -> Result<(Vec<AssistantBlock>, Usage), 
         Usage {
             input_tokens: g("prompt_tokens"),
             output_tokens: g("completion_tokens"),
+            ..Default::default()
         },
     ))
 }
 
-#[cfg(feature = "http")]
+#[cfg(feature = "byo-api-providers")]
 mod live {
     use super::*;
     use crate::provider::{LlmProvider, StreamEvent};
 
     /// Live OpenAI provider over the agent's own blocking HTTP transport.
     pub struct OpenAiProvider {
-        http: crate::http::HttpTransport,
+        http: Arc<crate::http::HttpTransport>,
         api_key: String,
         model: String,
         system: String,
@@ -166,7 +167,7 @@ mod live {
             system: impl Into<String>,
         ) -> Result<Self, AgentError> {
             Ok(Self {
-                http: crate::http::HttpTransport::new()?,
+                http: crate::http::HttpTransport::shared()?,
                 api_key: api_key.into(),
                 model: model.into(),
                 system: system.into(),
@@ -209,7 +210,7 @@ mod live {
     }
 }
 
-#[cfg(feature = "http")]
+#[cfg(feature = "byo-api-providers")]
 pub use live::OpenAiProvider;
 
 #[cfg(test)]
@@ -284,7 +285,8 @@ mod tests {
             usage,
             Usage {
                 input_tokens: 5,
-                output_tokens: 7
+                output_tokens: 7,
+                ..Default::default()
             }
         );
     }

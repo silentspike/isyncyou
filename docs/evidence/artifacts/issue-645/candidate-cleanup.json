@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "provider": "codex",
+  "operation": "switch",
+  "scenario": "same_verified_subject",
+  "result": "pass",
+  "closed_code": "same_account_selected",
+  "candidate_revoke_leg": 2,
+  "revoked_grant": "oauth_candidate",
+  "revoke_request_target": "refresh_token",
+  "revoke_scope_guarantee": "observed_token_session",
+  "final_state": "disconnected",
+  "candidate_ready": false,
+  "automatic_resume_after_callback_race": "pass",
+  "secret_or_identity_included": false
+}

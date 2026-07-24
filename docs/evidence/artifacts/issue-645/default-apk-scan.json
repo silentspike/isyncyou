@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "implementation_commit": "65c2126db3402d361e4bfe6e04f901759619b523",
+  "apk_sha256": "3de9f65fe44700f67a3571b3a290630c2170aee3bbde7e9048d1092953ee5006",
+  "hook_marker_present": false,
+  "build": "clean_final_default_debug_after_hook_instrumentation",
+  "installed_after_hook_test": true,
+  "physical_connect_reconnect_and_post_reconnect_turn": "pass",
+  "result": "pass"
+}

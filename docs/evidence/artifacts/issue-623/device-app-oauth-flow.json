@@ -1,0 +1,231 @@
+{
+  "artifact": "issue-623-device-app-oauth-flow",
+  "captured_at": "2026-07-10T08:39:00Z",
+  "oauth_flow_commit": "b2be12a",
+  "current_apk_commit": "cfcc714",
+  "device": {
+    "model": "Pixel 8 Pro",
+    "transport": "usb-adb",
+    "package": "com.silentspike.isyncyou.debug",
+    "device_lock": "ag-623"
+  },
+  "app_build": {
+    "command": "(cd android && ./gradlew :app:assembleDebug)",
+    "result": "pass",
+    "apk": "android/app/build/outputs/apk/debug/app-debug.apk",
+    "installed": true,
+    "reinstalled_after_usage_chip_fix": true
+  },
+  "oauth_flow": {
+    "provider": "claude",
+    "started_from": "Assistant setup UI in the Android WebView",
+    "external_browser": "com.vivaldi.browser",
+    "authorize_screen_seen": true,
+    "user_authorized": true,
+    "completion_mode": "manual_code_paste",
+    "completion_result": "connected",
+    "screenshots": [
+      "docs/evidence/artifacts/issue-623/device-start.png",
+      "docs/evidence/artifacts/issue-623/device-claude-browser.png",
+      "docs/evidence/artifacts/issue-623/device-claude-connected.png",
+      "docs/evidence/artifacts/issue-623/device-claude-turn.png"
+    ],
+    "screenshots_redacted": true
+  },
+  "codex_oauth_flow": {
+    "provider": "codex",
+    "started_from": "Assistant model picker Connect ChatGPT action in the Android WebView",
+    "external_browser": "com.vivaldi.browser",
+    "callback": "http://localhost:1455/auth/callback",
+    "callback_screen_seen": true,
+    "completion_mode": "loopback_callback",
+    "completion_result": "connected",
+    "screenshots": [
+      "docs/evidence/artifacts/issue-623/device-codex-browser-attempt.png",
+      "docs/evidence/artifacts/issue-623/device-codex-turn.png"
+    ],
+    "screenshots_redacted": true,
+    "notes": "device-codex-turn.png has the Usage chip area redacted because the committed screenshot is turn evidence; rate-limit formatting is proven by current_apk_usage_chip_check."
+  },
+  "webview_status_after_oauth": {
+    "document_cookie": "",
+    "enabled": true,
+    "connected": true,
+    "provider": "codex",
+    "claude": true,
+    "codex": true,
+    "model": "gpt-5.5"
+  },
+  "current_apk_usage_chip_check": {
+    "status_after_reinstall": {
+      "connected": true,
+      "provider": "codex",
+      "model": "gpt-5.5",
+      "claude": true,
+      "codex": true,
+      "document_cookie": ""
+    },
+    "rendered_after_reinstall": "Usage unavailable",
+    "synthetic_rate_limit_render": "Request req_1234567890abcdef · 12 in · 3 out · limit allowed · 23%",
+    "contains_object_object": false,
+    "screenshot_usage_area_redacted": true
+  },
+  "credential_store_observation": {
+    "path_root": "/data/user/0/com.silentspike.isyncyou.debug/files",
+    "credential_key": {
+      "path": "files/agent_credential.key",
+      "mode": "0600",
+      "size_bytes": 60
+    },
+    "credential_files": [
+      {
+        "path": "files/agent-credentials/provider-oauth-refresh__[redacted-credential-id-1].cred",
+        "mode": "0600",
+        "size_bytes": 3268
+      },
+      {
+        "path": "files/agent-credentials/provider-oauth-refresh__[redacted-credential-id-2].cred",
+        "mode": "0600",
+        "size_bytes": 495
+      }
+    ],
+    "credential_file_count": 2,
+    "store_db": {
+      "path": "files/archive/.isyncyou-store.db",
+      "mode": "0600",
+      "size_bytes": 135168
+    },
+    "secrets_read_or_printed": false
+  },
+  "device_live_turn": {
+    "prompt": "Use the isyncyou tool before answering. Search account me, service mail, query \"isyncyou623productlivesentinel\". Then answer exactly whether the tool returned results.",
+    "transport": "mobile WebView bridge stream",
+    "provider": "claude",
+    "model": "claude-sonnet-5",
+    "status_before": {
+      "connected": true,
+      "provider": "claude"
+    },
+    "status_after": {
+      "connected": true,
+      "provider": "claude",
+      "usage_present": true,
+      "usage_provider": "claude",
+      "usage_model": "claude-sonnet-5",
+      "input_tokens": 1383,
+      "output_tokens": 32,
+      "request_id_present": true,
+      "rate_limit_status_present": true
+    },
+    "observed_events": [
+      {
+        "event": "tool_call",
+        "name": "isyncyou",
+        "input": {
+          "account": "me",
+          "op": "search",
+          "service": "mail",
+          "query": "isyncyou623productlivesentinel"
+        }
+      },
+      {
+        "event": "search_stage",
+        "stage": "names",
+        "status": "done",
+        "hits": 0
+      },
+      {
+        "event": "search_stage",
+        "stage": "bodies",
+        "status": "done",
+        "hits": 0
+      },
+      {
+        "event": "tool_result",
+        "returned": 0,
+        "total_matches": 0,
+        "untrusted": true
+      },
+      {
+        "event": "done",
+        "reason": "complete"
+      }
+    ],
+    "final_answer": "No, the search returned no results - no mail items matched \"isyncyou623productlivesentinel\".",
+    "pass_conditions": {
+      "oauth_wrote_encrypted_app_private_credential": true,
+      "webview_cookie_contains_session_token": false,
+      "agent_status_connected_from_device_oauth": true,
+      "provider_stream_used_stored_credential": true,
+      "storearchive_tool_call_observed": true,
+      "storearchive_tool_result_observed": true,
+      "stream_done_complete": true
+    }
+  },
+  "codex_device_live_turn": {
+    "prompt": "Use the isyncyou tool before answering. Search account me, service mail, query \"isyncyou623productlivesentinel\". Then answer exactly whether the tool returned results.",
+    "transport": "mobile WebView bridge stream",
+    "provider": "codex",
+    "model": "gpt-5.5",
+    "status_before": {
+      "connected": true,
+      "provider": "codex",
+      "model": "gpt-5.5"
+    },
+    "status_after": {
+      "connected": true,
+      "provider": "codex",
+      "usage_present": true,
+      "usage_provider": "codex",
+      "usage_model": "gpt-5.5",
+      "input_tokens": 654,
+      "output_tokens": 10,
+      "request_id_present": false,
+      "rate_limit_status_present": false
+    },
+    "observed_events": [
+      {
+        "event": "tool_call",
+        "name": "isyncyou",
+        "input": {
+          "account": "me",
+          "op": "search",
+          "service": "mail",
+          "query": "isyncyou623productlivesentinel",
+          "limit": 10
+        }
+      },
+      {
+        "event": "search_stage",
+        "stage": "names",
+        "status": "done",
+        "hits": 0
+      },
+      {
+        "event": "search_stage",
+        "stage": "bodies",
+        "status": "done",
+        "hits": 0
+      },
+      {
+        "event": "tool_result",
+        "returned": 0,
+        "total_matches": 0,
+        "untrusted": true
+      },
+      {
+        "event": "done",
+        "reason": "complete"
+      }
+    ],
+    "final_answer": "The tool returned no results.",
+    "pass_conditions": {
+      "oauth_wrote_encrypted_app_private_credential": true,
+      "agent_status_connected_from_device_oauth": true,
+      "provider_stream_used_stored_credential": true,
+      "storearchive_tool_call_observed": true,
+      "storearchive_tool_result_observed": true,
+      "stream_done_complete": true
+    }
+  }
+}

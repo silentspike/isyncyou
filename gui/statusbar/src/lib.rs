@@ -218,12 +218,12 @@ fn text(
     s: &str,
 ) {
     let mut buf = Buffer::new(fs, Metrics::new(size, size * 1.3));
-    buf.set_size(fs, Some(WIDTH as f32), Some(size * 2.0));
+    buf.set_size(Some(WIDTH as f32), Some(size * 2.0));
     buf.set_text(
-        fs,
         s,
-        Attrs::new().family(Family::Name(FONT_FAMILY)),
+        &Attrs::new().family(Family::Name(FONT_FAMILY)),
         Shaping::Advanced,
+        None,
     );
     buf.shape_until_scroll(fs, false);
     let (pw, ph) = (pm.width(), pm.height());

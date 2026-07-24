@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "scope": "local_cli_drift_only_not_product_auth",
+  "product_auth_evidence": false,
+  "client": {
+    "name": "codex",
+    "version": "0.144.1"
+  },
+  "controlled_sentinel_observed": true,
+  "event_type_counts": {
+    "item.completed": 1,
+    "thread.started": 1,
+    "turn.completed": 1,
+    "turn.started": 1
+  },
+  "usage_fields": [
+    "cached_input_tokens",
+    "input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens"
+  ],
+  "rate_limit_fields": [],
+  "identifiers": {
+    "request_id_present": false,
+    "session_id_present": false,
+    "thread_id_present": true
+  },
+  "wire": {
+    "endpoint_observed": false,
+    "headers_observed": false,
+    "provider_hosts": [],
+    "path_categories": [],
+    "headers": {
+      "authorization_present": false,
+      "billing_identity_present": false,
+      "account_identity_present": false,
+      "client_identity_present": false,
+      "protocol_version_present": false,
+      "stream_accept_present": false
+    }
+  },
+  "model_catalog": {
+    "models_count": 8,
+    "bundled_models_count": 8,
+    "service_tiers_present": true,
+    "input_modalities_present": true,
+    "supports_parallel_tool_calls_present": true
+  },
+  "drift_decision": "not_safely_observable",
+  "raw_retained": false
+}

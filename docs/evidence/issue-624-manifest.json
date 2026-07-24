@@ -1,0 +1,171 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-07-10T15:41:55+02:00",
+  "commit": "47264c00b7b51a6b6b46d5416986913febe06450",
+  "entries": [
+    {
+      "id": "EV-001",
+      "requirement": "REQ-AGENT-012",
+      "claim": "RestoreLocal reads archived content through StoreArchive and writes only under the controlled restore-local root.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers restore_local -- --nocapture",
+      "result": "pass",
+      "test": "restore_local_writes_archived_body_to_controlled_restore_root",
+      "evidence": "Focused restore_local AppHost tests passed during Task 3; restore output was constrained to .isyncyou-agent/restore-local and used archived/envelope-aware body reads.",
+      "artifact": "docs/evidence/artifacts/issue-624/host-gates.txt"
+    },
+    {
+      "id": "EV-002",
+      "requirement": "REQ-AGENT-012",
+      "claim": "Confirmed Backup routes through the shared backup runner and records the backup run.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers agent_backup_ -- --nocapture",
+      "result": "pass",
+      "test": "agent_backup_confirm_runs_refresh_cache_and_records_backup_run",
+      "evidence": "Focused agent_backup_ AppHost tests passed during Task 4; selected services are validated before token lookup and refresh_cache_account_filtered receives the expected service set.",
+      "artifact": "docs/evidence/artifacts/issue-624/host-gates.txt"
+    },
+    {
+      "id": "EV-003",
+      "requirement": "REQ-AGENT-012",
+      "claim": "Confirmed RestoreCloud routes through the existing engine restore semantics instead of a new raw mutation path.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers agent_restore_cloud -- --nocapture",
+      "result": "pass",
+      "test": "agent_restore_cloud_confirm_routes_to_ledger_restore",
+      "evidence": "Focused agent_restore_cloud AppHost tests passed during Task 5; service support and cloud_restore_enabled are checked before cached restore-token lookup.",
+      "artifact": "docs/evidence/artifacts/issue-624/host-gates.txt"
+    },
+    {
+      "id": "EV-004",
+      "requirement": "REQ-AGENT-012",
+      "claim": "Confirmed LiveWrite uses existing service writer dispatch with strict service/verb parsing.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers agent_live_write -- --nocapture",
+      "result": "pass",
+      "test": "agent_live_write_mail_set_read_routes_existing_writer",
+      "evidence": "Focused agent_live_write AppHost tests passed during Task 7; mail, calendar, contacts, todo, and onenote dispatch cases route through the existing writer-trait seam.",
+      "artifact": "docs/evidence/artifacts/issue-624/agent-ops-fixture.json"
+    },
+    {
+      "id": "EV-005",
+      "requirement": "REQ-AGENT-012",
+      "claim": "Confirmed Share routes through DaemonShare and the ledger-backed #722 link/invite handler, including organization-scope links.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers agent_share -- --nocapture",
+      "result": "pass",
+      "test": "agent_share_link_confirm_routes_through_ledger_handler",
+      "evidence": "Focused agent_share AppHost tests passed during Task 6; link and invite intents are validated before pending registration and execution uses the ShareHandler seam.",
+      "artifact": "docs/evidence/artifacts/issue-624/agent-ops-fixture.json"
+    },
+    {
+      "id": "EV-006",
+      "requirement": "REQ-AGENT-012",
+      "claim": "Mobile destructive Agent confirmation remains fail-closed for #624.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers agent_confirm_ -- --nocapture",
+      "result": "pass",
+      "test": "agent_confirm_mobile_policy_refuses_before_mutation",
+      "evidence": "The agent_confirm_ AppHost filter passed during Task 8; MobileDisabledAgentOperations returns not_available_on_mobile and records only started/error audit states.",
+      "artifact": "docs/evidence/artifacts/issue-624/host-gates.txt"
+    },
+    {
+      "id": "EV-007",
+      "requirement": "REQ-AGENT-012",
+      "claim": "The confirm endpoint revalidates stored PendingActions before execution and rejects malformed destructive actions.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers agent_confirm_ -- --nocapture",
+      "result": "pass",
+      "test": "agent_confirm_revalidates_action_before_execution",
+      "evidence": "The revalidation test registers a malformed live-write PendingAction directly and proves confirm returns invalid_confirmed_action without executing or auditing it.",
+      "artifact": "docs/evidence/artifacts/issue-624/host-gates.txt"
+    },
+    {
+      "id": "EV-008",
+      "requirement": "REQ-AGENT-012",
+      "claim": "Read-class actions cannot execute through the confirmed destructive-action path.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers agent_confirm_ -- --nocapture",
+      "result": "pass",
+      "test": "agent_confirm_read_class_action_cannot_execute_in_confirm_path",
+      "evidence": "The read-class confirm test registers a search action directly and proves confirm rejects it as not_confirmable without executor or audit calls.",
+      "artifact": "docs/evidence/artifacts/issue-624/host-gates.txt"
+    },
+    {
+      "id": "EV-009",
+      "requirement": "REQ-AGENT-012",
+      "claim": "Confirmed-operation API summaries are JSON and centrally redacted even if an executor returns raw URL or email text.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers agent_confirm_ -- --nocapture",
+      "result": "pass",
+      "test": "agent_confirm_result_summary_is_json_and_redacted",
+      "evidence": "The JSON/redaction test parses the confirm response as JSON and verifies raw URL/email text is replaced with redacted placeholders.",
+      "artifact": "docs/evidence/artifacts/issue-624/host-gates.txt"
+    },
+    {
+      "id": "EV-010",
+      "requirement": "REQ-AGENT-012",
+      "claim": "The desktop confirmed executor block does not call raw GraphClient mutation methods directly.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-app-host --features agent-oauth-providers desktop_agent_operations_impl_does_not_call_graphclient_mutations_directly -- --nocapture",
+      "result": "pass",
+      "test": "desktop_agent_operations_impl_does_not_call_graphclient_mutations_directly",
+      "evidence": "Static source test passed during Task 7; DesktopAgentOperations dispatches to operation runners/handlers rather than GraphClient or direct share mutation calls.",
+      "artifact": "docs/evidence/artifacts/issue-624/agent-ops-fixture.json"
+    },
+    {
+      "id": "EV-011",
+      "requirement": "REQ-AGENT-012",
+      "claim": "A confirmed Agent live-write can create and clean up a Microsoft Graph mail draft only after PendingAction confirmation, while public stream input is redacted.",
+      "method": "test",
+      "command": "ISY624_M365_WRITE_TOKEN_FILE=<temp-0600-redacted> cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers -- --ignored live_issue_624_agent_confirm_",
+      "result": "pass",
+      "test": "live_issue_624_agent_confirm_create_draft_and_cleanup",
+      "evidence": "The ignored live test used a real Mail.ReadWrite token, observed a redacted public tool_call, confirmed the pending action, received a draft id, and deleted the draft in cleanup.",
+      "artifact": "docs/evidence/artifacts/issue-624/live-agent-confirm.json"
+    },
+    {
+      "id": "EV-012",
+      "requirement": "REQ-AGENT-012",
+      "claim": "A confirmed Agent share action can create and clean up a direct OneDrive anonymous view link only after PendingAction confirmation, while public stream input remains redacted.",
+      "method": "test",
+      "command": "ISY624_M365_WRITE_TOKEN_FILE=<temp-0600-redacted> cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers -- --ignored live_issue_624_agent_confirm_",
+      "result": "pass",
+      "test": "live_issue_624_agent_confirm_share_link_and_cleanup",
+      "evidence": "The ignored live test used a real Files.ReadWrite token, created a temporary OneDrive item, confirmed the pending share action, verified a direct non-inherited anonymous view permission, then deleted the permission and item.",
+      "artifact": "docs/evidence/artifacts/issue-624/live-agent-confirm.json"
+    },
+    {
+      "id": "EV-013",
+      "requirement": "REQ-AGENT-012",
+      "claim": "A confirmed Agent backup can run the shared backup runner and record an ok backup run only after PendingAction confirmation.",
+      "method": "test",
+      "command": "ISY624_M365_WRITE_TOKEN_FILE=<temp-0600-redacted> cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers -- --ignored live_issue_624_agent_confirm_",
+      "result": "pass",
+      "test": "live_issue_624_agent_confirm_backup_mail_records_run",
+      "evidence": "The ignored live Backup probe used a real Microsoft 365 token derived from the local MSAL cache, confirmed the PendingAction, executed DesktopAgentOperations, refreshed mail through the shared backup runner, and observed an ok backup run in the Store run log.",
+      "artifact": "docs/evidence/artifacts/issue-624/live-agent-confirm.json"
+    },
+    {
+      "id": "EV-014",
+      "requirement": "REQ-AGENT-012",
+      "claim": "A confirmed Agent restore-cloud can restore a synthetic archived mail item through the existing restore-cloud path only after PendingAction confirmation.",
+      "method": "test",
+      "command": "ISY624_M365_WRITE_TOKEN_FILE=<temp-0600-redacted> cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers -- --ignored live_issue_624_agent_confirm_",
+      "result": "pass",
+      "test": "live_issue_624_agent_confirm_restore_cloud_mail_and_cleanup",
+      "evidence": "The ignored live RestoreCloud probe seeded a synthetic archived mail body, confirmed restore-cloud through DesktopAgentOperations and the existing engine restore_cloud path, verified the new Graph message, deleted it, and checked the committed restore ledger row.",
+      "artifact": "docs/evidence/artifacts/issue-624/live-agent-confirm.json"
+    },
+    {
+      "id": "EV-015",
+      "requirement": "REQ-AGENT-012",
+      "claim": "The saved #624 plan was reloaded and checked against the implemented branch; live evidence boundaries are documented rather than overclaimed.",
+      "method": "command",
+      "command": "wc -l docs/security/issue-624-desktop-operations-agent-plan.md; gh issue view 624 --repo silentspike/isyncyou --json state,title,labels",
+      "result": "pass",
+      "evidence": "The plan was re-read at 924 lines after implementation. LiveWrite, Share, Backup, and RestoreCloud have live Graph confirmation probes. RestoreLocal remains host-fixture backed, and Invite is not live-claimed without a controlled recipient.",
+      "artifact": "docs/evidence/artifacts/issue-624/plan-verification.txt"
+    }
+  ]
+}

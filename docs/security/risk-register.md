@@ -43,7 +43,7 @@ README's [Known limitations](../../README.md#known-limitations).
 |---|---|
 | **Risk** | The tool holds Microsoft 365 access/refresh tokens; an over-broad scope or a leaked token widens the blast radius. |
 | **Impact** | High. |
-| **Mitigation** | Separate read and write/restore app registrations with least-privilege scopes; the write/restore scope is only requested when a restore is actually performed; tokens are never logged; public-client OAuth (PKCE / device-code) with no client secret on the desktop/CLI. |
+| **Mitigation** | Separate Reader and Writer app registrations use least-privilege scopes and independent encrypted caches. Product UI connects them explicitly per account, verifies the same stable Graph object identity before pairing them, never substitutes Writer for Reader cache refresh, and never logs tokens. Public-client OAuth uses PKCE in the desktop/mobile product flow and retains device-code only for the explicit headless CLI workflow; neither path uses a client secret. |
 | **Status** | **Mitigated** for handling; at-rest protection tracked under R2. |
 
 ## R5 — Malicious mail content in the viewer
@@ -73,14 +73,56 @@ README's [Known limitations](../../README.md#known-limitations).
 | **Mitigation** | `cargo deny` runs in the gate (advisories + licenses + bans); Dependabot tracks updates. The release workflow generates a CycloneDX SBOM from the locked Cargo graph and requests GitHub artifact attestations for the release archives, AppImage, Windows zip, SBOM, and checksum file. |
 | **Status** | **In progress** — `cargo deny`, Dependabot, SBOM generation, and signed GitHub artifact attestations are wired; deployed staging/full live-E2E evidence is still open. |
 
-## R8 — Experimental subscription provider is visible in a public repo
+## R8 — Claude/Codex OAuth provider compatibility and local fallback risk
 
 | | |
 |---|---|
-| **Risk** | The in-app agent (Epic #614) includes an experimental Claude/Codex *subscription* provider that mimics an official client's identity to ride the user's own consumer subscription. Even gated, its source is visible in a public repo, and a per-app consent dialog does not make the access provider-ToS-compliant — only the provider could. |
-| **Impact** | Medium — a reputational/compliance signal in an audit-clean public repo; brittle against provider header/wire drift. |
-| **Mitigation** | The official providers (Anthropic Messages, OpenAI Responses) are the default product path. The subscription provider is behind a default-off `agent-subscription-experimental` Cargo feature, **excluded from CI and release artifacts**, **absent from the README**, and documented only under `docs/experimental/` as `unsupported / personal-build only` (no product/marketing claim). The detailed subscription wire format stays in **private local evidence**; the public surface carries no reproducible recipe, token, or secret (S-AG.0/#615, S-AG.12/#627). The sole operator accepts the residual with eyes open. |
-| **Status** | **Accepted** — a deliberate, documented trade-off: the experimental path is fenced (feature-gated, non-release, non-README, private-evidence-only) so the public product path stays audit-clean while the operator retains a personal-build option. Design: [ADR-007](../adr/007-agent-architecture.md). |
+| **Risk** | The in-app agent uses app-authorized Claude/Codex OAuth and provider-compatible request envelopes. Required auth, billing, subscription identity, stream, and usage fields can drift. The default-off #627 local CLI fallback/capture path can leak credentials or ship accidentally, and an incorrect harness transformation can retain default-client behavior or remove a required provider field. |
+| **Impact** | Medium — wire drift can break provider access; credential or account leakage is security-sensitive; an incorrect retained/removed boundary can violate the product harness contract. |
+| **Mitigation** | #623 product builds load app OAuth credentials from the encrypted iSyncYou CredentialStore. The owner-approved compliance model begins with official provider OAuth, preserves the required auth/billing/subscription identity envelope unchanged and in its provider-required position, removes every other default-client prompt/tool/skill/plugin/MCP/rule/memory/history/context component, and installs only the iSyncYou M365 prompt and single `isyncyou` tool. Exact-position/absence tests freeze that boundary. Product sources ignore local CLI auth and reject OAuth endpoint/client/scope overrides. #627's desktop-only fallback is explicit, default-off, never satisfies product readiness, never persists local credentials, and is absent from mobile/release feature graphs and built artifacts. Its allowlist reducer commits only bounded summaries; raw captures are deleted. See [the experimental boundary](../experimental/agent-local-cli-fallback.md) and [#627 evidence](../evidence/issue-627-manifest.json). |
+| **Status** | **Accepted / monitored** — #623 product OAuth and StoreArchive evidence is complete. Residual technical risk remains for provider wire drift, credential leakage, accidental experimental-feature shipping, and defects in the retained-versus-removed harness boundary. The #627 version/capture process monitors those risks without treating local CLI auth as product evidence. Design: [ADR-007](../adr/007-agent-architecture.md). |
+
+## R9 — Android network-critical Agent flow interruption
+
+| | |
+|---|---|
+| **Risk** | Android backgrounds the app during provider OAuth or an active streamed turn; connectivity failure is misdiagnosed or leaks transport details; refresh failure silently changes credential origin. |
+| **Impact** | High — sign-in or turns can fail silently, and unsafe diagnostics or fallback can expose provider/network data or misrepresent authentication state. |
+| **Mitigation** | #640 uses reason-bound, acknowledged, bounded `dataSync` foreground leases; a session/capability-gated provider-purpose preflight emits only closed codes; mobile snapshots are single-use and bound to the active engine session and guard; status is network-free; explicit refresh atomically persists only complete credentials and fails closed. Codex callbacks are loopback-only, cancellable, one-shot, and leave no callback diagnostics or fixed-routing residue. Default artifacts exclude the separate diagnostic hook. |
+| **Status** | **Mitigated / monitored** — host, UI, artifact, official OAuth, guarded refresh, and streamed-turn evidence is recorded in [the #640 manifest](../evidence/issue-640-manifest.json). Residual Android scheduling, provider, and network-policy drift remains monitored; a foreground service mitigates priority loss but does not guarantee reachability. Design: [ADR-007](../adr/007-agent-architecture.md). |
+
+---
+
+## R10 — First-run OAuth handoff / product-readiness spoofing
+
+| | |
+|---|---|
+| **Risk** | A turn runs on a credential that never completed the official OAuth → custom-harness handoff (mere credential presence, a stale/forged onboarding journal, an experimental local-CLI credential, a policy/contract-mismatched or half-written credential), or a default-client harness component reaches the wire, or the pasted manual code leaks via URL/DOM/log. |
+| **Impact** | High — an unverified or spoofed provider identity could act on the user's Microsoft 365 domain, or full-power default-client capabilities could be exercised under the product path, or a subscription credential could leak. |
+| **Mitigation** | #639 makes readiness a durable, authenticated `ProductActivationV1` (generation + official policy fingerprint + harness contract) plus a valid Active V2 bundle plus a passing static harness attestation; the TTL'd onboarding journal is evidence/recovery only and never the authority. Every provider round re-attests the actually-sent request against a positive allowlist; the transport accepts only an attested request. One product-runtime gate spans selection + readiness + build before any turn-id/stream/archive and returns a closed 409 with no cross-provider fallback; an experimental local-CLI credential never confers readiness and FakeProvider is never an unconfigured product turn. Crash windows are defined and recovered without re-exchange; interrupted attempts are `error_redacted` and never resumed; refresh is a V2-lifecycle event only. Status carries `no-store` and no secrets; `/oauth/complete` is strict-JSON, attempt-state-bound, Claude-only; the pasted code is transient (type=password, cleared, never URL/DOM-attr/log/storage). |
+| **Status** | **Mitigated / monitored** — host, UI, boundary, default-artifact, and live official Claude + Codex OAuth handoff evidence is recorded in [the #639 manifest](../evidence/issue-639-manifest.json), and REQ-AGENT-014 is implemented. Residual provider wire drift and platform scheduling remain monitored. Design: [ADR-007](../adr/007-agent-architecture.md). |
+
+---
+
+## R11 — Provider account lifecycle grant loss or orphaning
+
+| | |
+|---|---|
+| **Risk** | Disconnect deletes only local state while the provider grant remains live; Reconnect overwrites an older grant; a crash loses revocation authority or a newly exchanged candidate; or Switch accepts an unverified/same identity. |
+| **Impact** | High — an apparently disconnected account can remain authorized, credentials can become unrecoverable, duplicate grants can survive, or the UI can misrepresent which account is active. |
+| **Mitigation** | #645 uses provider-scoped operation leases, a durable cross-process fence, stable installation-bound idempotency, encrypted lifecycle journals/candidates, separate active/candidate revoke legs, and fail-closed recovery. Provider revoke success is persisted before provider-scoped local cleanup. Ambiguous outcomes and grant-bearing candidates are retained non-ready. Reconnect revokes the prior generation before OAuth; Codex Switch requires a strictly validated signed subject and Claude Switch remains unavailable without one. Android revoke legs use the bounded #640 foreground-guard/snapshot contract; default artifacts exclude lifecycle hooks. |
+| **Status** | **Mitigated / monitored** — host, UI, Android contract, hook-isolation, real Claude/Codex Disconnect/Reconnect, post-Reconnect turns, same-account rejection, and a physical two-account Codex Switch are recorded in [the #645 manifest](../evidence/issue-645-manifest.json). AC-3 is closed and REQ-AGENT-015 is implemented. Residual provider revoke-scope and identity-contract drift remains monitored. Design: [ADR-007](../adr/007-agent-architecture.md). |
+
+---
+
+## R12 — Shared Agent session replay and cross-device authority
+
+| | |
+|---|---|
+| **Risk** | A transport retry duplicates a provider call or cloud effect, a stale session lease publishes after takeover, a request resumes under a different provider generation, or a one-time pairing transfer is reused. |
+| **Impact** | High — duplicate mutation, transcript fork, authority confusion, or session disclosure across devices. |
+| **Mitigation** | #628 adds route/session/payload-bound durable request IDs, bounded encrypted provider-step journals, provider-generation and harness binding, renewed server-time session leases, staged immutable objects with fenced manifest publication, host-owned cancellation/terminal ordering, and confirmation-gated one-time Pairing V2. Strict JSON and sealed mutation chunks remove mutable secrets and large bodies from URLs. |
+| **Status** | **Mitigated in the pre-RC candidate** — exact-commit host, live-provider, Android, and cross-device evidence is recorded in the #628 pre-RC manifest and REQ-AGENT-016 is implemented. Protected review, promotion, RC publication, final-RC artifact verification, and explicit issue closure remain outstanding release controls. Design: [ADR-007](../adr/007-agent-architecture.md). |
 
 ---
 

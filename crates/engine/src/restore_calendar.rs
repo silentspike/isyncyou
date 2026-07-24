@@ -24,7 +24,9 @@
 //! transactionId de-dup); `GraphClient` is the real impl.
 
 use crate::restore_key::{calendar_marker, idempotency_key, load_or_create_secret};
-use crate::restore_recovery::{recover_restore_op, run_restore_op, RestoreSink};
+use crate::restore_recovery::{
+    recover_restore_op, run_restore_op, RestoreError, RestoreResult, RestoreSink,
+};
 use isyncyou_core::Config;
 use isyncyou_store::{RestoreState, Store};
 use serde_json::Value;
@@ -39,6 +41,10 @@ pub trait CalendarApi {
     /// with the same `transactionId` returns the same id (Graph de-dups server-side),
     /// so this never produces a duplicate.
     fn create_event(&self, body: &Value) -> Result<String, String>;
+
+    fn create_event_for_restore(&self, body: &Value) -> RestoreResult<String> {
+        self.create_event(body).map_err(RestoreError::internal)
+    }
 }
 
 impl CalendarApi for isyncyou_graph::GraphClient {
@@ -51,6 +57,16 @@ impl CalendarApi for isyncyou_graph::GraphClient {
             .map(String::from)
             .ok_or_else(|| "created event response has no id".to_string())
     }
+
+    fn create_event_for_restore(&self, body: &Value) -> RestoreResult<String> {
+        let v = self
+            .post_json("/me/events", body)
+            .map_err(RestoreError::from_graph)?;
+        v.get("id")
+            .and_then(|i| i.as_str())
+            .map(String::from)
+            .ok_or_else(|| RestoreError::invalid("created event response has no id"))
+    }
 }
 
 /// A [`RestoreSink`] for calendar: `create` sanitizes the archived event, stamps the
@@ -62,22 +78,22 @@ pub struct CalendarSink<'a, A: CalendarApi> {
 }
 
 impl<A: CalendarApi> RestoreSink for CalendarSink<'_, A> {
-    fn create(&self, marker: &str, payload: &[u8]) -> Result<String, String> {
+    fn create(&self, marker: &str, payload: &[u8]) -> RestoreResult<String> {
         let event: Value = serde_json::from_slice(payload)
-            .map_err(|e| format!("archived event is not JSON: {e}"))?;
+            .map_err(|e| RestoreError::invalid(format!("archived event is not JSON: {e}")))?;
         let mut body = isyncyou_connectors::sanitize_event(&event);
         // The sanitizer keeps only writable event fields, so stamp the transactionId
         // marker afterwards (it would otherwise be dropped by the whitelist).
         let obj = body
             .as_object_mut()
-            .ok_or_else(|| "sanitized event is not a JSON object".to_string())?;
+            .ok_or_else(|| RestoreError::invalid("sanitized event is not a JSON object"))?;
         obj.insert(
             "transactionId".to_string(),
             Value::String(marker.to_string()),
         );
-        self.api.create_event(&body)
+        self.api.create_event_for_restore(&body)
     }
-    fn find_by_marker(&self, _marker: &str) -> Result<Option<String>, String> {
+    fn find_by_marker(&self, _marker: &str) -> RestoreResult<Option<String>> {
         // Graph has no `transactionId` $filter (it returns HTTP 400), so there is no
         // probe. Returning None routes recovery into the idempotent re-create path,
         // where Graph's server-side transactionId de-dup guarantees exactly one event.
@@ -103,18 +119,30 @@ pub fn restore_calendar_via_ledger(
     id: &str,
     token: String,
 ) -> Result<String, String> {
+    restore_calendar_via_ledger_classified(cfg, account, id, token)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn restore_calendar_via_ledger_classified(
+    cfg: &Config,
+    account: &str,
+    id: &str,
+    token: String,
+) -> RestoreResult<String> {
     let acc = cfg
         .accounts
         .iter()
         .find(|a| a.id == account)
-        .ok_or_else(|| format!("no account '{account}' in config"))?;
-    let (_item, bytes) = crate::read_archived_body(cfg, account, "calendar", id)?;
-    let secret = load_or_create_secret(&acc.archive_root.join(".isyncyou-restore-secret"))?;
+        .ok_or_else(|| RestoreError::invalid(format!("no account '{account}' in config")))?;
+    let (_item, bytes) =
+        crate::read_archived_body(cfg, account, "calendar", id).map_err(RestoreError::invalid)?;
+    let secret = load_or_create_secret(&acc.archive_root.join(".isyncyou-restore-secret"))
+        .map_err(RestoreError::internal)?;
     let key = idempotency_key(&secret, account, "calendar", id, &bytes);
     let op_id = format!("{account}:{key}");
     let marker = calendar_marker(&key);
-    let store =
-        Store::open(acc.archive_root.join(".isyncyou-store.db")).map_err(|e| e.to_string())?;
+    let store = Store::open(acc.archive_root.join(".isyncyou-store.db"))
+        .map_err(|e| RestoreError::internal(e.to_string()))?;
     let client = isyncyou_graph::GraphClient::new(token);
     let sink = CalendarSink { api: &client };
     finish_calendar_restore(
@@ -142,29 +170,29 @@ fn finish_calendar_restore<S: RestoreSink>(
     payload: &[u8],
     sink: &S,
     now: i64,
-) -> Result<String, String> {
+) -> RestoreResult<String> {
     match store
         .get_restore_operation(op_id)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| RestoreError::internal(e.to_string()))?
     {
         // Already done: return the recorded id (no second create).
         Some(op) if op.state == RestoreState::Committed => op
             .new_cloud_id
-            .ok_or_else(|| "committed operation has no cloud id".to_string()),
+            .ok_or_else(|| RestoreError::internal("committed operation has no cloud id")),
         // Interrupted earlier: recover (idempotent re-create) — never blind-retry.
         Some(_) => {
             recover_restore_op(store, op_id, payload, sink, now)?;
             store
                 .get_restore_operation(op_id)
-                .map_err(|e| e.to_string())?
+                .map_err(|e| RestoreError::internal(e.to_string()))?
                 .and_then(|o| o.new_cloud_id)
-                .ok_or_else(|| "recovery did not record a cloud id".to_string())
+                .ok_or_else(|| RestoreError::internal("recovery did not record a cloud id"))
         }
         // Fresh: record intent, then drive the happy path.
         None => {
             store
                 .create_restore_operation(op_id, account, "calendar", source_id, key, now)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| RestoreError::internal(e.to_string()))?;
             let (new_id, _) = run_restore_op(store, op_id, marker, payload, sink, now)?;
             Ok(new_id)
         }
@@ -225,8 +253,11 @@ pub fn recover_pending_calendar_restores_with<S: RestoreSink>(
     let now = now_secs();
     let (mut ok, mut failed) = (0usize, 0usize);
     for op in ops.into_iter().filter(|o| o.service == "calendar") {
-        let res = archived_calendar_bytes(&store, acc, &op.source_item_id)
-            .and_then(|bytes| recover_restore_op(&store, &op.op_id, &bytes, sink, now).map(|_| ()));
+        let res = archived_calendar_bytes(&store, acc, &op.source_item_id).and_then(|bytes| {
+            recover_restore_op(&store, &op.op_id, &bytes, sink, now)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
         match res {
             Ok(()) => ok += 1,
             Err(_) => failed += 1,

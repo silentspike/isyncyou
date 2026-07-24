@@ -112,6 +112,10 @@ enum Ingest {
 /// driver is unit-testable with a mock and live-tested with the real client.
 pub trait MimeFetcher {
     fn fetch_mime(&self, message_id: &str) -> Result<Vec<u8>, String>;
+
+    fn fetch_mime_for_sync(&self, message_id: &str) -> Result<Vec<u8>, SyncError> {
+        self.fetch_mime(message_id).map_err(SyncError::Remote)
+    }
 }
 
 #[cfg(feature = "http")]
@@ -119,6 +123,11 @@ impl MimeFetcher for isyncyou_graph::GraphClient {
     fn fetch_mime(&self, message_id: &str) -> Result<Vec<u8>, String> {
         self.download_message_mime(message_id)
             .map_err(|e| e.to_string())
+    }
+
+    fn fetch_mime_for_sync(&self, message_id: &str) -> Result<Vec<u8>, SyncError> {
+        self.download_message_mime(message_id)
+            .map_err(SyncError::Graph)
     }
 }
 
@@ -154,9 +163,7 @@ pub fn backup_message_bodies<F: MimeFetcher>(
         if limit != 0 && report.downloaded >= limit {
             break;
         }
-        let mime = fetcher
-            .fetch_mime(&msg.remote_id)
-            .map_err(SyncError::Remote)?;
+        let mime = fetcher.fetch_mime_for_sync(&msg.remote_id)?;
         let abs = shard_path(archive_root, SERVICE, &msg.remote_id, "eml");
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)?;
@@ -250,9 +257,7 @@ pub fn backup_mailbox_flanks<F: JsonFetcher>(
 ) -> Result<ArchiveReport, SyncError> {
     let mut report = ArchiveReport::default();
 
-    let settings = fetcher
-        .fetch_json("/me/mailboxSettings")
-        .map_err(SyncError::Remote)?;
+    let settings = fetcher.fetch_json_for_sync("/me/mailboxSettings")?;
     report.bytes += archive_json_item(
         store,
         account,
@@ -264,9 +269,7 @@ pub fn backup_mailbox_flanks<F: JsonFetcher>(
     )?;
     report.archived += 1;
 
-    let rules = fetcher
-        .fetch_json("/me/mailFolders/inbox/messageRules")
-        .map_err(SyncError::Remote)?;
+    let rules = fetcher.fetch_json_for_sync("/me/mailFolders/inbox/messageRules")?;
     report.bytes += archive_json_item(
         store,
         account,
@@ -278,9 +281,7 @@ pub fn backup_mailbox_flanks<F: JsonFetcher>(
     )?;
     report.archived += 1;
 
-    let cats = fetcher
-        .fetch_json("/me/outlook/masterCategories")
-        .map_err(SyncError::Remote)?;
+    let cats = fetcher.fetch_json_for_sync("/me/outlook/masterCategories")?;
     for cat in cats
         .get("value")
         .and_then(Value::as_array)
