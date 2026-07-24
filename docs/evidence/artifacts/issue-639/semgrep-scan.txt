@@ -1,0 +1,11 @@
+│ Scan Summary │
+└──────────────┘
+Some files were skipped or only partially analyzed.
+  Partially scanned: 1 files only partially analyzed due to parsing or internal Semgrep errors
+  Scan skipped: 10 files larger than 1.0 MB, 800 files matching .semgrepignore patterns
+  For a full list of skipped files, run semgrep with the --verbose flag.
+
+(need more rules? `semgrep login` for additional free Semgrep Registry rules)
+
+semgrep: RAN 136 rules on 90 files (gui/webui + android) via digest-pinned image sha256:a265d09a...; 0 findings (exit 0).
+android: ./gradlew :app:lintDebug -> BUILD SUCCESSFUL; :app:testDebugUnitTest -> BUILD SUCCESSFUL.

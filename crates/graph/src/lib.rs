@@ -24,7 +24,7 @@ pub mod throttle;
 pub mod upload;
 
 #[cfg(feature = "http")]
-pub use http::{DrivePermission, GraphClient, InviteOutcome};
+pub use http::{DrivePermission, GraphClient, InviteOutcome, StreamUploadOutcome, UploadError};
 
 pub use auth::{TokenCache, TokenResponse};
 pub use client::{run_delta, DeltaError, DeltaOutcome, Response, Transport};

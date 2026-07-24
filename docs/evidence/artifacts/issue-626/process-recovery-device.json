@@ -1,0 +1,12 @@
+{
+  "issue": 626,
+  "device": "Pixel 8 Pro",
+  "hook_phase": "after_execute_before_finish",
+  "process_killed": true,
+  "activity_relaunched": true,
+  "foreign_process_owner_reclaimed": true,
+  "job_reconciled_to": "succeeded",
+  "cloud_objects_created": 1,
+  "duplicate_cloud_objects": 0,
+  "graph_revert": "pass"
+}

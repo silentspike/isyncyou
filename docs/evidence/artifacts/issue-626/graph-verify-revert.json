@@ -1,0 +1,24 @@
+{
+  "issue": 626,
+  "device": "Pixel 8 Pro",
+  "restore_cloud": {
+    "physical_approval": true,
+    "new_cloud_objects": 1,
+    "duplicates": 0,
+    "revert_http_status": 204,
+    "revert_status": "pass"
+  },
+  "agent_live_write": {
+    "provider": "codex_app_oauth",
+    "real_tool_call": true,
+    "real_tool_result": true,
+    "physical_cancel_left_source_unchanged": true,
+    "physical_approval_changed_source": true,
+    "confirm_audit_result": "ok",
+    "reverted_to_prior_state": true,
+    "fixture_deleted": true,
+    "post_delete_http_status": 404,
+    "revert_status": "pass"
+  },
+  "identifiers_retained": false
+}

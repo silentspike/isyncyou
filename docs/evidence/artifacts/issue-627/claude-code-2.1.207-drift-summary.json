@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "scope": "local_cli_drift_only_not_product_auth",
+  "product_auth_evidence": false,
+  "client": {
+    "name": "claude",
+    "version": "2.1.207"
+  },
+  "controlled_sentinel_observed": true,
+  "event_type_counts": {
+    "assistant": 1,
+    "rate_limit_event": 1,
+    "result": 1,
+    "stream_event": 7,
+    "system": 2
+  },
+  "usage_fields": [
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "input_tokens",
+    "output_tokens",
+    "service_tier"
+  ],
+  "rate_limit_fields": [
+    "isUsingOverage",
+    "overageDisabledReason",
+    "overageStatus",
+    "rateLimitType",
+    "resetsAt",
+    "status"
+  ],
+  "identifiers": {
+    "request_id_present": true,
+    "session_id_present": true,
+    "thread_id_present": false
+  },
+  "wire": {
+    "endpoint_observed": false,
+    "headers_observed": false,
+    "provider_hosts": [],
+    "path_categories": [],
+    "headers": {
+      "authorization_present": false,
+      "billing_identity_present": false,
+      "account_identity_present": false,
+      "client_identity_present": false,
+      "protocol_version_present": false,
+      "stream_accept_present": false
+    }
+  },
+  "model_catalog": null,
+  "drift_decision": "not_safely_observable",
+  "raw_retained": false
+}

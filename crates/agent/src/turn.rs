@@ -4,7 +4,7 @@
 //! (The module is named `turn`, not `loop`, because `loop` is a Rust keyword.)
 
 use crate::provider::{AssistantBlock, LlmProvider, StreamEvent};
-use crate::tool::{parse_action, ToolAction, ToolClass, TOOL_NAME};
+use crate::tool::{parse_action, public_tool_call_input, ToolAction, ToolClass, TOOL_NAME};
 
 /// Who authored a message in the conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +67,31 @@ impl Message {
 pub trait ToolExecutor {
     fn execute_read(&self, action: &ToolAction) -> Result<String, crate::AgentError>;
 
+    fn execute_read_bound(
+        &self,
+        action: &ToolAction,
+        _binding: &ReadExecutionBinding,
+    ) -> Result<String, crate::AgentError> {
+        self.execute_read(action)
+    }
+
+    fn prepare_read_effect(
+        &self,
+        _action: &ToolAction,
+        _binding: &ReadExecutionBinding,
+    ) -> Result<Option<crate::LocalEffectCheckpointV1>, crate::AgentError> {
+        Ok(None)
+    }
+
+    fn execute_read_prepared(
+        &self,
+        action: &ToolAction,
+        binding: &ReadExecutionBinding,
+        _local_effect: Option<&crate::LocalEffectCheckpointV1>,
+    ) -> Result<String, crate::AgentError> {
+        self.execute_read_bound(action, binding)
+    }
+
     /// Execute a read that MAY stream intermediate progress via `emit` — used by the
     /// progressive search (S-AG.18/#643) to emit `SearchStage`/`PartialResult` between
     /// the fast, full-text and deep passes — returning the same final JSON as
@@ -82,6 +107,13 @@ pub trait ToolExecutor {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadExecutionBinding {
+    pub session_id: String,
+    pub request_id: String,
+    pub tool_use_id: String,
+}
+
 /// How a turn ended.
 #[derive(Debug)]
 pub enum TurnOutcome {
@@ -92,12 +124,84 @@ pub enum TurnOutcome {
     /// confirmation token only after the human confirms (handled by a later story).
     PendingConfirmation {
         id: String,
-        action: ToolAction,
+        action: Box<ToolAction>,
         preview: String,
     },
 }
 
+pub trait TurnObserver {
+    fn next_provider_step(&self) -> u8 {
+        0
+    }
+
+    fn read_execution_binding(&self, _tool_use_id: &str) -> Option<ReadExecutionBinding> {
+        None
+    }
+
+    fn provider_step_started(&mut self, _step_seq: u8) -> Result<(), crate::AgentError> {
+        Ok(())
+    }
+
+    fn provider_step_completed(
+        &mut self,
+        _step_seq: u8,
+        _blocks: &[crate::AssistantBlock],
+        _usage: Option<&crate::Usage>,
+    ) -> Result<(), crate::AgentError> {
+        Ok(())
+    }
+
+    fn read_tool_started(
+        &mut self,
+        _step_seq: u8,
+        _tool_use_id: &str,
+        _action: &ToolAction,
+        _local_effect: Option<&crate::LocalEffectCheckpointV1>,
+    ) -> Result<(), crate::AgentError> {
+        Ok(())
+    }
+
+    fn read_tool_completed(
+        &mut self,
+        _step_seq: u8,
+        _tool_use_id: &str,
+        _action: &ToolAction,
+        _result: &str,
+    ) -> Result<(), crate::AgentError> {
+        Ok(())
+    }
+}
+
+struct NoopTurnObserver;
+impl TurnObserver for NoopTurnObserver {}
+
 const MAX_STEPS: usize = 16;
+
+fn recoverable_read_error_result(action: &ToolAction, error: &crate::AgentError) -> Option<String> {
+    match error {
+        crate::AgentError::Provider(code) if code == "archive_body_unavailable" => Some(
+            serde_json::json!({
+                "status": "unavailable",
+                "code": "archive_body_unavailable",
+                "retryable": false,
+            })
+            .to_string(),
+        ),
+        crate::AgentError::ToolArgs(_)
+            if action.recovery_policy() == crate::RecoveryPolicy::RepeatableReadAndCompare =>
+        {
+            Some(
+                serde_json::json!({
+                    "status": "unavailable",
+                    "code": "read_target_unavailable",
+                    "retryable": false,
+                })
+                .to_string(),
+            )
+        }
+        _ => None,
+    }
+}
 
 /// Drive one user turn. `history` must already contain the user's message; the loop
 /// appends assistant/tool messages as it runs and streams events via `emit`.
@@ -107,10 +211,48 @@ pub fn run_turn(
     history: &mut Vec<Message>,
     emit: &mut dyn FnMut(StreamEvent),
 ) -> Result<TurnOutcome, crate::AgentError> {
+    run_turn_observed(provider, executor, history, emit, &mut NoopTurnObserver)
+}
+
+pub fn run_turn_observed(
+    provider: &mut dyn LlmProvider,
+    executor: &dyn ToolExecutor,
+    history: &mut Vec<Message>,
+    emit: &mut dyn FnMut(StreamEvent),
+    observer: &mut dyn TurnObserver,
+) -> Result<TurnOutcome, crate::AgentError> {
+    run_turn_cancellable(provider, executor, history, emit, observer, None)
+}
+
+pub fn run_turn_cancellable(
+    provider: &mut dyn LlmProvider,
+    executor: &dyn ToolExecutor,
+    history: &mut Vec<Message>,
+    emit: &mut dyn FnMut(StreamEvent),
+    observer: &mut dyn TurnObserver,
+    cancellation: Option<&crate::CancellationToken>,
+) -> Result<TurnOutcome, crate::AgentError> {
     let mut final_text = String::new();
 
-    for _ in 0..MAX_STEPS {
-        let blocks = provider.next(history, emit)?;
+    let check_cancelled = || {
+        if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+            Err(crate::AgentError::Cancelled)
+        } else {
+            Ok(())
+        }
+    };
+
+    for step_seq in usize::from(observer.next_provider_step())..MAX_STEPS {
+        let step_seq = u8::try_from(step_seq)
+            .map_err(|_| crate::AgentError::Provider("turn_step_invalid".into()))?;
+        check_cancelled()?;
+        observer.provider_step_started(step_seq)?;
+        check_cancelled()?;
+        let blocks = provider.next_cancellable(history, emit, cancellation)?;
+        check_cancelled()?;
+        let usage = provider.last_usage();
+        observer.provider_step_completed(step_seq, &blocks, usage.as_ref())?;
+        check_cancelled()?;
 
         // Collect the assistant turn: its text + the tool calls it made.
         let mut text_this = String::new();
@@ -133,7 +275,6 @@ pub fn run_turn(
 
         // No tool calls → the turn is done.
         if tool_uses.is_empty() {
-            emit(StreamEvent::Done);
             return Ok(TurnOutcome::Final { text: final_text });
         }
 
@@ -141,6 +282,7 @@ pub fn run_turn(
         // structure — never parsed out of content — so retrieved (untrusted) text can
         // never become an action (REQ-AGENT-005).
         for tu in tool_uses {
+            check_cancelled()?;
             let action = match parse_action(&tu.input) {
                 Ok(a) => a,
                 Err(help) => {
@@ -158,34 +300,51 @@ pub fn run_turn(
             emit(StreamEvent::ToolCall {
                 id: tu.id.clone(),
                 name: TOOL_NAME.to_string(),
-                input: tu.input.clone(),
+                input: public_tool_call_input(&action, &tu.input),
             });
 
             match action.class() {
                 ToolClass::Read => {
+                    check_cancelled()?;
+                    let binding = observer.read_execution_binding(&tu.id);
+                    let local_effect = binding
+                        .as_ref()
+                        .map(|binding| executor.prepare_read_effect(&action, binding))
+                        .transpose()?
+                        .flatten();
+                    observer.read_tool_started(step_seq, &tu.id, &action, local_effect.as_ref())?;
                     // Streamed read: a progressive search emits its stage/partial-result
                     // events via `emit` before returning the final JSON (S-AG.18/#643);
                     // all other reads delegate to the plain path (default impl).
-                    let result = executor.execute_read_streamed(&action, emit)?;
+                    let read_result = if let Some(binding) = binding {
+                        executor.execute_read_prepared(&action, &binding, local_effect.as_ref())
+                    } else {
+                        executor.execute_read_streamed(&action, emit)
+                    };
+                    let (result, untrusted) = match read_result {
+                        Ok(result) => (result, true),
+                        Err(error) => match recoverable_read_error_result(&action, &error) {
+                            Some(result) => (result, false),
+                            None => return Err(error),
+                        },
+                    };
+                    observer.read_tool_completed(step_seq, &tu.id, &action, &result)?;
+                    check_cancelled()?;
                     // Results carrying archived content are untrusted input.
                     emit(StreamEvent::ToolResult {
                         id: tu.id.clone(),
                         content: result.clone(),
-                        untrusted: true,
+                        untrusted,
                     });
                     history.push(Message::tool(tu.id, result));
                 }
                 ToolClass::Destructive => {
+                    check_cancelled()?;
                     // Never execute here — stop the turn for human confirmation.
                     let preview = format!("Requires confirmation — {} {:?}", action.op(), action);
-                    emit(StreamEvent::ConfirmationRequired {
-                        id: tu.id.clone(),
-                        action: action.clone(),
-                        preview: preview.clone(),
-                    });
                     return Ok(TurnOutcome::PendingConfirmation {
                         id: tu.id,
-                        action,
+                        action: Box::new(action),
                         preview,
                     });
                 }
@@ -204,6 +363,27 @@ mod tests {
     use crate::provider::FakeProvider;
     use serde_json::json;
     use std::cell::Cell;
+    use std::collections::VecDeque;
+
+    struct CancelOnReturnProvider {
+        token: crate::CancellationToken,
+        blocks: Vec<AssistantBlock>,
+    }
+
+    impl LlmProvider for CancelOnReturnProvider {
+        fn name(&self) -> &str {
+            "cancel-on-return"
+        }
+
+        fn next(
+            &mut self,
+            _history: &[Message],
+            _emit: &mut dyn FnMut(StreamEvent),
+        ) -> Result<Vec<AssistantBlock>, crate::AgentError> {
+            self.token.cancel();
+            Ok(std::mem::take(&mut self.blocks))
+        }
+    }
 
     /// Records how often a read executor ran, and returns a canned (or configured) body.
     struct CountingExecutor {
@@ -222,6 +402,71 @@ mod tests {
         fn execute_read(&self, _action: &ToolAction) -> Result<String, crate::AgentError> {
             self.reads.set(self.reads.get() + 1);
             Ok(self.reply.clone())
+        }
+    }
+
+    struct MissingArchiveBodyExecutor;
+
+    impl ToolExecutor for MissingArchiveBodyExecutor {
+        fn execute_read(&self, _action: &ToolAction) -> Result<String, crate::AgentError> {
+            Err(crate::AgentError::Provider(
+                "archive_body_unavailable".into(),
+            ))
+        }
+    }
+
+    struct InvalidReadTargetExecutor;
+
+    impl ToolExecutor for InvalidReadTargetExecutor {
+        fn execute_read(&self, _action: &ToolAction) -> Result<String, crate::AgentError> {
+            Err(crate::AgentError::ToolArgs(
+                "sensitive executor detail must not escape".into(),
+            ))
+        }
+    }
+
+    struct UnavailableArchiveStoreExecutor;
+
+    impl ToolExecutor for UnavailableArchiveStoreExecutor {
+        fn execute_read(&self, _action: &ToolAction) -> Result<String, crate::AgentError> {
+            Err(crate::AgentError::Provider(
+                "archive_store_unavailable".into(),
+            ))
+        }
+    }
+
+    struct HistoryCaptureProvider {
+        script: VecDeque<Vec<AssistantBlock>>,
+        seen: Vec<String>,
+    }
+
+    impl HistoryCaptureProvider {
+        fn new(script: Vec<Vec<AssistantBlock>>) -> Self {
+            Self {
+                script: script.into_iter().collect(),
+                seen: Vec::new(),
+            }
+        }
+    }
+
+    impl LlmProvider for HistoryCaptureProvider {
+        fn name(&self) -> &str {
+            "history-capture"
+        }
+
+        fn next(
+            &mut self,
+            history: &[Message],
+            emit: &mut dyn FnMut(StreamEvent),
+        ) -> Result<Vec<AssistantBlock>, crate::AgentError> {
+            self.seen.push(format!("{history:?}"));
+            let blocks = self.script.pop_front().unwrap_or_default();
+            for b in &blocks {
+                if let AssistantBlock::Text(t) = b {
+                    emit(StreamEvent::Token(t.clone()));
+                }
+            }
+            Ok(blocks)
         }
     }
 
@@ -266,7 +511,12 @@ mod tests {
                 ..
             }
         )));
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::Done)));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::Done { .. })),
+            "the harness must leave terminal ordering to the host"
+        );
 
         // History must round-trip: the assistant turn records its tool_use, and the
         // tool-result turn binds back to it by id (so a real provider can pair them).
@@ -281,6 +531,136 @@ mod tests {
             .expect("a tool-result turn");
         assert_eq!(tool.tool_use_id.as_deref(), Some("t1"));
         assert!(tool.content.contains("item-42"));
+    }
+
+    #[test]
+    fn missing_archive_body_returns_stable_tool_result_and_turn_can_continue() {
+        let mut provider = FakeProvider::new(vec![
+            vec![tool_use(
+                "t1",
+                json!({"op": "read", "account": "me", "service": "mail", "id": "missing"}),
+            )],
+            vec![AssistantBlock::Text(
+                "The archived body is unavailable.".into(),
+            )],
+        ]);
+        let mut history = vec![Message::user("read the item")];
+        let mut events = Vec::new();
+
+        let outcome = run_turn(
+            &mut provider,
+            &MissingArchiveBodyExecutor,
+            &mut history,
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, TurnOutcome::Final { .. }));
+        let tool_result = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::ToolResult {
+                    content, untrusted, ..
+                } => Some((content, untrusted)),
+                _ => None,
+            })
+            .expect("stable tool result");
+        assert!(!tool_result.1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(tool_result.0).unwrap(),
+            json!({
+                "status": "unavailable",
+                "code": "archive_body_unavailable",
+                "retryable": false,
+            })
+        );
+        assert!(!tool_result.0.contains("missing"));
+    }
+
+    #[test]
+    fn invalid_repeatable_read_target_returns_safe_tool_result_and_turn_can_continue() {
+        let mut provider = FakeProvider::new(vec![
+            vec![tool_use(
+                "t1",
+                json!({"op": "read", "account": "me", "service": "calendar", "id": "stale"}),
+            )],
+            vec![AssistantBlock::Text(
+                "I could not read that source, so I used the remaining results.".into(),
+            )],
+        ]);
+        let mut history = vec![Message::user("summarize recent events")];
+        let mut events = Vec::new();
+
+        let outcome = run_turn(
+            &mut provider,
+            &InvalidReadTargetExecutor,
+            &mut history,
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, TurnOutcome::Final { .. }));
+        let content = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::ToolResult {
+                    content,
+                    untrusted: false,
+                    ..
+                } => Some(content),
+                _ => None,
+            })
+            .expect("safe unavailable result");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(content).unwrap(),
+            json!({
+                "status": "unavailable",
+                "code": "read_target_unavailable",
+                "retryable": false,
+            })
+        );
+        assert!(!content.contains("sensitive executor detail"));
+    }
+
+    #[test]
+    fn invalid_restore_local_target_remains_fail_closed() {
+        let mut provider = FakeProvider::new(vec![vec![tool_use(
+            "t1",
+            json!({"op": "restore-local", "account": "me", "service": "onedrive", "id": "stale"}),
+        )]]);
+        let mut history = vec![Message::user("restore the file")];
+
+        let error = run_turn(
+            &mut provider,
+            &InvalidReadTargetExecutor,
+            &mut history,
+            &mut |_| {},
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, crate::AgentError::ToolArgs(_)));
+    }
+
+    #[test]
+    fn unavailable_archive_store_remains_fail_closed() {
+        let mut provider = FakeProvider::new(vec![vec![tool_use(
+            "t1",
+            json!({"op": "search", "account": "me", "query": "fixture"}),
+        )]]);
+        let mut history = vec![Message::user("find the fixture")];
+
+        let error = run_turn(
+            &mut provider,
+            &UnavailableArchiveStoreExecutor,
+            &mut history,
+            &mut |_| {},
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::AgentError::Provider(code) if code == "archive_store_unavailable"
+        ));
     }
 
     #[test]
@@ -307,13 +687,150 @@ mod tests {
             0,
             "a destructive action must not execute a read"
         );
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StreamEvent::ConfirmationRequired { .. })));
         assert!(
-            !events.iter().any(|e| matches!(e, StreamEvent::Done)),
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ConfirmationRequired { .. })),
+            "run_turn must not emit public confirmation before registry registration"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::Done { .. })),
             "a pending turn is not Done"
         );
+    }
+
+    #[test]
+    fn destructive_tool_call_event_redacts_input_before_pending() {
+        let raw_change = json!({
+            "verb": "create_draft",
+            "to": ["recipient@example.com"],
+            "subject": "Secret subject",
+            "body": "<html>raw-body-sentinel</html>"
+        });
+        let mut provider = FakeProvider::new(vec![vec![tool_use(
+            "t1",
+            json!({
+                "op": "live-write",
+                "account": "me",
+                "service": "mail",
+                "target": "drafts",
+                "change": raw_change
+            }),
+        )]]);
+        let exec = CountingExecutor::new("should never run");
+        let mut history = vec![Message::user("draft an email")];
+        let mut events = Vec::new();
+
+        let outcome =
+            run_turn(&mut provider, &exec, &mut history, &mut |e| events.push(e)).unwrap();
+
+        match outcome {
+            TurnOutcome::PendingConfirmation { action, .. } => {
+                assert_eq!(action.op(), "live-write");
+                if let ToolAction::LiveWrite { change, .. } = action.as_ref() {
+                    assert!(change.to_string().contains("recipient@example.com"));
+                    assert!(change.to_string().contains("raw-body-sentinel"));
+                } else {
+                    panic!("expected live-write action");
+                }
+            }
+            other => panic!("expected PendingConfirmation, got {other:?}"),
+        }
+        let public_tool_call = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::ToolCall { input, .. } => Some(input.clone()),
+                _ => None,
+            })
+            .expect("public tool_call event");
+        let public_text = public_tool_call.to_string();
+        assert_eq!(public_tool_call["op"], "live-write");
+        assert_eq!(public_tool_call["account"], "me");
+        assert_eq!(public_tool_call["service"], "mail");
+        assert_eq!(public_tool_call["verb"], "create_draft");
+        assert_eq!(public_tool_call["redacted"], true);
+        assert!(
+            public_tool_call.get("change").is_none(),
+            "public tool_call must omit raw destructive change"
+        );
+        assert!(!public_text.contains("recipient@example.com"));
+        assert!(!public_text.contains("raw-body-sentinel"));
+        assert!(!public_text.contains("Secret subject"));
+        assert_eq!(exec.reads.get(), 0);
+    }
+
+    #[test]
+    fn agent_context_contains_no_capability_token() {
+        let forbidden = [
+            "cap-secret-621",
+            "session-secret-621",
+            "confirm-secret-621",
+            "oauth-secret-621",
+            "provider-secret-621",
+            "bridge-secret-621",
+        ];
+        let mut provider = HistoryCaptureProvider::new(vec![
+            vec![tool_use(
+                "t1",
+                json!({"op": "search", "account": "me", "query": "invoice"}),
+            )],
+            vec![AssistantBlock::Text("Found one invoice.".into())],
+        ]);
+        let exec = CountingExecutor::new("hit: invoice-1");
+        let mut history = vec![Message::user("find invoice")];
+        let mut events = Vec::new();
+
+        let outcome =
+            run_turn(&mut provider, &exec, &mut history, &mut |e| events.push(e)).unwrap();
+        assert!(matches!(outcome, TurnOutcome::Final { .. }));
+        let provider_context = provider.seen.join("\n");
+        let final_history = format!("{history:?}");
+        for secret in forbidden {
+            assert!(
+                !provider_context.contains(secret),
+                "provider history leaked {secret}: {provider_context}"
+            );
+            assert!(
+                !final_history.contains(secret),
+                "turn history leaked {secret}: {final_history}"
+            );
+        }
+    }
+
+    #[test]
+    fn confirmation_required_event_not_in_provider_history() {
+        let mut provider = HistoryCaptureProvider::new(vec![vec![tool_use(
+            "t1",
+            json!({"op": "backup", "account": "me", "services": ["mail"]}),
+        )]]);
+        let exec = CountingExecutor::new("should never run");
+        let mut history = vec![Message::user("back up my mail")];
+        let mut events = Vec::new();
+
+        let outcome =
+            run_turn(&mut provider, &exec, &mut history, &mut |e| events.push(e)).unwrap();
+        assert!(matches!(outcome, TurnOutcome::PendingConfirmation { .. }));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ConfirmationRequired { .. })));
+        let provider_context = provider.seen.join("\n");
+        let final_history = format!("{history:?}");
+        for forbidden in [
+            "confirmation_required",
+            "pending_id",
+            "action_hash",
+            "expires_at_ms",
+            "confirm-secret-621",
+        ] {
+            assert!(
+                !provider_context.contains(forbidden),
+                "provider context leaked {forbidden}: {provider_context}"
+            );
+            assert!(
+                !final_history.contains(forbidden),
+                "turn history leaked {forbidden}: {final_history}"
+            );
+        }
     }
 
     #[test]
@@ -350,5 +867,251 @@ mod tests {
         assert!(!events
             .iter()
             .any(|e| matches!(e, StreamEvent::ConfirmationRequired { .. })));
+    }
+
+    #[test]
+    fn turn_cancel_stops_before_read_tool_execution() {
+        let token = crate::CancellationToken::default();
+        let mut provider = CancelOnReturnProvider {
+            token: token.clone(),
+            blocks: vec![tool_use(
+                "read-1",
+                json!({"op": "search", "account": "me", "query": "invoice"}),
+            )],
+        };
+        let executor = CountingExecutor::new("must not run");
+        let mut history = vec![Message::user("find invoice")];
+        let mut observer = NoopTurnObserver;
+
+        let result = run_turn_cancellable(
+            &mut provider,
+            &executor,
+            &mut history,
+            &mut |_| {},
+            &mut observer,
+            Some(&token),
+        );
+
+        assert!(matches!(result, Err(crate::AgentError::Cancelled)));
+        assert_eq!(executor.reads.get(), 0);
+    }
+
+    #[test]
+    fn turn_cancel_after_provider_return_blocks_pending_registration() {
+        let token = crate::CancellationToken::default();
+        let mut provider = CancelOnReturnProvider {
+            token: token.clone(),
+            blocks: vec![tool_use(
+                "write-1",
+                json!({"op": "backup", "account": "me", "services": ["mail"]}),
+            )],
+        };
+        let executor = CountingExecutor::new("must not run");
+        let mut history = vec![Message::user("back up mail")];
+        let mut observer = NoopTurnObserver;
+
+        let result = run_turn_cancellable(
+            &mut provider,
+            &executor,
+            &mut history,
+            &mut |_| {},
+            &mut observer,
+            Some(&token),
+        );
+
+        assert!(matches!(result, Err(crate::AgentError::Cancelled)));
+        assert_eq!(executor.reads.get(), 0);
+    }
+
+    #[test]
+    fn turn_cancel_before_persist_ignores_late_provider_result() {
+        struct RecordingObserver {
+            started: u32,
+            completed: u32,
+        }
+
+        impl TurnObserver for RecordingObserver {
+            fn provider_step_started(&mut self, _step_seq: u8) -> Result<(), crate::AgentError> {
+                self.started += 1;
+                Ok(())
+            }
+
+            fn provider_step_completed(
+                &mut self,
+                _step_seq: u8,
+                _blocks: &[AssistantBlock],
+                _usage: Option<&crate::Usage>,
+            ) -> Result<(), crate::AgentError> {
+                self.completed += 1;
+                Ok(())
+            }
+        }
+
+        let token = crate::CancellationToken::default();
+        let mut provider = CancelOnReturnProvider {
+            token: token.clone(),
+            blocks: vec![AssistantBlock::Text("late provider result".into())],
+        };
+        let executor = CountingExecutor::new("must not run");
+        let mut history = vec![Message::user("cancel this turn")];
+        let mut events = Vec::new();
+        let mut observer = RecordingObserver {
+            started: 0,
+            completed: 0,
+        };
+
+        let result = run_turn_cancellable(
+            &mut provider,
+            &executor,
+            &mut history,
+            &mut |event| events.push(event),
+            &mut observer,
+            Some(&token),
+        );
+
+        assert!(matches!(result, Err(crate::AgentError::Cancelled)));
+        assert_eq!(observer.started, 1);
+        assert_eq!(observer.completed, 0);
+        assert_eq!(history.len(), 1);
+        assert!(events.is_empty());
+        assert_eq!(executor.reads.get(), 0);
+    }
+
+    #[test]
+    fn turn_cancel_after_read_execution_persists_checkpoint_before_terminal() {
+        struct CancelDuringReadExecutor {
+            token: crate::CancellationToken,
+            reads: Cell<u32>,
+        }
+
+        impl ToolExecutor for CancelDuringReadExecutor {
+            fn execute_read(&self, _action: &ToolAction) -> Result<String, crate::AgentError> {
+                self.reads.set(self.reads.get() + 1);
+                self.token.cancel();
+                Ok("bounded result".into())
+            }
+        }
+
+        #[derive(Default)]
+        struct CheckpointObserver {
+            started: u32,
+            completed: u32,
+        }
+
+        impl TurnObserver for CheckpointObserver {
+            fn read_tool_started(
+                &mut self,
+                _step_seq: u8,
+                _tool_use_id: &str,
+                _action: &ToolAction,
+                _local_effect: Option<&crate::LocalEffectCheckpointV1>,
+            ) -> Result<(), crate::AgentError> {
+                self.started += 1;
+                Ok(())
+            }
+
+            fn read_tool_completed(
+                &mut self,
+                _step_seq: u8,
+                _tool_use_id: &str,
+                _action: &ToolAction,
+                _result: &str,
+            ) -> Result<(), crate::AgentError> {
+                self.completed += 1;
+                Ok(())
+            }
+        }
+
+        let token = crate::CancellationToken::default();
+        let mut provider = FakeProvider::new(vec![vec![tool_use(
+            "read-1",
+            json!({"op": "search", "account": "me", "query": "invoice"}),
+        )]]);
+        let executor = CancelDuringReadExecutor {
+            token: token.clone(),
+            reads: Cell::new(0),
+        };
+        let mut observer = CheckpointObserver::default();
+        let mut history = vec![Message::user("find invoice")];
+        let mut events = Vec::new();
+
+        let result = run_turn_cancellable(
+            &mut provider,
+            &executor,
+            &mut history,
+            &mut |event| events.push(event),
+            &mut observer,
+            Some(&token),
+        );
+
+        assert!(matches!(result, Err(crate::AgentError::Cancelled)));
+        assert_eq!(executor.reads.get(), 1);
+        assert_eq!(observer.started, 1);
+        assert_eq!(observer.completed, 1);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolResult { .. })));
+    }
+
+    #[test]
+    fn completed_provider_step_reports_usage_to_durable_observer_boundary() {
+        struct UsageProvider;
+
+        impl LlmProvider for UsageProvider {
+            fn name(&self) -> &str {
+                "usage-provider"
+            }
+
+            fn next(
+                &mut self,
+                _history: &[Message],
+                _emit: &mut dyn FnMut(StreamEvent),
+            ) -> Result<Vec<AssistantBlock>, crate::AgentError> {
+                Ok(vec![AssistantBlock::Text("complete".into())])
+            }
+
+            fn last_usage(&self) -> Option<crate::Usage> {
+                Some(crate::Usage {
+                    input_tokens: 29,
+                    output_tokens: 7,
+                    provider: "provider-private".into(),
+                    model: "model-private".into(),
+                    request_id: Some("request-private".into()),
+                    rate_limit: Default::default(),
+                })
+            }
+        }
+
+        #[derive(Default)]
+        struct UsageObserver {
+            token_counts: Option<(u64, u64)>,
+        }
+
+        impl TurnObserver for UsageObserver {
+            fn provider_step_completed(
+                &mut self,
+                _step_seq: u8,
+                _blocks: &[AssistantBlock],
+                usage: Option<&crate::Usage>,
+            ) -> Result<(), crate::AgentError> {
+                self.token_counts = usage.map(|usage| (usage.input_tokens, usage.output_tokens));
+                Ok(())
+            }
+        }
+
+        let mut provider = UsageProvider;
+        let mut observer = UsageObserver::default();
+        let mut history = vec![Message::user("question")];
+        let outcome = run_turn_observed(
+            &mut provider,
+            &CountingExecutor::new("unused"),
+            &mut history,
+            &mut |_| {},
+            &mut observer,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, TurnOutcome::Final { .. }));
+        assert_eq!(observer.token_counts, Some((29, 7)));
     }
 }

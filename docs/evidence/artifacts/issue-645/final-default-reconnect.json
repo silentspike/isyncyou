@@ -1,0 +1,32 @@
+{
+  "apk_sha256": "3de9f65fe44700f67a3571b3a290630c2170aee3bbde7e9048d1092953ee5006",
+  "app_process_running": true,
+  "credential_revoke_guard_running": false,
+  "device_connected": true,
+  "hook_marker_present": false,
+  "marker_matches_scope": true,
+  "observation": {
+    "candidate_retained_when_outcome_unknown": false,
+    "final_state": "connected",
+    "hook_checkpoint": null,
+    "initial_state": "connected",
+    "new_generation_ready": true,
+    "old_generation_cleaned": true,
+    "operation": "reconnect",
+    "post_turn_completed": true,
+    "provider": "codex",
+    "result": "pass",
+    "same_account_rejected": false,
+    "server_revoke_2xx": true
+  },
+  "package_installed": true,
+  "redaction": {
+    "account_identity_included": false,
+    "provider_response_included": false,
+    "raw_platform_output_included": false,
+    "serial_included": false,
+    "token_or_callback_included": false
+  },
+  "schema_version": 1,
+  "scope": "default"
+}

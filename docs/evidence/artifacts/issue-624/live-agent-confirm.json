@@ -1,0 +1,79 @@
+{
+  "generated_at": "2026-07-10T15:41:55+02:00",
+  "branch": "feature/ag-624",
+  "code_commit": "47264c00b7b51a6b6b46d5416986913febe06450",
+  "scope": "ignored live Microsoft 365 probes for #624 Agent PendingAction confirmation",
+  "token_handling": {
+    "source": "~/.config/m365-write/token_cache.json via local MSAL silent acquisition",
+    "transport": "temporary 0600 /tmp token file passed through ISY624_M365_WRITE_TOKEN_FILE",
+    "cleanup": "temporary token file removed after local test run",
+    "evidence_policy": "no token value, account identifier, raw Graph object identifier, share URL, OAuth query string, or raw body content is recorded"
+  },
+  "command": "ISY624_M365_WRITE_TOKEN_FILE=<temp-0600-redacted> cargo +1.95.0 test -p isyncyou-app-host --features agent-oauth-providers -- --ignored live_issue_624_agent_confirm_",
+  "result": {
+    "status": "pass",
+    "summary": "4 passed; 0 failed; 0 ignored; 89 filtered out",
+    "duration_seconds": 14.97
+  },
+  "probes": [
+    {
+      "operation": "live-write",
+      "service": "mail",
+      "test": "live_issue_624_agent_confirm_create_draft_and_cleanup",
+      "proof": [
+        "TestProviderScript emitted a destructive live-write create_draft action.",
+        "Public tool_call input was redacted before PendingAction registration and did not contain recipient or body sentinel.",
+        "AgentHandler::confirm executed through DesktopAgentOperations with a real Microsoft Graph Mail.ReadWrite token.",
+        "Graph returned a draft id through the confirmed result summary.",
+        "Drop cleanup deleted the created draft through GraphClient::delete_message."
+      ],
+      "reverted": true
+    },
+    {
+      "operation": "share",
+      "service": "onedrive",
+      "test": "live_issue_624_agent_confirm_share_link_and_cleanup",
+      "proof": [
+        "Test created a temporary OneDrive fixture file using conflictBehavior=fail.",
+        "TestProviderScript emitted a destructive share link action for the fixture item.",
+        "Public tool_call input was redacted and retained only non-sensitive link metadata.",
+        "AgentHandler::confirm executed through DesktopAgentOperations and the existing share handler path with a real Files.ReadWrite token.",
+        "Graph permission listing found a direct, non-inherited anonymous view link.",
+        "Drop cleanup deleted the created permission and temporary OneDrive item."
+      ],
+      "scope_tested": "anonymous",
+      "reverted": true
+    },
+    {
+      "operation": "backup",
+      "service": "mail",
+      "test": "live_issue_624_agent_confirm_backup_mail_records_run",
+      "proof": [
+        "TestProviderScript emitted a destructive backup action.",
+        "Public tool_call input was redacted before PendingAction registration.",
+        "AgentHandler::confirm executed through DesktopAgentOperations.",
+        "The shared backup runner performed a real mail refresh using cached token material seeded from the live token.",
+        "The Store run log contained a backup run with ok status."
+      ],
+      "reverted": true
+    },
+    {
+      "operation": "restore-cloud",
+      "service": "mail",
+      "test": "live_issue_624_agent_confirm_restore_cloud_mail_and_cleanup",
+      "proof": [
+        "Test seeded a synthetic archived mail body in the temporary Store archive.",
+        "TestProviderScript emitted a destructive restore-cloud action.",
+        "AgentHandler::confirm executed through DesktopAgentOperations and the existing engine restore_cloud path.",
+        "Graph readback verified the newly created restored message.",
+        "Cleanup deleted the restored message.",
+        "The Store restore_operations row was committed and carried a redacted new cloud id."
+      ],
+      "reverted": true
+    }
+  ],
+  "not_claimed_live": [
+    "RestoreLocal live proof remains host-fixture based; no personal restored content is recorded.",
+    "Invite live proof is intentionally not claimed without a controlled recipient; host tests cover the invite route."
+  ]
+}

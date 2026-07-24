@@ -1,14 +1,12 @@
 //! Standalone Android client (#89): runs the real iSyncYou engine **in the app
-//! process**. A tiny JNI surface lets Kotlin start the embedded loopback server
-//! (the same `build_live_router` the desktop daemon uses, in the live-companion
-//! profile) and read the per-process session token; the app's WebView then loads
-//! `http://127.0.0.1:<port>/`. No desktop daemon, no `adb reverse` — the phone is a
-//! self-contained iSyncYou node over mobile data.
+//! process**. A small JNI surface starts the same `build_live_router` used by the
+//! desktop daemon. The app's WebView reaches that router only through the native
+//! message/asset bridge at the appassets origin. No desktop daemon, loopback TCP
+//! server, or `adb reverse` is involved.
 //!
-//! SECURITY: the loopback API is fully session-token gated (#89 P1) because any app
-//! on the device can reach `127.0.0.1`. The token is minted here, handed to Kotlin
-//! over JNI (never served in a static asset), and required on every `/api/v1/*`
-//! route. Tokens are NEVER logged.
+//! SECURITY: the data API remains session-token gated (#89 P1/#721). The token is
+//! minted here, used only by trusted native request paths, and required on every
+//! `/api/v1/*` route. Tokens are NEVER logged or exposed to WebView JavaScript.
 
 use isyncyou_core::{AccountConfig, Config, OneDriveMode};
 #[cfg(test)]
@@ -47,18 +45,17 @@ fn android_info(message: &str) {
     eprintln!("{message}");
 }
 
-/// The single configured account id on the phone. The user signs in to it via the
-/// account menu's device-code flow; its token cache + store live under `filesDir`.
+/// The single configured account id on the phone. The account menu connects its
+/// independent Reader and Writer grants through Authorization Code + PKCE; encrypted
+/// token caches and the local store live under `filesDir`.
 const ACCOUNT: &str = "me";
 
 struct EngineState {
     session_token: String,
-    /// The live router. In the default build it is reached **only** in-process (the
-    /// message bridge + `shouldInterceptRequest` asset path) — no TCP port is bound, so no
-    /// other app on the device can reach it (#0A netstat AC). A loopback server is bound
-    /// **only** under the experimental agent-subscription feature (whose OAuth flow needs a
-    /// `http://127.0.0.1/callback` redirect target); its port is not retained here.
+    /// The live router is reached only in-process through the message bridge and
+    /// `shouldInterceptRequest` asset path. No TCP port is bound (#0A/#721).
     router: Arc<isyncyou_webui::Router>,
+    mobile_jobs: Arc<isyncyou_app_host::MobileJobRuntime>,
 }
 
 /// Process-global engine handle. `start` is idempotent (Activity recreation must not
@@ -80,12 +77,17 @@ const HOST: &str = "phone";
 static DEVICE_STATE: OnceLock<Mutex<isyncyou_core::policy::DeviceState>> = OnceLock::new();
 #[cfg(not(test))]
 static MOBILE_ENCRYPTION_READY: AtomicBool = AtomicBool::new(false);
+#[cfg(not(test))]
+static MOBILE_AGENT_CREDENTIAL_READY: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 thread_local! {
     static TEST_MOBILE_ENCRYPTION_READY: Cell<bool> = const { Cell::new(false) };
+    static TEST_MOBILE_AGENT_CREDENTIAL_READY: Cell<bool> = const { Cell::new(false) };
 }
 #[cfg(test)]
 static TEST_FAIL_NEXT_MOBILE_KEY_INSTALL: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_FAIL_NEXT_MOBILE_AGENT_CREDENTIAL_KEY_INSTALL: AtomicBool = AtomicBool::new(false);
 
 fn device_state_cell() -> &'static Mutex<isyncyou_core::policy::DeviceState> {
     DEVICE_STATE.get_or_init(|| Mutex::new(isyncyou_core::policy::DeviceState::always_on(u64::MAX)))
@@ -117,6 +119,13 @@ fn mark_mobile_encryption_ready() {
     TEST_MOBILE_ENCRYPTION_READY.with(|ready| ready.set(true));
 }
 
+fn mark_mobile_agent_credential_ready() {
+    #[cfg(not(test))]
+    MOBILE_AGENT_CREDENTIAL_READY.store(true, Ordering::SeqCst);
+    #[cfg(test)]
+    TEST_MOBILE_AGENT_CREDENTIAL_READY.with(|ready| ready.set(true));
+}
+
 fn mobile_encryption_ready() -> bool {
     #[cfg(not(test))]
     {
@@ -128,9 +137,25 @@ fn mobile_encryption_ready() -> bool {
     }
 }
 
+fn mobile_agent_credential_ready() -> bool {
+    #[cfg(not(test))]
+    {
+        MOBILE_AGENT_CREDENTIAL_READY.load(Ordering::SeqCst)
+    }
+    #[cfg(test)]
+    {
+        TEST_MOBILE_AGENT_CREDENTIAL_READY.with(Cell::get)
+    }
+}
+
 #[cfg(test)]
 fn reset_mobile_encryption_ready_for_tests() {
     TEST_MOBILE_ENCRYPTION_READY.with(|ready| ready.set(false));
+}
+
+#[cfg(test)]
+fn reset_mobile_agent_credential_ready_for_tests() {
+    TEST_MOBILE_AGENT_CREDENTIAL_READY.with(|ready| ready.set(false));
 }
 
 #[cfg(test)]
@@ -140,7 +165,9 @@ fn install_test_mobile_encryption() {
     isyncyou_core::envelope::require_body_envelope_for_process();
     isyncyou_store::set_store_key(key.to_vec());
     isyncyou_store::require_store_key_for_process();
+    isyncyou_agent::set_process_credential_key(key);
     mark_mobile_encryption_ready();
+    mark_mobile_agent_credential_ready();
 }
 
 fn install_mobile_body_key(key_id: i32, bytes: &[u8]) -> bool {
@@ -162,6 +189,23 @@ fn install_mobile_body_key(key_id: i32, bytes: &[u8]) -> bool {
         isyncyou_store::set_store_key(k.to_vec());
         isyncyou_store::require_store_key_for_process();
         mark_mobile_encryption_ready();
+    }))
+    .is_ok()
+}
+
+fn install_mobile_agent_credential_key(bytes: &[u8]) -> bool {
+    if bytes.len() != 32 {
+        return false;
+    }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(bytes);
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        #[cfg(test)]
+        if TEST_FAIL_NEXT_MOBILE_AGENT_CREDENTIAL_KEY_INSTALL.swap(false, Ordering::SeqCst) {
+            panic!("injected mobile agent credential key install failure");
+        }
+        isyncyou_agent::set_process_credential_key(k);
+        mark_mobile_agent_credential_ready();
     }))
     .is_ok()
 }
@@ -281,6 +325,91 @@ pub fn agent_session_kdf_benchmark_json(iterations: usize) -> Result<String, Str
     .map_err(|e| e.to_string())
 }
 
+#[cfg(feature = "agent-credential-store-self-test")]
+fn tree_contains_bytes(root: &Path, needle: &[u8]) -> Result<(bool, usize), String> {
+    if !root.exists() {
+        return Ok((false, 0));
+    }
+    let mut found = false;
+    let mut files = 0usize;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if meta.is_dir() {
+            for entry in std::fs::read_dir(&path).map_err(|e| e.to_string())? {
+                stack.push(entry.map_err(|e| e.to_string())?.path());
+            }
+        } else if meta.is_file() {
+            files += 1;
+            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+            if bytes.windows(needle.len()).any(|w| w == needle) {
+                found = true;
+            }
+        }
+    }
+    Ok((found, files))
+}
+
+#[cfg(feature = "agent-credential-store-self-test")]
+fn file_contains_bytes(path: &Path, needle: &[u8]) -> Result<bool, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(bytes.windows(needle.len()).any(|w| w == needle)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(feature = "agent-credential-store-self-test")]
+pub fn agent_credential_store_self_test_json(
+    files_dir: &str,
+    sentinel: &str,
+) -> Result<String, String> {
+    if !mobile_agent_credential_ready() {
+        return Err("agent credential key is not installed".into());
+    }
+    if sentinel.is_empty() {
+        return Err("sentinel must not be empty".into());
+    }
+    let base = PathBuf::from(files_dir);
+    let cfg = isyncyou_agent::CredentialStoreConfig::new(&base);
+    let store = isyncyou_agent::CredentialStoreResolver::new(cfg.clone())
+        .resolve()
+        .map_err(|e| e.to_string())?;
+    let id = isyncyou_agent::provider_api_key_secret_id("anthropic", Some("self-test"))
+        .map_err(|e| e.to_string())?;
+    store
+        .put(
+            isyncyou_agent::SecretClass::ProviderApiKey,
+            &id,
+            &isyncyou_agent::Secret::new(sentinel.as_bytes()),
+        )
+        .map_err(|e| e.to_string())?;
+    let round_trip = store
+        .get(isyncyou_agent::SecretClass::ProviderApiKey, &id)
+        .map_err(|e| e.to_string())?
+        .map(|secret| secret.expose() == sentinel.as_bytes())
+        .unwrap_or(false);
+    let (store_plaintext_found, store_file_count) =
+        tree_contains_bytes(cfg.store_dir(), sentinel.as_bytes())?;
+    let wrapped_key_file = base.join("agent_credential.key");
+    let wrapped_plaintext_found = file_contains_bytes(&wrapped_key_file, sentinel.as_bytes())?;
+    let _ = store.delete(isyncyou_agent::SecretClass::ProviderApiKey, &id);
+
+    serde_json::to_string(&serde_json::json!({
+        "self_test": "agent_credential_store",
+        "scope": "jni_only_feature_gated",
+        "status": if round_trip && !store_plaintext_found && !wrapped_plaintext_found { "ok" } else { "failed" },
+        "key_source": "android_installed",
+        "round_trip": round_trip,
+        "plaintext_sentinel_in_credential_store": store_plaintext_found,
+        "plaintext_sentinel_in_wrapped_key_file": wrapped_plaintext_found,
+        "credential_store_file_count": store_file_count,
+        "credential_store_dir": cfg.store_dir().file_name().and_then(|s| s.to_str()).unwrap_or("agent-credentials"),
+        "wrapped_key_file": wrapped_key_file.file_name().and_then(|s| s.to_str()).unwrap_or("agent_credential.key")
+    }))
+    .map_err(|e| e.to_string())
+}
+
 fn log_mobile_config_reload_failure(reason: &str, detail: &str, warned: &AtomicBool) {
     if warned.swap(true, Ordering::Relaxed) {
         return;
@@ -360,10 +489,11 @@ pub fn start_engine(files_dir: &str) -> Result<(), String> {
     if guard.is_some() {
         return Ok(()); // already running — idempotent
     }
-    let (session_token, router) = start_inner(files_dir)?;
+    let (session_token, router, mobile_jobs) = start_inner(files_dir)?;
     *guard = Some(EngineState {
         session_token,
         router,
+        mobile_jobs,
     });
     Ok(())
 }
@@ -390,14 +520,26 @@ fn current_router() -> Option<Arc<isyncyou_webui::Router>> {
 /// **Binary-safe** (unlike the JSON bridge envelope, which is text-only) and header-faithful
 /// so a viewer's per-response `Content-Security-Policy` survives. Frame:
 /// `[status:u16 BE][ct_len:u16 BE][content_type][hdr_len:u16 BE][headers "K: V\r\n"…][body]`.
-/// Cookie-gated exactly like the loopback path. Empty vec when the engine hasn't started.
+/// Session-gated like every native data path. Empty vec when the engine has not started.
 pub fn asset_request(path: &str, cookie: Option<String>) -> Vec<u8> {
     let router = current_router();
     let Some(router) = router else {
         return Vec::new();
     };
-    let resp =
-        isyncyou_webui::dispatch_message(&router, "GET", path, None, None, cookie, Vec::new());
+    let resp = isyncyou_webui::dispatch_message(
+        &router,
+        isyncyou_webui::BridgeDispatchRequest {
+            method: "GET",
+            target: path,
+            cap_token: None,
+            session_token: None,
+            per_action_token: None,
+            cookie,
+            content_type: None,
+            storage_not_low: None,
+            body: Vec::new(),
+        },
+    );
     frame_response(resp)
 }
 
@@ -538,14 +680,57 @@ pub fn stream_close(id: i64) {
     }
 }
 
-/// The per-process session token Kotlin must hand to the WebView (header + cookie)
-/// so the WebUI can reach the gated loopback API. `None` until the engine started.
+/// The per-process session token used by trusted Kotlin/native request paths. It is
+/// never exposed to WebView JavaScript. `None` until the engine starts.
 pub fn session_token() -> Option<String> {
     cell()
         .lock()
         .ok()?
         .as_ref()
         .map(|s| s.session_token.clone())
+}
+
+/// Register a Kotlin-captured connectivity snapshot for one mobile preflight. Kotlin validates
+/// the foreground guard before this JNI-owned call; JavaScript receives only the opaque result.
+struct NetworkSnapshotRegistration<'a> {
+    guard_id: &'a str,
+    reason: &'a str,
+    active_network: bool,
+    internet_capability: bool,
+    validated_capability: bool,
+    metered: bool,
+    restrict_background: &'a str,
+    notifications_visible: bool,
+    test_hook: Option<&'a str>,
+}
+
+fn register_network_snapshot(input: NetworkSnapshotRegistration<'_>) -> Result<String, String> {
+    let restrict_background = match input.restrict_background {
+        "disabled" => isyncyou_agent::RestrictBackgroundStatus::Disabled,
+        "whitelisted" => isyncyou_agent::RestrictBackgroundStatus::Whitelisted,
+        "enabled" => isyncyou_agent::RestrictBackgroundStatus::Enabled,
+        _ => isyncyou_agent::RestrictBackgroundStatus::Unknown,
+    };
+    let session_token = session_token().ok_or_else(|| "engine not started".to_string())?;
+    isyncyou_app_host::register_mobile_connectivity_snapshot(
+        &session_token,
+        input.guard_id,
+        input.reason,
+        isyncyou_agent::AndroidNetworkSnapshot {
+            active_network: input.active_network,
+            internet_capability: input.internet_capability,
+            validated_capability: input.validated_capability,
+            metered: input.metered,
+            restrict_background,
+            notifications_visible: input.notifications_visible,
+            guard_ready: true,
+        },
+        input.test_hook,
+    )
+}
+
+pub fn invalidate_network_guard(guard_id: &str) {
+    isyncyou_app_host::invalidate_mobile_connectivity_guard(guard_id);
 }
 
 /// Record a successful native `BiometricPrompt` for a pending destructive action
@@ -564,9 +749,54 @@ pub fn confirm_action(pending_id: &str) -> bool {
     }
 }
 
-fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>), String> {
+/// Return the fixed Rust-owned descriptor for native prompt rendering. The WebView
+/// can carry the opaque handle but cannot ask this function through its bridge.
+pub fn describe_action(
+    pending_id: &str,
+) -> Result<isyncyou_core::pending::PendingActionDescriptor, isyncyou_core::pending::DescribeError>
+{
+    let router = {
+        let guard = cell().lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|s| Arc::clone(&s.router))
+    };
+    match router {
+        Some(r) => r.describe_biometric(pending_id),
+        None => Err(isyncyou_core::pending::DescribeError::NotFound),
+    }
+}
+
+fn describe_action_json(pending_id: &str) -> String {
+    match describe_action(pending_id) {
+        Ok(descriptor) => serde_json::json!({
+            "status": "ok",
+            "op": descriptor.op.as_str(),
+            "service": descriptor.service.as_str(),
+        })
+        .to_string(),
+        Err(isyncyou_core::pending::DescribeError::Expired) => {
+            r#"{"status":"expired"}"#.to_string()
+        }
+        Err(isyncyou_core::pending::DescribeError::NotFound) => {
+            r#"{"status":"not_found"}"#.to_string()
+        }
+    }
+}
+
+fn start_inner(
+    files_dir: &str,
+) -> Result<
+    (
+        String,
+        Arc<isyncyou_webui::Router>,
+        Arc<isyncyou_app_host::MobileJobRuntime>,
+    ),
+    String,
+> {
     if !mobile_encryption_ready() {
         return Err("encrypted storage setup failed; local data was not opened".into());
+    }
+    if !mobile_agent_credential_ready() {
+        return Err("agent credential storage setup failed; local data was not opened".into());
     }
     isyncyou_core::envelope::require_body_envelope_for_process();
     isyncyou_store::require_store_key_for_process();
@@ -604,17 +834,30 @@ fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>),
     // The Mode-3 offline pass (refresh loop) writes per-file progress here; the router reads
     // the same handle at GET /api/v1/onedrive/transfers (#655). One shared instance, cloned.
     let transfer_progress = isyncyou_app_host::SharedProgress::new();
+    let mobile_jobs = Arc::new(isyncyou_app_host::MobileJobRuntime::new(
+        cfg.clone(),
+        gate.clone(),
+        events.clone(),
+    ));
+    #[cfg(feature = "mobile-job-device-test-hooks")]
+    mobile_jobs.set_device_test_hook_root(base.clone());
     let config_path_for_router = config_path.clone();
     let config_path_for_loop = config_path.clone();
 
     let router = Arc::new(
-        isyncyou_app_host::build_live_router(
-            cfg.clone(),
-            Some(gate.clone()),
-            events.clone(),
-            config_path_for_router,
-            live_interval.clone(),
-            transfer_progress.clone(),
+        isyncyou_app_host::with_mobile_full_node_jobs(
+            isyncyou_app_host::build_live_router(
+                cfg.clone(),
+                Some(gate.clone()),
+                events.clone(),
+                config_path_for_router,
+                live_interval.clone(),
+                transfer_progress.clone(),
+                isyncyou_app_host::AgentOperationPolicy::MobileFullNode {
+                    mobile_jobs: mobile_jobs.clone(),
+                },
+            ),
+            mobile_jobs.clone(),
         )
         .with_session_token(session_token.clone())
         // #onedrive-mobile 0.6: only the standalone Android app arms the biometric gate.
@@ -623,48 +866,30 @@ fn start_inner(files_dir: &str) -> Result<(String, Arc<isyncyou_webui::Router>),
         .with_biometric_gate(),
     );
 
-    // #0A: NO loopback TCP port in the default build — the WebView reaches the engine only
-    // in-process (the message bridge for data, `shouldInterceptRequest`→`asset_request` for
-    // GET assets), so nothing is reachable by another app on the device. A loopback server
-    // is bound ONLY under the experimental agent-subscription feature, whose device-code
-    // OAuth flow returns to a `http://127.0.0.1:<port>/callback` redirect the browser hits.
-    #[cfg(feature = "agent-subscription-experimental")]
-    {
-        let listener = isyncyou_webui::bind_loopback("127.0.0.1:0").map_err(|e| e.to_string())?;
-        // Serve on a background thread, panic-isolated: a request-handling panic must never
-        // take down the host app process. Shares the same router as the in-process bridge.
-        let serve_router = Arc::clone(&router);
-        std::thread::spawn(move || {
-            let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                let _ = isyncyou_webui::serve_listener_shared(listener, serve_router);
-            }));
-        });
-    }
-
     // Cache-refresh thread (#89 P2): once the account is signed in, periodically pull
     // mail/calendar/contacts/todo/onenote from Graph into the local cache store
     // (read-only — never writes back to the cloud) and wake SSE subscribers so the
     // UI refreshes. Skips silently until a token is cached.
     std::thread::spawn(move || {
         refresh_loop(
-            cfg,
+            cfg.clone(),
             base,
             config_path_for_loop,
             gate,
             events,
             live_interval,
-            transfer_progress,
+            transfer_progress.clone(),
         )
     });
 
-    Ok((session_token, router))
+    Ok((session_token, router, mobile_jobs))
 }
 
 /// One mobile scoped OneDrive pass under the store-access gate (#655/#718): Sync scopes ingest
 /// metadata; Offline scopes additionally materialize and mirror local edits back over the ledger.
 /// Returns whether UI-visible data changed. Skips quietly with no explicit Sync/Offline scopes
-/// configured or no cached sync/write token (not signed in). `progress` is the shared tracker the
-/// router surfaces. Token policy is unchanged: the scoped pass still uses `resolve_cached_sync_token`.
+/// configured or no cached Writer token (not signed in). `progress` is the shared tracker the
+/// router surfaces. Reader remains independently required by the cache-refresh pass.
 fn run_onedrive_scoped_pass(
     cfg: &Config,
     gate: &Arc<Mutex<()>>,
@@ -744,6 +969,168 @@ fn refresh_loop(
 // `com.silentspike.isyncyou.NativeEngine.nativeStart(filesDir)` -> bound port (or -1)
 // `com.silentspike.isyncyou.NativeEngine.nativeSessionToken()` -> token string
 
+#[derive(Debug)]
+struct NativeMobileJobRunRequest {
+    v: u32,
+    job_id: String,
+    kind: String,
+    device: NativeMobileDeviceSnapshot,
+}
+
+#[derive(Debug)]
+struct NativeMobileDeviceSnapshot {
+    network_validated: bool,
+    metered: bool,
+    charging: bool,
+    free_bytes: u64,
+}
+
+fn valid_mobile_job_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn mobile_job_kind_from_wire(kind: &str) -> Option<isyncyou_app_host::MobileJobKind> {
+    match kind {
+        "backup" => Some(isyncyou_app_host::MobileJobKind::Backup),
+        "restore-cloud" => Some(isyncyou_app_host::MobileJobKind::RestoreCloud),
+        _ => None,
+    }
+}
+
+fn mobile_jobs_handle() -> Option<Arc<isyncyou_app_host::MobileJobRuntime>> {
+    cell()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|state| state.mobile_jobs.clone())
+}
+
+fn native_mobile_job_plan_json() -> String {
+    let Some(jobs) = mobile_jobs_handle() else {
+        return r#"{"v":1,"status":"not_started"}"#.to_string();
+    };
+    match jobs.mobile_worker_plan(ACCOUNT) {
+        Ok((entries, truncated)) => {
+            let (wifi_only, charging_only, min_free_bytes) = jobs.mobile_worker_constraints();
+            let jobs = entries
+                .into_iter()
+                .map(|(job_id, kind)| serde_json::json!({"job_id": job_id, "kind": kind.as_str()}))
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "v": 1,
+                "status": "ok",
+                "jobs": jobs,
+                "truncated": truncated,
+                "constraints": {
+                    "wifi_only": wifi_only,
+                    "charging_only": charging_only,
+                    "min_free_bytes": min_free_bytes,
+                },
+            })
+            .to_string()
+        }
+        Err(_) => r#"{"v":1,"status":"error","code":"internal"}"#.to_string(),
+    }
+}
+
+fn native_mobile_job_run_json(request_json: &str) -> String {
+    let value = match serde_json::from_str::<serde_json::Value>(request_json) {
+        Ok(value) => value,
+        Err(_) => return r#"{"v":1,"status":"failed","code":"invalid_request"}"#.to_string(),
+    };
+    let device = match value.get("device").and_then(|v| v.as_object()) {
+        Some(device) => device,
+        None => return r#"{"v":1,"status":"failed","code":"invalid_request"}"#.to_string(),
+    };
+    let (
+        Some(v),
+        Some(job_id),
+        Some(kind),
+        Some(network_validated),
+        Some(metered),
+        Some(charging),
+        Some(free_bytes),
+    ) = (
+        value.get("v").and_then(|v| v.as_u64()),
+        value.get("job_id").and_then(|v| v.as_str()),
+        value.get("kind").and_then(|v| v.as_str()),
+        device.get("network_validated").and_then(|v| v.as_bool()),
+        device.get("metered").and_then(|v| v.as_bool()),
+        device.get("charging").and_then(|v| v.as_bool()),
+        device.get("free_bytes").and_then(|v| v.as_u64()),
+    )
+    else {
+        return r#"{"v":1,"status":"failed","code":"invalid_request"}"#.to_string();
+    };
+    let request = NativeMobileJobRunRequest {
+        v: v as u32,
+        job_id: job_id.to_string(),
+        kind: kind.to_string(),
+        device: NativeMobileDeviceSnapshot {
+            network_validated,
+            metered,
+            charging,
+            free_bytes,
+        },
+    };
+    if request.v != 1 {
+        return r#"{"v":1,"status":"failed","code":"invalid_request"}"#.to_string();
+    }
+    let Some(kind) = mobile_job_kind_from_wire(&request.kind) else {
+        return r#"{"v":1,"status":"failed","code":"invalid_kind"}"#.to_string();
+    };
+    if !valid_mobile_job_id(&request.job_id) {
+        return r#"{"v":1,"status":"failed","code":"invalid_job_id"}"#.to_string();
+    }
+    let Some(jobs) = mobile_jobs_handle() else {
+        return r#"{"v":1,"status":"failed","code":"not_started"}"#.to_string();
+    };
+    let device = isyncyou_app_host::MobileWorkerDeviceSnapshot {
+        network_validated: request.device.network_validated,
+        metered: request.device.metered,
+        charging: request.device.charging,
+        free_bytes: request.device.free_bytes,
+    };
+    let outcome = jobs.run_mobile_job_for_worker(&request.job_id, kind, device);
+    match outcome {
+        Ok(isyncyou_app_host::MobileJobRunOutcome::Succeeded { .. }) => {
+            r#"{"v":1,"status":"succeeded"}"#.to_string()
+        }
+        Ok(isyncyou_app_host::MobileJobRunOutcome::Retrying {
+            code,
+            retry_after_secs,
+            ..
+        }) => serde_json::json!({
+            "v": 1,
+            "status": "retry",
+            "code": code.as_str(),
+            "retry_after_secs": retry_after_secs,
+        })
+        .to_string(),
+        Ok(isyncyou_app_host::MobileJobRunOutcome::Failed { code, .. }) => {
+            serde_json::json!({"v": 1, "status": "failed", "code": code.as_str()}).to_string()
+        }
+        Ok(isyncyou_app_host::MobileJobRunOutcome::Deferred { code, .. }) => {
+            serde_json::json!({"v": 1, "status": "retry", "code": code.as_str()}).to_string()
+        }
+        Ok(isyncyou_app_host::MobileJobRunOutcome::Noop { code, .. }) => {
+            serde_json::json!({"v": 1, "status": "succeeded", "code": code.as_str()}).to_string()
+        }
+        Err(error) => {
+            let code = if error == "job_kind_mismatch" {
+                "kind_mismatch"
+            } else {
+                "internal"
+            };
+            serde_json::json!({"v": 1, "status": "failed", "code": code}).to_string()
+        }
+    }
+}
+
 fn jni_get_string<'local>(
     env: &mut jni::EnvUnowned<'local>,
     value: &jni::objects::JString<'local>,
@@ -798,7 +1185,7 @@ fn jni_convert_byte_array<'local>(
     }
 }
 
-/// JNI: start the engine, returning the bound loopback port (or -1 on error).
+/// JNI: start the in-process engine, returning a positive readiness value or -1.
 /// SECURITY: never logs the session token or any secret.
 #[no_mangle]
 pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStart<'local>(
@@ -816,6 +1203,40 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStart<'l
         Ok(()) => 1,
         Err(_) => -1,
     }
+}
+
+/// JNI: return the bounded list of recoverable mobile jobs for WorkManager. The
+/// response contains only opaque job IDs, kinds, and truncation metadata.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeMobileJobPlan<'local>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+) -> jni::sys::jstring {
+    let response = std::panic::catch_unwind(native_mobile_job_plan_json)
+        .unwrap_or_else(|_| r#"{"v":1,"status":"failed","code":"internal"}"#.to_string());
+    jni_new_string(&mut env, response)
+}
+
+/// JNI: validate and run one WorkManager-selected mobile job using a strict
+/// versioned request. No account, target, cloud result, or raw error is returned.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeRunMobileJob<'local>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    request_json: jni::objects::JString<'local>,
+) -> jni::sys::jstring {
+    let request = match jni_get_string(&mut env, &request_json) {
+        Some(request) if request.len() <= 16 * 1024 => request,
+        _ => {
+            return jni_new_string(
+                &mut env,
+                r#"{"v":1,"status":"failed","code":"invalid_request"}"#.to_string(),
+            )
+        }
+    };
+    let response = std::panic::catch_unwind(|| native_mobile_job_run_json(&request))
+        .unwrap_or_else(|_| r#"{"v":1,"status":"failed","code":"internal"}"#.to_string());
+    jni_new_string(&mut env, response)
 }
 
 /// JNI: the per-process session token Kotlin hands to the WebView (header + cookie).
@@ -840,6 +1261,59 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeDeviceSt
     free_bytes: jni::sys::jlong,
 ) {
     set_device_state(metered, charging, free_bytes.max(0) as u64);
+}
+
+/// JNI: register a one-shot, session-bound Android connectivity snapshot. No raw snapshot
+/// fields are returned to WebView JavaScript; callers receive only an opaque handle.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeRegisterNetworkSnapshot<
+    'local,
+>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    guard_id: jni::objects::JString<'local>,
+    reason: jni::objects::JString<'local>,
+    active_network: jni::sys::jboolean,
+    internet_capability: jni::sys::jboolean,
+    validated_capability: jni::sys::jboolean,
+    metered: jni::sys::jboolean,
+    restrict_background: jni::objects::JString<'local>,
+    notifications_visible: jni::sys::jboolean,
+    test_hook: jni::objects::JString<'local>,
+) -> jni::sys::jstring {
+    let result = (|| {
+        let guard_id = jni_get_string(&mut env, &guard_id)?;
+        let reason = jni_get_string(&mut env, &reason)?;
+        let restrict_background = jni_get_string(&mut env, &restrict_background)?;
+        let test_hook = jni_get_string(&mut env, &test_hook)?;
+        register_network_snapshot(NetworkSnapshotRegistration {
+            guard_id: &guard_id,
+            reason: &reason,
+            active_network,
+            internet_capability,
+            validated_capability,
+            metered,
+            restrict_background: &restrict_background,
+            notifications_visible,
+            test_hook: (!test_hook.is_empty()).then_some(test_hook.as_str()),
+        })
+        .ok()
+    })()
+    .unwrap_or_default();
+    jni_new_string(&mut env, result)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeInvalidateNetworkGuard<
+    'local,
+>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    guard_id: jni::objects::JString<'local>,
+) {
+    if let Some(guard_id) = jni_get_string(&mut env, &guard_id) {
+        invalidate_network_guard(&guard_id);
+    }
 }
 
 /// JNI: answer one in-process bridge request (#0A). Kotlin passes the JSON request
@@ -979,6 +1453,29 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeSetBodyK
     }
 }
 
+/// JNI: install the agent credential at-rest key (#620) — the 32-byte data key the
+/// Android Keystore unwrapped for provider credentials. MUST be called before
+/// [`nativeStart`] so app-host credential consumers use the Android-installed key instead
+/// of env/local fallback. SECURITY: the key bytes are never logged.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeSetAgentCredentialKey<
+    'local,
+>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    key: jni::objects::JByteArray<'local>,
+) -> jni::sys::jint {
+    let bytes = match jni_convert_byte_array(&mut env, &key) {
+        Some(b) => b,
+        None => return 0,
+    };
+    if install_mobile_agent_credential_key(&bytes) {
+        1
+    } else {
+        0
+    }
+}
+
 /// JNI test/evidence hook for #619. Built only with
 /// `ISY_CARGO_FEATURES=agent-session-kdf-bench`; there is deliberately no WebView,
 /// bridge, HTTP, or normal app UI path to this method.
@@ -1010,6 +1507,43 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeAgentSes
     jni_new_string(&mut env, out)
 }
 
+/// JNI test/evidence hook for #620. Built only with
+/// `ISY_CARGO_FEATURES=agent-credential-store-self-test`; there is deliberately no
+/// WebView, bridge, HTTP, or normal app UI path to this method.
+#[cfg(feature = "agent-credential-store-self-test")]
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeAgentCredentialStoreSelfTest<
+    'local,
+>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    files_dir: jni::objects::JString<'local>,
+    sentinel: jni::objects::JString<'local>,
+) -> jni::sys::jstring {
+    let files_dir = match jni_get_string(&mut env, &files_dir) {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
+    };
+    let sentinel = match jni_get_string(&mut env, &sentinel) {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
+    };
+    let out = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        agent_credential_store_self_test_json(&files_dir, &sentinel)
+    }))
+    .unwrap_or_else(|_| Err("panic".into()))
+    .unwrap_or_else(|error| {
+        serde_json::json!({
+            "self_test": "agent_credential_store",
+            "scope": "jni_only_feature_gated",
+            "status": "error",
+            "error": isyncyou_core::obs::redact(&error)
+        })
+        .to_string()
+    });
+    jni_new_string(&mut env, out)
+}
+
 /// JNI: record a successful native `BiometricPrompt` for a pending destructive action
 /// (#onedrive-mobile 0.6). Kotlin calls this ONLY from the biometric success callback, so
 /// the confirmation cannot originate in the WebView (which holds every cap-token). Returns
@@ -1027,13 +1561,495 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeConfirmA
     std::panic::catch_unwind(AssertUnwindSafe(|| confirm_action(&id))).unwrap_or(false)
 }
 
+/// JNI: return only the bounded Rust-owned operation/service descriptor for a pending
+/// action. Kotlin maps these enum names to fixed resources. The handle, action hash,
+/// account, item, and destructive payload are never returned or logged.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeDescribePendingAction<
+    'local,
+>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    pending_id: jni::objects::JString<'local>,
+) -> jni::sys::jstring {
+    let id = jni_get_string(&mut env, &pending_id).unwrap_or_default();
+    let out = std::panic::catch_unwind(AssertUnwindSafe(|| describe_action_json(&id)))
+        .unwrap_or_else(|_| r#"{"status":"internal_error"}"#.to_string());
+    jni_new_string(&mut env, out)
+}
+
+/// #640 evidence marker. It is intentionally JNI-only and has no WebView, bridge, HTTP,
+/// or router caller. The fixed marker lets the device harness distinguish a hook APK from a
+/// rebuilt default APK without relying on Cargo feature names surviving link-time stripping.
+#[cfg(feature = "agent-network-device-test-hooks")]
+#[used]
+#[no_mangle]
+pub static ISY_AGENT_NETWORK_DEVICE_HOOK_MARKER: &[u8] = b"ISY_AGENT_NETWORK_DEVICE_HOOK_V1";
+
+/// #625 mobile-job fault-injection marker. The hook remains app-private and JNI-internal;
+/// this symbol exists only so artifact scans can prove the exact hook build composition.
+#[cfg(feature = "mobile-job-device-test-hooks")]
+#[used]
+#[no_mangle]
+pub static ISY_MOBILE_JOB_DEVICE_HOOK_MARKER: &[u8] = b"ISY_MOBILE_JOB_DEVICE_HOOK_V1";
+
+/// #620 encrypted credential-store self-test marker. The feature exposes no WebView,
+/// bridge, or HTTP operation and is excluded from default product builds.
+#[cfg(feature = "agent-credential-store-self-test")]
+#[used]
+#[no_mangle]
+pub static ISY_AGENT_CREDENTIAL_STORE_SELF_TEST_MARKER: &[u8] =
+    b"ISY_AGENT_CREDENTIAL_STORE_SELF_TEST_V1";
+
+/// #645 evidence marker. The feature-enabled APK exposes only JNI-internal closed
+/// checkpoints; product WebView/HTTP/bridge code has no path to this marker or control.
+#[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
+#[used]
+#[no_mangle]
+pub static ISY_AGENT_ACCOUNT_LIFECYCLE_DEVICE_HOOK_MARKER: &[u8] =
+    b"ISY_AGENT_ACCOUNT_LIFECYCLE_DEVICE_HOOK_V1";
+
+/// Consume one app-private #640 diagnostic hook. This is deliberately JNI-only: WebView,
+/// HTTP, bridge payloads, and capability tokens cannot select a diagnostic branch.
+#[cfg(any(
+    feature = "agent-network-device-test-hooks",
+    feature = "agent-account-lifecycle-device-test-hooks"
+))]
+fn take_private_device_test_hook(
+    files_dir: &str,
+    hook_file: &str,
+    allowed_values: &[&str],
+) -> String {
+    use std::fs::OpenOptions;
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::path::Path;
+
+    const MAX_HOOK_BYTES: u64 = 128;
+    let root = Path::new(files_dir);
+    if !root.is_absolute()
+        || root.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return String::new();
+    }
+    let Ok(root_meta) = std::fs::symlink_metadata(root) else {
+        return String::new();
+    };
+    if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
+        return String::new();
+    }
+    let path = root.join(hook_file);
+    let Ok(pre_open_meta) = std::fs::symlink_metadata(&path) else {
+        return String::new();
+    };
+    if pre_open_meta.file_type().is_symlink()
+        || !pre_open_meta.is_file()
+        || pre_open_meta.len() > MAX_HOOK_BYTES
+        || pre_open_meta.mode() & 0o077 != 0
+        || pre_open_meta.uid() != unsafe { libc::geteuid() }
+    {
+        let _ = std::fs::remove_file(&path);
+        return String::new();
+    }
+
+    let mut bytes = Vec::with_capacity(pre_open_meta.len() as usize);
+    let read_result = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .and_then(|mut file| {
+            let meta = file.metadata()?;
+            if !meta.is_file()
+                || meta.len() > MAX_HOOK_BYTES
+                || meta.mode() & 0o077 != 0
+                || meta.uid() != unsafe { libc::geteuid() }
+            {
+                return Err(std::io::Error::other("invalid hook file"));
+            }
+            file.read_to_end(&mut bytes)
+        });
+    // The hook is always one-shot, including malformed or failed reads.
+    let _ = std::fs::remove_file(&path);
+    if read_result.is_err() || bytes.len() > MAX_HOOK_BYTES as usize {
+        return String::new();
+    }
+    let Ok(value) = std::str::from_utf8(&bytes) else {
+        return String::new();
+    };
+    let value = value.trim();
+    if allowed_values.contains(&value) {
+        value.to_string()
+    } else {
+        String::new()
+    }
+}
+
+#[cfg(feature = "agent-network-device-test-hooks")]
+fn take_network_device_test_hook(files_dir: &str) -> String {
+    take_private_device_test_hook(
+        files_dir,
+        "network-diagnostic-test-hook",
+        &[
+            "no_validated_network",
+            "connect_timeout",
+            "tls_failed",
+            "http_failed",
+            "foreground_guard_unavailable",
+        ],
+    )
+}
+
+#[cfg(feature = "agent-network-device-test-hooks")]
+fn arm_codex_refresh_device_test_hook(files_dir: &str) -> bool {
+    if take_private_device_test_hook(
+        files_dir,
+        "credential-refresh-test-hook",
+        &["codex_refresh_due"],
+    ) != "codex_refresh_due"
+    {
+        return false;
+    }
+    isyncyou_app_host::arm_codex_refresh_for_device_test();
+    true
+}
+
+#[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
+fn arm_account_lifecycle_device_test_hook(files_dir: &str) -> bool {
+    let value = take_private_device_test_hook(
+        files_dir,
+        "account-lifecycle-test-hook",
+        &[
+            "hold_after_revoke_before_cleanup",
+            "crash_after_revoke_confirmed",
+            "force_revoke_timeout",
+            "force_candidate_validation_failure",
+        ],
+    );
+    !value.is_empty() && isyncyou_app_host::arm_account_lifecycle_device_test_hook(&value)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeNetworkDeviceHooksEnabled<
+    'local,
+>(
+    _env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+) -> jni::sys::jboolean {
+    #[cfg(feature = "mobile-job-device-test-hooks")]
+    std::hint::black_box(ISY_MOBILE_JOB_DEVICE_HOOK_MARKER);
+    #[cfg(feature = "agent-credential-store-self-test")]
+    std::hint::black_box(ISY_AGENT_CREDENTIAL_STORE_SELF_TEST_MARKER);
+    #[cfg(feature = "agent-network-device-test-hooks")]
+    {
+        // Keep the marker referenced in the executable path so binary scans can prove the
+        // hook/default split. Returning a boolean avoids exposing any diagnostic control.
+        !ISY_AGENT_NETWORK_DEVICE_HOOK_MARKER.is_empty()
+    }
+    #[cfg(not(feature = "agent-network-device-test-hooks"))]
+    {
+        false
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeAccountLifecycleDeviceHooksEnabled<
+    'local,
+>(
+    _env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+) -> jni::sys::jboolean {
+    #[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
+    {
+        !ISY_AGENT_ACCOUNT_LIFECYCLE_DEVICE_HOOK_MARKER.is_empty()
+    }
+    #[cfg(not(feature = "agent-account-lifecycle-device-test-hooks"))]
+    {
+        false
+    }
+}
+
+#[cfg(feature = "agent-network-device-test-hooks")]
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeTakeNetworkDeviceTestHook<
+    'local,
+>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    files_dir: jni::objects::JString<'local>,
+) -> jni::sys::jstring {
+    let value = jni_get_string(&mut env, &files_dir)
+        .map(|path| take_network_device_test_hook(&path))
+        .unwrap_or_default();
+    jni_new_string(&mut env, value)
+}
+
+#[cfg(feature = "agent-network-device-test-hooks")]
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeArmCodexRefreshDeviceTestHook<
+    'local,
+>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    files_dir: jni::objects::JString<'local>,
+) -> jni::sys::jboolean {
+    jni_get_string(&mut env, &files_dir)
+        .map(|path| arm_codex_refresh_device_test_hook(&path))
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeArmAccountLifecycleDeviceTestHook<
+    'local,
+>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    files_dir: jni::objects::JString<'local>,
+) -> jni::sys::jboolean {
+    jni_get_string(&mut env, &files_dir)
+        .map(|path| arm_account_lifecycle_device_test_hook(&path))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(feature = "agent-network-device-test-hooks")]
+    #[test]
+    fn network_device_hook_is_one_shot_and_rejects_unsafe_files() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join("network-diagnostic-test-hook");
+        std::fs::write(&hook, "connect_timeout\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            take_network_device_test_hook(dir.path().to_str().unwrap()),
+            "connect_timeout"
+        );
+        assert!(!hook.exists(), "a valid hook must be consumed exactly once");
+        assert!(
+            take_network_device_test_hook(dir.path().to_str().unwrap()).is_empty(),
+            "a consumed hook cannot be replayed"
+        );
+
+        let target = dir.path().join("outside");
+        std::fs::write(&target, "tls_failed").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &hook).unwrap();
+        assert!(take_network_device_test_hook(dir.path().to_str().unwrap()).is_empty());
+        assert!(
+            !hook.exists(),
+            "a rejected symlink is removed without following it"
+        );
+
+        std::fs::write(&hook, "http_failed").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(take_network_device_test_hook(dir.path().to_str().unwrap()).is_empty());
+        assert!(
+            !hook.exists(),
+            "a non-owner-only hook is consumed and rejected"
+        );
+    }
+
+    #[cfg(feature = "agent-network-device-test-hooks")]
+    #[test]
+    fn codex_refresh_device_hook_value_is_closed_and_one_shot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join("credential-refresh-test-hook");
+        std::fs::write(&hook, "codex_refresh_due\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            take_private_device_test_hook(
+                dir.path().to_str().unwrap(),
+                "credential-refresh-test-hook",
+                &["codex_refresh_due"],
+            ),
+            "codex_refresh_due"
+        );
+        assert!(!hook.exists());
+        assert!(take_private_device_test_hook(
+            dir.path().to_str().unwrap(),
+            "credential-refresh-test-hook",
+            &["codex_refresh_due"],
+        )
+        .is_empty());
+    }
+
+    #[cfg(feature = "agent-account-lifecycle-device-test-hooks")]
+    #[test]
+    fn account_lifecycle_hook_apk_contains_deliberate_marker_and_closed_jni_only_controls() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_eq!(
+            ISY_AGENT_ACCOUNT_LIFECYCLE_DEVICE_HOOK_MARKER,
+            b"ISY_AGENT_ACCOUNT_LIFECYCLE_DEVICE_HOOK_V1"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join("account-lifecycle-test-hook");
+        let allowed = [
+            "hold_after_revoke_before_cleanup",
+            "crash_after_revoke_confirmed",
+            "force_revoke_timeout",
+            "force_candidate_validation_failure",
+        ];
+        std::fs::write(&hook, "force_revoke_timeout\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            take_private_device_test_hook(
+                dir.path().to_str().unwrap(),
+                "account-lifecycle-test-hook",
+                &allowed,
+            ),
+            "force_revoke_timeout"
+        );
+        assert!(!hook.exists());
+
+        std::fs::write(&hook, "arbitrary_checkpoint\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(take_private_device_test_hook(
+            dir.path().to_str().unwrap(),
+            "account-lifecycle-test-hook",
+            &allowed,
+        )
+        .is_empty());
+    }
+
+    #[cfg(not(feature = "agent-account-lifecycle-device-test-hooks"))]
+    #[test]
+    fn default_apk_excludes_account_lifecycle_test_hooks() {
+        let manifest = include_str!("../Cargo.toml");
+        let defaults = manifest
+            .split_once("default = [")
+            .expect("mobile defaults exist")
+            .1
+            .split_once(']')
+            .expect("mobile defaults close")
+            .0;
+        assert!(!defaults.contains("agent-account-lifecycle-device-test-hooks"));
+        assert!(!std::hint::black_box(cfg!(
+            feature = "agent-account-lifecycle-device-test-hooks"
+        )));
+    }
+
+    #[test]
+    fn mobile_product_has_no_local_cli_experimental_feature() {
+        let manifest = include_str!("../Cargo.toml");
+        let source = include_str!("lib.rs");
+        let forbidden_feature = ["agent-subscription", "-experimental"].concat();
+        let loopback_symbol = ["bind_", "loopback("].concat();
+
+        assert!(!manifest.contains(&forbidden_feature));
+        assert!(!source.contains(&forbidden_feature));
+        assert!(!source.contains(&loopback_symbol));
+    }
+
+    #[test]
+    fn android_rejects_agent_subscription_experimental_feature() {
+        let gradle = include_str!("../../../android/app/build.gradle.kts");
+        let forbidden_feature = ["agent-subscription", "-experimental"].concat();
+        let expected = [
+            "agent-session-kdf-bench",
+            "agent-credential-store-self-test",
+            "mobile-job-device-test-hooks",
+            "agent-network-device-test-hooks",
+            "agent-account-lifecycle-device-test-hooks",
+        ];
+        let allowlist = gradle
+            .split_once("val allowedCargoTestFeatures = setOf(")
+            .unwrap()
+            .1
+            .split_once(")\nval requestedCargoTestFeatures")
+            .unwrap()
+            .0;
+        let declared = allowlist
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix('"')
+                    .and_then(|line| line.strip_suffix("\","))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(declared, expected);
+        assert!(gradle.contains("Unsupported ISY_CARGO_FEATURES value"));
+        assert!(!gradle.contains(&forbidden_feature));
+    }
+
+    #[test]
+    fn native_mobile_job_run_rejects_malformed_and_unbounded_requests() {
+        assert!(native_mobile_job_run_json("not-json").contains("invalid_request"));
+        assert!(native_mobile_job_run_json(
+            r#"{"v":1,"job_id":"bad/id","kind":"backup","device":{"network_validated":true,"metered":false,"charging":true,"free_bytes":999999999}}"#
+        )
+        .contains("invalid_job_id"));
+        assert!(native_mobile_job_run_json(
+            r#"{"v":1,"job_id":"job-1","kind":"backup","device":{"network_validated":true}}"#
+        )
+        .contains("invalid_request"));
+    }
+
+    #[test]
+    fn native_mobile_job_kind_and_id_policy_is_bounded() {
+        assert!(valid_mobile_job_id("mobile-backup-123"));
+        assert!(!valid_mobile_job_id("mobile/job"));
+        assert!(!valid_mobile_job_id(&"x".repeat(129)));
+        assert!(mobile_job_kind_from_wire("backup").is_some());
+        assert!(mobile_job_kind_from_wire("restore-cloud").is_some());
+        assert!(mobile_job_kind_from_wire("unknown").is_none());
+    }
+
+    fn api_json(resp: isyncyou_webui::ApiResponse) -> serde_json::Value {
+        serde_json::from_slice(&resp.body).expect("json response")
+    }
+
     fn frame_status(framed: &[u8]) -> u16 {
         assert!(framed.len() >= 2, "framed response has status bytes");
         u16::from_be_bytes([framed[0], framed[1]])
+    }
+
+    fn cap_from_app_js(router: &isyncyou_webui::Router, key: &str) -> String {
+        let resp = router.route(&isyncyou_webui::ApiRequest::get("/app.js"));
+        assert_eq!(resp.status, 200, "app.js served");
+        let js = String::from_utf8(resp.body).unwrap();
+        let needle = format!("{key}: \"");
+        let start = js.find(&needle).expect("cap key in app.js") + needle.len();
+        let end = js[start..].find('"').expect("cap end") + start;
+        let cap = js[start..end].to_string();
+        assert!(!cap.is_empty(), "{key} cap must be populated");
+        assert!(
+            !cap.starts_with("__"),
+            "{key} cap placeholder must be replaced"
+        );
+        cap
+    }
+
+    fn strict_json_post(path: &str, body: serde_json::Value) -> isyncyou_webui::ApiRequest {
+        isyncyou_webui::ApiRequest::new("POST", path)
+            .with_content_type(Some("application/json".into()))
+            .with_body(serde_json::to_vec(&body).unwrap())
+    }
+
+    fn restore_enabled_mobile_config(files_dir: &std::path::Path) {
+        let mut cfg = Config::default();
+        cfg.restore.cloud_restore_enabled = true;
+        prepare_mobile_config_for_files_dir(&mut cfg, files_dir).unwrap();
+        cfg.save(files_dir.join("isyncyou.toml")).unwrap();
+    }
+
+    fn mobile_key_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[cfg(feature = "agent-session-kdf-bench")]
@@ -1054,11 +2070,60 @@ mod tests {
         assert_eq!(value["kdf"]["lanes"].as_u64(), Some(4));
     }
 
+    #[cfg(feature = "agent-credential-store-self-test")]
+    #[test]
+    fn agent_credential_store_self_test_json_is_structured_and_redacted() {
+        assert_eq!(
+            ISY_AGENT_CREDENTIAL_STORE_SELF_TEST_MARKER,
+            b"ISY_AGENT_CREDENTIAL_STORE_SELF_TEST_V1"
+        );
+        let _guard = mobile_key_test_guard();
+        reset_mobile_agent_credential_ready_for_tests();
+        assert!(install_mobile_agent_credential_key(&[8u8; 32]));
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = "agent-credential-self-test-sentinel";
+        let out = agent_credential_store_self_test_json(dir.path().to_str().unwrap(), sentinel)
+            .expect("self-test json");
+        assert!(!out.contains(sentinel));
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["self_test"].as_str(), Some("agent_credential_store"));
+        assert_eq!(value["scope"].as_str(), Some("jni_only_feature_gated"));
+        assert_eq!(value["status"].as_str(), Some("ok"));
+        assert_eq!(value["key_source"].as_str(), Some("android_installed"));
+        assert_eq!(value["round_trip"].as_bool(), Some(true));
+        assert_eq!(
+            value["plaintext_sentinel_in_credential_store"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            value["plaintext_sentinel_in_wrapped_key_file"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            value["credential_store_dir"].as_str(),
+            Some("agent-credentials")
+        );
+        assert_eq!(
+            value["wrapped_key_file"].as_str(),
+            Some("agent_credential.key")
+        );
+    }
+
+    #[cfg(feature = "mobile-job-device-test-hooks")]
+    #[test]
+    fn mobile_job_hook_apk_contains_deliberate_marker() {
+        assert_eq!(
+            ISY_MOBILE_JOB_DEVICE_HOOK_MARKER,
+            b"ISY_MOBILE_JOB_DEVICE_HOOK_V1"
+        );
+    }
+
     #[test]
     fn start_engine_is_idempotent_and_mints_a_session_token() {
         // Host test of the non-JNI core (#89 P4 / #0A): start succeeds, mints a session
         // token, and a second call reuses the SAME running engine (Activity recreation must
         // not start a second one). No loopback port is bound in the default build.
+        let _guard = mobile_key_test_guard();
         install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
@@ -1071,8 +2136,36 @@ mod tests {
     }
 
     #[test]
+    fn network_snapshot_registration_uses_engine_session_and_closed_guard_reason() {
+        let _guard = mobile_key_test_guard();
+        install_test_mobile_encryption();
+        let dir = tempfile::tempdir().unwrap();
+        start_engine(dir.path().to_str().unwrap()).expect("engine starts");
+        let guard_id = "network-snapshot-mobile-test-guard";
+
+        let snapshot_id = register_network_snapshot(NetworkSnapshotRegistration {
+            guard_id,
+            reason: "agent_turn",
+            active_network: true,
+            internet_capability: true,
+            validated_capability: true,
+            metered: false,
+            restrict_background: "disabled",
+            notifications_visible: true,
+            test_hook: None,
+        })
+        .expect("trusted native snapshot registration succeeds");
+
+        assert!(!snapshot_id.is_empty());
+        assert_ne!(snapshot_id, guard_id);
+        invalidate_network_guard(guard_id);
+    }
+
+    #[test]
     fn mobile_start_inner_fails_closed_without_encryption_ready() {
+        let _guard = mobile_key_test_guard();
         reset_mobile_encryption_ready_for_tests();
+        reset_mobile_agent_credential_ready_for_tests();
         let dir = tempfile::tempdir().unwrap();
 
         let err = match start_inner(dir.path().to_str().unwrap()) {
@@ -1094,7 +2187,34 @@ mod tests {
     }
 
     #[test]
+    fn mobile_start_inner_fails_closed_without_agent_credential_key() {
+        let _guard = mobile_key_test_guard();
+        reset_mobile_encryption_ready_for_tests();
+        reset_mobile_agent_credential_ready_for_tests();
+        assert!(install_mobile_body_key(1, &[7u8; 32]));
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = match start_inner(dir.path().to_str().unwrap()) {
+            Ok(_) => panic!("start_inner must fail without the agent credential key"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("agent credential storage setup failed"),
+            "startup must fail closed before opening local data without the agent credential key: {err}"
+        );
+        assert!(
+            !dir.path()
+                .join("archive")
+                .join(".isyncyou-store.db")
+                .exists(),
+            "no store is created when agent credential setup failed"
+        );
+    }
+
+    #[test]
     fn mobile_body_key_install_rejects_bad_length_and_panic() {
+        let _guard = mobile_key_test_guard();
         reset_mobile_encryption_ready_for_tests();
         assert!(!install_mobile_body_key(1, &[1, 2, 3]));
         assert!(!mobile_encryption_ready());
@@ -1106,11 +2226,34 @@ mod tests {
 
     #[test]
     fn mobile_body_key_install_marks_encryption_ready_on_success() {
+        let _guard = mobile_key_test_guard();
         reset_mobile_encryption_ready_for_tests();
 
         assert!(install_mobile_body_key(1, &[7u8; 32]));
 
         assert!(mobile_encryption_ready());
+    }
+
+    #[test]
+    fn mobile_agent_credential_key_install_rejects_bad_length_and_panic() {
+        let _guard = mobile_key_test_guard();
+        reset_mobile_agent_credential_ready_for_tests();
+        assert!(!install_mobile_agent_credential_key(&[1, 2, 3]));
+        assert!(!mobile_agent_credential_ready());
+
+        TEST_FAIL_NEXT_MOBILE_AGENT_CREDENTIAL_KEY_INSTALL.store(true, Ordering::SeqCst);
+        assert!(!install_mobile_agent_credential_key(&[7u8; 32]));
+        assert!(!mobile_agent_credential_ready());
+    }
+
+    #[test]
+    fn mobile_agent_credential_key_install_marks_ready_on_success() {
+        let _guard = mobile_key_test_guard();
+        reset_mobile_agent_credential_ready_for_tests();
+
+        assert!(install_mobile_agent_credential_key(&[7u8; 32]));
+
+        assert!(mobile_agent_credential_ready());
     }
 
     #[test]
@@ -1273,6 +2416,7 @@ mod tests {
 
     #[test]
     fn mobile_config_start_inner_forces_poll_interval_and_persists_once() {
+        let _guard = mobile_key_test_guard();
         install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("isyncyou.toml");
@@ -1293,6 +2437,7 @@ mod tests {
 
     #[test]
     fn mobile_start_inner_clears_legacy_plaintext_cache_but_keeps_tokens() {
+        let _guard = mobile_key_test_guard();
         install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("archive");
@@ -1480,13 +2625,15 @@ mod tests {
     }
 
     #[test]
-    fn standalone_serves_ui_and_gates_the_api_in_process() {
+    fn standalone_full_node_serves_ui_and_gates_restore_backup() {
         // #89 P7 / #0A (host slice): the embedded engine — the exact code that runs on the
         // phone — serves the UI shell and fully session-token gates the data API **entirely
         // in-process**, with NO loopback TCP port. `asset_request` serves the shell (as the
         // WebView's shouldInterceptRequest does); `bridge_request` carries the data API.
+        let _guard = mobile_key_test_guard();
         install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
+        restore_enabled_mobile_config(dir.path());
         start_engine(dir.path().to_str().unwrap()).expect("engine starts");
         let tok = session_token().expect("token");
 
@@ -1501,7 +2648,7 @@ mod tests {
         // Data route without the session token → 401 (the Android-exposure gate, now over
         // the bridge rather than an open port).
         let no_tok = bridge_request(
-            r#"{"method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{}}"#,
+            r#"{"t":"req","id":"standalone-denied","method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{}}"#,
         );
         assert!(
             no_tok.contains("\"status\":401"),
@@ -1509,20 +2656,244 @@ mod tests {
         );
         // With the session token → reaches the handler (not a 401).
         let with_tok = bridge_request(&format!(
-            r#"{{"method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{{"X-Session-Token":"{tok}"}}}}"#
+            r#"{{"t":"req","id":"standalone-authorized","method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{{"X-Session-Token":"{tok}"}}}}"#
         ));
         assert!(
             !with_tok.contains("\"status\":401"),
             "valid token must pass: {with_tok}"
         );
-        // Restore is absent in the mobile profile (cache, not backup-of-record) → 404.
-        let restore = bridge_request(&format!(
-            r#"{{"method":"POST","path":"/api/v1/restore?account=me&service=mail&id=x","headers":{{"X-Session-Token":"{tok}"}}}}"#
-        ));
-        assert!(
-            restore.contains("\"status\":404"),
-            "restore must be absent on mobile: {restore}"
+        // Restore/backup are now present in the mobile full-node profile, but still gated by
+        // the injected cap token and then the native per-action biometric token.
+        let restore_no_cap = bridge_request(
+            &serde_json::json!({
+                "t": "req",
+                "id": "standalone-restore",
+                "method": "POST",
+                "path": "/api/v1/restore",
+                "headers": {
+                    "X-Session-Token": tok.clone(),
+                    "Content-Type": "application/json"
+                },
+                "body": serde_json::json!({
+                    "request_id": "00000000-0000-4000-8000-000000000003",
+                    "account": "me",
+                    "service": "mail",
+                    "id": "x"
+                }).to_string()
+            })
+            .to_string(),
         );
+        assert!(
+            restore_no_cap.contains("\"status\":401"),
+            "restore must be wired and cap-gated, not absent: {restore_no_cap}"
+        );
+        let backup_no_cap = bridge_request(
+            &serde_json::json!({
+                "t": "req",
+                "id": "standalone-backup",
+                "method": "POST",
+                "path": "/api/v1/backup",
+                "headers": {
+                    "X-Session-Token": tok,
+                    "Content-Type": "application/json"
+                },
+                "body": serde_json::json!({
+                    "request_id": "00000000-0000-4000-8000-000000000004",
+                    "account": "me",
+                    "services": "mail"
+                }).to_string()
+            })
+            .to_string(),
+        );
+        assert!(
+            backup_no_cap.contains("\"status\":401"),
+            "backup must be wired and cap-gated, not absent: {backup_no_cap}"
+        );
+    }
+
+    #[test]
+    fn mobile_full_node_router_exposes_gated_restore_and_backup() {
+        let _guard = mobile_key_test_guard();
+        install_test_mobile_encryption();
+        let dir = tempfile::tempdir().unwrap();
+        restore_enabled_mobile_config(dir.path());
+        let (tok, router, _) = start_inner(dir.path().to_str().unwrap()).expect("engine starts");
+
+        for path in [
+            "/api/v1/restore?account=me&service=mail&id=x",
+            "/api/v1/backup?account=me&services=mail",
+            "/api/v1/jobs?account=me",
+            "/api/v1/jobs/cancel?account=me&job_id=job-1",
+        ] {
+            let method = if path == "/api/v1/jobs?account=me" {
+                "GET"
+            } else {
+                "POST"
+            };
+            let no_session = router.route(&isyncyou_webui::ApiRequest::new(method, path));
+            assert_eq!(no_session.status, 401, "session-gated: {path}");
+            let with_session = router.route(
+                &isyncyou_webui::ApiRequest::new(method, path)
+                    .with_session_token(Some(tok.clone())),
+            );
+            assert_eq!(with_session.status, 401, "cap-gated, not absent: {path}");
+        }
+
+        assert!(!cap_from_app_js(&router, "restore").is_empty());
+        assert!(!cap_from_app_js(&router, "backup").is_empty());
+        assert!(!cap_from_app_js(&router, "mobileJobs").is_empty());
+    }
+
+    #[test]
+    fn mobile_full_node_restore_backup_do_not_run_without_biometric_token() {
+        let _guard = mobile_key_test_guard();
+        install_test_mobile_encryption();
+        let dir = tempfile::tempdir().unwrap();
+        restore_enabled_mobile_config(dir.path());
+        let (tok, router, _) = start_inner(dir.path().to_str().unwrap()).expect("engine starts");
+        let restore_cap = cap_from_app_js(&router, "restore");
+        let backup_cap = cap_from_app_js(&router, "backup");
+        let jobs_cap = cap_from_app_js(&router, "mobileJobs");
+
+        let list_jobs = || {
+            api_json(
+                router.route(
+                    &isyncyou_webui::ApiRequest::get("/api/v1/jobs?account=me")
+                        .with_session_token(Some(tok.clone()))
+                        .with_cap_token(Some(jobs_cap.clone())),
+                ),
+            )
+        };
+
+        let restore_body = serde_json::json!({
+            "request_id": "00000000-0000-4000-8000-000000000001",
+            "account": "me",
+            "service": "mail",
+            "id": "restore-src-1"
+        });
+        let restore_challenge = api_json(
+            router.route(
+                &strict_json_post("/api/v1/restore", restore_body.clone())
+                    .with_session_token(Some(tok.clone()))
+                    .with_cap_token(Some(restore_cap.clone())),
+            ),
+        );
+        assert_eq!(
+            restore_challenge["status"].as_str(),
+            Some("confirmation_required")
+        );
+        assert_eq!(
+            list_jobs()["jobs"].as_array().unwrap().len(),
+            0,
+            "restore must not enqueue before biometric token"
+        );
+        let restore_pat = restore_challenge["pending_action_id"].as_str().unwrap();
+        assert!(router.confirm_biometric(restore_pat));
+        let restore_ok = api_json(
+            router.route(
+                &strict_json_post("/api/v1/restore", restore_body)
+                    .with_session_token(Some(tok.clone()))
+                    .with_cap_token(Some(restore_cap))
+                    .with_per_action_token(Some(restore_pat.to_owned())),
+            ),
+        );
+        assert_eq!(
+            restore_ok["queued"].as_bool(),
+            Some(true),
+            "restore response: {restore_ok}"
+        );
+        assert_eq!(restore_ok["kind"].as_str(), Some("restore-cloud"));
+        assert_eq!(restore_ok["state"].as_str(), Some("queued"));
+
+        let backup_body = serde_json::json!({
+            "request_id": "00000000-0000-4000-8000-000000000002",
+            "account": "me",
+            "services": "mail"
+        });
+        let backup_challenge = api_json(
+            router.route(
+                &strict_json_post("/api/v1/backup", backup_body.clone())
+                    .with_session_token(Some(tok.clone()))
+                    .with_cap_token(Some(backup_cap.clone())),
+            ),
+        );
+        assert_eq!(
+            backup_challenge["status"].as_str(),
+            Some("confirmation_required")
+        );
+        assert_eq!(
+            list_jobs()["jobs"].as_array().unwrap().len(),
+            1,
+            "backup must not enqueue before biometric token"
+        );
+        let backup_pat = backup_challenge["pending_action_id"].as_str().unwrap();
+        assert!(router.confirm_biometric(backup_pat));
+        let backup_ok = api_json(
+            router.route(
+                &strict_json_post("/api/v1/backup", backup_body)
+                    .with_session_token(Some(tok.clone()))
+                    .with_cap_token(Some(backup_cap))
+                    .with_per_action_token(Some(backup_pat.to_owned())),
+            ),
+        );
+        assert_eq!(backup_ok["queued"].as_bool(), Some(true));
+        assert_eq!(backup_ok["kind"].as_str(), Some("backup"));
+        assert_eq!(backup_ok["state"].as_str(), Some("queued"));
+        assert_eq!(
+            list_jobs()["jobs"].as_array().unwrap().len(),
+            2,
+            "both confirmed jobs are visible in the mobile job list"
+        );
+    }
+
+    #[test]
+    fn mobile_full_node_job_recovery_runs_on_start() {
+        let _guard = mobile_key_test_guard();
+        install_test_mobile_encryption();
+        let dir = tempfile::tempdir().unwrap();
+        restore_enabled_mobile_config(dir.path());
+        let cfg = Config::load(dir.path().join("isyncyou.toml")).unwrap();
+        let archive = dir.path().join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        {
+            let store = isyncyou_store::Store::open(archive.join(".isyncyou-store.db")).unwrap();
+            store
+                .create_mobile_job(
+                    "start-recovery-job",
+                    "me",
+                    isyncyou_store::MobileJobKind::Backup,
+                    None,
+                    None,
+                    "backup:me:mail",
+                    r#"{"op":"backup","account":"me","services":["mail"]}"#,
+                    1,
+                )
+                .unwrap();
+        }
+
+        let runtime = isyncyou_app_host::MobileJobRuntime::new(
+            cfg,
+            Arc::new(Mutex::new(())),
+            Arc::new(isyncyou_webui::EventBus::new()),
+        );
+        let (jobs, truncated) = runtime
+            .mobile_worker_plan("me")
+            .expect("worker plan should list queued jobs");
+        assert!(!truncated);
+        assert_eq!(
+            jobs,
+            vec![(
+                "start-recovery-job".to_string(),
+                isyncyou_store::MobileJobKind::Backup
+            )]
+        );
+
+        let store = isyncyou_store::Store::open(archive.join(".isyncyou-store.db")).unwrap();
+        let job = store
+            .get_mobile_job("start-recovery-job")
+            .unwrap()
+            .expect("job remains recorded");
+        assert_eq!(job.state, isyncyou_store::MobileJobState::Queued);
     }
 
     #[test]
@@ -1530,13 +2901,14 @@ mod tests {
         // #0A: the in-process bridge answers against the same router as loopback and
         // enforces the same session gate — proving the phone needs no TCP port to serve
         // its own UI's data calls.
+        let _guard = mobile_key_test_guard();
         install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         start_engine(dir.path().to_str().unwrap()).expect("engine starts");
         let tok = session_token().expect("token");
         // No session token → 401 envelope (the loopback-exposure gate applies here too).
         let denied = bridge_request(
-            r#"{"method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{}}"#,
+            r#"{"t":"req","id":"routing-denied","method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{}}"#,
         );
         assert!(
             denied.contains("\"status\":401"),
@@ -1544,7 +2916,7 @@ mod tests {
         );
         // With the token → reaches the handler (not a 401).
         let ok = bridge_request(&format!(
-            r#"{{"method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{{"X-Session-Token":"{tok}"}}}}"#
+            r#"{{"t":"req","id":"routing-authorized","method":"GET","path":"/api/v1/items?account=me&service=mail","headers":{{"X-Session-Token":"{tok}"}}}}"#
         ));
         assert!(
             !ok.contains("\"status\":401"),
@@ -1556,6 +2928,7 @@ mod tests {
     fn asset_request_serves_the_shell_framed_binary_safe() {
         // #0A: browser-initiated GETs (shell + subresources) are served binary-safe with
         // an explicit content-type, so images/viewers survive intact (no lossy UTF-8).
+        let _guard = mobile_key_test_guard();
         install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         start_engine(dir.path().to_str().unwrap()).expect("engine starts");
@@ -1577,6 +2950,7 @@ mod tests {
 
     #[test]
     fn asset_request_with_session_uses_trusted_session_not_cookie_or_query() {
+        let _guard = mobile_key_test_guard();
         install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         start_engine(dir.path().to_str().unwrap()).expect("engine starts");
@@ -1638,6 +3012,7 @@ mod tests {
         // #0A: the push-stream FFI plumbing — gating + open/close registry. Event delivery
         // semantics are proven in webui's open_bridge_stream test; the full push round-trip
         // is device-verified.
+        let _guard = mobile_key_test_guard();
         install_test_mobile_encryption();
         let dir = tempfile::tempdir().unwrap();
         start_engine(dir.path().to_str().unwrap()).expect("engine starts");

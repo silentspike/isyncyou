@@ -18,6 +18,12 @@ object NativeEngine {
      */
     external fun nativeStart(filesDir: String): Int
 
+    /** Return the bounded recoverable mobile-job plan for WorkManager. */
+    external fun nativeMobileJobPlan(): String
+
+    /** Validate and execute one versioned WorkManager mobile-job request. */
+    external fun nativeRunMobileJob(requestJson: String): String
+
     /** The per-process session token held by trusted native callers, never by WebView JS. */
     external fun nativeSessionToken(): String
 
@@ -64,11 +70,59 @@ object NativeEngine {
     external fun nativeSetBodyKey(keyId: Int, key: ByteArray): Int
 
     /**
+     * Install the at-rest agent credential key (#620): the 32-byte data key the Android
+     * Keystore unwrapped for provider credentials. MUST be called before [nativeStart] so
+     * the embedded app-host credential resolver uses this process-installed key. Returns
+     * 1 on success, 0 on a bad key length or native install failure.
+     */
+    external fun nativeSetAgentCredentialKey(key: ByteArray): Int
+
+    /**
      * #619 evidence hook: available only when the Rust library is built with
      * `ISY_CARGO_FEATURES=agent-session-kdf-bench`. This is intentionally a direct native
      * instrumentation path, not a WebView, bridge, HTTP, or production UI capability.
      */
     external fun nativeAgentSessionKdfBenchmark(iterations: Int): String
+
+    /**
+     * #620 evidence hook: available only when the Rust library is built with
+     * `ISY_CARGO_FEATURES=agent-credential-store-self-test`. This is intentionally a direct
+     * native instrumentation path, not a WebView, bridge, HTTP, or production UI capability.
+     */
+    external fun nativeAgentCredentialStoreSelfTest(filesDir: String, sentinel: String): String
+
+    /**
+     * #640 test/evidence hook marker. This method is present only in a deliberately
+     * feature-enabled test APK and is not callable from WebView, HTTP, or the bridge.
+     */
+    external fun nativeNetworkDeviceHooksEnabled(): Boolean
+
+    /**
+     * #640 test/evidence hook input. Available only in the explicitly feature-enabled
+     * native library and never reachable from WebView, HTTP, or the bridge. Native code
+     * consumes the fixed app-private file before returning one closed diagnostic category.
+     */
+    external fun nativeTakeNetworkDeviceTestHook(filesDir: String): String
+
+    /**
+     * Arm one real Codex credential refresh in the feature-enabled evidence APK. The native
+     * implementation consumes a separate owner-only app-private file and is absent from the
+     * default APK; WebView, HTTP, and bridge code cannot call it.
+     */
+    external fun nativeArmCodexRefreshDeviceTestHook(filesDir: String): Boolean
+
+    /** #645 feature-enabled JNI-only lifecycle checkpoint controls. */
+    external fun nativeAccountLifecycleDeviceHooksEnabled(): Boolean
+
+    /** Consume and arm one closed app-private #645 checkpoint. */
+    external fun nativeArmAccountLifecycleDeviceTestHook(filesDir: String): Boolean
+
+    /**
+     * Return the Rust-owned, bounded descriptor for a pending action without consuming it.
+     * The JSON result contains only `status`, `op`, and `service`; status is `ok`, `expired`,
+     * or `not_found`.
+     */
+    external fun nativeDescribePendingAction(pendingId: String): String
 
     /**
      * Record a successful native `BiometricPrompt` for a pending destructive action
@@ -85,4 +139,23 @@ object NativeEngine {
      * charging-only). May be called any time; the latest value wins.
      */
     external fun nativeDeviceState(metered: Boolean, charging: Boolean, freeBytes: Long)
+
+    /**
+     * Register a one-shot Rust-owned handle for a connectivity snapshot captured only after
+     * Kotlin has validated the active foreground guard. The returned value is opaque to JS.
+     */
+    external fun nativeRegisterNetworkSnapshot(
+        guardId: String,
+        reason: String,
+        activeNetwork: Boolean,
+        internetCapability: Boolean,
+        validatedCapability: Boolean,
+        metered: Boolean,
+        restrictBackground: String,
+        notificationsVisible: Boolean,
+        testHook: String,
+    ): String
+
+    /** Invalidate every unconsumed native snapshot bound to an ended guard. */
+    external fun nativeInvalidateNetworkGuard(guardId: String)
 }

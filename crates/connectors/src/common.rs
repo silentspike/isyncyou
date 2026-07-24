@@ -19,10 +19,7 @@ pub(crate) fn fetch_pages<T: Transport>(
     loop {
         let resp = transport.get(&url);
         if !(200..300).contains(&resp.status) {
-            return Err(SyncError::Remote(format!(
-                "HTTP {} listing {url}",
-                resp.status
-            )));
+            return Err(SyncError::HttpStatus(resp.status));
         }
         let body = resp
             .body
