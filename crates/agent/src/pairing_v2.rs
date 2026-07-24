@@ -941,11 +941,9 @@ fn random_b64(bytes: usize) -> Result<String, PairingV2Error> {
 }
 
 fn random_array<const N: usize>() -> Result<[u8; N], PairingV2Error> {
-    let mut value = [0u8; N];
-    SystemRandom::new()
-        .fill(&mut value)
-        .map_err(|_| PairingV2Error::Crypto)?;
-    Ok(value)
+    ring::rand::generate::<[u8; N]>(&SystemRandom::new())
+        .map(|value| value.expose())
+        .map_err(|_| PairingV2Error::Crypto)
 }
 
 fn decode_array<const N: usize>(value: &str) -> Result<[u8; N], PairingV2Error> {
