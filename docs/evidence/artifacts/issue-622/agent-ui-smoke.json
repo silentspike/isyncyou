@@ -1,0 +1,582 @@
+{
+  "ok": true,
+  "generated_at": "2026-07-09T20:27:24.580Z",
+  "fixture_origin": "http://127.0.0.1:36795",
+  "assertions": [
+    {
+      "name": "desktop Assistant nav visible",
+      "status": "pass",
+      "details": {}
+    },
+    {
+      "name": "setup consent panel visible",
+      "status": "pass",
+      "details": {}
+    },
+    {
+      "name": "connect disabled before consent",
+      "status": "pass",
+      "details": {}
+    },
+    {
+      "name": "BYO key row unavailable",
+      "status": "pass",
+      "details": {}
+    },
+    {
+      "name": "no editable secret input in setup",
+      "status": "pass",
+      "details": {}
+    },
+    {
+      "name": "consent localStorage is versioned",
+      "status": "pass",
+      "details": {
+        "version": 1,
+        "accepted": true,
+        "provider": "claude",
+        "timestamp": "2026-07-09T20:27:25.587Z"
+      }
+    },
+    {
+      "name": "consent localStorage contains no secrets",
+      "status": "pass",
+      "details": {
+        "version": 1,
+        "accepted": true,
+        "provider": "claude",
+        "timestamp": "2026-07-09T20:27:25.587Z"
+      }
+    },
+    {
+      "name": "oauth start posted once",
+      "status": "pass",
+      "details": [
+        {
+          "provider": "anthropic",
+          "redirect": "http://localhost:36795/callback"
+        }
+      ]
+    },
+    {
+      "name": "oauth start used same-origin fixture route",
+      "status": "pass",
+      "details": {}
+    },
+    {
+      "name": "auth launch stayed on fixture origin",
+      "status": "pass",
+      "details": [
+        {
+          "url": "http://127.0.0.1:36795/fixture-auth-complete",
+          "target": "same-tab"
+        }
+      ]
+    },
+    {
+      "name": "first token appears incrementally",
+      "status": "pass",
+      "details": {}
+    },
+    {
+      "name": "citation href same-origin path",
+      "status": "pass",
+      "details": {
+        "citationHref": "/api/v1/view?account=fixture&service=mail&id=mail-1"
+      }
+    },
+    {
+      "name": "citation click opens fixture view",
+      "status": "pass",
+      "details": {
+        "popup": "http://127.0.0.1:36795/api/v1/view?account=fixture&service=mail&id=mail-1"
+      }
+    },
+    {
+      "name": "model picker posts model change",
+      "status": "pass",
+      "details": [
+        {
+          "provider": "claude",
+          "model": "claude-opus-4"
+        }
+      ]
+    },
+    {
+      "name": "usage chip shows unavailable state",
+      "status": "pass",
+      "details": {}
+    },
+    {
+      "name": "pending card appears",
+      "status": "pass",
+      "details": {}
+    },
+    {
+      "name": "no confirm before click",
+      "status": "pass",
+      "details": {}
+    },
+    {
+      "name": "pending DOM excludes token and hash",
+      "status": "pass",
+      "details": {}
+    },
+    {
+      "name": "confirm posts once with pending token action_hash",
+      "status": "pass",
+      "details": [
+        {
+          "pending": "pending-turn-2",
+          "token": "fixture-token-turn-2",
+          "action_hash": "fixture-hash-turn-2"
+        }
+      ]
+    },
+    {
+      "name": "cancel posts once for separate turn",
+      "status": "pass",
+      "details": [
+        {
+          "turn": "turn-3"
+        }
+      ]
+    },
+    {
+      "name": "error stream renders inline",
+      "status": "pass",
+      "details": {}
+    },
+    {
+      "name": "mobile Assistant nav visible",
+      "status": "pass",
+      "details": {}
+    },
+    {
+      "name": "mobile Assistant has no horizontal overflow",
+      "status": "pass",
+      "details": {
+        "scrollWidth": 390,
+        "clientWidth": 390
+      }
+    },
+    {
+      "name": "no console errors",
+      "status": "pass",
+      "details": []
+    },
+    {
+      "name": "no page errors",
+      "status": "pass",
+      "details": []
+    },
+    {
+      "name": "no non-fixture-origin WebView requests",
+      "status": "pass",
+      "details": []
+    },
+    {
+      "name": "fixture routes complete",
+      "status": "pass",
+      "details": {
+        "fixture404": [],
+        "fixtureErrors": []
+      }
+    },
+    {
+      "name": "normal pending error streams exercised",
+      "status": "pass",
+      "details": [
+        {
+          "turn": "turn-1",
+          "scenario": "normal"
+        },
+        {
+          "turn": "turn-2",
+          "scenario": "pending-confirm"
+        },
+        {
+          "turn": "turn-3",
+          "scenario": "pending-cancel"
+        },
+        {
+          "turn": "turn-4",
+          "scenario": "error"
+        }
+      ]
+    }
+  ],
+  "console_errors": [],
+  "page_errors": [],
+  "browser_requests": [
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/",
+      "resource_type": "document"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/app.css",
+      "resource_type": "stylesheet"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/app.js",
+      "resource_type": "script"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/accounts",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/sync/state",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/status?account=fixture",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/activity?account=fixture&limit=200",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/settings",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/sync/state",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/events",
+      "resource_type": "eventsource"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/activity?account=fixture&limit=60",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/status?account=fixture",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/app.woff2",
+      "resource_type": "font"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/sync/state",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/agent/status",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/activity?account=fixture&limit=60",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/status?account=fixture",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/agent/status",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:36795/api/v1/agent/oauth/start?provider=anthropic&redirect=http%3A%2F%2Flocalhost%3A36795%2Fcallback",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/agent/status",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/fixture-auth-complete",
+      "resource_type": "document"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/agent/status",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/",
+      "resource_type": "document"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/app.css",
+      "resource_type": "stylesheet"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/app.js",
+      "resource_type": "script"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/accounts",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/sync/state",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/agent/status",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/events",
+      "resource_type": "eventsource"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/app.woff2",
+      "resource_type": "font"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/activity?account=fixture&limit=60",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/status?account=fixture",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:36795/api/v1/agent/turn?account=fixture&prompt=Find%20the%20quarterly%20brief",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/agent/stream?turn=turn-1",
+      "resource_type": "eventsource"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:36795/api/v1/agent/model?provider=claude&model=claude-opus-4",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/agent/status",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/agent/status",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:36795/api/v1/agent/turn?account=fixture&prompt=Please%20delete%20the%20stale%20fixture%20item",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/agent/stream?turn=turn-2",
+      "resource_type": "eventsource"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:36795/api/v1/agent/confirm?pending=pending-turn-2&token=fixture-token-turn-2&action_hash=fixture-hash-turn-2",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:36795/api/v1/agent/turn?account=fixture&prompt=Please%20cancel%20the%20delete%20fixture%20item",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/agent/stream?turn=turn-3",
+      "resource_type": "eventsource"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:36795/api/v1/agent/cancel?turn=turn-3",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:36795/api/v1/agent/turn?account=fixture&prompt=trigger%20error",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/agent/stream?turn=turn-4",
+      "resource_type": "eventsource"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/?mobile-smoke=1",
+      "resource_type": "document"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/app.css",
+      "resource_type": "stylesheet"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/app.js",
+      "resource_type": "script"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/accounts",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/sync/state",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/agent/status",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/app.woff2",
+      "resource_type": "font"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/events",
+      "resource_type": "eventsource"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/activity?account=fixture&limit=60",
+      "resource_type": "fetch"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:36795/api/v1/status?account=fixture",
+      "resource_type": "fetch"
+    }
+  ],
+  "runtime_transports": [
+    {
+      "kind": "fetch",
+      "url": "http://127.0.0.1:36795/api/v1/accounts"
+    },
+    {
+      "kind": "fetch",
+      "url": "http://127.0.0.1:36795/api/v1/sync/state"
+    },
+    {
+      "kind": "fetch",
+      "url": "http://127.0.0.1:36795/api/v1/agent/status"
+    },
+    {
+      "kind": "EventSource",
+      "url": "http://127.0.0.1:36795/api/v1/events"
+    },
+    {
+      "kind": "fetch",
+      "url": "http://127.0.0.1:36795/api/v1/activity?account=fixture&limit=60"
+    },
+    {
+      "kind": "fetch",
+      "url": "http://127.0.0.1:36795/api/v1/status?account=fixture"
+    }
+  ],
+  "external_launches": [
+    {
+      "url": "http://127.0.0.1:36795/fixture-auth-complete",
+      "target": "same-tab"
+    }
+  ],
+  "non_fixture_origin_requests": [],
+  "fixture404": [],
+  "fixtureErrors": [],
+  "fixture_state": {
+    "oauthStarts": [
+      {
+        "provider": "anthropic",
+        "redirect": "http://localhost:36795/callback"
+      }
+    ],
+    "modelPosts": [
+      {
+        "provider": "claude",
+        "model": "claude-opus-4"
+      }
+    ],
+    "confirmPosts": [
+      {
+        "pending": "pending-turn-2",
+        "token": "fixture-token-turn-2",
+        "action_hash": "fixture-hash-turn-2"
+      }
+    ],
+    "cancelPosts": [
+      {
+        "turn": "turn-3"
+      }
+    ],
+    "viewHits": [
+      {
+        "account": "fixture",
+        "service": "mail",
+        "id": "mail-1"
+      }
+    ],
+    "streamScenarios": [
+      {
+        "turn": "turn-1",
+        "scenario": "normal"
+      },
+      {
+        "turn": "turn-2",
+        "scenario": "pending-confirm"
+      },
+      {
+        "turn": "turn-3",
+        "scenario": "pending-cancel"
+      },
+      {
+        "turn": "turn-4",
+        "scenario": "error"
+      }
+    ]
+  },
+  "screenshots": {
+    "setup_consent": "docs/evidence/artifacts/issue-622/setup-consent.png",
+    "desktop_assistant": "docs/evidence/artifacts/issue-622/desktop-assistant.png",
+    "stream_citations": "docs/evidence/artifacts/issue-622/stream-citations.png",
+    "pending_confirm": "docs/evidence/artifacts/issue-622/pending-confirm.png",
+    "pending_cancel": "docs/evidence/artifacts/issue-622/pending-cancel.png",
+    "mobile_assistant": "docs/evidence/artifacts/issue-622/mobile-assistant.png"
+  }
+}

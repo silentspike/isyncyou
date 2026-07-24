@@ -18,7 +18,7 @@ requirements:
       - The Unix-domain socket is mode 0600.
     verified_by:
       - test: tcp_rejects_non_loopback_host_and_origin
-      - test: restore_post_requires_a_valid_capability_token
+      - test: destructive_capability_tokens_are_action_scoped
       - test: sync_control_state_and_token_guarded_commands
       - test: parses_serve_defaults_to_unix_socket_transport
       - test: parses_serve_tcp_opt_in

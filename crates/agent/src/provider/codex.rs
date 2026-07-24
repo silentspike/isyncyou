@@ -1,33 +1,64 @@
-//! EXPERIMENTAL OpenAI/ChatGPT (Codex) subscription provider — UNSUPPORTED, personal-build
-//! only (S-AG.12 / #627). Behind the default-off `agent-subscription-experimental` feature.
+//! ChatGPT/Codex OAuth-compatible provider runtime.
 //!
-//! Auth model (same rationale as the Claude provider): the operator first performs the
-//! normal `codex` login to their own ChatGPT account (`~/.codex/auth.json`), and this
-//! provider then uses the legitimately-obtained access token + account id, shaping the
-//! request to look like the official Codex CLI.
+//! Product auth is app OAuth plus encrypted credential storage. The #627 experimental
+//! build may additionally use local `codex` CLI credentials for private drift/capture
+//! work, but that fallback is outside the product boundary.
 //!
 //! Transport: the ChatGPT backend **Responses API over HTTP + SSE** (verified live — the
 //! backend accepts plain HTTP POST with `accept: text/event-stream`; no WebSocket needed,
-//! although the official client defaults to one). Recipe verified against the real client
-//! and may live in-repo (the legitimacy is the login-first sequence, not hiding the recipe).
+//! although the official client defaults to one). Recipe verified against the real client.
 
 use super::{AssistantBlock, Usage};
 use crate::tool::{tool_schema, TOOL_NAME};
 use crate::turn::{Message, Role};
 use crate::AgentError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Verified Codex-CLI mimicry recipe.
-const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
-const ORIGINATOR: &str = "codex_cli_rs";
-const OPENAI_BETA: &str = "responses=experimental";
-const DEFAULT_CLI_VERSION: &str = "0.142.3";
-const DEFAULT_MODEL: &str = "gpt-5.5";
+pub(crate) const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+pub(super) const ORIGINATOR: &str = crate::oauth::CODEX_OAUTH_ORIGINATOR;
+pub(crate) const DEFAULT_CLI_VERSION: &str = "0.144.5";
+const DEFAULT_MODEL: &str = "gpt-5.6-sol";
+const MAX_REASONING_CONTEXT_BYTES: usize = 1024 * 1024;
+const MAX_REASONING_SUMMARY_BYTES: usize = 64 * 1024;
+const MAX_REASONING_ITEMS_PER_ROUND: usize = 4;
 
-/// The ChatGPT/Codex wire configuration. Defaults to the verified recipe; the operator
-/// supplies their `account_id` (from `~/.codex/auth.json`) for the `chatgpt-account-id`
-/// header (without it the backend rejects the request).
+/// Closed reasoning levels offered by the product UI and accepted by the Codex backend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexReasoningEffort {
+    Low,
+    #[default]
+    Medium,
+    High,
+    XHigh,
+}
+
+impl CodexReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::XHigh),
+            _ => None,
+        }
+    }
+}
+
+/// The ChatGPT/Codex wire configuration. Defaults to the verified recipe; the product
+/// credential path supplies `account_id` from the encrypted store. #627 experimental
+/// builds may derive the same value from local CLI state for drift/capture only.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct CodexConfig {
@@ -35,6 +66,7 @@ pub struct CodexConfig {
     pub account_id: String,
     pub cli_version: String,
     pub model: String,
+    pub reasoning_effort: CodexReasoningEffort,
 }
 
 impl Default for CodexConfig {
@@ -44,13 +76,14 @@ impl Default for CodexConfig {
             account_id: String::new(),
             cli_version: DEFAULT_CLI_VERSION.to_string(),
             model: DEFAULT_MODEL.to_string(),
+            reasoning_effort: CodexReasoningEffort::default(),
         }
     }
 }
 
 /// The agent's single tool in the Responses `function` shape (vs Anthropic's
 /// `input_schema`). Reuses the same name/description/schema so behaviour matches.
-fn responses_tools() -> Value {
+pub(super) fn responses_tools() -> Value {
     let s = tool_schema();
     json!([{
         "type": "function",
@@ -64,7 +97,62 @@ fn responses_tools() -> Value {
 /// Map the agent history to the Responses `input` array (message / function_call /
 /// function_call_output items), pairing tool_use ↔ tool_result by `call_id`.
 pub(crate) fn build_input(history: &[Message]) -> Vec<Value> {
+    build_input_with_reasoning(history, &[], 0)
+}
+
+pub(super) fn tool_choice_for_input(_input: &[Value]) -> &'static str {
+    // Match the current Codex client contract. The model can answer ordinary chat
+    // directly and selects the sole iSyncYou tool only when the request needs data.
+    "auto"
+}
+
+pub(super) fn uses_responses_lite(model: &str) -> bool {
+    matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna")
+}
+
+fn prepare_input(model: &str, instructions: &str, mut input: Vec<Value>) -> Vec<Value> {
+    if !uses_responses_lite(model) {
+        return input;
+    }
+    let mut prefix = vec![json!({
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": responses_tools(),
+    })];
+    if !instructions.is_empty() {
+        prefix.push(json!({
+            "type": "message",
+            "role": "developer",
+            "content": [{ "type": "input_text", "text": instructions }],
+        }));
+    }
+    input.splice(0..0, prefix);
+    input
+}
+
+#[derive(Clone)]
+struct CodexReasoningContext {
+    summary: Value,
+    encrypted_content: String,
+}
+
+impl CodexReasoningContext {
+    fn replay_value(&self) -> Value {
+        json!({
+            "type": "reasoning",
+            "summary": self.summary,
+            "encrypted_content": self.encrypted_content,
+        })
+    }
+}
+
+fn build_input_with_reasoning(
+    history: &[Message],
+    reasoning_rounds: &[Vec<CodexReasoningContext>],
+    assistant_base: usize,
+) -> Vec<Value> {
     let mut out = Vec::new();
+    let mut assistant_index = 0usize;
     for m in history {
         match m.role {
             Role::User => out.push(json!({
@@ -72,6 +160,13 @@ pub(crate) fn build_input(history: &[Message]) -> Vec<Value> {
                 "content": [{ "type": "input_text", "text": m.content }],
             })),
             Role::Assistant => {
+                if let Some(round) = assistant_index
+                    .checked_sub(assistant_base)
+                    .and_then(|round| reasoning_rounds.get(round))
+                {
+                    out.extend(round.iter().map(CodexReasoningContext::replay_value));
+                }
+                assistant_index = assistant_index.saturating_add(1);
                 if !m.content.is_empty() {
                     out.push(json!({
                         "type": "message", "role": "assistant",
@@ -97,95 +192,266 @@ pub(crate) fn build_input(history: &[Message]) -> Vec<Value> {
     out
 }
 
-/// Build the Responses request body. `instructions` carries the system prompt (the
-/// Responses API's top-level system field).
-pub(crate) fn build_request(model: &str, instructions: &str, history: &[Message]) -> Value {
-    json!({
-        "model": model,
-        "instructions": instructions,
-        "input": build_input(history),
-        "tools": responses_tools(),
-        "tool_choice": "auto",
-        "parallel_tool_calls": false,
-        "stream": true,
-        "store": false,
+fn replayable_reasoning_context(item: &Value) -> Result<CodexReasoningContext, AgentError> {
+    let object = item
+        .as_object()
+        .filter(|object| object.get("type").and_then(Value::as_str) == Some("reasoning"))
+        .ok_or_else(|| AgentError::Provider("codex: invalid reasoning item".into()))?;
+    let encrypted_content = object
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= MAX_REASONING_CONTEXT_BYTES)
+        .ok_or_else(|| AgentError::Provider("codex: invalid reasoning context".into()))?;
+    let summary = object
+        .get("summary")
+        .cloned()
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+    if !summary.is_array()
+        || serde_json::to_vec(&summary)
+            .map_err(|_| AgentError::Provider("codex: invalid reasoning summary".into()))?
+            .len()
+            > MAX_REASONING_SUMMARY_BYTES
+    {
+        return Err(AgentError::Provider(
+            "codex: invalid reasoning summary".into(),
+        ));
+    }
+    Ok(CodexReasoningContext {
+        summary,
+        encrypted_content: encrypted_content.to_owned(),
     })
 }
 
-/// Parse the SSE Responses stream into assistant blocks + usage. Concatenates
-/// `response.output_text.delta` text and collects `function_call` output items.
-pub(crate) fn parse_sse(body: &str) -> Result<(Vec<AssistantBlock>, Usage), AgentError> {
-    let mut text = String::new();
-    let mut tools: Vec<(String, String)> = Vec::new(); // (call_id, arguments-json)
-    let mut usage = Usage::default();
-    let mut failure: Option<String> = None;
+/// Build the Responses request body. `instructions` carries the system prompt (the
+/// Responses API's top-level system field).
+pub(crate) fn build_request(
+    model: &str,
+    reasoning_effort: CodexReasoningEffort,
+    instructions: &str,
+    history: &[Message],
+) -> Value {
+    let input = prepare_input(model, instructions, build_input(history));
+    let tool_choice = tool_choice_for_input(&input);
+    if uses_responses_lite(model) {
+        return json!({
+            "model": model,
+            "reasoning": {
+                "effort": reasoning_effort.as_str(),
+                "context": "all_turns",
+            },
+            "input": input,
+            "tool_choice": tool_choice,
+            "parallel_tool_calls": false,
+            "stream": true,
+            "store": false,
+            "include": ["reasoning.encrypted_content"],
+        });
+    }
+    json!({
+        "model": model,
+        "reasoning": { "effort": reasoning_effort.as_str() },
+        "instructions": instructions,
+        "input": input,
+        "tools": responses_tools(),
+        "tool_choice": tool_choice,
+        "parallel_tool_calls": false,
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+    })
+}
 
-    for line in body.lines() {
-        let data = match line.strip_prefix("data: ") {
-            Some(d) => d.trim(),
-            None => continue,
-        };
-        if data == "[DONE]" {
-            break;
+type CodexToolArgs = (String, String);
+
+fn apply_output_message(item: &Value, text: &mut String) -> Result<Option<String>, AgentError> {
+    let complete = item
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|content| content.get("type").and_then(Value::as_str) == Some("output_text"))
+        .filter_map(|content| content.get("text").and_then(Value::as_str))
+        .collect::<String>();
+    if complete.is_empty() || complete == *text {
+        return Ok(None);
+    }
+    if text.is_empty() {
+        text.push_str(&complete);
+        return Ok(Some(complete));
+    }
+    if let Some(suffix) = complete.strip_prefix(text.as_str()) {
+        text.push_str(suffix);
+        return Ok((!suffix.is_empty()).then(|| suffix.to_owned()));
+    }
+    Err(AgentError::Provider(
+        "codex: completed message differs from streamed text".into(),
+    ))
+}
+
+fn apply_output_item(
+    item: &Value,
+    text: &mut String,
+    tools: &mut Vec<CodexToolArgs>,
+    reasoning: &mut Vec<CodexReasoningContext>,
+) -> Result<Option<String>, AgentError> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("message") => apply_output_message(item, text),
+        Some("function_call") => {
+            let id = item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let args = item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("{}")
+                .to_string();
+            tools.push((id, args));
+            Ok(None)
         }
-        let v: Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        match v.get("type").and_then(|t| t.as_str()) {
-            Some("response.output_text.delta") => {
-                if let Some(d) = v.get("delta").and_then(|d| d.as_str()) {
-                    text.push_str(d);
-                }
+        Some("reasoning") => {
+            if reasoning.len() >= MAX_REASONING_ITEMS_PER_ROUND {
+                return Err(AgentError::Provider(
+                    "codex: too many reasoning items".into(),
+                ));
             }
-            Some("response.output_item.done") => {
-                if let Some(item) = v.get("item") {
-                    if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                        let id = item
-                            .get("call_id")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        let args = item
-                            .get("arguments")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("{}")
-                            .to_string();
-                        tools.push((id, args));
+            reasoning.push(replayable_reasoning_context(item)?);
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn apply_sse_event(
+    data: &str,
+    text: &mut String,
+    tools: &mut Vec<CodexToolArgs>,
+    reasoning: &mut Vec<CodexReasoningContext>,
+    usage: &mut Usage,
+    failure: &mut Option<String>,
+) -> Result<Option<String>, AgentError> {
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(None);
+    }
+    let v: Value = serde_json::from_str(data)
+        .map_err(|e| AgentError::Provider(format!("codex: invalid SSE JSON: {e}")))?;
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some("response.output_text.delta") => {
+            if let Some(d) = v.get("delta").and_then(|d| d.as_str()) {
+                text.push_str(d);
+                return Ok(Some(d.to_string()));
+            }
+        }
+        Some("response.output_item.done") => {
+            if let Some(item) = v.get("item") {
+                return apply_output_item(item, text, tools, reasoning);
+            }
+        }
+        Some("response.completed") => {
+            let response = v.get("response");
+            let mut completed_delta = String::new();
+            if text.is_empty() && tools.is_empty() {
+                if let Some(output) = response
+                    .and_then(|response| response.get("output"))
+                    .and_then(Value::as_array)
+                {
+                    for item in output {
+                        if let Some(delta) = apply_output_item(item, text, tools, reasoning)? {
+                            completed_delta.push_str(&delta);
+                        }
                     }
                 }
             }
-            Some("response.completed") => {
-                if let Some(u) = v.get("response").and_then(|r| r.get("usage")) {
-                    let g = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-                    usage.input_tokens = g("input_tokens");
-                    usage.output_tokens = g("output_tokens");
-                }
+            if let Some(u) = response.and_then(|r| r.get("usage")) {
+                let g = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+                usage.input_tokens = g("input_tokens");
+                usage.output_tokens = g("output_tokens");
             }
-            Some("response.failed") => {
-                failure = Some(
-                    v.get("response")
-                        .and_then(|r| r.get("error"))
-                        .and_then(|e| e.get("message"))
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("response failed")
-                        .to_string(),
-                );
+            if !completed_delta.is_empty() {
+                return Ok(Some(completed_delta));
             }
-            Some("error") => {
-                failure = Some(
-                    v.get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("stream error")
-                        .to_string(),
-                );
-            }
-            _ => {}
         }
+        Some("response.failed") => {
+            *failure = Some(closed_sse_failure_code(&v).to_owned());
+        }
+        Some("response.incomplete") => {
+            *failure = Some("incomplete_response".to_owned());
+        }
+        Some("error") => {
+            *failure = Some("stream_failure".to_owned());
+        }
+        _ => {}
     }
+    Ok(None)
+}
 
-    if let Some(e) = failure {
-        return Err(AgentError::Provider(format!("codex: {e}")));
+fn sse_event_advances_turn(data: &str) -> bool {
+    serde_json::from_str::<Value>(data)
+        .ok()
+        .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
+        .is_some_and(|event_type| {
+            matches!(
+                event_type.as_str(),
+                "response.output_text.delta"
+                    | "response.output_item.done"
+                    | "response.completed"
+                    | "response.failed"
+                    | "response.incomplete"
+                    | "error"
+            )
+        })
+}
+
+fn closed_sse_failure_code(event: &Value) -> &'static str {
+    match event
+        .get("response")
+        .and_then(|response| response.get("error"))
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+    {
+        Some("rate_limit_exceeded") => "http_rate_limited",
+        Some("context_length_exceeded") => "context_limit",
+        Some("server_is_overloaded" | "slow_down") => "http_server_failure",
+        Some("invalid_prompt" | "bio_policy") => "http_request_rejected",
+        _ => "stream_failure",
+    }
+}
+
+#[cfg(feature = "http")]
+fn closed_backend_failure_code(status: u16, detail: &str) -> &'static str {
+    let detail = detail.to_ascii_lowercase();
+    if detail.contains("reasoning") {
+        "reasoning_context"
+    } else if detail.contains("function_call") {
+        "function_call_pairing"
+    } else if detail.contains("context_length") || detail.contains("input token") {
+        "context_limit"
+    } else if status == 400 {
+        "http_bad_request"
+    } else if status == 429 {
+        "http_rate_limited"
+    } else if status >= 500 {
+        "http_server_failure"
+    } else {
+        "http_request_rejected"
+    }
+}
+
+#[cfg(feature = "http")]
+fn closed_provider_failure(code: &str) -> AgentError {
+    AgentError::Provider(format!("codex_safe:{code}"))
+}
+
+fn finish_sse_blocks(
+    text: String,
+    tools: Vec<CodexToolArgs>,
+    usage: Usage,
+    failure: Option<String>,
+) -> Result<(Vec<AssistantBlock>, Usage), AgentError> {
+    if let Some(code) = failure {
+        return Err(AgentError::Provider(format!("codex_safe:{code}")));
     }
     let mut blocks = Vec::new();
     if !text.is_empty() {
@@ -195,7 +461,40 @@ pub(crate) fn parse_sse(body: &str) -> Result<(Vec<AssistantBlock>, Usage), Agen
         let input: Value = serde_json::from_str(&args).unwrap_or(Value::Null);
         blocks.push(AssistantBlock::ToolUse { id, input });
     }
+    if blocks.is_empty() {
+        return Err(AgentError::Provider(
+            "codex: response completed without assistant output".into(),
+        ));
+    }
     Ok((blocks, usage))
+}
+
+/// Parse the SSE Responses stream into assistant blocks + usage. Concatenates
+/// `response.output_text.delta` text and collects `function_call` output items.
+#[cfg(test)]
+pub(crate) fn parse_sse(body: &str) -> Result<(Vec<AssistantBlock>, Usage), AgentError> {
+    let mut text = String::new();
+    let mut tools: Vec<CodexToolArgs> = Vec::new();
+    let mut reasoning = Vec::new();
+    let mut usage = Usage::default();
+    let mut failure: Option<String> = None;
+
+    for line in body.lines() {
+        let data = match line.strip_prefix("data: ") {
+            Some(d) => d,
+            None => continue,
+        };
+        apply_sse_event(
+            data,
+            &mut text,
+            &mut tools,
+            &mut reasoning,
+            &mut usage,
+            &mut failure,
+        )?;
+    }
+
+    finish_sse_blocks(text, tools, usage, failure)
 }
 
 #[cfg(feature = "http")]
@@ -205,10 +504,12 @@ mod live {
 
     /// Live ChatGPT/Codex subscription provider over the agent's blocking HTTP transport.
     pub struct CodexProvider {
-        http: crate::http::HttpTransport,
+        http: crate::http::ProductHttpTransport,
         access_token: String,
         instructions: String,
         cfg: CodexConfig,
+        reasoning_rounds: Vec<Vec<CodexReasoningContext>>,
+        history_assistant_base: Option<usize>,
         pub last_usage: Usage,
     }
 
@@ -219,17 +520,19 @@ mod live {
             cfg: CodexConfig,
         ) -> Result<Self, AgentError> {
             Ok(Self {
-                http: crate::http::HttpTransport::new()?,
+                http: crate::http::ProductHttpTransport::shared()?,
                 access_token: access_token.into(),
                 instructions: instructions.into(),
                 cfg,
+                reasoning_rounds: Vec::new(),
+                history_assistant_base: None,
                 last_usage: Usage::default(),
             })
         }
 
         /// The Codex-CLI identity headers + Bearer (the legitimately-obtained token).
-        fn request_headers(&self) -> Vec<(String, String)> {
-            vec![
+        pub(crate) fn request_headers(&self) -> Vec<(String, String)> {
+            let mut headers = vec![
                 (
                     "authorization".to_string(),
                     format!("Bearer {}", self.access_token),
@@ -239,7 +542,6 @@ mod live {
                     self.cfg.account_id.clone(),
                 ),
                 ("originator".to_string(), ORIGINATOR.to_string()),
-                ("openai-beta".to_string(), OPENAI_BETA.to_string()),
                 (
                     "user-agent".to_string(),
                     format!("{ORIGINATOR}/{}", self.cfg.cli_version),
@@ -247,7 +549,14 @@ mod live {
                 // NB: do NOT set content-type here — post_json's `.json()` already sets it
                 // once; a duplicate content-type header makes the ChatGPT backend 400.
                 ("accept".to_string(), "text/event-stream".to_string()),
-            ]
+            ];
+            if uses_responses_lite(&self.cfg.model) {
+                headers.push((
+                    "x-openai-internal-codex-responses-lite".to_string(),
+                    "true".to_string(),
+                ));
+            }
+            headers
         }
     }
 
@@ -261,28 +570,104 @@ mod live {
             history: &[Message],
             emit: &mut dyn FnMut(StreamEvent),
         ) -> Result<Vec<AssistantBlock>, AgentError> {
-            let body = build_request(&self.cfg.model, &self.instructions, history);
-            let (status, text) =
-                self.http
-                    .post_json(&self.cfg.responses_url, &self.request_headers(), &body)?;
-            if status == 401 || status == 403 {
-                return Err(AgentError::Provider(
-                    "codex: unauthorized — run the official `codex` login first".into(),
-                ));
+            self.next_cancellable(history, emit, None)
+        }
+
+        fn next_cancellable(
+            &mut self,
+            history: &[Message],
+            emit: &mut dyn FnMut(StreamEvent),
+            cancellation: Option<&crate::CancellationToken>,
+        ) -> Result<Vec<AssistantBlock>, AgentError> {
+            let assistant_base = *self.history_assistant_base.get_or_insert_with(|| {
+                history
+                    .iter()
+                    .filter(|message| message.role == Role::Assistant)
+                    .count()
+            });
+            // #639: attest THIS round's request, then send only the attested object.
+            let attested = crate::provider::build_attested_provider_request(
+                crate::provider::ProviderRequestBinding::Codex {
+                    access_token: &self.access_token,
+                    account_id: &self.cfg.account_id,
+                    model: &self.cfg.model,
+                    reasoning_effort: self.cfg.reasoning_effort,
+                    instructions: &self.instructions,
+                },
+                self.cfg.responses_url.clone(),
+                self.request_headers(),
+                {
+                    let mut body = build_request(
+                        &self.cfg.model,
+                        self.cfg.reasoning_effort,
+                        &self.instructions,
+                        history,
+                    );
+                    body["input"] = Value::Array(prepare_input(
+                        &self.cfg.model,
+                        &self.instructions,
+                        build_input_with_reasoning(history, &self.reasoning_rounds, assistant_base),
+                    ));
+                    body
+                },
+            )?;
+            let mut text = String::new();
+            let mut tools: Vec<CodexToolArgs> = Vec::new();
+            let mut reasoning = Vec::new();
+            let mut usage = Usage::default();
+            let mut failure: Option<String> = None;
+            let mut parse_error: Option<AgentError> = None;
+            let response = self.http.post_attested_sse_cancellable(
+                &attested,
+                &mut |event| {
+                    if parse_error.is_some() {
+                        return false;
+                    }
+                    let advances_turn = sse_event_advances_turn(&event.data);
+                    match apply_sse_event(
+                        &event.data,
+                        &mut text,
+                        &mut tools,
+                        &mut reasoning,
+                        &mut usage,
+                        &mut failure,
+                    ) {
+                        Ok(Some(delta)) => emit(StreamEvent::Token(delta)),
+                        Ok(None) => {}
+                        Err(e) => parse_error = Some(e),
+                    }
+                    advances_turn
+                },
+                cancellation,
+            )?;
+            if response.status == 401 || response.status == 403 {
+                return Err(closed_provider_failure("authorization_rejected"));
             }
-            if status >= 400 {
-                return Err(AgentError::Provider(format!(
-                    "codex: backend status {status}"
+            if response.status >= 400 {
+                let detail = response.body_preview.unwrap_or_default();
+                return Err(closed_provider_failure(closed_backend_failure_code(
+                    response.status,
+                    &detail,
                 )));
             }
-            let (blocks, usage) = parse_sse(&text)?;
-            self.last_usage = usage;
-            for b in &blocks {
-                if let AssistantBlock::Text(t) = b {
-                    emit(StreamEvent::Token(t.clone()));
-                }
+            if parse_error.is_some() {
+                return Err(closed_provider_failure("parse_failure"));
             }
+            let (blocks, usage) =
+                finish_sse_blocks(text, tools, usage, failure).map_err(|error| match error {
+                    AgentError::Provider(code) if code.starts_with("codex_safe:") => {
+                        AgentError::Provider(code)
+                    }
+                    _ => closed_provider_failure("stream_failure"),
+                })?;
+            self.reasoning_rounds.push(reasoning);
+            let usage = usage.with_provider_response("codex", &self.cfg.model, &response.headers);
+            self.last_usage = usage;
             Ok(blocks)
+        }
+
+        fn last_usage(&self) -> Option<Usage> {
+            (!self.last_usage.is_empty()).then(|| self.last_usage.clone())
         }
     }
 }
@@ -302,21 +687,108 @@ mod tests {
             c.responses_url,
             "https://chatgpt.com/backend-api/codex/responses"
         );
-        assert_eq!(c.model, "gpt-5.5");
+        assert_eq!(c.model, "gpt-5.6-sol");
+        assert_eq!(c.reasoning_effort, CodexReasoningEffort::Medium);
+        assert_eq!(c.cli_version, "0.144.5");
     }
 
     #[test]
-    fn build_request_uses_responses_shape_with_instructions_and_tool() {
+    fn build_request_uses_responses_lite_shape_for_current_models() {
         let h = vec![Message::user("find the spotify invoice")];
-        let body = build_request("gpt-5.5", "be terse", &h);
-        assert_eq!(body["model"], "gpt-5.5");
-        assert_eq!(body["instructions"], "be terse");
+        let body = build_request("gpt-5.6-terra", CodexReasoningEffort::High, "be terse", &h);
+        assert_eq!(body["model"], "gpt-5.6-terra");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["context"], "all_turns");
+        assert!(body.get("instructions").is_none());
+        assert!(body.get("tools").is_none());
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
-        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["include"][0], "reasoning.encrypted_content");
+        assert_eq!(body["input"][0]["type"], "additional_tools");
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][0]["tools"][0]["type"], "function");
+        assert_eq!(body["input"][0]["tools"][0]["name"], "isyncyou");
+        assert_eq!(body["input"][1]["role"], "developer");
+        assert_eq!(body["input"][1]["content"][0]["text"], "be terse");
+        assert_eq!(body["input"][2]["role"], "user");
+        assert_eq!(body["input"][2]["content"][0]["type"], "input_text");
+    }
+
+    #[test]
+    fn build_request_keeps_classic_shape_for_non_lite_models() {
+        let body = build_request(
+            "gpt-5.5",
+            CodexReasoningEffort::Low,
+            "be terse",
+            &[Message::user("hello")],
+        );
+        assert_eq!(body["instructions"], "be terse");
         assert_eq!(body["tools"][0]["name"], "isyncyou");
+        assert!(body["reasoning"].get("context").is_none());
         assert_eq!(body["input"][0]["role"], "user");
-        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+    }
+
+    #[test]
+    fn build_request_keeps_auto_tool_choice_after_a_tool_result() {
+        let history = vec![
+            Message::user("find one archived item"),
+            Message::assistant(
+                "",
+                vec![crate::turn::ToolUseRef {
+                    id: "call_1".into(),
+                    input: json!({"op":"search","account":"me","query":"archive"}),
+                }],
+            ),
+            Message::tool("call_1", "no matching items"),
+        ];
+        let body = build_request(
+            "gpt-5.6-sol",
+            CodexReasoningEffort::Medium,
+            "read before answering",
+            &history,
+        );
+        assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn codex_subscription_identity_envelope_remains_unchanged() {
+        let p = CodexProvider::new(
+            "tok123",
+            "instructions",
+            CodexConfig {
+                account_id: "acct_123".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let h = p.request_headers();
+        let get = |k: &str| h.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+
+        assert_eq!(
+            h.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
+            vec![
+                "authorization",
+                "chatgpt-account-id",
+                "originator",
+                "user-agent",
+                "accept",
+                "x-openai-internal-codex-responses-lite",
+            ]
+        );
+
+        assert_eq!(get("authorization").unwrap(), "Bearer tok123");
+        assert_eq!(get("chatgpt-account-id").unwrap(), "acct_123");
+        assert_eq!(get("originator").unwrap(), "codex_cli_rs");
+        assert_eq!(get("user-agent").unwrap(), "codex_cli_rs/0.144.5");
+        assert_eq!(get("accept").unwrap(), "text/event-stream");
+        assert_eq!(
+            get("x-openai-internal-codex-responses-lite").unwrap(),
+            "true"
+        );
+        assert!(get("content-type").is_none());
     }
 
     #[test]
@@ -341,6 +813,88 @@ mod tests {
     }
 
     #[test]
+    fn build_input_replays_reasoning_before_matching_tool_round() {
+        let h = vec![
+            Message::assistant("older visible context", Vec::new()),
+            Message::user("q"),
+            Message::assistant(
+                "",
+                vec![ToolUseRef {
+                    id: "call_1".into(),
+                    input: json!({"op":"search","account":"me","query":"x"}),
+                }],
+            ),
+            Message::tool("call_1", "hit: item-42"),
+        ];
+        let reasoning = replayable_reasoning_context(&json!({
+            "type": "reasoning",
+            "id": "provider-item-id",
+            "summary": [{"type":"summary_text","text":"private summary"}],
+            "content": [{"type":"reasoning_text","text":"private plaintext"}],
+            "encrypted_content": "opaque-context",
+        }))
+        .unwrap();
+
+        let input = build_input_with_reasoning(&h, &[vec![reasoning]], 1);
+        let reasoning_index = input
+            .iter()
+            .position(|item| item["type"] == "reasoning")
+            .unwrap();
+        let call_index = input
+            .iter()
+            .position(|item| item["type"] == "function_call")
+            .unwrap();
+        let output_index = input
+            .iter()
+            .position(|item| item["type"] == "function_call_output")
+            .unwrap();
+
+        assert!(reasoning_index < call_index && call_index < output_index);
+        assert_eq!(
+            input[reasoning_index]["encrypted_content"],
+            "opaque-context"
+        );
+        assert!(input[reasoning_index].get("id").is_none());
+        assert!(input[reasoning_index].get("content").is_none());
+        assert!(!serde_json::to_string(&input)
+            .unwrap()
+            .contains("private plaintext"));
+    }
+
+    #[test]
+    fn codex_reasoning_context_is_bounded_and_requires_encrypted_content() {
+        assert!(replayable_reasoning_context(&json!({
+            "type": "reasoning",
+            "summary": [],
+        }))
+        .is_err());
+        assert!(replayable_reasoning_context(&json!({
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "x".repeat(MAX_REASONING_CONTEXT_BYTES + 1),
+        }))
+        .is_err());
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn codex_backend_failures_reduce_to_closed_diagnostics() {
+        assert_eq!(
+            closed_backend_failure_code(400, "reasoning item is required"),
+            "reasoning_context"
+        );
+        assert_eq!(
+            closed_backend_failure_code(400, "function_call pairing failed"),
+            "function_call_pairing"
+        );
+        assert_eq!(
+            closed_backend_failure_code(400, "unrecognized private provider detail"),
+            "http_bad_request"
+        );
+        assert!(!closed_backend_failure_code(400, "secret-value").contains("secret-value"));
+    }
+
+    #[test]
     fn parse_sse_collects_text_and_usage() {
         let sse = "\
 event: response.output_text.delta\n\
@@ -356,6 +910,101 @@ data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\"
         assert!(matches!(&blocks[0], AssistantBlock::Text(t) if t == "hello codex"));
         assert_eq!(usage.input_tokens, 22);
         assert_eq!(usage.output_tokens, 8);
+    }
+
+    #[test]
+    fn parse_sse_recovers_completed_message_when_text_deltas_are_absent() {
+        let sse = "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"fallback text\"}]}}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":3}}}\n";
+
+        let (blocks, usage) = parse_sse(sse).unwrap();
+
+        assert!(matches!(&blocks[0], AssistantBlock::Text(text) if text == "fallback text"));
+        assert_eq!(usage.output_tokens, 3);
+    }
+
+    #[test]
+    fn parse_sse_recovers_output_from_completed_response_and_deduplicates_deltas() {
+        let fallback = "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"completed text\"}]}]}}\n";
+        let (blocks, _) = parse_sse(fallback).unwrap();
+        assert!(matches!(&blocks[0], AssistantBlock::Text(text) if text == "completed text"));
+
+        let streamed = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"completed text\"}\n\n\
+data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"completed text\"}]}}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{}}\n";
+        let (blocks, _) = parse_sse(streamed).unwrap();
+        assert!(matches!(&blocks[0], AssistantBlock::Text(text) if text == "completed text"));
+    }
+
+    #[test]
+    fn parse_sse_rejects_completed_response_without_assistant_output() {
+        let error =
+            parse_sse("data: {\"type\":\"response.completed\",\"response\":{}}\n").unwrap_err();
+        assert!(error.to_string().contains("without assistant output"));
+    }
+
+    #[test]
+    fn apply_sse_event_returns_text_delta_immediately() {
+        let mut text = String::new();
+        let mut tools = Vec::new();
+        let mut reasoning = Vec::new();
+        let mut usage = Usage::default();
+        let mut failure = None;
+
+        let delta = apply_sse_event(
+            "{\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}",
+            &mut text,
+            &mut tools,
+            &mut reasoning,
+            &mut usage,
+            &mut failure,
+        )
+        .unwrap();
+
+        assert_eq!(delta.as_deref(), Some("hello"));
+        assert_eq!(text, "hello");
+        assert!(tools.is_empty());
+        assert!(reasoning.is_empty());
+        assert_eq!(usage, Usage::default());
+        assert!(failure.is_none());
+    }
+
+    #[test]
+    fn apply_sse_event_captures_replayable_reasoning_without_plaintext() {
+        let mut text = String::new();
+        let mut tools = Vec::new();
+        let mut reasoning = Vec::new();
+        let mut usage = Usage::default();
+        let mut failure = None;
+
+        apply_sse_event(
+            r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"reasoning_text","text":"do not retain"}],"encrypted_content":"opaque"}}"#,
+            &mut text,
+            &mut tools,
+            &mut reasoning,
+            &mut usage,
+            &mut failure,
+        )
+        .unwrap();
+
+        assert_eq!(reasoning.len(), 1);
+        let replay = reasoning[0].replay_value();
+        assert_eq!(replay["encrypted_content"], "opaque");
+        assert!(replay.get("id").is_none());
+        assert!(replay.get("content").is_none());
+    }
+
+    #[test]
+    fn codex_status_events_do_not_satisfy_response_or_extend_idle_deadline() {
+        assert!(!sse_event_advances_turn(
+            r#"{"type":"response.in_progress"}"#
+        ));
+        assert!(sse_event_advances_turn(
+            r#"{"type":"response.output_text.delta","delta":"ok"}"#
+        ));
+        assert!(sse_event_advances_turn(
+            r#"{"type":"response.completed","response":{}}"#
+        ));
     }
 
     #[test]
@@ -378,5 +1027,18 @@ data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\"
     fn parse_sse_surfaces_failure() {
         let sse = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"nope\"}}}\n";
         assert!(parse_sse(sse).unwrap_err().to_string().contains("codex"));
+    }
+
+    #[test]
+    fn parse_sse_classifies_closed_failure_and_incomplete_codes() {
+        let limited = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"private detail\"}}}\n";
+        let error = parse_sse(limited).unwrap_err().to_string();
+        assert!(error.contains("codex_safe:http_rate_limited"));
+        assert!(!error.contains("private detail"));
+
+        let incomplete = "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"private detail\"}}}\n";
+        let error = parse_sse(incomplete).unwrap_err().to_string();
+        assert!(error.contains("codex_safe:incomplete_response"));
+        assert!(!error.contains("private detail"));
     }
 }

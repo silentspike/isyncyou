@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "scope": "issue_645_provider_revoke_contracts",
+  "claude": {
+    "revoke_request_target": "refresh_token",
+    "revoke_scope_guarantee": "observed_token_session",
+    "switch_capability": "identity_unavailable"
+  },
+  "codex": {
+    "revoke_request_target": "refresh_token",
+    "revoke_scope_guarantee": "observed_token_session",
+    "switch_capability": "verified_subject",
+    "identity_validation": "oidc_rs256_pinned"
+  },
+  "full_grant_claimed": false,
+  "raw_endpoint_included": false,
+  "identity_included": false,
+  "token_included": false
+}
