@@ -17,7 +17,7 @@ isyncyou-connectors = { path = "../../crates/connectors", default-features = fal
 # Battle-tested allowlist HTML sanitizer for the mail viewer (MIT).
 ammonia = "4.1.4"
 # Decode base64 request bodies over the JSON bridge (#657 in-app upload/replace).
-base64 = "0.22"
+base64 = "0.23"
 ring = "0.17"
 # Fixed-buffer HTTP/1 parsing for the loopback adapter.
 httparse = "1.10"

@@ -19,7 +19,7 @@ isyncyou-webui = { path = "../../gui/webui", default-features = false }
 isyncyou-agent = { path = "../agent" }
 serde_json = { workspace = true }
 serde = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 ring = "0.17"
 rusqlite = { workspace = true }
 libc = "0.2"
