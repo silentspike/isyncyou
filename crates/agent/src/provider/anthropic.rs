@@ -172,7 +172,7 @@ mod live {
         fn next(
             &mut self,
             history: &[Message],
-            emit: &mut dyn FnMut(StreamEvent),
+            emit: &mut dyn crate::provider::TurnEventSink,
         ) -> Result<Vec<AssistantBlock>, AgentError> {
             let body = build_request(&self.model, &self.system, history);
             let (status, text) =
@@ -190,7 +190,7 @@ mod live {
             // Non-streaming call: emit text as tokens so the UI still streams live.
             for b in &blocks {
                 if let AssistantBlock::Text(t) = b {
-                    emit(StreamEvent::Token(t.clone()));
+                    emit.emit(StreamEvent::Token(t.clone()))?;
                 }
             }
             Ok(blocks)

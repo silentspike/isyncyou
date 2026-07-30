@@ -453,6 +453,7 @@ fn agent_safe_executor_error(error: &str) -> &'static str {
 fn agent_safe_turn_error(error: &isyncyou_agent::AgentError) -> &'static str {
     match error {
         isyncyou_agent::AgentError::Cancelled => "turn_cancelled",
+        isyncyou_agent::AgentError::StreamUnavailable => "assistant_stream_unavailable",
         isyncyou_agent::AgentError::ToolArgs(_) => "assistant_tool_arguments_invalid",
         isyncyou_agent::AgentError::Provider(code) => match code.as_str() {
             "archive_store_unavailable" => "assistant_archive_unavailable",
@@ -630,6 +631,7 @@ fn agent_safe_turn_start_error(error: &str) -> &'static str {
         "provider_busy" => "provider_busy",
         "provider_generation_changed" => "provider_generation_changed",
         "request_id_conflict" => "request_id_conflict",
+        "turn_outcome_unknown" => "turn_outcome_unknown",
         "session_account_mismatch" => "session_account_mismatch",
         "session_busy" => "session_busy",
         "manifest_conflict" => "session_busy",
@@ -3421,6 +3423,14 @@ impl DaemonAgent {
             feature = "agent-oauth-providers",
             feature = "agent-subscription-experimental"
         ))]
+        if agent.lifecycle_initialized && agent.reattest_existing_product_activations().is_err() {
+            agent.lifecycle_initialized = false;
+            agent.control_store_state = "recovery_required";
+        }
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
         if agent.lifecycle_initialized
             && agent
                 .bind_existing_product_credential_generations()
@@ -3504,6 +3514,89 @@ impl DaemonAgent {
             repository
                 .bind_current_credential_generation(provider, &meta.generation)
                 .map_err(|error| error.wire().to_string())?;
+        }
+        Ok(())
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn reattest_existing_product_activations(&self) -> Result<(), String> {
+        for provider in ProductProviderId::ALL {
+            let operation_id = account_lifecycle::mint_operation_id()
+                .map_err(|_| "lifecycle_unavailable".to_string())?;
+            let _provider = self
+                .provider_leases
+                .acquire_exclusive(
+                    &self.oauth_dir,
+                    provider,
+                    operation_id,
+                    account_lifecycle::ProviderOperationKind::Maintenance,
+                )
+                .map_err(|_| "provider_busy".to_string())?;
+            let _runtime = self
+                .product_runtime_gate
+                .lock()
+                .map_err(|_| "lifecycle_unavailable".to_string())?;
+            let _snapshot = acquire_product_runtime_file_lock(&self.oauth_dir)?;
+            let repository = account_lifecycle_repository(&self.oauth_dir)?;
+            let context = repository
+                .load_existing()
+                .map_err(|error| error.wire().to_string())?
+                .ok_or_else(|| "lifecycle_unavailable".to_string())?;
+            if context.authority.active_operations.contains_key(&provider) {
+                continue;
+            }
+            let credential_id = match provider {
+                ProductProviderId::Claude => SUBSCRIPTION_CREDENTIAL_ID,
+                ProductProviderId::Codex => CODEX_CREDENTIAL_ID,
+            };
+            let Some(meta) = load_product_bundle_meta(&self.oauth_dir, credential_id) else {
+                continue;
+            };
+            let official_policy = oauth_policy_fingerprint(provider);
+            if meta.provider != provider
+                || meta.lifecycle != CredentialLifecycle::Active
+                || meta.policy_fingerprint != official_policy
+            {
+                continue;
+            }
+            let Some(activation) = load_product_activation(&self.oauth_dir, provider) else {
+                continue;
+            };
+            if activation.matches(
+                provider,
+                &meta.generation,
+                &official_policy,
+                isyncyou_agent::HARNESS_CONTRACT_VERSION,
+            ) {
+                continue;
+            }
+            let is_exact_previous_contract = activation.matches(
+                provider,
+                &meta.generation,
+                &official_policy,
+                isyncyou_agent::HARNESS_CONTRACT_VERSION.saturating_sub(1),
+            );
+            if !is_exact_previous_contract {
+                continue;
+            }
+            isyncyou_agent::attest_static_product_harness(
+                harness_provider_for(provider),
+                AGENT_SYSTEM_PROMPT,
+            )
+            .map_err(|_| "harness_attestation_failed".to_string())?;
+            store_product_activation(
+                &self.oauth_dir,
+                provider,
+                &ProductActivationV1 {
+                    provider_id: provider.wire().to_owned(),
+                    credential_generation: meta.generation,
+                    oauth_policy_fingerprint: official_policy,
+                    harness_contract_version: isyncyou_agent::HARNESS_CONTRACT_VERSION,
+                },
+            )?;
         }
         Ok(())
     }
@@ -5024,7 +5117,7 @@ fn oauth_policy_fingerprint(provider: ProductProviderId) -> String {
 // #639: the activation/journal/lock storage below is wired into the runtime by T7 (gate),
 // T8 (journal transitions) and T9 (status); it reads as dead in the lib target until then.
 #[allow(dead_code)]
-const HARNESS_CONTRACT_VERSION: u32 = 1;
+const HARNESS_CONTRACT_VERSION: u32 = isyncyou_agent::HARNESS_CONTRACT_VERSION;
 
 /// #639: journal bounds — a hard cap the bounded reader enforces before allocation.
 #[cfg(any(
@@ -6206,7 +6299,7 @@ impl isyncyou_agent::LlmProvider for CredentialResolutionErrorProvider {
     fn next(
         &mut self,
         _history: &[isyncyou_agent::Message],
-        _emit: &mut dyn FnMut(isyncyou_agent::StreamEvent),
+        _emit: &mut dyn isyncyou_agent::TurnEventSink,
     ) -> Result<Vec<isyncyou_agent::AssistantBlock>, isyncyou_agent::AgentError> {
         Err(isyncyou_agent::AgentError::Provider(
             "the connected provider must be reconnected".to_string(),
@@ -9889,20 +9982,23 @@ impl DaemonAgent {
                     Ok(vec![isyncyou_agent::Message::user(prompt)])
                 };
                 let outcome = history.and_then(|mut history| {
-                    let _ = hub.emit(
-                        &tid,
+                    let mut events = isyncyou_agent::FallibleTurnEventSink::new(|event| {
+                        hub.emit(&tid, event)
+                            .then_some(())
+                            .ok_or(isyncyou_agent::AgentError::StreamUnavailable)
+                    });
+                    isyncyou_agent::TurnEventSink::emit(
+                        &mut events,
                         isyncyou_agent::StreamEvent::Progress {
                             phase: isyncyou_agent::ProgressPhase::ProviderStarted,
                         },
-                    );
+                    )?;
                     if let Some(observer) = product_turn.as_mut() {
                         isyncyou_agent::run_turn_cancellable(
                             provider.as_mut(),
                             exec.as_ref(),
                             &mut history,
-                            &mut |event| {
-                                hub.emit(&tid, event);
-                            },
+                            &mut events,
                             observer,
                             Some(&cancellation),
                         )
@@ -9912,9 +10008,7 @@ impl DaemonAgent {
                             provider.as_mut(),
                             exec.as_ref(),
                             &mut history,
-                            &mut |event| {
-                                hub.emit(&tid, event);
-                            },
+                            &mut events,
                             &mut observer,
                             Some(&cancellation),
                         )
@@ -9938,12 +10032,12 @@ impl DaemonAgent {
                     }
                 };
                 match outcome {
-                    Ok(isyncyou_agent::TurnOutcome::Final { text }) => {
+                    Ok(isyncyou_agent::TurnOutcome::Final { completion }) => {
                         let persisted = product_turn.map_or(Ok(()), |runtime| {
                             cache_product_session_context(
                                 &hot_session_history,
                                 runtime.finish_final(
-                                    text,
+                                    completion,
                                     usage.clone().map(|usage| isyncyou_agent::SanitizedUsage {
                                         input_tokens: usage.input_tokens,
                                         output_tokens: usage.output_tokens,
@@ -10501,10 +10595,37 @@ impl DaemonAgent {
         };
         let admissions = store.recover_agent_turn_admissions(MAX_ACTIVE_TURN_ADMISSIONS)?;
         let mut started = 0usize;
-        for admission in admissions {
+        for mut admission in admissions {
             if turn_id_from_request_id(&admission.request.request_id)? != admission.turn_id {
                 return Err("turn_admission_unavailable".into());
             }
+            let credential_store = agent_credential_store(&self.oauth_dir)
+                .map_err(|_| "session_store_unavailable".to_string())?;
+            let registry = product_session::ProductSessionRegistry::new(&credential_store);
+            let resolved_account_key = registry.account_for(&admission.request.session_id)?;
+            if admission.request.account != resolved_account_key {
+                return Err("session_account_mismatch".into());
+            }
+            let digest = match (
+                admission.resolved_account_key.as_deref(),
+                admission.admission_account_digest,
+            ) {
+                (Some(stored_key), Some(stored_digest))
+                    if stored_key == resolved_account_key
+                        && stored_digest
+                            == isyncyou_agent::admission_account_digest(&resolved_account_key)
+                                .map_err(|_| "turn_admission_unavailable".to_string())? =>
+                {
+                    stored_digest
+                }
+                (None, None) => store.migrate_agent_turn_admission_v3(
+                    &admission.request.request_id,
+                    &resolved_account_key,
+                )?,
+                _ => return Err("session_account_mismatch".into()),
+            };
+            admission.resolved_account_key = Some(resolved_account_key);
+            admission.admission_account_digest = Some(digest);
             isyncyou_webui::AgentHandler::start_turn_request(
                 Arc::clone(self),
                 admission.request,
@@ -10818,6 +10939,9 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                         }
                         isyncyou_agent::SessionV2Error::InvalidRequestId => {
                             "invalid_request_id".to_string()
+                        }
+                        isyncyou_agent::SessionV2Error::RecoveryOutcomeUnknown => {
+                            "turn_outcome_unknown".to_string()
                         }
                         isyncyou_agent::SessionV2Error::ManifestConflict
                         | isyncyou_agent::SessionV2Error::LeaseLost => "lease_lost".to_string(),
@@ -11611,13 +11735,17 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 let _operation_lease = operation_lease;
                 let exec = make_executor(&account_id, archive_root);
                 let mut history = vec![isyncyou_agent::Message::user(prompt)];
-                let outcome = isyncyou_agent::run_turn(
+                let mut events = isyncyou_agent::FallibleTurnEventSink::new(|event| {
+                    hub.emit(&tid, event)
+                        .then_some(())
+                        .ok_or(isyncyou_agent::AgentError::StreamUnavailable)
+                });
+                let outcome = isyncyou_agent::run_turn_observed_with_sink(
                     provider.as_mut(),
                     exec.as_ref(),
                     &mut history,
-                    &mut |ev| {
-                        hub.emit(&tid, ev);
-                    },
+                    &mut events,
+                    &mut NoopProductTurnObserver,
                 );
                 #[cfg(any(
                     feature = "agent-oauth-providers",
@@ -11766,8 +11894,14 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 Ok(None) => return Ok(turn_id),
                 Err(error) => return Err(error),
             };
-            let durable_state =
-                control_store.begin_agent_turn_admission_identity(&request, &turn_id, &identity)?;
+            let durable_state = control_store.begin_agent_turn_admission_identity(
+                &request,
+                &turn_id,
+                &identity,
+                &bound_account,
+                isyncyou_agent::admission_account_digest(&bound_account)
+                    .map_err(|_| "turn_admission_unavailable".to_string())?,
+            )?;
             let recovered_admission = matches!(
                 &durable_state,
                 agent_control_store::AgentTurnAdmissionBegin::Existing
@@ -12053,8 +12187,13 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                         return;
                     };
                     let safe_error = agent_safe_turn_start_error(&error);
-                    let terminal =
-                        control_store.fail_agent_turn_admission(&worker_turn_id, safe_error);
+                    let outcome_unknown = safe_error == "turn_outcome_unknown";
+                    let terminal = if outcome_unknown {
+                        control_store
+                            .outcome_unknown_agent_turn_admission(&worker_turn_id, safe_error)
+                    } else {
+                        control_store.fail_agent_turn_admission(&worker_turn_id, safe_error)
+                    };
                     let emitted_error = match terminal {
                         Ok(agent_control_store::AgentTurnAdmissionFailure::Cancelled) => {
                             "turn_cancelled"
@@ -12069,7 +12208,11 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                         worker.hot_request_statuses.insert(
                             &request.session_id,
                             &request.request_id,
-                            isyncyou_agent::RequestPhase::Failed,
+                            if outcome_unknown {
+                                isyncyou_agent::RequestPhase::OutcomeUnknown
+                            } else {
+                                isyncyou_agent::RequestPhase::Failed
+                            },
                         );
                     }
                     worker.fail_reserved_turn(&worker_turn_id, emitted_error);
@@ -15758,6 +15901,10 @@ mod tests {
             agent_safe_turn_start_error("manifest_conflict"),
             "session_busy"
         );
+        assert_eq!(
+            agent_safe_turn_start_error("turn_outcome_unknown"),
+            "turn_outcome_unknown"
+        );
 
         let raw = isyncyou_agent::AgentError::Provider("private session detail".into());
         assert_eq!(agent_safe_turn_error(&raw), "provider_request_failed");
@@ -16255,6 +16402,37 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn seed_previous_harness_activation(agent: &DaemonAgent) -> ProductBundleMeta {
+        let credential = StoredCredential {
+            access_token: "synthetic-offline-activation-access".into(),
+            refresh_token: "synthetic-offline-activation-refresh".into(),
+            expires_at_ms: 9_999_999_999_999,
+        };
+        let meta = ProductBundleMeta::fresh(ProductProviderId::Claude).unwrap();
+        store_agent_credential_blob(
+            &agent.oauth_dir,
+            SUBSCRIPTION_CREDENTIAL_ID,
+            meta.to_blob(credential.to_json()),
+        )
+        .unwrap();
+        store_product_activation(
+            &agent.oauth_dir,
+            ProductProviderId::Claude,
+            &ProductActivationV1 {
+                provider_id: ProductProviderId::Claude.wire().into(),
+                credential_generation: meta.generation.clone(),
+                oauth_policy_fingerprint: oauth_policy_fingerprint(ProductProviderId::Claude),
+                harness_contract_version: isyncyou_agent::HARNESS_CONTRACT_VERSION - 1,
+            },
+        )
+        .unwrap();
+        meta
     }
 
     #[cfg(all(
@@ -18326,7 +18504,13 @@ mod tests {
         let store = agent.control_store.as_ref().unwrap();
         assert!(matches!(
             store
-                .begin_agent_turn_admission_identity(&request, &turn_id, &identity)
+                .begin_agent_turn_admission_identity(
+                    &request,
+                    &turn_id,
+                    &identity,
+                    &request.account,
+                    isyncyou_agent::admission_account_digest(&request.account).unwrap(),
+                )
                 .unwrap(),
             agent_control_store::AgentTurnAdmissionBegin::Inserted
         ));
@@ -18349,7 +18533,13 @@ mod tests {
             .expect("retry owns both admission layers after release");
         assert!(matches!(
             store
-                .begin_agent_turn_admission_identity(&request, &turn_id, &identity)
+                .begin_agent_turn_admission_identity(
+                    &request,
+                    &turn_id,
+                    &identity,
+                    &request.account,
+                    isyncyou_agent::admission_account_digest(&request.account).unwrap(),
+                )
                 .unwrap(),
             agent_control_store::AgentTurnAdmissionBegin::Inserted
         ));
@@ -18565,6 +18755,112 @@ mod tests {
         feature = "agent-oauth-providers",
         feature = "agent-subscription-experimental"
     ))]
+    fn product_progressive_executor_fixture(
+        name: &str,
+    ) -> (
+        isyncyou_agent::ReadExecutionOutputV2,
+        Vec<isyncyou_agent::StreamEvent>,
+    ) {
+        let _guard = EnvelopeRequirementGuard::new();
+        isyncyou_core::envelope::set_body_key(643_018, [18u8; 32]);
+        let root = temp_agent_root(name);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("mail/aa")).unwrap();
+        let store = isyncyou_store::Store::open(root.join(".isyncyou-store.db")).unwrap();
+        let mut item =
+            isyncyou_store::Item::new("me", "mail", "m-progress", "Progress fixture", "message");
+        item.local_path = Some("mail/aa/m-progress.eml".into());
+        store.upsert_item(&item).unwrap();
+        store
+            .index_body("me", "mail", "m-progress", "Progress body indexed text")
+            .unwrap();
+        drop(store);
+        isyncyou_core::envelope::write_body_atomic(
+            &root.join("mail/aa/m-progress.eml"),
+            b"Progress body archived text",
+        )
+        .unwrap();
+
+        let executor = make_executor("me", root.clone());
+        let action = isyncyou_agent::ToolAction::Search {
+            account: "me".into(),
+            services: vec!["mail".into()],
+            query: "Progress".into(),
+            limit: Some(5),
+        };
+        let binding = isyncyou_agent::ReadExecutionBinding {
+            session_id: "01J00000000000000000000643".into(),
+            request_id: "64300000-0000-4000-8000-000000000018".into(),
+            tool_use_id: "search-progress".into(),
+            resolved_account_key: "me".into(),
+            admission_account_digest: isyncyou_agent::admission_account_digest("me").unwrap(),
+        };
+        let authority = isyncyou_agent::HmacProgressiveSearchAuthority::new([64; 32]);
+        let cancellation = isyncyou_agent::CancellationToken::default();
+        let mut input_budget = isyncyou_agent::ProviderInputBudgetV1::new(None, 128 * 1024, 0);
+        let mut events = Vec::new();
+        let mut capture = |event| events.push(event);
+        let output = executor
+            .execute_read_with_context(
+                &action,
+                isyncyou_agent::ReadExecutionContext {
+                    binding: &binding,
+                    local_effect: None,
+                    mode: isyncyou_agent::ReadExecutionMode::Live,
+                    provider_step_seq: 0,
+                    provider_steps_remaining_after_current: 15,
+                    input_budget: &mut input_budget,
+                    cancellation: &cancellation,
+                    events: &mut capture,
+                    progressive_authority: Some(&authority),
+                },
+            )
+            .unwrap();
+        let _ = std::fs::remove_dir_all(root);
+        (output, events)
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn product_agent_feature_uses_store_archive_progressive_executor() {
+        let (output, events) = product_progressive_executor_fixture("progressive-product-type");
+        assert!(matches!(
+            output,
+            isyncyou_agent::ReadExecutionOutputV2::Search(_)
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            isyncyou_agent::StreamEvent::StageProgress(progress)
+                if progress.stage == isyncyou_agent::SearchStage::Names
+        )));
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn product_bound_search_streams_stage_progress_and_partial_results() {
+        let (_output, events) = product_progressive_executor_fixture("progressive-product-events");
+        let public = events
+            .iter()
+            .map(agent_event_json)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(public.contains("\"event\":\"stage_progress\""));
+        assert!(public.contains("\"event\":\"partial_result\""));
+        assert!(!public.contains("search_stage"));
+        assert!(!public.contains("\"continuation\":"));
+        assert!(!public.contains("candidate_key"));
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     #[test]
     fn live_provider_agent_executor_reads_store_archive_fixture() {
         let _guard = EnvelopeRequirementGuard::new();
@@ -18651,6 +18947,23 @@ mod tests {
             .contains("Runtime body archived text"));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn minimal_non_provider_build_keeps_stub_outside_product_readiness() {
+        let source = include_str!("lib.rs");
+        let stub_definition = source
+            .split("struct StubExecutor;")
+            .next()
+            .expect("stub definition");
+        assert!(stub_definition.contains("not(any("));
+        let minimal_factory = source
+            .split("fn make_executor(\n    _account:")
+            .nth(1)
+            .and_then(|source| source.split("/// Serialize one stream event").next())
+            .expect("minimal executor factory");
+        assert!(minimal_factory.contains("Box::new(StubExecutor)"));
+        assert!(!minimal_factory.contains("StoreArchive"));
     }
 
     #[cfg(any(
@@ -18918,6 +19231,8 @@ mod tests {
             session_id: "01J00000000000000000000000".into(),
             request_id: "123e4567-e89b-42d3-a456-426614174000".into(),
             tool_use_id: "tool-restore".into(),
+            resolved_account_key: "me".into(),
+            admission_account_digest: isyncyou_agent::admission_account_digest("me").unwrap(),
         };
         let action = restore_local_action("mail", "m-idempotent");
         let first: serde_json::Value =
@@ -18955,6 +19270,8 @@ mod tests {
             session_id: "01J00000000000000000000000".into(),
             request_id: "123e4567-e89b-42d3-a456-426614174000".into(),
             tool_use_id: "tool-conflict".into(),
+            resolved_account_key: "me".into(),
+            admission_account_digest: isyncyou_agent::admission_account_digest("me").unwrap(),
         };
         let action = restore_local_action("mail", "m-conflict");
         let first: serde_json::Value =
@@ -21770,6 +22087,194 @@ mod tests {
             )
             .unwrap_err(),
             "reasoning effort is available only for ChatGPT"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn progressive_schema_bumps_single_harness_contract_to_version_two() {
+        assert_eq!(isyncyou_agent::HARNESS_CONTRACT_VERSION, 2);
+        assert_eq!(HARNESS_CONTRACT_VERSION, 2);
+        assert_eq!(isyncyou_agent::ACTIVITY_SCHEMA_VERSION, 1);
+        let provider_source = include_str!("../../agent/src/provider.rs");
+        assert_eq!(
+            provider_source
+                .matches("pub const HARNESS_CONTRACT_VERSION: u32")
+                .count(),
+            1,
+            "the agent provider module owns the single harness contract constant"
+        );
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn startup_harness_reattestation_preserves_credential_generation_without_network() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("startup-harness-v2-offline");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let meta = seed_previous_harness_activation(&agent);
+        let before = load_product_bundle_meta(&root, SUBSCRIPTION_CREDENTIAL_ID).unwrap();
+
+        agent.reattest_existing_product_activations().unwrap();
+
+        let after = load_product_bundle_meta(&root, SUBSCRIPTION_CREDENTIAL_ID).unwrap();
+        let activation = load_product_activation(&root, ProductProviderId::Claude).unwrap();
+        assert_eq!(before.generation, meta.generation);
+        assert_eq!(after.generation, meta.generation);
+        assert_eq!(
+            before, after,
+            "re-attestation must not rewrite the credential bundle"
+        );
+        assert_eq!(
+            activation.harness_contract_version,
+            isyncyou_agent::HARNESS_CONTRACT_VERSION
+        );
+        assert_eq!(activation.credential_generation, meta.generation);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn startup_harness_reattestation_requires_exact_active_policy_generation_binding() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("startup-harness-v2-binding");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let meta = seed_previous_harness_activation(&agent);
+        let old_contract = isyncyou_agent::HARNESS_CONTRACT_VERSION - 1;
+
+        for (generation, policy) in [
+            (
+                uuid_v4().unwrap(),
+                oauth_policy_fingerprint(ProductProviderId::Claude),
+            ),
+            (meta.generation.clone(), "0".repeat(64)),
+        ] {
+            store_product_activation(
+                &root,
+                ProductProviderId::Claude,
+                &ProductActivationV1 {
+                    provider_id: ProductProviderId::Claude.wire().into(),
+                    credential_generation: generation.clone(),
+                    oauth_policy_fingerprint: policy.clone(),
+                    harness_contract_version: old_contract,
+                },
+            )
+            .unwrap();
+            agent.reattest_existing_product_activations().unwrap();
+            let activation = load_product_activation(&root, ProductProviderId::Claude).unwrap();
+            assert_eq!(activation.credential_generation, generation);
+            assert_eq!(activation.oauth_policy_fingerprint, policy);
+            assert_eq!(activation.harness_contract_version, old_contract);
+        }
+
+        let credential = StoredCredential {
+            access_token: "inactive-access".into(),
+            refresh_token: "inactive-refresh".into(),
+            expires_at_ms: 9_999_999_999_999,
+        };
+        let mut inactive_meta = meta.clone();
+        inactive_meta.lifecycle = CredentialLifecycle::Disconnecting {
+            operation_id: "019f0000-0000-4000-8000-000000000643".into(),
+        };
+        store_agent_credential_blob(
+            &root,
+            SUBSCRIPTION_CREDENTIAL_ID,
+            inactive_meta.to_blob(credential.to_json()),
+        )
+        .unwrap();
+        store_product_activation(
+            &root,
+            ProductProviderId::Claude,
+            &ProductActivationV1 {
+                provider_id: ProductProviderId::Claude.wire().into(),
+                credential_generation: meta.generation,
+                oauth_policy_fingerprint: oauth_policy_fingerprint(ProductProviderId::Claude),
+                harness_contract_version: old_contract,
+            },
+        )
+        .unwrap();
+        agent.reattest_existing_product_activations().unwrap();
+        assert_eq!(
+            load_product_activation(&root, ProductProviderId::Claude)
+                .unwrap()
+                .harness_contract_version,
+            old_contract
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn startup_harness_reattestation_crash_before_or_after_activation_write_recovers() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("startup-harness-v2-crash");
+        let _ = std::fs::remove_dir_all(&root);
+        let first = DaemonAgent::new(Config::default(), root.clone());
+        let meta = seed_previous_harness_activation(&first);
+        drop(first);
+
+        let after_prewrite_crash = DaemonAgent::new(Config::default(), root.clone());
+        let updated = load_product_activation(&root, ProductProviderId::Claude).unwrap();
+        assert_eq!(
+            updated.harness_contract_version,
+            isyncyou_agent::HARNESS_CONTRACT_VERSION
+        );
+        assert_eq!(updated.credential_generation, meta.generation);
+        drop(after_prewrite_crash);
+
+        let after_postwrite_crash = DaemonAgent::new(Config::default(), root.clone());
+        let reopened = load_product_activation(&root, ProductProviderId::Claude).unwrap();
+        assert_eq!(reopened, updated);
+        assert_eq!(
+            load_product_bundle_meta(&root, SUBSCRIPTION_CREDENTIAL_ID)
+                .unwrap()
+                .generation,
+            meta.generation
+        );
+        drop(after_postwrite_crash);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn status_does_not_mutate_or_reattest_product_activation() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("status-no-harness-mutation");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let meta = seed_previous_harness_activation(&agent);
+        let before = load_product_activation(&root, ProductProviderId::Claude).unwrap();
+
+        let status: serde_json::Value =
+            serde_json::from_str(&isyncyou_webui::AgentHandler::status_json(&agent)).unwrap();
+
+        assert_eq!(status["connected"], false);
+        assert_eq!(
+            load_product_activation(&root, ProductProviderId::Claude).unwrap(),
+            before
+        );
+        assert_eq!(before.credential_generation, meta.generation);
+        assert_eq!(
+            before.harness_contract_version,
+            isyncyou_agent::HARNESS_CONTRACT_VERSION - 1
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -27406,7 +27911,7 @@ mod tests {
             fn next(
                 &mut self,
                 _history: &[isyncyou_agent::Message],
-                _emit: &mut dyn FnMut(isyncyou_agent::StreamEvent),
+                _emit: &mut dyn isyncyou_agent::TurnEventSink,
             ) -> Result<Vec<isyncyou_agent::AssistantBlock>, isyncyou_agent::AgentError>
             {
                 self.0.fetch_add(1, Ordering::SeqCst);
@@ -27461,7 +27966,7 @@ mod tests {
             fn next(
                 &mut self,
                 _history: &[isyncyou_agent::Message],
-                _emit: &mut dyn FnMut(isyncyou_agent::StreamEvent),
+                _emit: &mut dyn isyncyou_agent::TurnEventSink,
             ) -> Result<Vec<isyncyou_agent::AssistantBlock>, isyncyou_agent::AgentError>
             {
                 self.0.fetch_add(1, Ordering::SeqCst);
@@ -27536,7 +28041,7 @@ mod tests {
             .next()
             .unwrap();
         let recovery_branch = begin_turn
-            .split("let journal = replay")
+            .split("let journal = if let Some(journal) = replay.journal_v2")
             .nth(1)
             .unwrap()
             .split("if journal.phase == RequestPhase::ProviderStepStarted")
@@ -28270,7 +28775,7 @@ fn cancelled_or_unpersisted_turn_does_not_publish_provider_usage() {
     assert!(!authority_gate.contains("last_usage.lock()"));
 
     let final_branch = turn_completion
-        .split("Ok(isyncyou_agent::TurnOutcome::Final { text }) =>")
+        .split("Ok(isyncyou_agent::TurnOutcome::Final { completion }) =>")
         .nth(1)
         .unwrap()
         .split("Ok(isyncyou_agent::TurnOutcome::PendingConfirmation")

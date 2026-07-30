@@ -7,7 +7,194 @@
 //! path logic (which is private there).
 
 use crate::AgentError;
-use std::path::{Component, Path, PathBuf};
+use std::fmt;
+#[cfg(test)]
+use std::path::PathBuf;
+use std::path::{Component, Path};
+use std::sync::Arc;
+
+const SEARCH_SERVICES: [&str; 6] = [
+    "mail", "calendar", "contacts", "todo", "onenote", "onedrive",
+];
+
+/// Private archive locator. It deliberately has no serialization implementation.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ValidatedArchiveRelativePath(String);
+
+impl ValidatedArchiveRelativePath {
+    pub fn parse(value: impl Into<String>) -> Result<Self, AgentError> {
+        let value = value.into();
+        if value.is_empty() || value.len() > 4_096 || value.as_bytes().contains(&0) {
+            return Err(AgentError::Provider("archive_body_locator_invalid".into()));
+        }
+        let mut components = 0usize;
+        for component in Path::new(&value).components() {
+            match component {
+                Component::Normal(part) if !part.is_empty() => components += 1,
+                _ => {
+                    return Err(AgentError::Provider("archive_body_locator_invalid".into()));
+                }
+            }
+        }
+        if components == 0 || components > 64 {
+            return Err(AgentError::Provider("archive_body_locator_invalid".into()));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ValidatedArchiveRelativePath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ValidatedArchiveRelativePath([redacted])")
+    }
+}
+
+/// Private result row used only between StoreArchive and the progressive executor.
+///
+/// `body_rel_path` cannot enter serde-based provider/public output because neither this
+/// type nor the locator implements `Serialize`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ArchiveItemPrivateV1 {
+    pub service: String,
+    pub item_id: String,
+    pub name: String,
+    pub item_type: String,
+    pub sender: Option<String>,
+    pub remote_mtime: Option<String>,
+    pub size: Option<u64>,
+    pub body_rel_path: Option<ValidatedArchiveRelativePath>,
+    pub display_path: Option<String>,
+}
+
+impl fmt::Debug for ArchiveItemPrivateV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ArchiveItemPrivateV1")
+            .field("service", &self.service)
+            .field("item_id", &"[redacted]")
+            .field("name", &"[redacted]")
+            .field("item_type", &self.item_type)
+            .field("sender", &self.sender.as_ref().map(|_| "[redacted]"))
+            .field("remote_mtime", &self.remote_mtime)
+            .field("size", &self.size)
+            .field(
+                "body_rel_path",
+                &self.body_rel_path.as_ref().map(|_| "[redacted]"),
+            )
+            .field(
+                "display_path",
+                &self.display_path.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyFtsHit {
+    pub item: ArchiveItemPrivateV1,
+    pub snippet: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchPage<T> {
+    pub items: Vec<T>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedSearchScope {
+    account: String,
+    services: Vec<String>,
+}
+
+impl NormalizedSearchScope {
+    pub fn new(account: impl Into<String>, services: Vec<String>) -> Result<Self, AgentError> {
+        let account = account.into();
+        if account.is_empty() || account.len() > 128 {
+            return Err(AgentError::ToolArgs("invalid account binding".into()));
+        }
+        let mut selected = if services.is_empty() {
+            SEARCH_SERVICES.iter().map(ToString::to_string).collect()
+        } else {
+            let mut selected = Vec::with_capacity(services.len());
+            for allowed in SEARCH_SERVICES {
+                if services.iter().any(|service| service == allowed) {
+                    selected.push(allowed.to_string());
+                }
+            }
+            if selected.len()
+                != services
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                || services
+                    .iter()
+                    .any(|service| !SEARCH_SERVICES.contains(&service.as_str()))
+            {
+                return Err(AgentError::ToolArgs("invalid service scope".into()));
+            }
+            selected
+        };
+        selected.dedup();
+        if selected.is_empty() {
+            return Err(AgentError::ToolArgs("invalid service scope".into()));
+        }
+        Ok(Self {
+            account,
+            services: selected,
+        })
+    }
+
+    pub fn account(&self) -> &str {
+        &self.account
+    }
+
+    pub fn services(&self) -> &[String] {
+        &self.services
+    }
+}
+
+/// Injected cancellation/deadline predicate used by SQLite and body reads.
+#[derive(Clone)]
+pub struct StoreSearchDeadline {
+    should_interrupt: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl StoreSearchDeadline {
+    pub fn new(should_interrupt: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self {
+            should_interrupt: Arc::new(should_interrupt),
+        }
+    }
+
+    pub fn should_interrupt(&self) -> bool {
+        (self.should_interrupt)()
+    }
+}
+
+pub trait ArchiveSearchSnapshot {
+    fn search_names_page(
+        &self,
+        query: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<SearchPage<ArchiveItemPrivateV1>, AgentError>;
+    fn search_bodies_page(
+        &self,
+        query: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<SearchPage<BodyFtsHit>, AgentError>;
+    fn metadata_page(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> Result<SearchPage<ArchiveItemPrivateV1>, AgentError>;
+}
 
 /// A source-tagged reference to one archived item. Agent-side and decoupled from
 /// `isyncyou_store::Item`; `path` is the item's archived-body path, relative to the
@@ -44,13 +231,32 @@ pub trait ArchiveSource {
     fn children(&self, service: &str, parent: &str) -> Result<Vec<ItemRef>, AgentError>;
     /// Count items in a service.
     fn count(&self, service: &str) -> Result<u64, AgentError>;
+
+    /// Open one account/service-bound read snapshot for progressive Search/DeepSearch.
+    fn begin_search_snapshot(
+        &self,
+        _scope: &NormalizedSearchScope,
+        _deadline: &StoreSearchDeadline,
+    ) -> Result<Box<dyn ArchiveSearchSnapshot>, AgentError> {
+        Err(AgentError::Provider(
+            "progressive_search_unavailable".into(),
+        ))
+    }
+
+    fn read_private_body(
+        &self,
+        _locator: &ValidatedArchiveRelativePath,
+        _deadline: &StoreSearchDeadline,
+    ) -> Result<Vec<u8>, AgentError> {
+        Err(AgentError::Provider("archive_body_unavailable".into()))
+    }
 }
 
 /// Join `rel` under `root`, rejecting any path that escapes `root` (no `..` past the
 /// root, no absolute paths). Pure — does not touch the filesystem, so it is testable
 /// without a real archive and guards the read path (REQ-AGENT — traversal-safety).
 /// Used by the real `StoreArchive` (feature `retrieval`) and the unit tests.
-#[cfg_attr(not(feature = "retrieval"), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, AgentError> {
     let mut depth: i32 = 0;
     for comp in Path::new(rel).components() {
@@ -77,7 +283,10 @@ pub(crate) fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, AgentError> {
 
 #[cfg(feature = "retrieval")]
 mod store_backed {
-    use super::{ArchiveSource, ItemRef};
+    use super::{
+        ArchiveItemPrivateV1, ArchiveSearchSnapshot, ArchiveSource, BodyFtsHit, ItemRef,
+        NormalizedSearchScope, SearchPage, StoreSearchDeadline, ValidatedArchiveRelativePath,
+    };
     use crate::AgentError;
     use isyncyou_store::{Item, Store};
     use std::path::PathBuf;
@@ -97,6 +306,115 @@ mod store_backed {
             name: it.name,
             item_type: it.item_type,
             path: it.local_path,
+        }
+    }
+
+    fn to_private(it: Item) -> Result<ArchiveItemPrivateV1, AgentError> {
+        if it.service.is_empty()
+            || it.service.len() > 32
+            || it.remote_id.is_empty()
+            || it.remote_id.len() > 512
+            || it.name.len() > 2_048
+            || it.item_type.len() > 64
+        {
+            return Err(AgentError::Provider("archive_item_invalid".into()));
+        }
+        Ok(ArchiveItemPrivateV1 {
+            service: it.service,
+            item_id: it.remote_id,
+            name: it.name,
+            item_type: it.item_type,
+            sender: it.sender,
+            remote_mtime: it.remote_mtime,
+            size: it.size.and_then(|size| u64::try_from(size).ok()),
+            body_rel_path: it
+                .local_path
+                .map(ValidatedArchiveRelativePath::parse)
+                .transpose()?,
+            // The current store has no reviewed logical M365 path field.
+            display_path: None,
+        })
+    }
+
+    struct StoreArchiveSearchSnapshot {
+        snapshot: isyncyou_store::ProgressiveSearchSnapshot,
+    }
+
+    impl ArchiveSearchSnapshot for StoreArchiveSearchSnapshot {
+        fn search_names_page(
+            &self,
+            query: &str,
+            limit: u32,
+            offset: u32,
+        ) -> Result<SearchPage<ArchiveItemPrivateV1>, AgentError> {
+            let Some(query) = literal_fts_query(query) else {
+                return Ok(SearchPage {
+                    items: Vec::new(),
+                    has_more: false,
+                });
+            };
+            let page = self
+                .snapshot
+                .search_names_page(&query, limit, offset)
+                .map_err(|_| AgentError::Provider("archive_query_failed".into()))?;
+            Ok(SearchPage {
+                items: page
+                    .items
+                    .into_iter()
+                    .map(to_private)
+                    .collect::<Result<_, _>>()?,
+                has_more: page.has_more,
+            })
+        }
+
+        fn search_bodies_page(
+            &self,
+            query: &str,
+            limit: u32,
+            offset: u32,
+        ) -> Result<SearchPage<BodyFtsHit>, AgentError> {
+            let Some(query) = literal_fts_query(query) else {
+                return Ok(SearchPage {
+                    items: Vec::new(),
+                    has_more: false,
+                });
+            };
+            let page = self
+                .snapshot
+                .search_bodies_page(&query, limit, offset)
+                .map_err(|_| AgentError::Provider("archive_query_failed".into()))?;
+            Ok(SearchPage {
+                items: page
+                    .items
+                    .into_iter()
+                    .map(|hit| {
+                        Ok(BodyFtsHit {
+                            item: to_private(hit.item)?,
+                            snippet: hit.snippet,
+                        })
+                    })
+                    .collect::<Result<_, AgentError>>()?,
+                has_more: page.has_more,
+            })
+        }
+
+        fn metadata_page(
+            &self,
+            limit: u32,
+            offset: u32,
+        ) -> Result<SearchPage<ArchiveItemPrivateV1>, AgentError> {
+            let page = self
+                .snapshot
+                .metadata_page(limit, offset)
+                .map_err(|_| AgentError::Provider("archive_query_failed".into()))?;
+            Ok(SearchPage {
+                items: page
+                    .items
+                    .into_iter()
+                    .map(to_private)
+                    .collect::<Result<_, _>>()?,
+                has_more: page.has_more,
+            })
         }
     }
 
@@ -120,21 +438,6 @@ mod store_backed {
             // It is intentionally not a raw SQLite READ_ONLY connection.
             Store::open_readonly(self.archive_root.join(".isyncyou-store.db"))
                 .map_err(|_| AgentError::Provider("archive_store_unavailable".into()))
-        }
-
-        fn body_path(&self, rel: &str) -> Result<PathBuf, AgentError> {
-            let joined = super::safe_join(&self.archive_root, rel)?;
-            let root = self
-                .archive_root
-                .canonicalize()
-                .map_err(|_| AgentError::Provider("archive_body_unavailable".into()))?;
-            let path = joined
-                .canonicalize()
-                .map_err(|_| AgentError::Provider("archive_body_unavailable".into()))?;
-            if !path.starts_with(&root) {
-                return Err(AgentError::ToolArgs(format!("path escape rejected: {rel}")));
-            }
-            Ok(path)
         }
     }
 
@@ -181,9 +484,21 @@ mod store_backed {
             let rel = item.path.ok_or_else(|| {
                 AgentError::ToolArgs(format!("{service}/{id} has no archived body"))
             })?;
-            let path = self.body_path(&rel)?;
-            isyncyou_core::envelope::read_body(&path)
-                .map_err(|_| AgentError::Provider("archive_body_unavailable".into()))
+            let locator = ValidatedArchiveRelativePath::parse(rel)?;
+            self.read_private_body(&locator, &StoreSearchDeadline::new(|| false))
+        }
+
+        fn read_private_body(
+            &self,
+            locator: &ValidatedArchiveRelativePath,
+            deadline: &StoreSearchDeadline,
+        ) -> Result<Vec<u8>, AgentError> {
+            isyncyou_core::bounded_archive_body::read_bounded_archive_body(
+                &self.archive_root,
+                std::path::Path::new(locator.as_str()),
+                &|| deadline.should_interrupt(),
+            )
+            .map_err(|_| AgentError::Provider("archive_body_unavailable".into()))
         }
 
         fn list_page(
@@ -224,6 +539,28 @@ mod store_backed {
             store
                 .count_by_service(&self.account, service)
                 .map_err(|_| AgentError::Provider("archive_query_failed".into()))
+        }
+
+        fn begin_search_snapshot(
+            &self,
+            scope: &NormalizedSearchScope,
+            deadline: &StoreSearchDeadline,
+        ) -> Result<Box<dyn ArchiveSearchSnapshot>, AgentError> {
+            if scope.account() != self.account {
+                return Err(AgentError::Provider(
+                    "archive_account_binding_mismatch".into(),
+                ));
+            }
+            let deadline = deadline.clone();
+            let snapshot = self
+                .open_readonly()?
+                .begin_progressive_search(
+                    scope.account().to_string(),
+                    scope.services().to_vec(),
+                    move || deadline.should_interrupt(),
+                )
+                .map_err(|_| AgentError::Provider("archive_query_failed".into()))?;
+            Ok(Box::new(StoreArchiveSearchSnapshot { snapshot }))
         }
     }
 }
@@ -391,7 +728,10 @@ mod store_archive_tests {
 
         let archive = StoreArchive::new("me", dir.path());
         let err = archive.read_body("mail", "m1").unwrap_err();
-        assert!(err.to_string().contains("path traversal rejected"));
+        assert!(matches!(
+            err,
+            AgentError::Provider(code) if code == "archive_body_locator_invalid"
+        ));
     }
 
     #[cfg(unix)]
@@ -413,7 +753,7 @@ mod store_archive_tests {
 
         let archive = StoreArchive::new("me", dir.path());
         let err = archive.read_body("mail", "m1").unwrap_err();
-        assert!(err.to_string().contains("path escape rejected"));
+        assert!(err.to_string().contains("archive_body_unavailable"));
     }
 
     #[test]

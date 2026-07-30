@@ -16266,7 +16266,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "case \"token\":",
             "case \"tool_call\":",
             "case \"tool_result\":",
-            "case \"search_stage\":",
+            "case \"stage_progress\":",
             "case \"partial_result\":",
             "case \"confirmation_required\":",
             "case \"error\":",
@@ -16278,7 +16278,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "renderAgentToolRow(row)",
             "renderAgentError(message)",
             "Invalid stream payload",
-            "handleAgentEvent(d, turnState);",
+            ".then(() => handleAgentEvent(d, turnState))",
             "reason === \"pending_confirmation\"",
         ] {
             assert!(
@@ -16321,10 +16321,12 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "function renderAgentCitation(source)",
             "function renderAgentCitationBar(sources)",
             "function dedupeAgentSources(sources)",
-            "return JSON.stringify([source.service, source.id || \"\", source.path || \"\"]);",
+            "? JSON.stringify([source.service, source.id])",
+            ": JSON.stringify([source.service, \"\", source.path || \"\"]);",
             "if (event.event === \"partial_result\") visit(event.items || [], 0);",
-            "else if (event.event === \"tool_result\" && typeof event.content === \"string\")",
+            "else if (event.event === \"tool_result\")",
             "try { visit(JSON.parse(event.content), 0); } catch (_) {}",
+            "visit(event.content, 0);",
             "return q ? \"/api/v1/view?\" + qs(q) : null;",
             "\"data-agent-citation\": \"view\"",
             "\"data-agent-citation\": \"route\"",
@@ -16359,12 +16361,85 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn stage_progress_consumer_deduplicates_partial_results() {
+        for needle in [
+            "case \"stage_progress\":",
+            "case \"partial_result\":",
+            "const index = asst.results.findIndex(existing => existing.result_key === it.result_key);",
+            "if (index >= 0) asst.results[index] = it;",
+            "else asst.results.push(it);",
+        ] {
+            assert!(APP_JS.contains(needle), "missing progressive reducer rule: {needle}");
+        }
+        assert!(!APP_JS.contains("case \"search_stage\":"));
+    }
+
+    #[test]
+    fn assistant_baseline_rejects_unknown_progress_values() {
+        for needle in [
+            "event.event !== \"stage_progress\"",
+            "!AGENT_PROGRESS_STAGES.includes(event.stage)",
+            "!AGENT_PROGRESS_STATUS.has(event.status)",
+            "activity.stages.get(event.stage) !== \"running\"",
+            "return \"invalid\";",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "missing closed progress rule: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_baseline_ignores_identical_partial_replay_and_rejects_conflict() {
+        for needle in [
+            "protocol.partialDigests.get(replayKey) === digest ? \"replay\" : \"conflict\"",
+            "if (disposition === \"replay\") return false;",
+            "Search progress could not be reconciled.",
+        ] {
+            assert!(APP_JS.contains(needle), "missing replay rule: {needle}");
+        }
+    }
+
+    #[test]
+    fn assistant_baseline_partial_digest_index_is_bounded_and_erased_on_terminal() {
+        for needle in [
+            "const AGENT_PROGRESS_MAX_ACTIVITIES = 4;",
+            "const AGENT_PROGRESS_MAX_PARTIAL_UPDATES = 64;",
+            "if (protocol.activities.size >= AGENT_PROGRESS_MAX_ACTIVITIES)",
+            "activity.partialUpdates >= AGENT_PROGRESS_MAX_PARTIAL_UPDATES",
+            "activityProtocol.partialDigests.clear();",
+            "activityProtocol.activities.clear();",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "missing bounded replay index rule: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_baseline_never_renders_continuation_or_candidate_handles() {
+        let start = APP_JS
+            .find("async function handleAgentEvent")
+            .expect("activity consumer start");
+        let end = APP_JS[start..]
+            .find("function agentKeydown")
+            .map(|offset| start + offset)
+            .expect("activity consumer end");
+        let consumer = &APP_JS[start..end];
+        assert!(!consumer.contains("d.continuation"));
+        assert!(!consumer.contains("d.candidates"));
+        assert!(!consumer.contains("candidate_key"));
+    }
+
+    #[test]
     fn assistant_tool_result_ui_keeps_raw_content_out_of_state_and_dom() {
         let start = APP_JS
             .find("case \"tool_result\":")
             .expect("tool result event branch");
         let end = APP_JS[start..]
-            .find("case \"search_stage\":")
+            .find("case \"stage_progress\":")
             .map(|offset| start + offset)
             .expect("tool result event branch end");
         let branch = &APP_JS[start..end];

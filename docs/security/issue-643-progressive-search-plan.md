@@ -2812,7 +2812,7 @@ Required tests:
 - `old_harness_journal_fails_provider_generation_changed_before_executor`
 - `minimal_non_provider_build_keeps_stub_outside_product_readiness`
 - `live_product_executor_emits_store_archive_stage_progress`
-- `assistant_baseline_consumes_stage_progress_without_duplicate_results`
+- `stage_progress_consumer_deduplicates_partial_results`
 - `assistant_baseline_rejects_unknown_progress_values`
 - `assistant_baseline_ignores_identical_partial_replay_and_rejects_conflict`
 - `assistant_baseline_partial_digest_index_is_bounded_and_erased_on_terminal`
@@ -3159,6 +3159,7 @@ crates/store/src/lib.rs
 crates/store/Cargo.toml
 crates/agent/src/archive.rs
 crates/agent/src/activity.rs
+crates/agent/src/error.rs
 crates/agent/src/provider.rs
 crates/agent/src/provider/anthropic.rs
 crates/agent/src/provider/codex.rs
@@ -3167,6 +3168,7 @@ crates/agent/src/provider/openai.rs
 crates/agent/src/provider/subscription.rs
 crates/agent/src/progressive_search.rs
 crates/agent/src/retrieval.rs
+crates/agent/src/session_recovery_v2.rs
 crates/agent/src/session_v2.rs
 crates/agent/tests/fixtures/progressive-search-v1/**
 crates/agent/src/tool.rs
@@ -3176,7 +3178,7 @@ crates/app-host/src/agent_control_store.rs
 crates/app-host/src/agent_ops.rs
 crates/app-host/src/product_session.rs
 crates/app-host/src/lib.rs
-crates/app-host/tests/fixtures/agent-turn-admission-v2.sealed
+crates/app-host/tests/fixtures/agent-turn-admission-v2.sealed.json
 crates/app-host/tests/fixtures/agent-turn-admission-v2-meta.json
 crates/core/Cargo.toml
 crates/core/src/bounded_archive_body.rs
@@ -3193,6 +3195,7 @@ android/app/src/test/kotlin/com/silentspike/isyncyou/BridgeMessagePolicyTest.kt
 tools/agent-ui-smoke.mjs
 tools/agent-epic-closeout-probe.py
 tools/agent-progressive-search-probe.py
+tools/test_agent_epic_closeout_probe.py
 tools/test_agent_progressive_search_probe.py
 docs/requirements/agent.yml
 docs/adr/007-agent-architecture.md
@@ -3229,6 +3232,7 @@ android/app/src/test/kotlin/com/silentspike/isyncyou/BridgeDispatchTest.kt
 android/app/src/test/kotlin/com/silentspike/isyncyou/BridgeMessagePolicyTest.kt
 crates/agent/src/activity.rs
 crates/agent/src/archive.rs
+crates/agent/src/error.rs
 crates/agent/src/lib.rs
 crates/agent/src/provider.rs
 crates/agent/src/provider/anthropic.rs
@@ -3238,6 +3242,7 @@ crates/agent/src/provider/openai.rs
 crates/agent/src/provider/subscription.rs
 crates/agent/src/progressive_search.rs
 crates/agent/src/retrieval.rs
+crates/agent/src/session_recovery_v2.rs
 crates/agent/src/session_v2.rs
 crates/agent/src/tool.rs
 crates/agent/src/turn.rs
@@ -3246,7 +3251,7 @@ crates/app-host/src/agent_ops.rs
 crates/app-host/src/lib.rs
 crates/app-host/src/product_session.rs
 crates/app-host/tests/fixtures/agent-turn-admission-v2-meta.json
-crates/app-host/tests/fixtures/agent-turn-admission-v2.sealed
+crates/app-host/tests/fixtures/agent-turn-admission-v2.sealed.json
 crates/core/Cargo.toml
 crates/core/src/bounded_archive_body.rs
 crates/core/src/envelope.rs
@@ -3265,6 +3270,7 @@ gui/webui/src/app.js
 tools/agent-epic-closeout-probe.py
 tools/agent-progressive-search-probe.py
 tools/agent-ui-smoke.mjs
+tools/test_agent_epic_closeout_probe.py
 tools/test_agent_progressive_search_probe.py
 EOF
 

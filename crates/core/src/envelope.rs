@@ -36,11 +36,22 @@ pub type BodyKey = [u8; 32];
 /// `encrypted_blob_version`).
 pub const BODY_ENVELOPE_VERSION: u8 = 1;
 
-const MAGIC: &[u8; 4] = b"ISYE";
-const HEADER_LEN: usize = 32;
-const TAG_LEN: usize = 16;
+pub const BODY_ENVELOPE_MAGIC: &[u8; 4] = b"ISYE";
+pub const BODY_ENVELOPE_HEADER_LEN: usize = 32;
+pub const BODY_ENVELOPE_TAG_LEN: usize = 16;
+const MAGIC: &[u8; 4] = BODY_ENVELOPE_MAGIC;
+const HEADER_LEN: usize = BODY_ENVELOPE_HEADER_LEN;
+const TAG_LEN: usize = BODY_ENVELOPE_TAG_LEN;
 /// Default plaintext chunk size (64 KiB) — bounds per-chunk memory for large files.
 pub const DEFAULT_CHUNK: u32 = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnvelopeHeaderV1 {
+    pub key_id: u32,
+    pub chunk_size: u32,
+    pub plaintext_len: u64,
+    pub expected_envelope_len: u64,
+}
 
 static REQUIRE_BODY_ENVELOPE: AtomicBool = AtomicBool::new(false);
 
@@ -124,6 +135,50 @@ pub fn blob_plaintext_len(blob: &[u8]) -> Option<u64> {
     ]))
 }
 
+/// Validate a complete v1 header and compute its exact serialized envelope length.
+///
+/// The declared plaintext length is never used for allocation by this function.
+pub fn parse_envelope_header_v1(
+    header: &[u8],
+    require_production_chunk: bool,
+) -> Result<EnvelopeHeaderV1, EnvelopeError> {
+    if header.len() < HEADER_LEN {
+        return Err(EnvelopeError::Malformed("short header"));
+    }
+    if &header[0..4] != MAGIC {
+        return Err(EnvelopeError::Malformed("bad magic"));
+    }
+    if header[4] != BODY_ENVELOPE_VERSION {
+        return Err(EnvelopeError::Malformed("unsupported version"));
+    }
+    if header[5..8] != [0, 0, 0] {
+        return Err(EnvelopeError::Malformed("reserved header bits"));
+    }
+    let key_id = u32::from_be_bytes(header[8..12].try_into().unwrap());
+    let chunk_size = u32::from_be_bytes(header[12..16].try_into().unwrap());
+    if chunk_size == 0 {
+        return Err(EnvelopeError::Malformed("zero chunk size"));
+    }
+    if require_production_chunk && chunk_size != DEFAULT_CHUNK {
+        return Err(EnvelopeError::Malformed("non-production chunk size"));
+    }
+    let plaintext_len = u64::from_be_bytes(header[16..24].try_into().unwrap());
+    let chunks = plaintext_len
+        .checked_add(u64::from(chunk_size) - 1)
+        .ok_or(EnvelopeError::Malformed("length overflow"))?
+        / u64::from(chunk_size);
+    let expected_envelope_len = (HEADER_LEN as u64)
+        .checked_add(plaintext_len)
+        .and_then(|value| value.checked_add(chunks.checked_mul(TAG_LEN as u64)?))
+        .ok_or(EnvelopeError::Malformed("length overflow"))?;
+    Ok(EnvelopeHeaderV1 {
+        key_id,
+        chunk_size,
+        plaintext_len,
+        expected_envelope_len,
+    })
+}
+
 /// The plaintext size of the (possibly sealed) file at `path`: the envelope header's
 /// `plaintext_len` for a sealed file, or the raw file length for a plaintext file (desktop) /
 /// on any read error. Reads only the 32-byte header, never the whole body. Use this to compare
@@ -172,23 +227,21 @@ fn seal_with_chunk(plaintext: &[u8], key: &BodyKey, key_id: u32, chunk_size: u32
 /// Open an envelope sealed by [`seal`] with the matching `key`. Fails (never panics) on a
 /// malformed blob or a wrong/tampered key.
 pub fn open(blob: &[u8], key: &BodyKey) -> Result<Vec<u8>, EnvelopeError> {
-    if blob.len() < HEADER_LEN {
-        return Err(EnvelopeError::Malformed("short header"));
+    let header: [u8; HEADER_LEN] = blob
+        .get(..HEADER_LEN)
+        .ok_or(EnvelopeError::Malformed("short header"))?
+        .try_into()
+        .map_err(|_| EnvelopeError::Malformed("short header"))?;
+    let parsed = parse_envelope_header_v1(&header, false)?;
+    if parsed.expected_envelope_len != blob.len() as u64 {
+        return Err(EnvelopeError::Malformed("serialized length mismatch"));
     }
-    let header: [u8; HEADER_LEN] = blob[0..HEADER_LEN].try_into().unwrap();
-    if &header[0..4] != MAGIC {
-        return Err(EnvelopeError::Malformed("bad magic"));
-    }
-    if header[4] != BODY_ENVELOPE_VERSION {
-        return Err(EnvelopeError::Malformed("unsupported version"));
-    }
-    let chunk_size = u32::from_be_bytes([header[12], header[13], header[14], header[15]]) as usize;
-    let plaintext_len = u64::from_be_bytes(header[16..24].try_into().unwrap()) as usize;
+    let chunk_size = usize::try_from(parsed.chunk_size)
+        .map_err(|_| EnvelopeError::Malformed("chunk size overflow"))?;
+    let plaintext_len = usize::try_from(parsed.plaintext_len)
+        .map_err(|_| EnvelopeError::Malformed("plaintext length overflow"))?;
     let mut nonce_base = [0u8; 8];
     nonce_base.copy_from_slice(&header[24..32]);
-    if chunk_size == 0 {
-        return Err(EnvelopeError::Malformed("zero chunk size"));
-    }
 
     let opening =
         LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).expect("AES-256 key is 32 bytes"));
@@ -278,6 +331,13 @@ fn key_for_id(key_id: u32) -> Option<BodyKey> {
         .iter()
         .find(|(id, _)| *id == key_id)
         .map(|(_, k)| *k)
+}
+
+/// Open an already bounded envelope with the matching process-installed body key.
+pub fn open_with_registered_body_key(blob: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+    let header = parse_envelope_header_v1(blob, false)?;
+    let key = key_for_id(header.key_id).ok_or(EnvelopeError::Decrypt)?;
+    open(blob, &key)
 }
 
 /// Return the bytes to write to a body file: **sealed** when a body key is active, else the

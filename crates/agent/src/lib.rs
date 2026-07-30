@@ -23,6 +23,7 @@
 //! `agent-oauth-providers`; #627's local CLI fallback/capture surface remains behind
 //! `agent-subscription-experimental`.
 
+pub mod activity;
 pub mod archive;
 pub mod confirm;
 pub mod connectivity;
@@ -37,6 +38,7 @@ pub mod http;
 pub mod oauth;
 pub mod pairing_v2;
 pub mod product_provider;
+pub mod progressive_search;
 pub mod provider;
 pub mod retrieval;
 pub mod runtime_lock;
@@ -44,11 +46,18 @@ pub mod secrets;
 pub mod session;
 mod session_crypto;
 mod session_ids;
+pub mod session_recovery_v2;
 pub mod session_v2;
 pub mod stream;
 pub mod tool;
 pub mod turn;
 
+pub use activity::{
+    ActivityError, ActivityKind, CoverageNoteReason, CoverageNoteV1, PartialResultV1,
+    ProgressiveActivityExitV1, ProgressiveActivityFinalizationV1, ProgressiveExitStateV1,
+    ProgressiveFinalizationV1, PublicToolResultV1, ResultChange, SearchResultPublicV1, SearchStage,
+    StageProgressV1, StageStatus, TurnExitKind, ACTIVITY_SCHEMA_VERSION,
+};
 pub use archive::{ArchiveSource, ItemRef};
 pub use confirm::{
     action_hash, ConfirmError, PendingAction, PendingActionBinding, PendingOwnerBinding,
@@ -66,8 +75,15 @@ pub use pairing_v2::{
     PairingSourceSecretV2, PairingV2Error,
 };
 pub use product_provider::ProductProviderId;
+pub use progressive_search::{
+    admission_account_digest, candidate_page_digest, CanonicalSearchScopeV1,
+    DeepContinuationStateV1, HmacProgressiveSearchAuthority, IssuedCandidateV1,
+    ProgressiveSearchAuthority, ReadExecutionBindingV2, SearchActivityBindingV1,
+    SearchCandidateMetadataV1,
+};
 pub use provider::{
-    AssistantBlock, DoneReason, FakeProvider, LlmProvider, ProgressPhase, StreamEvent, Usage,
+    AssistantBlock, DoneReason, FakeProvider, FallibleTurnEventSink, InfallibleTurnEventSink,
+    LlmProvider, ProgressPhase, StreamEvent, TurnEventSink, Usage,
 };
 pub use retrieval::RetrievalExecutor;
 pub use runtime_lock::FileLock;
@@ -86,6 +102,12 @@ pub use session_crypto::{
     KdfProfile, PairingPayload, SessionCryptoConfig, SessionObjectClass, SessionObjectCrypto,
 };
 pub use session_ids::{DeviceId, LeaseId, SessionId, TurnId};
+pub use session_recovery_v2::{
+    CanonicalJsonValueV1, LegacyNormalizedAssistantBlockV1, LegacyRequestStepOutcomeV1,
+    LegacyToolActionV1, PersistedNormalizedAssistantBlockV2, PersistedToolActionKindV2,
+    PersistedToolActionV2, ReadToolCheckpointV2, RequestJournalV2, RequestStepOutcomeV2,
+    READ_CHECKPOINT_V2_VERSION, REQUEST_JOURNAL_V2_VERSION, REQUEST_OUTCOME_V2_VERSION,
+};
 pub use session_v2::{
     payload_digest, request_key, request_object_digest, select_provider_context,
     session_write_policy, tool_result_digest, ContextBudget, HistoryCursorCodec, HistoryPageV1,
@@ -98,8 +120,8 @@ pub use session_v2::{
     SessionManifestV1, SessionRecordKind, SessionRecordV2, SessionV2Error, SessionV2Store,
     SessionV2Transport, SessionWritePolicy, SourceRef, TurnTerminalStatus, VersionedManifest,
     VisibleContextMessage, DUPLICATE_TOOL_USE_ID_CODE, MAX_CONTEXT_BYTES, MAX_CONTEXT_MESSAGES,
-    MAX_TOOL_CHECKPOINTS, REQUEST_JOURNAL_VERSION, SESSION_RECORD_VERSION,
-    UNKNOWN_MODEL_INPUT_TOKENS,
+    MAX_PROVIDER_STEPS, MAX_SOURCE_REFS, MAX_TOOL_CHECKPOINTS, REQUEST_JOURNAL_VERSION,
+    SESSION_RECORD_VERSION, UNKNOWN_MODEL_INPUT_TOKENS,
 };
 pub use stream::{AgentStreamHub, CancellationToken};
 pub use tool::{
@@ -107,8 +129,11 @@ pub use tool::{
     ToolClass, TOOL_NAME,
 };
 pub use turn::{
-    run_turn, run_turn_cancellable, run_turn_observed, Message, ReadExecutionBinding, Role,
-    ToolExecutor, ToolUseRef, TurnObserver, TurnOutcome,
+    run_turn, run_turn_cancellable, run_turn_observed, run_turn_observed_with_sink,
+    ExistingSharedReadOutputV2, Message, ProviderInputBudgetV1, ReadCompletionV2,
+    ReadExecutionBinding, ReadExecutionContext, ReadExecutionMode, ReadExecutionOutputV2, Role,
+    SeparatedSearchOutputV2, TerminalEventDelivery, ToolExecutor, ToolUseRef, TurnCompletionV2,
+    TurnExitOutputV1, TurnObserver, TurnOutcome,
 };
 
 #[cfg(feature = "retrieval")]

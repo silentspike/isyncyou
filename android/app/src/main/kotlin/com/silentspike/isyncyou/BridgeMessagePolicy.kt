@@ -1,5 +1,6 @@
 package com.silentspike.isyncyou
 
+import org.json.JSONArray
 import org.json.JSONObject
 
 data class BridgeValidation(
@@ -11,11 +12,35 @@ data class BridgeValidation(
 
 object BridgeMessagePolicy {
     const val MAX_MESSAGE_BYTES = 16 * 1024
+    const val MAX_OUTBOUND_STREAM_MESSAGE_BYTES = 72 * 1024
     private const val MAX_ID_CHARS = 128
     private const val MAX_PATH_CHARS = 8 * 1024
     private const val MAX_HEADER_VALUE_CHARS = 8 * 1024
+    private const val MAX_STAGE_PROGRESS_BYTES = 4 * 1024
+    private const val MAX_PARTIAL_RESULT_BYTES = 64 * 1024
+    private const val MAX_PUBLIC_COUNTER = 1_000_000L
+    private const val MAX_PARTIAL_ITEMS = 20
     private val TYPES = setOf("req", "sub", "unsub", "bio", "native")
     private val HEADER_NAME = Regex("^[A-Za-z0-9-]{1,128}$")
+    private val OPAQUE_ACTIVITY_ID = Regex("^[A-Za-z0-9_-]{22}$")
+    private val PROGRESS_STAGES = setOf("names", "bodies", "deep")
+    private val PROGRESS_STATUSES = setOf(
+        "queued",
+        "running",
+        "complete",
+        "failed",
+        "skipped",
+        "cancelled",
+    )
+    private val RESULT_CHANGES = setOf("add", "enrich")
+    private val RESULT_SERVICES = setOf(
+        "mail",
+        "onedrive",
+        "calendar",
+        "contacts",
+        "todo",
+        "onenote",
+    )
     private val STORAGE_GUARDED_PATHS = setOf(
         "/api/v1/mutation-intent/create",
         "/api/v1/mutation-intent/chunk",
@@ -92,6 +117,174 @@ object BridgeMessagePolicy {
             .put("status", status)
             .put("body", body.toString())
             .toString()
+
+    fun outboundStreamEventJson(id: String, eventJson: String): String? {
+        if (id.isBlank() || id.length > MAX_ID_CHARS || !StrictJsonSyntax.validateObject(eventJson)) {
+            return null
+        }
+        val event = try {
+            JSONObject(eventJson)
+        } catch (_: Exception) {
+            return null
+        }
+        val eventType = exactString(event, "event") ?: return null
+        if (eventType == "search_stage") return null
+        if (
+            eventType in setOf("stage_progress", "partial_result") &&
+            !validateProgressEvent(eventType, event, eventJson)
+        ) {
+            return null
+        }
+        val envelope = JSONObject()
+            .put("t", "evt")
+            .put("id", id)
+            .put("ev", event)
+            .toString()
+        return envelope.takeIf {
+            it.toByteArray(Charsets.UTF_8).size <= MAX_OUTBOUND_STREAM_MESSAGE_BYTES
+        }
+    }
+
+    private fun validateProgressEvent(
+        eventType: String,
+        event: JSONObject,
+        eventJson: String,
+    ): Boolean {
+        if (exactLong(event, "schema_version") != 1L) return false
+        val activityId = exactString(event, "activity_id") ?: return false
+        if (!OPAQUE_ACTIVITY_ID.matches(activityId)) return false
+        return when (eventType) {
+            "stage_progress" -> {
+                val allowed = setOf(
+                    "event",
+                    "schema_version",
+                    "activity_id",
+                    "activity_kind",
+                    "stage",
+                    "status",
+                    "scanned",
+                    "total",
+                    "hits",
+                    "current_item",
+                    "coverage_complete",
+                    "budget_reached",
+                    "continuation_available",
+                )
+                hasExactKeys(event, allowed) &&
+                    exactString(event, "activity_kind") == "archive_search" &&
+                    exactString(event, "stage") in PROGRESS_STAGES &&
+                    exactString(event, "status") in PROGRESS_STATUSES &&
+                    boundedCounter(event, "scanned") &&
+                    nullableBoundedCounter(event, "total") &&
+                    boundedCounter(event, "hits") &&
+                    nullableBoundedString(event, "current_item", 160) &&
+                    nullableBoolean(event, "coverage_complete") &&
+                    nullableBoolean(event, "budget_reached") &&
+                    nullableBoolean(event, "continuation_available") &&
+                    eventJson.toByteArray(Charsets.UTF_8).size <= MAX_STAGE_PROGRESS_BYTES
+            }
+            "partial_result" -> {
+                if (
+                    !hasExactKeys(
+                        event,
+                        setOf(
+                            "event",
+                            "schema_version",
+                            "activity_id",
+                            "stage",
+                            "sequence",
+                            "items",
+                        ),
+                    ) ||
+                    exactString(event, "stage") !in PROGRESS_STAGES ||
+                    exactLong(event, "sequence") !in 0L..65535L ||
+                    eventJson.toByteArray(Charsets.UTF_8).size > MAX_PARTIAL_RESULT_BYTES
+                ) {
+                    return false
+                }
+                val items = event.opt("items") as? JSONArray ?: return false
+                if (items.length() > MAX_PARTIAL_ITEMS) return false
+                (0 until items.length()).all { index ->
+                    (items.opt(index) as? JSONObject)?.let(::validatePublicSearchItem) == true
+                }
+            }
+            else -> false
+        }
+    }
+
+    private fun validatePublicSearchItem(item: JSONObject): Boolean {
+        if (
+            !hasExactKeys(
+                item,
+                setOf(
+                    "result_key",
+                    "change",
+                    "service",
+                    "item_id",
+                    "name",
+                    "item_type",
+                    "display_path",
+                    "sender",
+                    "snippet",
+                    "body_available",
+                    "source",
+                ),
+            )
+        ) {
+            return false
+        }
+        val resultKey = exactString(item, "result_key") ?: return false
+        val service = exactString(item, "service") ?: return false
+        val itemId = exactString(item, "item_id") ?: return false
+        val name = exactString(item, "name") ?: return false
+        val itemType = exactString(item, "item_type") ?: return false
+        if (
+            !OPAQUE_ACTIVITY_ID.matches(resultKey) ||
+            exactString(item, "change") !in RESULT_CHANGES ||
+            service !in RESULT_SERVICES ||
+            !boundedRequiredString(itemId, 512) ||
+            !boundedRequiredString(name, 192) ||
+            !boundedRequiredString(itemType, 64) ||
+            !nullableBoundedString(item, "display_path", 768) ||
+            !nullableBoundedString(item, "sender", 256) ||
+            !nullableBoundedString(item, "snippet", 1_200) ||
+            item.opt("body_available") !is Boolean
+        ) {
+            return false
+        }
+        val source = item.opt("source") as? JSONObject ?: return false
+        if (!hasExactKeys(source, setOf("service", "item_id", "label"))) return false
+        return exactString(source, "service") == service &&
+            exactString(source, "item_id") == itemId &&
+            nullableBoundedString(source, "label", 192) &&
+            (source.isNull("label") || exactString(source, "label") == name)
+    }
+
+    private fun exactLong(obj: JSONObject, key: String): Long? = when (val value = obj.opt(key)) {
+        is Int -> value.toLong()
+        is Long -> value
+        else -> null
+    }
+
+    private fun boundedCounter(obj: JSONObject, key: String): Boolean =
+        exactLong(obj, key)?.let { it in 0L..MAX_PUBLIC_COUNTER } == true
+
+    private fun nullableBoundedCounter(obj: JSONObject, key: String): Boolean =
+        obj.isNull(key) || boundedCounter(obj, key)
+
+    private fun nullableBoolean(obj: JSONObject, key: String): Boolean =
+        obj.isNull(key) || obj.opt(key) is Boolean
+
+    private fun nullableBoundedString(obj: JSONObject, key: String, maxBytes: Int): Boolean {
+        if (obj.isNull(key)) return true
+        val value = exactString(obj, key) ?: return false
+        return boundedRequiredString(value, maxBytes)
+    }
+
+    private fun boundedRequiredString(value: String, maxBytes: Int): Boolean =
+        value.isNotEmpty() &&
+            value.toByteArray(Charsets.UTF_8).size <= maxBytes &&
+            value.none { it == '\u0000' || it.code < 0x20 || it.code == 0x7f }
 
     private fun validateRequest(obj: JSONObject, type: String, id: String): BridgeValidation {
         if (!hasOnlyKeys(obj, setOf("t", "id", "method", "path", "headers", "body"))) {
@@ -237,6 +430,9 @@ object BridgeMessagePolicy {
         }
         return true
     }
+
+    private fun hasExactKeys(obj: JSONObject, expected: Set<String>): Boolean =
+        obj.length() == expected.size && hasOnlyKeys(obj, expected)
 }
 
 private object StrictJsonSyntax {

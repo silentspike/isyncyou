@@ -568,7 +568,7 @@ mod live {
         fn next(
             &mut self,
             history: &[Message],
-            emit: &mut dyn FnMut(StreamEvent),
+            emit: &mut dyn crate::provider::TurnEventSink,
         ) -> Result<Vec<AssistantBlock>, AgentError> {
             self.next_cancellable(history, emit, None)
         }
@@ -576,7 +576,7 @@ mod live {
         fn next_cancellable(
             &mut self,
             history: &[Message],
-            emit: &mut dyn FnMut(StreamEvent),
+            emit: &mut dyn crate::provider::TurnEventSink,
             cancellation: Option<&crate::CancellationToken>,
         ) -> Result<Vec<AssistantBlock>, AgentError> {
             let assistant_base = *self.history_assistant_base.get_or_insert_with(|| {
@@ -632,7 +632,12 @@ mod live {
                         &mut usage,
                         &mut failure,
                     ) {
-                        Ok(Some(delta)) => emit(StreamEvent::Token(delta)),
+                        Ok(Some(delta)) => {
+                            if let Err(error) = emit.emit(StreamEvent::Token(delta)) {
+                                parse_error = Some(error);
+                                return false;
+                            }
+                        }
                         Ok(None) => {}
                         Err(e) => parse_error = Some(e),
                     }

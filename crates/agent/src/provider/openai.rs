@@ -185,7 +185,7 @@ mod live {
         fn next(
             &mut self,
             history: &[Message],
-            emit: &mut dyn FnMut(StreamEvent),
+            emit: &mut dyn crate::provider::TurnEventSink,
         ) -> Result<Vec<AssistantBlock>, AgentError> {
             let body = build_request(&self.model, &self.system, history, self.store);
             let (status, text) = self
@@ -202,7 +202,7 @@ mod live {
             self.last_usage = usage;
             for b in &blocks {
                 if let AssistantBlock::Text(t) = b {
-                    emit(StreamEvent::Token(t.clone()));
+                    emit.emit(StreamEvent::Token(t.clone()))?;
                 }
             }
             Ok(blocks)

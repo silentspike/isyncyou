@@ -11,7 +11,8 @@
 //! against corruption from concurrent daemons.
 
 use fs2::FileExt;
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
@@ -39,9 +40,49 @@ pub enum StoreError {
     IllegalMobileJobTransition(String),
     #[error("invalid mobile job: {0}")]
     InvalidMobileJob(String),
+    #[error("invalid progressive search: {0}")]
+    InvalidProgressiveSearch(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+const PROGRESSIVE_QUERY_MAX_PAGE: u32 = 200;
+const PROGRESSIVE_QUERY_OP_INTERVAL: i32 = 1_000;
+const PROGRESSIVE_BODY_SNIPPET_BYTES: usize = 1_200;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchPage<T> {
+    pub items: Vec<T>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodySearchHit {
+    pub item: Item,
+    pub snippet: String,
+}
+
+/// One consistent, account/service-bound read transaction for a progressive tool call.
+///
+/// The progress callback owns its cancellation/deadline closure. Drop always removes the
+/// callback before the connection can be reused and then closes the read transaction.
+pub struct ProgressiveSearchSnapshot {
+    store: Option<Store>,
+    account: String,
+    services: Vec<String>,
+}
+
+fn bounded_fts_snippet(value: String) -> String {
+    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.len() <= PROGRESSIVE_BODY_SNIPPET_BYTES {
+        return collapsed;
+    }
+    let mut end = PROGRESSIVE_BODY_SNIPPET_BYTES;
+    while !collapsed.is_char_boundary(end) {
+        end -= 1;
+    }
+    collapsed[..end].trim_end().to_string()
+}
 
 /// Current schema version. Bump + add a migration step when the schema changes.
 pub const SCHEMA_VERSION: i64 = 16;
@@ -788,6 +829,51 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&conn)?;
         Ok(Store { conn, _lock: None })
+    }
+
+    /// Consume this read handle and begin one consistent progressive-search snapshot.
+    ///
+    /// `should_interrupt` is called by SQLite at a fixed opcode interval. Returning true
+    /// interrupts the current statement with `SQLITE_INTERRUPT`; callers map that to their
+    /// closed cancellation/deadline code.
+    pub fn begin_progressive_search<F>(
+        self,
+        account: impl Into<String>,
+        services: Vec<String>,
+        should_interrupt: F,
+    ) -> Result<ProgressiveSearchSnapshot>
+    where
+        F: FnMut() -> bool + Send + 'static,
+    {
+        let account = account.into();
+        if account.is_empty() || account.len() > 128 {
+            return Err(StoreError::InvalidProgressiveSearch(
+                "account binding is invalid".into(),
+            ));
+        }
+        if services.is_empty()
+            || services.len() > 6
+            || services
+                .iter()
+                .any(|service| service.is_empty() || service.len() > 32)
+        {
+            return Err(StoreError::InvalidProgressiveSearch(
+                "service scope is invalid".into(),
+            ));
+        }
+        self.conn.execute_batch("BEGIN DEFERRED")?;
+        if let Err(error) = self
+            .conn
+            .progress_handler(PROGRESSIVE_QUERY_OP_INTERVAL, Some(should_interrupt))
+        {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            return Err(error.into());
+        }
+        Ok(ProgressiveSearchSnapshot {
+            store: Some(self),
+            account,
+            services,
+        })
     }
 
     /// Write a consistent snapshot of the database to `dest` via SQLite
@@ -2257,6 +2343,172 @@ impl Store {
     }
 }
 
+impl ProgressiveSearchSnapshot {
+    fn store(&self) -> &Store {
+        self.store
+            .as_ref()
+            .expect("progressive snapshot store exists until drop")
+    }
+
+    fn bounded_limit(limit: u32) -> Result<(u32, i64)> {
+        if limit == 0 || limit > PROGRESSIVE_QUERY_MAX_PAGE {
+            return Err(StoreError::InvalidProgressiveSearch(
+                "page limit is invalid".into(),
+            ));
+        }
+        let requested = i64::from(limit);
+        let with_probe = requested
+            .checked_add(1)
+            .ok_or_else(|| StoreError::InvalidProgressiveSearch("page overflow".into()))?;
+        Ok((limit, with_probe))
+    }
+
+    fn scoped_values(&self, query: Option<&str>, limit_with_probe: i64, offset: u32) -> Vec<Value> {
+        let mut values = Vec::with_capacity(self.services.len() + 4);
+        values.push(Value::Text(self.account.clone()));
+        if let Some(query) = query {
+            values.push(Value::Text(query.to_string()));
+        }
+        values.extend(self.services.iter().cloned().map(Value::Text));
+        values.push(Value::Integer(limit_with_probe));
+        values.push(Value::Integer(i64::from(offset)));
+        values
+    }
+
+    fn service_placeholders(&self) -> String {
+        std::iter::repeat_n("?", self.services.len())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    pub fn search_names_page(
+        &self,
+        query: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<SearchPage<Item>> {
+        if query.is_empty() {
+            return Err(StoreError::InvalidProgressiveSearch(
+                "query is empty".into(),
+            ));
+        }
+        let (requested, with_probe) = Self::bounded_limit(limit)?;
+        let cols = COLS
+            .split(", ")
+            .map(|column| format!("items.{}", column.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {cols}, bm25(items_fts) AS score
+             FROM items
+             JOIN items_fts ON items_fts.rowid = items.id
+             WHERE items.account_id = ?
+               AND items_fts MATCH ?
+               AND items.service IN ({})
+               AND (items.deleted_at IS NULL OR items.local_path IS NOT NULL)
+             ORDER BY score ASC, items.service ASC, items.remote_id ASC
+             LIMIT ? OFFSET ?",
+            self.service_placeholders()
+        );
+        let values = self.scoped_values(Some(query), with_probe, offset);
+        let mut statement = self.store().conn.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(values), row_to_item)?;
+        let mut items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_more = items.len() > requested as usize;
+        items.truncate(requested as usize);
+        Ok(SearchPage { items, has_more })
+    }
+
+    pub fn search_bodies_page(
+        &self,
+        query: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<SearchPage<BodySearchHit>> {
+        if query.is_empty() {
+            return Err(StoreError::InvalidProgressiveSearch(
+                "query is empty".into(),
+            ));
+        }
+        let (requested, with_probe) = Self::bounded_limit(limit)?;
+        let item_columns = COLS
+            .split(", ")
+            .map(|column| format!("items.{}", column.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {item_columns},
+                    snippet(bodies_fts, 0, '', '', ' ... ', 16) AS bounded_snippet,
+                    bm25(bodies_fts) AS score
+             FROM bodies_fts
+             JOIN bodies ON bodies.id = bodies_fts.rowid
+             JOIN items ON items.account_id = bodies.account_id
+                       AND items.service = bodies.service
+                       AND items.remote_id = bodies.remote_id
+             WHERE bodies.account_id = ?
+               AND bodies_fts MATCH ?
+               AND bodies.service IN ({})
+               AND (items.deleted_at IS NULL OR items.local_path IS NOT NULL)
+             ORDER BY score ASC, bodies.service ASC, bodies.remote_id ASC
+             LIMIT ? OFFSET ?",
+            self.service_placeholders()
+        );
+        let values = self.scoped_values(Some(query), with_probe, offset);
+        let mut statement = self.store().conn.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(values), |row| {
+            Ok(BodySearchHit {
+                item: row_to_item(row)?,
+                snippet: bounded_fts_snippet(row.get(33)?),
+            })
+        })?;
+        let mut items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_more = items.len() > requested as usize;
+        items.truncate(requested as usize);
+        Ok(SearchPage { items, has_more })
+    }
+
+    pub fn metadata_page(&self, limit: u32, offset: u32) -> Result<SearchPage<Item>> {
+        let (requested, with_probe) = Self::bounded_limit(limit)?;
+        let sql = format!(
+            "SELECT {COLS}
+             FROM items
+             WHERE account_id = ?
+               AND service IN ({})
+               AND (deleted_at IS NULL OR local_path IS NOT NULL)
+             ORDER BY service ASC, remote_id ASC
+             LIMIT ? OFFSET ?",
+            self.service_placeholders()
+        );
+        let values = self.scoped_values(None, with_probe, offset);
+        let mut statement = self.store().conn.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(values), row_to_item)?;
+        let mut items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_more = items.len() > requested as usize;
+        items.truncate(requested as usize);
+        Ok(SearchPage { items, has_more })
+    }
+
+    /// End the snapshot and return the underlying read handle with no progress callback.
+    pub fn finish(mut self) -> Result<Store> {
+        let store = self
+            .store
+            .take()
+            .expect("progressive snapshot store exists until finish");
+        store.conn.progress_handler::<fn() -> bool>(0, None)?;
+        store.conn.execute_batch("ROLLBACK")?;
+        Ok(store)
+    }
+}
+
+impl Drop for ProgressiveSearchSnapshot {
+    fn drop(&mut self) {
+        if let Some(store) = self.store.take() {
+            let _ = store.conn.progress_handler::<fn() -> bool>(0, None);
+            let _ = store.conn.execute_batch("ROLLBACK");
+        }
+    }
+}
+
 /// A process-installed SQLCipher key — the Android Keystore-unwrapped key on mobile —
 /// taking precedence over the env/keyring sources so the standalone app opens SQLCipher with
 /// a hardware-backed key and no env vars. Set once at startup via [`set_store_key`]. Always
@@ -2790,9 +3042,220 @@ fn migrate(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn item(acc: &str, id: &str, name: &str) -> Item {
         Item::new(acc, "onedrive", id, name, "file")
+    }
+
+    fn scoped_item(acc: &str, service: &str, id: &str, name: &str) -> Item {
+        Item::new(acc, service, id, name, "file")
+    }
+
+    #[test]
+    fn store_name_search_page_is_ranked_stable_and_bounded() {
+        let store = Store::open_in_memory().unwrap();
+        for entry in [
+            scoped_item("a", "mail", "b", "quarterly report"),
+            scoped_item("a", "mail", "a", "quarterly report"),
+            scoped_item("a", "onedrive", "c", "quarterly report appendix"),
+            scoped_item("b", "mail", "hidden", "quarterly report"),
+        ] {
+            store.upsert_item(&entry).unwrap();
+        }
+        let snapshot = store
+            .begin_progressive_search("a", vec!["mail".into(), "onedrive".into()], || false)
+            .unwrap();
+        let page = snapshot.search_names_page("report", 2, 0).unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert!(page.has_more);
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| (item.service.as_str(), item.remote_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("mail", "a"), ("mail", "b")]
+        );
+    }
+
+    #[test]
+    fn store_search_tie_breaks_by_service_and_remote_id() {
+        let store = Store::open_in_memory().unwrap();
+        for entry in [
+            scoped_item("a", "onedrive", "z", "identical report"),
+            scoped_item("a", "mail", "z", "identical report"),
+            scoped_item("a", "mail", "a", "identical report"),
+        ] {
+            store.upsert_item(&entry).unwrap();
+        }
+        let snapshot = store
+            .begin_progressive_search("a", vec!["mail".into(), "onedrive".into()], || false)
+            .unwrap();
+        let page = snapshot.search_names_page("report", 3, 0).unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| (item.service.as_str(), item.remote_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("mail", "a"), ("mail", "z"), ("onedrive", "z")]
+        );
+    }
+
+    #[test]
+    fn store_search_snapshot_keeps_scope_pages_and_rank_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.db");
+        let writer = Store::open(&path).unwrap();
+        for id in ["a", "b", "c"] {
+            writer
+                .upsert_item(&scoped_item("a", "mail", id, "stable report"))
+                .unwrap();
+        }
+        let reader = Store::open_readonly(&path).unwrap();
+        let snapshot = reader
+            .begin_progressive_search("a", vec!["mail".into()], || false)
+            .unwrap();
+
+        let first = snapshot.search_names_page("report", 2, 0).unwrap();
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|item| item.remote_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert!(first.has_more);
+
+        writer
+            .upsert_item(&scoped_item("a", "mail", "aa", "stable report"))
+            .unwrap();
+        let second = snapshot.search_names_page("report", 2, 2).unwrap();
+        assert_eq!(
+            second
+                .items
+                .iter()
+                .map(|item| item.remote_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c"]
+        );
+        assert!(!second.has_more);
+    }
+
+    #[test]
+    fn store_body_search_page_returns_bounded_snippet_without_body_file_read() {
+        let store = Store::open_in_memory().unwrap();
+        let entry = scoped_item("a", "mail", "message-1", "Unrelated subject");
+        store.upsert_item(&entry).unwrap();
+        store
+            .index_body(
+                "a",
+                "mail",
+                "message-1",
+                &format!("invoice {}", "boundedword ".repeat(500)),
+            )
+            .unwrap();
+        let snapshot = store
+            .begin_progressive_search("a", vec!["mail".into()], || false)
+            .unwrap();
+        let page = snapshot.search_bodies_page("invoice", 10, 0).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert!(!page.has_more);
+        assert_eq!(page.items[0].item.remote_id, "message-1");
+        assert!(page.items[0].snippet.len() <= PROGRESSIVE_BODY_SNIPPET_BYTES);
+    }
+
+    #[test]
+    fn store_progressive_search_uses_cap_plus_one_without_fts_count() {
+        let store = Store::open_in_memory().unwrap();
+        for index in 0..3 {
+            store
+                .upsert_item(&scoped_item(
+                    "a",
+                    "mail",
+                    &format!("item-{index}"),
+                    "matching report",
+                ))
+                .unwrap();
+        }
+        let snapshot = store
+            .begin_progressive_search("a", vec!["mail".into()], || false)
+            .unwrap();
+        let first = snapshot.search_names_page("report", 2, 0).unwrap();
+        let second = snapshot.search_names_page("report", 2, 2).unwrap();
+        assert_eq!(first.items.len(), 2);
+        assert!(first.has_more);
+        assert_eq!(second.items.len(), 1);
+        assert!(!second.has_more);
+    }
+
+    #[test]
+    fn store_search_scope_filters_services_before_rank_limit_and_page() {
+        let store = Store::open_in_memory().unwrap();
+        for index in 0..10 {
+            store
+                .upsert_item(&scoped_item(
+                    "a",
+                    "mail",
+                    &format!("mail-{index}"),
+                    "exact report",
+                ))
+                .unwrap();
+        }
+        store
+            .upsert_item(&scoped_item("a", "onedrive", "drive-result", "report"))
+            .unwrap();
+        let snapshot = store
+            .begin_progressive_search("a", vec!["onedrive".into()], || false)
+            .unwrap();
+        let page = snapshot.search_names_page("report", 1, 0).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].service, "onedrive");
+        assert_eq!(page.items[0].remote_id, "drive-result");
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn store_progressive_query_deadline_interrupts_long_match() {
+        let store = Store::open_in_memory().unwrap();
+        for index in 0..2_000 {
+            store
+                .upsert_item(&scoped_item(
+                    "a",
+                    "mail",
+                    &format!("item-{index:04}"),
+                    "large matching report corpus",
+                ))
+                .unwrap();
+        }
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let observed = callbacks.clone();
+        let snapshot = store
+            .begin_progressive_search("a", vec!["mail".into()], move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                true
+            })
+            .unwrap();
+        let error = snapshot.search_names_page("report", 200, 0).unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::Sqlite(rusqlite::Error::SqliteFailure(_, _))
+        ));
+        assert!(callbacks.load(Ordering::SeqCst) > 0);
+    }
+
+    #[test]
+    fn store_progress_handler_is_removed_before_connection_reuse() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_item(&scoped_item("a", "mail", "item-1", "report"))
+            .unwrap();
+        let snapshot = store
+            .begin_progressive_search("a", vec!["mail".into()], || true)
+            .unwrap();
+        let store = snapshot.finish().unwrap();
+        assert_eq!(store.search_names("a", "report").unwrap().len(), 1);
     }
 
     #[test]

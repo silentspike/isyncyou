@@ -24,19 +24,11 @@ pub enum ToolAction {
         limit: Option<u32>,
     },
     /// Agentic deep read (S-AG.18/#643): scan metadata and read candidate bodies the
-    /// keyword passes (search) missed, budgeted + resumable via `cursor`, so a match whose
-    /// wording never contains the query can still be found. Read-class.
+    /// keyword passes missed. All authority comes from the preceding Search result.
     DeepSearch {
-        account: String,
-        #[serde(default)]
-        services: Vec<String>,
-        query: String,
-        /// Resume offset into the unmatched-candidate list (from a prior call's `next_cursor`).
-        #[serde(default)]
-        cursor: Option<u32>,
-        /// Max candidate bodies to read this call (budget); server-capped.
-        #[serde(default)]
-        max_reads: Option<u32>,
+        activity_id: String,
+        continuation: String,
+        candidates: Vec<String>,
     },
     /// Read one archived item's content (byte-budgeted).
     Read {
@@ -183,7 +175,6 @@ impl ToolAction {
     pub fn account(&self) -> &str {
         match self {
             ToolAction::Search { account, .. }
-            | ToolAction::DeepSearch { account, .. }
             | ToolAction::Read { account, .. }
             | ToolAction::List { account, .. }
             | ToolAction::Export { account, .. }
@@ -192,6 +183,7 @@ impl ToolAction {
             | ToolAction::RestoreCloud { account, .. }
             | ToolAction::LiveWrite { account, .. }
             | ToolAction::Share { account, .. } => account,
+            ToolAction::DeepSearch { .. } => "",
         }
     }
 
@@ -230,7 +222,7 @@ impl ToolAction {
 pub fn help_text() -> String {
     "isyncyou tool — ops (M365 domain only): \
      search {account, services?, query, limit?} · \
-     deep-search {account, services?, query, cursor?, max_reads?} · \
+     deep-search {activity_id, continuation, candidates} · \
      read {account, service, id, max_bytes?} · \
      list {account, service, parent?, limit?, offset?} · \
      export {account, service, id} · \
@@ -243,18 +235,25 @@ pub fn help_text() -> String {
         .to_string()
 }
 
-pub const REJECTED_TOOL_HELP_SCHEMA_VERSION: u32 = 1;
+pub const REJECTED_TOOL_HELP_SCHEMA_VERSION: u32 = 2;
 pub const INVALID_TOOL_ARGUMENTS_CODE: &str = "invalid_tool_arguments";
+const REJECTED_TOOL_HELP_V1: &str = "invalid isyncyou tool call\n\nisyncyou tool — ops (M365 domain only): search {account, services?, query, limit?} · deep-search {account, services?, query, cursor?, max_reads?} · read {account, service, id, max_bytes?} · list {account, service, parent?, limit?, offset?} · export {account, service, id} · restore-local {account, service, id} · backup {account, services?} [confirm] · restore-cloud {account, service, id} [confirm] · live-write {account, service, target?, change} [confirm] · share {account, service, id, mode?, link_type?, scope?, recipients?, role?, recipient?} [confirm]. There is no shell/filesystem/OS/network op.";
 
 /// Render the stable model-visible correction for a rejected tool call.
 ///
 /// Retaining renderers by version makes crash recovery independent from Serde's
 /// diagnostic wording and from future schema changes.
 pub fn render_rejected_tool_help(version: u32, code: &str) -> Option<String> {
-    if version != REJECTED_TOOL_HELP_SCHEMA_VERSION || code != INVALID_TOOL_ARGUMENTS_CODE {
+    if code != INVALID_TOOL_ARGUMENTS_CODE {
         return None;
     }
-    Some(format!("invalid isyncyou tool call\n\n{}", help_text()))
+    match version {
+        1 => Some(REJECTED_TOOL_HELP_V1.to_string()),
+        REJECTED_TOOL_HELP_SCHEMA_VERSION => {
+            Some(format!("invalid isyncyou tool call\n\n{}", help_text()))
+        }
+        _ => None,
+    }
 }
 
 /// Parse a model tool input into a typed [`ToolAction`]. On failure the error carries
@@ -269,14 +268,32 @@ pub fn parse_action(input: &serde_json::Value) -> Result<ToolAction, String> {
     })
 }
 
-/// Public stream representation for a parsed tool call. Read-class inputs are safe to
-/// show as-is; destructive inputs are reduced before the first public `tool_call` event.
+/// Public stream representation for a parsed tool call.
+///
+/// Search inputs contain account, query, and continuation authority and are therefore
+/// reduced to a closed operation summary. Other read-class behavior remains compatible
+/// until its action-specific projection moves into the shared read-output contract.
 pub fn public_tool_call_input(
     action: &ToolAction,
     raw_input: &serde_json::Value,
 ) -> serde_json::Value {
-    if action.class() == ToolClass::Read {
-        return raw_input.clone();
+    match action {
+        ToolAction::Search { services, .. } => {
+            return serde_json::json!({
+                "op": action.op(),
+                "service_count": services.len(),
+                "redacted": true
+            });
+        }
+        ToolAction::DeepSearch { candidates, .. } => {
+            return serde_json::json!({
+                "op": action.op(),
+                "selected_candidate_count": candidates.len(),
+                "redacted": true
+            });
+        }
+        _ if action.class() == ToolClass::Read => return raw_input.clone(),
+        _ => {}
     }
     let mut out = serde_json::Map::new();
     out.insert("op".to_string(), serde_json::json!(action.op()));
@@ -369,8 +386,13 @@ pub fn tool_schema() -> serde_json::Value {
                 "services": { "type": "array", "items": { "type": "string" } },
                 "limit": { "type": "integer" },
                 "offset": { "type": "integer" },
-                "cursor": { "type": "integer" },
-                "max_reads": { "type": "integer" },
+                "activity_id": { "type": "string" },
+                "continuation": { "type": "string" },
+                "candidates": {
+                    "type": "array",
+                    "maxItems": 12,
+                    "items": { "type": "string" }
+                },
                 "max_bytes": { "type": "integer" },
                 "parent": { "type": "string" },
                 "target": { "type": "string" },
@@ -382,7 +404,7 @@ pub fn tool_schema() -> serde_json::Value {
                 "recipient": { "type": "string" },
                 "change": {}
             },
-            "required": ["op", "account"]
+            "required": ["op"]
         }
     })
 }
@@ -407,6 +429,38 @@ mod tests {
         );
         assert_eq!(action.class(), ToolClass::Read);
         assert_eq!(action.op(), "search");
+    }
+
+    #[test]
+    fn public_search_tool_call_omits_query_account_continuation_and_candidates() {
+        let search = ToolAction::Search {
+            account: "private-account".into(),
+            services: vec!["mail".into(), "onedrive".into()],
+            query: "private query".into(),
+            limit: Some(12),
+        };
+        let deep = ToolAction::DeepSearch {
+            activity_id: "abcdefghijklmnopqrstuv".into(),
+            continuation: "private-continuation".into(),
+            candidates: vec!["private-candidate".into()],
+        };
+        for action in [&search, &deep] {
+            let public = public_tool_call_input(
+                action,
+                &json!({
+                    "account": "private-account",
+                    "query": "private query",
+                    "continuation": "private-continuation",
+                    "candidates": ["private-candidate"]
+                }),
+            );
+            let encoded = public.to_string();
+            assert_eq!(public["redacted"], true);
+            assert!(!encoded.contains("private-account"));
+            assert!(!encoded.contains("private query"));
+            assert!(!encoded.contains("private-continuation"));
+            assert!(!encoded.contains("private-candidate"));
+        }
     }
 
     #[test]
@@ -533,7 +587,12 @@ mod tests {
                 RecoveryPolicy::RepeatableReadAndCompare,
             ),
             (
-                json!({"op":"deep-search","account":"me","query":"q"}),
+                json!({
+                    "op":"deep-search",
+                    "activity_id":"abcdefghijklmnopqrstuv",
+                    "continuation":"opaque",
+                    "candidates":[]
+                }),
                 RecoveryPolicy::RepeatableReadAndCompare,
             ),
             (

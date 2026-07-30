@@ -103,16 +103,29 @@ async function sendStream(res, scenario, turn) {
       untrusted: true,
     });
     await sleep(30);
+    const activityId = "abcdefghijklmnopqrstuv";
     sendSseMessage(res, {
       event: "partial_result",
+      schema_version: 1,
+      activity_id: activityId,
+      stage: "names",
+      sequence: 0,
       items: [{
+        result_key: "zyxwvutsrqponmlkjihgfe",
+        change: "add",
         service: "mail",
-        id: "mail-1",
-        remote_id: "mail-1",
-        path: "/Inbox/quarterly-brief.eml",
+        item_id: "mail-1",
         name: "Quarterly brief",
         item_type: "message",
+        display_path: "Inbox/Quarterly brief",
+        sender: null,
         snippet: "Source-backed fixture result.",
+        body_available: true,
+        source: {
+          service: "mail",
+          item_id: "mail-1",
+          label: "Quarterly brief",
+        },
       }],
     });
     await sleep(80);

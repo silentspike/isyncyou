@@ -4,6 +4,7 @@
 //!
 //! Currently: the per-item [`sync_state`] automaton and the [`conflict`] engine.
 
+pub mod bounded_archive_body;
 pub mod config;
 pub mod conflict;
 pub mod envelope;
