@@ -1,0 +1,39 @@
+{
+  "deep_search_semantic_digest": "7ldSb2hyBB3qrHJPuXAT5LvSUgaHMnpIeaPScDxjh-c",
+  "fixture_version": 1,
+  "objects": [
+    {
+      "ciphertext_sha256": "fecfd4c1a23c45eae91f690c372db9adf065d962556999bc17a70304d06817c3",
+      "file": "request-journal-v1.sealed",
+      "object_id": "request-journal-v1",
+      "plaintext_object_digest": "ESw_5oAS30YhkvMqFEXInPtQAoZiP36GNN125fbMQYs"
+    },
+    {
+      "ciphertext_sha256": "0978b378fe8b45ecbabdb92cb3dd65a7b91f34487320a1ec58af563b426c2f0a",
+      "file": "search-outcome-v1.sealed",
+      "object_id": "search-outcome-v1",
+      "plaintext_object_digest": "kCG5y7GX4Xy9uZf-Ji-wUop6hSsxLk15XLPWhMBpvK8"
+    },
+    {
+      "ciphertext_sha256": "b4c1a1ebdebcd83090df02467a0c75eb2ec18489ef7da8e5504451280c37045c",
+      "file": "deep-search-outcome-v1.sealed",
+      "object_id": "deep-search-outcome-v1",
+      "plaintext_object_digest": "L9wneZF5Bt5wTCHixhcGiY_pQbFMfwJ9peRiC8ANoA8"
+    },
+    {
+      "ciphertext_sha256": "101ec465e93e8d7fc5a633d210e0de8059568a746683e42136f1cb17d2ad3295",
+      "file": "read-checkpoint-v1.sealed",
+      "object_id": "read-checkpoint-v1",
+      "plaintext_object_digest": "8ryil2hAnI2l0hYFNAXIJrMk-2iRWM_BqMTN3-udiZM"
+    }
+  ],
+  "origin_commit": "5bf12dda5876545c6701c38fda2e5f52339c1795",
+  "rejected_help_schema_version": 1,
+  "rejected_help_sha256": "c32e472836f823d2470391579d9c8f065ffad1eb59f22d123a7daabde0c138bf",
+  "request_id": "00000000-0000-4000-8000-000000000643",
+  "search_semantic_digest": "6IE-Yfo0gIt9FKXayCjDdCpWHeYVw2AkM2xCoZgYSxo",
+  "session_id": "fixture-session",
+  "session_object_class": "request_state",
+  "test_key_id": "issue-643-fixed-fixture-key-v1",
+  "turn_id": "00000000000000000000000643"
+}
