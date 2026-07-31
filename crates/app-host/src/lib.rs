@@ -18760,6 +18760,7 @@ mod tests {
     ) -> (
         isyncyou_agent::ReadExecutionOutputV2,
         Vec<isyncyou_agent::StreamEvent>,
+        isyncyou_agent::TurnExitOutputV1,
     ) {
         let _guard = EnvelopeRequirementGuard::new();
         isyncyou_core::envelope::set_body_key(643_018, [18u8; 32]);
@@ -18774,10 +18775,27 @@ mod tests {
         store
             .index_body("me", "mail", "m-progress", "Progress body indexed text")
             .unwrap();
+        let mut candidate =
+            isyncyou_store::Item::new("me", "mail", "m-candidate", "Unmatched fixture", "message");
+        candidate.local_path = Some("mail/aa/m-candidate.eml".into());
+        store.upsert_item(&candidate).unwrap();
+        store
+            .index_body(
+                "me",
+                "mail",
+                "m-candidate",
+                "Semantically relevant candidate body",
+            )
+            .unwrap();
         drop(store);
         isyncyou_core::envelope::write_body_atomic(
             &root.join("mail/aa/m-progress.eml"),
             b"Progress body archived text",
+        )
+        .unwrap();
+        isyncyou_core::envelope::write_body_atomic(
+            &root.join("mail/aa/m-candidate.eml"),
+            b"Semantically relevant candidate body",
         )
         .unwrap();
 
@@ -18816,8 +18834,16 @@ mod tests {
                 },
             )
             .unwrap();
+        let finalization = executor
+            .finish_with_exit(
+                isyncyou_agent::TurnExitKind::ProviderError,
+                None,
+                Vec::new(),
+                &mut capture,
+            )
+            .unwrap();
         let _ = std::fs::remove_dir_all(root);
-        (output, events)
+        (output, events, finalization)
     }
 
     #[cfg(any(
@@ -18826,7 +18852,7 @@ mod tests {
     ))]
     #[test]
     fn product_agent_feature_uses_store_archive_progressive_executor() {
-        let (output, events) = product_progressive_executor_fixture("progressive-product-type");
+        let (output, events, _) = product_progressive_executor_fixture("progressive-product-type");
         assert!(matches!(
             output,
             isyncyou_agent::ReadExecutionOutputV2::Search(_)
@@ -18844,7 +18870,8 @@ mod tests {
     ))]
     #[test]
     fn product_bound_search_streams_stage_progress_and_partial_results() {
-        let (_output, events) = product_progressive_executor_fixture("progressive-product-events");
+        let (_output, events, _) =
+            product_progressive_executor_fixture("progressive-product-events");
         let public = events
             .iter()
             .map(agent_event_json)
@@ -18855,6 +18882,34 @@ mod tests {
         assert!(!public.contains("search_stage"));
         assert!(!public.contains("\"continuation\":"));
         assert!(!public.contains("candidate_key"));
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn product_bound_progressive_search_provider_error_closes_open_deep_stage() {
+        let (_output, events, finalization) =
+            product_progressive_executor_fixture("progressive-product-finalization");
+        let activity = finalization
+            .exit_state
+            .activities
+            .first()
+            .expect("progressive activity");
+
+        assert_eq!(
+            finalization.exit_state.exit_kind,
+            isyncyou_agent::TurnExitKind::ProviderError
+        );
+        assert_eq!(activity.deep_status, isyncyou_agent::StageStatus::Failed);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            isyncyou_agent::StreamEvent::StageProgress(progress)
+                if progress.stage == isyncyou_agent::SearchStage::Deep
+                    && progress.status == isyncyou_agent::StageStatus::Failed
+                    && progress.continuation_available == Some(false)
+        )));
     }
 
     #[cfg(any(

@@ -1739,6 +1739,17 @@ where
             _ => self.delegate.execute_read_with_context(action, context),
         }
     }
+
+    fn finish_with_exit(
+        &self,
+        exit: isyncyou_agent::TurnExitKind,
+        proposed_text: Option<String>,
+        assistant_sources: Vec<isyncyou_agent::SourceRef>,
+        events: &mut dyn isyncyou_agent::TurnEventSink,
+    ) -> Result<isyncyou_agent::TurnExitOutputV1, isyncyou_agent::AgentError> {
+        self.delegate
+            .finish_with_exit(exit, proposed_text, assistant_sources, events)
+    }
 }
 
 #[cfg(any(
