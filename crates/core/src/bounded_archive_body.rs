@@ -974,6 +974,41 @@ mod platform {
     }
 
     #[cfg(test)]
+    pub(super) fn install_test_owner_only_acl(path: &Path) -> Result<(), BoundedArchiveBodyError> {
+        use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
+        use windows_sys::Win32::Security::{AddAccessAllowedAceEx, InitializeAcl, ACL_REVISION};
+
+        let (_token, _user_buffer, user_sid) = process_user_sid()?;
+        let mut acl_storage = vec![0u32; 256];
+        let acl = acl_storage.as_mut_ptr().cast::<ACL>();
+        let acl_bytes = u32::try_from(acl_storage.len() * std::mem::size_of::<u32>())
+            .map_err(|_| BoundedArchiveBodyError::UnsafeMetadata)?;
+        if unsafe { InitializeAcl(acl, acl_bytes, ACL_REVISION) } == 0
+            || unsafe { AddAccessAllowedAceEx(acl, ACL_REVISION, 0, GENERIC_ALL_MASK, user_sid) }
+                == 0
+        {
+            return Err(BoundedArchiveBodyError::UnsafeMetadata);
+        }
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        wide.push(0);
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                user_sid,
+                null_mut(),
+                acl,
+                null_mut(),
+            )
+        };
+        if status != 0 {
+            return Err(BoundedArchiveBodyError::UnsafeMetadata);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(super) fn install_test_broad_object_allow_ace(
         path: &Path,
     ) -> Result<(), BoundedArchiveBodyError> {
@@ -1137,6 +1172,7 @@ mod windows_tests {
         std::fs::create_dir(root.path().join("mail")).unwrap();
         let relative = std::path::PathBuf::from("mail/body.bin");
         std::fs::write(root.path().join(&relative), bytes).unwrap();
+        platform::install_test_owner_only_acl(&root.path().join(&relative)).unwrap();
         (root, relative)
     }
 
