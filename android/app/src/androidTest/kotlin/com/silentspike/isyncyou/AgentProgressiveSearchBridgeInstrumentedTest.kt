@@ -1,5 +1,6 @@
 package com.silentspike.isyncyou
 
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -28,28 +29,33 @@ class AgentProgressiveSearchBridgeInstrumentedTest {
     }
 
     @Test
-    fun android_outbound_stream_wrapper_accepts_exact_72k_production_message() {
-        val emptyEvent = JSONObject().put("event", "token").put("text", "")
-        val emptyEnvelope = JSONObject()
-            .put("t", "evt")
-            .put("id", "stream")
-            .put("ev", emptyEvent)
-            .toString()
-        val paddingBytes = BridgeMessagePolicy.MAX_OUTBOUND_STREAM_MESSAGE_BYTES -
-            emptyEnvelope.toByteArray(Charsets.UTF_8).size
-        val exactEvent = JSONObject()
-            .put("event", "token")
-            .put("text", "x".repeat(paddingBytes))
-            .toString()
-        val encoded = BridgeMessagePolicy.outboundStreamEventJson("stream", exactEvent)
-        assertEquals(
-            BridgeMessagePolicy.MAX_OUTBOUND_STREAM_MESSAGE_BYTES,
-            encoded!!.toByteArray(Charsets.UTF_8).size,
+    fun android_outbound_stream_wrapper_accepts_maximum_valid_partial_result() {
+        val event = maximumValidPartialResult()
+        val encoded = BridgeMessagePolicy.outboundStreamEventJson("stream", event.toString())
+        assertTrue(encoded != null)
+        assertTrue(
+            encoded!!.toByteArray(Charsets.UTF_8).size <=
+                BridgeMessagePolicy.MAX_OUTBOUND_STREAM_MESSAGE_BYTES,
         )
+        assertEquals(20, JSONObject(encoded).getJSONObject("ev").getJSONArray("items").length())
     }
 
     @Test
-    fun android_outbound_stream_wrapper_rejects_one_over_without_partial_dispatch() {
+    fun android_outbound_stream_wrapper_rejects_partial_result_one_over_item_limit() {
+        val event = maximumValidPartialResult()
+        event.getJSONArray("items").put(event.getJSONArray("items").getJSONObject(0))
+        assertNull(BridgeMessagePolicy.outboundStreamEventJson("stream", event.toString()))
+    }
+
+    @Test
+    fun android_public_progress_rejects_body_excerpt_member() {
+        val event = maximumValidPartialResult()
+        event.getJSONArray("items").getJSONObject(0).put("snippet", "private body")
+        assertNull(BridgeMessagePolicy.outboundStreamEventJson("stream", event.toString()))
+    }
+
+    @Test
+    fun android_outbound_stream_wrapper_rejects_message_one_byte_over_limit() {
         val emptyEvent = JSONObject().put("event", "token").put("text", "")
         val emptyEnvelope = JSONObject()
             .put("t", "evt")
@@ -83,6 +89,26 @@ class AgentProgressiveSearchBridgeInstrumentedTest {
         )
     }
 
+    @Test
+    fun android_progress_accepts_failed_then_skipped_terminal_chain() {
+        val stages = listOf(
+            stage("names", "queued"),
+            stage("bodies", "queued"),
+            stage("deep", "queued"),
+            stage("names", "running"),
+            stage("names", "failed"),
+            stage("bodies", "skipped"),
+            stage("deep", "skipped"),
+        )
+        stages.forEach { event ->
+            assertTrue(BridgeMessagePolicy.outboundStreamEventJson("stream", event.toString()) != null)
+        }
+    }
+
+    private fun stage(name: String, status: String): JSONObject = validProgress()
+        .put("stage", name)
+        .put("status", status)
+
     private fun validProgress(): JSONObject = JSONObject()
         .put("event", "stage_progress")
         .put("schema_version", 1)
@@ -97,4 +123,38 @@ class AgentProgressiveSearchBridgeInstrumentedTest {
         .put("coverage_complete", JSONObject.NULL)
         .put("budget_reached", JSONObject.NULL)
         .put("continuation_available", JSONObject.NULL)
+
+    private fun maximumValidPartialResult(): JSONObject {
+        val items = JSONArray()
+        repeat(20) { index ->
+            val name = "n".repeat(192)
+            val itemId = "i".repeat(509) + "%03d".format(index)
+            items.put(
+                JSONObject()
+                    .put("result_key", "A".repeat(19) + "%03d".format(index))
+                    .put("change", "add")
+                    .put("service", "mail")
+                    .put("item_id", itemId)
+                    .put("name", name)
+                    .put("item_type", "m".repeat(64))
+                    .put("display_path", "p".repeat(768))
+                    .put("sender", "s".repeat(256))
+                    .put("body_available", true)
+                    .put(
+                        "source",
+                        JSONObject()
+                            .put("service", "mail")
+                            .put("item_id", itemId)
+                            .put("label", name),
+                    ),
+            )
+        }
+        return JSONObject()
+            .put("event", "partial_result")
+            .put("schema_version", 1)
+            .put("activity_id", "A".repeat(22))
+            .put("stage", "deep")
+            .put("sequence", 0)
+            .put("items", items)
+    }
 }

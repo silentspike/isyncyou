@@ -6192,12 +6192,11 @@ function renderAgentCitationBar(sources) {
 function asstResultCard(it) {
   const source = normalizeAgentSource(it) || { service: it.service, id: it.id, path: it.path || "", name: it.name || "", item_type: it.item_type || it.service };
   const viewQ = sourceViewQuery(source);
-  const snip = (it.snippet || "").trim();
   const head = el("div", { class: "asst-result-head" },
     el("span", { class: "asst-result-ic", style: `--svc:var(--svc-${it.service})` }, icon(asstSvcIcon(it.service), "icon-sm")),
     el("div", { class: "asst-result-main grow" },
       el("div", { class: "asst-result-name truncate", text: it.name || "(no name)" }),
-      el("div", { class: "asst-result-sub truncate", text: snip || (it.item_type || it.service) })),
+      el("div", { class: "asst-result-sub truncate", text: it.item_type || it.service })),
     el("span", { class: "asst-result-type", text: it.item_type || it.service }),
     el("span", { class: "asst-result-caret" }, icon("chevron-down", "icon-sm")));
   const panel = el("div", { class: "asst-result-panel" });
@@ -6529,7 +6528,6 @@ function canonicalPartialResultEvent(event) {
       item_type: item.item_type,
       display_path: item.display_path,
       sender: item.sender,
-      snippet: item.snippet,
       body_available: item.body_available,
       source: {
         service: item.source.service,
@@ -6573,7 +6571,7 @@ function validAgentPublicSource(source, service, itemId, name) {
 function validAgentPublicResult(item) {
   const keys = new Set([
     "result_key", "change", "service", "item_id", "name", "item_type",
-    "display_path", "sender", "snippet", "body_available", "source",
+    "display_path", "sender", "body_available", "source",
   ]);
   if (!hasOnlyAgentKeys(item, keys)
       || !AGENT_ACTIVITY_ID.test(item.result_key || "")
@@ -6587,8 +6585,6 @@ function validAgentPublicResult(item) {
       && !validAgentProgressText(item.display_path, 768)) return false;
   if (item.sender !== null && item.sender !== undefined
       && !validAgentProgressText(item.sender, 256)) return false;
-  if (item.snippet !== null && item.snippet !== undefined
-      && !validAgentProgressText(item.snippet, 1200)) return false;
   return validAgentPublicSource(item.source, item.service, item.item_id, item.name);
 }
 
@@ -6629,13 +6625,19 @@ async function acceptAgentActivityEvent(protocol, event) {
         || ![null, true, false].includes(event.continuation_available)
         || activity.stageUpdates >= AGENT_PROGRESS_MAX_STAGE_UPDATES) return "invalid";
     const stageIndex = AGENT_PROGRESS_STAGES.indexOf(event.stage);
-    for (let i = 0; i < stageIndex; i += 1) {
-      const prior = activity.stages.get(AGENT_PROGRESS_STAGES[i]);
-      if (!["complete", "skipped"].includes(prior)) return "invalid";
+    const priorStatuses = AGENT_PROGRESS_STAGES.slice(0, stageIndex)
+      .map(stage => activity.stages.get(stage));
+    if (event.status === "queued") {
+      if (priorStatuses.some(status => status === undefined)) return "invalid";
+    } else if (event.status === "running") {
+      if (priorStatuses.some(status => status !== "complete")) return "invalid";
+    } else if (priorStatuses.some(status => !AGENT_PROGRESS_TERMINAL.has(status))) {
+      return "invalid";
     }
     const previous = activity.stages.get(event.stage);
+    if (!previous && event.status !== "queued") return "invalid";
     if (previous && AGENT_PROGRESS_TERMINAL.has(previous) && previous !== event.status) return "invalid";
-    if (previous === "queued" && !["queued", "running", "skipped", "cancelled"].includes(event.status)) return "invalid";
+    if (previous === "queued" && !["queued", "running", "failed", "skipped", "cancelled"].includes(event.status)) return "invalid";
     if (previous === "running" && event.status === "queued") return "invalid";
     activity.stageUpdates += 1;
     activity.stages.set(event.stage, event.status);

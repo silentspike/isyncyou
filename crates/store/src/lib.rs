@@ -44,6 +44,16 @@ pub enum StoreError {
     InvalidProgressiveSearch(String),
 }
 
+impl StoreError {
+    pub fn is_progressive_interrupted(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::OperationInterrupted
+        )
+    }
+}
+
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 const PROGRESSIVE_QUERY_MAX_PAGE: u32 = 200;
@@ -3242,6 +3252,7 @@ mod tests {
             error,
             StoreError::Sqlite(rusqlite::Error::SqliteFailure(_, _))
         ));
+        assert!(error.is_progressive_interrupted());
         assert!(callbacks.load(Ordering::SeqCst) > 0);
     }
 

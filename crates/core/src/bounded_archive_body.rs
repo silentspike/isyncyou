@@ -81,6 +81,34 @@ fn decode_bounded(raw: Vec<u8>, physical_len: u64) -> Result<Vec<u8>, BoundedArc
     Ok(raw)
 }
 
+fn validated_physical_limit(
+    prefix: &[u8],
+    physical_len: u64,
+) -> Result<u64, BoundedArchiveBodyError> {
+    if prefix.starts_with(BODY_ENVELOPE_MAGIC) {
+        let header = parse_envelope_header_v1(
+            prefix
+                .get(..BODY_ENVELOPE_HEADER_LEN)
+                .ok_or(BoundedArchiveBodyError::MalformedEnvelope)?,
+            true,
+        )
+        .map_err(|_| BoundedArchiveBodyError::MalformedEnvelope)?;
+        if header.plaintext_len > MAX_DEEP_PLAINTEXT_BYTES
+            || header.expected_envelope_len > MAX_DEEP_ENVELOPE_BYTES
+        {
+            return Err(BoundedArchiveBodyError::TooLarge);
+        }
+        if header.expected_envelope_len != physical_len {
+            return Err(BoundedArchiveBodyError::MalformedEnvelope);
+        }
+        Ok(MAX_DEEP_ENVELOPE_BYTES)
+    } else if physical_len > MAX_DEEP_PLAINTEXT_BYTES {
+        Err(BoundedArchiveBodyError::TooLarge)
+    } else {
+        Ok(MAX_DEEP_PLAINTEXT_BYTES)
+    }
+}
+
 #[cfg(unix)]
 mod platform {
     use super::*;
@@ -260,21 +288,14 @@ mod platform {
         physical_len: u64,
         should_interrupt: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<Vec<u8>, BoundedArchiveBodyError> {
-        let mut magic = [0u8; 4];
+        let mut prefix = [0u8; BODY_ENVELOPE_HEADER_LEN];
         // SAFETY: the descriptor and destination buffer are valid for this call.
         let prefix_read =
-            unsafe { libc::pread(fd.as_raw_fd(), magic.as_mut_ptr().cast(), magic.len(), 0) };
+            unsafe { libc::pread(fd.as_raw_fd(), prefix.as_mut_ptr().cast(), prefix.len(), 0) };
         if prefix_read < 0 {
             return Err(BoundedArchiveBodyError::Io);
         }
-        let maximum = if prefix_read == magic.len() as isize && magic == *BODY_ENVELOPE_MAGIC {
-            MAX_DEEP_ENVELOPE_BYTES
-        } else {
-            MAX_DEEP_PLAINTEXT_BYTES
-        };
-        if physical_len > maximum {
-            return Err(BoundedArchiveBodyError::TooLarge);
-        }
+        let maximum = validated_physical_limit(&prefix[..prefix_read as usize], physical_len)?;
         let capacity =
             usize::try_from(physical_len).map_err(|_| BoundedArchiveBodyError::TooLarge)?;
         let mut bytes = Vec::with_capacity(capacity);
@@ -525,9 +546,9 @@ mod platform {
         PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        ReadFile, DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-        FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA,
-        READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+        ReadFile, SetFilePointerEx, DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_BEGIN, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_WRITE_DATA, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -887,17 +908,34 @@ mod platform {
         physical_len: u64,
         should_interrupt: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<Vec<u8>, BoundedArchiveBodyError> {
-        if physical_len > MAX_DEEP_ENVELOPE_BYTES {
-            return Err(BoundedArchiveBodyError::TooLarge);
+        let mut prefix = [0u8; BODY_ENVELOPE_HEADER_LEN];
+        let mut prefix_read = 0u32;
+        // SAFETY: the synchronous handle is live and prefix is writable.
+        if unsafe {
+            ReadFile(
+                handle,
+                prefix.as_mut_ptr(),
+                prefix.len() as u32,
+                &mut prefix_read,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(BoundedArchiveBodyError::Io);
         }
+        // SAFETY: rewinds the same synchronous handle; no path is reopened.
+        if unsafe { SetFilePointerEx(handle, 0, null_mut(), FILE_BEGIN) } == 0 {
+            return Err(BoundedArchiveBodyError::Io);
+        }
+        let maximum = validated_physical_limit(&prefix[..prefix_read as usize], physical_len)?;
         let capacity =
             usize::try_from(physical_len).map_err(|_| BoundedArchiveBodyError::TooLarge)?;
         let mut bytes = Vec::with_capacity(capacity);
-        while bytes.len() as u64 <= MAX_DEEP_ENVELOPE_BYTES {
+        while bytes.len() as u64 <= maximum {
             if should_interrupt() {
                 return Err(BoundedArchiveBodyError::Cancelled);
             }
-            let remaining = MAX_DEEP_ENVELOPE_BYTES
+            let remaining = maximum
                 .checked_add(1)
                 .and_then(|limit| limit.checked_sub(bytes.len() as u64))
                 .ok_or(BoundedArchiveBodyError::TooLarge)?;
@@ -927,7 +965,7 @@ mod platform {
                 break;
             }
             bytes.extend_from_slice(&chunk[..read as usize]);
-            if bytes.len() as u64 > MAX_DEEP_ENVELOPE_BYTES {
+            if bytes.len() as u64 > maximum {
                 return Err(BoundedArchiveBodyError::TooLarge);
             }
         }
@@ -1008,6 +1046,19 @@ mod windows_tests {
             read_bounded_archive_body(&junction, Path::new("mail/body.bin"), &|| false),
             Err(BoundedArchiveBodyError::InvalidRoot)
         );
+
+        let configured_root = junction.join("configured-root");
+        std::fs::create_dir(target.path().join("configured-root")).unwrap();
+        std::fs::create_dir(target.path().join("configured-root/mail")).unwrap();
+        std::fs::write(
+            target.path().join("configured-root/mail/body.bin"),
+            b"secret",
+        )
+        .unwrap();
+        assert!(matches!(
+            read_bounded_archive_body(&configured_root, Path::new("mail/body.bin"), &|| false),
+            Err(BoundedArchiveBodyError::InvalidRoot | BoundedArchiveBodyError::UnsafeComponent)
+        ));
 
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("mail")).unwrap();

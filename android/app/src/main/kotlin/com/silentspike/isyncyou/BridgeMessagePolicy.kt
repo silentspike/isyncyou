@@ -225,7 +225,6 @@ object BridgeMessagePolicy {
                     "item_type",
                     "display_path",
                     "sender",
-                    "snippet",
                     "body_available",
                     "source",
                 ),
@@ -247,7 +246,6 @@ object BridgeMessagePolicy {
             !boundedRequiredString(itemType, 64) ||
             !nullableBoundedString(item, "display_path", 768) ||
             !nullableBoundedString(item, "sender", 256) ||
-            !nullableBoundedString(item, "snippet", 1_200) ||
             item.opt("body_available") !is Boolean
         ) {
             return false

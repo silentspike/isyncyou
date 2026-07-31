@@ -52,6 +52,8 @@ FORBIDDEN_PROGRESS_KEYS = {
     "provider_content",
     "body_rel_path",
     "local_path",
+    "snippet",
+    "excerpt",
 }
 OTHER_EVENTS = {
     "progress",
@@ -179,7 +181,6 @@ def valid_result(value: object) -> bool:
         "item_type",
         "display_path",
         "sender",
-        "snippet",
         "body_available",
         "source",
     }
@@ -199,7 +200,6 @@ def valid_result(value: object) -> bool:
         or not valid_text(value.get("item_type"), 64)
         or not valid_display_path(value.get("display_path"))
         or not valid_text(value.get("sender"), 256, optional=True)
-        or not valid_text(value.get("snippet"), 1200, optional=True)
         or type(value.get("body_available")) is not bool
     ):
         return False
@@ -213,6 +213,7 @@ class ActivityState:
     partial_updates: int = 0
     next_sequence: int = 0
     result_keys: set[str] = field(default_factory=set)
+    result_keys_by_stage: dict[str, set[str]] = field(default_factory=dict)
     replay_digests: dict[int, str] = field(default_factory=dict)
 
 
@@ -314,17 +315,24 @@ class ProgressiveReducer:
         stage = str(event["stage"])
         status = str(event["status"])
         stage_index = STAGES.index(stage)
-        if any(
-            state.stages.get(prior) not in {"complete", "skipped"}
-            for prior in STAGES[:stage_index]
-        ):
+        prior_statuses = [state.stages.get(prior) for prior in STAGES[:stage_index]]
+        if status == "queued":
+            ordered = all(prior is not None for prior in prior_statuses)
+        elif status == "running":
+            ordered = all(prior == "complete" for prior in prior_statuses)
+        else:
+            ordered = all(prior in TERMINAL_STAGE_STATUSES for prior in prior_statuses)
+        if not ordered:
             raise ProbeError("stage_order_invalid")
         previous = state.stages.get(stage)
+        if previous is None and status != "queued":
+            raise ProbeError("stage_transition_invalid")
         if previous in TERMINAL_STAGE_STATUSES and previous != status:
             raise ProbeError("stage_transition_invalid")
         if previous == "queued" and status not in {
             "queued",
             "running",
+            "failed",
             "skipped",
             "cancelled",
         }:
@@ -394,6 +402,7 @@ class ProgressiveReducer:
             ):
                 raise ProbeError("result_change_invalid")
             next_keys.add(result_key)
+            state.result_keys_by_stage.setdefault(stage, set()).add(result_key)
             if len(next_keys) > MAX_RESULTS:
                 raise ProbeError("result_limit")
             source = item["source"]
@@ -491,14 +500,13 @@ def validate_scripted_fixture(document: dict[str, object]) -> dict[str, object]:
     events = document.get("events")
     if (
         not isinstance(script, dict)
-        or set(script) != {"selected_result_keys", "keywordless_selection"}
+        or set(script) != {"selected_result_keys"}
         or not isinstance(script.get("selected_result_keys"), list)
         or not script["selected_result_keys"]
         or any(
             not isinstance(value, str) or not ACTIVITY_ID_RE.fullmatch(value)
             for value in script["selected_result_keys"]
         )
-        or type(script.get("keywordless_selection")) is not bool
         or not isinstance(resolutions, dict)
         or any(
             not isinstance(key, str)
@@ -520,7 +528,20 @@ def validate_scripted_fixture(document: dict[str, object]) -> dict[str, object]:
         raise ProbeError("source_resolution_incomplete")
     report["all_sources_resolved"] = bool(resolutions) and all(resolutions.values())
     report["scripted_selection_count"] = len(selected)
-    report["keywordless_selection_observed"] = script["keywordless_selection"]
+    keyword_keys = {
+        key
+        for activity in reducer.activities.values()
+        for stage in ("names", "bodies")
+        for key in activity.result_keys_by_stage.get(stage, set())
+    }
+    deep_keys = {
+        key
+        for activity in reducer.activities.values()
+        for key in activity.result_keys_by_stage.get("deep", set())
+    }
+    report["keywordless_selection_observed"] = selected.issubset(deep_keys - keyword_keys)
+    if not report["keywordless_selection_observed"]:
+        raise ProbeError("scripted_selection_not_keywordless")
     return report
 
 

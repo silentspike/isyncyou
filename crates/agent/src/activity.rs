@@ -11,7 +11,6 @@ pub const MAX_RESULT_NAME_BYTES: usize = 192;
 pub const MAX_SENDER_BYTES: usize = 256;
 pub const MAX_ITEM_ID_BYTES: usize = 512;
 pub const MAX_DISPLAY_PATH_BYTES: usize = 768;
-pub const MAX_SNIPPET_BYTES: usize = 1_200;
 pub const MAX_ITEM_TYPE_BYTES: usize = 64;
 pub const MAX_PARTIAL_RESULT_ITEMS: usize = 20;
 pub const MAX_PUBLIC_COUNTER: u32 = 1_000_000;
@@ -197,7 +196,6 @@ pub struct SearchResultPublicV1 {
     pub item_type: String,
     pub display_path: Option<String>,
     pub sender: Option<String>,
-    pub snippet: Option<String>,
     pub body_available: bool,
     pub source: SourceRef,
 }
@@ -221,11 +219,6 @@ impl SearchResultPublicV1 {
                 .is_some_and(|path| !valid_display_path(path))
             || self.sender.as_ref().is_some_and(|sender| {
                 sender.is_empty() || sender.len() > MAX_SENDER_BYTES || has_forbidden_text(sender)
-            })
-            || self.snippet.as_ref().is_some_and(|snippet| {
-                snippet.is_empty()
-                    || snippet.len() > MAX_SNIPPET_BYTES
-                    || has_forbidden_text(snippet)
             })
             || self.source.service != self.service
             || self.source.item_id != self.item_id
@@ -390,7 +383,6 @@ mod tests {
             item_type: "message".into(),
             display_path: Some("Inbox/Reports".into()),
             sender: None,
-            snippet: Some("Summary text".into()),
             body_available: true,
             source: source(),
         }
@@ -491,7 +483,7 @@ mod tests {
         assert_eq!(too_many.validate(), Err(ActivityError::InvalidEvent));
 
         let mut too_large = valid;
-        too_large.items[0].snippet = Some("x".repeat(MAX_SNIPPET_BYTES + 1));
+        too_large.items[0].name = "x".repeat(MAX_RESULT_NAME_BYTES + 1);
         assert_eq!(too_large.validate(), Err(ActivityError::InvalidEvent));
     }
 

@@ -9,7 +9,7 @@ pub const MAX_CONTINUATION_ASCII_BYTES: usize = 1_024;
 pub const MAX_CONTINUATION_PAYLOAD_BYTES: usize = 640;
 pub const MAX_CANDIDATES_PER_PAGE: usize = 64;
 pub const MAX_SELECTED_CANDIDATES: usize = 12;
-pub const MAX_METADATA_SCANNED: u32 = 16_000;
+pub const MAX_METADATA_SCANNED: u32 = 1_000;
 
 const SERVICES: [&str; 6] = [
     "mail", "calendar", "contacts", "todo", "onenote", "onedrive",

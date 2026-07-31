@@ -104,6 +104,28 @@ async function sendStream(res, scenario, turn) {
     });
     await sleep(30);
     const activityId = "abcdefghijklmnopqrstuv";
+    for (const [stage, status] of [
+      ["names", "queued"],
+      ["bodies", "queued"],
+      ["deep", "queued"],
+      ["names", "running"],
+    ]) {
+      sendSseMessage(res, {
+        event: "stage_progress",
+        schema_version: 1,
+        activity_id: activityId,
+        activity_kind: "archive_search",
+        stage,
+        status,
+        scanned: 0,
+        total: null,
+        hits: 0,
+        current_item: null,
+        coverage_complete: null,
+        budget_reached: null,
+        continuation_available: null,
+      });
+    }
     sendSseMessage(res, {
       event: "partial_result",
       schema_version: 1,
@@ -119,7 +141,6 @@ async function sendStream(res, scenario, turn) {
         item_type: "message",
         display_path: "Inbox/Quarterly brief",
         sender: null,
-        snippet: "Source-backed fixture result.",
         body_available: true,
         source: {
           service: "mail",
@@ -128,10 +149,74 @@ async function sendStream(res, scenario, turn) {
         },
       }],
     });
+    sendSseMessage(res, {
+      event: "stage_progress",
+      schema_version: 1,
+      activity_id: activityId,
+      activity_kind: "archive_search",
+      stage: "names",
+      status: "complete",
+      scanned: 1,
+      total: null,
+      hits: 1,
+      current_item: "Quarterly brief",
+      coverage_complete: true,
+      budget_reached: false,
+      continuation_available: false,
+    });
+    for (const stage of ["bodies", "deep"]) {
+      for (const status of ["running", "complete"]) {
+        sendSseMessage(res, {
+          event: "stage_progress",
+          schema_version: 1,
+          activity_id: activityId,
+          activity_kind: "archive_search",
+          stage,
+          status,
+          scanned: stage === "bodies" ? 1 : 0,
+          total: null,
+          hits: 1,
+          current_item: status === "running" ? "Quarterly brief" : null,
+          coverage_complete: status === "complete" ? true : null,
+          budget_reached: status === "complete" ? false : null,
+          continuation_available: status === "complete" ? false : null,
+        });
+      }
+    }
     await sleep(80);
     sendSseMessage(res, { event: "token", text: "a source-backed answer." });
     await sleep(30);
     sendSseMessage(res, { event: "done", reason: "complete" });
+  } else if (scenario === "progressive-failure") {
+    const activityId = "zyxwvutsrqponmlkjihgfe";
+    for (const [stage, status] of [
+      ["names", "queued"],
+      ["bodies", "queued"],
+      ["deep", "queued"],
+      ["names", "running"],
+      ["names", "failed"],
+      ["bodies", "skipped"],
+      ["deep", "skipped"],
+    ]) {
+      sendSseMessage(res, {
+        event: "stage_progress",
+        schema_version: 1,
+        activity_id: activityId,
+        activity_kind: "archive_search",
+        stage,
+        status,
+        scanned: 0,
+        total: null,
+        hits: 0,
+        current_item: null,
+        coverage_complete: status === "failed" || status === "skipped" ? false : null,
+        budget_reached: status === "failed" || status === "skipped" ? false : null,
+        continuation_available: status === "failed" || status === "skipped" ? false : null,
+      });
+    }
+    sendSseMessage(res, { event: "error", message: "progressive_search_failed" });
+    await sleep(30);
+    sendSseMessage(res, { event: "done", reason: "error" });
   } else if (scenario === "error") {
     sendSseMessage(res, { event: "error", message: "raw-fixture-provider-error" });
     await sleep(30);
@@ -397,7 +482,8 @@ function makeFixtureServer(evidence) {
         const prompt = body.prompt || "";
         const turn = `turn-${++turnSeq}`;
         const lower = prompt.toLowerCase();
-        const scenario = lower.includes("slow cancellation") ? "slow-cancel"
+        const scenario = lower.includes("progressive failure") ? "progressive-failure"
+          : lower.includes("slow cancellation") ? "slow-cancel"
           : lower.includes("error") ? "error"
           : lower.includes("cancel") ? "pending-cancel"
             : lower.includes("delete") || lower.includes("confirm") ? "pending-confirm"
@@ -926,6 +1012,20 @@ async function main() {
     assert(evidence, "first token appears incrementally", firstTokenText.includes("Here is ") && !firstTokenText.includes("a source-backed answer."));
     await page.waitForFunction(() => document.body.innerText.includes("a source-backed answer."), null, { timeout: 10000 });
     await page.waitForSelector('[data-agent-citation="view"]', { timeout: 10000 });
+    const searchStageLabels = await page.locator('.asst-search .asst-stage').allInnerTexts();
+    const publicResultText = await page.locator('.asst-results .asst-result').allInnerTexts();
+    assert(evidence, "progressive search renders the ordered three-stage plan",
+      searchStageLabels.length === 3
+      && searchStageLabels[0].includes("Fast search")
+      && searchStageLabels[1].includes("Full-text")
+      && searchStageLabels[2].includes("AI deep-read"),
+      searchStageLabels);
+    assert(evidence, "progressive result projection excludes body excerpts and protocol errors",
+      publicResultText.length === 1
+      && publicResultText[0].includes("Quarterly brief")
+      && !publicResultText[0].includes("private body")
+      && !(await pageText(page)).includes("Invalid search progress was ignored."),
+      publicResultText);
     const toolCallText = await page.locator('[data-agent-tool-row="tool_call"]').first().innerText();
     assert(evidence, "tool call UI uses product copy and hides internal operation fields",
       toolCallText === "Searching your Microsoft 365 archive"
@@ -949,6 +1049,17 @@ async function main() {
     assert(evidence, "citation click opens fixture view", popup.url().startsWith(`${origin}/api/v1/view?`), { popup: popup.url() });
     await popup.close();
     evidence.screenshots.stream_citations = await screenshot(page, "stream-citations.png");
+
+    await page.locator('[data-testid="agent-input"]').fill("Run progressive failure fixture");
+    await page.locator('[data-testid="agent-send"]').click();
+    await page.waitForFunction(() => document.body.innerText.includes("Turn ended with an error"), null, { timeout: 10000 });
+    const failedStages = await page.locator('.asst-search .asst-stage').allInnerTexts();
+    assert(evidence, "failed progressive search closes later stages without protocol rejection",
+      failedStages.some((label) => label.includes("Fast search"))
+      && failedStages.some((label) => label.includes("Full-text"))
+      && failedStages.some((label) => label.includes("AI deep-read"))
+      && !(await pageText(page)).includes("Invalid search progress was ignored."),
+      failedStages);
 
     fixture.seedSelectedSessionHistory();
     await page.goto(`${origin}/?session-hydration-smoke=1#/assistant`, { waitUntil: "domcontentloaded" });
@@ -1140,7 +1251,7 @@ async function main() {
     assert(evidence, "no page errors", evidence.page_errors.length === 0, evidence.page_errors);
     assert(evidence, "no non-fixture-origin WebView requests", evidence.non_fixture_origin_requests.length === 0, evidence.non_fixture_origin_requests);
     assert(evidence, "fixture routes complete", evidence.fixture404.length === 0 && evidence.fixtureErrors.length === 0, { fixture404: evidence.fixture404, fixtureErrors: evidence.fixtureErrors });
-    assert(evidence, "normal pending error and cancellation streams exercised", ["normal", "slow-cancel", "pending-confirm", "pending-cancel", "error"].every((s) => fixture.state.streamScenarios.some((row) => row.scenario === s)), fixture.state.streamScenarios);
+    assert(evidence, "normal progressive-failure pending error and cancellation streams exercised", ["normal", "progressive-failure", "slow-cancel", "pending-confirm", "pending-cancel", "error"].every((s) => fixture.state.streamScenarios.some((row) => row.scenario === s)), fixture.state.streamScenarios);
 
     evidence.fixture_state = fixture.state;
     evidence.ok = true;

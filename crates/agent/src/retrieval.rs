@@ -9,7 +9,7 @@ use crate::activity::{
     ProgressiveActivityExitV1, ProgressiveActivityFinalizationV1, ProgressiveExitStateV1,
     ProgressiveFinalizationV1, ResultChange, SearchResultPublicV1, SearchStage, StageProgressV1,
     StageStatus, TurnExitKind, ACTIVITY_SCHEMA_VERSION, MAX_PARTIAL_RESULT_ITEMS,
-    MAX_PUBLIC_COUNTER, MAX_RESULT_NAME_BYTES, MAX_SNIPPET_BYTES,
+    MAX_PUBLIC_COUNTER, MAX_RESULT_NAME_BYTES,
 };
 use crate::archive::{
     ArchiveItemPrivateV1, ArchiveSearchSnapshot, ArchiveSource, BodyFtsHit, ItemRef,
@@ -28,7 +28,7 @@ use crate::AgentError;
 use base64::Engine as _;
 use ring::rand::SecureRandom as _;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const INCOMPLETE_COVERAGE_NOTE: &str =
@@ -53,6 +53,9 @@ pub const DEFAULT_DEEP_READS: u32 = 12;
 /// Hard cap on a deep-search pass regardless of the model's `max_reads`.
 pub const MAX_DEEP_READS: u32 = 40;
 pub const MAX_DEEP_TOOL_DURATION: Duration = Duration::from_secs(10);
+pub const MAX_METADATA_SCAN_DURATION: Duration = Duration::from_secs(2);
+pub const METADATA_PROGRESS_RECORD_INTERVAL: u32 = 25;
+pub const METADATA_PROGRESS_TIME_INTERVAL: Duration = Duration::from_millis(250);
 pub const MAX_KEYWORD_PROVIDER_ITEMS: usize = 64;
 pub const MAX_KEYWORD_PROVIDER_BYTES: usize = 96 * 1_024;
 pub const MAX_ACTIVITY_PROVIDER_BYTES: usize = 192 * 1_024;
@@ -63,6 +66,7 @@ pub const MAX_PARTIAL_EVENTS_PER_ACTIVITY: u16 = 64;
 pub const MAX_PUBLIC_PARTIAL_BYTES_PER_ACTIVITY: usize = 512 * 1_024;
 pub const MAX_CANDIDATE_PROVIDER_BYTES: usize = 24 * 1_024;
 pub const MAX_DEEP_PROVIDER_BYTES: usize = 64 * 1_024;
+pub const MAX_PROVIDER_PRIVATE_SNIPPET_BYTES: usize = 1_200;
 pub const MAX_DEEP_EXCERPT_BYTES: usize = 1_200;
 pub const MAX_VISIBLE_RESULTS: usize = 200;
 pub const MAX_KEYWORD_RESULTS: usize = 160;
@@ -76,6 +80,153 @@ pub const SCANNABLE_SERVICES: &[&str] = &[
 pub struct RetrievalExecutor<A: ArchiveSource> {
     source: A,
     progressive: Mutex<ProgressiveTurnState>,
+    clock: Arc<dyn ProgressiveClock>,
+}
+
+pub trait ProgressiveClock: Send + Sync {
+    fn now(&self) -> Instant;
+}
+
+struct SystemProgressiveClock;
+
+impl ProgressiveClock for SystemProgressiveClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+#[derive(Default)]
+struct MetadataScanState {
+    active_since: Option<Instant>,
+    elapsed: Duration,
+    scanned_this_call: u32,
+}
+
+struct ProgressiveCallTiming {
+    clock: Arc<dyn ProgressiveClock>,
+    cancellation: crate::CancellationToken,
+    overall_deadline: Instant,
+    metadata: Arc<Mutex<MetadataScanState>>,
+}
+
+struct MetadataScanGuard<'a> {
+    timing: &'a ProgressiveCallTiming,
+}
+
+impl Drop for MetadataScanGuard<'_> {
+    fn drop(&mut self) {
+        self.timing.pause_metadata_scan();
+    }
+}
+
+impl ProgressiveCallTiming {
+    fn new(clock: Arc<dyn ProgressiveClock>, cancellation: &crate::CancellationToken) -> Self {
+        let overall_deadline = clock.now() + MAX_DEEP_TOOL_DURATION;
+        Self {
+            clock,
+            cancellation: cancellation.clone(),
+            overall_deadline,
+            metadata: Arc::new(Mutex::new(MetadataScanState::default())),
+        }
+    }
+
+    fn store_deadline(&self) -> StoreSearchDeadline {
+        let clock = Arc::clone(&self.clock);
+        let cancellation = self.cancellation.clone();
+        let overall_deadline = self.overall_deadline;
+        let metadata = Arc::clone(&self.metadata);
+        StoreSearchDeadline::new(move || {
+            if cancellation.is_cancelled() || clock.now() >= overall_deadline {
+                return true;
+            }
+            let Ok(state) = metadata.lock() else {
+                return true;
+            };
+            state.active_since.is_some_and(|started| {
+                state
+                    .elapsed
+                    .saturating_add(clock.now().saturating_duration_since(started))
+                    >= MAX_METADATA_SCAN_DURATION
+            })
+        })
+    }
+
+    fn ensure_overall_active(&self) -> Result<(), AgentError> {
+        if self.cancellation.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+        if self.clock.now() >= self.overall_deadline {
+            return Err(AgentError::Provider(
+                "progressive_search_deadline_reached".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn metadata_scan(&self) -> Result<MetadataScanGuard<'_>, AgentError> {
+        self.ensure_overall_active()?;
+        let mut state = self
+            .metadata
+            .lock()
+            .map_err(|_| AgentError::Provider("progressive_clock_unavailable".into()))?;
+        if state.active_since.is_none() {
+            state.active_since = Some(self.clock.now());
+        }
+        drop(state);
+        Ok(MetadataScanGuard { timing: self })
+    }
+
+    fn pause_metadata_scan(&self) {
+        let Ok(mut state) = self.metadata.lock() else {
+            return;
+        };
+        if let Some(started) = state.active_since.take() {
+            state.elapsed = state
+                .elapsed
+                .saturating_add(self.clock.now().saturating_duration_since(started));
+        }
+    }
+
+    fn metadata_exhausted(&self) -> Result<bool, AgentError> {
+        let state = self
+            .metadata
+            .lock()
+            .map_err(|_| AgentError::Provider("progressive_clock_unavailable".into()))?;
+        let elapsed = state.elapsed.saturating_add(
+            state
+                .active_since
+                .map(|started| self.clock.now().saturating_duration_since(started))
+                .unwrap_or_default(),
+        );
+        Ok(
+            state.scanned_this_call >= MAX_METADATA_SCANNED
+                || elapsed >= MAX_METADATA_SCAN_DURATION,
+        )
+    }
+
+    fn record_metadata(&self) -> Result<(), AgentError> {
+        let mut state = self
+            .metadata
+            .lock()
+            .map_err(|_| AgentError::Provider("progressive_clock_unavailable".into()))?;
+        state.scanned_this_call = state
+            .scanned_this_call
+            .checked_add(1)
+            .ok_or_else(|| AgentError::Provider("progressive_counter_overflow".into()))?;
+        Ok(())
+    }
+
+    fn metadata_remaining(&self) -> Result<u32, AgentError> {
+        let state = self
+            .metadata
+            .lock()
+            .map_err(|_| AgentError::Provider("progressive_clock_unavailable".into()))?;
+        Ok(MAX_METADATA_SCANNED.saturating_sub(state.scanned_this_call))
+    }
+
+    fn now(&self) -> Instant {
+        self.clock.now()
+    }
 }
 
 #[derive(Default)]
@@ -185,6 +336,7 @@ struct CandidatePage {
     next_offset: u32,
     has_more: bool,
     budget_reached: bool,
+    last_current_item: Option<String>,
 }
 
 struct StagedReadResult {
@@ -207,9 +359,14 @@ impl std::ops::Deref for StagedReadResult {
 
 impl<A: ArchiveSource> RetrievalExecutor<A> {
     pub fn new(source: A) -> Self {
+        Self::with_progressive_clock(source, Arc::new(SystemProgressiveClock))
+    }
+
+    pub fn with_progressive_clock(source: A, clock: Arc<dyn ProgressiveClock>) -> Self {
         Self {
             source,
             progressive: Mutex::new(ProgressiveTurnState::default()),
+            clock,
         }
     }
 
@@ -273,7 +430,6 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         activity_id: &str,
         item: &ItemRef,
         change: ResultChange,
-        snippet: Option<&str>,
     ) -> SearchResultPublicV1 {
         let name = truncate_collapsed(&item.name, MAX_RESULT_NAME_BYTES);
         SearchResultPublicV1 {
@@ -285,9 +441,6 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             item_type: truncate_collapsed(&item.item_type, 64),
             display_path: None,
             sender: None,
-            snippet: snippet
-                .map(|value| truncate_collapsed(value, MAX_SNIPPET_BYTES))
-                .filter(|value| !value.is_empty()),
             body_available: item.path.is_some(),
             source: SourceRef {
                 service: item.service.clone(),
@@ -314,7 +467,6 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         activity_id: &str,
         item: &ArchiveItemPrivateV1,
         change: ResultChange,
-        snippet: Option<&str>,
     ) -> SearchResultPublicV1 {
         let name = {
             let value = truncate_collapsed(&item.name, MAX_RESULT_NAME_BYTES);
@@ -343,9 +495,6 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
                 .sender
                 .as_deref()
                 .map(|value| truncate_collapsed(value, crate::activity::MAX_SENDER_BYTES))
-                .filter(|value| !value.is_empty()),
-            snippet: snippet
-                .map(|value| truncate_collapsed(value, MAX_SNIPPET_BYTES))
                 .filter(|value| !value.is_empty()),
             body_available: item.body_rel_path.is_some(),
             source: SourceRef {
@@ -382,7 +531,8 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             "sender": item.sender.as_deref().map(|value| {
                 truncate_collapsed(value, crate::activity::MAX_SENDER_BYTES)
             }),
-            "snippet": snippet.map(|value| truncate_collapsed(value, MAX_SNIPPET_BYTES)),
+            "snippet": snippet
+                .map(|value| truncate_collapsed(value, MAX_PROVIDER_PRIVATE_SNIPPET_BYTES)),
             "body_available": item.body_rel_path.is_some(),
             "source": Self::private_source(item),
         })
@@ -448,27 +598,6 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         }
     }
 
-    fn deadline(cancellation: &crate::CancellationToken) -> StoreSearchDeadline {
-        let cancellation = cancellation.clone();
-        let deadline = Instant::now() + MAX_DEEP_TOOL_DURATION;
-        StoreSearchDeadline::new(move || cancellation.is_cancelled() || Instant::now() >= deadline)
-    }
-
-    fn ensure_search_active(
-        cancellation: &crate::CancellationToken,
-        deadline: &StoreSearchDeadline,
-    ) -> Result<(), AgentError> {
-        if cancellation.is_cancelled() {
-            return Err(AgentError::Cancelled);
-        }
-        if deadline.should_interrupt() {
-            return Err(AgentError::Provider(
-                "progressive_search_deadline_reached".into(),
-            ));
-        }
-        Ok(())
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn candidate_page(
         &self,
@@ -481,38 +610,63 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         metadata_scanned_before: u32,
         body_reads_used: u16,
         provider_step: u8,
-        cancellation: &crate::CancellationToken,
-        deadline: &StoreSearchDeadline,
+        timing: &ProgressiveCallTiming,
+        on_progress: &mut dyn FnMut(u32, &ArchiveItemPrivateV1) -> Result<(), AgentError>,
     ) -> Result<CandidatePage, AgentError> {
+        let _metadata_scan = timing.metadata_scan()?;
         let mut raw_offset = start_offset;
         let mut scanned = metadata_scanned_before;
         let mut items = Vec::new();
         let mut has_more = false;
         let mut budget_reached = false;
+        let mut last_current_item = None;
 
         'pages: loop {
-            Self::ensure_search_active(cancellation, deadline)?;
-            if scanned >= MAX_METADATA_SCANNED {
+            timing.ensure_overall_active()?;
+            if timing.metadata_exhausted()? {
                 budget_reached = true;
+                has_more = true;
                 break;
             }
-            let remaining_scan = MAX_METADATA_SCANNED - scanned;
+            let remaining_scan = timing.metadata_remaining()?;
             let limit = remaining_scan.min(MAX_LIST_LIMIT);
-            let page = snapshot.metadata_page(limit, raw_offset)?;
-            Self::ensure_search_active(cancellation, deadline)?;
+            let page = match snapshot.metadata_page(limit, raw_offset) {
+                Ok(page) => page,
+                Err(error) => {
+                    timing.ensure_overall_active()?;
+                    if timing.metadata_exhausted()? {
+                        budget_reached = true;
+                        has_more = true;
+                        break;
+                    }
+                    return Err(error);
+                }
+            };
+            timing.ensure_overall_active()?;
             if page.items.is_empty() {
                 has_more = false;
                 break;
             }
             let page_len = page.items.len();
             for (index, item) in page.items.into_iter().enumerate() {
-                Self::ensure_search_active(cancellation, deadline)?;
+                timing.ensure_overall_active()?;
+                if timing.metadata_exhausted()? {
+                    budget_reached = true;
+                    has_more = true;
+                    break 'pages;
+                }
                 raw_offset = raw_offset
                     .checked_add(1)
                     .ok_or_else(|| AgentError::Provider("progressive_offset_overflow".into()))?;
                 scanned = scanned
                     .checked_add(1)
                     .ok_or_else(|| AgentError::Provider("progressive_counter_overflow".into()))?;
+                timing.record_metadata()?;
+                last_current_item = Some(truncate_collapsed(
+                    &item.name,
+                    crate::activity::MAX_CURRENT_ITEM_BYTES,
+                ));
+                on_progress(scanned, &item)?;
                 if item.body_rel_path.is_none()
                     || matched.contains(&(item.service.clone(), item.item_id.clone()))
                 {
@@ -606,6 +760,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             next_offset: raw_offset,
             has_more,
             budget_reached,
+            last_current_item,
         })
     }
 
@@ -623,6 +778,18 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         hits: usize,
         completion: StageCompletion,
     ) -> StreamEvent {
+        Self::stage_event_with_current(activity_id, stage, status, scanned, hits, None, completion)
+    }
+
+    fn stage_event_with_current(
+        activity_id: &str,
+        stage: SearchStage,
+        status: StageStatus,
+        scanned: usize,
+        hits: usize,
+        current_item: Option<&str>,
+        completion: StageCompletion,
+    ) -> StreamEvent {
         StreamEvent::StageProgress(StageProgressV1 {
             schema_version: ACTIVITY_SCHEMA_VERSION,
             activity_id: activity_id.to_string(),
@@ -632,13 +799,16 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             scanned: Self::public_count(scanned),
             total: None,
             hits: Self::public_count(hits),
-            current_item: None,
+            current_item: current_item
+                .map(|value| truncate_collapsed(value, crate::activity::MAX_CURRENT_ITEM_BYTES))
+                .filter(|value| !value.is_empty()),
             coverage_complete: completion.coverage_complete,
             budget_reached: completion.budget_reached,
             continuation_available: completion.continuation_available,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_partial_batches(
         activity_id: &str,
         stage: SearchStage,
@@ -647,8 +817,10 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         budget: &mut ActivityEventBudget,
         emit: &mut dyn TurnEventSink,
         deliver: bool,
+        ensure_active: &mut dyn FnMut() -> Result<(), AgentError>,
     ) -> Result<(), AgentError> {
         for batch in items.chunks(MAX_PARTIAL_RESULT_ITEMS) {
+            ensure_active()?;
             budget.emit(
                 StreamEvent::PartialResult(PartialResultV1 {
                     schema_version: ACTIVITY_SCHEMA_VERSION,
@@ -660,6 +832,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
                 emit,
                 deliver,
             )?;
+            ensure_active()?;
             *sequence = sequence.saturating_add(1);
         }
         Ok(())
@@ -850,12 +1023,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         let mut stage1 = Vec::new();
         for it in self.source.search_names(query)? {
             if in_scope(&it) && seen.insert((it.service.clone(), it.id.clone())) {
-                stage1.push(Self::public_result(
-                    activity_id,
-                    &it,
-                    ResultChange::Add,
-                    None,
-                ));
+                stage1.push(Self::public_result(activity_id, &it, ResultChange::Add));
                 hits.push(it);
             }
         }
@@ -867,6 +1035,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             &mut event_budget,
             emit,
             true,
+            &mut || Ok(()),
         )?;
         event_budget.emit(
             Self::stage_event(
@@ -903,12 +1072,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             if seen.insert((service.clone(), id.clone())) {
                 if let Some(it) = self.source.get(&service, &id)? {
                     if in_scope(&it) {
-                        stage2.push(Self::public_result(
-                            activity_id,
-                            &it,
-                            ResultChange::Add,
-                            None,
-                        ));
+                        stage2.push(Self::public_result(activity_id, &it, ResultChange::Add));
                         hits.push(it);
                     }
                 }
@@ -922,6 +1086,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             &mut event_budget,
             emit,
             true,
+            &mut || Ok(()),
         )?;
         event_budget.emit(
             Self::stage_event(
@@ -995,12 +1160,8 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             originating_search_tool_use_id: context.binding.tool_use_id.clone(),
             canonical_scope_digest: scope.digest(),
         };
-        let deadline = Self::deadline(context.cancellation);
-        Self::ensure_search_active(context.cancellation, &deadline)?;
-        let snapshot = self
-            .source
-            .begin_search_snapshot(&normalized_scope, &deadline)?;
-        Self::ensure_search_active(context.cancellation, &deadline)?;
+        let timing = ProgressiveCallTiming::new(Arc::clone(&self.clock), context.cancellation);
+        let deadline = timing.store_deadline();
         let keyword_limit = usize::try_from(scope.effective_keyword_limit())
             .unwrap_or(MAX_KEYWORD_RESULTS)
             .min(MAX_KEYWORD_RESULTS);
@@ -1040,7 +1201,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
                     body_reads_used: 0,
                     provider_bytes: 0,
                     event_budget: ActivityEventBudget::default(),
-                    names_status: StageStatus::Running,
+                    names_status: StageStatus::Queued,
                     bodies_status: StageStatus::Queued,
                     deep_status: StageStatus::Queued,
                     coverage_complete: false,
@@ -1050,6 +1211,27 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             );
         }
 
+        for stage in [SearchStage::Names, SearchStage::Bodies, SearchStage::Deep] {
+            event_budget.emit(
+                Self::stage_event(
+                    &activity_id,
+                    stage,
+                    StageStatus::Queued,
+                    0,
+                    0,
+                    StageCompletion::default(),
+                ),
+                context.events,
+                context.mode == crate::ReadExecutionMode::Live,
+            )?;
+        }
+        self.progressive
+            .lock()
+            .map_err(|_| AgentError::Provider("progressive_state_unavailable".into()))?
+            .activities
+            .get_mut(&activity_id)
+            .ok_or_else(|| AgentError::Provider("progressive_state_unavailable".into()))?
+            .names_status = StageStatus::Running;
         event_budget.emit(
             Self::stage_event(
                 &activity_id,
@@ -1062,15 +1244,52 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             context.events,
             context.mode == crate::ReadExecutionMode::Live,
         )?;
+        timing.ensure_overall_active()?;
+        let snapshot = self
+            .source
+            .begin_search_snapshot(&normalized_scope, &deadline)?;
+        timing.ensure_overall_active()?;
         let names_limit = keyword_limit
             .saturating_sub(DEEP_RESULT_RESERVE.min(keyword_limit))
             .max(1);
-        Self::ensure_search_active(context.cancellation, &deadline)?;
-        let names = snapshot.search_names_page(query, names_limit as u32, 0)?;
-        Self::ensure_search_active(context.cancellation, &deadline)?;
+        timing.ensure_overall_active()?;
+        let names = match snapshot.search_names_page(query, names_limit as u32, 0) {
+            Ok(page) => page,
+            Err(error) => {
+                timing.ensure_overall_active()?;
+                return Err(error);
+            }
+        };
+        timing.ensure_overall_active()?;
         let mut name_public = Vec::new();
+        let mut names_scanned = 0_usize;
+        let mut names_last_progress_at = timing.now();
+        let mut names_last_current = None;
         for item in names.items {
-            Self::ensure_search_active(context.cancellation, &deadline)?;
+            timing.ensure_overall_active()?;
+            names_scanned = names_scanned.saturating_add(1);
+            names_last_current = Some(item.name.clone());
+            let now = timing.now();
+            if names_scanned == 1
+                || names_scanned.is_multiple_of(METADATA_PROGRESS_RECORD_INTERVAL as usize)
+                || now.saturating_duration_since(names_last_progress_at)
+                    >= METADATA_PROGRESS_TIME_INTERVAL
+            {
+                event_budget.emit(
+                    Self::stage_event_with_current(
+                        &activity_id,
+                        SearchStage::Names,
+                        StageStatus::Running,
+                        names_scanned,
+                        visible_keys.len(),
+                        Some(&item.name),
+                        StageCompletion::default(),
+                    ),
+                    context.events,
+                    context.mode == crate::ReadExecutionMode::Live,
+                )?;
+                names_last_progress_at = now;
+            }
             let key = (item.service.clone(), item.item_id.clone());
             if !matched.insert(key.clone()) {
                 continue;
@@ -1080,7 +1299,6 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
                 &activity_id,
                 &item,
                 ResultChange::Add,
-                None,
             ));
             let provider_item = Self::provider_keyword_item(&item, None);
             let mut projected = provider_results.clone();
@@ -1107,14 +1325,16 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             &mut event_budget,
             context.events,
             context.mode == crate::ReadExecutionMode::Live,
+            &mut || timing.ensure_overall_active(),
         )?;
         event_budget.emit(
-            Self::stage_event(
+            Self::stage_event_with_current(
                 &activity_id,
                 SearchStage::Names,
                 StageStatus::Complete,
-                matched.len(),
+                names_scanned,
                 visible_keys.len(),
+                names_last_current.as_deref(),
                 StageCompletion {
                     coverage_complete: Some(!names.has_more),
                     budget_reached: Some(names.has_more),
@@ -1124,7 +1344,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             context.events,
             context.mode == crate::ReadExecutionMode::Live,
         )?;
-        Self::ensure_search_active(context.cancellation, &deadline)?;
+        timing.ensure_overall_active()?;
         {
             let mut state = self
                 .progressive
@@ -1164,12 +1384,44 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             context.events,
             context.mode == crate::ReadExecutionMode::Live,
         )?;
-        Self::ensure_search_active(context.cancellation, &deadline)?;
-        let bodies = snapshot.search_bodies_page(query, keyword_limit as u32, 0)?;
-        Self::ensure_search_active(context.cancellation, &deadline)?;
+        timing.ensure_overall_active()?;
+        let bodies = match snapshot.search_bodies_page(query, keyword_limit as u32, 0) {
+            Ok(page) => page,
+            Err(error) => {
+                timing.ensure_overall_active()?;
+                return Err(error);
+            }
+        };
+        timing.ensure_overall_active()?;
         let mut body_public = Vec::new();
+        let mut bodies_scanned = 0_usize;
+        let mut bodies_last_progress_at = timing.now();
+        let mut bodies_last_current = None;
         for BodyFtsHit { item, snippet } in bodies.items {
-            Self::ensure_search_active(context.cancellation, &deadline)?;
+            timing.ensure_overall_active()?;
+            bodies_scanned = bodies_scanned.saturating_add(1);
+            bodies_last_current = Some(item.name.clone());
+            let now = timing.now();
+            if bodies_scanned == 1
+                || bodies_scanned.is_multiple_of(METADATA_PROGRESS_RECORD_INTERVAL as usize)
+                || now.saturating_duration_since(bodies_last_progress_at)
+                    >= METADATA_PROGRESS_TIME_INTERVAL
+            {
+                event_budget.emit(
+                    Self::stage_event_with_current(
+                        &activity_id,
+                        SearchStage::Bodies,
+                        StageStatus::Running,
+                        bodies_scanned,
+                        visible_keys.len(),
+                        Some(&item.name),
+                        StageCompletion::default(),
+                    ),
+                    context.events,
+                    context.mode == crate::ReadExecutionMode::Live,
+                )?;
+                bodies_last_progress_at = now;
+            }
             let key = (item.service.clone(), item.item_id.clone());
             let is_new = matched.insert(key.clone());
             if is_new && visible_keys.len() >= keyword_limit {
@@ -1181,12 +1433,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             } else {
                 ResultChange::Enrich
             };
-            body_public.push(Self::private_public_result(
-                &activity_id,
-                &item,
-                change,
-                Some(&snippet),
-            ));
+            body_public.push(Self::private_public_result(&activity_id, &item, change));
             let provider_item = Self::provider_keyword_item(&item, Some(&snippet));
             if let Some(index) = provider_indexes.get(&key).copied() {
                 let mut projected = provider_results.clone();
@@ -1224,14 +1471,16 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             &mut event_budget,
             context.events,
             context.mode == crate::ReadExecutionMode::Live,
+            &mut || timing.ensure_overall_active(),
         )?;
         event_budget.emit(
-            Self::stage_event(
+            Self::stage_event_with_current(
                 &activity_id,
                 SearchStage::Bodies,
                 StageStatus::Complete,
-                matched.len(),
+                bodies_scanned,
                 visible_keys.len(),
+                bodies_last_current.as_deref(),
                 StageCompletion {
                     coverage_complete: Some(!bodies.has_more),
                     budget_reached: Some(bodies.has_more || visible_keys.len() >= keyword_limit),
@@ -1257,19 +1506,73 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             activity.event_budget = event_budget.clone();
         }
 
-        let candidate_page = self.candidate_page(
-            snapshot.as_ref(),
-            authority,
-            &binding,
-            &matched,
-            0,
-            0,
-            0,
-            0,
-            context.provider_step_seq,
-            context.cancellation,
-            &deadline,
+        {
+            let mut state = self
+                .progressive
+                .lock()
+                .map_err(|_| AgentError::Provider("progressive_state_unavailable".into()))?;
+            state
+                .activities
+                .get_mut(&activity_id)
+                .ok_or_else(|| AgentError::Provider("progressive_state_unavailable".into()))?
+                .deep_status = StageStatus::Running;
+        }
+        event_budget.emit(
+            Self::stage_event(
+                &activity_id,
+                SearchStage::Deep,
+                StageStatus::Running,
+                0,
+                visible_keys.len(),
+                StageCompletion::default(),
+            ),
+            context.events,
+            context.mode == crate::ReadExecutionMode::Live,
         )?;
+        let mut last_progress_scanned = 0_u32;
+        let mut last_progress_at = timing.now();
+        let deliver = context.mode == crate::ReadExecutionMode::Live;
+        let candidate_page = {
+            let mut on_progress = |scanned: u32, item: &ArchiveItemPrivateV1| {
+                let now = timing.now();
+                if scanned.saturating_sub(last_progress_scanned)
+                    >= METADATA_PROGRESS_RECORD_INTERVAL
+                    || now.saturating_duration_since(last_progress_at)
+                        >= METADATA_PROGRESS_TIME_INTERVAL
+                {
+                    timing.ensure_overall_active()?;
+                    event_budget.emit(
+                        Self::stage_event_with_current(
+                            &activity_id,
+                            SearchStage::Deep,
+                            StageStatus::Running,
+                            scanned as usize,
+                            visible_keys.len(),
+                            Some(&item.name),
+                            StageCompletion::default(),
+                        ),
+                        context.events,
+                        deliver,
+                    )?;
+                    last_progress_scanned = scanned;
+                    last_progress_at = now;
+                }
+                Ok(())
+            };
+            self.candidate_page(
+                snapshot.as_ref(),
+                authority,
+                &binding,
+                &matched,
+                0,
+                0,
+                0,
+                0,
+                context.provider_step_seq,
+                &timing,
+                &mut on_progress,
+            )?
+        };
         let continuation_candidate = context.provider_steps_remaining_after_current >= 2
             && !candidate_page.budget_reached
             && (!candidate_page.provider_candidates.is_empty() || candidate_page.has_more);
@@ -1336,12 +1639,13 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             activity.continuation_available = can_continue;
         }
         event_budget.emit(
-            Self::stage_event(
+            Self::stage_event_with_current(
                 &activity_id,
                 SearchStage::Deep,
                 deep_status,
                 candidate_page.state.metadata_scanned as usize,
-                0,
+                visible_keys.len(),
+                candidate_page.last_current_item.as_deref(),
                 StageCompletion {
                     coverage_complete: Some(coverage_complete),
                     budget_reached: Some(budget_reached),
@@ -1362,7 +1666,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
                 .ok_or_else(|| AgentError::Provider("progressive_state_unavailable".into()))?
                 .event_budget = event_budget.clone();
         }
-        Self::ensure_search_active(context.cancellation, &deadline)?;
+        timing.ensure_overall_active()?;
         let visible_hit_count = visible_keys.len();
         let mut state = self
             .progressive
@@ -1481,25 +1785,69 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         }
         let normalized_scope =
             NormalizedSearchScope::new(scope.account().to_string(), scope.services().to_vec())?;
-        let deadline = Self::deadline(context.cancellation);
-        Self::ensure_search_active(context.cancellation, &deadline)?;
+        let timing = ProgressiveCallTiming::new(Arc::clone(&self.clock), context.cancellation);
+        let deadline = timing.store_deadline();
+        timing.ensure_overall_active()?;
         let snapshot = self
             .source
             .begin_search_snapshot(&normalized_scope, &deadline)?;
-        Self::ensure_search_active(context.cancellation, &deadline)?;
-        let page = self.candidate_page(
-            snapshot.as_ref(),
-            authority,
-            &binding,
-            &matched,
-            continuation_state.service_offset,
-            continuation_state.page,
-            continuation_state.service_offset,
-            continuation_state.body_reads_used,
-            continuation_state.issued_at_provider_step,
-            context.cancellation,
-            &deadline,
+        timing.ensure_overall_active()?;
+        event_budget.emit(
+            Self::stage_event(
+                activity_id,
+                SearchStage::Deep,
+                StageStatus::Running,
+                continuation_state.metadata_scanned as usize,
+                visible_keys.len(),
+                StageCompletion::default(),
+            ),
+            context.events,
+            context.mode == crate::ReadExecutionMode::Live,
         )?;
+        let mut last_progress_scanned = continuation_state.metadata_scanned;
+        let mut last_progress_at = timing.now();
+        let deliver = context.mode == crate::ReadExecutionMode::Live;
+        let page = {
+            let mut on_progress = |scanned: u32, item: &ArchiveItemPrivateV1| {
+                let now = timing.now();
+                if scanned.saturating_sub(last_progress_scanned)
+                    >= METADATA_PROGRESS_RECORD_INTERVAL
+                    || now.saturating_duration_since(last_progress_at)
+                        >= METADATA_PROGRESS_TIME_INTERVAL
+                {
+                    timing.ensure_overall_active()?;
+                    event_budget.emit(
+                        Self::stage_event_with_current(
+                            activity_id,
+                            SearchStage::Deep,
+                            StageStatus::Running,
+                            scanned as usize,
+                            visible_keys.len(),
+                            Some(&item.name),
+                            StageCompletion::default(),
+                        ),
+                        context.events,
+                        deliver,
+                    )?;
+                    last_progress_scanned = scanned;
+                    last_progress_at = now;
+                }
+                Ok(())
+            };
+            self.candidate_page(
+                snapshot.as_ref(),
+                authority,
+                &binding,
+                &matched,
+                continuation_state.service_offset,
+                continuation_state.page,
+                continuation_state.service_offset,
+                continuation_state.body_reads_used,
+                continuation_state.issued_at_provider_step,
+                &timing,
+                &mut on_progress,
+            )?
+        };
         if page.state != continuation_state || page.continuation != continuation {
             return Err(AgentError::Provider(
                 "archive_changed_restart_search".into(),
@@ -1549,7 +1897,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         let mut public_results = Vec::new();
         let mut assistant_sources = Vec::new();
         for index in selected {
-            Self::ensure_search_active(context.cancellation, &deadline)?;
+            timing.ensure_overall_active()?;
             let item = page
                 .private_items
                 .get(index)
@@ -1561,13 +1909,16 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             let bytes = match self.source.read_private_body(locator, &deadline) {
                 Ok(bytes) => bytes,
                 Err(_) => {
+                    // The archive adapter intentionally exposes only a closed error. Re-check
+                    // the authoritative cancellation/deadline state before treating it as a
+                    // genuinely unavailable body so no result can escape after interruption.
+                    timing.ensure_overall_active()?;
                     let mut unavailable = item.clone();
                     unavailable.body_rel_path = None;
                     public_results.push(Self::private_public_result(
                         activity_id,
                         &unavailable,
                         ResultChange::Add,
-                        None,
                     ));
                     provider_results.push(serde_json::json!({
                         "candidate_key": page.issued_candidates[index].candidate_key,
@@ -1580,10 +1931,11 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
                     if assistant_sources.len() < crate::session_v2::MAX_SOURCE_REFS {
                         assistant_sources.push(Self::private_source(item));
                     }
+                    timing.ensure_overall_active()?;
                     continue;
                 }
             };
-            Self::ensure_search_active(context.cancellation, &deadline)?;
+            timing.ensure_overall_active()?;
             let text = Self::body_model_text(&item.service, &bytes);
             let excerpt = truncate_collapsed(&text, MAX_DEEP_EXCERPT_BYTES);
             let key = (item.service.clone(), item.item_id.clone());
@@ -1592,12 +1944,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             } else {
                 ResultChange::Enrich
             };
-            public_results.push(Self::private_public_result(
-                activity_id,
-                item,
-                change,
-                Some(&excerpt),
-            ));
+            public_results.push(Self::private_public_result(activity_id, item, change));
             provider_results.push(serde_json::json!({
                 "candidate_key": page.issued_candidates[index].candidate_key,
                 "service": item.service,
@@ -1618,8 +1965,9 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             &mut event_budget,
             context.events,
             context.mode == crate::ReadExecutionMode::Live,
+            &mut || timing.ensure_overall_active(),
         )?;
-        Self::ensure_search_active(context.cancellation, &deadline)?;
+        timing.ensure_overall_active()?;
 
         let new_body_reads = replay_body_reads_used
             .checked_add(
@@ -1632,6 +1980,32 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             && new_body_reads < MAX_DEEP_READS as u16
             && context.provider_steps_remaining_after_current >= 2
         {
+            let mut on_progress = |scanned: u32, item: &ArchiveItemPrivateV1| {
+                let now = timing.now();
+                if scanned.saturating_sub(last_progress_scanned)
+                    >= METADATA_PROGRESS_RECORD_INTERVAL
+                    || now.saturating_duration_since(last_progress_at)
+                        >= METADATA_PROGRESS_TIME_INTERVAL
+                {
+                    timing.ensure_overall_active()?;
+                    event_budget.emit(
+                        Self::stage_event_with_current(
+                            activity_id,
+                            SearchStage::Deep,
+                            StageStatus::Running,
+                            scanned as usize,
+                            visible_keys.len(),
+                            Some(&item.name),
+                            StageCompletion::default(),
+                        ),
+                        context.events,
+                        deliver,
+                    )?;
+                    last_progress_scanned = scanned;
+                    last_progress_at = now;
+                }
+                Ok(())
+            };
             Some(
                 self.candidate_page(
                     snapshot.as_ref(),
@@ -1646,8 +2020,8 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
                     page.state.metadata_scanned,
                     new_body_reads,
                     context.provider_step_seq,
-                    context.cancellation,
-                    &deadline,
+                    &timing,
+                    &mut on_progress,
                 )?,
             )
         } else {
@@ -1670,7 +2044,9 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             })
         });
         let selected_count = provider_results.len();
-        let coverage_complete = selected_count == page.provider_candidates.len() && !page.has_more;
+        let coverage_complete = selected_count == page.provider_candidates.len()
+            && !page.has_more
+            && !page.budget_reached;
         let provider_content = serde_json::json!({
             "activity_id": activity_id,
             "stage": "deep",
@@ -1820,12 +2196,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         for it in candidates.iter().skip(start).take(budget) {
             // Same content-preview shape as the keyword hits (header + body preview).
             let value = self.hit_json(it);
-            public_items.push(Self::public_result(
-                &activity_id,
-                it,
-                ResultChange::Add,
-                value.get("snippet").and_then(serde_json::Value::as_str),
-            ));
+            public_items.push(Self::public_result(&activity_id, it, ResultChange::Add));
             read_items.push(value);
         }
         let next = start + read_items.len();
@@ -1839,6 +2210,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             &mut event_budget,
             emit,
             true,
+            &mut || Ok(()),
         )?;
         event_budget.emit(
             Self::stage_event(
@@ -2373,7 +2745,8 @@ impl<A: ArchiveSource> ToolExecutor for RetrievalExecutor<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::provider::FakeProvider;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     /// In-memory archive for testing the executor logic without a store.
@@ -2482,6 +2855,35 @@ mod tests {
         account: String,
         items: Arc<Vec<(ArchiveItemPrivateV1, Vec<u8>)>>,
         body_reads: Arc<AtomicUsize>,
+    }
+
+    struct SteppingProgressiveClock {
+        start: Instant,
+        step_ms: u64,
+        ticks: AtomicU64,
+    }
+
+    impl SteppingProgressiveClock {
+        fn new(step_ms: u64) -> Self {
+            Self {
+                start: Instant::now(),
+                step_ms,
+                ticks: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl ProgressiveClock for SteppingProgressiveClock {
+        fn now(&self) -> Instant {
+            let tick = self.ticks.fetch_add(1, Ordering::SeqCst);
+            self.start + Duration::from_millis(tick.saturating_mul(self.step_ms))
+        }
+    }
+
+    #[derive(Clone)]
+    struct CancelDuringBodyArchive {
+        inner: ProgressiveFakeArchive,
+        cancellation: crate::CancellationToken,
     }
 
     struct ProgressiveFakeSnapshot {
@@ -2645,6 +3047,67 @@ mod tests {
         }
     }
 
+    impl ArchiveSource for CancelDuringBodyArchive {
+        fn account(&self) -> &str {
+            self.inner.account()
+        }
+
+        fn search_names(&self, query: &str) -> Result<Vec<ItemRef>, AgentError> {
+            self.inner.search_names(query)
+        }
+
+        fn search_bodies(&self, query: &str) -> Result<Vec<(String, String)>, AgentError> {
+            self.inner.search_bodies(query)
+        }
+
+        fn get(&self, service: &str, id: &str) -> Result<Option<ItemRef>, AgentError> {
+            self.inner.get(service, id)
+        }
+
+        fn read_body(&self, service: &str, id: &str) -> Result<Vec<u8>, AgentError> {
+            self.inner.read_body(service, id)
+        }
+
+        fn list_page(
+            &self,
+            service: &str,
+            limit: u32,
+            offset: u32,
+        ) -> Result<Vec<ItemRef>, AgentError> {
+            self.inner.list_page(service, limit, offset)
+        }
+
+        fn roots(&self, service: &str) -> Result<Vec<ItemRef>, AgentError> {
+            self.inner.roots(service)
+        }
+
+        fn children(&self, service: &str, parent: &str) -> Result<Vec<ItemRef>, AgentError> {
+            self.inner.children(service, parent)
+        }
+
+        fn count(&self, service: &str) -> Result<u64, AgentError> {
+            self.inner.count(service)
+        }
+
+        fn begin_search_snapshot(
+            &self,
+            scope: &NormalizedSearchScope,
+            deadline: &StoreSearchDeadline,
+        ) -> Result<Box<dyn ArchiveSearchSnapshot>, AgentError> {
+            self.inner.begin_search_snapshot(scope, deadline)
+        }
+
+        fn read_private_body(
+            &self,
+            _locator: &crate::archive::ValidatedArchiveRelativePath,
+            _deadline: &StoreSearchDeadline,
+        ) -> Result<Vec<u8>, AgentError> {
+            self.inner.body_reads.fetch_add(1, Ordering::SeqCst);
+            self.cancellation.cancel();
+            Err(AgentError::Provider("archive_body_interrupted".into()))
+        }
+    }
+
     fn progressive_item(id: &str, name: &str, body: &str) -> (ArchiveItemPrivateV1, Vec<u8>) {
         (
             ArchiveItemPrivateV1 {
@@ -2750,10 +3213,417 @@ mod tests {
         let crate::ReadExecutionOutputV2::DeepSearch(deep_output) = deep_output else {
             panic!("deep output")
         };
+        let initial_plan = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::StageProgress(progress) => Some((progress.stage, progress.status)),
+                _ => None,
+            })
+            .take(4)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            initial_plan,
+            vec![
+                (SearchStage::Names, StageStatus::Queued),
+                (SearchStage::Bodies, StageStatus::Queued),
+                (SearchStage::Deep, StageStatus::Queued),
+                (SearchStage::Names, StageStatus::Running),
+            ]
+        );
         let public = serde_json::to_string(&deep_output.public_projection).unwrap();
         assert!(!public.contains("DistroKid"));
         assert!(!public.contains("mail/candidate.eml"));
+        let public_stream = events
+            .iter()
+            .map(StreamEvent::to_public_json_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!public_stream.contains("DistroKid"));
+        assert!(!public_stream.contains("mail/candidate.eml"));
         assert!(deep_output.provider_content.contains("DistroKid"));
+    }
+
+    #[test]
+    fn progressive_public_transport_never_contains_fts_or_deep_body_excerpt() {
+        let body_reads = Arc::new(AtomicUsize::new(0));
+        let items = Arc::new(vec![
+            progressive_item(
+                "keyword",
+                "Ordinary document",
+                "invoice body phrase visible only to the provider",
+            ),
+            progressive_item(
+                "candidate",
+                "Music receipt",
+                "DistroKid annual charge visible only to the provider",
+            ),
+        ]);
+        let executor = RetrievalExecutor::new(ProgressiveFakeArchive {
+            account: "account".into(),
+            items,
+            body_reads: Arc::clone(&body_reads),
+        });
+        let authority = crate::HmacProgressiveSearchAuthority::new([41; 32]);
+        let cancellation = crate::CancellationToken::default();
+        let binding = crate::ReadExecutionBindingV2 {
+            session_id: "session".into(),
+            request_id: "request-public-boundary".into(),
+            tool_use_id: "search-public-boundary".into(),
+            resolved_account_key: "account".into(),
+            admission_account_digest: crate::admission_account_digest("account").unwrap(),
+        };
+        let mut budget = crate::ProviderInputBudgetV1::new(None, 1_000_000, 0);
+        let mut events = Vec::new();
+        let output = {
+            let mut collect = |event| events.push(event);
+            let mut sink = crate::InfallibleTurnEventSink::new(&mut collect);
+            executor
+                .execute_read_with_context(
+                    &ToolAction::Search {
+                        account: "account".into(),
+                        services: vec!["mail".into()],
+                        query: "invoice".into(),
+                        limit: Some(20),
+                    },
+                    crate::ReadExecutionContext {
+                        binding: &binding,
+                        local_effect: None,
+                        mode: crate::ReadExecutionMode::Live,
+                        provider_step_seq: 0,
+                        provider_steps_remaining_after_current: 15,
+                        input_budget: &mut budget,
+                        cancellation: &cancellation,
+                        events: &mut sink,
+                        progressive_authority: Some(&authority),
+                    },
+                )
+                .unwrap()
+        };
+        let crate::ReadExecutionOutputV2::Search(output) = output else {
+            panic!("search output")
+        };
+
+        assert!(output.provider_content.contains("matched invoice"));
+        let public = events
+            .iter()
+            .map(StreamEvent::to_public_json_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for forbidden in [
+            "matched invoice",
+            "invoice body phrase",
+            "DistroKid annual charge",
+            "snippet",
+            "excerpt",
+        ] {
+            assert!(
+                !public.contains(forbidden),
+                "public stream leaked {forbidden}"
+            );
+        }
+        assert_eq!(body_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cancellation_during_private_body_read_emits_no_late_partial_result() {
+        let body_reads = Arc::new(AtomicUsize::new(0));
+        let cancellation = crate::CancellationToken::default();
+        let executor = RetrievalExecutor::new(CancelDuringBodyArchive {
+            inner: ProgressiveFakeArchive {
+                account: "account".into(),
+                items: Arc::new(vec![
+                    progressive_item("keyword", "Invoice 2026", "known invoice body"),
+                    progressive_item("candidate", "Music receipt", "DistroKid annual charge"),
+                ]),
+                body_reads: Arc::clone(&body_reads),
+            },
+            cancellation: cancellation.clone(),
+        });
+        let authority = crate::HmacProgressiveSearchAuthority::new([42; 32]);
+        let (binding, activity_id, continuation, candidate) =
+            open_progressive_candidate(&executor, &authority, &cancellation);
+        let mut budget = crate::ProviderInputBudgetV1::new(None, 1_000_000, 0);
+        let mut events = Vec::new();
+        let error = {
+            let mut collect = |event| events.push(event);
+            let mut sink = crate::InfallibleTurnEventSink::new(&mut collect);
+            executor
+                .execute_read_with_context(
+                    &ToolAction::DeepSearch {
+                        activity_id,
+                        continuation,
+                        candidates: vec![candidate],
+                    },
+                    crate::ReadExecutionContext {
+                        binding: &binding,
+                        local_effect: None,
+                        mode: crate::ReadExecutionMode::Live,
+                        provider_step_seq: 1,
+                        provider_steps_remaining_after_current: 14,
+                        input_budget: &mut budget,
+                        cancellation: &cancellation,
+                        events: &mut sink,
+                        progressive_authority: Some(&authority),
+                    },
+                )
+                .unwrap_err()
+        };
+
+        assert!(matches!(error, AgentError::Cancelled));
+        assert_eq!(body_reads.load(Ordering::SeqCst), 1);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::PartialResult(_))));
+    }
+
+    fn execute_large_progressive_fixture(
+        step_ms: u64,
+    ) -> (crate::SeparatedSearchOutputV2, Vec<StreamEvent>) {
+        let mut items = Vec::with_capacity(10_000);
+        for index in 0..10_000 {
+            let mut item = progressive_item(
+                &format!("item-{index:05}"),
+                &format!("Synthetic archive item {index:05}"),
+                "body without the search term",
+            );
+            item.0.body_rel_path = None;
+            items.push(item);
+        }
+        let executor = RetrievalExecutor::with_progressive_clock(
+            ProgressiveFakeArchive {
+                account: "account".into(),
+                items: Arc::new(items),
+                body_reads: Arc::new(AtomicUsize::new(0)),
+            },
+            Arc::new(SteppingProgressiveClock::new(step_ms)),
+        );
+        let authority = crate::HmacProgressiveSearchAuthority::new([43; 32]);
+        let cancellation = crate::CancellationToken::default();
+        let binding = crate::ReadExecutionBindingV2 {
+            session_id: "session".into(),
+            request_id: format!("large-fixture-{step_ms}"),
+            tool_use_id: format!("large-search-{step_ms}"),
+            resolved_account_key: "account".into(),
+            admission_account_digest: crate::admission_account_digest("account").unwrap(),
+        };
+        let mut budget = crate::ProviderInputBudgetV1::new(None, 1_000_000, 0);
+        let mut events = Vec::new();
+        let output = {
+            let mut collect = |event| events.push(event);
+            let mut sink = crate::InfallibleTurnEventSink::new(&mut collect);
+            executor
+                .execute_read_with_context(
+                    &ToolAction::Search {
+                        account: "account".into(),
+                        services: vec!["mail".into()],
+                        query: "absent-search-term".into(),
+                        limit: Some(20),
+                    },
+                    crate::ReadExecutionContext {
+                        binding: &binding,
+                        local_effect: None,
+                        mode: crate::ReadExecutionMode::Live,
+                        provider_step_seq: 0,
+                        provider_steps_remaining_after_current: 15,
+                        input_budget: &mut budget,
+                        cancellation: &cancellation,
+                        events: &mut sink,
+                        progressive_authority: Some(&authority),
+                    },
+                )
+                .unwrap()
+        };
+        let crate::ReadExecutionOutputV2::Search(output) = output else {
+            panic!("search output")
+        };
+        (output, events)
+    }
+
+    #[test]
+    fn large_fixture_enforces_record_cap_and_coalesces_current_progress() {
+        let (output, events) = execute_large_progressive_fixture(0);
+        assert!(!output.public_projection.coverage_complete);
+        assert!(output.public_projection.budget_reached);
+        assert!(!output.public_projection.continuation_available);
+
+        let running = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::StageProgress(progress)
+                    if progress.stage == SearchStage::Deep
+                        && progress.status == StageStatus::Running
+                        && progress.current_item.is_some() =>
+                {
+                    Some(progress.scanned)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(running.first().copied(), Some(25));
+        assert_eq!(running.last().copied(), Some(MAX_METADATA_SCANNED));
+        assert_eq!(
+            running.len(),
+            usize::try_from(MAX_METADATA_SCANNED / METADATA_PROGRESS_RECORD_INTERVAL).unwrap()
+        );
+        assert!(running
+            .windows(2)
+            .all(|pair| { pair[1].saturating_sub(pair[0]) == METADATA_PROGRESS_RECORD_INTERVAL }));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::StageProgress(progress)
+                if progress.stage == SearchStage::Deep
+                    && progress.budget_reached == Some(true)
+                    && progress.coverage_complete == Some(false)
+        )));
+    }
+
+    #[test]
+    fn large_fixture_injected_two_second_metadata_deadline_stops_before_record_cap() {
+        let (output, events) = execute_large_progressive_fixture(1);
+        assert!(!output.public_projection.coverage_complete);
+        assert!(output.public_projection.budget_reached);
+        let terminal_scanned = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::StageProgress(progress)
+                    if progress.stage == SearchStage::Deep
+                        && progress.budget_reached == Some(true) =>
+                {
+                    Some(progress.scanned)
+                }
+                _ => None,
+            })
+            .next_back()
+            .expect("deep budget terminal");
+        assert!(terminal_scanned > 0);
+        assert!(terminal_scanned < MAX_METADATA_SCANNED);
+    }
+
+    struct ProgressiveTurnObserver {
+        authority: Arc<crate::HmacProgressiveSearchAuthority>,
+    }
+
+    impl crate::TurnObserver for ProgressiveTurnObserver {
+        fn read_execution_binding(&self, tool_use_id: &str) -> Option<crate::ReadExecutionBinding> {
+            Some(crate::ReadExecutionBindingV2 {
+                session_id: "session".into(),
+                request_id: "request".into(),
+                tool_use_id: tool_use_id.into(),
+                resolved_account_key: "account".into(),
+                admission_account_digest: crate::admission_account_digest("account").unwrap(),
+            })
+        }
+
+        fn progressive_authority(&self) -> Option<Arc<dyn crate::ProgressiveSearchAuthority>> {
+            Some(self.authority.clone())
+        }
+
+        fn provider_input_limit(&self) -> usize {
+            1_000_000
+        }
+    }
+
+    #[test]
+    fn fake_provider_turn_selects_keywordless_candidate_after_store_archive_search() {
+        let items = Arc::new(vec![
+            progressive_item(
+                "keyword",
+                "Ordinary document",
+                "invoice body phrase visible only to the provider",
+            ),
+            progressive_item(
+                "candidate",
+                "Music receipt",
+                "DistroKid annual charge visible only to the provider",
+            ),
+        ]);
+        let authority = Arc::new(crate::HmacProgressiveSearchAuthority::new([44; 32]));
+        let preflight = RetrievalExecutor::new(ProgressiveFakeArchive {
+            account: "account".into(),
+            items: Arc::clone(&items),
+            body_reads: Arc::new(AtomicUsize::new(0)),
+        });
+        let cancellation = crate::CancellationToken::default();
+        let (_, activity_id, continuation, candidate) =
+            open_progressive_candidate(&preflight, authority.as_ref(), &cancellation);
+        let private_continuation = continuation.clone();
+
+        let body_reads = Arc::new(AtomicUsize::new(0));
+        let executor = RetrievalExecutor::new(ProgressiveFakeArchive {
+            account: "account".into(),
+            items,
+            body_reads: Arc::clone(&body_reads),
+        });
+        let mut provider = FakeProvider::new(vec![
+            vec![crate::AssistantBlock::ToolUse {
+                id: "search-A".into(),
+                input: serde_json::json!({
+                    "op": "search",
+                    "account": "account",
+                    "services": ["mail"],
+                    "query": "invoice",
+                    "limit": 20,
+                }),
+            }],
+            vec![crate::AssistantBlock::ToolUse {
+                id: "deep-B".into(),
+                input: serde_json::json!({
+                    "op": "deep-search",
+                    "activity_id": activity_id,
+                    "continuation": continuation,
+                    "candidates": [candidate],
+                }),
+            }],
+            vec![crate::AssistantBlock::Text(
+                "The selected archive item contains the requested charge.".into(),
+            )],
+        ]);
+        let mut observer = ProgressiveTurnObserver {
+            authority: Arc::clone(&authority),
+        };
+        let mut history = vec![crate::Message::user("Find the relevant charge")];
+        let mut events = Vec::new();
+        let outcome = crate::run_turn_observed(
+            &mut provider,
+            &executor,
+            &mut history,
+            &mut |event| events.push(event),
+            &mut observer,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, crate::TurnOutcome::Final { .. }));
+        assert_eq!(body_reads.load(Ordering::SeqCst), 1);
+        let private_tool_results = history
+            .iter()
+            .filter(|message| message.role == crate::Role::Tool)
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(private_tool_results.contains("matched invoice"));
+        assert!(private_tool_results.contains("DistroKid annual charge"));
+        let public = events
+            .iter()
+            .map(StreamEvent::to_public_json_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for forbidden in [
+            "invoice body phrase",
+            "matched invoice",
+            "DistroKid annual charge",
+            private_continuation.as_str(),
+        ] {
+            assert!(
+                !public.contains(forbidden),
+                "public stream leaked {forbidden}"
+            );
+        }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::PartialResult(result)
+                if result.stage == SearchStage::Deep
+                    && result.items.iter().any(|item| item.name == "Music receipt")
+        )));
     }
 
     #[test]
@@ -2877,8 +3747,8 @@ mod tests {
         assert!(!error.contains(private_marker));
     }
 
-    fn open_progressive_candidate(
-        executor: &RetrievalExecutor<ProgressiveFakeArchive>,
+    fn open_progressive_candidate<A: ArchiveSource>(
+        executor: &RetrievalExecutor<A>,
         authority: &crate::HmacProgressiveSearchAuthority,
         cancellation: &crate::CancellationToken,
     ) -> (crate::ReadExecutionBindingV2, String, String, String) {
@@ -3171,7 +4041,16 @@ mod tests {
                 AgentError::Provider(code) if code == "progressive_provider_budget_exhausted"
             ));
             assert_eq!(body_reads.load(Ordering::SeqCst), 0);
-            assert!(events.is_empty());
+            assert_eq!(events.len(), 1);
+            assert!(matches!(
+                &events[0],
+                StreamEvent::StageProgress(progress)
+                    if progress.stage == SearchStage::Deep
+                        && progress.status == StageStatus::Running
+            ));
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::PartialResult(_))));
         }
     }
 
@@ -3836,7 +4715,8 @@ mod tests {
         fn emit(&mut self, event: StreamEvent) -> Result<(), AgentError> {
             if matches!(
                 &event,
-                StreamEvent::StageProgress(progress) if progress.stage == self.stage
+                StreamEvent::StageProgress(progress)
+                    if progress.stage == self.stage && progress.status == StageStatus::Running
             ) {
                 self.cancellation.cancel();
             }
@@ -3899,7 +4779,9 @@ mod tests {
                 .position(|event| {
                     matches!(
                         event,
-                        StreamEvent::StageProgress(progress) if progress.stage == stage
+                        StreamEvent::StageProgress(progress)
+                            if progress.stage == stage
+                                && progress.status == StageStatus::Running
                     )
                 })
                 .unwrap();
@@ -4061,7 +4943,6 @@ mod tests {
                     activity_id,
                     &item,
                     ResultChange::Add,
-                    None,
                 )
             })
             .collect();
@@ -4076,6 +4957,7 @@ mod tests {
             &mut event_budget,
             &mut |event| events.push(event),
             true,
+            &mut || Ok(()),
         )
         .unwrap();
         let observed = events
@@ -4097,7 +4979,6 @@ mod tests {
             "abcdefghijklmnopqrstuv",
             &item,
             ResultChange::Add,
-            Some("bounded excerpt"),
         );
         assert!(public.display_path.is_none());
         assert!(!serde_json::to_string(&public)

@@ -340,6 +340,14 @@ mod store_backed {
         snapshot: isyncyou_store::ProgressiveSearchSnapshot,
     }
 
+    fn map_progressive_store_error(error: isyncyou_store::StoreError) -> AgentError {
+        if error.is_progressive_interrupted() {
+            AgentError::Provider("archive_query_interrupted".into())
+        } else {
+            AgentError::Provider("archive_query_failed".into())
+        }
+    }
+
     impl ArchiveSearchSnapshot for StoreArchiveSearchSnapshot {
         fn search_names_page(
             &self,
@@ -356,7 +364,7 @@ mod store_backed {
             let page = self
                 .snapshot
                 .search_names_page(&query, limit, offset)
-                .map_err(|_| AgentError::Provider("archive_query_failed".into()))?;
+                .map_err(map_progressive_store_error)?;
             Ok(SearchPage {
                 items: page
                     .items
@@ -382,7 +390,7 @@ mod store_backed {
             let page = self
                 .snapshot
                 .search_bodies_page(&query, limit, offset)
-                .map_err(|_| AgentError::Provider("archive_query_failed".into()))?;
+                .map_err(map_progressive_store_error)?;
             Ok(SearchPage {
                 items: page
                     .items
@@ -406,7 +414,7 @@ mod store_backed {
             let page = self
                 .snapshot
                 .metadata_page(limit, offset)
-                .map_err(|_| AgentError::Provider("archive_query_failed".into()))?;
+                .map_err(map_progressive_store_error)?;
             Ok(SearchPage {
                 items: page
                     .items
@@ -498,7 +506,14 @@ mod store_backed {
                 std::path::Path::new(locator.as_str()),
                 &|| deadline.should_interrupt(),
             )
-            .map_err(|_| AgentError::Provider("archive_body_unavailable".into()))
+            .map_err(|error| {
+                if error == isyncyou_core::bounded_archive_body::BoundedArchiveBodyError::Cancelled
+                {
+                    AgentError::Provider("archive_body_interrupted".into())
+                } else {
+                    AgentError::Provider("archive_body_unavailable".into())
+                }
+            })
         }
 
         fn list_page(

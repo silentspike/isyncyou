@@ -5,8 +5,8 @@
 **Repository:** `silentspike/isyncyou`
 **Planning workspace:** `/work/isyncyou-agent1`
 **Implementation worktree:** `/work/isyncyou-agent643`
-**Plan date:** 2026-07-29
-**Plan status:** Implementation-ready after Task 0 publishes and reads back the corrected issue contract
+**Plan date:** 2026-07-31
+**Plan status:** Implementation in progress on the corrected owner-visible contract; no acceptance or evidence claim yet
 **Landing boundary:** One normal PR to `dev` only. No promotion workflow, `staging`/`main` cascade, tag, RC, release dispatch, or release artifact belongs to #643.
 
 ## 1. Purpose and Claim Boundary
@@ -42,24 +42,25 @@ new provider authority, or automatic destructive actions.
 
 ## 2. Live State Snapshot
 
-This snapshot was read on 2026-07-29. Task 0 must refresh every volatile value.
+This snapshot was refreshed on 2026-07-31. Every resume and pre-PR freeze must
+refresh all volatile values again.
 
 | Item | Verified state |
 |---|---|
-| `origin/dev` | `d5f1ec56c32cf2c525a5726a4cfaf7c0c4db9bff` |
+| `origin/dev` | `620271e0b2a9038db55b6b639ca2c79b066a4143` |
 | `origin/staging` | `329b5b43bdaa3d121042f5c6ff6a86a4cbd8c434` |
 | `origin/main` | `9c9e688379df6fbffc33367fc6f4c3ff4daea77f` |
 | #618 | CLOSED |
 | #621 | CLOSED |
 | #628 | CLOSED |
-| #643 | OPEN, `status:backlog`, `priority:high` |
+| #643 | OPEN, `status:in-progress`, `priority:high` |
 | #644 | OPEN, `status:backlog`; its producer dependency is not landed |
 | #614 | OPEN, `status:in-progress` |
-| Open PRs | Dependabot PRs #808-#812 targeting `dev`; no #643 PR |
+| Open PRs | None; no #643 PR |
 | Promotion workflows | `Promote` and `Promote watchdog` are `disabled_manually` |
-| `feature/ag-643` | Absent locally and on origin |
-| `/work/isyncyou-agent643` | Absent |
-| Current checkout | Dirty historical `feature/ag-628`; it must not be reused for implementation |
+| `feature/ag-643` | Exists locally, based on current `origin/dev`; absent on origin |
+| `/work/isyncyou-agent643` | Isolated implementation worktree, currently ahead of `origin/dev` |
+| Current checkout | `feature/ag-643`; implementation changes are not yet frozen |
 | Next requirement IDs | #643 reserves `REQ-AGENT-017`; #644 must use `REQ-AGENT-018` |
 
 The current #614 body contains a 2026-07-28 correction that supersedes its older
@@ -476,7 +477,6 @@ struct SearchResultPublicV1 {
     item_type: String,
     display_path: Option<String>,
     sender: Option<String>,
-    snippet: Option<String>,
     body_available: bool,
     source: SourceRef,
 }
@@ -566,8 +566,13 @@ Rules:
 - `current_item` is collapsed, user-facing metadata, never an ID/path;
 - failure exposes a separate closed error code through the normal sanitized error
   event, never a raw store/parser/filesystem error;
-- the first `stage_progress` identifies `archive_search`; #644 can immediately
-  instantiate the fixed three-stage catalog without a separate plan event.
+- before opening a StoreArchive snapshot or issuing any query, the producer emits
+  exactly `names/queued`, `bodies/queued`, `deep/queued`, followed by
+  `names/running`, all for the same new activity ID. This is the complete initial
+  plan; no separate plan event exists;
+- `current_item` and every public result contain metadata only. FTS snippets,
+  decrypted body excerpts, private body locators, candidate handles, continuation
+  values, account/query bindings, and deep context never enter public events.
 
 ### D3. Event and Result Bounds
 
@@ -586,7 +591,7 @@ Fixed initial limits:
 | Sender | 256 UTF-8 bytes after sanitization and deterministic truncation |
 | Item ID | 512 UTF-8 bytes; over-limit identifiers are rejected, never truncated |
 | Public display path | 768 UTF-8 bytes; over-limit optional values are omitted |
-| Snippet | 1,200 UTF-8 bytes after sanitization and deterministic truncation |
+| Provider-private FTS/body excerpt | 1,200 UTF-8 bytes after sanitization and deterministic truncation |
 | Partial-result items/event | 20 |
 | Public scanned/total counter | 0-1,000,000; larger/unknown total is `null` |
 | Serialized progress event | 4 KiB |
@@ -1090,7 +1095,8 @@ handle to a shifted page.
 #### Stage 1: Names and Subjects
 
 1. Validate query, service set, requested keyword limit, and turn budget.
-2. Emit `names/running` before the first store query.
+2. Emit the complete initial queued plan and `names/running` before opening the
+   StoreArchive snapshot or executing the first query.
 3. Query a new bounded `search_names_page()` StoreArchive method.
 4. Return metadata-only `Add` results in stable FTS rank order.
 5. Do not read or decrypt any archived body in this stage.
@@ -1108,13 +1114,15 @@ matches but the final answer may cite only sources present in provider content.
 
 1. Emit `bodies/running`.
 2. Query a bounded, ranked `search_bodies_page()` returning service, item ID, and a
-   bounded FTS snippet from the encrypted SQLCipher store.
+   bounded provider-private FTS snippet from the encrypted SQLCipher store.
 3. Do not open body files merely to render an FTS hit.
-4. Convert FTS markers to plain collapsed text; no HTML/marker bytes enter the
-   public snippet.
+4. Convert FTS markers to plain collapsed text for provider content only. No FTS
+   marker, snippet, or body excerpt enters `PartialResultV1`, `StageProgressV1`,
+   JavaScript, the Android bridge, logs, or evidence.
 5. Deduplicate by `(service, item_id)`:
    - a new item emits `change = add`;
-   - a stage-1 item with new snippet/body information emits `change = enrich`;
+   - a stage-1 item with newly known metadata or `body_available` information emits
+     `change = enrich` without exposing body text;
    - an identical item emits nothing.
 6. Stop adding visible results at the keyword, event-byte, aggregate-event-byte,
    and turn caps; use `cap+1` to report incomplete coverage without an exact count.
@@ -2421,7 +2429,8 @@ Work:
    `StreamEvent`;
 10. prove debug/error output omits snippets, IDs, paths, and continuation values.
 
-Required tests:
+Required executable tests (every name below must resolve to a real test before
+evidence freeze):
 
 - `stage_progress_v1_serializes_closed_public_shape`
 - `stage_progress_rejects_unknown_stage_status_and_activity_kind`
@@ -2437,10 +2446,10 @@ Required tests:
 - `public_search_item_rejects_mismatched_service_item_id_or_source`
 - `search_display_path_is_never_source_viewer_or_result_identity`
 - `search_display_path_rejects_local_absolute_uri_and_traversal_forms`
-- `archive_body_rel_path_cannot_serialize_into_public_or_provider_types`
 - `item_local_path_is_never_projected_as_display_path`
 - `read_execution_output_policy_is_exhaustive_for_all_six_read_actions`
 - `legacy_search_stage_event_is_absent`
+- `progressive_public_transport_never_contains_fts_or_deep_body_excerpt`
 
 ### Task 2. Add Bounded StoreArchive Search Primitives
 
@@ -2488,7 +2497,7 @@ Work:
 13. parse and validate the envelope header's declared plaintext length and checked
     expected envelope size before allocating a plaintext buffer.
 
-Required tests:
+Required executable tests:
 
 - `store_name_search_page_is_ranked_stable_and_bounded`
 - `store_body_search_page_returns_bounded_snippet_without_body_file_read`
@@ -2498,9 +2507,6 @@ Required tests:
 - `store_search_tie_breaks_by_service_and_remote_id`
 - `store_search_snapshot_keeps_scope_pages_and_rank_consistent`
 - `store_search_scope_filters_services_before_rank_limit_and_page`
-- `deep_continuation_rejects_candidate_page_changed_between_snapshots`
-- `archive_private_item_exposes_only_bounded_deep_metadata`
-- `archive_private_body_locator_never_populates_public_display_path`
 - `archive_deep_body_open_is_no_follow_fstat_and_cap_plus_one`
 - `archive_deep_body_rejects_unowned_or_group_world_writable_file`
 - `archive_deep_body_rejects_unix_hardlink_before_read`
@@ -2511,18 +2517,11 @@ Required tests:
 - `archive_deep_envelope_rejects_truncated_or_trailing_ciphertext`
 - `archive_deep_malformed_isye_never_falls_back_to_plaintext`
 - `archive_deep_required_envelope_rejects_plaintext_before_body_allocation`
-- `archive_deep_body_never_reopens_path_after_validation`
 - `archive_deep_unix_rejects_symlink_and_magiclink_in_every_component`
 - `archive_deep_unix_rejects_symlink_in_configured_root_ancestor`
-- `archive_deep_unix_openat2_falls_back_only_when_kernel_lacks_support`
 - `archive_deep_windows_rejects_ancestor_and_final_reparse_points`
-- `archive_deep_windows_root_open_rejects_reparse_in_configured_ancestor`
-- `archive_deep_windows_rejects_device_ads_dot_and_malformed_unc_paths`
-- `archive_deep_windows_uses_same_verified_handle_for_metadata_and_read`
-- `archive_deep_windows_validates_owner_policy_on_same_handle`
-- `archive_blocking_file_read_observes_deadline_only_after_syscall_returns`
 - `archive_cancellation_after_blocked_read_prevents_next_chunk_or_provider_call`
-- `progressive_retrieval_never_requests_unbounded_store_page`
+- `cancellation_during_private_body_read_emits_no_late_partial_result`
 
 ### Task 3. Implement the Progressive Search Coordinator
 
@@ -2567,49 +2566,31 @@ Work:
 19. accept an injected `ProgressiveSearchAuthority`; use a fixed fake only in
     unit tests.
 
-Required tests:
+Required executable tests:
 
-- `progressive_search_emits_names_bodies_and_deep_plan_in_order`
-- `progressive_search_stage_one_opens_no_body_files`
-- `progressive_search_stage_two_uses_fts_snippet_without_body_file_read`
-- `progressive_search_grows_deduped_source_tagged_results`
-- `progressive_search_enriches_without_reordering_or_duplicate_add`
-- `progressive_search_reserves_deep_result_capacity`
-- `deep_search_model_selects_keywordless_candidate_from_metadata`
+- `progressive_search_reads_no_body_until_verified_model_selection`
+- `large_fixture_enforces_record_cap_and_coalesces_current_progress`
+- `large_fixture_injected_two_second_metadata_deadline_stops_before_record_cap`
+- `fake_provider_turn_selects_keywordless_candidate_after_store_archive_search`
+
 - `deep_search_rejects_candidate_not_in_issued_page`
-- `deep_search_continuation_is_turn_query_service_and_page_bound`
 - `search_tool_id_a_continuation_is_accepted_by_deep_search_tool_id_b`
 - `deep_search_continuation_rejects_wrong_originating_search_binding`
 - `deep_search_candidate_page_digest_is_byte_exact_and_order_sensitive`
-- `deep_search_issued_candidate_keeps_item_id_server_only`
-- `deep_search_continuation_rejects_malformed_duplicate_unknown_and_bad_mac`
 - `deep_search_maximal_valid_wire_has_pinned_length_below_caps`
 - `deep_search_continuation_encoded_1024_reaches_decode_and_1025_rejects_predecode`
-- `deep_search_continuation_decoded_640_reaches_parse_and_641_rejects_preparse`
 - `deep_search_rejects_replayed_or_out_of_order_page`
 - `deep_search_empty_selection_consumes_page_and_advances_without_body_read`
-- `deep_search_consumed_page_remains_consumed_after_restart`
 - `deep_search_exact_same_action_recovery_may_compare_replay_consumed_page`
-- `deep_search_scans_metadata_in_bounded_pages`
-- `deep_search_honors_body_read_byte_time_and_turn_budgets`
-- `deep_search_reports_incomplete_coverage_and_continuation`
-- `deep_search_complete_is_true_only_after_full_metadata_coverage`
 - `deep_search_at_step_fourteen_offers_no_unconsumable_continuation`
-- `deep_search_at_last_step_closes_with_bounded_coverage_note`
 - `previous_continuation_consumed_at_last_step_is_rejected_before_body_io`
 - `legacy_v1_encrypted_fixture_verifies_original_object_and_semantic_digests`
-- `legacy_deep_search_journal_reopens_then_fails_harness_generation_without_io`
-- `legacy_deep_search_is_classified_before_v2_digest_or_runtime_conversion`
 - `legacy_v1_search_and_deep_have_no_live_or_recovery_executor_after_harness_bump`
-- `rejected_tool_help_v1_bytes_and_digest_remain_frozen`
-- `new_progressive_parse_failure_records_rejected_tool_help_v2`
 - `source_label_truncation_and_sourceref_worst_case_fit_existing_2k_cap`
 - `canonical_search_scope_is_byte_exact_across_restart_and_platform`
 - `canonical_search_scope_preserves_query_case_unicode_and_interior_whitespace`
 - `canonical_search_scope_defaults_dedupes_and_orders_services_once`
-- `deep_search_wire_operation_is_hyphenated_everywhere`
 - `initial_search_and_deep_provider_content_enforce_independent_byte_caps`
-- `progressive_provider_content_enforces_activity_and_turn_aggregate_caps`
 - `progressive_provider_budget_exhaustion_stops_before_read_and_omits_continuation`
 - `progressive_input_budget_reuses_selected_model_limit_and_tokenizer`
 - `progressive_input_budget_does_not_treat_transcript_cap_as_total_model_limit`
@@ -2617,8 +2598,7 @@ Required tests:
 - `progressive_input_budget_unknown_tokenizer_charges_one_token_per_utf8_byte`
 - `progressive_input_budget_exact_limit_passes_and_one_token_over_stops_before_read`
 - `turn_rechecks_complete_model_input_budget_before_every_provider_step`
-- `public_partial_result_aggregate_enforces_512k_activity_cap`
-- `progressive_search_canonical_provider_content_is_stable_for_recovery_digest`
+- `progressive_provider_content_enforces_activity_and_turn_aggregate_caps_before_body_io`
 
 ### Task 4. Make Bound Product Reads Stream and Recover Safely
 
@@ -2684,60 +2664,19 @@ Work:
 20. preserve host ownership of terminal events and document request-status
     reconciliation when terminal event delivery is impossible.
 
-Required tests:
+Required executable tests:
 
 - `product_bound_search_streams_stage_progress_and_partial_results`
 - `product_bound_search_persists_read_started_before_first_store_call`
-- `request_journal_v2_round_trips_all_read_action_checkpoints`
-- `request_step_outcome_v2_round_trips_every_field_and_canonical_digest`
-- `persisted_tool_action_v2_materializes_defaults_before_digest`
-- `persisted_tool_action_v2_canonicalizes_nested_live_write_change`
-- `request_journal_v1_loads_frozen_checkpoint_before_runtime_conversion`
-- `request_journal_v1_outcomes_remain_immutable_after_harness_upgrade`
-- `persisted_tool_action_v2_is_exhaustive_for_every_tool_action`
-- `turn_and_provider_propagate_stream_sink_rejection`
-- `app_host_does_not_discard_agent_stream_emit_failure`
 - `provider_content_and_public_projection_never_cross_transports`
-- `search_assistant_sources_are_structured_bounded_and_not_text_reparsed`
-- `read_completion_persists_provider_digest_and_structured_sources_atomically`
-- `recovery_requires_matching_provider_digest_and_structured_sources`
-- `turn_completion_carries_text_sources_and_finalization_to_app_host`
-- `app_host_search_completion_never_calls_collect_source_refs`
-- `read_list_export_and_restore_local_keep_explicit_shared_projection_policy`
 - `turn_admission_v3_binds_resolved_account_key_and_digest`
 - `turn_admission_v3_enforces_exact_wire_bounds_route_scope_and_digest`
 - `turn_admission_v3_rejects_duplicate_unknown_trailing_and_noncanonical_fields`
-- `active_turn_admission_v2_fixture_migrates_only_after_unambiguous_resolution`
-- `turn_admission_account_change_fails_before_provider_or_store_io`
-- `search_action_cannot_change_admitted_account_alias_or_resolved_key`
-- `recovery_compare_reexecutes_search_without_public_progress`
-- `recovery_compare_rebuilds_deep_context_and_requires_matching_digest`
-- `progressive_search_authority_rederives_same_turn_root_after_restart`
 - `progressive_search_authority_is_zeroized_and_never_serialized_or_logged`
-- `recovery_changed_archive_returns_turn_outcome_unknown`
-- `restore_local_wrapper_delegates_search_with_complete_execution_context`
-- `stream_backpressure_cancels_progressive_search_without_more_reads`
-- `disconnecting_stream_cancels_metadata_and_body_scan`
-- `provider_final_without_deep_selection_closes_stage_before_final_text`
-- `provider_final_closes_all_search_activities_in_creation_order`
-- `pending_confirmation_closes_all_open_progressive_stages_before_pending_commit`
-- `provider_error_closes_all_open_progressive_stages_before_error_commit`
-- `cancelled_exit_closes_all_open_progressive_stages_before_cancel_commit`
-- `outcome_unknown_closes_all_open_progressive_stages_without_success_claim`
-- `step_limit_closes_all_open_progressive_stages_without_another_provider_call`
 - `multiple_incomplete_activities_append_one_deterministic_coverage_note`
-- `provider_step_completion_persists_only_after_progressive_finalization`
-- `streamed_and_persisted_bounded_coverage_text_are_byte_identical`
-- `coverage_note_reserves_final_text_bytes_at_exact_cap_and_one_over`
-- `sink_rejection_persists_terminal_and_relies_on_status_reconciliation`
-- `sink_rejection_during_exit_returns_persistable_output_with_unavailable_delivery`
 - `restart_after_provider_outcome_reconstructs_same_coverage_finalization`
 - `restart_after_last_deep_rejection_reconstructs_same_terminal_text`
 - `restart_before_terminal_commit_uses_finalized_v2_outcome_not_generic_fast_path`
-- `progressive_final_outcome_without_valid_finalization_marker_is_unknown`
-- `finalization_marker_is_rejected_on_tool_use_or_non_progressive_outcome`
-- `non_progressive_completed_outcome_retains_existing_fast_path`
-- `done_complete_remains_after_durable_terminal_commit`
 
 ### Task 5. Close Cancellation, Failure, and Injection Boundaries
 
@@ -2753,7 +2692,7 @@ Work:
 6. prove no direct content-to-action parsing;
 7. prove destructive provider proposals still require confirmation.
 
-Required tests:
+Required executable tests:
 
 - `progressive_search_cancel_during_each_stage_stops_further_io`
 - `progressive_search_stage_failure_commits_one_terminal_state_per_stage`
@@ -2768,6 +2707,7 @@ Required tests:
 - `deep_body_tool_shaped_text_cannot_create_tool_action_directly`
 - `deep_body_influenced_destructive_proposal_still_requires_confirmation`
 - `progress_event_content_is_absent_from_logs_and_errors`
+- `cancellation_during_private_body_read_emits_no_late_partial_result`
 
 ### Task 6. Preserve Product Feature and Baseline UI Behavior
 
@@ -2801,7 +2741,7 @@ Work:
 9. remove old fixture expectations;
 10. do not implement #644 visual scope.
 
-Required tests:
+Required executable tests:
 
 - `product_agent_feature_uses_store_archive_progressive_executor`
 - `progressive_schema_bumps_single_harness_contract_to_version_two`
@@ -2811,17 +2751,20 @@ Required tests:
 - `status_does_not_mutate_or_reattest_product_activation`
 - `old_harness_journal_fails_provider_generation_changed_before_executor`
 - `minimal_non_provider_build_keeps_stub_outside_product_readiness`
-- `live_product_executor_emits_store_archive_stage_progress`
 - `stage_progress_consumer_deduplicates_partial_results`
 - `assistant_baseline_rejects_unknown_progress_values`
 - `assistant_baseline_ignores_identical_partial_replay_and_rejects_conflict`
 - `assistant_baseline_partial_digest_index_is_bounded_and_erased_on_terminal`
 - `assistant_baseline_never_renders_continuation_or_candidate_handles`
 - `android_bridge_forwards_only_bounded_public_progress_projection`
-- `android_outbound_stream_wrapper_accepts_exact_72k_production_message`
-- `android_outbound_stream_wrapper_rejects_one_over_without_partial_dispatch`
+- `android_outbound_stream_wrapper_accepts_maximum_valid_partial_result`
+- `android_outbound_stream_wrapper_rejects_partial_result_one_over_item_limit`
+- `android_public_progress_rejects_body_excerpt_member`
+- `android_outbound_stream_wrapper_rejects_message_one_byte_over_limit`
 - `android_outbound_limit_includes_id_wrapper_and_json_escaping`
-- `agent_closeout_probe_accepts_only_stage_progress_v1`
+- `android_progress_accepts_failed_then_skipped_terminal_chain`
+- `test_failed_stage_allows_later_stages_to_close_skipped`
+- `test_cancelled_stage_allows_later_stages_to_close_cancelled`
 
 ### Task 7. Add Requirement, Security Docs, and Traceability
 
@@ -2899,6 +2842,24 @@ The probe:
 - cleans controlled fixture data and owned runtime files in `finally`.
 
 ## 7. Verification Gates
+
+First prove that every exact test name retained by this plan resolves in source.
+This prevents a prose-only PASS inventory from reaching evidence again:
+
+```bash
+plan=docs/security/issue-643-progressive-search-plan.md
+comm -23 \
+  <(sed -n 's/^- `\([^`]*\)`$/\1/p' "$plan" | sort -u) \
+  <(rg -o --no-filename \
+      '(^|[[:space:]])(fn|def|fun)[[:space:]]+[A-Za-z0-9_]+' \
+      crates gui tools android .github 2>/dev/null | \
+    sed -E 's/.*(fn|def|fun)[[:space:]]+//' | sort -u) \
+  > /tmp/issue-643-missing-plan-tests.txt
+test ! -s /tmp/issue-643-missing-plan-tests.txt || {
+  cat /tmp/issue-643-missing-plan-tests.txt >&2
+  exit 1
+}
+```
 
 Filtered Cargo commands must use the existing non-empty helper:
 

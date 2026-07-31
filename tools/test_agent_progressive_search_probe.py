@@ -63,7 +63,6 @@ def partial(sequence: int = 0) -> dict[str, object]:
                 "item_type": "message",
                 "display_path": "Inbox/Synthetic",
                 "sender": "private@example.invalid",
-                "snippet": "Private body excerpt must not enter report",
                 "body_available": True,
                 "source": {
                     "service": "mail",
@@ -78,6 +77,8 @@ def partial(sequence: int = 0) -> dict[str, object]:
 def events() -> list[dict[str, object]]:
     return [
         stage("names", "queued", scanned=0, hits=0),
+        stage("bodies", "queued", scanned=0, hits=0),
+        stage("deep", "queued", scanned=0, hits=0),
         stage("names", "running"),
         stage("names", "complete"),
         stage("bodies", "running"),
@@ -120,7 +121,6 @@ class ProgressiveSearchProbeTest(unittest.TestCase):
             "fixture_kind": "synthetic",
             "provider_script": {
                 "selected_result_keys": [RESULT],
-                "keywordless_selection": True,
             },
             "events": events(),
             "source_resolution": {RESULT: True},
@@ -135,22 +135,61 @@ class ProgressiveSearchProbeTest(unittest.TestCase):
     def test_conflicting_old_partial_replay_is_rejected(self) -> None:
         replay = partial()
         conflicting = partial()
-        conflicting["items"][0]["snippet"] = "different"
+        conflicting["items"][0]["item_type"] = "different"
         fixture = events()
-        fixture.insert(7, replay)
+        fixture.insert(9, replay)
         _reducer, report = probe.reduce_events(fixture)
         self.assertEqual(report["replay_count"], 1)
-        fixture[7] = conflicting
+        fixture[9] = conflicting
         with self.assertRaisesRegex(probe.ProbeError, "partial_replay_conflict"):
             probe.reduce_events(fixture)
 
     def test_later_stage_before_prior_terminal_is_rejected(self) -> None:
-        invalid = [stage("names", "running"), stage("bodies", "running")]
+        invalid = [
+            stage("names", "queued"),
+            stage("bodies", "queued"),
+            stage("deep", "queued"),
+            stage("names", "running"),
+            stage("bodies", "running"),
+        ]
         with self.assertRaisesRegex(probe.ProbeError, "stage_order_invalid"):
             probe.reduce_events(invalid)
 
+    def test_failed_stage_allows_later_stages_to_close_skipped(self) -> None:
+        fixture = [
+            stage("names", "queued"),
+            stage("bodies", "queued"),
+            stage("deep", "queued"),
+            stage("names", "running"),
+            stage("names", "failed"),
+            stage("bodies", "skipped"),
+            stage("deep", "skipped"),
+            {"event": "done", "reason": "error"},
+        ]
+        _reducer, report = probe.reduce_events(fixture)
+        self.assertEqual(report["terminal_reason"], "error")
+        self.assertEqual([row["status"] for row in report["stage_updates"][-3:]], [
+            "failed",
+            "skipped",
+            "skipped",
+        ])
+
+    def test_cancelled_stage_allows_later_stages_to_close_cancelled(self) -> None:
+        fixture = [
+            stage("names", "queued"),
+            stage("bodies", "queued"),
+            stage("deep", "queued"),
+            stage("names", "running"),
+            stage("names", "cancelled"),
+            stage("bodies", "cancelled"),
+            stage("deep", "cancelled"),
+            {"event": "done", "reason": "cancelled"},
+        ]
+        _reducer, report = probe.reduce_events(fixture)
+        self.assertEqual(report["terminal_reason"], "cancelled")
+
     def test_model_private_progress_member_is_rejected(self) -> None:
-        invalid = stage("names", "running")
+        invalid = stage("names", "queued")
         invalid["continuation"] = "private"
         with self.assertRaisesRegex(probe.ProbeError, "private_projection_observed"):
             probe.reduce_events([invalid])
@@ -161,7 +200,6 @@ class ProgressiveSearchProbeTest(unittest.TestCase):
             "fixture_kind": "synthetic",
             "provider_script": {
                 "selected_result_keys": [RESULT],
-                "keywordless_selection": True,
             },
             "events": events(),
             "source_resolution": {RESULT: True},
