@@ -477,7 +477,7 @@ fn agent_safe_turn_error(error: &isyncyou_agent::AgentError) -> &'static str {
             "provider_generation_changed" => "provider_generation_changed",
             "invalid_session_record" | "invalid_request_journal" => "session_state_invalid",
             "turn_step_invalid" => "turn_state_invalid",
-            "turn exceeded max steps" => "provider_step_limit_reached",
+            "turn_step_limit" | "turn exceeded max steps" => "provider_step_limit_reached",
             "outcome_unknown" => "turn_outcome_unknown",
             "codex_safe:authorization_rejected" => "provider_authorization_rejected",
             "codex_safe:reasoning_context" => "provider_reasoning_context_rejected",
@@ -16133,6 +16133,7 @@ mod tests {
     fn turn_runtime_failures_serialize_only_closed_diagnostic_codes() {
         let cases = [
             ("turn_step_invalid", "turn_state_invalid"),
+            ("turn_step_limit", "provider_step_limit_reached"),
             ("turn exceeded max steps", "provider_step_limit_reached"),
             (
                 "harness attestation failed: private detail",
