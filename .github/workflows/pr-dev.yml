@@ -107,7 +107,8 @@ jobs:
             "archive_deep_windows_rejects_ancestor_",
             "archive_deep_windows_uses_same_verified_handle_",
             "archive_deep_body_rejects_windows_hardlink_",
-            "archive_deep_windows_validates_owner_"
+            "archive_deep_windows_validates_owner_",
+            "archive_deep_windows_rejects_nonstandard_"
           )
           foreach ($prefix in $required) {
             if (-not (Select-String -Path archive-tests.txt -SimpleMatch $prefix -Quiet)) {

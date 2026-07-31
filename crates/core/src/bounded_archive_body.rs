@@ -540,15 +540,20 @@ mod platform {
     };
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
-        CreateWellKnownSid, EqualSid, GetAce, GetTokenInformation, TokenUser,
-        WinAuthenticatedUserSid, WinBuiltinUsersSid, WinWorldSid, ACCESS_ALLOWED_ACE,
-        ACCESS_ALLOWED_ACE_TYPE, ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
+        CreateWellKnownSid, EqualSid, GetAce, GetLengthSid, GetTokenInformation, IsValidSid,
+        TokenUser, WinAuthenticatedUserSid, WinBuiltinUsersSid, WinWorldSid,
+        ACE_INHERITED_OBJECT_TYPE_PRESENT, ACE_OBJECT_TYPE_PRESENT, ACL, DACL_SECURITY_INFORMATION,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         ReadFile, SetFilePointerEx, DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT,
         FILE_BEGIN, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ,
         FILE_SHARE_WRITE, FILE_WRITE_DATA, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+    };
+    use windows_sys::Win32::System::SystemServices::{
+        ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
+        ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE, ACCESS_ALLOWED_COMPOUND_ACE_TYPE,
+        ACCESS_ALLOWED_OBJECT_ACE_TYPE,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -834,6 +839,76 @@ mod platform {
         Ok((bytes, length))
     }
 
+    fn read_ace_u32(
+        raw: *const u8,
+        ace_size: usize,
+        offset: usize,
+    ) -> Result<u32, BoundedArchiveBodyError> {
+        if offset
+            .checked_add(std::mem::size_of::<u32>())
+            .is_none_or(|end| end > ace_size)
+        {
+            return Err(BoundedArchiveBodyError::UnsafeMetadata);
+        }
+        // SAFETY: the checked range is inside the ACE. ACE fields are not guaranteed
+        // to have Rust alignment, so the integer is read unaligned.
+        Ok(unsafe { std::ptr::read_unaligned(raw.add(offset).cast::<u32>()) })
+    }
+
+    fn allow_ace_mask_and_sid(
+        raw: *mut c_void,
+        header: &windows_sys::Win32::Security::ACE_HEADER,
+    ) -> Result<Option<(u32, PSID)>, BoundedArchiveBodyError> {
+        let ace_type = u32::from(header.AceType);
+        let ace_size = usize::from(header.AceSize);
+        let raw = raw.cast::<u8>();
+        let sid_offset = match ace_type {
+            ACCESS_ALLOWED_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_ACE_TYPE => 8usize,
+            ACCESS_ALLOWED_OBJECT_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE => {
+                let flags = read_ace_u32(raw, ace_size, 8)?;
+                if flags & !(ACE_OBJECT_TYPE_PRESENT | ACE_INHERITED_OBJECT_TYPE_PRESENT) != 0 {
+                    return Err(BoundedArchiveBodyError::UnsafeMetadata);
+                }
+                12usize
+                    .checked_add(if flags & ACE_OBJECT_TYPE_PRESENT != 0 {
+                        16
+                    } else {
+                        0
+                    })
+                    .and_then(|offset| {
+                        offset.checked_add(if flags & ACE_INHERITED_OBJECT_TYPE_PRESENT != 0 {
+                            16
+                        } else {
+                            0
+                        })
+                    })
+                    .ok_or(BoundedArchiveBodyError::UnsafeMetadata)?
+            }
+            // Compound allow ACEs contain two SIDs and are obsolete for file ACLs. Do
+            // not guess which principal receives authority.
+            ACCESS_ALLOWED_COMPOUND_ACE_TYPE => {
+                return Err(BoundedArchiveBodyError::UnsafeMetadata)
+            }
+            _ => return Ok(None),
+        };
+        let mask = read_ace_u32(raw, ace_size, 4)?;
+        if sid_offset >= ace_size {
+            return Err(BoundedArchiveBodyError::UnsafeMetadata);
+        }
+        // SAFETY: sid_offset is inside this ACE. IsValidSid validates the variable
+        // structure before GetLengthSid or EqualSid inspect it further.
+        let sid = unsafe { raw.add(sid_offset).cast_mut().cast::<c_void>() };
+        if unsafe { IsValidSid(sid) } == 0 {
+            return Err(BoundedArchiveBodyError::UnsafeMetadata);
+        }
+        let sid_length = usize::try_from(unsafe { GetLengthSid(sid) })
+            .map_err(|_| BoundedArchiveBodyError::UnsafeMetadata)?;
+        if sid_length == 0 || sid_length > ace_size - sid_offset {
+            return Err(BoundedArchiveBodyError::UnsafeMetadata);
+        }
+        Ok(Some((mask, sid)))
+    }
+
     fn validate_owner_and_dacl(handle: HANDLE) -> Result<(), BoundedArchiveBodyError> {
         let mut owner: PSID = null_mut();
         let mut dacl: *mut ACL = null_mut();
@@ -879,18 +954,13 @@ mod platform {
                 return Err(BoundedArchiveBodyError::UnsafeMetadata);
             }
             let header = unsafe { &*(raw.cast::<windows_sys::Win32::Security::ACE_HEADER>()) };
-            if header.AceType != ACCESS_ALLOWED_ACE_TYPE as u8 {
+            let Some((mask, sid)) = allow_ace_mask_and_sid(raw, header)? else {
+                continue;
+            };
+            if mask & dangerous_mask == 0 {
                 continue;
             }
-            if usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>() {
-                return Err(BoundedArchiveBodyError::UnsafeMetadata);
-            }
-            let ace = unsafe { &*(raw.cast::<ACCESS_ALLOWED_ACE>()) };
-            if ace.Mask & dangerous_mask == 0 {
-                continue;
-            }
-            let sid = (&ace.SidStart as *const u32).cast_mut().cast::<c_void>();
-            // SAFETY: standard ACCESS_ALLOWED_ACE stores its SID at SidStart.
+            // SAFETY: allow_ace_mask_and_sid validated the complete SID range.
             let broad = unsafe {
                 EqualSid(sid, world.as_ptr().cast_mut().cast())
                     | EqualSid(sid, authenticated.as_ptr().cast_mut().cast())
@@ -899,6 +969,57 @@ mod platform {
             if broad != 0 {
                 return Err(BoundedArchiveBodyError::UnsafeMetadata);
             }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_test_broad_object_allow_ace(
+        path: &Path,
+    ) -> Result<(), BoundedArchiveBodyError> {
+        use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
+        use windows_sys::Win32::Security::{
+            AddAccessAllowedAceEx, AddAccessAllowedObjectAce, InitializeAcl, ACL_REVISION_DS,
+        };
+
+        let (_token, _user_buffer, user_sid) = process_user_sid()?;
+        let (world, _) = well_known_sid(WinWorldSid)?;
+        let mut acl_storage = vec![0u32; 256];
+        let acl = acl_storage.as_mut_ptr().cast::<ACL>();
+        let acl_bytes = u32::try_from(acl_storage.len() * std::mem::size_of::<u32>())
+            .map_err(|_| BoundedArchiveBodyError::UnsafeMetadata)?;
+        if unsafe { InitializeAcl(acl, acl_bytes, ACL_REVISION_DS) } == 0
+            || unsafe { AddAccessAllowedAceEx(acl, ACL_REVISION_DS, 0, GENERIC_ALL_MASK, user_sid) }
+                == 0
+            || unsafe {
+                AddAccessAllowedObjectAce(
+                    acl,
+                    ACL_REVISION_DS,
+                    0,
+                    FILE_WRITE_DATA,
+                    null(),
+                    null(),
+                    world.as_ptr().cast_mut().cast(),
+                )
+            } == 0
+        {
+            return Err(BoundedArchiveBodyError::UnsafeMetadata);
+        }
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        wide.push(0);
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                acl,
+                null_mut(),
+            )
+        };
+        if status != 0 {
+            return Err(BoundedArchiveBodyError::UnsafeMetadata);
         }
         Ok(())
     }
@@ -1112,6 +1233,16 @@ mod windows_tests {
             .status()
             .unwrap();
         assert!(status.success(), "failed to create test broad-write ACL");
+        assert_eq!(
+            read_bounded_archive_body(root.path(), &relative, &|| false),
+            Err(BoundedArchiveBodyError::UnsafeMetadata)
+        );
+    }
+
+    #[test]
+    fn archive_deep_windows_rejects_nonstandard_broad_allow_ace() {
+        let (root, relative) = fixture(b"unsafe object acl");
+        platform::install_test_broad_object_allow_ace(&root.path().join(&relative)).unwrap();
         assert_eq!(
             read_bounded_archive_body(root.path(), &relative, &|| false),
             Err(BoundedArchiveBodyError::UnsafeMetadata)

@@ -18,7 +18,8 @@ use crate::archive::{
 use crate::progressive_search::{
     candidate_page_digest, CanonicalSearchScopeV1, DeepContinuationStateV1, IssuedCandidateV1,
     SearchActivityBindingV1, SearchCandidateMetadataV1, MAX_CANDIDATES_PER_PAGE,
-    MAX_METADATA_SCANNED, MAX_SELECTED_CANDIDATES,
+    MAX_METADATA_SCANNED_PER_ACTIVITY, MAX_METADATA_SCANNED_PER_CALL,
+    MAX_METADATA_SCANNED_PER_CANDIDATE_PAGE, MAX_SELECTED_CANDIDATES,
 };
 use crate::provider::{StreamEvent, TurnEventSink};
 use crate::session_v2::SourceRef;
@@ -198,10 +199,8 @@ impl ProgressiveCallTiming {
                 .map(|started| self.clock.now().saturating_duration_since(started))
                 .unwrap_or_default(),
         );
-        Ok(
-            state.scanned_this_call >= MAX_METADATA_SCANNED
-                || elapsed >= MAX_METADATA_SCAN_DURATION,
-        )
+        Ok(state.scanned_this_call >= MAX_METADATA_SCANNED_PER_CALL
+            || elapsed >= MAX_METADATA_SCAN_DURATION)
     }
 
     fn record_metadata(&self) -> Result<(), AgentError> {
@@ -221,7 +220,7 @@ impl ProgressiveCallTiming {
             .metadata
             .lock()
             .map_err(|_| AgentError::Provider("progressive_clock_unavailable".into()))?;
-        Ok(MAX_METADATA_SCANNED.saturating_sub(state.scanned_this_call))
+        Ok(MAX_METADATA_SCANNED_PER_CALL.saturating_sub(state.scanned_this_call))
     }
 
     fn now(&self) -> Instant {
@@ -613,9 +612,17 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         timing: &ProgressiveCallTiming,
         on_progress: &mut dyn FnMut(u32, &ArchiveItemPrivateV1) -> Result<(), AgentError>,
     ) -> Result<CandidatePage, AgentError> {
+        if metadata_scanned_before != start_offset
+            || metadata_scanned_before > MAX_METADATA_SCANNED_PER_ACTIVITY
+        {
+            return Err(AgentError::Provider(
+                "progressive_candidate_offset_invalid".into(),
+            ));
+        }
         let _metadata_scan = timing.metadata_scan()?;
         let mut raw_offset = start_offset;
         let mut scanned = metadata_scanned_before;
+        let mut page_scanned = 0u32;
         let mut items = Vec::new();
         let mut has_more = false;
         let mut budget_reached = false;
@@ -628,7 +635,15 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
                 has_more = true;
                 break;
             }
-            let remaining_scan = timing.metadata_remaining()?;
+            if scanned >= MAX_METADATA_SCANNED_PER_ACTIVITY {
+                budget_reached = true;
+                has_more = true;
+                break;
+            }
+            let remaining_scan = timing
+                .metadata_remaining()?
+                .min(MAX_METADATA_SCANNED_PER_CANDIDATE_PAGE - page_scanned)
+                .min(MAX_METADATA_SCANNED_PER_ACTIVITY - scanned);
             let limit = remaining_scan.min(MAX_LIST_LIMIT);
             let page = match snapshot.metadata_page(limit, raw_offset) {
                 Ok(page) => page,
@@ -655,10 +670,50 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
                     has_more = true;
                     break 'pages;
                 }
+                if scanned >= MAX_METADATA_SCANNED_PER_ACTIVITY {
+                    budget_reached = true;
+                    has_more = true;
+                    break 'pages;
+                }
+                let candidate = if item.body_rel_path.is_some()
+                    && !matched.contains(&(item.service.clone(), item.item_id.clone()))
+                {
+                    let candidate = Self::candidate_metadata(&item);
+                    let mut projected = items
+                        .iter()
+                        .map(
+                            |(_, candidate): &(ArchiveItemPrivateV1, SearchCandidateMetadataV1)| {
+                                candidate
+                            },
+                        )
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    projected.push(candidate.clone());
+                    let bytes = serde_json::to_vec(&projected)
+                        .map_err(|_| AgentError::Provider("candidate_encode_failed".into()))?
+                        .len();
+                    if items.len() >= MAX_CANDIDATES_PER_PAGE
+                        || bytes > MAX_CANDIDATE_PROVIDER_BYTES
+                    {
+                        if items.is_empty() {
+                            return Err(AgentError::Provider(
+                                "progressive_candidate_too_large".into(),
+                            ));
+                        }
+                        has_more = true;
+                        break 'pages;
+                    }
+                    Some(candidate)
+                } else {
+                    None
+                };
                 raw_offset = raw_offset
                     .checked_add(1)
                     .ok_or_else(|| AgentError::Provider("progressive_offset_overflow".into()))?;
                 scanned = scanned
+                    .checked_add(1)
+                    .ok_or_else(|| AgentError::Provider("progressive_counter_overflow".into()))?;
+                page_scanned = page_scanned
                     .checked_add(1)
                     .ok_or_else(|| AgentError::Provider("progressive_counter_overflow".into()))?;
                 timing.record_metadata()?;
@@ -667,33 +722,14 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
                     crate::activity::MAX_CURRENT_ITEM_BYTES,
                 ));
                 on_progress(scanned, &item)?;
-                if item.body_rel_path.is_none()
-                    || matched.contains(&(item.service.clone(), item.item_id.clone()))
-                {
-                    continue;
+                if let Some(candidate) = candidate {
+                    items.push((item, candidate));
+                    if items.len() == MAX_CANDIDATES_PER_PAGE {
+                        has_more = index + 1 < page_len || page.has_more;
+                        break 'pages;
+                    }
                 }
-                let candidate = Self::candidate_metadata(&item);
-                let mut projected = items
-                    .iter()
-                    .map(
-                        |(_, candidate): &(ArchiveItemPrivateV1, SearchCandidateMetadataV1)| {
-                            candidate
-                        },
-                    )
-                    .cloned()
-                    .collect::<Vec<_>>();
-                projected.push(candidate.clone());
-                let bytes = serde_json::to_vec(&projected)
-                    .map_err(|_| AgentError::Provider("candidate_encode_failed".into()))?
-                    .len();
-                if items.len() >= MAX_CANDIDATES_PER_PAGE || bytes > MAX_CANDIDATE_PROVIDER_BYTES {
-                    raw_offset = raw_offset.saturating_sub(1);
-                    scanned = scanned.saturating_sub(1);
-                    has_more = true;
-                    break 'pages;
-                }
-                items.push((item, candidate));
-                if items.len() == MAX_CANDIDATES_PER_PAGE {
+                if page_scanned >= MAX_METADATA_SCANNED_PER_CANDIDATE_PAGE {
                     has_more = index + 1 < page_len || page.has_more;
                     break 'pages;
                 }
@@ -2027,9 +2063,14 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         } else {
             None
         };
-        let can_continue = next_page
-            .as_ref()
-            .is_some_and(|next| !next.provider_candidates.is_empty() && !next.budget_reached);
+        let can_continue = next_page.as_ref().is_some_and(|next| {
+            !next.budget_reached && (!next.provider_candidates.is_empty() || next.has_more)
+        });
+        let next_page_budget_reached = next_page.as_ref().is_some_and(|next| next.budget_reached);
+        let budget_reached = page.budget_reached
+            || next_page_budget_reached
+            || new_body_reads >= MAX_DEEP_READS as u16
+            || (page.has_more && context.provider_steps_remaining_after_current < 2);
         let deep_context = next_page.as_ref().filter(|_| can_continue).map(|next| {
             serde_json::json!({
                 "contract_version": 1,
@@ -2052,9 +2093,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             "stage": "deep",
             "selected": provider_results,
             "coverage_complete": coverage_complete,
-            "budget_reached": page.budget_reached
-                || new_body_reads >= MAX_DEEP_READS as u16
-                || (page.has_more && context.provider_steps_remaining_after_current < 2),
+            "budget_reached": budget_reached,
             "deep_context": deep_context,
         })
         .to_string();
@@ -2111,9 +2150,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             activity.provider_bytes = new_activity_bytes;
             activity.event_budget = event_budget;
             activity.coverage_complete = coverage_complete;
-            activity.budget_reached = page.budget_reached
-                || new_body_reads >= MAX_DEEP_READS as u16
-                || (page.has_more && context.provider_steps_remaining_after_current < 2);
+            activity.budget_reached = budget_reached;
             activity.continuation_available = can_continue;
             state.provider_bytes = projected_turn;
         }
@@ -2123,9 +2160,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             assistant_sources,
             visible_hits: Self::public_count(selected_count),
             coverage_complete,
-            budget_reached: page.budget_reached
-                || new_body_reads >= MAX_DEEP_READS as u16
-                || (page.has_more && context.provider_steps_remaining_after_current < 2),
+            budget_reached,
             continuation_available: can_continue,
         })
     }
@@ -3439,12 +3474,59 @@ mod tests {
         (output, events)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn execute_large_deep_page(
+        executor: &RetrievalExecutor<ProgressiveFakeArchive>,
+        authority: &crate::HmacProgressiveSearchAuthority,
+        cancellation: &crate::CancellationToken,
+        activity_id: &str,
+        continuation: &str,
+        candidates: Vec<String>,
+        provider_step_seq: u8,
+        budget: &mut crate::ProviderInputBudgetV1<'_>,
+    ) -> crate::SeparatedSearchOutputV2 {
+        let binding = crate::ReadExecutionBindingV2 {
+            session_id: "session".into(),
+            request_id: "large-continuation".into(),
+            tool_use_id: format!("large-deep-{provider_step_seq}"),
+            resolved_account_key: "account".into(),
+            admission_account_digest: crate::admission_account_digest("account").unwrap(),
+        };
+        let mut events = Vec::new();
+        let mut collect = |event| events.push(event);
+        let mut sink = crate::InfallibleTurnEventSink::new(&mut collect);
+        let output = executor
+            .execute_read_with_context(
+                &ToolAction::DeepSearch {
+                    activity_id: activity_id.into(),
+                    continuation: continuation.into(),
+                    candidates,
+                },
+                crate::ReadExecutionContext {
+                    binding: &binding,
+                    local_effect: None,
+                    mode: crate::ReadExecutionMode::Live,
+                    provider_step_seq,
+                    provider_steps_remaining_after_current: 15 - provider_step_seq,
+                    input_budget: budget,
+                    cancellation,
+                    events: &mut sink,
+                    progressive_authority: Some(authority),
+                },
+            )
+            .unwrap();
+        let crate::ReadExecutionOutputV2::DeepSearch(output) = output else {
+            panic!("deep-search output")
+        };
+        output
+    }
+
     #[test]
     fn large_fixture_enforces_record_cap_and_coalesces_current_progress() {
         let (output, events) = execute_large_progressive_fixture(0);
         assert!(!output.public_projection.coverage_complete);
-        assert!(output.public_projection.budget_reached);
-        assert!(!output.public_projection.continuation_available);
+        assert!(!output.public_projection.budget_reached);
+        assert!(output.public_projection.continuation_available);
 
         let running = events
             .iter()
@@ -3452,7 +3534,8 @@ mod tests {
                 StreamEvent::StageProgress(progress)
                     if progress.stage == SearchStage::Deep
                         && progress.status == StageStatus::Running
-                        && progress.current_item.is_some() =>
+                        && progress.current_item.is_some()
+                        && progress.continuation_available.is_none() =>
                 {
                     Some(progress.scanned)
                 }
@@ -3460,10 +3543,16 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(running.first().copied(), Some(25));
-        assert_eq!(running.last().copied(), Some(MAX_METADATA_SCANNED));
+        assert_eq!(
+            running.last().copied(),
+            Some(MAX_METADATA_SCANNED_PER_CANDIDATE_PAGE)
+        );
         assert_eq!(
             running.len(),
-            usize::try_from(MAX_METADATA_SCANNED / METADATA_PROGRESS_RECORD_INTERVAL).unwrap()
+            usize::try_from(
+                MAX_METADATA_SCANNED_PER_CANDIDATE_PAGE / METADATA_PROGRESS_RECORD_INTERVAL
+            )
+            .unwrap()
         );
         assert!(running
             .windows(2)
@@ -3472,14 +3561,186 @@ mod tests {
             event,
             StreamEvent::StageProgress(progress)
                 if progress.stage == SearchStage::Deep
-                    && progress.budget_reached == Some(true)
+                    && progress.budget_reached == Some(false)
                     && progress.coverage_complete == Some(false)
+                    && progress.continuation_available == Some(true)
         )));
     }
 
     #[test]
+    fn large_fixture_continuation_reaches_candidate_after_first_thousand_records() {
+        let mut items = Vec::with_capacity(10_000);
+        for index in 0..10_000 {
+            let mut item = progressive_item(
+                &format!("item-{index:05}"),
+                &format!("Synthetic archive item {index:05}"),
+                "body without the search term",
+            );
+            if index != 1_200 {
+                item.0.body_rel_path = None;
+            }
+            items.push(item);
+        }
+        let body_reads = Arc::new(AtomicUsize::new(0));
+        let executor = RetrievalExecutor::new(ProgressiveFakeArchive {
+            account: "account".into(),
+            items: Arc::new(items),
+            body_reads: Arc::clone(&body_reads),
+        });
+        let authority = crate::HmacProgressiveSearchAuthority::new([44; 32]);
+        let cancellation = crate::CancellationToken::default();
+        let search_binding = crate::ReadExecutionBindingV2 {
+            session_id: "session".into(),
+            request_id: "large-continuation".into(),
+            tool_use_id: "large-search".into(),
+            resolved_account_key: "account".into(),
+            admission_account_digest: crate::admission_account_digest("account").unwrap(),
+        };
+        let mut budget = crate::ProviderInputBudgetV1::new(None, 1_000_000, 0);
+        let mut events = Vec::new();
+        let search = {
+            let mut collect = |event| events.push(event);
+            let mut sink = crate::InfallibleTurnEventSink::new(&mut collect);
+            executor
+                .execute_read_with_context(
+                    &ToolAction::Search {
+                        account: "account".into(),
+                        services: vec!["mail".into()],
+                        query: "absent-search-term".into(),
+                        limit: Some(20),
+                    },
+                    crate::ReadExecutionContext {
+                        binding: &search_binding,
+                        local_effect: None,
+                        mode: crate::ReadExecutionMode::Live,
+                        provider_step_seq: 0,
+                        provider_steps_remaining_after_current: 15,
+                        input_budget: &mut budget,
+                        cancellation: &cancellation,
+                        events: &mut sink,
+                        progressive_authority: Some(&authority),
+                    },
+                )
+                .unwrap()
+        };
+        let crate::ReadExecutionOutputV2::Search(search) = search else {
+            panic!("search output")
+        };
+        let mut private: serde_json::Value =
+            serde_json::from_str(&search.provider_content).unwrap();
+        let mut deep = private["deep_context"].take();
+        assert_eq!(deep["scanned"], 500);
+        assert!(deep["candidates"].as_array().unwrap().is_empty());
+        let activity_id = deep["activity_id"].as_str().unwrap().to_string();
+
+        for (provider_step, expected_scanned) in [(1, 1_000), (2, 1_500)] {
+            let continuation = deep["continuation"].as_str().unwrap().to_string();
+            let output = execute_large_deep_page(
+                &executor,
+                &authority,
+                &cancellation,
+                &activity_id,
+                &continuation,
+                Vec::new(),
+                provider_step,
+                &mut budget,
+            );
+            private = serde_json::from_str(&output.provider_content).unwrap();
+            deep = private["deep_context"].take();
+            assert_eq!(deep["scanned"], expected_scanned);
+            assert!(!output.public_projection.budget_reached);
+            assert!(output.public_projection.continuation_available);
+        }
+
+        let candidate = deep["candidates"][0]["candidate_key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let continuation = deep["continuation"].as_str().unwrap().to_string();
+        let selected = execute_large_deep_page(
+            &executor,
+            &authority,
+            &cancellation,
+            &activity_id,
+            &continuation,
+            vec![candidate],
+            3,
+            &mut budget,
+        );
+        assert_eq!(body_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(selected.assistant_sources.len(), 1);
+        assert!(selected.provider_content.contains("item-01200"));
+    }
+
+    #[test]
+    fn candidate_page_byte_boundary_never_rolls_back_published_scan_counter() {
+        let mut items = Vec::new();
+        for index in 0..100 {
+            let mut item = progressive_item(
+                &format!("candidate-{index:03}"),
+                &format!("{index:03}-{}", "candidate metadata ".repeat(40)),
+                "bounded body",
+            );
+            item.0.sender = Some("bounded sender ".repeat(24));
+            items.push(item);
+        }
+        let executor = RetrievalExecutor::new(ProgressiveFakeArchive {
+            account: "account".into(),
+            items: Arc::new(items),
+            body_reads: Arc::new(AtomicUsize::new(0)),
+        });
+        let scope = CanonicalSearchScopeV1::new(
+            "account",
+            "absent-search-term",
+            vec!["mail".into()],
+            Some(20),
+        )
+        .unwrap();
+        let binding = SearchActivityBindingV1 {
+            session_id: "session".into(),
+            request_id: "candidate-page-byte-boundary".into(),
+            activity_id: "AAAAAAAAAAAAAAAAAAAAAA".into(),
+            originating_search_tool_use_id: "search-tool".into(),
+            canonical_scope_digest: scope.digest(),
+        };
+        let normalized_scope = NormalizedSearchScope::new("account", vec!["mail".into()]).unwrap();
+        let cancellation = crate::CancellationToken::default();
+        let timing = ProgressiveCallTiming::new(Arc::clone(&executor.clock), &cancellation);
+        let snapshot = executor
+            .source
+            .begin_search_snapshot(&normalized_scope, &timing.store_deadline())
+            .unwrap();
+        let authority = crate::HmacProgressiveSearchAuthority::new([45; 32]);
+        let mut published = Vec::new();
+        let page = executor
+            .candidate_page(
+                snapshot.as_ref(),
+                &authority,
+                &binding,
+                &BTreeSet::new(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                &timing,
+                &mut |scanned, _| {
+                    published.push(scanned);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert!(page.has_more);
+        assert!(page.provider_candidates.len() < MAX_CANDIDATES_PER_PAGE);
+        assert_eq!(published.last().copied(), Some(page.state.metadata_scanned));
+        assert_eq!(page.next_offset, page.state.metadata_scanned);
+        assert!(published.windows(2).all(|pair| pair[1] == pair[0] + 1));
+    }
+
+    #[test]
     fn large_fixture_injected_two_second_metadata_deadline_stops_before_record_cap() {
-        let (output, events) = execute_large_progressive_fixture(1);
+        let (output, events) = execute_large_progressive_fixture(2);
         assert!(!output.public_projection.coverage_complete);
         assert!(output.public_projection.budget_reached);
         let terminal_scanned = events
@@ -3496,7 +3757,7 @@ mod tests {
             .next_back()
             .expect("deep budget terminal");
         assert!(terminal_scanned > 0);
-        assert!(terminal_scanned < MAX_METADATA_SCANNED);
+        assert!(terminal_scanned < MAX_METADATA_SCANNED_PER_CANDIDATE_PAGE);
     }
 
     struct ProgressiveTurnObserver {

@@ -609,9 +609,11 @@ Fixed initial limits:
 | Stage-progress events/activity | 256 |
 | Partial-result events/activity | 64 |
 | Candidate metadata/page | 64 records and 24 KiB canonical JSON |
+| Metadata records/candidate page | 500 |
 | Candidate selections/deep call | default 12, hard maximum 12 |
 | Deep body reads/activity | hard maximum 40 |
 | Metadata records/deep call | 1,000 |
+| Metadata records/activity | 16,000 cumulative |
 | Metadata scan wall time/deep call | 2 seconds, injected monotonic clock |
 | Cooperative DeepSearch tool-call budget | 10 seconds from executor entry, injected monotonic clock; no hard kernel-I/O or whole-turn SLA |
 | Deep provider content/call | 64 KiB canonical JSON |
@@ -626,6 +628,13 @@ first. While the sink accepts events, a start and one terminal event are emitted
 even when no periodic update was needed. Sink loss commits internal terminal state
 but cannot promise delivery to a disconnected receiver. The producer must never
 emit one event for every item in a large archive.
+
+Each candidate page covers at most 500 metadata records. A DeepSearch call may
+therefore reconstruct and verify the current page and prepare the next page while
+remaining inside the independent 1,000-record call budget. Reaching a candidate-
+page boundary is not a terminal budget condition: an empty page with more metadata
+still produces a continuation. Only the cumulative 16,000-record activity limit,
+the per-call time/record limit, or another closed budget ends continuation.
 
 Timer checks use an injected monotonic clock. Every progressive SQLite statement
 also installs a cancellation/deadline progress handler (or equivalent interrupt
@@ -1199,8 +1208,11 @@ callers but this path must not call them.
     `FileBasicInformation` must describe a non-directory non-reparse file, and
     `GetSecurityInfo` plus `GetTokenInformation(TokenUser)` must show that the
     owner SID equals the process user SID. The DACL is walked with `GetAce` and
-    must contain no allow ACE granting write-data/append, delete, write-DAC, or
-    write-owner authority to Everyone, Authenticated Users, or Builtin Users;
+    every standard, callback, object, and callback-object allow ACE is parsed with
+    bounds-checked SID offsets. It must contain no allow ACE granting write-data/
+    append, delete, write-DAC, or write-owner authority to Everyone, Authenticated
+    Users, or Builtin Users. Malformed allow ACEs and obsolete compound allow ACEs
+    fail closed rather than being skipped;
     inherited ACEs are evaluated identically. The final metadata and bytes come from that
     same target handle. `CreateFileW` path reopens, `canonicalize()`, and
     check-then-open sequences are forbidden. The implementation uses explicit
@@ -2520,6 +2532,7 @@ Required executable tests:
 - `archive_deep_unix_rejects_symlink_and_magiclink_in_every_component`
 - `archive_deep_unix_rejects_symlink_in_configured_root_ancestor`
 - `archive_deep_windows_rejects_ancestor_and_final_reparse_points`
+- `archive_deep_windows_rejects_nonstandard_broad_allow_ace`
 - `archive_cancellation_after_blocked_read_prevents_next_chunk_or_provider_call`
 - `cancellation_during_private_body_read_emits_no_late_partial_result`
 
@@ -2570,6 +2583,8 @@ Required executable tests:
 
 - `progressive_search_reads_no_body_until_verified_model_selection`
 - `large_fixture_enforces_record_cap_and_coalesces_current_progress`
+- `large_fixture_continuation_reaches_candidate_after_first_thousand_records`
+- `candidate_page_byte_boundary_never_rolls_back_published_scan_counter`
 - `large_fixture_injected_two_second_metadata_deadline_stops_before_record_cap`
 - `fake_provider_turn_selects_keywordless_candidate_after_store_archive_search`
 
@@ -2921,14 +2936,16 @@ cargo remote -c -- check -p isyncyou-core \
 The Linux-hosted Windows cross-check is compilation evidence only. Add one focused
 `windows-latest` job to `.github/workflows/pr-dev.yml` that runs the actual
 `isyncyou-core` bounded-archive-body unit tests on Windows. It must exercise
-ancestor and final reparse points, hardlinks, owner policy, and same-handle reads; a mocked `cfg(windows)`
+ancestor and final reparse points, hardlinks, standard and object-ACE owner policy,
+and same-handle reads; a mocked `cfg(windows)`
 test or cross-compile alone is not a PASS. The job first lists tests and fails
-unless at least these five prefixes matched:
+unless at least these six prefixes matched:
 `archive_deep_windows_root_open_`,
 `archive_deep_windows_rejects_ancestor_`,
 `archive_deep_windows_uses_same_verified_handle_`,
 `archive_deep_body_rejects_windows_hardlink_`, and
-`archive_deep_windows_validates_owner_`; only then may it run the
+`archive_deep_windows_validates_owner_`, and
+`archive_deep_windows_rejects_nonstandard_`; only then may it run the
 filtered tests. The workstation uses `cargo remote`; the GitHub-hosted Windows job
 uses the repository-pinned Rust toolchain directly, like the existing CI jobs.
 

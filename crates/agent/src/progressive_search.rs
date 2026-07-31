@@ -9,7 +9,9 @@ pub const MAX_CONTINUATION_ASCII_BYTES: usize = 1_024;
 pub const MAX_CONTINUATION_PAYLOAD_BYTES: usize = 640;
 pub const MAX_CANDIDATES_PER_PAGE: usize = 64;
 pub const MAX_SELECTED_CANDIDATES: usize = 12;
-pub const MAX_METADATA_SCANNED: u32 = 1_000;
+pub const MAX_METADATA_SCANNED_PER_CANDIDATE_PAGE: u32 = 500;
+pub const MAX_METADATA_SCANNED_PER_CALL: u32 = 1_000;
+pub const MAX_METADATA_SCANNED_PER_ACTIVITY: u32 = 16_000;
 
 const SERVICES: [&str; 6] = [
     "mail", "calendar", "contacts", "todo", "onenote", "onedrive",
@@ -462,6 +464,10 @@ fn validate_activity_state(
     activity: &SearchActivityBindingV1,
     state: &DeepContinuationStateV1,
 ) -> Result<(), AgentError> {
+    let page_metadata_scanned = state
+        .metadata_scanned
+        .checked_sub(state.service_offset)
+        .filter(|scanned| *scanned <= MAX_METADATA_SCANNED_PER_CANDIDATE_PAGE);
     if state.version != 1
         || state.activity_id != activity.activity_id
         || state.canonical_scope_digest != activity.canonical_scope_digest
@@ -473,7 +479,8 @@ fn validate_activity_state(
         || activity.originating_search_tool_use_id.is_empty()
         || activity.originating_search_tool_use_id.len() > 128
         || state.service_index as usize >= SERVICES.len()
-        || state.metadata_scanned > MAX_METADATA_SCANNED
+        || state.metadata_scanned > MAX_METADATA_SCANNED_PER_ACTIVITY
+        || page_metadata_scanned.is_none()
         || state.body_reads_used > 40
         || state.issued_at_provider_step > 15
     {
@@ -652,6 +659,31 @@ mod tests {
         let mut wrong = activity.clone();
         wrong.originating_search_tool_use_id = "search-other".into();
         assert!(authority.open_continuation(&wrong, &encoded).is_err());
+    }
+
+    #[test]
+    fn deep_search_continuation_accepts_activity_budget_beyond_one_call_and_rejects_overflow() {
+        let authority = HmacProgressiveSearchAuthority::new([7; 32]);
+        let activity = activity(&authority);
+        let mut continuation = state(&activity);
+        continuation.service_offset =
+            MAX_METADATA_SCANNED_PER_ACTIVITY - MAX_METADATA_SCANNED_PER_CANDIDATE_PAGE;
+        continuation.metadata_scanned = MAX_METADATA_SCANNED_PER_ACTIVITY;
+        let encoded = authority
+            .seal_continuation(&activity, &continuation)
+            .unwrap();
+        assert_eq!(
+            authority
+                .open_continuation(&activity, &encoded)
+                .unwrap()
+                .metadata_scanned,
+            MAX_METADATA_SCANNED_PER_ACTIVITY
+        );
+
+        continuation.metadata_scanned = MAX_METADATA_SCANNED_PER_ACTIVITY + 1;
+        assert!(authority
+            .seal_continuation(&activity, &continuation)
+            .is_err());
     }
 
     #[test]
