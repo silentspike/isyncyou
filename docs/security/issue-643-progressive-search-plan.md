@@ -2950,9 +2950,9 @@ cargo remote -c -- clippy -p isyncyou-app-host --all-targets \
 cargo remote -c -- test -p isyncyou-webui --all-targets -- --nocapture
 cargo remote -c -- clippy -p isyncyou-webui --all-targets -- -D warnings
 cargo remote -c -- test -p isyncyou-mobile --all-targets \
-  --no-default-features -- --nocapture
+  --features agent-oauth-providers -- --nocapture
 cargo remote -c -- clippy -p isyncyou-mobile --all-targets \
-  --no-default-features -- -D warnings
+  --features agent-oauth-providers -- -D warnings
 cargo remote -c -- check -p isyncyou-core \
   --target x86_64-pc-windows-gnu
 ```
