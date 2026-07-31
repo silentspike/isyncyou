@@ -113,7 +113,7 @@ pub use session_v2::{
     session_write_policy, tool_result_digest, ContextBudget, HistoryCursorCodec, HistoryPageV1,
     IdempotencyTombstoneV1, ImmutableIndexEntryV1, ImmutableIndexPageV1,
     InMemorySessionV2Transport, IndexPageRef, InputTokenCounter, LocalEffectCheckpointV1,
-    LocalEffectState, ManifestDelta, ManifestLease, NormalizedAssistantBlock,
+    LocalEffectState, ManifestDelta, ManifestLease, ModelInputAllowance, NormalizedAssistantBlock,
     PersistedLeaseBinding, ProviderAttemptBindingV1, ReadToolCheckpointV1, RequestJournalV1,
     RequestPhase, RequestReplayV1, RequestRouteDomain, RequestStatusV1, RequestStepOutcomeV1,
     RequestStepRef, RequestUuidBindingV1, SanitizedUsage, SessionCommitV1, SessionLeaseGuard,

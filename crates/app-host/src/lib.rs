@@ -7075,14 +7075,20 @@ fn provider_has_model(provider: ProductProviderId, model: &str) -> bool {
     known.iter().any(|spec| spec.id == model)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProductModelBudgets {
+    context: isyncyou_agent::ContextBudget,
+    provider_input_limit: usize,
+}
+
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-fn product_model_context_budget(
+fn product_model_budgets(
     provider: ProductProviderId,
     model: &str,
-) -> Result<isyncyou_agent::ContextBudget, String> {
+) -> Result<ProductModelBudgets, String> {
     let known = match provider {
         ProductProviderId::Claude => CLAUDE_MODELS,
         ProductProviderId::Codex => CODEX_MODELS,
@@ -7091,10 +7097,17 @@ fn product_model_context_budget(
         .iter()
         .find(|spec| spec.id == model)
         .ok_or_else(|| "unknown_model".to_string())?;
-    Ok(isyncyou_agent::ContextBudget::for_model_limits(
-        spec.context_window_tokens,
-        spec.max_output_tokens,
-    ))
+    Ok(ProductModelBudgets {
+        context: isyncyou_agent::ContextBudget::for_model_limits(
+            spec.context_window_tokens,
+            spec.max_output_tokens,
+        ),
+        provider_input_limit: isyncyou_agent::ModelInputAllowance::for_model_limits(
+            spec.context_window_tokens,
+            spec.max_output_tokens,
+        )
+        .max_tokens,
+    })
 }
 
 #[cfg(any(
@@ -11996,7 +12009,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                             .session_binding
                             .clone()
                             .ok_or_else(|| "provider_generation_changed".to_string())?;
-                        let context_budget = product_model_context_budget(
+                        let model_budgets = product_model_budgets(
                             provider_binding.provider,
                             &provider_binding.model,
                         )?;
@@ -12030,7 +12043,8 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                                 installation_principal: installation.principal(),
                                 created_at_ms: unix_now_ms(),
                                 cached_context: cached_context.clone(),
-                                context_budget,
+                                context_budget: model_budgets.context,
+                                provider_input_limit: model_budgets.provider_input_limit,
                             })?;
                         Ok((worker, prepared, product_turn))
                     },
@@ -22060,20 +22074,34 @@ mod tests {
     ))]
     #[test]
     fn product_model_catalog_supplies_conservative_context_budget() {
-        let claude = product_model_context_budget(ProductProviderId::Claude, DEFAULT_MODEL)
+        let claude = product_model_budgets(ProductProviderId::Claude, DEFAULT_MODEL)
             .expect("catalogued Claude model");
-        let codex = product_model_context_budget(ProductProviderId::Codex, CODEX_MODELS[0].id)
+        let codex = product_model_budgets(ProductProviderId::Codex, CODEX_MODELS[0].id)
             .expect("catalogued Codex model");
 
         assert_eq!(
-            claude.max_tokens,
+            claude.context.max_tokens,
             isyncyou_agent::UNKNOWN_MODEL_INPUT_TOKENS
         );
-        assert_eq!(codex.max_tokens, isyncyou_agent::UNKNOWN_MODEL_INPUT_TOKENS);
-        assert_eq!(claude.max_messages, isyncyou_agent::MAX_CONTEXT_MESSAGES);
-        assert_eq!(codex.max_bytes, isyncyou_agent::MAX_CONTEXT_BYTES);
         assert_eq!(
-            product_model_context_budget(ProductProviderId::Claude, "unreviewed-model"),
+            codex.context.max_tokens,
+            isyncyou_agent::UNKNOWN_MODEL_INPUT_TOKENS
+        );
+        assert_eq!(
+            claude.provider_input_limit,
+            isyncyou_agent::UNKNOWN_MODEL_INPUT_TOKENS
+        );
+        assert_eq!(
+            codex.provider_input_limit,
+            isyncyou_agent::UNKNOWN_MODEL_INPUT_TOKENS
+        );
+        assert_eq!(
+            claude.context.max_messages,
+            isyncyou_agent::MAX_CONTEXT_MESSAGES
+        );
+        assert_eq!(codex.context.max_bytes, isyncyou_agent::MAX_CONTEXT_BYTES);
+        assert_eq!(
+            product_model_budgets(ProductProviderId::Claude, "unreviewed-model"),
             Err("unknown_model".to_string())
         );
     }

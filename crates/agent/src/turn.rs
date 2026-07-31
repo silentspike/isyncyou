@@ -786,6 +786,13 @@ fn run_turn_cancellable_inner(
             });
         }
 
+        // The assistant tool-use block was not present in the pre-provider snapshot.
+        // Recount it before retrieval decides how much progressive content can fit.
+        input_budget.reset_committed_tokens(complete_provider_input_tokens(
+            history,
+            input_counter.as_deref(),
+        )?)?;
+
         // Execute each tool call. Tool calls come ONLY from the provider's tool_use
         // structure — never parsed out of content — so retrieved (untrusted) text can
         // never become an action (REQ-AGENT-005).
@@ -1149,7 +1156,7 @@ mod tests {
 
         impl TurnObserver for SmallBudgetObserver {
             fn provider_input_limit(&self) -> usize {
-                48
+                72
             }
         }
 
@@ -1444,6 +1451,67 @@ mod tests {
             .content
             .contains("private-continuation"));
         assert!(private_tool_message.content.contains("private-body"));
+    }
+
+    struct AssistantFramingBudgetExecutor {
+        committed_tokens_at_read: Cell<usize>,
+    }
+
+    impl ToolExecutor for AssistantFramingBudgetExecutor {
+        fn execute_read(&self, _action: &ToolAction) -> Result<String, crate::AgentError> {
+            panic!("search must use contextual execution")
+        }
+
+        fn execute_read_with_context(
+            &self,
+            action: &ToolAction,
+            context: ReadExecutionContext<'_, '_>,
+        ) -> Result<ReadExecutionOutputV2, crate::AgentError> {
+            assert!(matches!(action, ToolAction::Search { .. }));
+            self.committed_tokens_at_read
+                .set(context.input_budget.already_committed_tokens);
+            let provider_content = "{}".to_string();
+            context.input_budget.charge(&provider_content)?;
+            Ok(ReadExecutionOutputV2::Search(SeparatedSearchOutputV2 {
+                provider_content,
+                public_projection: crate::PublicToolResultV1 {
+                    schema_version: crate::activity::ACTIVITY_SCHEMA_VERSION,
+                    operation: "search".into(),
+                    activity_id: "abcdefghijklmnopqrstuv".into(),
+                    visible_hits: 0,
+                    coverage_complete: false,
+                    budget_reached: true,
+                    continuation_available: false,
+                    sources: Vec::new(),
+                },
+                assistant_sources: Vec::new(),
+            }))
+        }
+    }
+
+    #[test]
+    fn progressive_budget_recounts_assistant_tool_framing_before_read() {
+        let tool_input = json!({
+            "op": "search",
+            "account": "me",
+            "services": ["mail"],
+            "query": "invoice"
+        });
+        let mut provider = FakeProvider::new(vec![
+            vec![tool_use("search-budget", tool_input.clone())],
+            vec![AssistantBlock::Text("Bounded answer".into())],
+        ]);
+        let executor = AssistantFramingBudgetExecutor {
+            committed_tokens_at_read: Cell::new(0),
+        };
+        let mut history = vec![Message::user("Find it")];
+
+        run_turn(&mut provider, &executor, &mut history, &mut |_| {}).unwrap();
+
+        let expected = "Find it".len()
+            + "search-budget".len()
+            + serde_json::to_string(&tool_input).unwrap().len();
+        assert_eq!(executor.committed_tokens_at_read.get(), expected);
     }
 
     struct MissingArchiveBodyExecutor;

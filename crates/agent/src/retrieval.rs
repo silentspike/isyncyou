@@ -388,6 +388,32 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         })
     }
 
+    fn search_provider_content(
+        query: &str,
+        provider_results: &[serde_json::Value],
+        coverage_complete: bool,
+        deep_context: Option<&serde_json::Value>,
+    ) -> Result<String, AgentError> {
+        serde_json::to_string(&serde_json::json!({
+            "query": query,
+            "returned": provider_results.len(),
+            "coverage_complete": coverage_complete,
+            "results": provider_results,
+            "deep_context": deep_context,
+        }))
+        .map_err(|_| AgentError::Provider("search_result_encode_failed".into()))
+    }
+
+    fn search_provider_content_fits(
+        query: &str,
+        provider_results: &[serde_json::Value],
+        input_budget: &crate::ProviderInputBudgetV1<'_>,
+    ) -> Result<bool, AgentError> {
+        let content = Self::search_provider_content(query, provider_results, false, None)?;
+        Ok(content.len() <= MAX_ACTIVITY_PROVIDER_BYTES
+            && input_budget.tokens_for(&content) <= input_budget.remaining_tokens)
+    }
+
     fn candidate_metadata(item: &ArchiveItemPrivateV1) -> SearchCandidateMetadataV1 {
         SearchCandidateMetadataV1 {
             candidate_key: "AAAAAAAAAAAAAAAAAAAAAA".into(),
@@ -1057,14 +1083,14 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
                 None,
             ));
             let provider_item = Self::provider_keyword_item(&item, None);
-            let projected = serde_json::to_vec(&provider_item)
-                .map_err(|_| AgentError::Provider("search_result_encode_failed".into()))?
-                .len();
-            let current = serde_json::to_vec(&provider_results)
+            let mut projected = provider_results.clone();
+            projected.push(provider_item.clone());
+            let projected_bytes = serde_json::to_vec(&projected)
                 .map_err(|_| AgentError::Provider("search_result_encode_failed".into()))?
                 .len();
             if provider_results.len() < MAX_KEYWORD_PROVIDER_ITEMS
-                && current.saturating_add(projected) <= MAX_KEYWORD_PROVIDER_BYTES
+                && projected_bytes <= MAX_KEYWORD_PROVIDER_BYTES
+                && Self::search_provider_content_fits(query, &projected, context.input_budget)?
             {
                 provider_indexes.insert(key, provider_results.len());
                 provider_results.push(provider_item);
@@ -1163,7 +1189,16 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             ));
             let provider_item = Self::provider_keyword_item(&item, Some(&snippet));
             if let Some(index) = provider_indexes.get(&key).copied() {
-                provider_results[index] = provider_item;
+                let mut projected = provider_results.clone();
+                projected[index] = provider_item.clone();
+                if serde_json::to_vec(&projected)
+                    .map_err(|_| AgentError::Provider("search_result_encode_failed".into()))?
+                    .len()
+                    <= MAX_KEYWORD_PROVIDER_BYTES
+                    && Self::search_provider_content_fits(query, &projected, context.input_budget)?
+                {
+                    provider_results[index] = provider_item;
+                }
             } else if provider_results.len() < MAX_KEYWORD_PROVIDER_ITEMS {
                 let mut projected = provider_results.clone();
                 projected.push(provider_item.clone());
@@ -1171,6 +1206,7 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
                     .map_err(|_| AgentError::Provider("search_result_encode_failed".into()))?
                     .len()
                     <= MAX_KEYWORD_PROVIDER_BYTES
+                    && Self::search_provider_content_fits(query, &projected, context.input_budget)?
                 {
                     provider_indexes.insert(key, provider_results.len());
                     provider_results.push(provider_item);
@@ -1234,12 +1270,36 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             context.cancellation,
             &deadline,
         )?;
-        let can_continue = context.provider_steps_remaining_after_current >= 2
+        let continuation_candidate = context.provider_steps_remaining_after_current >= 2
             && !candidate_page.budget_reached
             && (!candidate_page.provider_candidates.is_empty() || candidate_page.has_more);
         let coverage_complete = candidate_page.provider_candidates.is_empty()
             && !candidate_page.has_more
             && !candidate_page.budget_reached;
+        let candidate_deep_context = continuation_candidate.then(|| {
+            serde_json::json!({
+                "contract_version": 1,
+                "activity_id": activity_id,
+                "continuation": candidate_page.continuation,
+                "candidates": candidate_page.provider_candidates,
+                "scanned": candidate_page.state.metadata_scanned,
+                "total": serde_json::Value::Null,
+                "body_reads_used": 0,
+                "body_reads_remaining": MAX_DEEP_READS,
+                "provider_steps_remaining": context.provider_steps_remaining_after_current,
+            })
+        });
+        let candidate_provider_content = Self::search_provider_content(
+            query,
+            &provider_results,
+            coverage_complete,
+            candidate_deep_context.as_ref(),
+        )?;
+        let continuation_fits = candidate_provider_content.len() <= MAX_ACTIVITY_PROVIDER_BYTES
+            && context.input_budget.tokens_for(&candidate_provider_content)
+                <= context.input_budget.remaining_tokens;
+        let can_continue = continuation_candidate && continuation_fits;
+        let model_budget_reached = continuation_candidate && !continuation_fits;
         let deep_status = if can_continue {
             StageStatus::Running
         } else if coverage_complete {
@@ -1248,7 +1308,19 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
             StageStatus::Skipped
         };
         let budget_reached = candidate_page.budget_reached
-            || (!coverage_complete && context.provider_steps_remaining_after_current < 2);
+            || (!coverage_complete && context.provider_steps_remaining_after_current < 2)
+            || model_budget_reached;
+        let provider_content = if can_continue {
+            candidate_provider_content
+        } else {
+            Self::search_provider_content(query, &provider_results, coverage_complete, None)?
+        };
+        if provider_content.len() > MAX_ACTIVITY_PROVIDER_BYTES {
+            return Err(AgentError::Provider(
+                "progressive_provider_budget_exhausted".into(),
+            ));
+        }
+        context.input_budget.charge(&provider_content)?;
         {
             let mut state = self
                 .progressive
@@ -1291,33 +1363,6 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
                 .event_budget = event_budget.clone();
         }
         Self::ensure_search_active(context.cancellation, &deadline)?;
-        let deep_context = can_continue.then(|| {
-            serde_json::json!({
-                "contract_version": 1,
-                "activity_id": activity_id,
-                "continuation": candidate_page.continuation,
-                "candidates": candidate_page.provider_candidates,
-                "scanned": candidate_page.state.metadata_scanned,
-                "total": serde_json::Value::Null,
-                "body_reads_used": 0,
-                "body_reads_remaining": MAX_DEEP_READS,
-                "provider_steps_remaining": context.provider_steps_remaining_after_current,
-            })
-        });
-        let provider_content = serde_json::json!({
-            "query": query,
-            "returned": provider_results.len(),
-            "coverage_complete": coverage_complete,
-            "results": provider_results,
-            "deep_context": deep_context,
-        })
-        .to_string();
-        if provider_content.len() > MAX_ACTIVITY_PROVIDER_BYTES {
-            return Err(AgentError::Provider(
-                "progressive_provider_budget_exhausted".into(),
-            ));
-        }
-        context.input_budget.charge(&provider_content)?;
         let visible_hit_count = visible_keys.len();
         let mut state = self
             .progressive
@@ -2941,6 +2986,81 @@ mod tests {
                     if progress.continuation_available == Some(true)
             )
         }));
+    }
+
+    #[test]
+    fn initial_search_omits_deep_context_when_model_budget_cannot_fit_candidates() {
+        let body_reads = Arc::new(AtomicUsize::new(0));
+        let mut items = vec![progressive_item(
+            "keyword",
+            "Invoice 2026",
+            "known invoice body",
+        )];
+        for index in 0..32 {
+            items.push(progressive_item(
+                &format!("candidate-{index:02}"),
+                &format!("Semantically related candidate {index:02}"),
+                "candidate body",
+            ));
+        }
+        let executor = RetrievalExecutor::new(ProgressiveFakeArchive {
+            account: "account".into(),
+            items: Arc::new(items),
+            body_reads: Arc::clone(&body_reads),
+        });
+        let authority = crate::HmacProgressiveSearchAuthority::new([27; 32]);
+        let cancellation = crate::CancellationToken::default();
+        let binding = crate::ReadExecutionBindingV2 {
+            session_id: "session".into(),
+            request_id: "request".into(),
+            tool_use_id: "search-budget".into(),
+            resolved_account_key: "account".into(),
+            admission_account_digest: crate::admission_account_digest("account").unwrap(),
+        };
+        let mut budget = crate::ProviderInputBudgetV1::new(None, 4_096, 0);
+        let mut events = Vec::new();
+        let mut collect = |event| events.push(event);
+        let mut sink = crate::InfallibleTurnEventSink::new(&mut collect);
+
+        let output = executor
+            .execute_read_with_context(
+                &ToolAction::Search {
+                    account: "account".into(),
+                    services: vec!["mail".into()],
+                    query: "invoice".into(),
+                    limit: Some(20),
+                },
+                crate::ReadExecutionContext {
+                    binding: &binding,
+                    local_effect: None,
+                    mode: crate::ReadExecutionMode::Live,
+                    provider_step_seq: 0,
+                    provider_steps_remaining_after_current: 15,
+                    input_budget: &mut budget,
+                    cancellation: &cancellation,
+                    events: &mut sink,
+                    progressive_authority: Some(&authority),
+                },
+            )
+            .unwrap();
+        let crate::ReadExecutionOutputV2::Search(output) = output else {
+            panic!("search output")
+        };
+        let provider: serde_json::Value = serde_json::from_str(&output.provider_content).unwrap();
+
+        assert!(provider["deep_context"].is_null());
+        assert!(output.public_projection.budget_reached);
+        assert!(!output.public_projection.continuation_available);
+        assert!(output.provider_content.len() <= 4_096);
+        assert_eq!(body_reads.load(Ordering::SeqCst), 0);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::StageProgress(progress)
+                if progress.stage == SearchStage::Deep
+                    && progress.status == StageStatus::Skipped
+                    && progress.budget_reached == Some(true)
+                    && progress.continuation_available == Some(false)
+        )));
     }
 
     #[test]

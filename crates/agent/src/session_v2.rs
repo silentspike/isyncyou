@@ -5000,6 +5000,31 @@ pub struct ContextBudget {
     pub max_tokens: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelInputAllowance {
+    pub max_tokens: usize,
+}
+
+impl ModelInputAllowance {
+    pub fn for_model_limits(
+        context_window_tokens: Option<usize>,
+        max_output_tokens: Option<usize>,
+    ) -> Self {
+        let max_tokens = match (context_window_tokens, max_output_tokens) {
+            (Some(context), Some(output)) => {
+                let safety_margin = context / 10 + usize::from(context % 10 != 0);
+                output
+                    .checked_add(MIN_TOOL_RESULT_TOKENS)
+                    .and_then(|reserved| reserved.checked_add(safety_margin))
+                    .and_then(|reserved| context.checked_sub(reserved))
+                    .unwrap_or(0)
+            }
+            _ => UNKNOWN_MODEL_INPUT_TOKENS,
+        };
+        Self { max_tokens }
+    }
+}
+
 impl Default for ContextBudget {
     fn default() -> Self {
         Self {
@@ -5017,16 +5042,10 @@ impl ContextBudget {
         context_window_tokens: Option<usize>,
         max_output_tokens: Option<usize>,
     ) -> Self {
-        let max_tokens = match (context_window_tokens, max_output_tokens) {
-            (Some(context), Some(output)) => {
-                let safety_margin = context / 10 + usize::from(context % 10 != 0);
-                context
-                    .saturating_sub(output.saturating_add(MIN_TOOL_RESULT_TOKENS))
-                    .saturating_sub(safety_margin)
-                    .min(MAX_CONTEXT_TOKENS)
-            }
-            _ => UNKNOWN_MODEL_INPUT_TOKENS,
-        };
+        let max_tokens =
+            ModelInputAllowance::for_model_limits(context_window_tokens, max_output_tokens)
+                .max_tokens
+                .min(MAX_CONTEXT_TOKENS);
         Self {
             max_messages: MAX_CONTEXT_MESSAGES,
             max_bytes: MAX_CONTEXT_BYTES,
@@ -7617,6 +7636,8 @@ mod tests {
         assert_eq!(budget.max_bytes, MAX_CONTEXT_BYTES);
         assert_eq!(budget.max_tokens, 17_203);
 
+        let allowance = ModelInputAllowance::for_model_limits(Some(200_000), Some(16_384));
+        assert_eq!(allowance.max_tokens, 159_520);
         let large = ContextBudget::for_model_limits(Some(200_000), Some(16_384));
         assert_eq!(large.max_tokens, MAX_CONTEXT_TOKENS);
     }
@@ -7634,6 +7655,14 @@ mod tests {
         assert_eq!(
             ContextBudget::for_model_limits(None, Some(4_096)).max_tokens,
             UNKNOWN_MODEL_INPUT_TOKENS
+        );
+        assert_eq!(
+            ModelInputAllowance::for_model_limits(None, Some(4_096)).max_tokens,
+            UNKNOWN_MODEL_INPUT_TOKENS
+        );
+        assert_eq!(
+            ModelInputAllowance::for_model_limits(Some(4_096), Some(4_096)).max_tokens,
+            0
         );
     }
 

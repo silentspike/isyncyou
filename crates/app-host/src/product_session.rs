@@ -225,6 +225,7 @@ pub struct ProductTurnRequest<'a> {
     pub created_at_ms: u64,
     pub cached_context: Option<ProductSessionContextSnapshot>,
     pub context_budget: isyncyou_agent::ContextBudget,
+    pub provider_input_limit: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2053,6 +2054,7 @@ impl<'a> ProductSessionRegistry<'a> {
             created_at_ms,
             cached_context,
             context_budget,
+            provider_input_limit,
         } = request;
         // This runs only in the admission worker. The route has already returned
         // the deterministic turn ID, so Graph manifest creation cannot delay the
@@ -2072,7 +2074,6 @@ impl<'a> ProductSessionRegistry<'a> {
         .into_iter()
         .filter(|record| record.request_id != request_id)
         .collect::<Vec<_>>();
-        let provider_input_limit = context_budget.max_tokens;
         let provider_history = select_provider_context(&context_records, None, &context_budget)
             .into_iter()
             .map(|message| match message.role {
