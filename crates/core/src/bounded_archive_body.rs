@@ -897,7 +897,7 @@ mod platform {
         }
         // SAFETY: sid_offset is inside this ACE. IsValidSid validates the variable
         // structure before GetLengthSid or EqualSid inspect it further.
-        let sid = unsafe { raw.add(sid_offset).cast_mut().cast::<c_void>() };
+        let sid = unsafe { raw.add(sid_offset).cast::<c_void>() };
         if unsafe { IsValidSid(sid) } == 0 {
             return Err(BoundedArchiveBodyError::UnsafeMetadata);
         }
