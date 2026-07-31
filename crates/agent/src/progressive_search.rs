@@ -577,11 +577,20 @@ mod tests {
 
     #[test]
     fn canonical_search_scope_is_byte_exact_across_restart_and_platform() {
-        let first =
-            CanonicalSearchScopeV1::new("Account", "Ä  Query", vec!["mail".into()], None).unwrap();
-        let second =
-            CanonicalSearchScopeV1::new("Account", "Ä  Query", vec!["mail".into()], Some(20))
-                .unwrap();
+        let first = CanonicalSearchScopeV1::new(
+            "Account",
+            "Ä  Query", // lang-allow: frozen Unicode canonicalization fixture
+            vec!["mail".into()],
+            None,
+        )
+        .unwrap();
+        let second = CanonicalSearchScopeV1::new(
+            "Account",
+            "Ä  Query", // lang-allow: frozen Unicode canonicalization fixture
+            vec!["mail".into()],
+            Some(20),
+        )
+        .unwrap();
         assert_eq!(first.encoded(), second.encoded());
         assert_eq!(first.digest(), second.digest());
         assert_eq!(
@@ -596,13 +605,25 @@ mod tests {
 
     #[test]
     fn canonical_search_scope_preserves_query_case_unicode_and_interior_whitespace() {
-        let upper = CanonicalSearchScopeV1::new("a", "Ä  Query", vec![], None).unwrap();
-        let lower = CanonicalSearchScopeV1::new("a", "ä query", vec![], None).unwrap();
+        let upper = CanonicalSearchScopeV1::new(
+            "a",
+            "Ä  Query", // lang-allow: Unicode preservation fixture
+            vec![],
+            None,
+        )
+        .unwrap();
+        let lower = CanonicalSearchScopeV1::new(
+            "a",
+            "ä query", // lang-allow: Unicode preservation fixture
+            vec![],
+            None,
+        )
+        .unwrap();
         assert_ne!(upper.encoded(), lower.encoded());
         assert!(upper
             .encoded()
             .windows(9)
-            .any(|part| part == "Ä  Query".as_bytes()));
+            .any(|part| part == "Ä  Query".as_bytes())); // lang-allow: Unicode preservation fixture
     }
 
     #[test]
