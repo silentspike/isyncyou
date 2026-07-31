@@ -598,15 +598,15 @@ mod platform {
                     || *unit < 0x20
                     || matches!(
                         *unit,
-                        b'<' as u16
-                            | b'>' as u16
-                            | b':' as u16
-                            | b'"' as u16
-                            | b'/' as u16
-                            | b'\\' as u16
-                            | b'|' as u16
-                            | b'?' as u16
-                            | b'*' as u16
+                        0x003c
+                            | 0x003e
+                            | 0x003a
+                            | 0x0022
+                            | 0x002f
+                            | 0x005c
+                            | 0x007c
+                            | 0x003f
+                            | 0x002a
                     )
             })
         {
