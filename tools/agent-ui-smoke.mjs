@@ -7,7 +7,7 @@ import { chromium } from "playwright";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const REPO = path.resolve(path.dirname(__filename), "..");
@@ -240,7 +240,7 @@ async function sendStream(res, scenario, turn) {
   res.end();
 }
 
-function makeFixtureServer(evidence) {
+function makeFixtureServer(evidence, options = {}) {
   const indexHtml = readText("gui/webui/src/index.html");
   const appCss = readText("gui/webui/src/app.css");
   const appJs = fixtureAppJs();
@@ -482,12 +482,12 @@ function makeFixtureServer(evidence) {
         const prompt = body.prompt || "";
         const turn = `turn-${++turnSeq}`;
         const lower = prompt.toLowerCase();
-        const scenario = lower.includes("progressive failure") ? "progressive-failure"
+        const scenario = options.scenarioForPrompt?.(prompt) || (lower.includes("progressive failure") ? "progressive-failure"
           : lower.includes("slow cancellation") ? "slow-cancel"
           : lower.includes("error") ? "error"
           : lower.includes("cancel") ? "pending-cancel"
             : lower.includes("delete") || lower.includes("confirm") ? "pending-confirm"
-              : "normal";
+              : "normal");
         turns.set(turn, scenario);
         requestScenarios.set(body.request_id, scenario);
         json(res, 200, { turn });
@@ -505,7 +505,7 @@ function makeFixtureServer(evidence) {
           activeTurnStreams.set(turn, res);
           res.on("close", () => activeTurnStreams.delete(turn));
         } else {
-          await sendStream(res, scenario, turn);
+          await (options.sendStream || sendStream)(res, scenario, turn);
         }
       } else if (req.method === "POST" && url.pathname === "/api/v1/agent/turn/cancel") {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
@@ -1016,9 +1016,9 @@ async function main() {
     const publicResultText = await page.locator('.asst-results .asst-result').allInnerTexts();
     assert(evidence, "progressive search renders the ordered three-stage plan",
       searchStageLabels.length === 3
-      && searchStageLabels[0].includes("Fast search")
-      && searchStageLabels[1].includes("Full-text")
-      && searchStageLabels[2].includes("AI deep-read"),
+      && searchStageLabels[0].includes("Names and subjects")
+      && searchStageLabels[1].includes("Archived content")
+      && searchStageLabels[2].includes("Selected deep reads"),
       searchStageLabels);
     assert(evidence, "progressive result projection excludes body excerpts and protocol errors",
       publicResultText.length === 1
@@ -1055,9 +1055,9 @@ async function main() {
     await page.waitForFunction(() => document.body.innerText.includes("Turn ended with an error"), null, { timeout: 10000 });
     const failedStages = await page.locator('.asst-search .asst-stage').allInnerTexts();
     assert(evidence, "failed progressive search closes later stages without protocol rejection",
-      failedStages.some((label) => label.includes("Fast search"))
-      && failedStages.some((label) => label.includes("Full-text"))
-      && failedStages.some((label) => label.includes("AI deep-read"))
+      failedStages.some((label) => label.includes("Names and subjects"))
+      && failedStages.some((label) => label.includes("Archived content"))
+      && failedStages.some((label) => label.includes("Selected deep reads"))
       && !(await pageText(page)).includes("Invalid search progress was ignored."),
       failedStages);
 
@@ -1180,7 +1180,7 @@ async function main() {
       transcript.append(probe);
       transcript.scrollTop = 0;
       view.scrollTop = 0;
-      scrollAssistantToEnd();
+      jumpAssistantToLatest();
       await new Promise(requestAnimationFrame);
       await new Promise(requestAnimationFrame);
       const result = {
@@ -1213,7 +1213,7 @@ async function main() {
       transcript.append(probe);
       transcript.scrollTop = 0;
       view.scrollTop = 0;
-      scrollAssistantToEnd();
+      jumpAssistantToLatest();
       await new Promise(requestAnimationFrame);
       await new Promise(requestAnimationFrame);
       const result = {
@@ -1271,4 +1271,8 @@ async function main() {
   process.exit(evidence.ok ? 0 : 1);
 }
 
-await main();
+export { makeFixtureServer, sendSseMessage, sleep };
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  await main();
+}

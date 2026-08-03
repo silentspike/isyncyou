@@ -775,7 +775,9 @@ gui/webui/src/app.css
 Expected support changes:
 
 ```text
+gui/webui/src/lib.rs (test-only source contract assertions)
 tools/agent-living-ui-smoke.mjs
+tools/agent-ui-smoke.mjs (test-only fixture export; direct #622 smoke behavior unchanged)
 docs/security/issue-644-living-agent-ui-plan.md
 docs/requirements/agent.yml
 docs/security/agent-threat-model.md
@@ -787,7 +789,6 @@ docs/evidence/artifacts/issue-644/*
 Unexpected and blocking without explicit scope approval:
 
 ```text
-gui/webui/src/lib.rs
 gui/webui/src/serve.rs
 crates/app-host/src/*
 crates/agent/src/*
