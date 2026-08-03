@@ -16326,8 +16326,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "function dedupeAgentSources(sources)",
             "? JSON.stringify([source.service, source.id])",
             ": JSON.stringify([source.service, \"\", source.path || \"\"]);",
-            "if (event.event === \"partial_result\") visit(event.items || [], 0);",
-            "else if (event.event === \"tool_result\")",
+            "if (event.event === \"tool_result\")",
+            "accepted.value.items.map(item => item.source)",
             "try { visit(JSON.parse(event.content), 0); } catch (_) {}",
             "visit(event.content, 0);",
             "return q ? \"/api/v1/view?\" + qs(q) : null;",
@@ -16601,6 +16601,46 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         ] {
             assert!(APP_JS.contains(needle), "missing teardown rule: {needle}");
         }
+    }
+
+    #[test]
+    fn living_ui_route_teardown_invalidates_queued_event_side_effects() {
+        for needle in [
+            "if (typeof turnState.isCurrent === \"function\" && !turnState.isCurrent()) return;",
+            "if (!isCurrentTurn()) return;",
+            "activityProtocol = finishAssistantActivityState(",
+            "activityProtocol, activityIdentity, \"cancelled\"",
+            "turn_id: turnState.turnId || \"\"",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "missing stale-turn boundary: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn living_ui_rejected_partial_result_has_no_citation_side_effect() {
+        let branch = APP_JS
+            .split("case \"partial_result\": {")
+            .nth(1)
+            .unwrap()
+            .split("case \"confirmation_required\"")
+            .next()
+            .unwrap();
+        assert!(branch.contains("const accepted = await turnState.onPartialResult(d);"));
+        assert!(branch.contains("if (accepted && accepted.kind === \"partial\")"));
+        assert!(branch.contains("accepted.value.items.map(item => item.source)"));
+        assert!(!branch.contains("extractAgentSources(d)"));
+    }
+
+    #[test]
+    fn living_ui_progress_warnings_are_bounded() {
+        assert!(APP_JS.contains("const displayedProgressWarnings = new Set();"));
+        assert!(APP_JS.contains(
+            "!displayedProgressWarnings.has(warning) && displayedProgressWarnings.size < 2"
+        ));
+        assert!(APP_JS.contains("displayedProgressWarnings.clear();"));
     }
 
     #[test]
@@ -16908,6 +16948,21 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(!APP_CSS.contains(".mdl-panel, .mdl-caret, .mdl.open .mdl-panel > *"));
         assert!(APP_CSS.contains(".mdl.open .mdl-panel, .mdl.open .mdl-panel > *"));
         assert!(APP_CSS.contains(".asst-citations {\n  display: flex;\n  flex-wrap: nowrap;"));
+    }
+
+    #[test]
+    fn living_ui_motion_transitions_checkmarks_and_staggers_results() {
+        assert!(
+            APP_CSS.contains("animation: asstStageDone .28s cubic-bezier(.34, 1.56, .64, 1) both;")
+        );
+        assert!(APP_CSS.contains("@keyframes asstStageDone"));
+        assert!(APP_CSS.contains(".asst-result.is-new:nth-child(16) { animation-delay: 180ms; }"));
+        let reduced = APP_CSS
+            .rsplit("@media (prefers-reduced-motion: reduce)")
+            .next()
+            .unwrap();
+        assert!(reduced.contains(".asst-stage.complete .asst-stage-ic"));
+        assert!(reduced.contains(".asst-result.is-new"));
     }
 
     #[test]
