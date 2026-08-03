@@ -1641,10 +1641,11 @@ impl<A: ArchiveSource> RetrievalExecutor<A> {
         let model_budget_reached = continuation_candidate && !continuation_fits;
         let deep_status = if can_continue {
             StageStatus::Running
-        } else if coverage_complete {
-            StageStatus::Complete
         } else {
-            StageStatus::Skipped
+            // The metadata scan has already run, even when coverage is bounded by the
+            // provider-step or input budget. Report that limitation through the coverage
+            // fields instead of emitting the invalid running -> skipped transition.
+            StageStatus::Complete
         };
         let budget_reached = candidate_page.budget_reached
             || (!coverage_complete && context.provider_steps_remaining_after_current < 2)
@@ -4188,7 +4189,7 @@ mod tests {
             event,
             StreamEvent::StageProgress(progress)
                 if progress.stage == SearchStage::Deep
-                    && progress.status == StageStatus::Skipped
+                    && progress.status == StageStatus::Complete
                     && progress.budget_reached == Some(true)
                     && progress.continuation_available == Some(false)
         )));
@@ -4474,7 +4475,7 @@ mod tests {
             event,
             StreamEvent::StageProgress(progress)
                 if progress.stage == SearchStage::Deep
-                    && progress.status == StageStatus::Skipped
+                    && progress.status == StageStatus::Complete
                     && progress.coverage_complete == Some(false)
                     && progress.continuation_available == Some(false)
         )));
