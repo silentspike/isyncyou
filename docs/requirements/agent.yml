@@ -548,7 +548,7 @@ requirements:
       behavior, and one generic already-authorized operation presentation. It never
       exposes provider reasoning, private search authority, body excerpts, or durable
       activity state. (S-AG.19, #644)
-    status: planned
+    status: implemented
     design: docs/adr/007-agent-architecture.md
     acceptance:
       - The first valid archive-search event shows the complete names, bodies, and deep plan while closed monotonic transitions and producer-aligned bounds prevent replay, gaps, or event floods from creating misleading UI state.
@@ -557,4 +557,15 @@ requirements:
       - Operational feedback uses closed local labels rather than model reasoning; direct single-step responses do not fabricate an activity plan and an existing non-search operation uses the same visual language without changing authority.
       - Reduced-motion, keyboard, screen-reader, mobile, desktop, cancellation, failure, pending-confirmation, and terminal states remain complete and truthful.
       - Activity plans, counters, result cards, and animation remain ephemeral and are not added to SessionRecordV2, cross-device history, provider input, or analytics.
-    verified_by: []
+    verified_by:
+      - test: living_ui_reducer_stage_transitions_are_monotonic
+      - test: living_ui_reducer_rejects_counter_regression_and_unknown_enums
+      - test: living_ui_reducer_dedupes_results_by_source_identity
+      - test: living_ui_reducer_enforces_per_activity_and_per_turn_detail_caps
+      - test: living_ui_reducer_rejects_private_search_fields
+      - test: living_ui_backup_or_restore_uses_closed_display_only_plan
+      - test: living_ui_tokens_flush_once_per_frame_and_preserve_exact_text
+      - test: living_ui_autoscroll_stops_when_reader_leaves_bottom
+      - test: living_ui_reduced_motion_preserves_content_and_interaction
+      - file: tools/agent-living-ui-smoke.mjs
+      - file: docs/evidence/issue-644-manifest.json
