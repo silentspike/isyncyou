@@ -1,0 +1,170 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-08-03T08:14:05Z",
+  "commit": "65e96ddfe8cd05be62b2fae54b78ec5665cef882",
+  "entries": [
+    {
+      "id": "EV-001",
+      "requirement": "REQ-AGENT-017",
+      "claim": "A product search publishes names, bodies, and deep in order with deduplicated source-tagged results.",
+      "method": "test",
+      "command": "tools/run-nonempty-cargo-filter.sh -p isyncyou-agent --features agent-oauth-providers,onedrive,retrieval --filter progressive_search_streams_staged_deduped_results",
+      "test": "progressive_search_streams_staged_deduped_results",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-643/deterministic-search-matrix.json"
+    },
+    {
+      "id": "EV-002",
+      "requirement": "REQ-AGENT-017",
+      "claim": "Deep search finds an authenticated metadata-selected item that name and body keyword search missed.",
+      "method": "test",
+      "command": "tools/run-nonempty-cargo-filter.sh -p isyncyou-agent --features agent-oauth-providers,onedrive,retrieval --filter deep_search_surfaces_keyword_less_candidate_and_excludes_matched",
+      "test": "deep_search_surfaces_keyword_less_candidate_and_excludes_matched",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-643/deterministic-search-matrix.json"
+    },
+    {
+      "id": "EV-003",
+      "requirement": "REQ-AGENT-017",
+      "claim": "Large metadata scans stop at the fixed record bound while current-item progress remains coalesced.",
+      "method": "test",
+      "command": "tools/run-nonempty-cargo-filter.sh -p isyncyou-agent --features agent-oauth-providers,onedrive,retrieval --filter large_fixture_enforces_record_cap_and_coalesces_current_progress",
+      "test": "large_fixture_enforces_record_cap_and_coalesces_current_progress",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-643/performance-bounds.json"
+    },
+    {
+      "id": "EV-004",
+      "requirement": "REQ-AGENT-017",
+      "claim": "Provider input exhaustion stops before a body read and does not advertise an unusable continuation.",
+      "method": "test",
+      "command": "tools/run-nonempty-cargo-filter.sh -p isyncyou-agent --features agent-oauth-providers,onedrive,retrieval --filter progressive_provider_budget_exhaustion_stops_before_read_and_omits_continuation",
+      "test": "progressive_provider_budget_exhaustion_stops_before_read_and_omits_continuation",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-643/performance-bounds.json"
+    },
+    {
+      "id": "EV-005",
+      "requirement": "REQ-AGENT-017",
+      "claim": "The public event contract exposes only bounded stage metadata and SourceRef fields, including truthful skipped terminals.",
+      "method": "command",
+      "command": "jq -e '.state == \"pass\" and .initial_plan == [\"names:queued\", \"bodies:queued\", \"deep:queued\"] and .public_projection.body_excerpt_is_public == false and .consumer_contract.terminal_predecessor_allows_later_skipped == true' docs/evidence/artifacts/issue-643/event-contract.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-643/event-contract.json"
+    },
+    {
+      "id": "EV-006",
+      "requirement": "REQ-AGENT-017",
+      "claim": "Product readiness uses the real StoreArchive progressive executor rather than the minimal stub.",
+      "method": "test",
+      "command": "tools/run-nonempty-cargo-filter.sh -p isyncyou-app-host --features agent-oauth-providers --filter product_agent_feature_uses_store_archive_progressive_executor",
+      "test": "product_agent_feature_uses_store_archive_progressive_executor",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-643/feature-graphs.json"
+    },
+    {
+      "id": "EV-007",
+      "requirement": "REQ-AGENT-017",
+      "claim": "Unix archive body reads reject hardlinks before reading content.",
+      "method": "test",
+      "command": "tools/run-nonempty-cargo-filter.sh -p isyncyou-core --filter archive_deep_body_rejects_unix_hardlink_before_read",
+      "test": "archive_deep_body_rejects_unix_hardlink_before_read",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-643/host-gates.txt"
+    },
+    {
+      "id": "EV-008",
+      "requirement": "REQ-AGENT-017",
+      "claim": "The protected Windows job executed native archive handle and reparse-point tests on windows-latest.",
+      "method": "command",
+      "command": "rg -q 'PASS windows-progressive-archive on windows-latest' docs/evidence/artifacts/issue-643/host-gates.txt",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-643/host-gates.txt"
+    },
+    {
+      "id": "EV-009",
+      "requirement": "REQ-AGENT-017",
+      "claim": "Tool-shaped text read from an untrusted body cannot directly create a destructive tool action.",
+      "method": "test",
+      "command": "tools/run-nonempty-cargo-filter.sh -p isyncyou-agent --features agent-oauth-providers,onedrive,retrieval --filter deep_body_tool_shaped_text_cannot_create_tool_action_directly",
+      "test": "deep_body_tool_shaped_text_cannot_create_tool_action_directly",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-643/recovery-cancel-injection.json"
+    },
+    {
+      "id": "EV-010",
+      "requirement": "REQ-AGENT-017",
+      "claim": "The one all-exit finalizer closes every opened progressive stage for every turn outcome.",
+      "method": "test",
+      "command": "tools/run-nonempty-cargo-filter.sh -p isyncyou-agent --features agent-oauth-providers,onedrive,retrieval --filter progressive_search_finish_with_exit_closes_every_turn_outcome",
+      "test": "progressive_search_finish_with_exit_closes_every_turn_outcome",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-643/recovery-cancel-injection.json"
+    },
+    {
+      "id": "EV-011",
+      "requirement": "REQ-AGENT-017",
+      "claim": "Encrypted legacy recovery verifies the original object and semantic digests before migration.",
+      "method": "test",
+      "command": "tools/run-nonempty-cargo-filter.sh -p isyncyou-agent --features agent-oauth-providers,onedrive,retrieval --filter legacy_v1_encrypted_fixture_verifies_original_object_and_semantic_digests",
+      "test": "legacy_v1_encrypted_fixture_verifies_original_object_and_semantic_digests",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-643/recovery-cancel-injection.json"
+    },
+    {
+      "id": "EV-012",
+      "requirement": "REQ-AGENT-017",
+      "claim": "The deterministic synthetic probe records a keyword-less deep hit, ordered activity, and one resolvable source without private content.",
+      "method": "probe",
+      "command": "jq -e '.state == \"pass\" and .fixture_kind == \"synthetic\" and .progressive_search.keywordless_selection_observed == true and .progressive_search.all_sources_resolved == true and .redaction.body_or_snippet_included == false' docs/evidence/artifacts/issue-643/deterministic-search-matrix.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-643/deterministic-search-matrix.json"
+    },
+    {
+      "id": "EV-013",
+      "requirement": "REQ-AGENT-017",
+      "claim": "A controlled desktop product turn used official Claude OAuth, emitted the ordered search activity, committed, and returned a resolvable source.",
+      "method": "probe",
+      "command": "jq -e '.state == \"pass\" and .implementation_commit == \"65e96ddfe8cd05be62b2fae54b78ec5665cef882\" and .provider == \"claude\" and .progressive_search.all_sources_resolved == true and .progressive_search.terminal_reason == \"complete\" and .request_status.state == \"committed\" and .retry_reused_turn == true' docs/evidence/artifacts/issue-643/desktop-live.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-643/desktop-live.json"
+    },
+    {
+      "id": "EV-014",
+      "requirement": "REQ-AGENT-017",
+      "claim": "The final hook-free default APK completed one normal physical product search with ordered stages and a resolvable source.",
+      "method": "probe",
+      "command": "jq -e '.state == \"pass\" and .implementation_commit == \"65e96ddfe8cd05be62b2fae54b78ec5665cef882\" and .artifact.sha256 == \"3bb39954ec3893a5e06fe4f3137b69f986110914ca19b98904ef6b7ab29391f3\" and .artifact.test_hook_markers_present == false and .product_row.stage_order == [\"names\", \"bodies\", \"deep\"] and .product_row.stage_states.deep == \"skipped\" and .product_row.terminal == \"complete\" and .product_row.source_count > 0 and .product_row.all_sources_resolved == true and .product_row.public_body_excerpt == false and .cleanup.device_lock_released == true' docs/evidence/artifacts/issue-643/default-apk.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-643/default-apk.json"
+    },
+    {
+      "id": "EV-015",
+      "requirement": "REQ-AGENT-017",
+      "claim": "The baseline UI accepts the public progressive contract, renders three stages and citations, and rejects body excerpts and private handles.",
+      "method": "command",
+      "command": "jq -e '.ok == true and (.assertions | length) == 65 and all(.assertions[]; .status == \"pass\")' docs/evidence/artifacts/issue-643/ui-smoke/agent-ui-smoke.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-643/ui-smoke/agent-ui-smoke.json"
+    },
+    {
+      "id": "EV-016",
+      "requirement": "REQ-AGENT-017",
+      "claim": "Daemon and mobile product feature graphs include retrieval while excluding the experimental subscription fallback.",
+      "method": "command",
+      "command": "jq -e '.state == \"pass\" and .daemon.isyncyou_agent_retrieval == true and .mobile_product.isyncyou_agent_retrieval == true and .mobile_product.isyncyou_agent_onedrive == true and .experimental_subscription_feature_present == false' docs/evidence/artifacts/issue-643/feature-graphs.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-643/feature-graphs.json"
+    },
+    {
+      "id": "EV-017",
+      "requirement": "REQ-AGENT-017",
+      "claim": "The Android bridge forwards only the bounded public progressive projection.",
+      "method": "test",
+      "command": "(cd android && env -u ISY_CARGO_FEATURES ./gradlew :app:testDebugUnitTest --tests com.silentspike.isyncyou.BridgeMessagePolicyTest.android_bridge_forwards_only_bounded_public_progress_projection)",
+      "test": "android_bridge_forwards_only_bounded_public_progress_projection",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-643/default-apk.json"
+    }
+  ]
+}

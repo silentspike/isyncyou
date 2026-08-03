@@ -509,7 +509,7 @@ requirements:
       queries, and excerpts never enter the public stream. Structured sources and one
       deterministic coverage finalization survive restart recovery without reparsing a
       public ToolResult. (S-AG.18, #643)
-    status: planned
+    status: implemented
     design: docs/adr/007-agent-architecture.md
     acceptance:
       - Name and body FTS stages use stable bounded pages, account/service scope, deterministic dedupe, and no archived body-file reads.
@@ -536,3 +536,4 @@ requirements:
       - test: assistant_baseline_never_renders_continuation_or_candidate_handles
       - test: android_bridge_forwards_only_bounded_public_progress_projection
       - file: tools/agent-progressive-search-probe.py
+      - file: docs/evidence/issue-643-manifest.json
