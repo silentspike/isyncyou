@@ -7315,6 +7315,7 @@ function createAssistantOperationRenderer(bubble, textNode, clearThinking, onUpd
 }
 
 async function handleAgentEvent(message, turnState) {
+  if (typeof turnState.isCurrent === "function" && !turnState.isCurrent()) return;
   const d = message || {};
   switch (d.event) {
     case "progress":
@@ -7354,12 +7355,15 @@ async function handleAgentEvent(message, turnState) {
       turnState.stopTokenCaret();
       await turnState.onSearchStage(d);
       break;
-    case "partial_result":
+    case "partial_result": {
       turnState.flushTokens();
       turnState.stopTokenCaret();
-      await turnState.onPartialResult(d);
-      turnState.addCitations(extractAgentSources(d));
+      const accepted = await turnState.onPartialResult(d);
+      if (accepted && accepted.kind === "partial") {
+        turnState.addCitations(accepted.value.items.map(item => item.source));
+      }
       break;
+    }
     case "confirmation_required": {
       turnState.flushTokens();
       turnState.stopTokenCaret();
@@ -7368,7 +7372,7 @@ async function handleAgentEvent(message, turnState) {
         preview: d.preview || "Action requires confirmation",
         risk: d.risk || "",
         expires_at_ms: d.expires_at_ms || null,
-        turn_id: AssistantState.activeTurnId || "",
+        turn_id: turnState.turnId || "",
         status: "pending",
         result: "",
         error: "",
@@ -7936,27 +7940,45 @@ async function agentSend(text) {
   const operationRenderer = createAssistantOperationRenderer(
     bubble, textEl, clearThinking, scrollAssistantToEnd,
   );
-  const cleanupActivityRenderer = () => activityRenderer.finish();
-  AssistantState.activeActivityCleanup = cleanupActivityRenderer;
   let activityProtocol = null;
   let activityIdentity = null;
+  const displayedProgressWarnings = new Set();
+  const cleanupActivityRenderer = () => {
+    activityRenderer.finish();
+    displayedProgressWarnings.clear();
+    if (activityProtocol && activityIdentity && !activityProtocol.terminalReason) {
+      activityProtocol = finishAssistantActivityState(
+        activityProtocol, activityIdentity, "cancelled",
+      );
+    }
+  };
+  AssistantState.activeActivityCleanup = cleanupActivityRenderer;
   const acceptProgressEvent = async (d) => {
-    activityProtocol = await acceptAgentActivityEvent(activityProtocol, activityIdentity, d);
+    const normalized = await normalizeAssistantActivityEvent(activityIdentity, d);
+    activityProtocol = reduceAssistantActivity(activityProtocol, normalized);
     const disposition = activityProtocol.lastDisposition;
-    if (disposition === "accept") return true;
-    if (["replay", "dedupe", "limited"].includes(disposition)) return false;
-    addError(disposition === "conflict" || disposition === "gap"
+    if (disposition === "accept") return normalized;
+    if (["replay", "dedupe", "limited"].includes(disposition)) return null;
+    const warning = disposition === "conflict" || disposition === "gap"
       ? "Search progress could not be reconciled."
-      : "Invalid search progress was ignored.");
-    return false;
+      : "Invalid search progress was ignored.";
+    if (!displayedProgressWarnings.has(warning) && displayedProgressWarnings.size < 2) {
+      displayedProgressWarnings.add(warning);
+      addError(warning);
+    }
+    return null;
   };
   const onSearchStage = async (d) => {
-    if (!await acceptProgressEvent(d)) return;
+    const accepted = await acceptProgressEvent(d);
+    if (!accepted) return null;
     await activityRenderer.render(activityProtocol);
+    return accepted;
   };
   const onPartialResult = async (d) => {
-    if (!await acceptProgressEvent(d)) return;
+    const accepted = await acceptProgressEvent(d);
+    if (!accepted) return null;
     await activityRenderer.render(activityProtocol);
+    return accepted;
   };
 
   let turn;
@@ -8049,6 +8071,9 @@ async function agentSend(text) {
     stream_id: crypto.randomUUID(),
   });
   activityProtocol = createAssistantActivityState(activityIdentity);
+  const isCurrentTurn = () => AssistantState.activeMessage === asst
+    && AssistantState.activeTurnId === turn
+    && AssistantState.activeActivityCleanup === cleanupActivityRenderer;
   syncAssistantComposerControls();
   if (BRIDGE && startingGuardId) {
     // Own the starting lease immediately. Even an ambiguous native bind response must be released
@@ -8120,6 +8145,8 @@ async function agentSend(text) {
       activityRenderer.finish(reason);
       activityProtocol = finishAssistantActivityState(activityProtocol, activityIdentity, reason);
     },
+    isCurrent: isCurrentTurn,
+    turnId: turn,
     finish,
     reconcileRequestStatus,
   };
@@ -8127,15 +8154,18 @@ async function agentSend(text) {
   let eventIngressSinceYield = 0;
   const openTurnStream = () => openEventStream(url, (name, data) => {
     if (name !== "message") return; // ignore ping heartbeats
+    if (!isCurrentTurn()) return;
     let d;
     try { d = JSON.parse(data); }
     catch (_) {
+      if (!isCurrentTurn()) return;
       addError("Invalid stream payload");
       finish("Stream error");
       return;
     }
     eventIngress = eventIngress
       .then(async () => {
+        if (!isCurrentTurn()) return;
         await handleAgentEvent(d, turnState);
         eventIngressSinceYield += 1;
         if (eventIngressSinceYield >= 10) {
@@ -8144,6 +8174,7 @@ async function agentSend(text) {
         }
       })
       .catch(() => {
+        if (!isCurrentTurn()) return;
         addError("Invalid stream payload");
         finish("Stream error");
       });
