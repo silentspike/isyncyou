@@ -1,9 +1,12 @@
 # Contributing to iSyncYou
 
 Thanks for your interest. iSyncYou is public and at the release-candidate stage.
-**Bug reports and issues are welcome from anyone.** All coding, however, is done by the
-silentspike org — **external pull requests are not accepted**; please open an issue
-instead. The workflow below documents how the org develops the project.
+Public bug reports and focused product suggestions are welcome in the
+[iSyncYou feedback tracker](https://github.com/silentspike/isyncyou-feedback/issues/new/choose).
+The Issues in this source repository are the collaborator-only engineering
+tracker. All coding is done by the silentspike organization; external pull
+requests are not accepted and are closed automatically. The workflow below
+documents how the organization develops the project.
 
 ## Ground rules
 
@@ -21,7 +24,10 @@ just check                            # fmt-check + clippy + tests (the pre-push
 
 ## Issue model
 
-Work is tracked as **Epic → Story → Task** (`E-`/`S-`/`T-` IDs). Tasks carry acceptance criteria, dependencies (Depends On / Blocking) and a testing strategy. See the issue templates.
+Maintainer work is tracked in this repository as **Epic → Story → Task**
+(`E-`/`S-`/`T-` IDs). Tasks carry acceptance criteria, dependencies (Depends On /
+Blocking), and a testing strategy. Public feedback is triaged separately and may
+be converted into a bounded maintainer issue. See the issue templates.
 
 ## Verification
 
