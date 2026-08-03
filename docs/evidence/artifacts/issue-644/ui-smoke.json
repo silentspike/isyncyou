@@ -15,6 +15,14 @@
       "status": "pass"
     },
     {
+      "name": "search results use bounded stagger delays",
+      "status": "pass"
+    },
+    {
+      "name": "stage completion uses a checkmark transition",
+      "status": "pass"
+    },
+    {
       "name": "search content creates a scrollable reading position",
       "status": "pass"
     },
@@ -103,6 +111,14 @@
       "status": "pass"
     },
     {
+      "name": "repeated invalid progress produces one bounded warning",
+      "status": "pass"
+    },
+    {
+      "name": "rejected partial progress produces no citations",
+      "status": "pass"
+    },
+    {
       "name": "cancelled turn leaves no active caret",
       "status": "pass"
     },
@@ -120,6 +136,14 @@
     },
     {
       "name": "terminal teardown erases reducer results and rejects stale events",
+      "status": "pass"
+    },
+    {
+      "name": "rejected partial results cannot add citations",
+      "status": "pass"
+    },
+    {
+      "name": "stale queued events cannot register pending actions",
       "status": "pass"
     },
     {
@@ -183,7 +207,7 @@
       "status": "pass"
     }
   ],
-  "assertion_count": 45,
+  "assertion_count": 51,
   "console_error_count": 0,
   "page_error_count": 0,
   "csp_violation_count": 0,
@@ -191,17 +215,17 @@
   "non_self_request_count": 0,
   "performance": {
     "token_events": 500,
-    "token_dom_writes": 31,
+    "token_dom_writes": 32,
     "long_task_count": 0,
     "max_long_task_ms": 0,
     "longest_task_start_ms": 0,
     "long_tasks": [],
     "marks_ms": {
-      "after_running_screenshot": 3236.9,
-      "result_50": 3291.8,
-      "terminal": 4417.4
+      "after_running_screenshot": 3052.3,
+      "result_50": 3515.8,
+      "terminal": 4181.1
     },
-    "cumulative_layout_shift": 0.03145
+    "cumulative_layout_shift": 0.02356
   },
   "reducer_bounds": {
     "stage_limit": 256,
@@ -213,6 +237,8 @@
     "terminal_results": 0,
     "stale": "stale",
     "post_terminal": 1,
+    "rejected_citations": 0,
+    "stale_pending_delta": 0,
     "running_regression": "invalid",
     "terminal_reconciled": "accept",
     "reconciled_status": "complete",
@@ -237,13 +263,13 @@
     "text_length": 500,
     "expected_text_length": 500,
     "token_events": 500,
-    "token_dom_writes": 31
+    "token_dom_writes": 32
   },
   "reduced_motion": {
     "text_length": 500,
     "expected_text_length": 500,
     "token_events": 500,
-    "token_dom_writes": 25
+    "token_dom_writes": 24
   },
   "failed_request_routes": [],
   "expected_cancelled_request_count": 0,

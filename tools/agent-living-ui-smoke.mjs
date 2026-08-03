@@ -102,6 +102,7 @@ async function searchStream(res, turn) {
   sendSseMessage(res, partial(9, Array.from({ length: 20 }, (_, offset) => publicResult(180 + offset))));
   sendSseMessage(res, partial(10, [publicResult(0, "enrich")]));
   sendSseMessage(res, stage("names", "complete", 100, 100, 200));
+  await sleep(180);
   sendSseMessage(res, stage("bodies", "running", 80, 200, 35, "Checking public availability"));
   sendSseMessage(res, stage("bodies", "complete", 200, 200, 80));
   sendSseMessage(res, stage("deep", "running", 3, 8, 3, "Selecting public source 3"));
@@ -163,10 +164,28 @@ async function failureStream(res, turn) {
   res.end();
 }
 
+async function invalidProgressStream(res, turn) {
+  startSse(res);
+  await sleep(80);
+  const invalidStage = { ...stage("names", "queued", 0, null, 0), schema_version: 99 };
+  sendSseMessage(res, invalidStage);
+  sendSseMessage(res, invalidStage);
+  sendSseMessage(res, invalidStage);
+  sendSseMessage(res, {
+    ...partial(0, [publicResult(0)]),
+    schema_version: 99,
+  });
+  sendSseMessage(res, { event: "token", text: "Invalid progress was contained." });
+  FIXTURE_TERMINAL_TURNS.add(turn);
+  sendSseMessage(res, { event: "done", reason: "complete" });
+  res.end();
+}
+
 async function sendLivingStream(res, scenario, turn) {
   if (scenario === "search") return searchStream(res, turn);
   if (scenario === "backup") return backupStream(res, turn);
   if (scenario === "error") return failureStream(res, turn);
+  if (scenario === "invalid-progress") return invalidProgressStream(res, turn);
   return directStream(res, turn);
 }
 
@@ -175,6 +194,7 @@ function scenarioForPrompt(prompt) {
   if (value.includes("living search") || value.includes("living reduced")) return "search";
   if (value.includes("living backup")) return "backup";
   if (value.includes("living failure")) return "error";
+  if (value.includes("living invalid progress")) return "invalid-progress";
   if (value.includes("slow cancellation")) return "slow-cancel";
   return "direct";
 }
@@ -203,7 +223,7 @@ async function sendPrompt(page, prompt, during = null) {
 }
 
 async function reducerBoundaryProbe(page) {
-  return page.evaluate(() => {
+  return page.evaluate(async () => {
     const identity = { session_id: "s", turn_request_id: "r", turn_id: "t", stream_id: "x" };
     const stageValue = (activity_id, status = "queued") => ({
       event: "stage_progress", schema_version: 1, activity_id, activity_kind: "archive_search",
@@ -259,6 +279,20 @@ async function reducerBoundaryProbe(page) {
     const terminal = finishAssistantActivityState(resultState, identity, "complete");
     const stale = reduceAssistantActivity(terminal, stageEvent("aaaaaaaaaaaaaaaaaaaaaa"));
 
+    let rejectedCitations = 0;
+    await handleAgentEvent({ event: "partial_result" }, {
+      isCurrent: () => true,
+      flushTokens() {}, stopTokenCaret() {},
+      async onPartialResult() { return null; },
+      addCitations() { rejectedCitations += 1; },
+    });
+    const pendingBefore = AssistantState.pendingCardsById.size;
+    await handleAgentEvent({
+      event: "confirmation_required", pending_id: "stale-pending",
+      token: "stale-token", action_hash: "stale-hash",
+    }, { isCurrent: () => false });
+    const stalePendingDelta = AssistantState.pendingCardsById.size - pendingBefore;
+
     let terminalCounterState = createAssistantActivityState(identity);
     terminalCounterState = reduceAssistantActivity(terminalCounterState, stageEvent("aaaaaaaaaaaaaaaaaaaaaa"));
     terminalCounterState = reduceAssistantActivity(terminalCounterState, {
@@ -283,6 +317,8 @@ async function reducerBoundaryProbe(page) {
       terminal_results: terminal.results.size,
       stale: stale.lastDisposition,
       post_terminal: stale.diagnostics.post_terminal,
+      rejected_citations: rejectedCitations,
+      stale_pending_delta: stalePendingDelta,
       running_regression: runningRegression.lastDisposition,
       terminal_reconciled: terminalReconciled.lastDisposition,
       reconciled_status: reconciledStage.status,
@@ -414,7 +450,7 @@ async function main() {
       !accountLabels.rendered.includes("controlled") && !accountLabels.rendered.includes("me"));
 
     const searchMessage = await sendPrompt(page, "living search", async message => {
-      await message.locator(".asst-thinking").waitFor();
+      await message.locator(".asst-stage.running").waitFor();
       await page.screenshot({ path: path.join(OUT, "desktop-running.png"), fullPage: true });
       await page.evaluate(() => {
         window.__livingPerf.long = [];
@@ -422,6 +458,14 @@ async function main() {
         window.__livingPerf.marks.after_running_screenshot = performance.now();
       });
       await message.locator(".asst-result").nth(49).waitFor({ timeout: 10000 });
+      const stagger = await message.locator(".asst-result").evaluateAll(nodes => nodes.slice(0, 3)
+        .map(node => getComputedStyle(node).animationDelay));
+      check(report, "search results use bounded stagger delays",
+        stagger.length === 3 && stagger[0] !== stagger[1] && stagger[1] !== stagger[2]);
+      await message.locator(".asst-stage.complete .asst-stage-ic").first().waitFor();
+      const stageAnimation = await message.locator(".asst-stage.complete .asst-stage-ic").first()
+        .evaluate(node => getComputedStyle(node).animationName);
+      check(report, "stage completion uses a checkmark transition", stageAnimation === "asstStageDone");
       await page.evaluate(() => { window.__livingPerf.marks.result_50 = performance.now(); });
       await page.waitForFunction(() => {
         const scroller = assistantCurrentScroller();
@@ -516,6 +560,12 @@ async function main() {
       && await failed.locator(".asst-stage.skipped").count() === 2);
     check(report, "provider error is rendered through closed copy", !(await failed.innerText()).includes("provider_request_failed"));
 
+    const invalidProgress = await sendPrompt(page, "living invalid progress");
+    check(report, "repeated invalid progress produces one bounded warning",
+      await invalidProgress.locator('[data-agent-stream-error="1"]').count() === 1);
+    check(report, "rejected partial progress produces no citations",
+      await invalidProgress.locator('[data-agent-citation]').count() === 0);
+
     const cancelled = await sendPrompt(page, "living slow cancellation", async () => {
       const turn = await page.evaluate(() => AssistantState.activeTurnId);
       expectedCancelledTurns.add(turn);
@@ -529,6 +579,8 @@ async function main() {
     check(report, "result cap accepts 200 and limits one over", report.reducer_bounds.results === 200 && report.reducer_bounds.result_over === "limited");
     check(report, "terminal teardown erases reducer results and rejects stale events", report.reducer_bounds.terminal_results === 0
       && report.reducer_bounds.stale === "stale" && report.reducer_bounds.post_terminal === 1);
+    check(report, "rejected partial results cannot add citations", report.reducer_bounds.rejected_citations === 0);
+    check(report, "stale queued events cannot register pending actions", report.reducer_bounds.stale_pending_delta === 0);
     check(report, "running counter regression remains rejected", report.reducer_bounds.running_regression === "invalid");
     check(report, "terminal counter regression closes with monotonic observed counters",
       report.reducer_bounds.terminal_reconciled === "accept"

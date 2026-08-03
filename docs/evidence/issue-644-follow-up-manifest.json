@@ -1,0 +1,55 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-08-03T13:21:58Z",
+  "commit": "81b982636c4b64786662faf5b7f42b7a80d7f786",
+  "entries": [
+    {
+      "id": "EV-101",
+      "requirement": "REQ-AGENT-018",
+      "claim": "The browser smoke contains stale turn callbacks, rejected partial-result citations, and repeated invalid progress while preserving bounded activity rendering and motion alternatives.",
+      "method": "command",
+      "command": "node tools/agent-living-ui-smoke.mjs --out docs/evidence/artifacts/issue-644",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-644/ui-smoke.json"
+    },
+    {
+      "id": "EV-102",
+      "requirement": "REQ-AGENT-018",
+      "claim": "Queued callbacks from a closed or replaced turn cannot mutate activity, citation, or PendingAction state.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-webui --all-targets -- --nocapture",
+      "test": "living_ui_route_teardown_invalidates_queued_event_side_effects",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-644/follow-up.json"
+    },
+    {
+      "id": "EV-103",
+      "requirement": "REQ-AGENT-018",
+      "claim": "Only accepted normalized partial results may add citations, and rejected progress diagnostics remain bounded.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-webui --all-targets -- --nocapture",
+      "test": "living_ui_rejected_partial_result_has_no_citation_side_effect",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-644/follow-up.json"
+    },
+    {
+      "id": "EV-104",
+      "requirement": "REQ-AGENT-018",
+      "claim": "Completed stages and newly accepted results use bounded transitions that are disabled under reduced motion.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-webui --all-targets -- --nocapture",
+      "test": "living_ui_motion_transitions_checkmarks_and_staggers_results",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-644/ui-smoke.json"
+    },
+    {
+      "id": "EV-105",
+      "requirement": "REQ-AGENT-018",
+      "claim": "The exact fix commit produced a hook-free default APK and passed a bounded physical search plus background and foreground regression without a duplicate turn.",
+      "method": "probe",
+      "command": "jq -e '.state == \"pass\" and .implementation_commit == \"81b982636c4b64786662faf5b7f42b7a80d7f786\" and .default_apk.sha256 == \"49e1a0448b6d6dae6d8851cadf67c23829f2dec9a460e257fec7e3155f30754d\" and .default_apk.test_hook_markers_present == false and .physical_regression.terminal_reason == \"complete\" and .physical_regression.citation_count_minimum >= 1 and .physical_regression.duplicate_turn_present == false and .cleanup.device_lock_released == true' docs/evidence/artifacts/issue-644/follow-up.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-644/follow-up.json"
+    }
+  ]
+}
