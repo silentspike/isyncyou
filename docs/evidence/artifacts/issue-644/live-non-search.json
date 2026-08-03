@@ -1,0 +1,56 @@
+{
+  "evidence_version": 1,
+  "generated_at": "2026-08-03T12:32:32Z",
+  "implementation_commit": "7464479a2228abcf90c4bc8fafe4a99b9a59ca30",
+  "state": "pass",
+  "surface": "physical_default_debug_apk",
+  "provider": "claude",
+  "direct_turn": {
+    "terminal_reason": "complete",
+    "final_text_present": true,
+    "activity_plan_present": false,
+    "operation_plan_present": false,
+    "active_caret_after_terminal": false
+  },
+  "controlled_backup": {
+    "fresh_session_used": true,
+    "operation_plan": "backup",
+    "pending_stage_states": [
+      "complete",
+      "running",
+      "queued"
+    ],
+    "terminal_reason_before_cancel": "pending_confirmation",
+    "confirm_control_enabled_before_cancel": true,
+    "cancel_control_enabled_before_cancel": true,
+    "pending_status_after_cancel": "cancelled",
+    "terminal_stage_states_after_cancel": [
+      "complete",
+      "cancelled",
+      "skipped"
+    ],
+    "authority_controls_after_cancel": 0,
+    "backup_restore_run_count_before": 0,
+    "backup_restore_run_count_after": 0,
+    "cloud_mutation_observed": false
+  },
+  "session_isolation": {
+    "prior_session_pending_persistence_failures": 2,
+    "closed_error_code": "session_transport_unavailable",
+    "fresh_session_pending_path_passed": true,
+    "account_reauthentication_performed": false
+  },
+  "account_labels": {
+    "internal_me_visible_as_account_name": false,
+    "internal_controlled_visible_as_account_name": false,
+    "user_facing_fallback_observed": true
+  },
+  "redaction": {
+    "account_identity_included": false,
+    "device_serial_included": false,
+    "confirmation_token_included": false,
+    "pending_identifier_included": false,
+    "prompt_or_result_text_included": false,
+    "provider_frame_included": false
+  }
+}

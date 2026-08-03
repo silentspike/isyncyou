@@ -136,7 +136,7 @@ function rng(seed) { let s = seed >>> 0; return () => { s = s + 0x6D2B79F5 | 0; 
 // layers whose canvas left the DOM (e.g. a closed sheet).
 const Net = (() => {
   const layers = new Set();
-  let raf = 0, last = 0;
+  let raf = 0, last = 0, workSuppressed = false;
   const reduce = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
   const TWO_PI = Math.PI * 2;
   // Frame throttle: the constellation drifts slowly, so 60 fps is wasted work — every redraw
@@ -186,7 +186,7 @@ const Net = (() => {
     const elapsed = now - last;
     if (document.hidden) {
       last = now;                                   // don't bank a huge dt while hidden
-    } else if (elapsed >= FRAME_MS) {               // throttle: skip frames under the fps cap
+    } else if (!workSuppressed && elapsed >= FRAME_MS) { // preserve the main thread for active work
       const dt = Math.min(4, elapsed / 16.67); last = now;
       for (const layer of layers) {
         if (!layer.canvas.isConnected) { layers.delete(layer); continue; }   // self-heal
@@ -212,7 +212,11 @@ const Net = (() => {
     if (document.hidden) { if (raf) { cancelAnimationFrame(raf); raf = 0; } }
     else if (layers.size && !reduce && !raf) { last = 0; raf = requestAnimationFrame(tick); }
   });
-  return { register, resize, reduce, _layers: layers };
+  const setWorkSuppressed = (value) => {
+    workSuppressed = value === true;
+    if (!workSuppressed) last = 0;
+  };
+  return { register, resize, reduce, setWorkSuppressed, _layers: layers };
 })();
 let _bgLayer = null;
 function paintBackdrop() {
@@ -850,6 +854,16 @@ const SHAREABLE = new Set(["onedrive"]);
 
 /* ---------------------------------------------------------------- global state */
 const App = { account: null, accounts: [], route: "overview", counts: {}, svcFilter: {} };
+const INTERNAL_ACCOUNT_LABELS = new Set(["me", "controlled"]);
+function accountDisplayLabel(account) {
+  const username = String(account && account.username || "").trim();
+  const accountId = String(account && account.id || "").trim();
+  if (!username && !accountId) return "No account configured";
+  if (username
+      && username !== accountId
+      && !INTERNAL_ACCOUNT_LABELS.has(username.toLowerCase())) return username;
+  return "Microsoft 365 account";
+}
 // Per-service filter sub-items shown in the LEFT sidebar, indented under the
 // active service (NOT a separate rail). Lazy so Mail.cats is populated at call.
 // Map a well-known mail folder to an icon; custom folders fall back to "folder".
@@ -1222,6 +1236,7 @@ function invadersGame(canvas) {
 
 function renderShell() {
   const acc = App.accounts.find(a => a.id === App.account) || {};
+  const accountLabel = accountDisplayLabel(acc);
   const nav = el("nav", { class: "nav" },
     visibleServices().map(s => {
       const cnt = App.counts[s.id];
@@ -1261,8 +1276,8 @@ function renderShell() {
   const sidebar = el("aside", { class: "sidebar" },
     el("div", { class: "brand" }, logoGlyph(30), el("div", { class: "wordmark", html: "iSync<b>You</b>" })),
     el("button", { class: "sb-account", onclick: openAccountSwitcher, title: "Switch account" },
-      el("span", { class: "avatar", text: initials(acc.username) }),
-      el("span", { class: "who" }, el("b", { text: acc.username || "no account" }), el("span", { class: "dim", text: "Microsoft 365" })),
+      el("span", { class: "avatar", text: initials(accountLabel) }),
+      el("span", { class: "who" }, el("b", { text: accountLabel }), el("span", { class: "dim", text: "Microsoft 365" })),
     ),
     el("div", { class: "sb-section", text: "Library" }),
     nav,
@@ -1509,7 +1524,7 @@ async function renderOverview(view) {
     body.append(el("div", { class: "card panel", style: "margin-top:var(--sp-3)" },
       el("div", { class: "panel-head" }, icon("users", "icon-sm"), "Connection & policy"),
       el("div", { class: "panel-body" }, el("dl", { class: "conn-grid" },
-        connItem("Account", acc.username || App.account),
+        connItem("Account", accountDisplayLabel(acc)),
         connItem("Scheduled sync", sy.enabled ? (sy.paused ? "Paused" : "Running") : "Off"),
         connItem("Change source", sync.change_source || "—"),
         connItem("Body index", sync.body_index ? "On (full-text)" : "Off"),
@@ -4723,7 +4738,7 @@ async function renderSettingsView(view) {
     const sy = cfg.sync || {}, acc = (cfg.accounts || []).find(a => a.id === App.account) || {};
     clear(body);
     const acctCard = el("div", { class: "card" }, el("h3", { class: "sb-section", text: "Account" }),
-      kvList([["User", acc.username || App.account], ["Sync root", acc.sync_root], ["Archive root", acc.archive_root], ["Mount point", acc.mount_point || "—"]]));
+      kvList([["User", accountDisplayLabel(acc)], ["Sync root", acc.sync_root], ["Archive root", acc.archive_root], ["Mount point", acc.mount_point || "—"]]));
     // The sidebar account chip (which opens sign-in / reconnect) is hidden in the phone
     // bottom-nav layout, so surface the same Microsoft account menu here too —
     // Settings is reachable on mobile. Without this a standalone phone (#89) would have
@@ -5456,7 +5471,7 @@ async function completeAiLogin() {
 
 const AssistantState = {
   status: null,
-  transcript: [],       // [{role:'user'|'assistant', text, chips, stages, results}]
+  transcript: [],       // Durable-visible text, citations, and redacted operation state only.
   activeTurnId: null,
   activeStream: null,
   pendingCardsById: new Map(),
@@ -5481,17 +5496,29 @@ const AssistantState = {
   sessionHydrationSeq: 0,
   sessionHistoryRefreshing: false,
   sessionHydrationError: null,
+  activeActivityCleanup: null,
+  activeTokenCleanup: null,
+  followMode: true,
+  unseenContent: 0,
+  followScrollBindings: [],
+  jumpToLatestButton: null,
 };
 
 function closeAssistantStream(_reason) {
   const stream = AssistantState.activeStream;
   const turn = AssistantState.activeTurnId;
+  const activityCleanup = AssistantState.activeActivityCleanup;
+  const tokenCleanup = AssistantState.activeTokenCleanup;
   AssistantState.activeStream = null;
   AssistantState.activeTurnId = null;
   AssistantState.activeMessage = null;
   AssistantState.busy = false;
   AssistantState.turnCancelPending = false;
   AssistantState.turnStreamReady = false;
+  AssistantState.activeActivityCleanup = null;
+  AssistantState.activeTokenCleanup = null;
+  if (activityCleanup) activityCleanup();
+  if (tokenCleanup) tokenCleanup();
   if (stream) {
     try { stream.close(); } catch (_) {}
   }
@@ -5613,23 +5640,197 @@ function renderAssistantConsentPanel(providers) {
         icon("x", "icon-sm"), "Reset")));
 }
 
+const ASSISTANT_FOLLOW_THRESHOLD_PX = 72;
+const ASSISTANT_UNSEEN_MAX = 999;
 let ASSISTANT_SCROLL_FRAME = 0;
-function scrollAssistantToEnd() {
+let ASSISTANT_PROGRAMMATIC_SCROLLS = 0;
+
+function writeAssistantScrollToEnd(scroller) {
+  if (!scroller) return;
+  ASSISTANT_PROGRAMMATIC_SCROLLS += 1;
+  scroller.scrollTop = scroller.scrollHeight;
+  requestAnimationFrame(() => {
+    ASSISTANT_PROGRAMMATIC_SCROLLS = Math.max(0, ASSISTANT_PROGRAMMATIC_SCROLLS - 1);
+  });
+}
+
+function assistantCurrentScroller() {
+  const transcript = $("#asst-log");
+  const view = $("#view");
+  const transcriptScrolls = transcript
+    && getComputedStyle(transcript).overflowY !== "visible"
+    && transcript.scrollHeight > transcript.clientHeight + 1;
+  return transcriptScrolls ? transcript : view;
+}
+
+function assistantNearBottom(scroller) {
+  return !scroller || scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight
+    <= ASSISTANT_FOLLOW_THRESHOLD_PX;
+}
+
+function updateAssistantJumpButton() {
+  const button = AssistantState.jumpToLatestButton;
+  if (!button) return;
+  const count = AssistantState.unseenContent;
+  const focused = document.activeElement === button;
+  button.hidden = count === 0 && !focused;
+  button.dataset.unseen = String(count);
+  button.setAttribute("aria-label", count
+    ? `Jump to latest, ${count} new ${count === 1 ? "update" : "updates"}`
+    : "At latest");
+  const badge = button.querySelector(".assistant-jump-count");
+  if (badge) badge.textContent = count ? (count > 99 ? "99+" : String(count)) : "";
+}
+
+function jumpAssistantToLatest() {
+  AssistantState.followMode = true;
+  AssistantState.unseenContent = 0;
+  const scroller = assistantCurrentScroller();
+  writeAssistantScrollToEnd(scroller);
+  updateAssistantJumpButton();
+}
+
+function teardownAssistantFollowController() {
+  (AssistantState.followScrollBindings || []).forEach(({ node, listener, intentListener }) => {
+    node.removeEventListener("scroll", listener);
+    ["wheel", "touchstart", "pointerdown", "keydown"].forEach(eventName => {
+      node.removeEventListener(eventName, intentListener);
+    });
+  });
+  AssistantState.followScrollBindings = [];
+  AssistantState.jumpToLatestButton = null;
   if (ASSISTANT_SCROLL_FRAME) cancelAnimationFrame(ASSISTANT_SCROLL_FRAME);
+  ASSISTANT_SCROLL_FRAME = 0;
+}
+
+function bindAssistantFollowController(transcript, jumpButton) {
+  teardownAssistantFollowController();
+  AssistantState.followMode = true;
+  AssistantState.unseenContent = 0;
+  AssistantState.jumpToLatestButton = jumpButton;
+  const nodes = [transcript, $("#view")].filter(Boolean);
+  AssistantState.followScrollBindings = nodes.map(node => {
+    const intentListener = () => { ASSISTANT_PROGRAMMATIC_SCROLLS = 0; };
+    const listener = () => {
+      if (assistantCurrentScroller() !== node) return;
+      if (ASSISTANT_PROGRAMMATIC_SCROLLS > 0) {
+        updateAssistantJumpButton();
+        return;
+      }
+      AssistantState.followMode = assistantNearBottom(node);
+      if (AssistantState.followMode) AssistantState.unseenContent = 0;
+      updateAssistantJumpButton();
+    };
+    node.addEventListener("scroll", listener, { passive: true });
+    ["wheel", "touchstart", "pointerdown", "keydown"].forEach(eventName => {
+      node.addEventListener(eventName, intentListener, { passive: true });
+    });
+    return { node, listener, intentListener };
+  });
+  jumpButton.addEventListener("blur", updateAssistantJumpButton);
+  updateAssistantJumpButton();
+}
+
+function scrollAssistantToEnd() {
+  if (!AssistantState.followMode) {
+    AssistantState.unseenContent = Math.min(ASSISTANT_UNSEEN_MAX, AssistantState.unseenContent + 1);
+    updateAssistantJumpButton();
+    return;
+  }
+  if (ASSISTANT_SCROLL_FRAME) return;
   ASSISTANT_SCROLL_FRAME = requestAnimationFrame(() => {
     ASSISTANT_SCROLL_FRAME = 0;
-    const transcript = $("#asst-log");
-    const view = $("#view");
-    const transcriptScrolls = transcript
-      && getComputedStyle(transcript).overflowY !== "visible"
-      && transcript.scrollHeight > transcript.clientHeight + 1;
-    const scroller = transcriptScrolls ? transcript : view;
-    if (scroller) scroller.scrollTop = scroller.scrollHeight;
+    if (!AssistantState.followMode) return;
+    const scroller = assistantCurrentScroller();
+    writeAssistantScrollToEnd(scroller);
   });
+}
+
+function settleAssistantAtEnd() {
+  if (!AssistantState.followMode) return;
+  if (ASSISTANT_SCROLL_FRAME) cancelAnimationFrame(ASSISTANT_SCROLL_FRAME);
+  ASSISTANT_SCROLL_FRAME = 0;
+  const scroller = assistantCurrentScroller();
+  writeAssistantScrollToEnd(scroller);
+}
+
+function renderAssistantJumpButton() {
+  return el("button", {
+    class: "btn icon-only assistant-jump-latest", type: "button", hidden: "hidden",
+    title: "Jump to latest", "aria-label": "At latest", onclick: jumpAssistantToLatest,
+    "data-agent-jump-latest": "1",
+  }, icon("arrow-down", "icon-sm"), el("span", { class: "assistant-jump-count", "aria-hidden": "true" }));
+}
+
+function createAssistantTokenWriter(message, textElement, onFirstToken, onContent) {
+  const textNode = document.createTextNode(message.text || "");
+  const caret = el("span", { class: "asst-token-caret", "aria-hidden": "true" });
+  caret.hidden = true;
+  textElement.setAttribute("aria-live", "off");
+  textElement.replaceChildren(textNode, caret);
+  let committed = message.text || "";
+  let pending = "";
+  let frame = 0;
+  let tokenEvents = 0;
+  let domWrites = 0;
+  const exposeMetrics = () => {
+    textElement.dataset.tokenEvents = String(tokenEvents);
+    textElement.dataset.tokenWrites = String(domWrites);
+  };
+  const flush = () => {
+    if (frame) cancelAnimationFrame(frame);
+    frame = 0;
+    if (!pending) return committed;
+    committed += pending;
+    pending = "";
+    message.text = committed;
+    textNode.nodeValue = committed;
+    domWrites += 1;
+    exposeMetrics();
+    onContent();
+    return committed;
+  };
+  const schedule = () => {
+    if (frame) return;
+    frame = requestAnimationFrame(flush);
+  };
+  exposeMetrics();
+  return {
+    append(delta) {
+      if (typeof delta !== "string" || !delta) return;
+      if (!pending && !committed) onFirstToken();
+      pending += delta;
+      tokenEvents += 1;
+      caret.hidden = false;
+      exposeMetrics();
+      schedule();
+    },
+    replace(value) {
+      if (frame) cancelAnimationFrame(frame);
+      frame = 0;
+      pending = "";
+      committed = String(value || "");
+      message.text = committed;
+      textNode.nodeValue = committed;
+      domWrites += 1;
+      exposeMetrics();
+      onContent();
+    },
+    flush,
+    stopCaret() { caret.hidden = true; },
+    finish() {
+      flush();
+      caret.hidden = true;
+      if (frame) cancelAnimationFrame(frame);
+      frame = 0;
+    },
+    textNode,
+  };
 }
 
 let ASSISTANT_RENDER_SEQUENCE = 0;
 async function renderAssistantView(view) {
+  teardownAssistantFollowController();
   const renderSequence = ++ASSISTANT_RENDER_SEQUENCE;
   const previousStatus = AssistantState.status;
   clear(view).append(
@@ -5798,6 +5999,8 @@ function renderAssistantWizard(body, st) {
 function renderAssistantChat(body, st) {
   const provider = agentActiveProvider(st);
   const hasConsent = agentPrivacyConsentAccepted(provider);
+  const transcriptNode = el("div", { id: "asst-log", class: "assistant-transcript", "data-agent-transcript": "1", "data-testid": "agent-transcript" });
+  const jumpToLatest = renderAssistantJumpButton();
   const chatNodes = [
     el("div", { class: "assistant-toolbar" },
       el("span", { class: "chip ok" }, el("span", { class: "dot" }), "Connected"),
@@ -5808,7 +6011,8 @@ function renderAssistantChat(body, st) {
       el("button", { class: "btn ghost sm", type: "button", onclick: resetAgentPrivacyConsent, "data-agent-consent-reset": "1" },
         icon("shield", "icon-sm"), "Privacy"),
     ),
-    el("div", { id: "asst-log", class: "assistant-transcript", "data-agent-transcript": "1", "data-testid": "agent-transcript" }),
+    transcriptNode,
+    jumpToLatest,
     el("div", { class: "assistant-pending-host", "data-agent-pending": "1", "data-testid": "agent-pending-actions" }),
     renderAssistantComposer(st),
   ];
@@ -5827,6 +6031,7 @@ function renderAssistantChat(body, st) {
   if (lifecycleControls) body.append(lifecycleControls);
   body.append(...chatNodes);
   const log = $("#asst-log");
+  bindAssistantFollowController(log, jumpToLatest);
   if (!AssistantState.transcript.length) {
     log.append(el("div", { class: "dim", style: "text-align:center;padding:2.5rem 1rem", text: "Ask me anything about your Microsoft 365 — I'll read your archive and answer with sources." }));
   } else {
@@ -5896,6 +6101,7 @@ function renderAssistantComposer(_st) {
 }
 
 function syncAssistantComposerControls() {
+  Net.setWorkSuppressed(AssistantState.busy);
   const input = $("#asst-input");
   const send = $('[data-testid="agent-send"]');
   const stop = $('[data-testid="agent-stop"]');
@@ -6094,7 +6300,11 @@ async function pollCodexStatus(n) {
 
 // Progressive-search rendering (S-AG.18/#643). Activity detail is current-turn UI state;
 // durable session hydration remains limited to the existing transcript/source contract.
-const ASST_STAGE_LABEL = { names: "Fast search — subject", bodies: "Full-text — bodies", deep: "AI deep-read" };
+const ASST_STAGE_CATALOG = Object.freeze([
+  Object.freeze({ id: "names", label: "Names and subjects" }),
+  Object.freeze({ id: "bodies", label: "Archived content" }),
+  Object.freeze({ id: "deep", label: "Selected deep reads" }),
+]);
 function asstSvcIcon(s) { return ({ mail: "mail", onedrive: "hard-drive", calendar: "calendar", contacts: "users", todo: "check-square", onenote: "notebook" })[s] || "file"; }
 // The app's canonical item viewer — the SAME sandboxed, same-origin iframe the Mail reader
 // uses (`/api/v1/view` renders sanitized-HTML mail / a rendered item; frame-src 'self' +
@@ -6147,6 +6357,7 @@ function dedupeAgentSources(sources) {
   });
   return out;
 }
+const AGENT_MAX_CITATIONS = 64;
 function extractAgentSources(event) {
   const found = [];
   const visit = (value, depth) => {
@@ -6187,25 +6398,47 @@ function renderAgentCitationBar(sources) {
   dedupeAgentSources(sources).forEach(source => bar.append(renderAgentCitation(source)));
   return bar;
 }
-// One typed result: header (name) + one-line preview; click → animated pull-down that
-// lazily embeds the real viewer for the body + a link to open it full-screen.
-function asstResultCard(it) {
-  const source = normalizeAgentSource(it) || { service: it.service, id: it.id, path: it.path || "", name: it.name || "", item_type: it.item_type || it.service };
+const ASST_SERVICE_VISUAL = Object.freeze({
+  mail: "mail", onedrive: "onedrive", calendar: "calendar",
+  contacts: "contacts", todo: "todo", onenote: "onenote",
+});
+const ASST_RESULT_NEW_MS = 5000;
+const ASST_RESULT_ANIMATION_LIMIT = 16;
+
+function assistantResultSubtitle(item) {
+  return [item.item_type || item.service, item.sender, item.display_path]
+    .filter(Boolean).join(" · ");
+}
+
+function createAssistantResultView(it, animate) {
+  const source = normalizeAgentSource(it) || {
+    service: it.service, id: it.item_id, path: "", name: it.name || "",
+    item_type: it.item_type || it.service,
+  };
   const viewQ = sourceViewQuery(source);
-  const head = el("div", { class: "asst-result-head" },
-    el("span", { class: "asst-result-ic", style: `--svc:var(--svc-${it.service})` }, icon(asstSvcIcon(it.service), "icon-sm")),
+  const name = el("span", { class: "asst-result-name truncate", text: it.name || "(no name)" });
+  const subtitle = el("span", { class: "asst-result-sub truncate", text: assistantResultSubtitle(it) });
+  const type = el("span", { class: "asst-result-type", text: it.item_type || it.service });
+  const fresh = el("span", { class: "asst-result-new" + (animate ? " is-animated" : ""), text: "NEW" });
+  const head = el("button", {
+    class: "asst-result-head", type: "button", "aria-expanded": "false",
+    "aria-label": "Open result " + (it.name || "item"),
+  },
+    el("span", { class: "asst-result-ic svc-" + ASST_SERVICE_VISUAL[it.service] }, icon(asstSvcIcon(it.service), "icon-sm")),
     el("div", { class: "asst-result-main grow" },
-      el("div", { class: "asst-result-name truncate", text: it.name || "(no name)" }),
-      el("div", { class: "asst-result-sub truncate", text: it.item_type || it.service })),
-    el("span", { class: "asst-result-type", text: it.item_type || it.service }),
+      name, subtitle),
+    fresh, type,
     el("span", { class: "asst-result-caret" }, icon("chevron-down", "icon-sm")));
   const panel = el("div", { class: "asst-result-panel" });
-  const row = el("div", { class: "asst-result" }, head, panel);
+  panel.hidden = true;
+  const row = el("div", { class: "asst-result" + (animate ? " is-new" : ""), "data-agent-result": "1" }, head, panel);
   let loaded = false;
   head.addEventListener("click", () => {
     const opening = !row.classList.contains("open");
     row.classList.toggle("open");
-    if (opening && !loaded) {   // lazy: only load the viewer when the user opens the card
+    head.setAttribute("aria-expanded", opening ? "true" : "false");
+    panel.hidden = !opening;
+    if (opening && !loaded) {
       loaded = true;
       if (viewQ) {
         panel.append(
@@ -6218,28 +6451,19 @@ function asstResultCard(it) {
       }
     }
   });
-  return row;
-}
-function asstStageRowDone(stage, hits) {
-  return el("div", { class: "asst-stage done" },
-    el("span", { class: "asst-stage-ic", text: "✓" }),
-    el("span", { class: "grow", text: ASST_STAGE_LABEL[stage] || stage }),
-    el("span", { class: "asst-stage-n dim", text: hits + (hits === 1 ? " hit" : " hits") }));
-}
-// Rebuild a turn's search block (final stages + result cards) from stored data.
-function asstSearchBlock(stages, results) {
-  const frag = document.createDocumentFragment();
-  if (stages && stages.length) {
-    const sb = el("div", { class: "asst-search" });
-    stages.forEach(s => sb.append(asstStageRowDone(s.stage, s.hits)));
-    frag.append(sb);
-  }
-  if (results && results.length) {
-    const rb = el("div", { class: "asst-results" });
-    results.forEach(it => rb.append(asstResultCard(it)));
-    frag.append(rb);
-  }
-  return frag;
+  return {
+    node: row,
+    update(next) {
+      name.textContent = next.name || "(no name)";
+      subtitle.textContent = assistantResultSubtitle(next);
+      type.textContent = next.item_type || next.service;
+      head.setAttribute("aria-label", "Open result " + (next.name || "item"));
+    },
+    clearNew() {
+      row.classList.remove("is-new");
+      fresh.remove();
+    },
+  };
 }
 
 function agentCompactValue(v, max = 140) {
@@ -6312,16 +6536,21 @@ function rerenderPendingCards(pendingId) {
 function pendingStatus(pending) {
   const status = pending.status || "pending";
   if (status === "pending" && pending.expires_at_ms && Date.now() >= Number(pending.expires_at_ms)) {
-    pending.status = "expired";
+    updateAgentPendingStatus(pending, "expired");
     return "expired";
   }
   return status;
 }
 
+function updateAgentPendingStatus(record, status) {
+  record.status = status;
+  if (typeof record.onDisplayStatus === "function") record.onDisplayStatus(status);
+}
+
 async function confirmAgentPending(pendingId) {
   const record = pendingRecord(pendingId);
   if (!record || !record.token || !record.action_hash) return;
-  record.status = "confirming";
+  updateAgentPendingStatus(record, "confirming");
   record.error = "";
   rerenderPendingCards(pendingId);
   try {
@@ -6329,12 +6558,12 @@ async function confirmAgentPending(pendingId) {
       request_id: crypto.randomUUID(), pending: pendingId,
       token: record.token, action_hash: record.action_hash,
     });
-    record.status = "confirmed";
+    updateAgentPendingStatus(record, "confirmed");
     record.result = "Completed successfully.";
     record.token = "";
     record.action_hash = "";
   } catch (e) {
-    record.status = "error";
+    updateAgentPendingStatus(record, "error");
     record.error = agentCompactValue(e.message || e, 180);
   }
   rerenderPendingCards(pendingId);
@@ -6345,12 +6574,12 @@ async function cancelAgentPending(pendingId) {
   if (!record) return;
   const turn = record.turn_id || AssistantState.activeTurnId;
   if (!turn) {
-    record.status = "error";
+    updateAgentPendingStatus(record, "error");
     record.error = "Missing turn id";
     rerenderPendingCards(pendingId);
     return;
   }
-  record.status = "cancelling";
+  updateAgentPendingStatus(record, "cancelling");
   record.error = "";
   rerenderPendingCards(pendingId);
   try {
@@ -6359,12 +6588,12 @@ async function cancelAgentPending(pendingId) {
       pending: pendingId,
       action_hash: record.action_hash,
     });
-    record.status = "cancelled";
+    updateAgentPendingStatus(record, "cancelled");
     record.token = "";
     record.action_hash = "";
     closeAssistantStream("pending-cancel");
   } catch (e) {
-    record.status = "error";
+    updateAgentPendingStatus(record, "error");
     record.error = agentCompactValue(e.message || e, 180);
   }
   rerenderPendingCards(pendingId);
@@ -6434,9 +6663,6 @@ function renderAssistantMessage(m) {
   (m.errors || []).forEach(e => bubble.append(renderAgentError(e)));
   if (m.pending) bubble.append(renderAgentPendingCard(m.pending));
   if (m.citations && m.citations.length) bubble.append(renderAgentCitationBar(m.citations));
-  // Re-render the turn's search stages + result cards (persisted in the message), so a view
-  // switch brings the whole conversation back — not just the text (#644).
-  if ((m.stages && m.stages.length) || (m.results && m.results.length)) bubble.append(asstSearchBlock(m.stages, m.results));
   return el("div", { class: "assistant-message" + (isUser ? " user" : ""), "data-agent-message": m.role || "assistant" }, bubble);
 }
 
@@ -6510,8 +6736,17 @@ const AGENT_PROGRESS_TERMINAL = new Set(["complete", "failed", "skipped", "cance
 const AGENT_PROGRESS_SERVICES = new Set(["mail", "onedrive", "calendar", "contacts", "todo", "onenote"]);
 const AGENT_PROGRESS_MAX_ACTIVITIES = 4;
 const AGENT_PROGRESS_MAX_STAGE_UPDATES = 256;
+const AGENT_PROGRESS_MAX_TURN_STAGE_UPDATES = 1024;
 const AGENT_PROGRESS_MAX_PARTIAL_UPDATES = 64;
+const AGENT_PROGRESS_MAX_TURN_PARTIAL_UPDATES = 256;
 const AGENT_PROGRESS_MAX_RESULTS = 200;
+const AGENT_PROGRESS_MAX_DIAGNOSTIC = 1_000_000;
+const AGENT_ACTIVITY_DIAGNOSTICS = Object.freeze([
+  "stale_identity", "post_terminal", "invalid_event", "detail_limited",
+  "counter_regression", "identical_replay", "conflicting_replay", "sequence_gap",
+  "unknown_enrich", "duplicate_source", "duplicate_result", "stage_order",
+  "stage_reopen", "private_field", "result_limit", "activity_limit",
+]);
 
 function canonicalPartialResultEvent(event) {
   return JSON.stringify({
@@ -6588,26 +6823,41 @@ function validAgentPublicResult(item) {
   return validAgentPublicSource(item.source, item.service, item.item_id, item.name);
 }
 
-function createAgentActivityProtocol() {
-  return { activities: new Map(), partialDigests: new Map(), failed: false };
+function createAssistantActivityState(identity) {
+  const diagnostics = Object.fromEntries(AGENT_ACTIVITY_DIAGNOSTICS.map(key => [key, 0]));
+  return {
+    identity: Object.freeze({ ...identity }), phase: "running", thinking: "preparing",
+    activities: new Map(), results: new Map(), resultOrder: [], sourceResults: new Map(),
+    partialDigests: new Map(), detailLimited: false, needsReconciliation: false,
+    acceptedStageUpdates: 0, acceptedPartialUpdates: 0,
+    terminalReason: null, diagnostics: Object.freeze(diagnostics), lastDisposition: "created",
+  };
 }
 
-async function acceptAgentActivityEvent(protocol, event) {
-  if (!protocol || protocol.failed || event.schema_version !== 1
-      || !AGENT_ACTIVITY_ID.test(event.activity_id || "")) return "invalid";
-  let activity = protocol.activities.get(event.activity_id);
-  if (!activity) {
-    if (event.event !== "stage_progress") return "invalid";
-    if (protocol.activities.size >= AGENT_PROGRESS_MAX_ACTIVITIES) return "invalid";
-    activity = {
-      stages: new Map(),
-      stageUpdates: 0,
-      partialUpdates: 0,
-      nextSequence: 0,
-      resultKeys: new Set(),
-    };
-    protocol.activities.set(event.activity_id, activity);
-  }
+function sameAssistantActivityIdentity(left, right) {
+  return !!left && !!right && left.session_id === right.session_id
+    && left.turn_request_id === right.turn_request_id && left.turn_id === right.turn_id
+    && left.stream_id === right.stream_id;
+}
+
+function bumpAssistantActivityDiagnostic(state, key) {
+  if (!Object.prototype.hasOwnProperty.call(state.diagnostics, key)) return state.diagnostics;
+  return Object.freeze({
+    ...state.diagnostics,
+    [key]: Math.min(AGENT_PROGRESS_MAX_DIAGNOSTIC, state.diagnostics[key] + 1),
+  });
+}
+
+function assistantActivityDisposition(previous, disposition, diagnostic, extra = {}) {
+  return {
+    ...previous, ...extra, lastDisposition: disposition,
+    diagnostics: diagnostic ? bumpAssistantActivityDiagnostic(previous, diagnostic) : previous.diagnostics,
+  };
+}
+
+async function normalizeAssistantActivityEvent(identity, event) {
+  if (!identity || !event || typeof event !== "object" || event.schema_version !== 1
+      || !AGENT_ACTIVITY_ID.test(event.activity_id || "")) return null;
   if (event.event === "stage_progress") {
     const allowed = new Set([
       "event", "schema_version", "activity_id", "activity_kind", "stage", "status",
@@ -6618,59 +6868,450 @@ async function acceptAgentActivityEvent(protocol, event) {
         || !AGENT_PROGRESS_STAGES.includes(event.stage) || !AGENT_PROGRESS_STATUS.has(event.status)
         || !Number.isInteger(event.scanned) || event.scanned < 0 || event.scanned > 1000000
         || (event.total !== null && (!Number.isInteger(event.total) || event.total < 0 || event.total > 1000000))
+        || (event.total !== null && event.total < event.scanned)
         || !Number.isInteger(event.hits) || event.hits < 0 || event.hits > 1000000
         || (event.current_item !== null && !validAgentProgressText(event.current_item, 160))
         || ![null, true, false].includes(event.coverage_complete)
         || ![null, true, false].includes(event.budget_reached)
-        || ![null, true, false].includes(event.continuation_available)
-        || activity.stageUpdates >= AGENT_PROGRESS_MAX_STAGE_UPDATES) return "invalid";
-    const stageIndex = AGENT_PROGRESS_STAGES.indexOf(event.stage);
-    const priorStatuses = AGENT_PROGRESS_STAGES.slice(0, stageIndex)
-      .map(stage => activity.stages.get(stage));
-    if (event.status === "queued") {
-      if (priorStatuses.some(status => status === undefined)) return "invalid";
-    } else if (event.status === "running") {
-      if (priorStatuses.some(status => status !== "complete")) return "invalid";
-    } else if (priorStatuses.some(status => !AGENT_PROGRESS_TERMINAL.has(status))) {
-      return "invalid";
-    }
-    const previous = activity.stages.get(event.stage);
-    if (!previous && event.status !== "queued") return "invalid";
-    if (previous && AGENT_PROGRESS_TERMINAL.has(previous) && previous !== event.status) return "invalid";
-    if (previous === "queued" && !["queued", "running", "failed", "skipped", "cancelled"].includes(event.status)) return "invalid";
-    if (previous === "running" && event.status === "queued") return "invalid";
-    activity.stageUpdates += 1;
-    activity.stages.set(event.stage, event.status);
-    return "accept";
+        || ![null, true, false].includes(event.continuation_available)) return null;
+    return { kind: "stage", identity, value: { ...event } };
   }
   if (event.event === "partial_result") {
     const allowed = new Set(["event", "schema_version", "activity_id", "stage", "sequence", "items"]);
     if (!hasOnlyAgentKeys(event, allowed) || !AGENT_PROGRESS_STAGES.includes(event.stage)
         || !Number.isInteger(event.sequence) || event.sequence < 0 || event.sequence > 65535
         || !Array.isArray(event.items) || event.items.length > 20
-        || event.items.some(item => !validAgentPublicResult(item))) return "invalid";
-    const replayKey = `${event.activity_id}:${event.sequence}`;
-    const digest = await digestAgentPartialResult(event);
-    if (event.sequence < activity.nextSequence) {
-      return protocol.partialDigests.get(replayKey) === digest ? "replay" : "conflict";
-    }
-    if (event.sequence !== activity.nextSequence
-        || activity.partialUpdates >= AGENT_PROGRESS_MAX_PARTIAL_UPDATES
-        || activity.stages.get(event.stage) !== "running") return "invalid";
-    const nextKeys = new Set(activity.resultKeys);
-    for (const item of event.items) {
-      const known = nextKeys.has(item.result_key);
-      if ((item.change === "add" && known) || (item.change === "enrich" && !known)) return "invalid";
-      nextKeys.add(item.result_key);
-      if (nextKeys.size > AGENT_PROGRESS_MAX_RESULTS) return "invalid";
-    }
-    activity.partialUpdates += 1;
-    activity.resultKeys = nextKeys;
-    protocol.partialDigests.set(replayKey, digest);
-    activity.nextSequence += 1;
-    return "accept";
+        || event.items.some(item => !validAgentPublicResult(item))) return null;
+    return { kind: "partial", identity, value: { ...event }, digest: await digestAgentPartialResult(event) };
   }
-  return "invalid";
+  return null;
+}
+
+function reduceAssistantActivity(previous, normalizedEvent) {
+  if (!previous) return null;
+  if (!normalizedEvent) return assistantActivityDisposition(previous, "invalid", "invalid_event");
+  if (!sameAssistantActivityIdentity(previous.identity, normalizedEvent.identity)) {
+    return assistantActivityDisposition(previous, "stale", "stale_identity");
+  }
+  if (previous.terminalReason) return assistantActivityDisposition(previous, "stale", "post_terminal");
+  if (normalizedEvent.kind === "terminal") {
+    const phase = normalizedEvent.reason === "pending_confirmation" ? "pending_confirmation"
+      : normalizedEvent.reason === "cancelled" ? "cancelled"
+        : normalizedEvent.reason === "complete" ? "complete" : "error";
+    return {
+      ...previous, phase, thinking: "hidden", activities: new Map(), results: new Map(),
+      resultOrder: [], sourceResults: new Map(), partialDigests: new Map(),
+      acceptedStageUpdates: 0, acceptedPartialUpdates: 0,
+      terminalReason: normalizedEvent.reason, lastDisposition: "terminal",
+    };
+  }
+
+  const event = normalizedEvent.value;
+  let activity = previous.activities.get(event.activity_id);
+  if (!activity) {
+    if (normalizedEvent.kind !== "stage" || event.stage !== "names" || event.status !== "queued") {
+      return assistantActivityDisposition(previous, "invalid", "stage_order");
+    }
+    if (previous.activities.size >= AGENT_PROGRESS_MAX_ACTIVITIES) {
+      return assistantActivityDisposition(previous, "limited", "activity_limit", { detailLimited: true });
+    }
+    activity = { stages: new Map(), stageUpdates: 0, partialUpdates: 0, nextSequence: 0 };
+  }
+
+  if (normalizedEvent.kind === "stage") {
+    if (activity.stageUpdates >= AGENT_PROGRESS_MAX_STAGE_UPDATES
+        || previous.acceptedStageUpdates >= AGENT_PROGRESS_MAX_TURN_STAGE_UPDATES) {
+      return assistantActivityDisposition(previous, "limited", "detail_limited", { detailLimited: true });
+    }
+    const previousStage = activity.stages.get(event.stage);
+    const previousStatus = previousStage && previousStage.status;
+    const stageIndex = AGENT_PROGRESS_STAGES.indexOf(event.stage);
+    const priorStatuses = AGENT_PROGRESS_STAGES.slice(0, stageIndex)
+      .map(stage => activity.stages.get(stage)?.status);
+    const validOrder = event.status === "queued"
+      ? priorStatuses.every(status => status !== undefined)
+      : event.status === "running"
+        ? priorStatuses.every(status => status === "complete")
+        : priorStatuses.every(status => AGENT_PROGRESS_TERMINAL.has(status));
+    if (!validOrder || (!previousStage && event.status !== "queued")) {
+      return assistantActivityDisposition(previous, "invalid", "stage_order");
+    }
+    if (previousStatus && AGENT_PROGRESS_TERMINAL.has(previousStatus) && previousStatus !== event.status) {
+      return assistantActivityDisposition(previous, "invalid", "stage_reopen");
+    }
+    if (previousStatus === "queued" && !["queued", "running", "failed", "skipped", "cancelled"].includes(event.status)) {
+      return assistantActivityDisposition(previous, "invalid", "stage_order");
+    }
+    if (previousStatus === "running" && !["running", "complete", "failed", "cancelled"].includes(event.status)) {
+      return assistantActivityDisposition(previous, "invalid", "stage_order");
+    }
+    const counterRegressed = previousStage && (event.scanned < previousStage.scanned
+      || event.hits < previousStage.hits
+      || (previousStage.total !== null && (event.total === null || event.total < previousStage.total)));
+    if (counterRegressed && !AGENT_PROGRESS_TERMINAL.has(event.status)) {
+      return assistantActivityDisposition(previous, "invalid", "counter_regression");
+    }
+    const scanned = counterRegressed ? Math.max(event.scanned, previousStage.scanned) : event.scanned;
+    const hits = counterRegressed ? Math.max(event.hits, previousStage.hits) : event.hits;
+    const total = counterRegressed
+      ? (event.total !== null && event.total >= scanned
+          ? event.total
+          : previousStage.total !== null && previousStage.total >= scanned ? previousStage.total : null)
+      : event.total;
+    const stages = new Map(activity.stages);
+    stages.set(event.stage, {
+      status: event.status, scanned, total, hits,
+      current_item: event.current_item, coverage_complete: event.coverage_complete,
+      budget_reached: event.budget_reached, continuation_available: event.continuation_available,
+    });
+    const activities = new Map(previous.activities);
+    activities.set(event.activity_id, { ...activity, stages, stageUpdates: activity.stageUpdates + 1 });
+    return {
+      ...previous, activities, thinking: "working",
+      acceptedStageUpdates: previous.acceptedStageUpdates + 1,
+      diagnostics: counterRegressed
+        ? bumpAssistantActivityDiagnostic(previous, "counter_regression") : previous.diagnostics,
+      lastDisposition: "accept",
+    };
+  }
+
+  if (normalizedEvent.kind === "partial") {
+    const replayKey = `${event.activity_id}:${event.sequence}`;
+    if (event.sequence < activity.nextSequence) {
+      const same = previous.partialDigests.get(replayKey) === normalizedEvent.digest;
+      return assistantActivityDisposition(previous, same ? "replay" : "conflict",
+        same ? "identical_replay" : "conflicting_replay");
+    }
+    if (event.sequence > activity.nextSequence) {
+      return assistantActivityDisposition(previous, "gap", "sequence_gap", { needsReconciliation: true });
+    }
+    if (activity.partialUpdates >= AGENT_PROGRESS_MAX_PARTIAL_UPDATES
+        || previous.acceptedPartialUpdates >= AGENT_PROGRESS_MAX_TURN_PARTIAL_UPDATES) {
+      return assistantActivityDisposition(previous, "limited", "detail_limited", { detailLimited: true });
+    }
+    if (activity.stages.get(event.stage)?.status !== "running") {
+      return assistantActivityDisposition(previous, "invalid", "stage_order");
+    }
+    const results = new Map(previous.results);
+    const resultOrder = previous.resultOrder.slice();
+    const sourceResults = new Map(previous.sourceResults);
+    for (const item of event.items) {
+      const resultKey = `${event.activity_id}:${item.result_key}`;
+      const sourceKey = JSON.stringify([item.service, item.item_id]);
+      const known = results.has(resultKey);
+      if (item.change === "enrich" && !known) {
+        return assistantActivityDisposition(previous, "invalid", "unknown_enrich");
+      }
+      if (item.change === "add" && known) {
+        return assistantActivityDisposition(previous, "invalid", "duplicate_result");
+      }
+      if (item.change === "add" && sourceResults.has(sourceKey)) {
+        return assistantActivityDisposition(previous, "dedupe", "duplicate_source");
+      }
+      if (known) {
+        const prior = results.get(resultKey);
+        if (prior.service !== item.service || prior.item_id !== item.item_id) {
+          return assistantActivityDisposition(previous, "invalid", "unknown_enrich");
+        }
+      } else {
+        if (resultOrder.length >= AGENT_PROGRESS_MAX_RESULTS) {
+          return assistantActivityDisposition(previous, "limited", "result_limit", { detailLimited: true });
+        }
+        resultOrder.push(resultKey);
+        sourceResults.set(sourceKey, resultKey);
+      }
+      results.set(resultKey, { ...item, activity_id: event.activity_id, stage: event.stage });
+    }
+    const activities = new Map(previous.activities);
+    activities.set(event.activity_id, {
+      ...activity, partialUpdates: activity.partialUpdates + 1,
+      nextSequence: activity.nextSequence + 1,
+    });
+    const partialDigests = new Map(previous.partialDigests);
+    partialDigests.set(replayKey, normalizedEvent.digest);
+    return {
+      ...previous, activities, results, resultOrder, sourceResults, partialDigests,
+      acceptedPartialUpdates: previous.acceptedPartialUpdates + 1,
+      lastDisposition: "accept",
+    };
+  }
+  return assistantActivityDisposition(previous, "invalid", "invalid_event");
+}
+
+async function acceptAgentActivityEvent(protocol, identity, event) {
+  const current = protocol || createAssistantActivityState(identity || {});
+  const normalized = await normalizeAssistantActivityEvent(identity, event);
+  return reduceAssistantActivity(current, normalized);
+}
+
+function finishAssistantActivityState(protocol, identity, reason) {
+  return reduceAssistantActivity(protocol, { kind: "terminal", identity, reason });
+}
+
+const ASSISTANT_STAGE_ICON = Object.freeze({
+  queued: "circle", running: "loader-circle", complete: "check",
+  failed: "triangle-alert", skipped: "minus", cancelled: "x",
+});
+const ASSISTANT_STAGE_STATUS = Object.freeze({
+  queued: "Queued", running: "Running", complete: "Complete",
+  failed: "Failed", skipped: "Skipped", cancelled: "Cancelled",
+});
+
+function assistantStageStatusText(stage) {
+  if (!stage) return ASSISTANT_STAGE_STATUS.queued;
+  if (stage.status === "running") {
+    const count = stage.total === null
+      ? `${stage.scanned} checked`
+      : `${stage.scanned} of ${stage.total}`;
+    return `${ASSISTANT_STAGE_STATUS.running} · ${count}`;
+  }
+  if (stage.status === "complete") {
+    return `${ASSISTANT_STAGE_STATUS.complete} · ${stage.hits} ${stage.hits === 1 ? "hit" : "hits"}`;
+  }
+  return ASSISTANT_STAGE_STATUS[stage.status] || ASSISTANT_STAGE_STATUS.queued;
+}
+
+function createAssistantStageView(definition) {
+  const iconHost = el("span", { class: "asst-stage-ic", "aria-hidden": "true" });
+  const label = el("span", { class: "asst-stage-label", text: definition.label });
+  const current = el("span", { class: "asst-stage-current truncate", "aria-hidden": "true" });
+  const status = el("span", { class: "asst-stage-n", text: ASSISTANT_STAGE_STATUS.queued });
+  const row = el("div", {
+    class: "asst-stage queued", role: "listitem", "data-agent-stage": definition.id,
+    "data-agent-stage-status": "queued", "aria-label": `${definition.label}: Queued`,
+  }, iconHost, el("span", { class: "asst-stage-copy" }, label, current), status);
+  const update = (next) => {
+    const state = next || { status: "queued", current_item: null };
+    const copy = assistantStageStatusText(state);
+    row.className = "asst-stage " + state.status;
+    row.dataset.agentStageStatus = state.status;
+    row.setAttribute("aria-label", `${definition.label}: ${copy}`);
+    iconHost.className = "asst-stage-ic" + (state.status === "running" ? " is-running" : "");
+    iconHost.replaceChildren(icon(ASSISTANT_STAGE_ICON[state.status], "icon-sm"));
+    current.textContent = state.status === "running" && state.current_item
+      ? state.current_item : "";
+    status.textContent = copy;
+  };
+  update(null);
+  return { node: row, update };
+}
+
+function createAssistantActivityRenderer(bubble, textNode, clearThinking, onUpdate) {
+  let host = null;
+  let planHost = null;
+  let resultsHost = null;
+  let resultsHeading = null;
+  let detailNote = null;
+  let announcement = null;
+  const activityViews = new Map();
+  const renderedStages = new Map();
+  const resultViews = new Map();
+  const renderedResults = new Map();
+  const newTimers = new Map();
+  const announcedStageStates = new Map();
+
+  const ensureHost = () => {
+    if (host) return;
+    clearThinking();
+    host = el("section", {
+      class: "asst-activity-host", "data-agent-activity-host": "1",
+      "aria-label": "Assistant activity",
+    });
+    planHost = el("div", { class: "asst-search" });
+    resultsHeading = el("div", { class: "asst-results-heading", text: "Results" });
+    resultsHeading.hidden = true;
+    resultsHost = el("div", { class: "asst-results" });
+    resultsHost.hidden = true;
+    detailNote = el("p", { class: "asst-activity-note", text: "Some activity details were omitted." });
+    detailNote.hidden = true;
+    announcement = el("span", { class: "sr-only", role: "status", "aria-live": "polite", "aria-atomic": "true" });
+    host.append(planHost, resultsHeading, resultsHost, detailNote, announcement);
+    bubble.insertBefore(host, textNode);
+  };
+
+  const ensureActivity = (activityId) => {
+    let view = activityViews.get(activityId);
+    if (view) return view;
+    ensureHost();
+    const rows = new Map();
+    const list = el("div", { class: "asst-stage-list", role: "list" });
+    ASST_STAGE_CATALOG.forEach((definition) => {
+      const stageView = createAssistantStageView(definition);
+      rows.set(definition.id, stageView);
+      list.append(stageView.node);
+    });
+    const section = el("section", { class: "asst-search-activity", "aria-label": "Archive search plan" },
+      el("div", { class: "asst-activity-title" }, icon("search", "icon-sm"), el("span", { text: "Archive search" })),
+      list);
+    planHost.append(section);
+    view = { section, rows };
+    activityViews.set(activityId, view);
+    return view;
+  };
+
+  const render = async (state) => {
+    if (!state || !state.activities.size) return;
+    ensureHost();
+    state.activities.forEach((activity, activityId) => {
+      const view = ensureActivity(activityId);
+      ASST_STAGE_CATALOG.forEach((definition) => {
+        const stage = activity.stages.get(definition.id) || null;
+        const key = `${activityId}:${definition.id}`;
+        if (renderedStages.get(key) !== stage) {
+          view.rows.get(definition.id).update(stage);
+          renderedStages.set(key, stage);
+        }
+        if (stage) {
+          if (announcedStageStates.get(key) !== stage.status) {
+            announcedStageStates.set(key, stage.status);
+            announcement.textContent = `${definition.label}: ${ASSISTANT_STAGE_STATUS[stage.status]}`;
+          }
+        }
+      });
+    });
+    let changedResults = 0;
+    let pendingResultNodes = document.createDocumentFragment();
+    for (const key of state.resultOrder) {
+      const result = state.results.get(key);
+      let view = resultViews.get(key);
+      if (!view) {
+        view = createAssistantResultView(result, resultViews.size < ASST_RESULT_ANIMATION_LIMIT);
+        resultViews.set(key, view);
+        renderedResults.set(key, result);
+        pendingResultNodes.append(view.node);
+        const timer = setTimeout(() => {
+          view.clearNew();
+          newTimers.delete(key);
+        }, ASST_RESULT_NEW_MS);
+        newTimers.set(key, timer);
+        changedResults += 1;
+      } else if (renderedResults.get(key) !== result) {
+        view.update(result);
+        renderedResults.set(key, result);
+        changedResults += 1;
+      }
+      if (changedResults > 0 && changedResults % 4 === 0) {
+        resultsHost.append(pendingResultNodes);
+        pendingResultNodes = document.createDocumentFragment();
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+    }
+    if (pendingResultNodes.childNodes.length) resultsHost.append(pendingResultNodes);
+    resultsHeading.hidden = resultViews.size === 0;
+    resultsHost.hidden = resultViews.size === 0;
+    detailNote.hidden = !state.detailLimited;
+    onUpdate();
+  };
+
+  const finish = () => {
+    newTimers.forEach(timer => clearTimeout(timer));
+    newTimers.clear();
+    resultViews.forEach(view => view.clearNew());
+    renderedStages.clear();
+    renderedResults.clear();
+    if (announcement) announcement.textContent = "";
+  };
+  return { render, finish, hasPlan: () => activityViews.size > 0 };
+}
+
+const ASSISTANT_OPERATION_PLANS = Object.freeze({
+  backup: Object.freeze({
+    title: "Backup", stages: Object.freeze(["Prepare", "Await confirmation", "Run backup"]),
+  }),
+  "restore-cloud": Object.freeze({
+    title: "Cloud restore", stages: Object.freeze(["Prepare", "Await confirmation", "Run restore"]),
+  }),
+});
+
+function assistantOperationKind(event) {
+  const input = event && event.input && typeof event.input === "object" ? event.input : {};
+  const operation = String(input.op || event?.name || "").toLowerCase();
+  return Object.prototype.hasOwnProperty.call(ASSISTANT_OPERATION_PLANS, operation)
+    ? operation : null;
+}
+
+function createAssistantOperationRenderer(bubble, textNode, clearThinking, onUpdate) {
+  let kind = null;
+  let host = null;
+  let rows = [];
+  let states = [];
+  const updateRow = (index, status) => {
+    states[index] = status;
+    const row = rows[index];
+    row.node.className = "asst-stage " + status;
+    row.node.dataset.agentStageStatus = status;
+    row.node.setAttribute("aria-label", `${row.label}: ${ASSISTANT_STAGE_STATUS[status]}`);
+    row.icon.className = "asst-stage-ic" + (status === "running" ? " is-running" : "");
+    row.icon.replaceChildren(icon(ASSISTANT_STAGE_ICON[status], "icon-sm"));
+    row.status.textContent = ASSISTANT_STAGE_STATUS[status];
+  };
+  const renderPlan = (nextKind) => {
+    if (host || !nextKind) return;
+    kind = nextKind;
+    clearThinking();
+    const plan = ASSISTANT_OPERATION_PLANS[kind];
+    const list = el("div", { class: "asst-stage-list", role: "list" });
+    rows = plan.stages.map((label, index) => {
+      const iconHost = el("span", { class: "asst-stage-ic", "aria-hidden": "true" });
+      const status = el("span", { class: "asst-stage-n" });
+      const node = el("div", {
+        class: "asst-stage queued", role: "listitem", "data-agent-operation-stage": String(index),
+      }, iconHost, el("span", { class: "asst-stage-label", text: label }), status);
+      list.append(node);
+      return { node, icon: iconHost, label, status };
+    });
+    host = el("section", {
+      class: "asst-activity-host asst-operation-plan", "data-agent-operation-plan": kind,
+      "aria-label": `${plan.title} plan`,
+    }, el("div", { class: "asst-activity-title" }, icon("list-checks", "icon-sm"), el("span", { text: plan.title })), list);
+    bubble.insertBefore(host, textNode);
+    states = ["running", "queued", "queued"];
+    states.forEach((statusValue, index) => updateRow(index, statusValue));
+    onUpdate();
+  };
+  const closeRemaining = (activeStatus) => {
+    const active = states.findIndex(status => status === "running");
+    if (active >= 0) updateRow(active, activeStatus);
+    for (let index = Math.max(0, active + 1); index < states.length; index += 1) {
+      if (states[index] === "queued") updateRow(index, "skipped");
+    }
+    onUpdate();
+  };
+  return {
+    onToolCall(event) { renderPlan(assistantOperationKind(event)); },
+    onToolResult() {
+      if (!host) return;
+      states.forEach((_, index) => updateRow(index, "complete"));
+      onUpdate();
+    },
+    onConfirmation() {
+      if (!host) return;
+      updateRow(0, "complete");
+      updateRow(1, "running");
+      onUpdate();
+    },
+    onPendingStatus(status) {
+      if (!host) return;
+      if (status === "confirmed") {
+        updateRow(1, "complete");
+        updateRow(2, "complete");
+      } else if (status === "cancelled" || status === "expired") {
+        updateRow(1, status === "cancelled" ? "cancelled" : "failed");
+        updateRow(2, "skipped");
+      } else if (status === "error") {
+        updateRow(1, "failed");
+        updateRow(2, "skipped");
+      }
+      onUpdate();
+    },
+    finish(reason) {
+      if (!host || reason === "pending_confirmation") return;
+      if (reason === "complete") states.forEach((_, index) => updateRow(index, "complete"));
+      else closeRemaining(reason === "cancelled" ? "cancelled" : "failed");
+      onUpdate();
+    },
+    hasPlan: () => !!host,
+  };
 }
 
 async function handleAgentEvent(message, turnState) {
@@ -6680,9 +7321,12 @@ async function handleAgentEvent(message, turnState) {
       turnState.setProgress(d.phase);
       break;
     case "token":
-      turnState.setText(turnState.message.text + (d.text || ""));
+      turnState.appendToken(d.text || "");
       break;
     case "tool_call":
+      turnState.flushTokens();
+      turnState.stopTokenCaret();
+      turnState.onOperationToolCall(d);
       turnState.addToolRow({
         kind: "tool_call",
         title: agentToolCallCopy(d.name, d.input),
@@ -6690,6 +7334,9 @@ async function handleAgentEvent(message, turnState) {
       break;
     case "tool_result":
       {
+        turnState.flushTokens();
+        turnState.stopTokenCaret();
+        turnState.onOperationToolResult(d);
         const sources = extractAgentSources(d);
         turnState.addToolRow({
           kind: "tool_result",
@@ -6703,13 +7350,19 @@ async function handleAgentEvent(message, turnState) {
       }
       break;
     case "stage_progress":
+      turnState.flushTokens();
+      turnState.stopTokenCaret();
       await turnState.onSearchStage(d);
       break;
     case "partial_result":
+      turnState.flushTokens();
+      turnState.stopTokenCaret();
       await turnState.onPartialResult(d);
       turnState.addCitations(extractAgentSources(d));
       break;
     case "confirmation_required": {
+      turnState.flushTokens();
+      turnState.stopTokenCaret();
       const pending = {
         pending_id: d.pending_id || d.id || d.tool_id || "",
         preview: d.preview || "Action requires confirmation",
@@ -6725,17 +7378,23 @@ async function handleAgentEvent(message, turnState) {
       if (pending.pending_id) {
         AssistantState.pendingCardsById.set(pending.pending_id, pending);
       }
+      turnState.onOperationConfirmation(pending);
       turnState.setPending(pending);
       break;
     }
     case "error":
+      turnState.flushTokens();
+      turnState.stopTokenCaret();
       turnState.addError(agentSafeErrorCopy(d.message));
       break;
     case "done": {
+      turnState.flushTokens();
+      turnState.stopTokenCaret();
       if (typeof turnState.finishActivityProtocol === "function") {
-        turnState.finishActivityProtocol();
+        turnState.finishActivityProtocol(d.reason || "complete");
       }
       const reason = d.reason || "complete";
+      turnState.finishOperationPlan(reason);
       const fallback = reason === "pending_confirmation" ? "Waiting for confirmation"
         : reason === "cancelled" ? "Cancelled"
         : reason === "error" ? "Turn ended with an error"
@@ -6815,7 +7474,7 @@ function sessionRecordsToTranscript(records) {
       transcript.push({
         role: "assistant",
         text: payload.text,
-        chips: [], stages: [], results: [], tools: [], errors: [],
+        chips: [], tools: [], errors: [],
         citations: Array.isArray(payload.sources) ? payload.sources : [],
         pending: null,
         doneReason: "complete",
@@ -6828,7 +7487,7 @@ function sessionRecordsToTranscript(records) {
         message = {
           role: "assistant",
           text: operationCopy(code),
-          chips: [], stages: [], results: [], tools: [], errors: [],
+          chips: [], tools: [], errors: [],
           citations: [], pending: null,
           doneReason: kind === "pending_operation" ? "pending_confirmation" : code,
         };
@@ -7194,7 +7853,7 @@ async function agentSend(text) {
 
   AssistantState.transcript.push({ role: "user", text });
   log.append(renderAssistantMessage(AssistantState.transcript[AssistantState.transcript.length - 1]));
-  const asst = { role: "assistant", text: "", chips: [], stages: [], results: [], tools: [], errors: [], citations: [], pending: null, doneReason: null };
+  const asst = { role: "assistant", text: "", chips: [], tools: [], errors: [], citations: [], pending: null, doneReason: null };
   AssistantState.transcript.push(asst);
   AssistantState.busy = true;
   AssistantState.turnCancelPending = false;
@@ -7206,23 +7865,30 @@ async function agentSend(text) {
   log.append(asstEl);
   const textEl = asstEl.querySelector(".asst-text");
   const bubble = asstEl.querySelector(".asst-bubble");
-  // Immediate animated "working" ack (#644) instead of a bare "…" while the model thinks
-  // before its first token / search stage. Removed on the first real content.
   textEl.textContent = "";
   const thinkingEl = el("div", { class: "asst-thinking" },
     el("span", { class: "asst-thinking-dot" }), el("span", { class: "asst-thinking-dot" }), el("span", { class: "asst-thinking-dot" }),
-    el("span", { class: "asst-thinking-label dim", text: "Preparing secure session…" }));
+    el("span", { class: "asst-thinking-label dim", text: "Preparing" }));
   bubble.insertBefore(thinkingEl, textEl);
   let thinkingDone = false;
   const clearThinking = () => { if (!thinkingDone) { thinkingDone = true; thinkingEl.remove(); } };
   const setProgress = (phase) => {
     if (thinkingDone) return;
     const label = thinkingEl.querySelector(".asst-thinking-label");
-    if (label && phase === "provider_started") label.textContent = "Thinking…";
+    const copy = Object.freeze({ provider_started: "Thinking" })[phase];
+    if (label && copy) label.textContent = copy;
     scrollAssistantToEnd();
   };
   scrollAssistantToEnd();
-  const setText = (t) => { if (t) clearThinking(); asst.text = t; textEl.textContent = t || ""; scrollAssistantToEnd(); };
+  const tokenWriter = createAssistantTokenWriter(
+    asst, textEl, clearThinking, scrollAssistantToEnd,
+  );
+  const cleanupTokenWriter = () => tokenWriter.finish();
+  AssistantState.activeTokenCleanup = cleanupTokenWriter;
+  const setText = (value) => {
+    if (value) clearThinking();
+    tokenWriter.replace(value);
+  };
   const addToolRow = (row) => {
     clearThinking();
     asst.tools.push(row);
@@ -7237,6 +7903,7 @@ async function agentSend(text) {
   };
   const setPending = (pending) => {
     clearThinking();
+    pending.onDisplayStatus = (status) => operationRenderer.onPendingStatus(status);
     asst.pending = pending;
     const old = bubble.querySelector("[data-agent-pending-card]");
     if (old) old.remove();
@@ -7244,73 +7911,52 @@ async function agentSend(text) {
     scrollAssistantToEnd();
   };
   let citationsBox = null;
+  const citationKeys = new Set();
   const addCitations = (sources) => {
-    const merged = dedupeAgentSources([...(asst.citations || []), ...(sources || [])]);
-    if (merged.length === (asst.citations || []).length) return;
-    asst.citations = merged;
-    if (citationsBox) citationsBox.remove();
-    citationsBox = renderAgentCitationBar(asst.citations);
-    bubble.append(citationsBox);
+    const added = [];
+    for (const source of dedupeAgentSources(sources || [])) {
+      const key = agentSourceKey(source);
+      if (citationKeys.has(key) || citationKeys.size >= AGENT_MAX_CITATIONS) continue;
+      citationKeys.add(key);
+      added.push(source);
+    }
+    if (!added.length) return;
+    asst.citations.push(...added);
+    if (!citationsBox) {
+      citationsBox = el("div", { class: "asst-citations", "data-agent-citations": "1" });
+      bubble.append(citationsBox);
+    }
+    added.forEach(source => citationsBox.append(renderAgentCitation(source)));
     scrollAssistantToEnd();
   };
 
-  // Progressive-search UI (S-AG.18/#643): a small plan with a live checkmark per stage
-  // and a result list that grows as PartialResult events arrive.
-  const STAGE_LABEL = { names: "Fast search — subject", bodies: "Full-text — bodies", deep: "AI deep-read" };
-  let searchBox = null, resultsBox = null; const stageRow = {};
-  const activityProtocol = createAgentActivityProtocol();
+  const activityRenderer = createAssistantActivityRenderer(
+    bubble, textEl, clearThinking, scrollAssistantToEnd,
+  );
+  const operationRenderer = createAssistantOperationRenderer(
+    bubble, textEl, clearThinking, scrollAssistantToEnd,
+  );
+  const cleanupActivityRenderer = () => activityRenderer.finish();
+  AssistantState.activeActivityCleanup = cleanupActivityRenderer;
+  let activityProtocol = null;
+  let activityIdentity = null;
   const acceptProgressEvent = async (d) => {
-    const disposition = await acceptAgentActivityEvent(activityProtocol, d);
+    activityProtocol = await acceptAgentActivityEvent(activityProtocol, activityIdentity, d);
+    const disposition = activityProtocol.lastDisposition;
     if (disposition === "accept") return true;
-    if (disposition === "replay") return false;
-    activityProtocol.failed = true;
-    addError(disposition === "conflict"
+    if (["replay", "dedupe", "limited"].includes(disposition)) return false;
+    addError(disposition === "conflict" || disposition === "gap"
       ? "Search progress could not be reconciled."
       : "Invalid search progress was ignored.");
     return false;
   };
-  const ensureSearchUI = () => {
-    clearThinking();   // the search plan replaces the generic "working" indicator
-    if (searchBox) return;
-    searchBox = el("div", { class: "asst-search" });
-    resultsBox = el("div", { class: "asst-results" });
-    bubble.append(searchBox, resultsBox);
-    scrollAssistantToEnd();
-  };
   const onSearchStage = async (d) => {
     if (!await acceptProgressEvent(d)) return;
-    ensureSearchUI();
-    const stageKey = `${d.activity_id}:${d.stage}`;
-    let row = stageRow[stageKey];
-    if (!row) {
-      row = el("div", { class: "asst-stage" }, el("span", { class: "asst-stage-ic" }), el("span", { class: "grow", text: STAGE_LABEL[d.stage] || d.stage }), el("span", { class: "asst-stage-n dim" }));
-      stageRow[stageKey] = row; searchBox.append(row);
-    }
-    const done = AGENT_PROGRESS_TERMINAL.has(d.status);
-    row.classList.toggle("done", done);
-    row.querySelector(".asst-stage-ic").textContent = done ? "✓" : "";
-    if (done) {
-      row.querySelector(".asst-stage-n").textContent = d.hits + (d.hits === 1 ? " hit" : " hits");
-      const e = asst.stages.find(s => s.activity_id === d.activity_id && s.stage === d.stage);
-      if (e) {
-        e.hits = d.hits;
-        e.status = d.status;
-      } else {
-        asst.stages.push({ activity_id: d.activity_id, stage: d.stage, status: d.status, hits: d.hits });
-      }
-    }
-    scrollAssistantToEnd();
+    await activityRenderer.render(activityProtocol);
   };
   const onPartialResult = async (d) => {
     if (!await acceptProgressEvent(d)) return;
-    ensureSearchUI();
-    (d.items || []).forEach((it) => {
-      const index = asst.results.findIndex(existing => existing.result_key === it.result_key);
-      if (index >= 0) asst.results[index] = it;
-      else asst.results.push(it);
-    });
-    resultsBox.replaceChildren(...asst.results.map(asstResultCard));
-    scrollAssistantToEnd();
+    await activityRenderer.render(activityProtocol);
   };
 
   let turn;
@@ -7357,6 +8003,14 @@ async function agentSend(text) {
     AssistantState.turnCancelPending = false;
     AssistantState.turnStreamReady = false;
     AssistantState.activeMessage = null;
+    if (AssistantState.activeActivityCleanup === cleanupActivityRenderer) {
+      AssistantState.activeActivityCleanup = null;
+    }
+    cleanupActivityRenderer();
+    if (AssistantState.activeTokenCleanup === cleanupTokenWriter) {
+      AssistantState.activeTokenCleanup = null;
+    }
+    cleanupTokenWriter();
     syncAssistantComposerControls();
     asst.doneReason = "error";
     if (e && e.connectivity) {
@@ -7377,11 +8031,24 @@ async function agentSend(text) {
     AssistantState.turnCancelPending = false;
     AssistantState.turnStreamReady = false;
     AssistantState.activeMessage = null;
+    if (AssistantState.activeActivityCleanup === cleanupActivityRenderer) {
+      AssistantState.activeActivityCleanup = null;
+    }
+    cleanupActivityRenderer();
+    if (AssistantState.activeTokenCleanup === cleanupTokenWriter) {
+      AssistantState.activeTokenCleanup = null;
+    }
+    cleanupTokenWriter();
     syncAssistantComposerControls();
     setText("Error: could not start the turn");
     return;
   }
   AssistantState.activeTurnId = turn;
+  activityIdentity = Object.freeze({
+    session_id: sessionId, turn_request_id: requestId, turn_id: turn,
+    stream_id: crypto.randomUUID(),
+  });
+  activityProtocol = createAssistantActivityState(activityIdentity);
   syncAssistantComposerControls();
   if (BRIDGE && startingGuardId) {
     // Own the starting lease immediately. Even an ambiguous native bind response must be released
@@ -7401,7 +8068,10 @@ async function agentSend(text) {
   let stream;
   let terminalReplayAttempted = false;
   finish = (msg, terminalReason) => {
+    tokenWriter.flush();
+    tokenWriter.stopCaret();
     clearThinking();
+    settleAssistantAtEnd();
     if (AssistantState.activeStream === stream) closeAssistantStream("turn-finish");
     else {
       try { stream.close(); } catch (_) {}
@@ -7433,20 +8103,28 @@ async function agentSend(text) {
     message: asst,
     setProgress,
     setText,
+    appendToken: (delta) => tokenWriter.append(delta),
+    flushTokens: () => tokenWriter.flush(),
+    stopTokenCaret: () => tokenWriter.stopCaret(),
     addToolRow,
     addError,
     setPending,
     addCitations,
     onSearchStage,
     onPartialResult,
-    finishActivityProtocol: () => {
-      activityProtocol.activities.clear();
-      activityProtocol.partialDigests.clear();
+    onOperationToolCall: (event) => operationRenderer.onToolCall(event),
+    onOperationToolResult: (event) => operationRenderer.onToolResult(event),
+    onOperationConfirmation: () => operationRenderer.onConfirmation(),
+    finishOperationPlan: (reason) => operationRenderer.finish(reason),
+    finishActivityProtocol: (reason) => {
+      activityRenderer.finish(reason);
+      activityProtocol = finishAssistantActivityState(activityProtocol, activityIdentity, reason);
     },
     finish,
     reconcileRequestStatus,
   };
   let eventIngress = Promise.resolve();
+  let eventIngressSinceYield = 0;
   const openTurnStream = () => openEventStream(url, (name, data) => {
     if (name !== "message") return; // ignore ping heartbeats
     let d;
@@ -7457,13 +8135,25 @@ async function agentSend(text) {
       return;
     }
     eventIngress = eventIngress
-      .then(() => handleAgentEvent(d, turnState))
+      .then(async () => {
+        await handleAgentEvent(d, turnState);
+        eventIngressSinceYield += 1;
+        if (eventIngressSinceYield >= 10) {
+          eventIngressSinceYield = 0;
+          await new Promise(resolve => setTimeout(resolve, 0));
+        }
+      })
       .catch(() => {
         addError("Invalid stream payload");
         finish("Stream error");
       });
   }, () => {
     void (async () => {
+      const endedStream = stream;
+      if (endedStream) {
+        try { endedStream.close(); } catch (_) {}
+      }
+      await eventIngress;
       const status = await reconcileRequestStatus();
       if (status && status.terminal && !terminalReplayAttempted
           && AssistantState.activeMessage === asst && AssistantState.activeTurnId === turn) {
@@ -7522,12 +8212,13 @@ function renderAccountMenu(body) {
   clear(body);
   App.accounts.forEach(a => {
     const active = a.id === App.account;
+    const accountLabel = accountDisplayLabel(a);
     const row = el("div", { class: "acct-row" + (active ? " active" : "") });
     row.append(el("div", { class: "acct-main" },
-      el("span", { class: "avatar mail-av", style: "--c:var(--accent)", text: initials(a.username || a.id) }),
-      el("button", { class: "acct-pick grow", title: "Switch to this account", onclick: () => { if (!active) { App.account = a.id; toast("Switched to " + (a.username || a.id)); closeAccountMenu(); onRoute(); } } },
-        el("div", { class: "truncate", text: a.username || a.id }),
-        el("div", { class: "dim", style: "font-size:11px", text: active ? "Active" : a.id })),
+      el("span", { class: "avatar mail-av", style: "--c:var(--accent)", text: initials(accountLabel) }),
+      el("button", { class: "acct-pick grow", title: "Switch to this account", onclick: () => { if (!active) { App.account = a.id; toast("Switched to " + accountLabel); closeAccountMenu(); onRoute(); } } },
+        el("div", { class: "truncate", text: accountLabel }),
+        el("div", { class: "dim", style: "font-size:11px", text: active ? "Currently selected" : "Microsoft 365 account" })),
       active ? icon("check", "icon-sm") : null));
     if (CAP.account) {
       const roles = el("div", { class: "acct-roles" });

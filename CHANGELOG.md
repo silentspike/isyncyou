@@ -8,6 +8,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+**Living Agent activity UI (#644)**
+- `webui`: added bounded turn-local activity plans, monotonic stage and result
+  rendering, frame-batched streaming text, reader-controlled autoscroll, reduced-
+  motion parity, and display-only backup/restore progress without changing
+  confirmation authority or durable session history.
+
 **Progressive multi-stage Agent archive search (#643)**
 - `store`+`core`+`agent`+`app-host`+`webui`+`android`: added bounded
   name/body FTS stages, authenticated model-selected deep reads, verified-handle

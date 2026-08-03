@@ -1,0 +1,82 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-08-03T12:32:32Z",
+  "commit": "7464479a2228abcf90c4bc8fafe4a99b9a59ca30",
+  "entries": [
+    {
+      "id": "EV-001",
+      "requirement": "REQ-AGENT-018",
+      "claim": "The bounded browser smoke verifies the complete activity plan, monotonic reducer, result dedupe, token batching, reduced motion, responsive layout, and terminal cleanup.",
+      "method": "command",
+      "command": "node tools/agent-living-ui-smoke.mjs --out docs/evidence/artifacts/issue-644",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-644/ui-smoke.json"
+    },
+    {
+      "id": "EV-002",
+      "requirement": "REQ-AGENT-018",
+      "claim": "The reducer accepts only monotonic stage transitions for the active turn.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-webui --all-targets -- --nocapture",
+      "test": "living_ui_reducer_stage_transitions_are_monotonic",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-644/ui-smoke.json"
+    },
+    {
+      "id": "EV-003",
+      "requirement": "REQ-AGENT-018",
+      "claim": "Private progressive-search authority and body fields are rejected before rendering.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-webui --all-targets -- --nocapture",
+      "test": "living_ui_reducer_rejects_private_search_fields",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-644/ui-smoke.json"
+    },
+    {
+      "id": "EV-004",
+      "requirement": "REQ-AGENT-018",
+      "claim": "Provider token order is preserved while DOM writes are frame-batched.",
+      "method": "test",
+      "command": "cargo remote -c -- test -p isyncyou-webui --all-targets -- --nocapture",
+      "test": "living_ui_tokens_flush_once_per_frame_and_preserve_exact_text",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-644/ui-smoke.json"
+    },
+    {
+      "id": "EV-005",
+      "requirement": "REQ-AGENT-018",
+      "claim": "A physical default-APK search displayed the complete ordered plan, live counters and current item, a streamed terminal answer, and an existing viewer citation.",
+      "method": "probe",
+      "command": "jq -e '.state == \"pass\" and .implementation_commit == \"7464479a2228abcf90c4bc8fafe4a99b9a59ca30\" and .search.complete_plan_observed_while_running and .search.live_counter_observed and .search.current_item_observed and .search.terminal_reason == \"complete\" and .search.citation_count_minimum >= 1' docs/evidence/artifacts/issue-644/live-search.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-644/live-search.json"
+    },
+    {
+      "id": "EV-006",
+      "requirement": "REQ-AGENT-018",
+      "claim": "Reduced motion and reader-controlled scrolling preserve the complete search result and restore follow mode only on explicit request.",
+      "method": "probe",
+      "command": "jq -e '.state == \"pass\" and .reduced_motion.media_query_active and .reduced_motion.successful_attempt_terminal_reason == \"complete\" and .scroll_follow.reader_scroll_position_preserved_while_running and .scroll_follow.jump_to_latest_restored_follow' docs/evidence/artifacts/issue-644/live-search.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-644/live-search.json"
+    },
+    {
+      "id": "EV-007",
+      "requirement": "REQ-AGENT-018",
+      "claim": "A direct answer rendered no plan, while a real backup tool call rendered the closed display-only plan and reached PendingAction without changing confirmation authority.",
+      "method": "probe",
+      "command": "jq -e '.state == \"pass\" and .direct_turn.terminal_reason == \"complete\" and .direct_turn.activity_plan_present == false and .controlled_backup.terminal_reason_before_cancel == \"pending_confirmation\" and .controlled_backup.cloud_mutation_observed == false' docs/evidence/artifacts/issue-644/live-non-search.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-644/live-non-search.json"
+    },
+    {
+      "id": "EV-008",
+      "requirement": "REQ-AGENT-018",
+      "claim": "The exact implementation commit produced a hook-free default APK that passed the bounded physical UI regression and released all test resources.",
+      "method": "probe",
+      "command": "jq -e '.state == \"pass\" and .implementation_commit == \"7464479a2228abcf90c4bc8fafe4a99b9a59ca30\" and .artifact.sha256 == \"ef89afef761c145d7bcdc013e6746511379f4236a91c8db6b990539fdf74af0c\" and .artifact.test_hook_markers_present == false and .cleanup.device_lock_released == true' docs/evidence/artifacts/issue-644/default-apk.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-644/default-apk.json"
+    }
+  ]
+}

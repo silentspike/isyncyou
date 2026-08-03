@@ -1,0 +1,64 @@
+{
+  "evidence_version": 1,
+  "generated_at": "2026-08-03T12:32:32Z",
+  "implementation_commit": "7464479a2228abcf90c4bc8fafe4a99b9a59ca30",
+  "state": "pass",
+  "surface": "physical_default_debug_apk",
+  "provider": "claude",
+  "search": {
+    "complete_plan_observed_while_running": true,
+    "stage_order": [
+      "names",
+      "bodies",
+      "deep"
+    ],
+    "terminal_stage_states": [
+      "complete",
+      "complete",
+      "complete"
+    ],
+    "live_counter_observed": true,
+    "current_item_observed": true,
+    "deduplicated_result_count_observed": 1,
+    "streamed_final_text_present": true,
+    "terminal_reason": "complete",
+    "error_count": 0,
+    "citation_count_minimum": 1,
+    "all_citations_used_existing_view_route": true,
+    "invalid_activity_warning_present": false,
+    "active_caret_after_terminal": false
+  },
+  "background_foreground": {
+    "transcript_count_before": 16,
+    "transcript_count_after": 16,
+    "duplicate_turn_present": false,
+    "plan_preserved": true
+  },
+  "reduced_motion": {
+    "media_query_active": true,
+    "successful_attempt_stage_states": [
+      "complete",
+      "complete",
+      "complete"
+    ],
+    "successful_attempt_result_count": 1,
+    "successful_attempt_citation_count": 1,
+    "successful_attempt_terminal_reason": "complete",
+    "prior_transient_provider_error_rendered_truthfully": true
+  },
+  "scroll_follow": {
+    "reader_scroll_position_preserved_while_running": true,
+    "follow_disabled_after_reader_scroll": true,
+    "unseen_updates_announced": true,
+    "jump_to_latest_restored_follow": true,
+    "jump_to_latest_reached_end": true
+  },
+  "redaction": {
+    "account_identity_included": false,
+    "device_serial_included": false,
+    "prompt_or_result_text_included": false,
+    "source_identifier_included": false,
+    "provider_frame_included": false,
+    "raw_tool_result_included": false
+  }
+}

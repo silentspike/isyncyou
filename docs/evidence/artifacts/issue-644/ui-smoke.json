@@ -1,0 +1,251 @@
+{
+  "evidence_version": 1,
+  "ok": true,
+  "assertions": [
+    {
+      "name": "internal account aliases use a user-facing fallback",
+      "status": "pass"
+    },
+    {
+      "name": "configured Microsoft account name remains visible",
+      "status": "pass"
+    },
+    {
+      "name": "account switcher never renders internal account aliases",
+      "status": "pass"
+    },
+    {
+      "name": "search content creates a scrollable reading position",
+      "status": "pass"
+    },
+    {
+      "name": "reader movement disables follow mode",
+      "status": "pass"
+    },
+    {
+      "name": "reader scroll position remains unchanged while updates arrive",
+      "status": "pass"
+    },
+    {
+      "name": "jump to latest restores follow mode",
+      "status": "pass"
+    },
+    {
+      "name": "jump to latest does not steal focus elsewhere",
+      "status": "pass"
+    },
+    {
+      "name": "follow mode reaches the terminal bottom",
+      "status": "pass"
+    },
+    {
+      "name": "search renders the complete three-stage plan",
+      "status": "pass"
+    },
+    {
+      "name": "search stages finish truthfully",
+      "status": "pass"
+    },
+    {
+      "name": "search dedupes and enriches 200 results",
+      "status": "pass"
+    },
+    {
+      "name": "hostile public labels remain text",
+      "status": "pass"
+    },
+    {
+      "name": "frame-batched token output remains exact",
+      "status": "pass"
+    },
+    {
+      "name": "500 token events use materially fewer DOM writes",
+      "status": "pass"
+    },
+    {
+      "name": "token caret stops at terminal",
+      "status": "pass"
+    },
+    {
+      "name": "public UI contains no body excerpt fields",
+      "status": "pass"
+    },
+    {
+      "name": "desktop labels and counters do not overlap",
+      "status": "pass"
+    },
+    {
+      "name": "direct answer has no activity plan",
+      "status": "pass"
+    },
+    {
+      "name": "direct answer preserves streamed text",
+      "status": "pass"
+    },
+    {
+      "name": "backup uses the closed display-only three-stage plan",
+      "status": "pass"
+    },
+    {
+      "name": "backup reaches PendingAction without implicit confirmation",
+      "status": "pass"
+    },
+    {
+      "name": "pending cancellation removes both authority controls",
+      "status": "pass"
+    },
+    {
+      "name": "failed search closes remaining stages as skipped",
+      "status": "pass"
+    },
+    {
+      "name": "provider error is rendered through closed copy",
+      "status": "pass"
+    },
+    {
+      "name": "cancelled turn leaves no active caret",
+      "status": "pass"
+    },
+    {
+      "name": "activity cap accepts four and limits one over",
+      "status": "pass"
+    },
+    {
+      "name": "stage cap accepts 256 and limits one over",
+      "status": "pass"
+    },
+    {
+      "name": "result cap accepts 200 and limits one over",
+      "status": "pass"
+    },
+    {
+      "name": "terminal teardown erases reducer results and rejects stale events",
+      "status": "pass"
+    },
+    {
+      "name": "running counter regression remains rejected",
+      "status": "pass"
+    },
+    {
+      "name": "terminal counter regression closes with monotonic observed counters",
+      "status": "pass"
+    },
+    {
+      "name": "reduced motion preserves the full search plan",
+      "status": "pass"
+    },
+    {
+      "name": "reduced motion preserves all search results",
+      "status": "pass"
+    },
+    {
+      "name": "reduced motion preserves exact final text",
+      "status": "pass"
+    },
+    {
+      "name": "reduced motion disables decorative result animation",
+      "status": "pass"
+    },
+    {
+      "name": "compact layout has no horizontal page overflow",
+      "status": "pass"
+    },
+    {
+      "name": "compact labels and counters do not overlap",
+      "status": "pass"
+    },
+    {
+      "name": "terminal paths release stream renderer and token resources",
+      "status": "pass"
+    },
+    {
+      "name": "controlled renderer has no long task above 100 ms",
+      "status": "pass"
+    },
+    {
+      "name": "controlled renderer cumulative layout shift stays below 0.1",
+      "status": "pass"
+    },
+    {
+      "name": "browser emits no console or page errors",
+      "status": "pass"
+    },
+    {
+      "name": "browser emits no CSP violations",
+      "status": "pass"
+    },
+    {
+      "name": "browser has no unexpected failed or non-self request",
+      "status": "pass"
+    },
+    {
+      "name": "fixture has no missing routes or internal errors",
+      "status": "pass"
+    }
+  ],
+  "assertion_count": 45,
+  "console_error_count": 0,
+  "page_error_count": 0,
+  "csp_violation_count": 0,
+  "failed_request_count": 0,
+  "non_self_request_count": 0,
+  "performance": {
+    "token_events": 500,
+    "token_dom_writes": 31,
+    "long_task_count": 0,
+    "max_long_task_ms": 0,
+    "longest_task_start_ms": 0,
+    "long_tasks": [],
+    "marks_ms": {
+      "after_running_screenshot": 3236.9,
+      "result_50": 3291.8,
+      "terminal": 4417.4
+    },
+    "cumulative_layout_shift": 0.03145
+  },
+  "reducer_bounds": {
+    "stage_limit": 256,
+    "stage_over": "limited",
+    "activities": 4,
+    "activity_over": "limited",
+    "results": 200,
+    "result_over": "limited",
+    "terminal_results": 0,
+    "stale": "stale",
+    "post_terminal": 1,
+    "running_regression": "invalid",
+    "terminal_reconciled": "accept",
+    "reconciled_status": "complete",
+    "reconciled_scanned": 50,
+    "reconciled_hits": 4,
+    "reconciled_total": null,
+    "reconciled_diagnostic": 1
+  },
+  "screenshots": [
+    "desktop-running.png",
+    "desktop-terminal.png",
+    "mobile-terminal.png",
+    "reduced-motion.png"
+  ],
+  "scroll_probe": {
+    "top": 0,
+    "height": 765,
+    "client_height": 604,
+    "follow": false
+  },
+  "primary_stream": {
+    "text_length": 500,
+    "expected_text_length": 500,
+    "token_events": 500,
+    "token_dom_writes": 31
+  },
+  "reduced_motion": {
+    "text_length": 500,
+    "expected_text_length": 500,
+    "token_events": 500,
+    "token_dom_writes": 25
+  },
+  "failed_request_routes": [],
+  "expected_cancelled_request_count": 0,
+  "expected_terminal_close_count": 1
+}
