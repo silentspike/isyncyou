@@ -1,0 +1,44 @@
+{
+  "evidence_version": 1,
+  "generated_at": "2026-08-03T12:32:32Z",
+  "implementation_commit": "7464479a2228abcf90c4bc8fafe4a99b9a59ca30",
+  "state": "pass",
+  "artifact": {
+    "kind": "default_debug_apk",
+    "sha256": "ef89afef761c145d7bcdc013e6746511379f4236a91c8db6b990539fdf74af0c",
+    "default_features": true,
+    "test_hook_markers_present": false,
+    "experimental_subscription_marker_present": false
+  },
+  "build": {
+    "native_command": "env -u ISY_CARGO_FEATURES tools/build-android-native.sh",
+    "gradle_command": "cd android && env -u ISY_CARGO_FEATURES ./gradlew clean :app:assembleDebug",
+    "native_result": "pass",
+    "gradle_result": "pass"
+  },
+  "install": {
+    "mode": "adb_install_r",
+    "app_data_preserved": true,
+    "provider_ready": true,
+    "microsoft_365_connection_preserved": true
+  },
+  "physical_regression": {
+    "progressive_search": "pass",
+    "background_foreground": "pass",
+    "reduced_motion": "pass",
+    "scroll_follow": "pass",
+    "direct_turn": "pass",
+    "pending_cancel_without_mutation": "pass"
+  },
+  "cleanup": {
+    "playwright_session_closed": true,
+    "adb_debug_forward_removed": true,
+    "device_lock_released": true
+  },
+  "redaction": {
+    "device_serial_included": false,
+    "account_identity_included": false,
+    "oauth_data_included": false,
+    "raw_log_included": false
+  }
+}

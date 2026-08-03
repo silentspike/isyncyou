@@ -16278,7 +16278,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "renderAgentToolRow(row)",
             "renderAgentError(message)",
             "Invalid stream payload",
-            ".then(() => handleAgentEvent(d, turnState))",
+            "eventIngress = eventIngress",
+            ".then(async () => {",
+            "await handleAgentEvent(d, turnState);",
+            "await eventIngress;",
             "reason === \"pending_confirmation\"",
         ] {
             assert!(
@@ -16343,7 +16346,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .find("function normalizeAgentSource")
             .expect("citation helper start");
         let end = APP_JS
-            .find("function asstResultCard")
+            .find("const ASST_SERVICE_VISUAL")
             .expect("citation helper end");
         let citation_helpers = &APP_JS[start..end];
         assert!(
@@ -16365,9 +16368,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         for needle in [
             "case \"stage_progress\":",
             "case \"partial_result\":",
-            "const index = asst.results.findIndex(existing => existing.result_key === it.result_key);",
-            "if (index >= 0) asst.results[index] = it;",
-            "else asst.results.push(it);",
+            "function reduceAssistantActivity(previous, normalizedEvent)",
+            "const sourceKey = JSON.stringify([item.service, item.item_id]);",
+            "if (item.change === \"add\" && sourceResults.has(sourceKey))",
+            "results.set(resultKey, { ...item, activity_id: event.activity_id, stage: event.stage });",
         ] {
             assert!(APP_JS.contains(needle), "missing progressive reducer rule: {needle}");
         }
@@ -16377,11 +16381,13 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     #[test]
     fn assistant_baseline_rejects_unknown_progress_values() {
         for needle in [
-            "event.event !== \"stage_progress\"",
+            "if (event.event === \"stage_progress\")",
+            "if (event.event === \"partial_result\")",
             "!AGENT_PROGRESS_STAGES.includes(event.stage)",
             "!AGENT_PROGRESS_STATUS.has(event.status)",
-            "activity.stages.get(event.stage) !== \"running\"",
-            "return \"invalid\";",
+            "activity.stages.get(event.stage)?.status !== \"running\"",
+            "return null;",
+            "return assistantActivityDisposition(previous, \"invalid\", \"invalid_event\");",
         ] {
             assert!(
                 APP_JS.contains(needle),
@@ -16393,8 +16399,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     #[test]
     fn assistant_baseline_ignores_identical_partial_replay_and_rejects_conflict() {
         for needle in [
-            "protocol.partialDigests.get(replayKey) === digest ? \"replay\" : \"conflict\"",
-            "if (disposition === \"replay\") return false;",
+            "const same = previous.partialDigests.get(replayKey) === normalizedEvent.digest;",
+            "same ? \"replay\" : \"conflict\"",
+            "[\"replay\", \"dedupe\", \"limited\"].includes(disposition)",
             "Search progress could not be reconciled.",
         ] {
             assert!(APP_JS.contains(needle), "missing replay rule: {needle}");
@@ -16406,14 +16413,552 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         for needle in [
             "const AGENT_PROGRESS_MAX_ACTIVITIES = 4;",
             "const AGENT_PROGRESS_MAX_PARTIAL_UPDATES = 64;",
-            "if (protocol.activities.size >= AGENT_PROGRESS_MAX_ACTIVITIES)",
+            "if (previous.activities.size >= AGENT_PROGRESS_MAX_ACTIVITIES)",
             "activity.partialUpdates >= AGENT_PROGRESS_MAX_PARTIAL_UPDATES",
-            "activityProtocol.partialDigests.clear();",
-            "activityProtocol.activities.clear();",
+            "activities: new Map(), results: new Map(),",
+            "resultOrder: [], sourceResults: new Map(), partialDigests: new Map(),",
         ] {
             assert!(
                 APP_JS.contains(needle),
                 "missing bounded replay index rule: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn living_ui_reducer_accepts_only_matching_active_turn_events() {
+        for needle in [
+            "function sameAssistantActivityIdentity(left, right)",
+            "left.session_id === right.session_id",
+            "left.turn_request_id === right.turn_request_id",
+            "left.turn_id === right.turn_id",
+            "left.stream_id === right.stream_id",
+            "return assistantActivityDisposition(previous, \"stale\", \"stale_identity\");",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "missing activity identity rule: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn living_ui_reducer_requires_merged_activity_schema() {
+        for needle in [
+            "async function normalizeAssistantActivityEvent(identity, event)",
+            "event.schema_version !== 1",
+            "event.activity_kind !== \"archive_search\"",
+            "event.items.some(item => !validAgentPublicResult(item))",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "missing merged schema rule: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn living_ui_reducer_stage_transitions_are_monotonic() {
+        for needle in [
+            "event.scanned < previousStage.scanned",
+            "event.hits < previousStage.hits",
+            "event.total < previousStage.total",
+            "counterRegressed && !AGENT_PROGRESS_TERMINAL.has(event.status)",
+            "return assistantActivityDisposition(previous, \"invalid\", \"counter_regression\");",
+            "Math.max(event.scanned, previousStage.scanned)",
+            "Math.max(event.hits, previousStage.hits)",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "missing monotonic stage rule: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn living_ui_reducer_never_reopens_terminal_stage() {
+        assert!(APP_JS.contains(
+            "AGENT_PROGRESS_TERMINAL.has(previousStatus) && previousStatus !== event.status"
+        ));
+        assert!(APP_JS
+            .contains("assistantActivityDisposition(previous, \"invalid\", \"stage_reopen\")"));
+    }
+
+    #[test]
+    fn living_ui_reducer_rejects_counter_regression_and_unknown_enums() {
+        assert!(APP_JS.contains("!AGENT_PROGRESS_STAGES.includes(event.stage)"));
+        assert!(APP_JS.contains("!AGENT_PROGRESS_STATUS.has(event.status)"));
+        assert!(APP_JS.contains("counter_regression"));
+    }
+
+    #[test]
+    fn living_ui_reducer_reconciles_terminal_counter_regression_only() {
+        for needle in [
+            "counterRegressed && !AGENT_PROGRESS_TERMINAL.has(event.status)",
+            "const scanned = counterRegressed ? Math.max(event.scanned, previousStage.scanned)",
+            "const hits = counterRegressed ? Math.max(event.hits, previousStage.hits)",
+            "bumpAssistantActivityDiagnostic(previous, \"counter_regression\")",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "missing terminal reconciliation rule: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn living_ui_reducer_marks_partial_sequence_gap_for_reconciliation() {
+        assert!(APP_JS.contains("event.sequence > activity.nextSequence"));
+        assert!(APP_JS.contains("needsReconciliation: true"));
+    }
+
+    #[test]
+    fn living_ui_reducer_ignores_replayed_partial_sequence() {
+        assert!(APP_JS.contains("event.sequence < activity.nextSequence"));
+        assert!(APP_JS.contains("same ? \"replay\" : \"conflict\""));
+        assert!(APP_JS.contains("[\"replay\", \"dedupe\", \"limited\"].includes(disposition)"));
+    }
+
+    #[test]
+    fn living_ui_reducer_applies_add_then_enrich_without_reordering() {
+        assert!(APP_JS.contains("const resultOrder = previous.resultOrder.slice();"));
+        assert!(APP_JS.contains("if (item.change === \"enrich\" && !known)"));
+        assert!(APP_JS.contains("resultOrder.push(resultKey);"));
+    }
+
+    #[test]
+    fn living_ui_reducer_dedupes_results_by_source_identity() {
+        assert!(APP_JS.contains("const sourceKey = JSON.stringify([item.service, item.item_id]);"));
+        assert!(APP_JS
+            .contains("assistantActivityDisposition(previous, \"dedupe\", \"duplicate_source\")"));
+    }
+
+    #[test]
+    fn living_ui_reducer_keeps_terminal_events_after_detail_cap() {
+        let terminal = APP_JS
+            .find("normalizedEvent.kind === \"terminal\"")
+            .unwrap();
+        let stage_cap = APP_JS
+            .find("activity.stageUpdates >= AGENT_PROGRESS_MAX_STAGE_UPDATES")
+            .unwrap();
+        assert!(
+            terminal < stage_cap,
+            "terminal handling must precede detail caps"
+        );
+        assert!(APP_JS.contains("detailLimited: true"));
+    }
+
+    #[test]
+    fn living_ui_reducer_enforces_per_activity_and_per_turn_detail_caps() {
+        for needle in [
+            "const AGENT_PROGRESS_MAX_STAGE_UPDATES = 256;",
+            "const AGENT_PROGRESS_MAX_TURN_STAGE_UPDATES = 1024;",
+            "const AGENT_PROGRESS_MAX_PARTIAL_UPDATES = 64;",
+            "const AGENT_PROGRESS_MAX_TURN_PARTIAL_UPDATES = 256;",
+            "previous.acceptedStageUpdates >= AGENT_PROGRESS_MAX_TURN_STAGE_UPDATES",
+            "previous.acceptedPartialUpdates >= AGENT_PROGRESS_MAX_TURN_PARTIAL_UPDATES",
+            "acceptedStageUpdates: previous.acceptedStageUpdates + 1",
+            "acceptedPartialUpdates: previous.acceptedPartialUpdates + 1",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "missing bounded turn reducer rule: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn living_ui_reducer_rejects_private_search_fields() {
+        let normalizer = APP_JS
+            .split("async function normalizeAssistantActivityEvent")
+            .nth(1)
+            .unwrap()
+            .split("function reduceAssistantActivity")
+            .next()
+            .unwrap();
+        assert!(normalizer.contains("hasOnlyAgentKeys(event, allowed)"));
+        for private in [
+            "continuation",
+            "candidate",
+            "deep_context",
+            "query",
+            "account",
+        ] {
+            assert!(
+                !normalizer.contains(&format!("\"{private}\"")),
+                "private field accepted: {private}"
+            );
+        }
+    }
+
+    #[test]
+    fn living_ui_reducer_erases_state_on_turn_teardown() {
+        for needle in [
+            "function finishAssistantActivityState(protocol, identity, reason)",
+            "activities: new Map(), results: new Map(),",
+            "resultOrder: [], sourceResults: new Map(), partialDigests: new Map(),",
+            "terminalReason: normalizedEvent.reason",
+        ] {
+            assert!(APP_JS.contains(needle), "missing teardown rule: {needle}");
+        }
+    }
+
+    #[test]
+    fn living_ui_search_shows_complete_plan_from_first_activity_event() {
+        for needle in [
+            "Object.freeze({ id: \"names\", label: \"Names and subjects\" })",
+            "Object.freeze({ id: \"bodies\", label: \"Archived content\" })",
+            "Object.freeze({ id: \"deep\", label: \"Selected deep reads\" })",
+            "ASST_STAGE_CATALOG.forEach((definition) => {",
+            "const view = ensureActivity(activityId);",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "missing full search plan rule: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn living_ui_stage_rows_render_all_terminal_states_truthfully() {
+        for value in ["complete", "failed", "skipped", "cancelled"] {
+            assert!(
+                APP_JS.contains(&format!("{value}: \"")),
+                "missing stage state: {value}"
+            );
+            assert!(APP_CSS.contains(&format!(".asst-stage.{value}")) || value == "complete");
+        }
+        assert!(APP_JS.contains("row.dataset.agentStageStatus = state.status;"));
+        assert!(APP_JS.contains("ASSISTANT_STAGE_STATUS[stage.status]"));
+    }
+
+    #[test]
+    fn living_ui_unknown_total_never_renders_false_percentage() {
+        let summary = APP_JS
+            .split("function assistantStageStatusText")
+            .nth(1)
+            .unwrap()
+            .split("function createAssistantStageView")
+            .next()
+            .unwrap();
+        assert!(summary.contains("stage.total === null"));
+        assert!(summary.contains("`${stage.scanned} checked`"));
+        assert!(!summary.contains('%'));
+    }
+
+    #[test]
+    fn living_ui_results_use_text_nodes_and_existing_source_viewer() {
+        let renderer = APP_JS
+            .split("function createAssistantResultView")
+            .nth(1)
+            .unwrap()
+            .split("function agentCompactValue")
+            .next()
+            .unwrap();
+        assert!(renderer.contains("asstViewerFrame(viewQ)"));
+        assert!(renderer.contains("name.textContent ="));
+        assert!(renderer.contains("subtitle.textContent ="));
+        assert!(!renderer.contains("innerHTML"));
+        assert!(!renderer.contains("display_path)"));
+        assert!(APP_JS.contains("const AGENT_MAX_CITATIONS = 64;"));
+        assert!(APP_JS
+            .contains("added.forEach(source => citationsBox.append(renderAgentCitation(source)))"));
+    }
+
+    #[test]
+    fn living_ui_result_enrich_preserves_card_order() {
+        assert!(APP_JS.contains("pendingResultNodes.append(view.node);"));
+        assert!(APP_JS.contains("resultsHost.append(pendingResultNodes);"));
+        assert!(APP_JS.contains(
+            "} else if (renderedResults.get(key) !== result) {\n        view.update(result);"
+        ));
+        assert!(!APP_JS.contains("resultsBox.replaceChildren"));
+    }
+
+    #[test]
+    fn living_ui_new_state_expires_without_removing_result() {
+        assert!(APP_JS.contains("const ASST_RESULT_NEW_MS = 5000;"));
+        assert!(APP_JS.contains("setTimeout(() => {\n          view.clearNew();"));
+        assert!(APP_JS.contains("row.classList.remove(\"is-new\");"));
+        assert!(!APP_JS.contains("setTimeout(() => row.remove"));
+    }
+
+    #[test]
+    fn living_ui_backup_or_restore_uses_closed_display_only_plan() {
+        let adapter = APP_JS
+            .split("const ASSISTANT_OPERATION_PLANS")
+            .nth(1)
+            .unwrap()
+            .split("async function handleAgentEvent")
+            .next()
+            .unwrap();
+        assert!(adapter.contains("backup: Object.freeze"));
+        assert!(adapter.contains("\"restore-cloud\": Object.freeze"));
+        assert!(adapter.contains("\"Await confirmation\""));
+        assert!(!adapter.contains("postJson("));
+        assert!(!adapter.contains("request("));
+    }
+
+    #[test]
+    fn living_ui_single_step_turn_has_no_plan() {
+        let catalog = APP_JS
+            .split("const ASSISTANT_OPERATION_PLANS")
+            .nth(1)
+            .unwrap()
+            .split("function createAssistantOperationRenderer")
+            .next()
+            .unwrap();
+        for excluded in ["read:", "list:", "search:", "export:", "restore-local:"] {
+            assert!(
+                !catalog.contains(excluded),
+                "single-step action gained a plan: {excluded}"
+            );
+        }
+        assert!(catalog.contains("hasOwnProperty.call(ASSISTANT_OPERATION_PLANS, operation)"));
+    }
+
+    #[test]
+    fn living_ui_thinking_copy_contains_no_reasoning_or_raw_event_text() {
+        assert!(APP_JS.contains("text: \"Preparing\""));
+        assert!(APP_JS.contains("provider_started: \"Thinking\""));
+        assert!(!APP_JS
+            .contains("thinkingEl.querySelector(\".asst-thinking-label\").textContent = phase"));
+        assert!(!APP_JS.contains("chain of thought"));
+    }
+
+    #[test]
+    fn living_ui_pending_card_authority_and_terminal_controls_are_unchanged() {
+        for needle in [
+            "postJson(\"/api/v1/agent/confirm\"",
+            "token: record.token, action_hash: record.action_hash",
+            "postJson(\"/api/v1/agent/pending/cancel\"",
+            "action_hash: record.action_hash",
+            "done ? null : el(\"div\", { class: \"asst-pending-actions\" }",
+            "pending.onDisplayStatus = (status) => operationRenderer.onPendingStatus(status);",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "pending authority changed: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn living_ui_tokens_flush_once_per_frame_and_preserve_exact_text() {
+        let writer = APP_JS
+            .split("function createAssistantTokenWriter")
+            .nth(1)
+            .unwrap()
+            .split("let ASSISTANT_RENDER_SEQUENCE")
+            .next()
+            .unwrap();
+        for needle in [
+            "const textNode = document.createTextNode(message.text || \"\");",
+            "pending += delta;",
+            "committed += pending;",
+            "textNode.nodeValue = committed;",
+            "if (frame) return;",
+            "frame = requestAnimationFrame(flush);",
+        ] {
+            assert!(
+                writer.contains(needle),
+                "missing token batching invariant: {needle}"
+            );
+        }
+        assert_eq!(writer.matches("requestAnimationFrame(flush)").count(), 1);
+        assert!(!writer.contains("innerHTML"));
+        assert!(APP_JS.contains(
+            "if (changedResults > 0 && changedResults % 4 === 0) {\n        resultsHost.append(pendingResultNodes);"
+        ));
+        assert!(APP_JS.contains("if (eventIngressSinceYield >= 10)"));
+        assert!(APP_JS.contains("if (renderedStages.get(key) !== stage)"));
+        assert!(APP_JS.contains("const ASST_RESULT_ANIMATION_LIMIT = 16;"));
+        assert!(APP_JS.contains(
+            "createAssistantResultView(result, resultViews.size < ASST_RESULT_ANIMATION_LIMIT)"
+        ));
+        assert!(APP_CSS.contains("content-visibility: auto;"));
+        assert!(APP_CSS.contains("contain-intrinsic-size: auto 2.65rem;"));
+        assert!(APP_CSS.contains("height: min(24rem, 45vh);"));
+        assert!(APP_CSS.contains("contain: strict;"));
+        assert!(APP_JS.contains("resultsHost.hidden = resultViews.size === 0;"));
+        assert!(APP_JS.contains("Net.setWorkSuppressed(AssistantState.busy);"));
+        assert!(APP_JS.contains("!workSuppressed && elapsed >= FRAME_MS"));
+    }
+
+    #[test]
+    fn living_ui_terminal_flushes_pending_tokens_before_done() {
+        let done = APP_JS
+            .split("case \"done\": {")
+            .nth(1)
+            .unwrap()
+            .split("default:")
+            .next()
+            .unwrap();
+        let flush = done.find("turnState.flushTokens();").unwrap();
+        let terminal = done.find("turnState.message.doneReason = reason;").unwrap();
+        assert!(
+            flush < terminal,
+            "terminal state preceded the synchronous token flush"
+        );
+        assert!(APP_JS.contains(
+            "try { endedStream.close(); } catch (_) {}\n      }\n      await eventIngress;\n      const status = await reconcileRequestStatus();"
+        ));
+    }
+
+    #[test]
+    fn living_ui_terminal_settles_follow_position_before_stream_cleanup() {
+        assert!(APP_JS.contains("function settleAssistantAtEnd()"));
+        assert!(APP_JS
+            .contains("if (ASSISTANT_SCROLL_FRAME) cancelAnimationFrame(ASSISTANT_SCROLL_FRAME);"));
+        assert!(APP_JS.contains(
+            "clearThinking();\n    settleAssistantAtEnd();\n    if (AssistantState.activeStream === stream)"
+        ));
+    }
+
+    #[test]
+    fn living_ui_programmatic_scroll_does_not_disable_follow_mode() {
+        assert!(APP_JS.contains("function writeAssistantScrollToEnd(scroller)"));
+        assert!(APP_JS.contains("ASSISTANT_PROGRAMMATIC_SCROLLS += 1;"));
+        assert!(APP_JS.contains("if (ASSISTANT_PROGRAMMATIC_SCROLLS > 0) {"));
+        assert!(APP_JS.contains(
+            "ASSISTANT_PROGRAMMATIC_SCROLLS = Math.max(0, ASSISTANT_PROGRAMMATIC_SCROLLS - 1);"
+        ));
+        assert!(APP_JS
+            .contains("const intentListener = () => { ASSISTANT_PROGRAMMATIC_SCROLLS = 0; };"));
+        assert!(APP_JS.contains("[\"wheel\", \"touchstart\", \"pointerdown\", \"keydown\"]"));
+    }
+
+    #[test]
+    fn living_ui_caret_stops_on_pending_error_cancel_and_complete() {
+        let handler = APP_JS
+            .split("async function handleAgentEvent")
+            .nth(1)
+            .unwrap()
+            .split("function agentKeydown")
+            .next()
+            .unwrap();
+        for event in ["tool_call", "confirmation_required", "error", "done"] {
+            let branch = handler
+                .split(&format!("case \"{event}\""))
+                .nth(1)
+                .unwrap()
+                .split("case ")
+                .next()
+                .unwrap();
+            assert!(
+                branch.contains("turnState.stopTokenCaret();"),
+                "caret remains active for {event}"
+            );
+        }
+        assert!(APP_JS.contains("finish = (msg, terminalReason) => {\n    tokenWriter.flush();\n    tokenWriter.stopCaret();"));
+    }
+
+    #[test]
+    fn living_ui_autoscroll_stops_when_reader_leaves_bottom() {
+        for needle in [
+            "const ASSISTANT_FOLLOW_THRESHOLD_PX = 72;",
+            "AssistantState.followMode = assistantNearBottom(node);",
+            "if (!AssistantState.followMode) {",
+            "AssistantState.unseenContent = Math.min(ASSISTANT_UNSEEN_MAX",
+            "if (!AssistantState.followMode) return;",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "missing follow-mode invariant: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn living_ui_jump_to_latest_restores_follow_without_focus_loss() {
+        let jump = APP_JS
+            .split("function jumpAssistantToLatest")
+            .nth(1)
+            .unwrap()
+            .split("function teardownAssistantFollowController")
+            .next()
+            .unwrap();
+        assert!(jump.contains("AssistantState.followMode = true;"));
+        assert!(jump.contains("AssistantState.unseenContent = 0;"));
+        assert!(jump.contains("writeAssistantScrollToEnd(scroller);"));
+        assert!(!jump.contains(".focus("));
+        assert!(APP_JS.contains("\"data-agent-jump-latest\": \"1\""));
+        assert!(APP_CSS.contains(".assistant-jump-latest:focus-visible"));
+    }
+
+    #[test]
+    fn living_ui_reduced_motion_preserves_content_and_interaction() {
+        let reduced = APP_CSS
+            .rsplit("@media (prefers-reduced-motion: reduce)")
+            .next()
+            .unwrap();
+        for selector in [
+            ".asst-thinking-dot",
+            ".asst-stage-ic.is-running .icon",
+            ".asst-result.is-new",
+            ".asst-token-caret",
+        ] {
+            assert!(
+                reduced.contains(selector),
+                "reduced motion misses {selector}"
+            );
+        }
+        assert!(!reduced.contains("display: none"));
+        assert!(!reduced.contains("pointer-events: none"));
+        assert!(!APP_CSS.contains(".mdl-panel, .mdl-caret, .mdl.open .mdl-panel > *"));
+        assert!(APP_CSS.contains(".mdl.open .mdl-panel, .mdl.open .mdl-panel > *"));
+        assert!(APP_CSS.contains(".asst-citations {\n  display: flex;\n  flex-wrap: nowrap;"));
+    }
+
+    #[test]
+    fn living_ui_status_is_not_conveyed_by_color_alone() {
+        for needle in [
+            "queued: \"circle\", running: \"loader-circle\", complete: \"check\"",
+            "failed: \"triangle-alert\", skipped: \"minus\", cancelled: \"x\"",
+            "queued: \"Queued\", running: \"Running\", complete: \"Complete\"",
+            "failed: \"Failed\", skipped: \"Skipped\", cancelled: \"Cancelled\"",
+            "row.setAttribute(\"aria-label\", `${definition.label}: ${copy}`);",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "missing non-color status signal: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn living_ui_stream_updates_do_not_announce_every_token_or_move_focus() {
+        let writer = APP_JS
+            .split("function createAssistantTokenWriter")
+            .nth(1)
+            .unwrap()
+            .split("let ASSISTANT_RENDER_SEQUENCE")
+            .next()
+            .unwrap();
+        assert!(writer.contains("textElement.setAttribute(\"aria-live\", \"off\");"));
+        assert!(!writer.contains(".focus("));
+        let scroll = APP_JS
+            .split("function scrollAssistantToEnd")
+            .nth(1)
+            .unwrap()
+            .split("function renderAssistantJumpButton")
+            .next()
+            .unwrap();
+        assert!(!scroll.contains(".focus("));
+    }
+
+    #[test]
+    fn living_ui_long_labels_do_not_overlap_compact_or_mobile_layout() {
+        for needle in [
+            "grid-template-columns: 1.15rem minmax(0, 1fr) minmax(5.5rem, max-content)",
+            ".asst-stage-copy { display: flex; flex-direction: column; min-width: 0;",
+            ".asst-pending-title {\n  min-width: 0;\n  overflow-wrap: anywhere;",
+            "@media (max-width: 520px)",
+            ".asst-stage-n { grid-column: 2; min-width: 0; text-align: left; }",
+        ] {
+            assert!(
+                APP_CSS.contains(needle),
+                "missing compact-label constraint: {needle}"
             );
         }
     }
@@ -16471,12 +17016,12 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "action_hash: d.action_hash || \"\"",
             "postJson(\"/api/v1/agent/confirm\", CAP.agent, {",
             "postJson(\"/api/v1/agent/pending/cancel\", CAP.agent",
-            "record.status = \"confirming\"",
-            "record.status = \"confirmed\"",
-            "record.status = \"cancelling\"",
-            "record.status = \"cancelled\"",
-            "pending.status = \"expired\"",
-            "record.status = \"error\"",
+            "updateAgentPendingStatus(record, \"confirming\")",
+            "updateAgentPendingStatus(record, \"confirmed\")",
+            "updateAgentPendingStatus(record, \"cancelling\")",
+            "updateAgentPendingStatus(record, \"cancelled\")",
+            "updateAgentPendingStatus(pending, \"expired\")",
+            "updateAgentPendingStatus(record, \"error\")",
             "confirm.setAttribute(\"disabled\", \"disabled\")",
             "cancel.setAttribute(\"disabled\", \"disabled\")",
             "\"data-agent-pending-confirm\": \"1\"",
