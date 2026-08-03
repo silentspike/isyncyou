@@ -1,0 +1,3 @@
+invalid isyncyou tool call
+
+isyncyou tool — ops (M365 domain only): search {account, services?, query, limit?} · deep-search {account, services?, query, cursor?, max_reads?} · read {account, service, id, max_bytes?} · list {account, service, parent?, limit?, offset?} · export {account, service, id} · restore-local {account, service, id} · backup {account, services?} [confirm] · restore-cloud {account, service, id} [confirm] · live-write {account, service, target?, change} [confirm] · share {account, service, id, mode?, link_type?, scope?, recipients?, role?, recipient?} [confirm]. There is no shell/filesystem/OS/network op.

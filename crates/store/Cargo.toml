@@ -8,7 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, features = ["hooks"] }
 sha2 = "0.10"
 thiserror = { workspace = true }
 fs2 = "0.4"

@@ -6,6 +6,9 @@ pub enum AgentError {
     /// The caller cancelled the turn. No later provider/tool result may be committed.
     #[error("turn cancelled")]
     Cancelled,
+    /// The bounded public event stream rejected an event or disconnected.
+    #[error("turn stream unavailable")]
+    StreamUnavailable,
     /// A model tool call could not be parsed into a typed [`crate::ToolAction`].
     #[error("tool argument error: {0}")]
     ToolArgs(String),

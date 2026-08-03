@@ -1,0 +1,36 @@
+Issue #643 host gate summary
+Implementation commit: 65e96ddfe8cd05be62b2fae54b78ec5665cef882
+Pull request: 820
+
+Protected exact-head CI:
+PASS dev-checks: format, workspace Clippy, and workspace tests
+  run 30653902263, job 91233547837
+PASS coverage
+  run 30653902258, job 91233536191
+PASS windows-progressive-archive on windows-latest
+  run 30653902263, job 91233547887
+PASS cargo-deny, actionlint, Gitleaks, dependency review, JavaScript syntax,
+  language policy, requirements/evidence validation, Semgrep, and MSRV
+
+Exact-head closeout checks:
+PASS cargo-remote-fmt --check
+PASS cargo remote -c -- check -p isyncyou-core
+PASS cargo remote -c -- clippy -p isyncyou-core --all-targets -- -D warnings
+PASS node --check gui/webui/src/app.js
+PASS python3 -m unittest tools.test_agent_progressive_search_probe (8 tests)
+PASS python3 -m py_compile tools/*.py
+PASS python3 tools/check_traceability.py
+PASS npm ci (0 vulnerabilities)
+PASS node tools/agent-ui-smoke.mjs --out docs/evidence/artifacts/issue-643/ui-smoke (65 assertions)
+PASS git diff --check
+
+Feature boundaries:
+PASS daemon product graph includes isyncyou-agent/retrieval
+PASS mobile product inverse graph includes agent-oauth-providers, onedrive, and retrieval
+PASS daemon/mobile product graphs exclude agent-subscription-experimental
+
+Live desktop row:
+PASS managed release daemon from the implementation commit
+PASS official product Claude provider, progressive names -> bodies -> deep activity,
+  one resolvable controlled source, committed terminal state, and idempotent retry
+PASS evidence redaction and owned runtime cleanup

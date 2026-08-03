@@ -2,13 +2,20 @@ use base64::Engine as _;
 use isyncyou_agent::{
     new_ulid, parse_action, payload_digest, request_object_digest, select_provider_context,
     tool_result_digest, AgentCredentialStore, AssistantBlock, IdempotencyTombstoneV1,
-    LocalEffectCheckpointV1, NormalizedAssistantBlock, OneDriveSessionV2Transport, PairingPayload,
-    PendingOwnerBinding, PersistedLeaseBinding, ProviderAttemptBindingV1, ReadToolCheckpointV1,
-    RequestJournalV1, RequestPhase, RequestRouteDomain, RequestStepOutcomeV1, RequestStepRef,
-    RequestUuidBindingV1, SanitizedUsage, Secret, SecretClass, SessionCommitV1, SessionId,
-    SessionLeaseGuard, SessionObjectCrypto, SessionRecordKind, SessionRecordV2, SessionV2Error,
-    SessionV2Store, SessionV2Transport, SourceRef, ToolAction, TurnObserver, TurnTerminalStatus,
-    VersionedManifest, REQUEST_JOURNAL_VERSION, SESSION_RECORD_VERSION,
+    LocalEffectCheckpointV1, OneDriveSessionV2Transport, PairingPayload, PendingOwnerBinding,
+    PersistedLeaseBinding, PersistedNormalizedAssistantBlockV2, PersistedToolActionV2,
+    ProviderAttemptBindingV1, ReadToolCheckpointV2, RequestJournalV2, RequestPhase,
+    RequestRouteDomain, RequestStepOutcomeV2, RequestStepRef, RequestUuidBindingV1, SanitizedUsage,
+    Secret, SecretClass, SessionCommitV1, SessionId, SessionLeaseGuard, SessionObjectCrypto,
+    SessionRecordKind, SessionRecordV2, SessionV2Error, SessionV2Store, SessionV2Transport,
+    SourceRef, ToolAction, TurnObserver, TurnTerminalStatus, VersionedManifest,
+    READ_CHECKPOINT_V2_VERSION, REQUEST_JOURNAL_V2_VERSION, REQUEST_OUTCOME_V2_VERSION,
+    SESSION_RECORD_VERSION,
+};
+#[cfg(test)]
+use isyncyou_agent::{
+    NormalizedAssistantBlock, ReadToolCheckpointV1, RequestJournalV1, RequestStepOutcomeV1,
+    REQUEST_JOURNAL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -178,12 +185,27 @@ pub struct ProductTurnRuntime {
     intent_record_id: String,
     intent_record: SessionRecordV2,
     context_records: Vec<SessionRecordV2>,
-    journal: RequestJournalV1,
+    journal: RequestJournalV2,
     pending_request_objects: Vec<(String, Vec<u8>)>,
     seen_tool_use_ids: std::collections::BTreeSet<String>,
     provider_history: Vec<isyncyou_agent::Message>,
-    recovery_outcomes: Vec<RequestStepOutcomeV1>,
+    recovery_outcomes: Vec<RequestStepOutcomeV2>,
     sources: Vec<SourceRef>,
+    resolved_account_key: String,
+    admission_account_digest: [u8; 32],
+    provider_input_limit: usize,
+    progressive_authority: std::sync::Arc<isyncyou_agent::HmacProgressiveSearchAuthority>,
+}
+
+struct ProviderStepCompletion {
+    step_seq: u8,
+    normalized_blocks: Vec<PersistedNormalizedAssistantBlockV2>,
+    final_text: Option<String>,
+    assistant_sources: Vec<SourceRef>,
+    sanitized_usage: Option<SanitizedUsage>,
+    terminal_validation_error: Option<String>,
+    finalization: Option<isyncyou_agent::ProgressiveFinalizationV1>,
+    exit_state: Option<isyncyou_agent::ProgressiveExitStateV1>,
 }
 
 pub enum ProductTurnStart {
@@ -203,6 +225,7 @@ pub struct ProductTurnRequest<'a> {
     pub created_at_ms: u64,
     pub cached_context: Option<ProductSessionContextSnapshot>,
     pub context_budget: isyncyou_agent::ContextBudget,
+    pub provider_input_limit: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -229,6 +252,33 @@ enum CompletedRecoveryDisposition {
     Continue,
 }
 
+fn classify_completed_recovery_v2(
+    outcomes: &[RequestStepOutcomeV2],
+) -> CompletedRecoveryDisposition {
+    let Some(outcome) = outcomes.last() else {
+        return CompletedRecoveryDisposition::Continue;
+    };
+    if outcome.terminal_validation_error.as_deref()
+        == Some(isyncyou_agent::DUPLICATE_TOOL_USE_ID_CODE)
+    {
+        return CompletedRecoveryDisposition::Failed {
+            code: "assistant_tool_response_invalid",
+        };
+    }
+    if outcome
+        .normalized_blocks
+        .iter()
+        .all(|block| matches!(block, PersistedNormalizedAssistantBlockV2::Text { .. }))
+    {
+        return CompletedRecoveryDisposition::Final {
+            text: outcome.final_text.clone().unwrap_or_default(),
+            usage: outcome.sanitized_usage.clone(),
+        };
+    }
+    CompletedRecoveryDisposition::Continue
+}
+
+#[cfg(test)]
 fn classify_completed_recovery(outcomes: &[RequestStepOutcomeV1]) -> CompletedRecoveryDisposition {
     let Some(outcome) = outcomes.last() else {
         return CompletedRecoveryDisposition::Continue;
@@ -260,6 +310,22 @@ fn validate_provider_recovery_binding(
     recorded.revalidate(current).map_err(map_session_error)
 }
 
+fn legacy_chain_contains_deep_search(
+    outcomes: &[isyncyou_agent::LegacyRequestStepOutcomeV1],
+) -> bool {
+    outcomes.iter().any(|outcome| {
+        outcome.normalized_blocks.iter().any(|block| {
+            matches!(
+                block,
+                isyncyou_agent::LegacyNormalizedAssistantBlockV1::ToolUse {
+                    action: isyncyou_agent::LegacyToolActionV1::DeepSearch { .. },
+                    ..
+                }
+            )
+        })
+    })
+}
+
 fn sanitize_provider_usage(usage: Option<&isyncyou_agent::Usage>) -> Option<SanitizedUsage> {
     usage.map(|usage| SanitizedUsage {
         input_tokens: usage.input_tokens,
@@ -288,6 +354,7 @@ fn terminal_compaction_due_at(
             .is_some_and(|eligible_at_ms| server_now_ms >= eligible_at_ms)
 }
 
+#[cfg(test)]
 fn record_ambiguous_provider_step<T>(
     store: &SessionV2Store<T>,
     current: VersionedManifest,
@@ -300,9 +367,65 @@ fn record_ambiguous_provider_step<T>(
 where
     T: SessionV2Transport + Clone + 'static,
 {
-    if journal.phase != RequestPhase::ProviderStepStarted
-        || journal.request_id != request_binding.request_id
-        || journal.turn_id != intent_record.turn_id
+    record_ambiguous_provider_step_fields(
+        store,
+        current,
+        holder_binding,
+        request_binding,
+        intent_record,
+        &journal.session_id,
+        &journal.request_id,
+        &journal.turn_id,
+        journal.phase,
+        created_at_ms,
+    )
+}
+
+fn record_ambiguous_provider_step_v2<T>(
+    store: &SessionV2Store<T>,
+    current: VersionedManifest,
+    holder_binding: &str,
+    request_binding: &RequestUuidBindingV1,
+    intent_record: &SessionRecordV2,
+    journal: &RequestJournalV2,
+    created_at_ms: u64,
+) -> Result<(), String>
+where
+    T: SessionV2Transport + Clone + 'static,
+{
+    record_ambiguous_provider_step_fields(
+        store,
+        current,
+        holder_binding,
+        request_binding,
+        intent_record,
+        &journal.session_id,
+        &journal.request_id,
+        &journal.turn_id,
+        journal.phase,
+        created_at_ms,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_ambiguous_provider_step_fields<T>(
+    store: &SessionV2Store<T>,
+    current: VersionedManifest,
+    holder_binding: &str,
+    request_binding: &RequestUuidBindingV1,
+    intent_record: &SessionRecordV2,
+    session_id: &str,
+    request_id: &str,
+    turn_id: &str,
+    phase: RequestPhase,
+    created_at_ms: u64,
+) -> Result<(), String>
+where
+    T: SessionV2Transport + Clone + 'static,
+{
+    if phase != RequestPhase::ProviderStepStarted
+        || request_id != request_binding.request_id
+        || turn_id != intent_record.turn_id
         || intent_record.request_id != request_binding.request_id
     {
         return Err("session_store_unavailable".into());
@@ -315,9 +438,9 @@ where
     let terminal_record = SessionRecordV2 {
         record_version: SESSION_RECORD_VERSION,
         record_id: new_ulid().map_err(|_| "session_store_unavailable")?,
-        session_id: journal.session_id.clone(),
-        request_id: journal.request_id.clone(),
-        turn_id: journal.turn_id.clone(),
+        session_id: session_id.to_owned(),
+        request_id: request_id.to_owned(),
+        turn_id: turn_id.to_owned(),
         kind: SessionRecordKind::TurnTerminal {
             status: TurnTerminalStatus::OutcomeUnknown,
             error_code: Some("turn_outcome_unknown".into()),
@@ -347,7 +470,7 @@ where
             .collect(),
     };
     guard
-        .publish_terminal(visible_records, &journal.request_id, tombstone)
+        .publish_terminal(visible_records, request_id, tombstone)
         .map_err(map_session_error)?;
     guard.release().map_err(map_session_error)?;
     Ok(())
@@ -370,7 +493,7 @@ impl ProductTurnRuntime {
         let mut history = self.provider_history.clone();
         history.push(isyncyou_agent::Message::user(prompt));
         let outcomes = self.recovery_outcomes.clone();
-        recover_provider_messages_runtime(&mut history, &outcomes, self, executor)?;
+        recover_provider_messages_runtime_v2(&mut history, &outcomes, self, executor)?;
         Ok(history)
     }
 
@@ -385,17 +508,23 @@ impl ProductTurnRuntime {
 
     fn persist_provider_step_outcome(
         &mut self,
-        step_seq: u8,
-        normalized_blocks: Vec<NormalizedAssistantBlock>,
-        final_text: Option<String>,
-        sanitized_usage: Option<SanitizedUsage>,
-        terminal_validation_error: Option<String>,
+        completion: ProviderStepCompletion,
     ) -> Result<(), isyncyou_agent::AgentError> {
+        let ProviderStepCompletion {
+            step_seq,
+            normalized_blocks,
+            final_text,
+            assistant_sources,
+            sanitized_usage,
+            terminal_validation_error,
+            finalization,
+            exit_state,
+        } = completion;
         let outcome_id = new_ulid().map_err(|_| {
             isyncyou_agent::AgentError::Provider("session_store_unavailable".into())
         })?;
-        let outcome = RequestStepOutcomeV1 {
-            outcome_version: 1,
+        let outcome = RequestStepOutcomeV2 {
+            outcome_version: REQUEST_OUTCOME_V2_VERSION,
             outcome_id: outcome_id.clone(),
             step_seq,
             previous_outcome_id: self
@@ -407,8 +536,10 @@ impl ProductTurnRuntime {
             model: self.provider_binding.model.clone(),
             normalized_blocks,
             final_text,
+            assistant_sources,
             sanitized_usage,
             terminal_validation_error,
+            finalization,
             outcome_digest: String::new(),
         }
         .seal_digest()
@@ -428,6 +559,9 @@ impl ProductTurnRuntime {
             .checked_add(1)
             .ok_or_else(|| isyncyou_agent::AgentError::Provider("turn_step_invalid".into()))?;
         self.journal.phase = RequestPhase::ProviderStepCompleted;
+        if let Some(exit_state) = exit_state {
+            self.journal.progressive_exit = Some(exit_state);
+        }
         let journal_id = new_ulid().map_err(|_| {
             isyncyou_agent::AgentError::Provider("session_store_unavailable".into())
         })?;
@@ -445,10 +579,11 @@ impl ProductTurnRuntime {
 
     pub fn finish_final(
         mut self,
-        text: String,
+        completion: isyncyou_agent::TurnCompletionV2,
         usage: Option<SanitizedUsage>,
         created_at_ms: u64,
     ) -> Result<ProductSessionContextSnapshot, String> {
+        self.sources = completion.assistant_sources;
         let assistant_id = new_ulid().map_err(|_| "session_store_unavailable")?;
         let terminal_id = new_ulid().map_err(|_| "session_store_unavailable")?;
         let lease = self.guard.binding().map_err(map_session_error)?;
@@ -464,7 +599,7 @@ impl ProductTurnRuntime {
                 request_id: self.request_id.clone(),
                 turn_id: self.turn_id.clone(),
                 kind: SessionRecordKind::AssistantResult {
-                    text,
+                    text: completion.final_text,
                     sources: self.sources.clone(),
                     usage,
                 },
@@ -656,7 +791,185 @@ impl ProductTurnRuntime {
     }
 }
 
-trait RecoveryRuntimeState {
+fn recover_provider_messages_runtime_v2(
+    history: &mut Vec<isyncyou_agent::Message>,
+    outcomes: &[RequestStepOutcomeV2],
+    runtime: &mut ProductTurnRuntime,
+    executor: &dyn isyncyou_agent::ToolExecutor,
+) -> Result<(), isyncyou_agent::AgentError> {
+    let cancellation = isyncyou_agent::CancellationToken::default();
+    let committed_tokens = history
+        .iter()
+        .map(|message| message.content.len())
+        .sum::<usize>();
+    let mut input_budget = isyncyou_agent::ProviderInputBudgetV1::new(
+        None,
+        runtime.provider_input_limit,
+        committed_tokens,
+    );
+    let mut discard_recovery_event = |_event: isyncyou_agent::StreamEvent| {};
+
+    for outcome in outcomes {
+        if outcome.terminal_validation_error.is_some() {
+            return Err(isyncyou_agent::AgentError::Provider(
+                isyncyou_agent::DUPLICATE_TOOL_USE_ID_CODE.into(),
+            ));
+        }
+        let mut text = String::new();
+        let mut tool_uses = Vec::new();
+        for block in &outcome.normalized_blocks {
+            match block {
+                PersistedNormalizedAssistantBlockV2::Text { text: block_text } => {
+                    text.push_str(block_text);
+                }
+                PersistedNormalizedAssistantBlockV2::ToolUse {
+                    tool_use_id,
+                    action,
+                } => {
+                    let action = action.to_runtime().map_err(|_| {
+                        isyncyou_agent::AgentError::Provider("turn_outcome_unknown".into())
+                    })?;
+                    tool_uses.push(isyncyou_agent::ToolUseRef {
+                        id: tool_use_id.clone(),
+                        input: serde_json::to_value(action).map_err(|_| {
+                            isyncyou_agent::AgentError::Provider("turn_outcome_unknown".into())
+                        })?,
+                    });
+                }
+                PersistedNormalizedAssistantBlockV2::RejectedToolUse { tool_use_id, .. } => {
+                    tool_uses.push(isyncyou_agent::ToolUseRef {
+                        id: tool_use_id.clone(),
+                        input: serde_json::json!({}),
+                    });
+                }
+            }
+        }
+        history.push(isyncyou_agent::Message::assistant(text, tool_uses));
+
+        for block in &outcome.normalized_blocks {
+            match block {
+                PersistedNormalizedAssistantBlockV2::Text { .. } => {}
+                PersistedNormalizedAssistantBlockV2::RejectedToolUse { tool_use_id, .. } => {
+                    let help = block.recover_rejected_tool_help().map_err(|_| {
+                        isyncyou_agent::AgentError::Provider("turn_outcome_unknown".into())
+                    })?;
+                    history.push(isyncyou_agent::Message::tool(
+                        tool_use_id.clone(),
+                        help.ok_or_else(|| {
+                            isyncyou_agent::AgentError::Provider("turn_outcome_unknown".into())
+                        })?,
+                    ));
+                }
+                PersistedNormalizedAssistantBlockV2::ToolUse {
+                    tool_use_id,
+                    action: persisted_action,
+                } => {
+                    let action = persisted_action.to_runtime().map_err(|_| {
+                        isyncyou_agent::AgentError::Provider("turn_outcome_unknown".into())
+                    })?;
+                    let binding = isyncyou_agent::ReadExecutionBinding {
+                        session_id: runtime.session_id.clone(),
+                        request_id: runtime.request_id.clone(),
+                        tool_use_id: tool_use_id.clone(),
+                        resolved_account_key: runtime.resolved_account_key.clone(),
+                        admission_account_digest: runtime.admission_account_digest,
+                    };
+                    let checkpoint = runtime
+                        .journal
+                        .read_checkpoints
+                        .iter()
+                        .find(|checkpoint| {
+                            checkpoint.provider_step_seq == outcome.step_seq
+                                && checkpoint.tool_use_id == *tool_use_id
+                                && checkpoint.action == *persisted_action
+                        })
+                        .cloned();
+                    let checkpoint = if let Some(checkpoint) = checkpoint {
+                        checkpoint
+                    } else {
+                        if action.recovery_policy() == isyncyou_agent::RecoveryPolicy::NeverRepeat {
+                            return Err(isyncyou_agent::AgentError::Provider(
+                                "turn_outcome_unknown".into(),
+                            ));
+                        }
+                        let local_effect = executor.prepare_read_effect(&action, &binding)?;
+                        runtime.read_tool_started(
+                            outcome.step_seq,
+                            tool_use_id,
+                            &action,
+                            local_effect.as_ref(),
+                        )?;
+                        runtime
+                            .journal
+                            .read_checkpoints
+                            .iter()
+                            .find(|checkpoint| {
+                                checkpoint.provider_step_seq == outcome.step_seq
+                                    && checkpoint.tool_use_id == *tool_use_id
+                                    && checkpoint.action == *persisted_action
+                            })
+                            .cloned()
+                            .ok_or_else(|| {
+                                isyncyou_agent::AgentError::Provider("turn_outcome_unknown".into())
+                            })?
+                    };
+                    if checkpoint.policy == isyncyou_agent::RecoveryPolicy::NeverRepeat {
+                        return Err(isyncyou_agent::AgentError::Provider(
+                            "turn_outcome_unknown".into(),
+                        ));
+                    }
+                    let output = executor.execute_read_with_context(
+                        &action,
+                        isyncyou_agent::ReadExecutionContext {
+                            binding: &binding,
+                            local_effect: checkpoint.local_effect.as_ref(),
+                            mode: isyncyou_agent::ReadExecutionMode::RecoveryCompare,
+                            provider_step_seq: outcome.step_seq,
+                            provider_steps_remaining_after_current:
+                                isyncyou_agent::MAX_PROVIDER_STEPS
+                                    .saturating_sub(outcome.step_seq.saturating_add(1)),
+                            input_budget: &mut input_budget,
+                            cancellation: &cancellation,
+                            events: &mut discard_recovery_event,
+                            progressive_authority: Some(runtime.progressive_authority.as_ref()),
+                        },
+                    )?;
+                    let completion = output.into_completion(&action)?;
+                    if !checkpoint.result_sha256.is_empty()
+                        && (tool_result_digest(completion.provider_content.as_bytes())
+                            != checkpoint.result_sha256
+                            || completion.assistant_sources != checkpoint.assistant_sources)
+                    {
+                        return Err(isyncyou_agent::AgentError::Provider(
+                            "turn_outcome_unknown".into(),
+                        ));
+                    }
+                    runtime.read_tool_completed(
+                        outcome.step_seq,
+                        tool_use_id,
+                        &action,
+                        &completion,
+                    )?;
+                    for source in &completion.assistant_sources {
+                        if !runtime.sources.contains(source)
+                            && runtime.sources.len() < isyncyou_agent::MAX_SOURCE_REFS
+                        {
+                            runtime.sources.push(source.clone());
+                        }
+                    }
+                    history.push(isyncyou_agent::Message::tool(
+                        tool_use_id.clone(),
+                        completion.provider_content,
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+trait LegacyRecoveryRuntimeState {
     fn recovery_journal(&self) -> &RequestJournalV1;
     fn recovery_sources_mut(&mut self) -> &mut Vec<SourceRef>;
     fn persist_read_started(
@@ -675,37 +988,8 @@ trait RecoveryRuntimeState {
     ) -> Result<(), isyncyou_agent::AgentError>;
 }
 
-impl RecoveryRuntimeState for ProductTurnRuntime {
-    fn recovery_journal(&self) -> &RequestJournalV1 {
-        &self.journal
-    }
-
-    fn recovery_sources_mut(&mut self) -> &mut Vec<SourceRef> {
-        &mut self.sources
-    }
-
-    fn persist_read_started(
-        &mut self,
-        step_seq: u8,
-        tool_use_id: &str,
-        action: &ToolAction,
-        local_effect: Option<&LocalEffectCheckpointV1>,
-    ) -> Result<(), isyncyou_agent::AgentError> {
-        self.read_tool_started(step_seq, tool_use_id, action, local_effect)
-    }
-
-    fn persist_read_completed(
-        &mut self,
-        step_seq: u8,
-        tool_use_id: &str,
-        action: &ToolAction,
-        result: &str,
-    ) -> Result<(), isyncyou_agent::AgentError> {
-        self.read_tool_completed(step_seq, tool_use_id, action, result)
-    }
-}
-
-fn recover_provider_messages_runtime<R: RecoveryRuntimeState>(
+#[cfg(test)]
+fn recover_provider_messages_runtime_v1<R: LegacyRecoveryRuntimeState>(
     history: &mut Vec<isyncyou_agent::Message>,
     outcomes: &[RequestStepOutcomeV1],
     runtime: &mut R,
@@ -764,6 +1048,10 @@ fn recover_provider_messages_runtime<R: RecoveryRuntimeState>(
                         session_id: runtime.recovery_journal().session_id.clone(),
                         request_id: runtime.recovery_journal().request_id.clone(),
                         tool_use_id: tool_use_id.clone(),
+                        resolved_account_key: action.account().to_owned(),
+                        admission_account_digest: isyncyou_agent::admission_account_digest(
+                            action.account(),
+                        )?,
                     };
                     if !runtime
                         .recovery_journal()
@@ -846,7 +1134,7 @@ fn recover_provider_messages(
         sources: &'a mut Vec<SourceRef>,
     }
 
-    impl RecoveryRuntimeState for TestRecoveryRuntime<'_> {
+    impl LegacyRecoveryRuntimeState for TestRecoveryRuntime<'_> {
         fn recovery_journal(&self) -> &RequestJournalV1 {
             &self.journal
         }
@@ -903,7 +1191,7 @@ fn recover_provider_messages(
         journal: journal.clone(),
         sources,
     };
-    recover_provider_messages_runtime(history, outcomes, &mut runtime, executor)
+    recover_provider_messages_runtime_v1(history, outcomes, &mut runtime, executor)
 }
 
 impl TurnObserver for ProductTurnRuntime {
@@ -919,7 +1207,19 @@ impl TurnObserver for ProductTurnRuntime {
             session_id: self.session_id.clone(),
             request_id: self.request_id.clone(),
             tool_use_id: tool_use_id.to_owned(),
+            resolved_account_key: self.resolved_account_key.clone(),
+            admission_account_digest: self.admission_account_digest,
         })
+    }
+
+    fn progressive_authority(
+        &self,
+    ) -> Option<std::sync::Arc<dyn isyncyou_agent::ProgressiveSearchAuthority>> {
+        Some(self.progressive_authority.clone())
+    }
+
+    fn provider_input_limit(&self) -> usize {
+        self.provider_input_limit
     }
 
     fn provider_step_started(&mut self, step_seq: u8) -> Result<(), isyncyou_agent::AgentError> {
@@ -938,6 +1238,8 @@ impl TurnObserver for ProductTurnRuntime {
         step_seq: u8,
         blocks: &[AssistantBlock],
         usage: Option<&isyncyou_agent::Usage>,
+        completion: Option<&isyncyou_agent::TurnCompletionV2>,
+        exit_state: Option<&isyncyou_agent::ProgressiveExitStateV1>,
     ) -> Result<(), isyncyou_agent::AgentError> {
         if step_seq != self.journal.next_step_seq {
             return Err(isyncyou_agent::AgentError::Provider(
@@ -958,13 +1260,16 @@ impl TurnObserver for ProductTurnRuntime {
                     || !step_tool_use_ids.insert(id.clone())
             });
         if invalid_tool_use_id {
-            self.persist_provider_step_outcome(
+            self.persist_provider_step_outcome(ProviderStepCompletion {
                 step_seq,
-                Vec::new(),
-                None,
-                sanitize_provider_usage(usage),
-                Some(isyncyou_agent::DUPLICATE_TOOL_USE_ID_CODE.into()),
-            )?;
+                normalized_blocks: Vec::new(),
+                final_text: None,
+                assistant_sources: Vec::new(),
+                sanitized_usage: sanitize_provider_usage(usage),
+                terminal_validation_error: Some(isyncyou_agent::DUPLICATE_TOOL_USE_ID_CODE.into()),
+                finalization: None,
+                exit_state: exit_state.cloned(),
+            })?;
             return Err(isyncyou_agent::AgentError::Provider(
                 isyncyou_agent::DUPLICATE_TOOL_USE_ID_CODE.into(),
             ));
@@ -976,33 +1281,49 @@ impl TurnObserver for ProductTurnRuntime {
             match block {
                 AssistantBlock::Text(text) => {
                     final_text.push_str(text);
-                    normalized_blocks.push(NormalizedAssistantBlock::Text { text: text.clone() });
+                    normalized_blocks
+                        .push(PersistedNormalizedAssistantBlockV2::Text { text: text.clone() });
                 }
                 AssistantBlock::ToolUse { id, input } => match parse_action(input) {
-                    Ok(action) => normalized_blocks.push(NormalizedAssistantBlock::ToolUse {
-                        tool_use_id: id.clone(),
-                        action,
-                    }),
-                    Err(help) => {
-                        normalized_blocks.push(NormalizedAssistantBlock::RejectedToolUse {
+                    Ok(action) => {
+                        normalized_blocks.push(PersistedNormalizedAssistantBlockV2::ToolUse {
+                            tool_use_id: id.clone(),
+                            action: PersistedToolActionV2::from_runtime(&action).map_err(
+                                |error| isyncyou_agent::AgentError::Provider(error.to_string()),
+                            )?,
+                        })
+                    }
+                    Err(help) => normalized_blocks.push(
+                        PersistedNormalizedAssistantBlockV2::RejectedToolUse {
                             tool_use_id: id.clone(),
                             stable_error_code: isyncyou_agent::tool::INVALID_TOOL_ARGUMENTS_CODE
                                 .into(),
                             help_schema_version:
                                 isyncyou_agent::tool::REJECTED_TOOL_HELP_SCHEMA_VERSION,
                             help_digest: tool_result_digest(help.as_bytes()),
-                        })
-                    }
+                        },
+                    ),
                 },
             }
         }
-        self.persist_provider_step_outcome(
+        let final_text = completion
+            .map(|completion| completion.final_text.clone())
+            .or_else(|| (!final_text.is_empty()).then_some(final_text));
+        let assistant_sources = completion
+            .map(|completion| completion.assistant_sources.clone())
+            .unwrap_or_default();
+        let finalization =
+            completion.and_then(|completion| completion.progressive_finalization.clone());
+        self.persist_provider_step_outcome(ProviderStepCompletion {
             step_seq,
             normalized_blocks,
-            (!final_text.is_empty()).then_some(final_text),
-            sanitize_provider_usage(usage),
-            None,
-        )
+            final_text,
+            assistant_sources,
+            sanitized_usage: sanitize_provider_usage(usage),
+            terminal_validation_error: None,
+            finalization,
+            exit_state: exit_state.cloned(),
+        })
     }
 
     fn read_tool_started(
@@ -1025,12 +1346,15 @@ impl TurnObserver for ProductTurnRuntime {
                 "turn_outcome_unknown".into(),
             ));
         }
-        self.journal.read_checkpoints.push(ReadToolCheckpointV1 {
+        self.journal.read_checkpoints.push(ReadToolCheckpointV2 {
+            checkpoint_version: READ_CHECKPOINT_V2_VERSION,
             provider_step_seq: step_seq,
             tool_use_id: tool_use_id.to_owned(),
-            action: action.clone(),
+            action: PersistedToolActionV2::from_runtime(action)
+                .map_err(|error| isyncyou_agent::AgentError::Provider(error.to_string()))?,
             policy,
             result_sha256: String::new(),
+            assistant_sources: Vec::new(),
             local_effect: local_effect.cloned(),
         });
         self.publish_journal()
@@ -1042,7 +1366,7 @@ impl TurnObserver for ProductTurnRuntime {
         step_seq: u8,
         tool_use_id: &str,
         action: &ToolAction,
-        result: &str,
+        completion: &isyncyou_agent::ReadCompletionV2,
     ) -> Result<(), isyncyou_agent::AgentError> {
         let checkpoint = self
             .journal
@@ -1053,21 +1377,42 @@ impl TurnObserver for ProductTurnRuntime {
                 checkpoint.provider_step_seq == step_seq && checkpoint.tool_use_id == tool_use_id
             })
             .ok_or_else(|| isyncyou_agent::AgentError::Provider("turn_outcome_unknown".into()))?;
-        if checkpoint.action != *action || checkpoint.policy != action.recovery_policy() {
+        let persisted_action = PersistedToolActionV2::from_runtime(action)
+            .map_err(|error| isyncyou_agent::AgentError::Provider(error.to_string()))?;
+        if checkpoint.action != persisted_action || checkpoint.policy != action.recovery_policy() {
             return Err(isyncyou_agent::AgentError::Provider(
                 "turn_outcome_unknown".into(),
             ));
         }
-        checkpoint.result_sha256 = tool_result_digest(result.as_bytes());
+        checkpoint.result_sha256 = tool_result_digest(completion.provider_content.as_bytes());
+        checkpoint.assistant_sources = completion.assistant_sources.clone();
         if let Some(local_effect) = &mut checkpoint.local_effect {
             local_effect.state = isyncyou_agent::LocalEffectState::Committed;
         }
-        collect_source_refs(result, &mut self.sources);
+        for source in &completion.assistant_sources {
+            if !self.sources.contains(source)
+                && self.sources.len() < isyncyou_agent::MAX_SOURCE_REFS
+            {
+                self.sources.push(source.clone());
+            }
+        }
         self.publish_journal().map_err(|_| {
             // The read or deterministic local materialization already completed. A failed or
             // ambiguous checkpoint publication must never be flattened into an ordinary error.
             isyncyou_agent::AgentError::Provider("turn_outcome_unknown".into())
         })
+    }
+
+    fn turn_finalized(
+        &mut self,
+        output: &isyncyou_agent::TurnExitOutputV1,
+    ) -> Result<(), isyncyou_agent::AgentError> {
+        if self.journal.progressive_exit.as_ref() == Some(&output.exit_state) {
+            return Ok(());
+        }
+        self.journal.progressive_exit = Some(output.exit_state.clone());
+        self.publish_journal()
+            .map_err(isyncyou_agent::AgentError::Provider)
     }
 }
 
@@ -1709,6 +2054,7 @@ impl<'a> ProductSessionRegistry<'a> {
             created_at_ms,
             cached_context,
             context_budget,
+            provider_input_limit,
         } = request;
         // This runs only in the admission worker. The route has already returned
         // the deterministic turn ID, so Graph manifest creation cannot delay the
@@ -1742,6 +2088,26 @@ impl<'a> ProductSessionRegistry<'a> {
             payload_digest(&(session_id, local_account, prompt)).map_err(map_session_error)?,
         )
         .map_err(map_session_error)?;
+        let admission_account_digest = isyncyou_agent::admission_account_digest(local_account)
+            .map_err(|_| "session_store_unavailable".to_string())?;
+        let mut progressive_root_message =
+            Vec::with_capacity(session_id.len() + request_id.len() + 4);
+        for component in [session_id.as_bytes(), request_id.as_bytes()] {
+            let length = u16::try_from(component.len())
+                .map_err(|_| "session_store_unavailable".to_string())?;
+            progressive_root_message.extend_from_slice(&length.to_be_bytes());
+            progressive_root_message.extend_from_slice(component);
+        }
+        let progressive_root = self
+            .store
+            .domain_hmac(
+                b"isyncyou-progressive-search-root/v1",
+                &progressive_root_message,
+            )
+            .map_err(|_| "session_store_unavailable".to_string())?;
+        let progressive_authority = std::sync::Arc::new(
+            isyncyou_agent::HmacProgressiveSearchAuthority::new(progressive_root),
+        );
         if let Some(replay) = store
             .request_replay_from_manifest(&current, &request_binding)
             .map_err(map_session_error)?
@@ -1772,9 +2138,38 @@ impl<'a> ProductSessionRegistry<'a> {
                     error_code,
                 }));
             }
-            let journal = replay
-                .journal
-                .ok_or_else(|| "session_store_unavailable".to_string())?;
+            let journal = if let Some(journal) = replay.journal_v2 {
+                journal
+            } else if let Some(legacy_journal) = replay.legacy_journal {
+                if legacy_chain_contains_deep_search(&replay.legacy_outcomes) {
+                    return Ok(ProductTurnStart::Replay(ProductTurnReplay {
+                        phase: RequestPhase::OutcomeUnknown,
+                        final_text,
+                        error_code: Some("turn_outcome_unknown".into()),
+                    }));
+                }
+                validate_provider_recovery_binding(
+                    &legacy_journal.provider_binding,
+                    &provider_binding,
+                )?;
+                return Ok(ProductTurnStart::Replay(ProductTurnReplay {
+                    phase: RequestPhase::Failed,
+                    final_text,
+                    error_code: Some("provider_generation_changed".into()),
+                }));
+            } else if let Some(legacy_journal) = replay.journal {
+                validate_provider_recovery_binding(
+                    &legacy_journal.provider_binding,
+                    &provider_binding,
+                )?;
+                return Ok(ProductTurnStart::Replay(ProductTurnReplay {
+                    phase: RequestPhase::Failed,
+                    final_text,
+                    error_code: Some("provider_generation_changed".into()),
+                }));
+            } else {
+                return Err("session_store_unavailable".into());
+            };
             validate_provider_recovery_binding(&journal.provider_binding, &provider_binding)?;
             if journal.phase.permits_automatic_resume() {
                 let lease_id = new_ulid().map_err(|_| "session_store_unavailable")?;
@@ -1804,25 +2199,46 @@ impl<'a> ProductSessionRegistry<'a> {
                     journal: journal.clone(),
                     pending_request_objects: Vec::new(),
                     seen_tool_use_ids: replay
-                        .outcomes
+                        .outcomes_v2
                         .iter()
                         .flat_map(|outcome| &outcome.normalized_blocks)
                         .filter_map(|block| match block {
-                            NormalizedAssistantBlock::ToolUse { tool_use_id, .. }
-                            | NormalizedAssistantBlock::RejectedToolUse { tool_use_id, .. } => {
-                                Some(tool_use_id.clone())
+                            PersistedNormalizedAssistantBlockV2::ToolUse {
+                                tool_use_id, ..
                             }
-                            NormalizedAssistantBlock::Text { .. } => None,
+                            | PersistedNormalizedAssistantBlockV2::RejectedToolUse {
+                                tool_use_id,
+                                ..
+                            } => Some(tool_use_id.clone()),
+                            PersistedNormalizedAssistantBlockV2::Text { .. } => None,
                         })
                         .collect(),
                     provider_history,
-                    recovery_outcomes: replay.outcomes,
+                    recovery_outcomes: replay.outcomes_v2,
                     sources: Vec::new(),
+                    resolved_account_key: local_account.to_owned(),
+                    admission_account_digest,
+                    provider_input_limit,
+                    progressive_authority: progressive_authority.clone(),
                 };
                 if runtime.journal.phase == RequestPhase::ProviderStepCompleted {
-                    match classify_completed_recovery(&runtime.recovery_outcomes) {
+                    match classify_completed_recovery_v2(&runtime.recovery_outcomes) {
                         CompletedRecoveryDisposition::Final { text, usage } => {
-                            runtime.finish_final(text.clone(), usage, created_at_ms)?;
+                            let outcome = runtime
+                                .recovery_outcomes
+                                .last()
+                                .ok_or_else(|| "session_store_unavailable".to_string())?;
+                            let assistant_sources = outcome.assistant_sources.clone();
+                            let progressive_finalization = outcome.finalization.clone();
+                            runtime.finish_final(
+                                isyncyou_agent::TurnCompletionV2 {
+                                    final_text: text.clone(),
+                                    assistant_sources,
+                                    progressive_finalization,
+                                },
+                                usage,
+                                created_at_ms,
+                            )?;
                             return Ok(ProductTurnStart::Replay(ProductTurnReplay {
                                 phase: RequestPhase::Committed,
                                 final_text: Some(text),
@@ -1859,7 +2275,7 @@ impl<'a> ProductSessionRegistry<'a> {
                     .map_err(|_| "session_store_unavailable")?;
                 let intent_record =
                     intent_record.ok_or_else(|| "session_store_unavailable".to_string())?;
-                record_ambiguous_provider_step(
+                record_ambiguous_provider_step_v2(
                     &store,
                     current,
                     &holder_binding,
@@ -1895,8 +2311,8 @@ impl<'a> ProductSessionRegistry<'a> {
         let turn_id = turn_id.to_owned();
         let intent_record_id = new_ulid().map_err(|_| "session_store_unavailable")?;
         let journal_id = new_ulid().map_err(|_| "session_store_unavailable")?;
-        let journal = RequestJournalV1 {
-            journal_version: REQUEST_JOURNAL_VERSION,
+        let journal = RequestJournalV2 {
+            journal_version: REQUEST_JOURNAL_V2_VERSION,
             session_id: session_id.to_owned(),
             request_id: request_id.to_owned(),
             turn_id: turn_id.clone(),
@@ -1905,6 +2321,7 @@ impl<'a> ProductSessionRegistry<'a> {
             next_step_seq: 0,
             completed_steps: vec![],
             read_checkpoints: vec![],
+            progressive_exit: None,
         };
         let journal_bytes =
             serde_json::to_vec(&journal).map_err(|_| "session_store_unavailable")?;
@@ -1964,6 +2381,10 @@ impl<'a> ProductSessionRegistry<'a> {
             provider_history,
             recovery_outcomes: Vec::new(),
             sources: Vec::new(),
+            resolved_account_key: local_account.to_owned(),
+            admission_account_digest,
+            provider_input_limit,
+            progressive_authority,
         })))
     }
 
@@ -2097,6 +2518,7 @@ fn visible_parent_ids(logical_parents: &[String], observed_head: &Option<String>
     parents
 }
 
+#[cfg(test)]
 fn collect_source_refs(result: &str, output: &mut Vec<SourceRef>) {
     fn visit(value: &serde_json::Value, output: &mut Vec<SourceRef>) {
         if output.len() >= 64 {
@@ -2189,6 +2611,11 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use isyncyou_agent::activity::{
+        CoverageNoteReason, CoverageNoteV1, ProgressiveActivityExitV1,
+        ProgressiveActivityFinalizationV1, ProgressiveExitStateV1, ProgressiveFinalizationV1,
+        StageStatus, TurnExitKind,
+    };
     use isyncyou_agent::InMemorySessionV2Transport;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2317,6 +2744,230 @@ mod tests {
         index.selected_session_id = Some(session_id.into());
         index.generation += 1;
         registry.save_index(&index).unwrap();
+    }
+
+    fn finalized_text_sha256(text: &str) -> String {
+        ring::digest::digest(&ring::digest::SHA256, text.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn reopen_progressive_final_fixture(
+        final_text: &str,
+        finalization: Option<ProgressiveFinalizationV1>,
+        exit_state: ProgressiveExitStateV1,
+    ) -> Result<isyncyou_agent::RequestReplayV1, SessionV2Error> {
+        const SESSION_ID: &str = "01J00000000000000000000000";
+        const REQUEST_ID: &str = "123e4567-e89b-42d3-a456-426614174000";
+        const TURN_ID: &str = "01J00000000000000000000001";
+        const INTENT_ID: &str = "01J00000000000000000000002";
+        const OUTCOME_ID: &str = "01J00000000000000000000003";
+        const JOURNAL_ID: &str = "01J00000000000000000000004";
+
+        let payload = PairingPayload::generate(SessionId::new(SESSION_ID).unwrap()).unwrap();
+        let crypto =
+            SessionObjectCrypto::new(payload.pairing_secret(), payload.crypto_config().unwrap())
+                .unwrap();
+        let transport = InMemorySessionV2Transport::default();
+        transport.set_server_time_ms(10_000);
+        transport.create_session(SESSION_ID).unwrap();
+        let store = SessionV2Store::new(transport.clone(), &[74; 32], crypto.clone());
+        let mut guard = store
+            .acquire_lease(SESSION_ID, "lease-a", "holder-a")
+            .unwrap();
+        let mut binding = recovery_binding();
+        binding.harness_contract_version = isyncyou_agent::HARNESS_CONTRACT_VERSION;
+        let request_binding = RequestUuidBindingV1::new(
+            RequestRouteDomain::AgentTurn,
+            SESSION_ID,
+            REQUEST_ID,
+            payload_digest(&(SESSION_ID, "me", "question")).unwrap(),
+        )
+        .unwrap();
+        let intent_record = SessionRecordV2 {
+            record_version: SESSION_RECORD_VERSION,
+            record_id: INTENT_ID.into(),
+            session_id: SESSION_ID.into(),
+            request_id: REQUEST_ID.into(),
+            turn_id: TURN_ID.into(),
+            kind: SessionRecordKind::TurnIntent {
+                user_text: "question".into(),
+            },
+            parent_record_ids: vec![],
+            observed_head: None,
+            lease: guard.binding().unwrap(),
+            created_at_ms: 1,
+        };
+        let outcome = RequestStepOutcomeV2 {
+            outcome_version: REQUEST_OUTCOME_V2_VERSION,
+            outcome_id: OUTCOME_ID.into(),
+            step_seq: 0,
+            previous_outcome_id: None,
+            provider: binding.provider,
+            model: binding.model.clone(),
+            normalized_blocks: vec![PersistedNormalizedAssistantBlockV2::Text {
+                text: final_text.into(),
+            }],
+            final_text: Some(final_text.into()),
+            assistant_sources: vec![SourceRef {
+                service: "onedrive".into(),
+                item_id: "item-a".into(),
+                label: Some("Result".into()),
+            }],
+            sanitized_usage: Some(SanitizedUsage {
+                input_tokens: 10,
+                output_tokens: 4,
+            }),
+            terminal_validation_error: None,
+            finalization,
+            outcome_digest: String::new(),
+        }
+        .seal_digest()
+        .unwrap();
+        let outcome_bytes = serde_json::to_vec(&outcome).unwrap();
+        let journal = RequestJournalV2 {
+            journal_version: REQUEST_JOURNAL_V2_VERSION,
+            session_id: SESSION_ID.into(),
+            request_id: REQUEST_ID.into(),
+            turn_id: TURN_ID.into(),
+            provider_binding: binding,
+            phase: RequestPhase::ProviderStepCompleted,
+            next_step_seq: 1,
+            completed_steps: vec![RequestStepRef {
+                step_seq: 0,
+                outcome_id: OUTCOME_ID.into(),
+                outcome_sha256: request_object_digest(&outcome_bytes),
+            }],
+            read_checkpoints: vec![],
+            progressive_exit: Some(exit_state),
+        };
+        guard
+            .publish(SessionCommitV1 {
+                visible_records: vec![intent_record],
+                request_objects: vec![
+                    (OUTCOME_ID.into(), outcome_bytes),
+                    (JOURNAL_ID.into(), serde_json::to_vec(&journal).unwrap()),
+                ],
+                uuid_bindings: vec![request_binding.clone()],
+            })
+            .unwrap();
+        guard.release().unwrap();
+        drop(store);
+
+        let reopened = SessionV2Store::new(transport, &[74; 32], crypto);
+        let current = reopened.current_manifest(SESSION_ID).unwrap();
+        reopened
+            .request_replay_from_manifest(&current, &request_binding)?
+            .ok_or(SessionV2Error::InvalidJournal)
+    }
+
+    fn complete_progressive_exit(deep_status: StageStatus) -> ProgressiveExitStateV1 {
+        ProgressiveExitStateV1 {
+            exit_version: 1,
+            exit_kind: TurnExitKind::Final,
+            activities: vec![ProgressiveActivityExitV1 {
+                activity_id: "abcdefghijklmnopqrstuv".into(),
+                names_status: StageStatus::Complete,
+                bodies_status: StageStatus::Complete,
+                deep_status,
+            }],
+            terminal_code: None,
+        }
+    }
+
+    fn progressive_finalization(
+        final_text: &str,
+        deep_status: StageStatus,
+        coverage_note: Option<CoverageNoteReason>,
+    ) -> ProgressiveFinalizationV1 {
+        ProgressiveFinalizationV1 {
+            finalization_version: 1,
+            activities: vec![ProgressiveActivityFinalizationV1 {
+                activity_id: "abcdefghijklmnopqrstuv".into(),
+                deep_status,
+                coverage_complete: coverage_note.is_none(),
+                budget_reached: coverage_note == Some(CoverageNoteReason::BudgetReached),
+                continuation_available: false,
+            }],
+            coverage_note: coverage_note.map(|reason| CoverageNoteV1 { version: 1, reason }),
+            finalized_text_sha256: finalized_text_sha256(final_text),
+        }
+    }
+
+    #[test]
+    fn restart_after_provider_outcome_reconstructs_same_coverage_finalization() {
+        let final_text = "Complete answer";
+        let replay = reopen_progressive_final_fixture(
+            final_text,
+            Some(progressive_finalization(
+                final_text,
+                StageStatus::Complete,
+                None,
+            )),
+            complete_progressive_exit(StageStatus::Complete),
+        )
+        .unwrap();
+        let outcomes = replay.outcomes_v2;
+        assert_eq!(
+            classify_completed_recovery_v2(&outcomes),
+            CompletedRecoveryDisposition::Final {
+                text: final_text.into(),
+                usage: Some(SanitizedUsage {
+                    input_tokens: 10,
+                    output_tokens: 4,
+                }),
+            }
+        );
+        assert_eq!(
+            outcomes[0].finalization,
+            Some(progressive_finalization(
+                final_text,
+                StageStatus::Complete,
+                None,
+            ))
+        );
+        assert_eq!(outcomes[0].assistant_sources.len(), 1);
+    }
+
+    #[test]
+    fn restart_after_last_deep_rejection_reconstructs_same_terminal_text() {
+        let final_text = concat!(
+            "Partial answer\n\n",
+            "Search coverage was limited; some archive items may not have been reviewed."
+        );
+        let replay = reopen_progressive_final_fixture(
+            final_text,
+            Some(progressive_finalization(
+                final_text,
+                StageStatus::Skipped,
+                Some(CoverageNoteReason::Incomplete),
+            )),
+            complete_progressive_exit(StageStatus::Skipped),
+        )
+        .unwrap();
+        let outcome = replay.outcomes_v2.last().unwrap();
+        assert_eq!(outcome.final_text.as_deref(), Some(final_text));
+        assert_eq!(
+            outcome
+                .finalization
+                .as_ref()
+                .and_then(|value| value.coverage_note.as_ref())
+                .map(|note| note.reason),
+            Some(CoverageNoteReason::Incomplete)
+        );
+    }
+
+    #[test]
+    fn restart_before_terminal_commit_uses_finalized_v2_outcome_not_generic_fast_path() {
+        let error = reopen_progressive_final_fixture(
+            "answer",
+            None,
+            complete_progressive_exit(StageStatus::Complete),
+        )
+        .unwrap_err();
+        assert_eq!(error, SessionV2Error::RecoveryOutcomeUnknown);
     }
 
     #[test]
@@ -2674,6 +3325,108 @@ mod tests {
     }
 
     #[test]
+    fn old_harness_journal_fails_provider_generation_changed_before_executor() {
+        let recorded = recovery_binding();
+        let mut current = recorded.clone();
+        current.harness_contract_version = isyncyou_agent::HARNESS_CONTRACT_VERSION;
+        assert_ne!(
+            recorded.harness_contract_version,
+            current.harness_contract_version
+        );
+        assert_eq!(
+            validate_provider_recovery_binding(&recorded, &current),
+            Err("provider_generation_changed".into())
+        );
+
+        let source = include_str!("product_session.rs");
+        let recovery = source
+            .split("pub fn begin_turn(")
+            .nth(1)
+            .and_then(|source| source.split("pub(crate) fn pairing_payload(").next())
+            .expect("begin_turn recovery body");
+        assert!(
+            recovery.find("validate_provider_recovery_binding").unwrap()
+                < recovery.find("acquire_lease_from_manifest").unwrap(),
+            "harness mismatch must fail before session execution authority is acquired"
+        );
+    }
+
+    #[test]
+    fn legacy_v1_search_and_deep_have_no_live_or_recovery_executor_after_harness_bump() {
+        let recorded = recovery_binding();
+        let mut current = recorded.clone();
+        current.harness_contract_version = isyncyou_agent::HARNESS_CONTRACT_VERSION;
+
+        let legacy_outcomes = vec![
+            isyncyou_agent::LegacyRequestStepOutcomeV1 {
+                outcome_version: 1,
+                outcome_id: "00000000000000000000000643".into(),
+                step_seq: 0,
+                previous_outcome_id: None,
+                provider: recorded.provider,
+                model: recorded.model.clone(),
+                normalized_blocks: vec![
+                    isyncyou_agent::LegacyNormalizedAssistantBlockV1::ToolUse {
+                        tool_use_id: "legacy-search".into(),
+                        action: isyncyou_agent::LegacyToolActionV1::Search {
+                            account: "me".into(),
+                            services: vec!["mail".into()],
+                            query: "invoice".into(),
+                            limit: Some(10),
+                        },
+                    },
+                ],
+                final_text: None,
+                sanitized_usage: None,
+                terminal_validation_error: None,
+                outcome_digest: "fixture-search-digest".into(),
+            },
+            isyncyou_agent::LegacyRequestStepOutcomeV1 {
+                outcome_version: 1,
+                outcome_id: "00000000000000000000000644".into(),
+                step_seq: 1,
+                previous_outcome_id: Some("00000000000000000000000643".into()),
+                provider: recorded.provider,
+                model: recorded.model.clone(),
+                normalized_blocks: vec![
+                    isyncyou_agent::LegacyNormalizedAssistantBlockV1::ToolUse {
+                        tool_use_id: "legacy-deep-search".into(),
+                        action: isyncyou_agent::LegacyToolActionV1::DeepSearch {
+                            account: "me".into(),
+                            services: vec!["mail".into()],
+                            query: "invoice".into(),
+                            cursor: Some(17),
+                            max_reads: Some(3),
+                        },
+                    },
+                ],
+                final_text: None,
+                sanitized_usage: None,
+                terminal_validation_error: None,
+                outcome_digest: "fixture-deep-digest".into(),
+            },
+        ];
+
+        assert!(legacy_chain_contains_deep_search(&legacy_outcomes));
+        assert_eq!(
+            validate_provider_recovery_binding(&recorded, &current),
+            Err("provider_generation_changed".into())
+        );
+
+        let source = include_str!("product_session.rs");
+        let recovery = source
+            .split("pub fn begin_turn(")
+            .nth(1)
+            .and_then(|source| source.split("pub(crate) fn pairing_payload(").next())
+            .expect("begin_turn recovery body");
+        assert!(
+            recovery.find("legacy_chain_contains_deep_search").unwrap()
+                < recovery.find("acquire_lease_from_manifest").unwrap(),
+            "legacy progressive recovery must terminate before execution authority"
+        );
+    }
+
+    #[test]
     fn crash_after_repeatable_read_before_second_step_resumes_after_digest_match() {
         let binding = recovery_binding();
         let action = read_action("item-a");
@@ -2922,8 +3675,13 @@ mod tests {
     #[test]
     fn turn_admission_and_step_checkpoints_publish_at_their_exact_boundaries() {
         let source = include_str!("product_session.rs");
-        let admission = source
-            .split("let journal = RequestJournalV1")
+        let begin_turn = source
+            .split("pub fn begin_turn(")
+            .nth(1)
+            .and_then(|source| source.split("pub(crate) fn pairing_payload(").next())
+            .expect("begin_turn body");
+        let admission = begin_turn
+            .split("let journal = RequestJournalV2")
             .nth(1)
             .and_then(|source| source.split("let journal_bytes").next())
             .expect("turn admission journal");
@@ -2953,6 +3711,30 @@ mod tests {
                 .expect("read checkpoint transition");
             assert!(transition.contains("publish_journal"), "{boundary}");
         }
+    }
+
+    #[test]
+    fn product_bound_search_persists_read_started_before_first_store_call() {
+        let product_source = include_str!("product_session.rs");
+        let persisted_boundary = product_source
+            .split("fn read_tool_started")
+            .nth(1)
+            .and_then(|source| source.split("fn read_tool_completed").next())
+            .expect("product read-start observer");
+        assert!(persisted_boundary.contains("publish_journal"));
+
+        let turn_source = include_str!("../../agent/src/turn.rs");
+        let live_read_path = turn_source
+            .split("observer.read_tool_started")
+            .nth(1)
+            .and_then(|source| source.split("observer.read_tool_completed").next())
+            .expect("live read execution boundary");
+        assert!(
+            live_read_path
+                .find("executor.execute_read_with_context")
+                .is_some(),
+            "the persisted read-start callback must precede the bound executor call"
+        );
     }
 
     #[test]
@@ -3036,7 +3818,11 @@ mod tests {
         let replay = source
             .split("if let Some(tombstone) = replay.tombstone {")
             .nth(1)
-            .and_then(|source| source.split("let journal = replay").next())
+            .and_then(|source| {
+                source
+                    .split("let journal = if let Some(journal) = replay.journal_v2")
+                    .next()
+            })
             .expect("terminal replay branch");
 
         assert!(replay.contains("ProductTurnStart::Replay"));

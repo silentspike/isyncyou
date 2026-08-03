@@ -87,6 +87,8 @@ pub enum SessionV2Error {
     LeaseLost,
     #[error("invalid_request_journal")]
     InvalidJournal,
+    #[error("turn_outcome_unknown")]
+    RecoveryOutcomeUnknown,
     #[error("duplicate_tool_use_id")]
     DuplicateToolUseId,
     #[error("provider_generation_changed")]
@@ -717,8 +719,12 @@ pub struct HistoryPageV1 {
 pub struct RequestReplayV1 {
     pub binding: RequestUuidBindingV1,
     pub journal: Option<RequestJournalV1>,
+    pub legacy_journal: Option<crate::session_recovery_v2::LegacyRequestJournalV1>,
+    pub journal_v2: Option<crate::session_recovery_v2::RequestJournalV2>,
     pub tombstone: Option<IdempotencyTombstoneV1>,
     pub outcomes: Vec<RequestStepOutcomeV1>,
+    pub legacy_outcomes: Vec<crate::session_recovery_v2::LegacyRequestStepOutcomeV1>,
+    pub outcomes_v2: Vec<crate::session_recovery_v2::RequestStepOutcomeV2>,
     pub visible_records: Vec<SessionRecordV2>,
 }
 
@@ -1030,7 +1036,37 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
                 }
                 continue;
             }
-            if let Ok(journal) = serde_json::from_slice::<RequestJournalV1>(&bytes) {
+            if request_journal_version(&bytes) == Some(2) {
+                let journal =
+                    serde_json::from_slice::<crate::session_recovery_v2::RequestJournalV2>(&bytes)
+                        .map_err(|_| SessionV2Error::InvalidJournal)?;
+                self.load_request_chain_v2(&journal)?;
+                if journal.request_id == request_id {
+                    if journal.session_id != current.manifest.session_id {
+                        return Err(SessionV2Error::InvalidJournal);
+                    }
+                    found_request_journal = true;
+                    removed.insert(entry.object_id.clone());
+                    removed.extend(
+                        journal
+                            .completed_steps
+                            .into_iter()
+                            .map(|step| step.outcome_id),
+                    );
+                } else {
+                    retained_outcomes.extend(
+                        journal
+                            .completed_steps
+                            .into_iter()
+                            .map(|step| step.outcome_id),
+                    );
+                }
+                continue;
+            }
+            if request_journal_version(&bytes) == Some(1) {
+                let Ok(journal) = serde_json::from_slice::<RequestJournalV1>(&bytes) else {
+                    continue;
+                };
                 self.load_request_chain(&journal)?;
                 if journal.request_id == request_id {
                     if journal.session_id != current.manifest.session_id {
@@ -1375,6 +1411,44 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
         })
     }
 
+    pub fn load_request_chain_v2(
+        &self,
+        journal: &crate::session_recovery_v2::RequestJournalV2,
+    ) -> Result<Vec<crate::session_recovery_v2::RequestStepOutcomeV2>, SessionV2Error> {
+        journal.validate_chain_with(|outcome_id| {
+            let sealed = self
+                .transport
+                .load_immutable(SessionObjectClass::RequestState, outcome_id)?;
+            self.object_crypto
+                .open(
+                    &journal.session_id,
+                    SessionObjectClass::RequestState,
+                    outcome_id,
+                    &sealed,
+                )
+                .map_err(|_| SessionV2Error::InvalidJournal)
+        })
+    }
+
+    pub fn load_legacy_request_chain(
+        &self,
+        journal: &crate::session_recovery_v2::LegacyRequestJournalV1,
+    ) -> Result<Vec<crate::session_recovery_v2::LegacyRequestStepOutcomeV1>, SessionV2Error> {
+        journal.validate_chain_with(|outcome_id| {
+            let sealed = self
+                .transport
+                .load_immutable(SessionObjectClass::RequestState, outcome_id)?;
+            self.object_crypto
+                .open(
+                    &journal.session_id,
+                    SessionObjectClass::RequestState,
+                    outcome_id,
+                    &sealed,
+                )
+                .map_err(|_| SessionV2Error::InvalidJournal)
+        })
+    }
+
     pub fn request_replay(
         &self,
         session_id: &str,
@@ -1425,6 +1499,8 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
             current.manifest.request_index_head.as_ref(),
         )?;
         let mut journal = None;
+        let mut legacy_journal = None;
+        let mut journal_v2 = None;
         let mut tombstone = None;
         for entry in request_entries.iter().rev() {
             let bytes =
@@ -1440,15 +1516,42 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
                 }
                 continue;
             }
-            let Ok(candidate_journal) = serde_json::from_slice::<RequestJournalV1>(&bytes) else {
+            if request_journal_version(&bytes) == Some(2) {
+                let candidate_journal =
+                    serde_json::from_slice::<crate::session_recovery_v2::RequestJournalV2>(&bytes)
+                        .map_err(|_| SessionV2Error::InvalidJournal)?;
+                if candidate_journal.session_id == session_id.as_str()
+                    && candidate_journal.request_id == candidate.request_id
+                {
+                    self.load_request_chain_v2(&candidate_journal)?;
+                    journal_v2 = Some(candidate_journal);
+                    break;
+                }
                 continue;
-            };
-            if candidate_journal.session_id == session_id.as_str()
-                && candidate_journal.request_id == candidate.request_id
-            {
-                self.load_request_chain(&candidate_journal)?;
-                journal = Some(candidate_journal);
-                break;
+            }
+            if request_journal_version(&bytes) == Some(1) {
+                if let Ok(candidate_journal) = serde_json::from_slice::<RequestJournalV1>(&bytes) {
+                    if candidate_journal.session_id == session_id.as_str()
+                        && candidate_journal.request_id == candidate.request_id
+                    {
+                        self.load_request_chain(&candidate_journal)?;
+                        journal = Some(candidate_journal);
+                        break;
+                    }
+                    continue;
+                }
+                if let Ok(candidate_journal) = serde_json::from_slice::<
+                    crate::session_recovery_v2::LegacyRequestJournalV1,
+                >(&bytes)
+                {
+                    if candidate_journal.session_id == session_id.as_str()
+                        && candidate_journal.request_id == candidate.request_id
+                    {
+                        self.load_legacy_request_chain(&candidate_journal)?;
+                        legacy_journal = Some(candidate_journal);
+                        break;
+                    }
+                }
             }
         }
         let outcomes = journal
@@ -1456,7 +1559,21 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
             .map(|journal| self.load_request_chain(journal))
             .transpose()?
             .unwrap_or_default();
-        if journal.is_none() && tombstone.is_none() {
+        let outcomes_v2 = journal_v2
+            .as_ref()
+            .map(|journal| self.load_request_chain_v2(journal))
+            .transpose()?
+            .unwrap_or_default();
+        let legacy_outcomes = legacy_journal
+            .as_ref()
+            .map(|journal| self.load_legacy_request_chain(journal))
+            .transpose()?
+            .unwrap_or_default();
+        if journal.is_none()
+            && legacy_journal.is_none()
+            && journal_v2.is_none()
+            && tombstone.is_none()
+        {
             return Err(SessionV2Error::InvalidJournal);
         }
 
@@ -1482,8 +1599,12 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
         Ok(Some(RequestReplayV1 {
             binding,
             journal,
+            legacy_journal,
+            journal_v2,
             tombstone,
             outcomes,
+            legacy_outcomes,
+            outcomes_v2,
             visible_records,
         }))
     }
@@ -1520,25 +1641,38 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
                 }
                 continue;
             }
-            let Ok(journal) = serde_json::from_slice::<RequestJournalV1>(&bytes) else {
+            let (journal_session_id, journal_request_id) = if request_journal_version(&bytes)
+                == Some(1)
+            {
+                let Ok(journal) = serde_json::from_slice::<RequestJournalV1>(&bytes) else {
+                    continue;
+                };
+                self.load_request_chain(&journal)?;
+                (journal.session_id, journal.request_id)
+            } else if request_journal_version(&bytes) == Some(2) {
+                let journal =
+                    serde_json::from_slice::<crate::session_recovery_v2::RequestJournalV2>(&bytes)
+                        .map_err(|_| SessionV2Error::InvalidJournal)?;
+                self.load_request_chain_v2(&journal)?;
+                (journal.session_id, journal.request_id)
+            } else {
                 continue;
             };
-            if journal.session_id != *session_id {
+            if journal_session_id != *session_id {
                 return Err(SessionV2Error::InvalidJournal);
             }
-            self.load_request_chain(&journal)?;
             let request_key = request_key(
                 RequestRouteDomain::AgentTurn,
                 session_id,
-                &journal.request_id,
+                &journal_request_id,
             )?;
             match journal_requests.get(&request_key) {
-                Some(existing) if existing != &journal.request_id => {
+                Some(existing) if existing != &journal_request_id => {
                     return Err(SessionV2Error::InvalidJournal);
                 }
                 Some(_) => {}
                 None => {
-                    journal_requests.insert(request_key, journal.request_id);
+                    journal_requests.insert(request_key, journal_request_id);
                 }
             }
         }
@@ -1659,6 +1793,22 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
                         terminal_code,
                     }));
                 }
+                continue;
+            }
+            if request_journal_version(&bytes) == Some(2) {
+                let journal =
+                    serde_json::from_slice::<crate::session_recovery_v2::RequestJournalV2>(&bytes)
+                        .map_err(|_| SessionV2Error::InvalidJournal)?;
+                if journal.session_id == session_id && journal.request_id == request_id {
+                    self.load_request_chain_v2(&journal)?;
+                    return Ok(Some(RequestStatusV1 {
+                        phase: journal.phase.recovery_phase(),
+                        terminal_code: None,
+                    }));
+                }
+                continue;
+            }
+            if request_journal_version(&bytes) != Some(1) {
                 continue;
             }
             let Ok(journal) = serde_json::from_slice::<RequestJournalV1>(&bytes) else {
@@ -4612,6 +4762,17 @@ pub struct RequestJournalV1 {
     pub read_checkpoints: Vec<ReadToolCheckpointV1>,
 }
 
+fn request_journal_version(bytes: &[u8]) -> Option<u32> {
+    #[derive(Deserialize)]
+    struct JournalVersion {
+        journal_version: u32,
+    }
+
+    serde_json::from_slice::<JournalVersion>(bytes)
+        .ok()
+        .map(|wire| wire.journal_version)
+}
+
 impl RequestJournalV1 {
     pub fn validate_chain<T: SessionV2Transport>(
         &self,
@@ -4839,6 +5000,31 @@ pub struct ContextBudget {
     pub max_tokens: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelInputAllowance {
+    pub max_tokens: usize,
+}
+
+impl ModelInputAllowance {
+    pub fn for_model_limits(
+        context_window_tokens: Option<usize>,
+        max_output_tokens: Option<usize>,
+    ) -> Self {
+        let max_tokens = match (context_window_tokens, max_output_tokens) {
+            (Some(context), Some(output)) => {
+                let safety_margin = context / 10 + usize::from(context % 10 != 0);
+                output
+                    .checked_add(MIN_TOOL_RESULT_TOKENS)
+                    .and_then(|reserved| reserved.checked_add(safety_margin))
+                    .and_then(|reserved| context.checked_sub(reserved))
+                    .unwrap_or(0)
+            }
+            _ => UNKNOWN_MODEL_INPUT_TOKENS,
+        };
+        Self { max_tokens }
+    }
+}
+
 impl Default for ContextBudget {
     fn default() -> Self {
         Self {
@@ -4856,16 +5042,10 @@ impl ContextBudget {
         context_window_tokens: Option<usize>,
         max_output_tokens: Option<usize>,
     ) -> Self {
-        let max_tokens = match (context_window_tokens, max_output_tokens) {
-            (Some(context), Some(output)) => {
-                let safety_margin = context / 10 + usize::from(context % 10 != 0);
-                context
-                    .saturating_sub(output.saturating_add(MIN_TOOL_RESULT_TOKENS))
-                    .saturating_sub(safety_margin)
-                    .min(MAX_CONTEXT_TOKENS)
-            }
-            _ => UNKNOWN_MODEL_INPUT_TOKENS,
-        };
+        let max_tokens =
+            ModelInputAllowance::for_model_limits(context_window_tokens, max_output_tokens)
+                .max_tokens
+                .min(MAX_CONTEXT_TOKENS);
         Self {
             max_messages: MAX_CONTEXT_MESSAGES,
             max_bytes: MAX_CONTEXT_BYTES,
@@ -7456,6 +7636,8 @@ mod tests {
         assert_eq!(budget.max_bytes, MAX_CONTEXT_BYTES);
         assert_eq!(budget.max_tokens, 17_203);
 
+        let allowance = ModelInputAllowance::for_model_limits(Some(200_000), Some(16_384));
+        assert_eq!(allowance.max_tokens, 159_520);
         let large = ContextBudget::for_model_limits(Some(200_000), Some(16_384));
         assert_eq!(large.max_tokens, MAX_CONTEXT_TOKENS);
     }
@@ -7473,6 +7655,14 @@ mod tests {
         assert_eq!(
             ContextBudget::for_model_limits(None, Some(4_096)).max_tokens,
             UNKNOWN_MODEL_INPUT_TOKENS
+        );
+        assert_eq!(
+            ModelInputAllowance::for_model_limits(None, Some(4_096)).max_tokens,
+            UNKNOWN_MODEL_INPUT_TOKENS
+        );
+        assert_eq!(
+            ModelInputAllowance::for_model_limits(Some(4_096), Some(4_096)).max_tokens,
+            0
         );
     }
 

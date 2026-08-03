@@ -318,7 +318,7 @@ impl LlmProvider for SubscriptionProvider {
     fn next(
         &mut self,
         history: &[Message],
-        emit: &mut dyn FnMut(StreamEvent),
+        emit: &mut dyn crate::provider::TurnEventSink,
     ) -> Result<Vec<AssistantBlock>, AgentError> {
         self.next_cancellable(history, emit, None)
     }
@@ -326,7 +326,7 @@ impl LlmProvider for SubscriptionProvider {
     fn next_cancellable(
         &mut self,
         history: &[Message],
-        emit: &mut dyn FnMut(StreamEvent),
+        emit: &mut dyn crate::provider::TurnEventSink,
         cancellation: Option<&crate::CancellationToken>,
     ) -> Result<Vec<AssistantBlock>, AgentError> {
         // #639: build + attest the exact request for THIS round's history, then send only the
@@ -354,7 +354,12 @@ impl LlmProvider for SubscriptionProvider {
                 }
                 let advances_turn = sse_event_advances_turn(&event.data);
                 match apply_claude_sse_event(&event.data, &mut state) {
-                    Ok(Some(delta)) => emit(StreamEvent::Token(delta)),
+                    Ok(Some(delta)) => {
+                        if let Err(error) = emit.emit(StreamEvent::Token(delta)) {
+                            parse_error = Some(error);
+                            return false;
+                        }
+                    }
                     Ok(None) => {}
                     Err(e) => parse_error = Some(e),
                 }

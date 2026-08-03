@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "implementation_commit": "65e96ddfe8cd05be62b2fae54b78ec5665cef882",
+  "deep_call": {
+    "metadata_records": 1000,
+    "metadata_time_ms": 2000,
+    "progress_every_records": 25,
+    "progress_every_ms": 250,
+    "default_body_reads": 12,
+    "maximum_body_reads": 40
+  },
+  "body": {
+    "maximum_plaintext_bytes": 2097152,
+    "envelope_limit_is_checked_separately": true,
+    "declared_plaintext_is_checked_before_allocation": true,
+    "cap_plus_one_read": true
+  },
+  "provider": {
+    "progressive_turn_bytes": 262144,
+    "selected_model_input_tokens_recounted_before_every_call": true,
+    "unknown_tokenizer_charges_one_token_per_utf8_byte": true,
+    "maximum_provider_steps": 16
+  },
+  "large_fixture": {
+    "records": 10000,
+    "bounded_page_size": 200,
+    "tested_metadata_stop_at": 1000,
+    "coverage_complete_when_budget_reached": false
+  },
+  "tests": {
+    "large_fixture_enforces_record_cap_and_coalesces_current_progress": "pass",
+    "large_fixture_injected_two_second_metadata_deadline_stops_before_record_cap": "pass",
+    "progressive_provider_budget_exhaustion_stops_before_read_and_omits_continuation": "pass",
+    "progressive_input_budget_exact_limit_passes_and_one_token_over_stops_before_read": "pass",
+    "archive_deep_envelope_exact_max_matches_checked_serialization_formula": "pass",
+    "archive_deep_envelope_rejects_declared_plaintext_one_over_before_allocation": "pass"
+  },
+  "state": "pass"
+}

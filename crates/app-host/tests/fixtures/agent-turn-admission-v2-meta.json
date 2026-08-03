@@ -1,0 +1,11 @@
+{
+  "ciphertext_sha256": "57518e2e73bbe632a5f4184dbd9894f7b74f0f7605a06645bb89a6e07f74b874",
+  "fixture_version": 1,
+  "origin_commit": "5bf12dda5876545c6701c38fda2e5f52339c1795",
+  "plaintext_sha256": "e1e9ca8708d46d7bbb3d44d011b95d85f6ba0e229d7b8d7f14e144ab409181ad",
+  "record_version": 2,
+  "request_id": "00000000-0000-4000-8000-000000000646",
+  "row_class": "agent-turn-admission",
+  "test_key_id": "issue-643-agent-turn-admission-row-key-v1",
+  "storage_encoding": "u8-json-array"
+}

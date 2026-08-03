@@ -8,6 +8,87 @@ import org.junit.Test
 
 class BridgeMessagePolicyTest {
     @Test
+    fun android_bridge_forwards_only_bounded_public_progress_projection() {
+        val event = JSONObject()
+            .put("event", "stage_progress")
+            .put("schema_version", 1)
+            .put("activity_id", "AAAAAAAAAAAAAAAAAAAAAA")
+            .put("activity_kind", "archive_search")
+            .put("stage", "deep")
+            .put("status", "complete")
+            .put("scanned", 12)
+            .put("total", JSONObject.NULL)
+            .put("hits", 2)
+            .put("current_item", JSONObject.NULL)
+            .put("coverage_complete", true)
+            .put("budget_reached", false)
+            .put("continuation_available", false)
+        assertTrue(BridgeMessagePolicy.outboundStreamEventJson("stream", event.toString()) != null)
+
+        event.put("schema_version", 2)
+        assertEquals(null, BridgeMessagePolicy.outboundStreamEventJson("stream", event.toString()))
+        event.put("schema_version", 1).put("unexpected", true)
+        assertEquals(null, BridgeMessagePolicy.outboundStreamEventJson("stream", event.toString()))
+        assertEquals(
+            null,
+            BridgeMessagePolicy.outboundStreamEventJson(
+                "stream",
+                JSONObject().put("event", "search_stage").toString(),
+            ),
+        )
+    }
+
+    @Test
+    fun android_outbound_limit_includes_id_wrapper_and_json_escaping() {
+        val raw = JSONObject().put("event", "token").put("text", "\"\\\n")
+        val encoded = BridgeMessagePolicy.outboundStreamEventJson(
+            "i".repeat(128),
+            raw.toString(),
+        )
+        assertTrue(encoded != null)
+        assertEquals(raw.toString(), JSONObject(encoded!!).getJSONObject("ev").toString())
+        assertTrue(encoded.toByteArray(Charsets.UTF_8).size > raw.toString().toByteArray(Charsets.UTF_8).size)
+    }
+
+    @Test
+    fun outboundStreamLimitCoversTheFullySerializedBridgeEnvelope() {
+        val emptyEvent = JSONObject().put("event", "token").put("text", "")
+        val emptyEnvelope = JSONObject()
+            .put("t", "evt")
+            .put("id", "stream")
+            .put("ev", emptyEvent)
+            .toString()
+        val paddingBytes = BridgeMessagePolicy.MAX_OUTBOUND_STREAM_MESSAGE_BYTES -
+            emptyEnvelope.toByteArray(Charsets.UTF_8).size
+        val exactEvent = JSONObject()
+            .put("event", "token")
+            .put("text", "x".repeat(paddingBytes))
+            .toString()
+        val exact = BridgeMessagePolicy.outboundStreamEventJson("stream", exactEvent)
+        assertTrue(exact != null)
+        assertEquals(
+            BridgeMessagePolicy.MAX_OUTBOUND_STREAM_MESSAGE_BYTES,
+            exact!!.toByteArray(Charsets.UTF_8).size,
+        )
+
+        val oneOverEvent = JSONObject()
+            .put("event", "token")
+            .put("text", "x".repeat(paddingBytes + 1))
+            .toString()
+        assertEquals(null, BridgeMessagePolicy.outboundStreamEventJson("stream", oneOverEvent))
+    }
+
+    @Test
+    fun outboundStreamRejectsMalformedDuplicateAndInvalidIdMessages() {
+        assertEquals(null, BridgeMessagePolicy.outboundStreamEventJson("stream", "{"))
+        assertEquals(
+            null,
+            BridgeMessagePolicy.outboundStreamEventJson("stream", """{"event":"a","event":"b"}"""),
+        )
+        assertEquals(null, BridgeMessagePolicy.outboundStreamEventJson("", """{"event":"done"}"""))
+    }
+
+    @Test
     fun envelopeRejectsOversizedMalformedUnknownAndMissingIdMessages() {
         val oversized = "x".repeat(BridgeMessagePolicy.MAX_MESSAGE_BYTES + 1)
         assertInvalid(BridgeMessagePolicy.validateEnvelope(oversized), "too_large")

@@ -130,13 +130,26 @@ pub(crate) enum ProductRequestBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AgentTurnAdmissionV1 {
+struct LegacyStoredAgentTurnAdmissionV2 {
     version: u32,
     turn_id: String,
     route_domain: String,
     request_scope: String,
     payload_digest: String,
     request: isyncyou_webui::AgentTurnRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredAgentTurnAdmissionV3 {
+    version: u32,
+    turn_id: String,
+    route_domain: String,
+    request_scope: String,
+    payload_digest: String,
+    request: isyncyou_webui::AgentTurnRequest,
+    resolved_account_key: String,
+    admission_account_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +166,8 @@ pub(crate) struct RecoveredAgentTurnAdmission {
     pub request: isyncyou_webui::AgentTurnRequest,
     pub turn_id: String,
     pub identity: isyncyou_webui::ProductRequestIdentity,
+    pub resolved_account_key: Option<String>,
+    pub admission_account_digest: Option<[u8; 32]>,
 }
 
 impl std::fmt::Debug for RecoveredAgentTurnAdmission {
@@ -3701,23 +3716,36 @@ impl AgentControlStore {
         request: &isyncyou_webui::AgentTurnRequest,
         turn_id: &str,
         identity: &isyncyou_webui::ProductRequestIdentity,
+        resolved_account_key: &str,
+        admission_account_digest: [u8; 32],
     ) -> Result<AgentTurnAdmissionBegin, String> {
         if request.request_id != identity.request_id
             || identity.route_domain != AGENT_TURN_ROUTE_DOMAIN
             || identity.request_scope != format!("session_id:{}", request.session_id)
             || request.request_id.len() > 64
             || turn_id.len() > 128
+            || resolved_account_key.is_empty()
+            || resolved_account_key.len() > 128
+            || request.account != resolved_account_key
             || !valid_sha256(&identity.payload_digest)
         {
             return Err("turn_admission_unavailable".into());
         }
-        let record = AgentTurnAdmissionV1 {
-            version: 2,
+        let expected_account_digest =
+            isyncyou_agent::admission_account_digest(resolved_account_key)
+                .map_err(|_| "turn_admission_unavailable".to_string())?;
+        if expected_account_digest != admission_account_digest {
+            return Err("turn_admission_unavailable".into());
+        }
+        let record = StoredAgentTurnAdmissionV3 {
+            version: 3,
             turn_id: turn_id.to_owned(),
             route_domain: identity.route_domain.to_owned(),
             request_scope: identity.request_scope.clone(),
             payload_digest: identity.payload_digest.clone(),
             request: request.clone(),
+            resolved_account_key: resolved_account_key.to_owned(),
+            admission_account_digest: URL_SAFE_NO_PAD.encode(admission_account_digest),
         };
         let plaintext = serde_json::to_vec(&record).map_err(|_| "turn_admission_unavailable")?;
         if plaintext.len() > MAX_AGENT_TURN_ADMISSION_BYTES {
@@ -3885,6 +3913,8 @@ impl AgentControlStore {
         turn_id: &str,
         payload_digest: &str,
     ) -> Result<AgentTurnAdmissionBegin, String> {
+        let account_digest = isyncyou_agent::admission_account_digest(&request.account)
+            .map_err(|_| "turn_admission_unavailable".to_string())?;
         self.begin_agent_turn_admission_identity(
             request,
             turn_id,
@@ -3894,6 +3924,8 @@ impl AgentControlStore {
                 request_scope: format!("session_id:{}", request.session_id),
                 payload_digest: payload_digest.into(),
             },
+            &request.account,
+            account_digest,
         )
     }
 
@@ -3936,29 +3968,173 @@ impl AgentControlStore {
                 &request_id,
                 &sealed,
             )?;
-            let record: AgentTurnAdmissionV1 =
-                serde_json::from_slice(&plaintext).map_err(|_| "turn_admission_unavailable")?;
-            if record.version != 2
-                || record.request.request_id != request_id
-                || record.turn_id != turn_id
-                || record.route_domain != AGENT_TURN_ROUTE_DOMAIN
-                || record.request_scope != request_scope
-                || record.payload_digest != payload_digest
-            {
-                return Err("turn_admission_unavailable".into());
-            }
+            let (request, record_turn_id, resolved_account_key, admission_account_digest) =
+                if let Ok(record) = serde_json::from_slice::<StoredAgentTurnAdmissionV3>(&plaintext)
+                {
+                    if record.version != 3
+                        || record.request.request_id != request_id
+                        || record.turn_id != turn_id
+                        || record.route_domain != AGENT_TURN_ROUTE_DOMAIN
+                        || record.request_scope != request_scope
+                        || record.payload_digest != payload_digest
+                        || record.request.account != record.resolved_account_key
+                    {
+                        return Err("turn_admission_unavailable".into());
+                    }
+                    let decoded = URL_SAFE_NO_PAD
+                        .decode(record.admission_account_digest.as_bytes())
+                        .map_err(|_| "turn_admission_unavailable")?;
+                    let digest: [u8; 32] = decoded
+                        .try_into()
+                        .map_err(|_| "turn_admission_unavailable")?;
+                    if isyncyou_agent::admission_account_digest(&record.resolved_account_key)
+                        .map_err(|_| "turn_admission_unavailable")?
+                        != digest
+                    {
+                        return Err("turn_admission_unavailable".into());
+                    }
+                    (
+                        record.request,
+                        record.turn_id,
+                        Some(record.resolved_account_key),
+                        Some(digest),
+                    )
+                } else {
+                    let record: LegacyStoredAgentTurnAdmissionV2 =
+                        serde_json::from_slice(&plaintext)
+                            .map_err(|_| "turn_admission_unavailable")?;
+                    if record.version != 2
+                        || record.request.request_id != request_id
+                        || record.turn_id != turn_id
+                        || record.route_domain != AGENT_TURN_ROUTE_DOMAIN
+                        || record.request_scope != request_scope
+                        || record.payload_digest != payload_digest
+                    {
+                        return Err("turn_admission_unavailable".into());
+                    }
+                    (record.request, record.turn_id, None, None)
+                };
             recovered.push(RecoveredAgentTurnAdmission {
-                request: record.request,
-                turn_id: record.turn_id,
+                request,
+                turn_id: record_turn_id,
                 identity: isyncyou_webui::ProductRequestIdentity {
                     request_id,
                     route_domain: AGENT_TURN_ROUTE_DOMAIN,
                     request_scope,
                     payload_digest,
                 },
+                resolved_account_key,
+                admission_account_digest,
             });
         }
         Ok(recovered)
+    }
+
+    pub(crate) fn migrate_agent_turn_admission_v3(
+        &self,
+        request_id: &str,
+        resolved_account_key: &str,
+    ) -> Result<[u8; 32], String> {
+        if resolved_account_key.is_empty() || resolved_account_key.len() > 128 {
+            return Err("turn_admission_unavailable".into());
+        }
+        let digest = isyncyou_agent::admission_account_digest(resolved_account_key)
+            .map_err(|_| "turn_admission_unavailable".to_string())?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| "turn_admission_unavailable")?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| "turn_admission_unavailable")?;
+        let (sealed, previous_logical_bytes): (Vec<u8>, i64) = transaction
+            .query_row(
+                "SELECT sealed_request,logical_bytes FROM agent_turn_admissions
+                 WHERE request_id=?1 AND state='active' AND terminal_code IS NULL",
+                params![request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| "turn_admission_unavailable")?;
+        let plaintext = open_row(
+            &self.row_wrap_key,
+            "agent-turn-admission",
+            request_id,
+            &sealed,
+        )?;
+        if let Ok(current) = serde_json::from_slice::<StoredAgentTurnAdmissionV3>(&plaintext) {
+            let decoded = URL_SAFE_NO_PAD
+                .decode(current.admission_account_digest.as_bytes())
+                .map_err(|_| "turn_admission_unavailable")?;
+            let stored: [u8; 32] = decoded
+                .try_into()
+                .map_err(|_| "turn_admission_unavailable")?;
+            if current.version != 3
+                || current.request.request_id != request_id
+                || current.request.account != resolved_account_key
+                || current.resolved_account_key != resolved_account_key
+                || stored != digest
+            {
+                return Err("session_account_mismatch".into());
+            }
+            transaction
+                .commit()
+                .map_err(|_| "turn_admission_unavailable")?;
+            return Ok(digest);
+        }
+        let legacy: LegacyStoredAgentTurnAdmissionV2 =
+            serde_json::from_slice(&plaintext).map_err(|_| "turn_admission_unavailable")?;
+        if legacy.version != 2
+            || legacy.request.request_id != request_id
+            || legacy.request.account != resolved_account_key
+        {
+            return Err("session_account_mismatch".into());
+        }
+        let current = StoredAgentTurnAdmissionV3 {
+            version: 3,
+            turn_id: legacy.turn_id,
+            route_domain: legacy.route_domain,
+            request_scope: legacy.request_scope,
+            payload_digest: legacy.payload_digest,
+            request: legacy.request,
+            resolved_account_key: resolved_account_key.to_owned(),
+            admission_account_digest: URL_SAFE_NO_PAD.encode(digest),
+        };
+        let next_plaintext =
+            serde_json::to_vec(&current).map_err(|_| "turn_admission_unavailable")?;
+        if next_plaintext.len() > MAX_AGENT_TURN_ADMISSION_BYTES {
+            return Err("turn_admission_unavailable".into());
+        }
+        let next_sealed = seal_row(
+            &self.row_wrap_key,
+            "agent-turn-admission",
+            request_id,
+            &next_plaintext,
+        )?;
+        let next_logical_bytes = previous_logical_bytes
+            .checked_add(
+                i64::try_from(next_sealed.len()).map_err(|_| "turn_admission_unavailable")?
+                    - i64::try_from(sealed.len()).map_err(|_| "turn_admission_unavailable")?,
+            )
+            .ok_or_else(|| "turn_admission_unavailable".to_string())?;
+        if next_logical_bytes < 0 {
+            return Err("turn_admission_unavailable".into());
+        }
+        enforce_control_quota(&transaction, next_logical_bytes - previous_logical_bytes)?;
+        let changed = transaction
+            .execute(
+                "UPDATE agent_turn_admissions
+                 SET sealed_request=?1,logical_bytes=?2
+                 WHERE request_id=?3 AND state='active' AND terminal_code IS NULL",
+                params![next_sealed, next_logical_bytes, request_id],
+            )
+            .map_err(|_| "turn_admission_unavailable")?;
+        if changed != 1 {
+            return Err("turn_admission_unavailable".into());
+        }
+        transaction
+            .commit()
+            .map_err(|_| "turn_admission_unavailable")?;
+        Ok(digest)
     }
 
     pub(crate) fn complete_agent_turn_admission(&self, request_id: &str) -> Result<(), String> {
@@ -5758,7 +5934,11 @@ fn migrate_agent_turn_admissions_v2(
     for (request_id, turn_id, payload_digest, sealed, previous_logical_bytes) in rows {
         let plaintext = open_row(row_wrap_key, "agent-turn-admission", &request_id, &sealed)
             .map_err(|_| "control_store_migration_failed")?;
-        if let Ok(current) = serde_json::from_slice::<AgentTurnAdmissionV1>(&plaintext) {
+        if serde_json::from_slice::<StoredAgentTurnAdmissionV3>(&plaintext).is_ok() {
+            continue;
+        }
+        if let Ok(current) = serde_json::from_slice::<LegacyStoredAgentTurnAdmissionV2>(&plaintext)
+        {
             if current.version != 2
                 || current.request.request_id != request_id
                 || current.turn_id != turn_id
@@ -5805,7 +5985,7 @@ fn migrate_agent_turn_admissions_v2(
             ProductRequestBinding::Inserted | ProductRequestBinding::Existing => {}
             ProductRequestBinding::Conflict => return Err("control_store_migration_failed".into()),
         }
-        let current = AgentTurnAdmissionV1 {
+        let current = LegacyStoredAgentTurnAdmissionV2 {
             version: 2,
             turn_id: legacy.turn_id,
             route_domain: AGENT_TURN_ROUTE_DOMAIN.into(),
@@ -7314,6 +7494,10 @@ mod tests {
                     request_scope: format!("session_id:{}", request.session_id),
                     payload_digest: digest.into(),
                 },
+                resolved_account_key: Some(request.account.clone()),
+                admission_account_digest: Some(
+                    isyncyou_agent::admission_account_digest(&request.account).unwrap(),
+                ),
             }]
         );
         control
@@ -7828,7 +8012,9 @@ mod tests {
                 .begin_agent_turn_admission_identity(
                     &request,
                     "01JTURN0000000000000000001",
-                    &identity
+                    &identity,
+                    &request.account,
+                    isyncyou_agent::admission_account_digest(&request.account).unwrap(),
                 )
                 .unwrap_err(),
             "turn_admission_unavailable"
@@ -7975,6 +8161,281 @@ mod tests {
             )
             .unwrap();
         assert!(!receipt_exists);
+        drop(control);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn turn_admission_v3_binds_resolved_account_key_and_digest() {
+        let root = temp_root("turn-admission-v3-binding");
+        let credential_store = credential_store(&root);
+        let control =
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let request = isyncyou_webui::AgentTurnRequest {
+            request_id: "019f0000-0000-4000-8000-000000000643".into(),
+            session_id: "01JSESSION00000000000000643".into(),
+            account: "resolved-account-key".into(),
+            prompt: "Find the controlled fixture".into(),
+        };
+        let identity = isyncyou_webui::ProductRequestIdentity {
+            request_id: request.request_id.clone(),
+            route_domain: AGENT_TURN_ROUTE_DOMAIN,
+            request_scope: format!("session_id:{}", request.session_id),
+            payload_digest: "6464646464646464646464646464646464646464646464646464646464646464"
+                .into(),
+        };
+        let account_digest = isyncyou_agent::admission_account_digest(&request.account).unwrap();
+
+        assert_eq!(
+            control
+                .begin_agent_turn_admission_identity(
+                    &request,
+                    "01JTURN0000000000000000643",
+                    &identity,
+                    &request.account,
+                    account_digest,
+                )
+                .unwrap(),
+            AgentTurnAdmissionBegin::Inserted
+        );
+        let recovered = control.recover_agent_turn_admissions(1).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].resolved_account_key.as_deref(),
+            Some(request.account.as_str())
+        );
+        assert_eq!(recovered[0].admission_account_digest, Some(account_digest));
+        assert_eq!(recovered[0].identity, identity);
+        drop(control);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn turn_admission_v3_enforces_exact_wire_bounds_route_scope_and_digest() {
+        let root = temp_root("turn-admission-v3-bounds");
+        let credential_store = credential_store(&root);
+        let control =
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let request = isyncyou_webui::AgentTurnRequest {
+            request_id: "019f0000-0000-4000-8000-000000000644".into(),
+            session_id: "01JSESSION00000000000000644".into(),
+            account: "bounded-account".into(),
+            prompt: "Find the controlled fixture".into(),
+        };
+        let identity = isyncyou_webui::ProductRequestIdentity {
+            request_id: request.request_id.clone(),
+            route_domain: AGENT_TURN_ROUTE_DOMAIN,
+            request_scope: format!("session_id:{}", request.session_id),
+            payload_digest: "6565656565656565656565656565656565656565656565656565656565656565"
+                .into(),
+        };
+        let account_digest = isyncyou_agent::admission_account_digest(&request.account).unwrap();
+        let valid_record = StoredAgentTurnAdmissionV3 {
+            version: 3,
+            turn_id: "01JTURN0000000000000000644".into(),
+            route_domain: identity.route_domain.into(),
+            request_scope: identity.request_scope.clone(),
+            payload_digest: identity.payload_digest.clone(),
+            request: request.clone(),
+            resolved_account_key: request.account.clone(),
+            admission_account_digest: URL_SAFE_NO_PAD.encode(account_digest),
+        };
+        assert!(serde_json::to_vec(&valid_record).unwrap().len() < MAX_AGENT_TURN_ADMISSION_BYTES);
+
+        for mut invalid_identity in [
+            isyncyou_webui::ProductRequestIdentity {
+                route_domain: "post:/api/v1/agent/session/create",
+                ..identity.clone()
+            },
+            isyncyou_webui::ProductRequestIdentity {
+                request_scope: "session_id:different".into(),
+                ..identity.clone()
+            },
+            isyncyou_webui::ProductRequestIdentity {
+                payload_digest: "65".repeat(31),
+                ..identity.clone()
+            },
+        ] {
+            invalid_identity.request_id.clone_from(&request.request_id);
+            assert_eq!(
+                control
+                    .begin_agent_turn_admission_identity(
+                        &request,
+                        "01JTURN0000000000000000644",
+                        &invalid_identity,
+                        &request.account,
+                        account_digest,
+                    )
+                    .unwrap_err(),
+                "turn_admission_unavailable"
+            );
+        }
+
+        let mut oversized = request.clone();
+        oversized.request_id = "019f0000-0000-4000-8000-000000000645".into();
+        oversized.prompt = "x".repeat(MAX_AGENT_TURN_ADMISSION_BYTES);
+        let oversized_identity = isyncyou_webui::ProductRequestIdentity {
+            request_id: oversized.request_id.clone(),
+            route_domain: AGENT_TURN_ROUTE_DOMAIN,
+            request_scope: format!("session_id:{}", oversized.session_id),
+            payload_digest: identity.payload_digest,
+        };
+        assert_eq!(
+            control
+                .begin_agent_turn_admission_identity(
+                    &oversized,
+                    "01JTURN0000000000000000645",
+                    &oversized_identity,
+                    &oversized.account,
+                    isyncyou_agent::admission_account_digest(&oversized.account).unwrap(),
+                )
+                .unwrap_err(),
+            "turn_admission_unavailable"
+        );
+        drop(control);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn turn_admission_v3_rejects_duplicate_unknown_trailing_and_noncanonical_fields() {
+        let request = isyncyou_webui::AgentTurnRequest {
+            request_id: "019f0000-0000-4000-8000-000000000646".into(),
+            session_id: "01JSESSION00000000000000646".into(),
+            account: "strict-account".into(),
+            prompt: "Find the controlled fixture".into(),
+        };
+        let record = StoredAgentTurnAdmissionV3 {
+            version: 3,
+            turn_id: "01JTURN0000000000000000646".into(),
+            route_domain: AGENT_TURN_ROUTE_DOMAIN.into(),
+            request_scope: format!("session_id:{}", request.session_id),
+            payload_digest: "6666666666666666666666666666666666666666666666666666666666666666"
+                .into(),
+            request: request.clone(),
+            resolved_account_key: request.account.clone(),
+            admission_account_digest: URL_SAFE_NO_PAD
+                .encode(isyncyou_agent::admission_account_digest(&request.account).unwrap()),
+        };
+        let canonical = serde_json::to_string(&record).unwrap();
+        assert_eq!(
+            serde_json::from_str::<StoredAgentTurnAdmissionV3>(&canonical).unwrap(),
+            record
+        );
+        for malformed in [
+            canonical.replacen('{', "{\"version\":3,", 1),
+            canonical.replacen('{', "{\"unknown\":true,", 1),
+            format!("{canonical} true"),
+        ] {
+            assert!(serde_json::from_str::<StoredAgentTurnAdmissionV3>(&malformed).is_err());
+        }
+
+        let root = temp_root("turn-admission-v3-noncanonical");
+        let credential_store = credential_store(&root);
+        let control =
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let identity = isyncyou_webui::ProductRequestIdentity {
+            request_id: request.request_id.clone(),
+            route_domain: AGENT_TURN_ROUTE_DOMAIN,
+            request_scope: format!("session_id:{}", request.session_id),
+            payload_digest: "AB".repeat(32),
+        };
+        assert_eq!(
+            control
+                .begin_agent_turn_admission_identity(
+                    &request,
+                    "01JTURN0000000000000000646",
+                    &identity,
+                    &request.account,
+                    isyncyou_agent::admission_account_digest(&request.account).unwrap(),
+                )
+                .unwrap_err(),
+            "turn_admission_unavailable"
+        );
+        drop(control);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn encrypted_pre_643_turn_admission_fixture_reopens_and_migrates_to_v3() {
+        let metadata: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/agent-turn-admission-v2-meta.json"
+        )))
+        .unwrap();
+        let sealed: Vec<u8> = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/agent-turn-admission-v2.sealed.json"
+        )))
+        .unwrap();
+        assert_eq!(
+            sha256_hex(&sealed),
+            metadata["ciphertext_sha256"].as_str().unwrap()
+        );
+        let request_id = metadata["request_id"].as_str().unwrap();
+        let plaintext = open_row(&[77; 32], "agent-turn-admission", request_id, &sealed).unwrap();
+        assert_eq!(
+            sha256_hex(&plaintext),
+            metadata["plaintext_sha256"].as_str().unwrap()
+        );
+        let legacy: LegacyStoredAgentTurnAdmissionV2 = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(legacy.version, 2);
+        assert_eq!(legacy.request.request_id, request_id);
+
+        let root = temp_root("agent-turn-admission-v2-encrypted-fixture");
+        let credential_store = credential_store(&root);
+        {
+            let control =
+                AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1)
+                    .unwrap();
+            assert_eq!(
+                control
+                    .begin_agent_turn_admission(
+                        &legacy.request,
+                        &legacy.turn_id,
+                        &legacy.payload_digest,
+                    )
+                    .unwrap(),
+                AgentTurnAdmissionBegin::Inserted
+            );
+            let resealed = seal_row(
+                &control.row_wrap_key,
+                "agent-turn-admission",
+                request_id,
+                &plaintext,
+            )
+            .unwrap();
+            control
+                .connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE agent_turn_admissions
+                     SET sealed_request=?1,logical_bytes=?2
+                     WHERE request_id=?3",
+                    params![
+                        resealed,
+                        i64::try_from(sealed.len() + 256).unwrap(),
+                        request_id
+                    ],
+                )
+                .unwrap();
+        }
+
+        let control =
+            AgentControlStore::open(&root, &credential_store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let recovered = control.recover_agent_turn_admissions(8).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].resolved_account_key, None);
+        assert_eq!(recovered[0].admission_account_digest, None);
+        let migrated_digest = control
+            .migrate_agent_turn_admission_v3(request_id, "fixture-account")
+            .unwrap();
+        let recovered = control.recover_agent_turn_admissions(8).unwrap();
+        assert_eq!(
+            recovered[0].resolved_account_key.as_deref(),
+            Some("fixture-account")
+        );
+        assert_eq!(recovered[0].admission_account_digest, Some(migrated_digest));
         drop(control);
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -256,6 +256,16 @@ class RetrievalHandler(BaseHTTPRequestHandler):
 
 
 class CloseoutProbeTest(unittest.TestCase):
+    def test_agent_closeout_probe_accepts_only_stage_progress_v1(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        allowed_start = source.index('    allowed = {\n', source.index("def stream_turn"))
+        allowed_end = source.index("    }\n", allowed_start) + len("    }\n")
+        allowed = source[allowed_start:allowed_end]
+
+        self.assertIn('"stage_progress"', allowed)
+        self.assertIn('"partial_result"', allowed)
+        self.assertNotIn('"search_stage"', allowed)
+
     def test_final_release_integrity_requires_unchanged_snapshots_and_tag_commit(self):
         release = valid_release_snapshot()
         fetches = []

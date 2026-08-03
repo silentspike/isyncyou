@@ -1,13 +1,64 @@
 //! Provider abstraction + streamed events. The turn loop drives any [`LlmProvider`];
 //! [`FakeProvider`] is the deterministic CI provider (no real LLM tokens).
 
+use crate::activity::{PartialResultV1, PublicToolResultV1, StageProgressV1};
 use crate::tool::ToolAction;
-#[cfg(any(
-    feature = "agent-oauth-providers",
-    feature = "agent-subscription-experimental"
-))]
 use crate::AgentError;
 use std::collections::BTreeMap;
+use std::fmt;
+
+/// Fallible, bounded destination for all public turn events.
+pub trait TurnEventSink {
+    fn emit(&mut self, event: StreamEvent) -> Result<(), AgentError>;
+}
+
+impl<F> TurnEventSink for F
+where
+    F: FnMut(StreamEvent),
+{
+    fn emit(&mut self, event: StreamEvent) -> Result<(), AgentError> {
+        self(event);
+        Ok(())
+    }
+}
+
+/// Compatibility adapter for tests and callers whose sink cannot reject an event.
+pub struct InfallibleTurnEventSink<'a> {
+    emit: &'a mut dyn FnMut(StreamEvent),
+}
+
+impl<'a> InfallibleTurnEventSink<'a> {
+    pub fn new(emit: &'a mut dyn FnMut(StreamEvent)) -> Self {
+        Self { emit }
+    }
+}
+
+impl TurnEventSink for InfallibleTurnEventSink<'_> {
+    fn emit(&mut self, event: StreamEvent) -> Result<(), AgentError> {
+        (self.emit)(event);
+        Ok(())
+    }
+}
+
+/// Adapter used by the app-host to preserve backpressure/disconnect failures.
+pub struct FallibleTurnEventSink<F> {
+    emit: F,
+}
+
+impl<F> FallibleTurnEventSink<F> {
+    pub fn new(emit: F) -> Self {
+        Self { emit }
+    }
+}
+
+impl<F> TurnEventSink for FallibleTurnEventSink<F>
+where
+    F: FnMut(StreamEvent) -> Result<(), AgentError>,
+{
+    fn emit(&mut self, event: StreamEvent) -> Result<(), AgentError> {
+        (self.emit)(event)
+    }
+}
 
 /// Why a turn stream reached its terminal `done` event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +95,7 @@ impl ProgressPhase {
 
 /// One streamed event produced while a turn runs. This is the typed event set the
 /// `AgentStreamHub` will carry to the UI (REQ-AGENT-007); here it is emitted via a sink.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum StreamEvent {
     /// Closed lifecycle progress. It carries no provider text or request metadata.
     Progress { phase: ProgressPhase },
@@ -63,21 +114,16 @@ pub enum StreamEvent {
         content: String,
         untrusted: bool,
     },
-    /// A progressive-search stage boundary (S-AG.18/#643): `stage` is "names" (fast
-    /// subject match), "bodies" (full-text), or "deep"; `status` is "running" | "done";
-    /// `hits` is the running deduped total. Lets the UI show a per-stage checkmark.
-    SearchStage {
-        stage: String,
-        status: String,
-        hits: usize,
+    /// Closed, bounded public projection of a Search/DeepSearch result. Provider-only
+    /// content and continuations are carried separately by the read completion.
+    SearchToolResult {
+        id: String,
+        result: PublicToolResultV1,
     },
-    /// Items a search stage added (deduped against earlier stages), streamed so the UI
-    /// can grow the result list before the turn's final answer. Each item is
-    /// source-tagged (`{service, id, name, item_type, path}`).
-    PartialResult {
-        stage: String,
-        items: serde_json::Value,
-    },
+    /// A typed progressive archive-search stage update.
+    StageProgress(StageProgressV1),
+    /// A typed, bounded batch of public search results.
+    PartialResult(PartialResultV1),
     /// A destructive action is awaiting human confirmation (REQ-AGENT-002). The turn
     /// stops here; the model never receives a capability token (REQ-AGENT-004).
     ConfirmationRequired {
@@ -105,9 +151,9 @@ impl StreamEvent {
             Self::Progress { .. } => "progress",
             Self::Token(_) => "token",
             Self::ToolCall { .. } => "tool_call",
-            Self::ToolResult { .. } => "tool_result",
-            Self::SearchStage { .. } => "search_stage",
-            Self::PartialResult { .. } => "partial_result",
+            Self::ToolResult { .. } | Self::SearchToolResult { .. } => "tool_result",
+            Self::StageProgress(_) => "stage_progress",
+            Self::PartialResult(_) => "partial_result",
             Self::ConfirmationRequired { .. } => "confirmation_required",
             Self::Error(_) => "error",
             Self::Done { .. } => "done",
@@ -133,6 +179,20 @@ impl StreamEvent {
             } => serde_json::json!({
                 "event": "tool_result", "id": id, "content": content, "untrusted": untrusted
             }),
+            Self::SearchToolResult { id, result } => {
+                if result.validate().is_err() {
+                    return serde_json::json!({
+                        "event": "error",
+                        "message": "invalid_activity_event"
+                    });
+                }
+                serde_json::json!({
+                    "event": "tool_result",
+                    "id": id,
+                    "content": result,
+                    "untrusted": true
+                })
+            }
             Self::ConfirmationRequired {
                 id,
                 preview,
@@ -151,15 +211,23 @@ impl StreamEvent {
                 "expires_at_ms": expires_at_ms,
                 "token": token
             }),
-            Self::SearchStage {
-                stage,
-                status,
-                hits,
-            } => serde_json::json!({
-                "event": "search_stage", "stage": stage, "status": status, "hits": hits
-            }),
-            Self::PartialResult { stage, items } => {
-                serde_json::json!({ "event": "partial_result", "stage": stage, "items": items })
+            Self::StageProgress(progress) => {
+                if progress.validate().is_err() {
+                    return serde_json::json!({
+                        "event": "error",
+                        "message": "invalid_activity_event"
+                    });
+                }
+                progress.public_json()
+            }
+            Self::PartialResult(result) => {
+                if result.validate().is_err() {
+                    return serde_json::json!({
+                        "event": "error",
+                        "message": "invalid_activity_event"
+                    });
+                }
+                result.public_json()
             }
             Self::Error(e) => serde_json::json!({ "event": "error", "message": e }),
             Self::Done { reason } => {
@@ -170,6 +238,15 @@ impl StreamEvent {
 
     pub fn to_public_json_string(&self) -> String {
         self.to_public_json().to_string()
+    }
+}
+
+impl fmt::Debug for StreamEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StreamEvent")
+            .field("event", &self.event_name())
+            .finish()
     }
 }
 
@@ -196,13 +273,13 @@ pub trait LlmProvider {
     fn next(
         &mut self,
         history: &[crate::turn::Message],
-        emit: &mut dyn FnMut(StreamEvent),
+        emit: &mut dyn TurnEventSink,
     ) -> Result<Vec<AssistantBlock>, crate::AgentError>;
 
     fn next_cancellable(
         &mut self,
         history: &[crate::turn::Message],
-        emit: &mut dyn FnMut(StreamEvent),
+        emit: &mut dyn TurnEventSink,
         _cancellation: Option<&crate::CancellationToken>,
     ) -> Result<Vec<AssistantBlock>, crate::AgentError> {
         self.next(history, emit)
@@ -294,7 +371,7 @@ pub use fake::FakeProvider;
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-pub const HARNESS_CONTRACT_VERSION: u32 = 1;
+pub const HARNESS_CONTRACT_VERSION: u32 = 2;
 
 /// Which provider's positive harness allowlist to enforce.
 #[cfg(any(
@@ -882,12 +959,77 @@ pub fn attest_static_product_harness(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::activity::{
+        ActivityKind, PartialResultV1, PublicToolResultV1, SearchStage, StageProgressV1,
+        StageStatus, ACTIVITY_SCHEMA_VERSION,
+    };
     use serde_json::json;
     #[cfg(any(
         feature = "agent-oauth-providers",
         feature = "agent-subscription-experimental"
     ))]
     use std::collections::BTreeSet;
+
+    const ACTIVITY_ID: &str = "abcdefghijklmnopqrstuv";
+
+    #[test]
+    fn stream_event_debug_does_not_expose_search_content_or_continuation() {
+        let event = StreamEvent::StageProgress(StageProgressV1 {
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            activity_id: ACTIVITY_ID.into(),
+            activity_kind: ActivityKind::ArchiveSearch,
+            stage: SearchStage::Deep,
+            status: StageStatus::Running,
+            scanned: 1,
+            total: None,
+            hits: 0,
+            current_item: Some("private-visible-label".into()),
+            coverage_complete: None,
+            budget_reached: None,
+            continuation_available: Some(true),
+        });
+        let debug = format!("{event:?}");
+        assert_eq!(debug, "StreamEvent { event: \"stage_progress\" }");
+        assert!(!debug.contains(ACTIVITY_ID));
+        assert!(!debug.contains("private-visible-label"));
+        assert!(!debug.contains("continuation"));
+    }
+
+    #[test]
+    fn deep_context_is_provider_only_and_absent_from_public_stream() {
+        let private_context = "private-deep-context-with-candidate-authority";
+        let event = StreamEvent::SearchToolResult {
+            id: "tool-public-id".into(),
+            result: PublicToolResultV1 {
+                schema_version: ACTIVITY_SCHEMA_VERSION,
+                operation: "deep-search".into(),
+                activity_id: ACTIVITY_ID.into(),
+                visible_hits: 0,
+                coverage_complete: false,
+                budget_reached: false,
+                continuation_available: true,
+                sources: Vec::new(),
+            },
+        };
+        let public = event.to_public_json().to_string();
+        assert!(!public.contains(private_context));
+        assert!(!public.contains("candidate"));
+        assert!(!public.contains("deep_context"));
+        assert!(!public.contains("continuation\""));
+    }
+
+    #[test]
+    fn legacy_search_stage_event_is_absent() {
+        let event = StreamEvent::PartialResult(PartialResultV1 {
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            activity_id: ACTIVITY_ID.into(),
+            stage: SearchStage::Names,
+            sequence: 0,
+            items: Vec::new(),
+        });
+        assert_eq!(event.event_name(), "partial_result");
+        assert!(!event.to_public_json().to_string().contains("search_stage"));
+    }
 
     #[cfg(any(
         feature = "agent-oauth-providers",

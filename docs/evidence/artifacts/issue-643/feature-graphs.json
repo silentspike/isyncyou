@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "implementation_commit": "65e96ddfe8cd05be62b2fae54b78ec5665cef882",
+  "commands": [
+    "cargo remote -c -- tree -e features -p isyncyou-daemon",
+    "cargo remote -c -- tree -e features -p isyncyou-mobile",
+    "cargo remote -c -- tree -e features -p isyncyou-mobile --features agent-oauth-providers",
+    "cargo remote -c -- tree -e features -i isyncyou-agent -p isyncyou-mobile --features agent-oauth-providers --depth 4"
+  ],
+  "daemon": {
+    "isyncyou_agent_retrieval": true
+  },
+  "mobile_product": {
+    "agent_oauth_providers_forwards_to_app_host": true,
+    "app_host_agent_oauth_providers_forwards_to_agent": true,
+    "isyncyou_agent_retrieval": true,
+    "isyncyou_agent_onedrive": true
+  },
+  "minimal_stub_is_not_product_ready": true,
+  "experimental_subscription_feature_present": false,
+  "state": "pass"
+}

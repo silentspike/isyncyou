@@ -496,3 +496,44 @@ requirements:
       - test: user_presence_and_agent_session_routes_require_session_cap_strict_json_and_no_store
       - file: tools/agent-epic-closeout-probe.py
       - file: docs/evidence/issue-628-pre-rc-manifest.json
+
+  - id: REQ-AGENT-017
+    title: Progressive archive search is bounded, source-tagged, and truthful about coverage
+    statement: >
+      Product archive search emits an ephemeral, versioned names -> bodies -> deep
+      activity stream. Indexed name and body stages are paged and do not open archived
+      body files. Deep reads require a model-selected, authenticated candidate from the
+      same turn, canonical account, query, service set, and originating Search activity;
+      every read and provider continuation remains inside explicit descriptor, byte,
+      token, step, event, and time budgets. Provider-only continuations, candidates,
+      queries, and excerpts never enter the public stream. Structured sources and one
+      deterministic coverage finalization survive restart recovery without reparsing a
+      public ToolResult. (S-AG.18, #643)
+    status: implemented
+    design: docs/adr/007-agent-architecture.md
+    acceptance:
+      - Name and body FTS stages use stable bounded pages, account/service scope, deterministic dedupe, and no archived body-file reads.
+      - DeepSearch accepts only authenticated model-selected candidates and keeps a Search continuation valid across a later DeepSearch tool-use ID while rejecting a changed origin, turn, query, service set, page, or candidate.
+      - Archive body reads use one verified no-follow handle, reject unsafe owner/mode/link/reparse metadata, enforce separate plaintext/envelope caps before allocation, and stop cooperatively.
+      - Public stage/result projections are closed and bounded; provider content is separately typed and progressive input is admitted against both byte and selected-model token budgets before every provider step.
+      - Read completion carries structured sources and finalization state into V2 persistence; legacy V1 actions are classified before V2 semantic-digest validation and never fabricate historical progress.
+      - One all-exit finalizer closes every opened stage for final, pending, error, cancellation, outcome-unknown, and step-limit exits; streamed and persisted final text remain deterministic.
+      - Product StoreArchive wiring uses harness contract v2; matching active credentials are re-attested locally without OAuth or credential-generation rotation, while old-harness journals remain fenced.
+      - Baseline WebUI, SSE, and Android bridge accept only the versioned public projection and never render or record model-private continuation or candidate authority.
+    verified_by:
+      - test: progressive_search_streams_staged_deduped_results
+      - test: deep_search_surfaces_keyword_less_candidate_and_excludes_matched
+      - test: search_tool_id_a_continuation_is_accepted_by_deep_search_tool_id_b
+      - test: progressive_provider_budget_exhaustion_stops_before_read_and_omits_continuation
+      - test: archive_deep_body_rejects_unix_hardlink_before_read
+      - test: archive_deep_windows_rejects_ancestor_and_final_reparse_points
+      - test: progressive_search_finish_with_exit_closes_every_turn_outcome
+      - test: legacy_v1_encrypted_fixture_verifies_original_object_and_semantic_digests
+      - test: encrypted_pre_643_turn_admission_fixture_reopens_and_migrates_to_v3
+      - test: restart_before_terminal_commit_uses_finalized_v2_outcome_not_generic_fast_path
+      - test: product_agent_feature_uses_store_archive_progressive_executor
+      - test: old_harness_journal_fails_provider_generation_changed_before_executor
+      - test: assistant_baseline_never_renders_continuation_or_candidate_handles
+      - test: android_bridge_forwards_only_bounded_public_progress_projection
+      - file: tools/agent-progressive-search-probe.py
+      - file: docs/evidence/issue-643-manifest.json

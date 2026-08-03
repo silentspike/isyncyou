@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "implementation_commit": "65e96ddfe8cd05be62b2fae54b78ec5665cef882",
+  "artifact": {
+    "kind": "default-debug-apk",
+    "sha256": "3bb39954ec3893a5e06fe4f3137b69f986110914ca19b98904ef6b7ab29391f3",
+    "bytes": 23045320,
+    "test_hook_markers_present": false
+  },
+  "build": {
+    "rust_native_build": "remote-pass",
+    "gradle_unit_tests": "pass",
+    "gradle_lint": "pass",
+    "gradle_assemble": "pass",
+    "connected_instrumentation": "pass"
+  },
+  "product_row": {
+    "provider": "claude",
+    "stage_order": [
+      "names",
+      "bodies",
+      "deep"
+    ],
+    "stage_states": {
+      "names": "complete",
+      "bodies": "complete",
+      "deep": "skipped"
+    },
+    "terminal": "complete",
+    "source_count": 1,
+    "all_sources_resolved": true,
+    "public_body_excerpt": false
+  },
+  "cleanup": {
+    "temporary_sensitive_readbacks_removed": true,
+    "adb_forward_removed": true,
+    "device_lock_released": true,
+    "provider_or_account_logout_performed": false
+  },
+  "redaction": {
+    "device_serial_included": false,
+    "account_identity_included": false,
+    "query_included": false,
+    "source_id_or_path_included": false,
+    "body_included": false,
+    "token_included": false
+  },
+  "state": "pass"
+}

@@ -2,7 +2,7 @@
 //! and uses **no** real LLM token (REQ-AGENT-008), so the whole turn/tool/stream
 //! machinery can be exercised in CI.
 
-use super::{AssistantBlock, LlmProvider, StreamEvent};
+use super::{AssistantBlock, LlmProvider, StreamEvent, TurnEventSink};
 
 /// Replays a fixed script: each call to [`LlmProvider::next`] pops the next response
 /// (a list of [`AssistantBlock`]s). Text blocks are streamed token-by-token so the
@@ -28,13 +28,13 @@ impl LlmProvider for FakeProvider {
     fn next(
         &mut self,
         _history: &[crate::turn::Message],
-        emit: &mut dyn FnMut(StreamEvent),
+        emit: &mut dyn TurnEventSink,
     ) -> Result<Vec<AssistantBlock>, crate::AgentError> {
         let blocks = self.script.pop_front().unwrap_or_default();
         for b in &blocks {
             if let AssistantBlock::Text(t) = b {
                 for tok in t.split_inclusive(' ') {
-                    emit(StreamEvent::Token(tok.to_string()));
+                    emit.emit(StreamEvent::Token(tok.to_string()))?;
                 }
             }
         }

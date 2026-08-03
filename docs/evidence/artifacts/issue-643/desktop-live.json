@@ -1,0 +1,222 @@
+{
+  "cleanup": {
+    "daemon_stopped": true,
+    "runtime_files_cleaned": true
+  },
+  "daemon_binary_sha256": "aa3493a510add6cb263e14097b6ed8f65b38970b832a4c2554e0dfe1c946fb15",
+  "implementation_commit": "65e96ddfe8cd05be62b2fae54b78ec5665cef882",
+  "managed_daemon": true,
+  "mode": "live",
+  "progressive_search": {
+    "activity_count": 1,
+    "all_sources_resolved": true,
+    "budget_stop_observed": true,
+    "continuation_available_observed": false,
+    "error_code": null,
+    "ordered_event_types": [
+      "progress",
+      "tool_call",
+      "stage_progress",
+      "stage_progress",
+      "stage_progress",
+      "stage_progress",
+      "stage_progress",
+      "partial_result",
+      "stage_progress",
+      "stage_progress",
+      "stage_progress",
+      "stage_progress",
+      "stage_progress",
+      "stage_progress",
+      "stage_progress",
+      "tool_result",
+      "token",
+      "token",
+      "token",
+      "token",
+      "token",
+      "done"
+    ],
+    "partial_updates": [
+      {
+        "activity": "sha256:c0dd4b1b2146f05795b5c9922eee0ea50c2897f509fb2d174ffbd54f6ddc78f2",
+        "item_count": 1,
+        "result_key_digests": [
+          "sha256:a81dbd525bd6b9c0f2597cd8dd5a6dadbb3667a74a97ee548b7cf6e28e62b797"
+        ],
+        "sequence": 0,
+        "stage": "names"
+      }
+    ],
+    "replay_count": 0,
+    "result_count": 1,
+    "source_count": 1,
+    "stage_updates": [
+      {
+        "activity": "sha256:c0dd4b1b2146f05795b5c9922eee0ea50c2897f509fb2d174ffbd54f6ddc78f2",
+        "budget_reached": null,
+        "continuation_available": null,
+        "coverage_complete": null,
+        "current_item_present": false,
+        "hits": 0,
+        "scanned": 0,
+        "stage": "names",
+        "status": "queued",
+        "total": null
+      },
+      {
+        "activity": "sha256:c0dd4b1b2146f05795b5c9922eee0ea50c2897f509fb2d174ffbd54f6ddc78f2",
+        "budget_reached": null,
+        "continuation_available": null,
+        "coverage_complete": null,
+        "current_item_present": false,
+        "hits": 0,
+        "scanned": 0,
+        "stage": "bodies",
+        "status": "queued",
+        "total": null
+      },
+      {
+        "activity": "sha256:c0dd4b1b2146f05795b5c9922eee0ea50c2897f509fb2d174ffbd54f6ddc78f2",
+        "budget_reached": null,
+        "continuation_available": null,
+        "coverage_complete": null,
+        "current_item_present": false,
+        "hits": 0,
+        "scanned": 0,
+        "stage": "deep",
+        "status": "queued",
+        "total": null
+      },
+      {
+        "activity": "sha256:c0dd4b1b2146f05795b5c9922eee0ea50c2897f509fb2d174ffbd54f6ddc78f2",
+        "budget_reached": null,
+        "continuation_available": null,
+        "coverage_complete": null,
+        "current_item_present": false,
+        "hits": 0,
+        "scanned": 0,
+        "stage": "names",
+        "status": "running",
+        "total": null
+      },
+      {
+        "activity": "sha256:c0dd4b1b2146f05795b5c9922eee0ea50c2897f509fb2d174ffbd54f6ddc78f2",
+        "budget_reached": null,
+        "continuation_available": null,
+        "coverage_complete": null,
+        "current_item_present": true,
+        "hits": 0,
+        "scanned": 1,
+        "stage": "names",
+        "status": "running",
+        "total": null
+      },
+      {
+        "activity": "sha256:c0dd4b1b2146f05795b5c9922eee0ea50c2897f509fb2d174ffbd54f6ddc78f2",
+        "budget_reached": true,
+        "continuation_available": false,
+        "coverage_complete": false,
+        "current_item_present": true,
+        "hits": 1,
+        "scanned": 1,
+        "stage": "names",
+        "status": "complete",
+        "total": null
+      },
+      {
+        "activity": "sha256:c0dd4b1b2146f05795b5c9922eee0ea50c2897f509fb2d174ffbd54f6ddc78f2",
+        "budget_reached": null,
+        "continuation_available": null,
+        "coverage_complete": null,
+        "current_item_present": false,
+        "hits": 1,
+        "scanned": 0,
+        "stage": "bodies",
+        "status": "running",
+        "total": null
+      },
+      {
+        "activity": "sha256:c0dd4b1b2146f05795b5c9922eee0ea50c2897f509fb2d174ffbd54f6ddc78f2",
+        "budget_reached": false,
+        "continuation_available": false,
+        "coverage_complete": true,
+        "current_item_present": false,
+        "hits": 1,
+        "scanned": 0,
+        "stage": "bodies",
+        "status": "complete",
+        "total": null
+      },
+      {
+        "activity": "sha256:c0dd4b1b2146f05795b5c9922eee0ea50c2897f509fb2d174ffbd54f6ddc78f2",
+        "budget_reached": null,
+        "continuation_available": null,
+        "coverage_complete": null,
+        "current_item_present": false,
+        "hits": 1,
+        "scanned": 0,
+        "stage": "deep",
+        "status": "running",
+        "total": null
+      },
+      {
+        "activity": "sha256:c0dd4b1b2146f05795b5c9922eee0ea50c2897f509fb2d174ffbd54f6ddc78f2",
+        "budget_reached": null,
+        "continuation_available": null,
+        "coverage_complete": null,
+        "current_item_present": true,
+        "hits": 1,
+        "scanned": 25,
+        "stage": "deep",
+        "status": "running",
+        "total": null
+      },
+      {
+        "activity": "sha256:c0dd4b1b2146f05795b5c9922eee0ea50c2897f509fb2d174ffbd54f6ddc78f2",
+        "budget_reached": null,
+        "continuation_available": null,
+        "coverage_complete": null,
+        "current_item_present": true,
+        "hits": 1,
+        "scanned": 50,
+        "stage": "deep",
+        "status": "running",
+        "total": null
+      },
+      {
+        "activity": "sha256:c0dd4b1b2146f05795b5c9922eee0ea50c2897f509fb2d174ffbd54f6ddc78f2",
+        "budget_reached": true,
+        "continuation_available": false,
+        "coverage_complete": false,
+        "current_item_present": true,
+        "hits": 1,
+        "scanned": 65,
+        "stage": "deep",
+        "status": "skipped",
+        "total": null
+      }
+    ],
+    "terminal_reason": "complete"
+  },
+  "provider": "claude",
+  "redaction": {
+    "body_or_snippet_included": false,
+    "prompt_included": false,
+    "provider_request_included": false,
+    "raw_tool_result_included": false,
+    "sender_or_email_included": false,
+    "source_id_or_path_included": false,
+    "token_included": false
+  },
+  "request": "sha256:3109bded4ba940f94769089d6549f00b8c405516a80086f162e04997415910ef",
+  "request_status": {
+    "code": "ok",
+    "state": "committed",
+    "terminal": true
+  },
+  "retry_reused_turn": true,
+  "schema_version": 1,
+  "state": "pass",
+  "turn": "sha256:b550d07bbcae6c2a1dda2a1f1cf34fda384107b854579db33b132ed7ae9a3067"
+}

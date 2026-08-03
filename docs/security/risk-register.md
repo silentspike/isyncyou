@@ -126,6 +126,17 @@ README's [Known limitations](../../README.md#known-limitations).
 
 ---
 
+## R13 — Progressive search leaks private context or exceeds archive bounds
+
+| | |
+|---|---|
+| **Risk** | Model-only candidates, continuations, queries, excerpts, or local archive paths reach the public stream; progressive FTS/body work exceeds resource limits; a linked/replaced body escapes the selected archive; or restart recovery publishes different coverage/source state. |
+| **Impact** | High — personal content or local path disclosure, cross-account reads, resource exhaustion, misleading coverage, or inconsistent cited answers. |
+| **Mitigation** | #643 uses separate provider/public result types; authenticated account/turn/query/service/Search-origin authority; bounded SQL pages and interrupt handlers; model-selected candidate pages; descriptor/body/event/provider-byte/model-token/provider-step caps; and one verified no-follow body handle with owner/mode/link/reparse validation. Structured sources and one all-exit finalization marker are persisted in the V2 recovery contract. Harness-v2 startup re-attestation is local and generation-preserving; old-harness journals fail closed. |
+| **Status** | **In progress** — implementation and focused host/UI/Android contract tests exist on the #643 branch, but the immutable implementation commit, full host/Windows CI gates, controlled desktop provider row, mandatory default-APK row, evidence manifest, protected PR checks, and merge are not yet complete. REQ-AGENT-017 therefore remains planned. Design: [ADR-007](../adr/007-agent-architecture.md). |
+
+---
+
 ## How this register is maintained
 
 A risk is added the moment it is understood, with an honest status — not after it is
