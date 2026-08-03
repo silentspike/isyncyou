@@ -25,6 +25,9 @@ const SCENARIO = scenarioFlag >= 0 ? process.argv[scenarioFlag + 1] : "all";
 if (!["all", "functional", "containment"].includes(SCENARIO)) {
   throw new Error("--scenario requires all, functional, or containment");
 }
+if (SCENARIO !== "all" && outFlag < 0) {
+  throw new Error("focused scenarios require an explicit --out directory");
+}
 const CAPTURE_SCREENSHOTS = SCENARIO === "all";
 const ASSERT_PERFORMANCE = SCENARIO === "all";
 const ACTIVITY_ID = "abcdefghijklmnopqrstuv";
