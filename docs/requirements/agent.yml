@@ -537,3 +537,24 @@ requirements:
       - test: android_bridge_forwards_only_bounded_public_progress_projection
       - file: tools/agent-progressive-search-probe.py
       - file: docs/evidence/issue-643-manifest.json
+
+  - id: REQ-AGENT-018
+    title: Living Agent UI renders bounded and truthful activity
+    statement: >
+      The product Assistant consumes only the typed public progressive-search event
+      projection and renders bounded, ephemeral operational activity for the active
+      turn. A turn-local reducer owns stage transitions, counters, deduplicated result
+      cards, frame-batched provider tokens, follow-mode scrolling, reduced-motion
+      behavior, and one generic already-authorized operation presentation. It never
+      exposes provider reasoning, private search authority, body excerpts, or durable
+      activity state. (S-AG.19, #644)
+    status: planned
+    design: docs/adr/007-agent-architecture.md
+    acceptance:
+      - The first valid archive-search event shows the complete names, bodies, and deep plan while closed monotonic transitions and producer-aligned bounds prevent replay, gaps, or event floods from creating misleading UI state.
+      - Incremental public results are keyed and enriched without duplicates, use only text-safe public metadata, and never display body excerpts, provider-private continuation data, or raw event payloads.
+      - Provider token order is preserved while DOM writes are frame-batched; follow mode scrolls only while the reader remains near the bottom and exposes a deterministic return-to-latest control otherwise.
+      - Operational feedback uses closed local labels rather than model reasoning; direct single-step responses do not fabricate an activity plan and an existing non-search operation uses the same visual language without changing authority.
+      - Reduced-motion, keyboard, screen-reader, mobile, desktop, cancellation, failure, pending-confirmation, and terminal states remain complete and truthful.
+      - Activity plans, counters, result cards, and animation remain ephemeral and are not added to SessionRecordV2, cross-device history, provider input, or analytics.
+    verified_by: []
