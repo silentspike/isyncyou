@@ -2,6 +2,9 @@
 //
 // Reuses the real WebUI assets and the established loopback fixture server. All
 // streamed values are synthetic public projections; no account or provider is used.
+// The default `all` scenario remains the evidence gate. `functional` skips only
+// host-sensitive performance assertions and screenshots, while `containment`
+// exercises the stale/rejected event boundary for focused iteration.
 import { chromium } from "playwright";
 import fs from "node:fs";
 import path from "node:path";
@@ -14,6 +17,16 @@ if (outFlag >= 0 && !process.argv[outFlag + 1]) throw new Error("--out requires 
 const OUT = outFlag >= 0
   ? path.resolve(REPO, process.argv[outFlag + 1])
   : path.join(REPO, "docs/evidence/artifacts/issue-644");
+const scenarioFlag = process.argv.indexOf("--scenario");
+if (scenarioFlag >= 0 && !process.argv[scenarioFlag + 1]) {
+  throw new Error("--scenario requires all, functional, or containment");
+}
+const SCENARIO = scenarioFlag >= 0 ? process.argv[scenarioFlag + 1] : "all";
+if (!["all", "functional", "containment"].includes(SCENARIO)) {
+  throw new Error("--scenario requires all, functional, or containment");
+}
+const CAPTURE_SCREENSHOTS = SCENARIO === "all";
+const ASSERT_PERFORMANCE = SCENARIO === "all";
 const ACTIVITY_ID = "abcdefghijklmnopqrstuv";
 const LONG_PUBLIC_NAME = "<img src=x onerror=window.__livingInjected=true> " + "Long public label ".repeat(7);
 const FINAL_TEXT = ("A source-backed fixture summary remains exact. ".repeat(16)).slice(0, 500);
@@ -343,6 +356,7 @@ async function main() {
   fs.mkdirSync(OUT, { recursive: true });
   const report = {
     evidence_version: 1,
+    scenario: SCENARIO,
     ok: false,
     assertions: [],
     assertion_count: 0,
@@ -353,7 +367,9 @@ async function main() {
     non_self_request_count: 0,
     performance: {},
     reducer_bounds: {},
-    screenshots: ["desktop-running.png", "desktop-terminal.png", "mobile-terminal.png", "reduced-motion.png"],
+    screenshots: CAPTURE_SCREENSHOTS
+      ? ["desktop-running.png", "desktop-terminal.png", "mobile-terminal.png", "reduced-motion.png"]
+      : [],
   };
   const fixtureEvidence = {
     fixture404: [], fixtureErrors: [], console_errors: [], page_errors: [], browser_requests: [],
@@ -449,9 +465,42 @@ async function main() {
     check(report, "account switcher never renders internal account aliases",
       !accountLabels.rendered.includes("controlled") && !accountLabels.rendered.includes("me"));
 
+    let lifecycle;
+    if (SCENARIO === "containment") {
+      const invalidProgress = await sendPrompt(page, "living invalid progress");
+      check(report, "repeated invalid progress produces one bounded warning",
+        await invalidProgress.locator('[data-agent-stream-error="1"]').count() === 1);
+      check(report, "rejected partial progress produces no citations",
+        await invalidProgress.locator('[data-agent-citation]').count() === 0);
+
+      report.reducer_bounds = await reducerBoundaryProbe(page);
+      check(report, "terminal teardown erases reducer results and rejects stale events",
+        report.reducer_bounds.terminal_results === 0
+        && report.reducer_bounds.stale === "stale"
+        && report.reducer_bounds.post_terminal === 1);
+      check(report, "rejected partial results cannot add citations",
+        report.reducer_bounds.rejected_citations === 0);
+      check(report, "stale queued events cannot register pending actions",
+        report.reducer_bounds.stale_pending_delta === 0);
+      check(report, "running counter regression remains rejected",
+        report.reducer_bounds.running_regression === "invalid");
+
+      lifecycle = await page.evaluate(() => ({
+        activity_cleanup: AssistantState.activeActivityCleanup === null,
+        token_cleanup: AssistantState.activeTokenCleanup === null,
+        active_stream: AssistantState.activeStream === null,
+        visible_carets: document.querySelectorAll(".asst-token-caret:not([hidden])").length,
+        perf: window.__livingPerf,
+      }));
+      check(report, "terminal paths release stream renderer and token resources",
+        lifecycle.activity_cleanup && lifecycle.token_cleanup
+        && lifecycle.active_stream && lifecycle.visible_carets === 0);
+    } else {
     const searchMessage = await sendPrompt(page, "living search", async message => {
       await message.locator(".asst-stage.running").waitFor();
-      await page.screenshot({ path: path.join(OUT, "desktop-running.png"), fullPage: true });
+      if (CAPTURE_SCREENSHOTS) {
+        await page.screenshot({ path: path.join(OUT, "desktop-running.png"), fullPage: true });
+      }
       await page.evaluate(() => {
         window.__livingPerf.long = [];
         window.__livingPerf.cls = 0;
@@ -542,7 +591,9 @@ async function main() {
     check(report, "token caret stops at terminal", tokenMetrics.caret_hidden);
     check(report, "public UI contains no body excerpt fields", !(await searchMessage.innerText()).includes("body_excerpt"));
     check(report, "desktop labels and counters do not overlap", await noOverlap(page));
-    await page.screenshot({ path: path.join(OUT, "desktop-terminal.png"), fullPage: true });
+    if (CAPTURE_SCREENSHOTS) {
+      await page.screenshot({ path: path.join(OUT, "desktop-terminal.png"), fullPage: true });
+    }
 
     const direct = await sendPrompt(page, "living direct");
     check(report, "direct answer has no activity plan", await direct.locator(".asst-activity-host").count() === 0);
@@ -615,15 +666,19 @@ async function main() {
       return animation;
     });
     check(report, "reduced motion disables decorative result animation", reducedAnimations === "none");
-    await page.screenshot({ path: path.join(OUT, "reduced-motion.png"), fullPage: true });
+    if (CAPTURE_SCREENSHOTS) {
+      await page.screenshot({ path: path.join(OUT, "reduced-motion.png"), fullPage: true });
+    }
 
     await page.setViewportSize({ width: 390, height: 844 });
     check(report, "compact layout has no horizontal page overflow",
       await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth));
     check(report, "compact labels and counters do not overlap", await noOverlap(page));
-    await page.screenshot({ path: path.join(OUT, "mobile-terminal.png"), fullPage: true });
+    if (CAPTURE_SCREENSHOTS) {
+      await page.screenshot({ path: path.join(OUT, "mobile-terminal.png"), fullPage: true });
+    }
 
-    const lifecycle = await page.evaluate(() => ({
+    lifecycle = await page.evaluate(() => ({
       activity_cleanup: AssistantState.activeActivityCleanup === null,
       token_cleanup: AssistantState.activeTokenCleanup === null,
       active_stream: AssistantState.activeStream === null,
@@ -647,8 +702,13 @@ async function main() {
         .map(([key, value]) => [key, Math.round(value * 100) / 100])),
       cumulative_layout_shift: Math.round(rendererPerf.cls * 100000) / 100000,
     };
-    check(report, "controlled renderer has no long task above 100 ms", report.performance.max_long_task_ms <= 100);
-    check(report, "controlled renderer cumulative layout shift stays below 0.1", report.performance.cumulative_layout_shift < 0.1);
+    if (ASSERT_PERFORMANCE) {
+      check(report, "controlled renderer has no long task above 100 ms",
+        report.performance.max_long_task_ms <= 100);
+      check(report, "controlled renderer cumulative layout shift stays below 0.1",
+        report.performance.cumulative_layout_shift < 0.1);
+    }
+    }
 
     const nonSelf = requests.filter(raw => {
       try { return new URL(raw).origin !== origin; } catch (_) { return true; }
@@ -678,7 +738,7 @@ async function main() {
     fs.writeFileSync(path.join(OUT, "ui-smoke.json"), JSON.stringify(report, null, 2) + "\n");
   }
   if (!report.ok) process.exitCode = 1;
-  else console.log(`agent-living-ui-smoke: ${report.assertion_count} assertions passed`);
+  else console.log(`agent-living-ui-smoke(${SCENARIO}): ${report.assertion_count} assertions passed`);
 }
 
 await main();
