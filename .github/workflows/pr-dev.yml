@@ -59,6 +59,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6.0.0
+      - name: Verify immutable workflow action pins
+        run: python3 tools/check_workflow_pins.py
+      - name: Verify external contribution policy
+        run: python3 -m unittest tools.test_external_contribution_policy
       - name: No code/CI changes — skip compile gate
         if: needs.changes.outputs.code != 'true'
         run: echo "No Rust/Cargo/CI changes in this PR — compile gate skipped."

@@ -365,9 +365,12 @@ live cloud refresh, download notifications, Dolphin overlays).
 
 ## Contributing
 
-Issues and PRs are welcome. PRs are gated on `fmt`, `clippy -D warnings`, the test
-suite and `cargo deny`; see [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow and
-[SECURITY.md](SECURITY.md) for how to report vulnerabilities.
+Public bug reports and focused product suggestions are welcome in the
+[feedback tracker](https://github.com/silentspike/isyncyou-feedback/issues/new/choose).
+This source repository's Issues are reserved for collaborator engineering work,
+and external pull requests are closed automatically. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the workflow and [SECURITY.md](SECURITY.md)
+for private vulnerability reporting.
 
 ## License
 
