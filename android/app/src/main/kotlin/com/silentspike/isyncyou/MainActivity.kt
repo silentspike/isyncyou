@@ -946,8 +946,12 @@ class MainActivity : FragmentActivity() {
             while (bridgeStreams[jsId] == nativeId) {
                 val ev = NativeEngine.nativeStreamNext(nativeId)
                 if (ev.isEmpty()) break
-                // ev is a JSON {event,data} object — embed it as the `ev` field.
-                reply.postMessage(streamEventJson(jsId, ev))
+                val envelope = BridgeMessagePolicy.outboundStreamEventJson(jsId, ev)
+                if (envelope == null) {
+                    reply.postMessage(streamErrorJson(jsId, "stream_event_rejected"))
+                    break
+                }
+                reply.postMessage(envelope)
             }
         } finally {
             bridgeStreams.remove(jsId)
@@ -959,14 +963,12 @@ class MainActivity : FragmentActivity() {
     private fun streamEndJson(jsId: String): String =
         JSONObject().put("t", "end").put("id", jsId).toString()
 
-    private fun streamEventJson(jsId: String, ev: String): String {
-        val event = try {
-            JSONObject(ev)
-        } catch (_: Exception) {
-            JSONObject().put("error", "bad_stream_event")
-        }
-        return JSONObject().put("t", "evt").put("id", jsId).put("ev", event).toString()
-    }
+    private fun streamErrorJson(jsId: String, code: String): String =
+        JSONObject()
+            .put("t", "evt")
+            .put("id", jsId)
+            .put("ev", JSONObject().put("event", "error").put("message", code))
+            .toString()
 
     /**
      * Decode the framed bytes from [NativeEngine.nativeAssetRequest] (#0A) into a

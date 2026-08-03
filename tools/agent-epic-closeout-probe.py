@@ -875,7 +875,7 @@ def stream_turn(client: RuntimeClient, turn_id: str, timeout: float) -> dict[str
         "token",
         "tool_call",
         "tool_result",
-        "search_stage",
+        "stage_progress",
         "partial_result",
         "confirmation_required",
         "error",

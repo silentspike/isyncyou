@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "implementation_commit": "65e96ddfe8cd05be62b2fae54b78ec5665cef882",
+  "tests": {
+    "progressive_search_cancel_during_each_stage_stops_further_io": "pass",
+    "progressive_search_provider_error_fails_current_and_skips_future_stages": "pass",
+    "progressive_search_outcome_unknown_persists_no_coverage_success": "pass",
+    "progressive_search_finish_with_exit_closes_every_turn_outcome": "pass",
+    "progressive_search_finish_with_exit_is_called_once_for_every_turn_outcome": "pass",
+    "progressive_search_terminal_delivery_is_not_claimed_after_sink_loss": "pass",
+    "progressive_final_recovery_without_marker_is_outcome_unknown": "pass",
+    "progressive_exit_and_finalization_mismatch_is_outcome_unknown": "pass",
+    "legacy_v1_encrypted_fixture_verifies_original_object_and_semantic_digests": "pass",
+    "old_harness_journal_fails_provider_generation_changed_before_executor": "pass"
+  },
+  "observed_contract": {
+    "cancel_and_deadline_errors_preserved": true,
+    "no_partial_result_after_cancel": true,
+    "recovery_compare_emits_no_public_progress": true,
+    "structured_sources_survive_recovery": true,
+    "all_turn_exits_close_open_stages": true
+  },
+  "state": "pass"
+}

@@ -1,0 +1,165 @@
+{
+  "fixture_kind": "synthetic",
+  "fixture_sha256": "sha256:2bf152288fb8b41e1d8414993f9c0e31f7bdadecd4c3b9e6f215c38522de03ea",
+  "implementation_commit": "65e96ddfe8cd05be62b2fae54b78ec5665cef882",
+  "mode": "fixture",
+  "progressive_search": {
+    "activity_count": 1,
+    "all_sources_resolved": true,
+    "budget_stop_observed": false,
+    "continuation_available_observed": false,
+    "error_code": null,
+    "keywordless_selection_observed": true,
+    "ordered_event_types": [
+      "stage_progress",
+      "stage_progress",
+      "stage_progress",
+      "stage_progress",
+      "stage_progress",
+      "stage_progress",
+      "stage_progress",
+      "stage_progress",
+      "partial_result",
+      "stage_progress",
+      "token",
+      "done"
+    ],
+    "partial_updates": [
+      {
+        "activity": "sha256:610d969612115c93814ed425467301e06c157dbe9351b839698473e86eb40954",
+        "item_count": 1,
+        "result_key_digests": [
+          "sha256:3ba5696be590f343f9f5e9eb11561a22d31fd7fe3280d0929e39d97eb9012d94"
+        ],
+        "sequence": 0,
+        "stage": "deep"
+      }
+    ],
+    "replay_count": 0,
+    "result_count": 1,
+    "scripted_selection_count": 1,
+    "source_count": 1,
+    "stage_updates": [
+      {
+        "activity": "sha256:610d969612115c93814ed425467301e06c157dbe9351b839698473e86eb40954",
+        "budget_reached": null,
+        "continuation_available": null,
+        "coverage_complete": null,
+        "current_item_present": true,
+        "hits": 0,
+        "scanned": 0,
+        "stage": "names",
+        "status": "queued",
+        "total": null
+      },
+      {
+        "activity": "sha256:610d969612115c93814ed425467301e06c157dbe9351b839698473e86eb40954",
+        "budget_reached": null,
+        "continuation_available": null,
+        "coverage_complete": null,
+        "current_item_present": true,
+        "hits": 0,
+        "scanned": 0,
+        "stage": "bodies",
+        "status": "queued",
+        "total": null
+      },
+      {
+        "activity": "sha256:610d969612115c93814ed425467301e06c157dbe9351b839698473e86eb40954",
+        "budget_reached": null,
+        "continuation_available": null,
+        "coverage_complete": null,
+        "current_item_present": true,
+        "hits": 0,
+        "scanned": 0,
+        "stage": "deep",
+        "status": "queued",
+        "total": null
+      },
+      {
+        "activity": "sha256:610d969612115c93814ed425467301e06c157dbe9351b839698473e86eb40954",
+        "budget_reached": null,
+        "continuation_available": null,
+        "coverage_complete": null,
+        "current_item_present": true,
+        "hits": 1,
+        "scanned": 1,
+        "stage": "names",
+        "status": "running",
+        "total": null
+      },
+      {
+        "activity": "sha256:610d969612115c93814ed425467301e06c157dbe9351b839698473e86eb40954",
+        "budget_reached": null,
+        "continuation_available": null,
+        "coverage_complete": null,
+        "current_item_present": true,
+        "hits": 1,
+        "scanned": 1,
+        "stage": "names",
+        "status": "complete",
+        "total": null
+      },
+      {
+        "activity": "sha256:610d969612115c93814ed425467301e06c157dbe9351b839698473e86eb40954",
+        "budget_reached": null,
+        "continuation_available": null,
+        "coverage_complete": null,
+        "current_item_present": true,
+        "hits": 1,
+        "scanned": 1,
+        "stage": "bodies",
+        "status": "running",
+        "total": null
+      },
+      {
+        "activity": "sha256:610d969612115c93814ed425467301e06c157dbe9351b839698473e86eb40954",
+        "budget_reached": null,
+        "continuation_available": null,
+        "coverage_complete": null,
+        "current_item_present": true,
+        "hits": 1,
+        "scanned": 1,
+        "stage": "bodies",
+        "status": "complete",
+        "total": null
+      },
+      {
+        "activity": "sha256:610d969612115c93814ed425467301e06c157dbe9351b839698473e86eb40954",
+        "budget_reached": null,
+        "continuation_available": null,
+        "coverage_complete": null,
+        "current_item_present": true,
+        "hits": 1,
+        "scanned": 1,
+        "stage": "deep",
+        "status": "running",
+        "total": null
+      },
+      {
+        "activity": "sha256:610d969612115c93814ed425467301e06c157dbe9351b839698473e86eb40954",
+        "budget_reached": false,
+        "continuation_available": false,
+        "coverage_complete": true,
+        "current_item_present": true,
+        "hits": 1,
+        "scanned": 1,
+        "stage": "deep",
+        "status": "complete",
+        "total": null
+      }
+    ],
+    "terminal_reason": "complete"
+  },
+  "redaction": {
+    "body_or_snippet_included": false,
+    "prompt_included": false,
+    "provider_request_included": false,
+    "raw_tool_result_included": false,
+    "sender_or_email_included": false,
+    "source_id_or_path_included": false,
+    "token_included": false
+  },
+  "schema_version": 1,
+  "state": "pass"
+}

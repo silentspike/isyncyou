@@ -6092,9 +6092,8 @@ async function pollCodexStatus(n) {
   else await finishCodexGuard();
 }
 
-// Progressive-search rendering (S-AG.18/#643, S-AG.19/#644). Module-level so BOTH the live
-// stream (agentSend) and a re-render from AssistantState.transcript build
-// identical cards — the transcript keeps its search stages + result cards, not just the text.
+// Progressive-search rendering (S-AG.18/#643). Activity detail is current-turn UI state;
+// durable session hydration remains limited to the existing transcript/source contract.
 const ASST_STAGE_LABEL = { names: "Fast search — subject", bodies: "Full-text — bodies", deep: "AI deep-read" };
 function asstSvcIcon(s) { return ({ mail: "mail", onedrive: "hard-drive", calendar: "calendar", contacts: "users", todo: "check-square", onenote: "notebook" })[s] || "file"; }
 // The app's canonical item viewer — the SAME sandboxed, same-origin iframe the Mail reader
@@ -6131,7 +6130,9 @@ function sourceViewHref(source) {
   return q ? "/api/v1/view?" + qs(q) : null;
 }
 function agentSourceKey(source) {
-  return JSON.stringify([source.service, source.id || "", source.path || ""]);
+  return source.id
+    ? JSON.stringify([source.service, source.id])
+    : JSON.stringify([source.service, "", source.path || ""]);
 }
 function dedupeAgentSources(sources) {
   const seen = new Set();
@@ -6160,8 +6161,12 @@ function extractAgentSources(event) {
   };
   if (!event || typeof event !== "object") return [];
   if (event.event === "partial_result") visit(event.items || [], 0);
-  else if (event.event === "tool_result" && typeof event.content === "string") {
-    try { visit(JSON.parse(event.content), 0); } catch (_) {}
+  else if (event.event === "tool_result") {
+    if (typeof event.content === "string") {
+      try { visit(JSON.parse(event.content), 0); } catch (_) {}
+    } else {
+      visit(event.content, 0);
+    }
   }
   return dedupeAgentSources(found);
 }
@@ -6187,12 +6192,11 @@ function renderAgentCitationBar(sources) {
 function asstResultCard(it) {
   const source = normalizeAgentSource(it) || { service: it.service, id: it.id, path: it.path || "", name: it.name || "", item_type: it.item_type || it.service };
   const viewQ = sourceViewQuery(source);
-  const snip = (it.snippet || "").trim();
   const head = el("div", { class: "asst-result-head" },
     el("span", { class: "asst-result-ic", style: `--svc:var(--svc-${it.service})` }, icon(asstSvcIcon(it.service), "icon-sm")),
     el("div", { class: "asst-result-main grow" },
       el("div", { class: "asst-result-name truncate", text: it.name || "(no name)" }),
-      el("div", { class: "asst-result-sub truncate", text: snip || (it.item_type || it.service) })),
+      el("div", { class: "asst-result-sub truncate", text: it.item_type || it.service })),
     el("span", { class: "asst-result-type", text: it.item_type || it.service }),
     el("span", { class: "asst-result-caret" }, icon("chevron-down", "icon-sm")));
   const panel = el("div", { class: "asst-result-panel" });
@@ -6499,7 +6503,177 @@ function agentSafeErrorCopy(code) {
   return known[code] || "The assistant could not complete this request.";
 }
 
-function handleAgentEvent(message, turnState) {
+const AGENT_ACTIVITY_ID = /^[A-Za-z0-9_-]{22}$/;
+const AGENT_PROGRESS_STAGES = ["names", "bodies", "deep"];
+const AGENT_PROGRESS_STATUS = new Set(["queued", "running", "complete", "failed", "skipped", "cancelled"]);
+const AGENT_PROGRESS_TERMINAL = new Set(["complete", "failed", "skipped", "cancelled"]);
+const AGENT_PROGRESS_SERVICES = new Set(["mail", "onedrive", "calendar", "contacts", "todo", "onenote"]);
+const AGENT_PROGRESS_MAX_ACTIVITIES = 4;
+const AGENT_PROGRESS_MAX_STAGE_UPDATES = 256;
+const AGENT_PROGRESS_MAX_PARTIAL_UPDATES = 64;
+const AGENT_PROGRESS_MAX_RESULTS = 200;
+
+function canonicalPartialResultEvent(event) {
+  return JSON.stringify({
+    schema_version: event.schema_version,
+    activity_id: event.activity_id,
+    stage: event.stage,
+    sequence: event.sequence,
+    items: event.items.map(item => ({
+      result_key: item.result_key,
+      change: item.change,
+      service: item.service,
+      item_id: item.item_id,
+      name: item.name,
+      item_type: item.item_type,
+      display_path: item.display_path,
+      sender: item.sender,
+      body_available: item.body_available,
+      source: {
+        service: item.source.service,
+        item_id: item.source.item_id,
+        label: item.source.label,
+      },
+    })),
+  });
+}
+
+async function digestAgentPartialResult(event) {
+  const canonical = new TextEncoder().encode(canonicalPartialResultEvent(event));
+  const domain = new TextEncoder().encode("isyncyou-partial-event-replay/v1");
+  const framed = new Uint8Array(domain.length + 4 + canonical.length);
+  framed.set(domain);
+  new DataView(framed.buffer).setUint32(domain.length, canonical.length, false);
+  framed.set(canonical, domain.length + 4);
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", framed));
+  return Array.from(digest, byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function hasOnlyAgentKeys(value, allowed) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).every(key => allowed.has(key));
+}
+
+function validAgentProgressText(value, maxBytes) {
+  return typeof value === "string" && value.length > 0
+    && new TextEncoder().encode(value).length <= maxBytes
+    && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value);
+}
+
+function validAgentPublicSource(source, service, itemId, name) {
+  if (!hasOnlyAgentKeys(source, new Set(["service", "item_id", "label"]))) return false;
+  if (source.service !== service || source.item_id !== itemId) return false;
+  if (source.label !== null && source.label !== undefined && source.label !== name) return false;
+  return source.label === null || source.label === undefined
+    || validAgentProgressText(source.label, 192);
+}
+
+function validAgentPublicResult(item) {
+  const keys = new Set([
+    "result_key", "change", "service", "item_id", "name", "item_type",
+    "display_path", "sender", "body_available", "source",
+  ]);
+  if (!hasOnlyAgentKeys(item, keys)
+      || !AGENT_ACTIVITY_ID.test(item.result_key || "")
+      || !["add", "enrich"].includes(item.change)
+      || !AGENT_PROGRESS_SERVICES.has(item.service)
+      || !validAgentProgressText(item.item_id, 512)
+      || !validAgentProgressText(item.name, 192)
+      || !validAgentProgressText(item.item_type, 64)
+      || typeof item.body_available !== "boolean") return false;
+  if (item.display_path !== null && item.display_path !== undefined
+      && !validAgentProgressText(item.display_path, 768)) return false;
+  if (item.sender !== null && item.sender !== undefined
+      && !validAgentProgressText(item.sender, 256)) return false;
+  return validAgentPublicSource(item.source, item.service, item.item_id, item.name);
+}
+
+function createAgentActivityProtocol() {
+  return { activities: new Map(), partialDigests: new Map(), failed: false };
+}
+
+async function acceptAgentActivityEvent(protocol, event) {
+  if (!protocol || protocol.failed || event.schema_version !== 1
+      || !AGENT_ACTIVITY_ID.test(event.activity_id || "")) return "invalid";
+  let activity = protocol.activities.get(event.activity_id);
+  if (!activity) {
+    if (event.event !== "stage_progress") return "invalid";
+    if (protocol.activities.size >= AGENT_PROGRESS_MAX_ACTIVITIES) return "invalid";
+    activity = {
+      stages: new Map(),
+      stageUpdates: 0,
+      partialUpdates: 0,
+      nextSequence: 0,
+      resultKeys: new Set(),
+    };
+    protocol.activities.set(event.activity_id, activity);
+  }
+  if (event.event === "stage_progress") {
+    const allowed = new Set([
+      "event", "schema_version", "activity_id", "activity_kind", "stage", "status",
+      "scanned", "total", "hits", "current_item", "coverage_complete",
+      "budget_reached", "continuation_available",
+    ]);
+    if (!hasOnlyAgentKeys(event, allowed) || event.activity_kind !== "archive_search"
+        || !AGENT_PROGRESS_STAGES.includes(event.stage) || !AGENT_PROGRESS_STATUS.has(event.status)
+        || !Number.isInteger(event.scanned) || event.scanned < 0 || event.scanned > 1000000
+        || (event.total !== null && (!Number.isInteger(event.total) || event.total < 0 || event.total > 1000000))
+        || !Number.isInteger(event.hits) || event.hits < 0 || event.hits > 1000000
+        || (event.current_item !== null && !validAgentProgressText(event.current_item, 160))
+        || ![null, true, false].includes(event.coverage_complete)
+        || ![null, true, false].includes(event.budget_reached)
+        || ![null, true, false].includes(event.continuation_available)
+        || activity.stageUpdates >= AGENT_PROGRESS_MAX_STAGE_UPDATES) return "invalid";
+    const stageIndex = AGENT_PROGRESS_STAGES.indexOf(event.stage);
+    const priorStatuses = AGENT_PROGRESS_STAGES.slice(0, stageIndex)
+      .map(stage => activity.stages.get(stage));
+    if (event.status === "queued") {
+      if (priorStatuses.some(status => status === undefined)) return "invalid";
+    } else if (event.status === "running") {
+      if (priorStatuses.some(status => status !== "complete")) return "invalid";
+    } else if (priorStatuses.some(status => !AGENT_PROGRESS_TERMINAL.has(status))) {
+      return "invalid";
+    }
+    const previous = activity.stages.get(event.stage);
+    if (!previous && event.status !== "queued") return "invalid";
+    if (previous && AGENT_PROGRESS_TERMINAL.has(previous) && previous !== event.status) return "invalid";
+    if (previous === "queued" && !["queued", "running", "failed", "skipped", "cancelled"].includes(event.status)) return "invalid";
+    if (previous === "running" && event.status === "queued") return "invalid";
+    activity.stageUpdates += 1;
+    activity.stages.set(event.stage, event.status);
+    return "accept";
+  }
+  if (event.event === "partial_result") {
+    const allowed = new Set(["event", "schema_version", "activity_id", "stage", "sequence", "items"]);
+    if (!hasOnlyAgentKeys(event, allowed) || !AGENT_PROGRESS_STAGES.includes(event.stage)
+        || !Number.isInteger(event.sequence) || event.sequence < 0 || event.sequence > 65535
+        || !Array.isArray(event.items) || event.items.length > 20
+        || event.items.some(item => !validAgentPublicResult(item))) return "invalid";
+    const replayKey = `${event.activity_id}:${event.sequence}`;
+    const digest = await digestAgentPartialResult(event);
+    if (event.sequence < activity.nextSequence) {
+      return protocol.partialDigests.get(replayKey) === digest ? "replay" : "conflict";
+    }
+    if (event.sequence !== activity.nextSequence
+        || activity.partialUpdates >= AGENT_PROGRESS_MAX_PARTIAL_UPDATES
+        || activity.stages.get(event.stage) !== "running") return "invalid";
+    const nextKeys = new Set(activity.resultKeys);
+    for (const item of event.items) {
+      const known = nextKeys.has(item.result_key);
+      if ((item.change === "add" && known) || (item.change === "enrich" && !known)) return "invalid";
+      nextKeys.add(item.result_key);
+      if (nextKeys.size > AGENT_PROGRESS_MAX_RESULTS) return "invalid";
+    }
+    activity.partialUpdates += 1;
+    activity.resultKeys = nextKeys;
+    protocol.partialDigests.set(replayKey, digest);
+    activity.nextSequence += 1;
+    return "accept";
+  }
+  return "invalid";
+}
+
+async function handleAgentEvent(message, turnState) {
   const d = message || {};
   switch (d.event) {
     case "progress":
@@ -6528,11 +6702,11 @@ function handleAgentEvent(message, turnState) {
         turnState.addCitations(sources);
       }
       break;
-    case "search_stage":
-      turnState.onSearchStage(d);
+    case "stage_progress":
+      await turnState.onSearchStage(d);
       break;
     case "partial_result":
-      turnState.onPartialResult(d);
+      await turnState.onPartialResult(d);
       turnState.addCitations(extractAgentSources(d));
       break;
     case "confirmation_required": {
@@ -6558,6 +6732,9 @@ function handleAgentEvent(message, turnState) {
       turnState.addError(agentSafeErrorCopy(d.message));
       break;
     case "done": {
+      if (typeof turnState.finishActivityProtocol === "function") {
+        turnState.finishActivityProtocol();
+      }
       const reason = d.reason || "complete";
       const fallback = reason === "pending_confirmation" ? "Waiting for confirmation"
         : reason === "cancelled" ? "Cancelled"
@@ -7081,6 +7258,17 @@ async function agentSend(text) {
   // and a result list that grows as PartialResult events arrive.
   const STAGE_LABEL = { names: "Fast search — subject", bodies: "Full-text — bodies", deep: "AI deep-read" };
   let searchBox = null, resultsBox = null; const stageRow = {};
+  const activityProtocol = createAgentActivityProtocol();
+  const acceptProgressEvent = async (d) => {
+    const disposition = await acceptAgentActivityEvent(activityProtocol, d);
+    if (disposition === "accept") return true;
+    if (disposition === "replay") return false;
+    activityProtocol.failed = true;
+    addError(disposition === "conflict"
+      ? "Search progress could not be reconciled."
+      : "Invalid search progress was ignored.");
+    return false;
+  };
   const ensureSearchUI = () => {
     clearThinking();   // the search plan replaces the generic "working" indicator
     if (searchBox) return;
@@ -7089,29 +7277,39 @@ async function agentSend(text) {
     bubble.append(searchBox, resultsBox);
     scrollAssistantToEnd();
   };
-  const onSearchStage = (d) => {
+  const onSearchStage = async (d) => {
+    if (!await acceptProgressEvent(d)) return;
     ensureSearchUI();
-    let row = stageRow[d.stage];
+    const stageKey = `${d.activity_id}:${d.stage}`;
+    let row = stageRow[stageKey];
     if (!row) {
       row = el("div", { class: "asst-stage" }, el("span", { class: "asst-stage-ic" }), el("span", { class: "grow", text: STAGE_LABEL[d.stage] || d.stage }), el("span", { class: "asst-stage-n dim" }));
-      stageRow[d.stage] = row; searchBox.append(row);
+      stageRow[stageKey] = row; searchBox.append(row);
     }
-    const done = d.status === "done";
+    const done = AGENT_PROGRESS_TERMINAL.has(d.status);
     row.classList.toggle("done", done);
     row.querySelector(".asst-stage-ic").textContent = done ? "✓" : "";
     if (done) {
       row.querySelector(".asst-stage-n").textContent = d.hits + (d.hits === 1 ? " hit" : " hits");
-      const e = asst.stages.find(s => s.stage === d.stage);   // persist final stage state
-      if (e) e.hits = d.hits; else asst.stages.push({ stage: d.stage, hits: d.hits });
+      const e = asst.stages.find(s => s.activity_id === d.activity_id && s.stage === d.stage);
+      if (e) {
+        e.hits = d.hits;
+        e.status = d.status;
+      } else {
+        asst.stages.push({ activity_id: d.activity_id, stage: d.stage, status: d.status, hits: d.hits });
+      }
     }
     scrollAssistantToEnd();
   };
-  const onPartialResult = (d) => {
+  const onPartialResult = async (d) => {
+    if (!await acceptProgressEvent(d)) return;
     ensureSearchUI();
     (d.items || []).forEach((it) => {
-      asst.results.push(it);                 // persist so the cards survive a view switch
-      resultsBox.append(asstResultCard(it));  // module-level builder (shared with re-render)
+      const index = asst.results.findIndex(existing => existing.result_key === it.result_key);
+      if (index >= 0) asst.results[index] = it;
+      else asst.results.push(it);
     });
+    resultsBox.replaceChildren(...asst.results.map(asstResultCard));
     scrollAssistantToEnd();
   };
 
@@ -7241,9 +7439,14 @@ async function agentSend(text) {
     addCitations,
     onSearchStage,
     onPartialResult,
+    finishActivityProtocol: () => {
+      activityProtocol.activities.clear();
+      activityProtocol.partialDigests.clear();
+    },
     finish,
     reconcileRequestStatus,
   };
+  let eventIngress = Promise.resolve();
   const openTurnStream = () => openEventStream(url, (name, data) => {
     if (name !== "message") return; // ignore ping heartbeats
     let d;
@@ -7253,7 +7456,12 @@ async function agentSend(text) {
       finish("Stream error");
       return;
     }
-    handleAgentEvent(d, turnState);
+    eventIngress = eventIngress
+      .then(() => handleAgentEvent(d, turnState))
+      .catch(() => {
+        addError("Invalid stream payload");
+        finish("Stream error");
+      });
   }, () => {
     void (async () => {
       const status = await reconcileRequestStatus();

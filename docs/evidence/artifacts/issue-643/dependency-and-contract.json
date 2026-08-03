@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-07-31T18:28:58Z",
+  "implementation_commit": "65e96ddfe8cd05be62b2fae54b78ec5665cef882",
+  "origin_dev": "620271e0b2a9038db55b6b639ca2c79b066a4143",
+  "dependencies": {
+    "issue_618": "closed",
+    "issue_621": "closed",
+    "issue_628": "closed",
+    "dependency_commits_are_in_origin_dev": true
+  },
+  "issue_643": {
+    "state": "open",
+    "label": "status:review",
+    "binding_contract_comment_id": 5119956130,
+    "historical_completion_claims_superseded": true
+  },
+  "repository": {
+    "open_pull_requests": 1,
+    "owned_path_conflicts": 0,
+    "promotion_workflow": "disabled_manually",
+    "promotion_watchdog_workflow": "disabled_manually",
+    "active_promotion_or_release_runs": 0
+  },
+  "landing_boundary": {
+    "target": "dev",
+    "staging_or_main_cascade": false,
+    "release_or_rc": false,
+    "push_or_pr_authorized": true,
+    "pull_request": 820,
+    "pull_request_head_matches_implementation_commit": true,
+    "pull_request_merge_state": "clean"
+  },
+  "state": "pass"
+}

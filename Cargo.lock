@@ -1671,11 +1671,13 @@ dependencies = [
 name = "isyncyou-core"
 version = "1.0.0"
 dependencies = [
+ "libc",
  "ring",
  "serde",
  "serde_json",
  "tempfile",
  "toml",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

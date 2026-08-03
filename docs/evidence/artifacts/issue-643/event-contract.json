@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "implementation_commit": "65e96ddfe8cd05be62b2fae54b78ec5665cef882",
+  "public_stage_statuses": [
+    "queued",
+    "running",
+    "complete",
+    "failed",
+    "cancelled",
+    "skipped"
+  ],
+  "turn_exit_only_statuses": [
+    "outcome_unknown"
+  ],
+  "initial_plan": [
+    "names:queued",
+    "bodies:queued",
+    "deep:queued"
+  ],
+  "ordered_execution": [
+    "names",
+    "bodies",
+    "deep"
+  ],
+  "public_projection": {
+    "body_excerpt_is_public": false,
+    "query_is_public": false,
+    "account_is_public": false,
+    "continuation_is_public": false,
+    "candidate_authority_is_public": false,
+    "private_archive_path_is_public": false,
+    "source_ref_shape": [
+      "service",
+      "item_id",
+      "label"
+    ]
+  },
+  "consumer_contract": {
+    "terminal_predecessor_allows_later_skipped": true,
+    "conflicting_sequence_replay_is_rejected": true,
+    "identical_sequence_replay_is_idempotent": true,
+    "current_item_is_bounded_and_redacted": true
+  },
+  "transport_caps": {
+    "public_event_bytes": 8192,
+    "android_outer_message_bytes": 73728,
+    "android_cap_applies_after_outer_serialization": true
+  },
+  "state": "pass"
+}

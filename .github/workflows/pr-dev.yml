@@ -84,6 +84,39 @@ jobs:
         if: needs.changes.outputs.code == 'true'
         run: cargo test --workspace
 
+  windows-progressive-archive:
+    name: windows-progressive-archive
+    needs: changes
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6.0.0
+      - name: No code/CI changes - skip Windows archive gate
+        if: needs.changes.outputs.code != 'true'
+        run: echo "No Rust/Cargo/CI changes in this PR - Windows archive gate skipped."
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        if: needs.changes.outputs.code == 'true'
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
+        if: needs.changes.outputs.code == 'true'
+      - name: Require and run real Windows archive-handle tests
+        if: needs.changes.outputs.code == 'true'
+        shell: pwsh
+        run: |
+          cargo test -p isyncyou-core --lib -- --list | Tee-Object -FilePath archive-tests.txt
+          $required = @(
+            "archive_deep_windows_root_open_",
+            "archive_deep_windows_rejects_ancestor_",
+            "archive_deep_windows_uses_same_verified_handle_",
+            "archive_deep_body_rejects_windows_hardlink_",
+            "archive_deep_windows_validates_owner_",
+            "archive_deep_windows_rejects_nonstandard_"
+          )
+          foreach ($prefix in $required) {
+            if (-not (Select-String -Path archive-tests.txt -SimpleMatch $prefix -Quiet)) {
+              throw "required Windows archive test prefix did not match: $prefix"
+            }
+          }
+          cargo test -p isyncyou-core --lib archive_deep_ -- --nocapture
+
   # The web UI is hand-written vanilla JS embedded into the daemon via include_str!.
   # A syntax error still *compiles* (it is just a string to Rust) and only blows up
   # at runtime in the browser, so parse-check it here on every JS change.

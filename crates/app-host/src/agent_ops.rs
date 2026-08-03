@@ -1710,12 +1710,45 @@ where
     fn execute_read_streamed(
         &self,
         action: &isyncyou_agent::ToolAction,
-        emit: &mut dyn FnMut(isyncyou_agent::StreamEvent),
+        emit: &mut dyn isyncyou_agent::TurnEventSink,
     ) -> Result<String, isyncyou_agent::AgentError> {
         match action {
             isyncyou_agent::ToolAction::RestoreLocal { .. } => self.execute_read(action),
             _ => self.delegate.execute_read_streamed(action, emit),
         }
+    }
+
+    fn execute_read_with_context(
+        &self,
+        action: &isyncyou_agent::ToolAction,
+        context: isyncyou_agent::ReadExecutionContext<'_, '_>,
+    ) -> Result<isyncyou_agent::ReadExecutionOutputV2, isyncyou_agent::AgentError> {
+        match action {
+            isyncyou_agent::ToolAction::RestoreLocal { .. } => {
+                let content =
+                    self.execute_read_prepared(action, context.binding, context.local_effect)?;
+                context.input_budget.charge(&content)?;
+                Ok(isyncyou_agent::ReadExecutionOutputV2::RestoreLocal(
+                    isyncyou_agent::ExistingSharedReadOutputV2 {
+                        content,
+                        untrusted: true,
+                        assistant_sources: Vec::new(),
+                    },
+                ))
+            }
+            _ => self.delegate.execute_read_with_context(action, context),
+        }
+    }
+
+    fn finish_with_exit(
+        &self,
+        exit: isyncyou_agent::TurnExitKind,
+        proposed_text: Option<String>,
+        assistant_sources: Vec<isyncyou_agent::SourceRef>,
+        events: &mut dyn isyncyou_agent::TurnEventSink,
+    ) -> Result<isyncyou_agent::TurnExitOutputV1, isyncyou_agent::AgentError> {
+        self.delegate
+            .finish_with_exit(exit, proposed_text, assistant_sources, events)
     }
 }
 

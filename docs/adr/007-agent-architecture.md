@@ -183,6 +183,31 @@ The constraints that force the shape of this decision:
     their sealed result JSON immediately and retain only committed state and a result
     digest for the bounded replay window.
 
+16. **Progressive archive search (REQ-AGENT-017, S-AG.18/#643).** Product Search
+    executes three ordered stages: bounded metadata/name FTS, bounded body FTS, then
+    model-selected deep reads. The first two stages never open archived body files.
+    DeepSearch consumes only MAC-authenticated candidate and continuation authority
+    bound to the canonical account, turn, query, normalized service set, originating
+    Search activity, page, and provider-step budget. Search and DeepSearch may use
+    different provider tool-use IDs without weakening that origin binding.
+
+    Provider content and public activity projection are separate types. The model may
+    receive bounded candidates and excerpts, while SSE/WebView/Android receive only
+    versioned `stage_progress`, deduped `partial_result`, and redacted public tool
+    completion. Every public/provider payload is byte-bounded, and provider content is
+    additionally charged to the selected model's remaining input-token budget before
+    every provider step. Archive body reads use one verified no-follow handle with
+    owner/mode/link/reparse checks and separate plaintext/envelope caps.
+
+    V2 recovery persists typed read completion, structured sources, and a deterministic
+    all-exit finalization marker. Legacy actions are classified from their frozen wire
+    representation before V2 semantic-digest validation; replay comparison emits no
+    fabricated historical activity. The one product harness contract advances to
+    version 2. Matching active credentials are re-attested locally under the existing
+    provider lifecycle fence without OAuth or generation rotation, and journals bound
+    to the prior harness remain non-resumable. Rich activity rendering and elapsed-turn
+    timers remain the separately scoped #644 consumer.
+
 ## Consequences
 
 - **Cost:** a new crate, a second HTTP client (small, blocking, rustls), and a genuinely

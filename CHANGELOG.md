@@ -8,6 +8,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+**Progressive multi-stage Agent archive search (#643)**
+- `store`+`core`+`agent`+`app-host`+`webui`+`android`: added bounded
+  name/body FTS stages, authenticated model-selected deep reads, verified-handle
+  body I/O, separate provider/public projections, model-token and provider-step
+  budgets, structured V2 recovery/finalization, harness-v2 re-attestation, and
+  versioned SSE/WebView/Android progress transport.
+
 **Agent shared-session and closeout contract (#628)**
 - `agent`+`app-host`+`webui`+`android`: added encrypted V2 shared sessions,
   provider-generation-bound request recovery, renewed fenced publication, durable
