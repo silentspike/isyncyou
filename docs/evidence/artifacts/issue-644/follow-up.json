@@ -1,0 +1,56 @@
+{
+  "evidence_version": 1,
+  "generated_at": "2026-08-03T13:21:58Z",
+  "implementation_commit": "81b982636c4b64786662faf5b7f42b7a80d7f786",
+  "state": "pass",
+  "scope": "post_merge_activity_stream_containment",
+  "browser_smoke": {
+    "assertions_passed": 51,
+    "assertions_failed": 0,
+    "rejected_partial_citation_count": 0,
+    "stale_pending_delta": 0,
+    "bounded_progress_warning_count": 1,
+    "stage_completion_transition_present": true,
+    "result_stagger_present": true,
+    "reduced_motion_disables_new_animations": true
+  },
+  "default_apk": {
+    "sha256": "49e1a0448b6d6dae6d8851cadf67c23829f2dec9a460e257fec7e3155f30754d",
+    "source_commit_binding_matches": true,
+    "default_features": true,
+    "test_hook_markers_present": false,
+    "install_result": "pass",
+    "app_data_preserved": true
+  },
+  "physical_regression": {
+    "provider_ready": true,
+    "microsoft_365_connection_preserved": true,
+    "complete_plan_observed_while_running": true,
+    "stage_order": [
+      "names",
+      "bodies",
+      "deep"
+    ],
+    "live_counter_observed": true,
+    "current_item_observed": true,
+    "deduplicated_result_count_observed": 1,
+    "streamed_final_text_present": true,
+    "terminal_reason": "complete",
+    "citation_count_minimum": 1,
+    "background_foreground_completed": true,
+    "duplicate_turn_present": false
+  },
+  "cleanup": {
+    "temporary_device_files_removed": true,
+    "device_lock_released": true
+  },
+  "redaction": {
+    "device_serial_included": false,
+    "account_identity_included": false,
+    "prompt_or_result_text_included": false,
+    "source_identifier_included": false,
+    "provider_identifier_included": false,
+    "oauth_or_confirmation_material_included": false,
+    "raw_log_included": false
+  }
+}
