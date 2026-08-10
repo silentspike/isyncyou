@@ -148,7 +148,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libx11-dev
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.8.1
       - name: Build release binaries
         run: cargo build --release --workspace
 
@@ -459,7 +459,7 @@ jobs:
         with:
           toolchain: "1.95.0"
           targets: aarch64-linux-android
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.8.1
         if: needs.preflight.outputs.mode == 'rc'
       - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
         if: needs.preflight.outputs.mode == 'rc'

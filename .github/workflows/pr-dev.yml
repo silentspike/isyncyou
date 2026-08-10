@@ -76,7 +76,7 @@ jobs:
         if: needs.changes.outputs.code == 'true'
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.8.1
         if: needs.changes.outputs.code == 'true'
       - name: Format
         if: needs.changes.outputs.code == 'true'
@@ -99,7 +99,7 @@ jobs:
         run: echo "No Rust/Cargo/CI changes in this PR - Windows archive gate skipped."
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         if: needs.changes.outputs.code == 'true'
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.8.1
         if: needs.changes.outputs.code == 'true'
       - name: Require and run real Windows archive-handle tests
         if: needs.changes.outputs.code == 'true'
@@ -159,7 +159,7 @@ jobs:
         if: needs.changes.outputs.code == 'true'
         with:
           toolchain: "1.95"
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.8.1
         if: needs.changes.outputs.code == 'true'
       - name: Check workspace on the declared MSRV
         if: needs.changes.outputs.code == 'true'
