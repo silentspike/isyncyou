@@ -595,6 +595,20 @@ mod tests {
     const TURN_B: &str = "0000000000000000000000000B";
 
     #[test]
+    fn session_key_matches_independent_argon2id_hkdf_vector() {
+        // Fixed synthetic inputs, checked with the reference libargon2 implementation
+        // and RFC 5869 HMAC-SHA256. A dependency upgrade must not strand old sessions.
+        let key = key_for(b"a-high-entropy-pairing-secret-32b", &test_config());
+        assert_eq!(
+            key.bytes_for_test(),
+            &[
+                14, 165, 220, 2, 48, 96, 40, 145, 202, 40, 44, 224, 101, 180, 98, 72, 52, 105, 66,
+                69, 210, 246, 92, 63, 123, 14, 115, 160, 106, 254, 231, 161,
+            ]
+        );
+    }
+
+    #[test]
     fn argon2id_hkdf_round_trips_with_pairing_secret() {
         let secret = b"a-high-entropy-pairing-secret-32b";
         let config = test_config();
