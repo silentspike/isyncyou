@@ -466,33 +466,97 @@ function nativeConfirmationMessage(code) {
   if (code === "busy") return "Another confirmation is already open";
   return "Could not confirm this action";
 }
-/* A short human label for the biometric sheet from the challenge payload (#0.6). */
-function biometricServiceLabel(service) {
-  return service === "onedrive" ? "OneDrive"
-    : service === "backup" || service === "agent" ? "iSyncYou"
-    : service === "mail" ? "Mail"
-    : service === "calendar" ? "Calendar"
-    : service === "contacts" ? "Contacts"
-    : service === "todo" ? "To Do"
-    : service === "onenote" ? "OneNote"
-    : service || "Microsoft 365";
+const AGENT_SSE_FRAME_MAX_BYTES = 72 * 1024;
+const AGENT_SSE_CARRY_MAX_BYTES = 144 * 1024;
+
+function parseAgentSseFrame(frame, onEvent) {
+  if (new TextEncoder().encode(frame).byteLength > AGENT_SSE_FRAME_MAX_BYTES) {
+    throw new Error("agent_stream_frame_too_large");
+  }
+  let eventName = "message";
+  const data = [];
+  for (const line of frame.split("\n")) {
+    if (!line || line.startsWith(":")) continue;
+    if (line.startsWith("event:")) {
+      eventName = line.slice(6).replace(/^ /, "");
+    } else if (line.startsWith("data:")) {
+      data.push(line.slice(5).replace(/^ /, ""));
+    } else {
+      throw new Error("agent_stream_invalid_field");
+    }
+  }
+  if (data.length) onEvent(eventName, data.join("\n"));
 }
-function biometricLabel(d) {
-  const verb = d.op === "delete" ? "Delete" : d.op === "share" ? "Share"
-    : d.op === "backup" ? "Start backup"
-    : d.op === "restore-cloud" ? "Restore to cloud"
-    : d.op === "live-write" ? "Run Agent write"
-    : d.op === "move-out-of-protected" ? "Move out of offline folder"
-    : d.op === "mode-switch-offline-large" ? "Make folder offline"
-    : d.op === "bulk" && d.service === "todo" ? "Delete selected tasks"
-    : d.op === "bulk" ? "Bulk OneDrive change"
-    : d.op ? d.op.charAt(0).toUpperCase() + d.op.slice(1) : "Confirm";
-  const service = biometricServiceLabel(d.service);
-  return `${verb} in ${service}`;
+
+function openAgentFetchStream(path, capToken, onEvent, onError) {
+  const controller = new AbortController();
+  let closed = false;
+  let failed = false;
+  const fail = () => {
+    if (closed || failed) return;
+    failed = true;
+    controller.abort();
+    if (onError) onError();
+  };
+  void (async () => {
+    try {
+      const response = await fetch(path, {
+        method: "GET",
+        credentials: "same-origin",
+        cache: "no-store",
+        redirect: "error",
+        headers: { "X-Capability-Token": capToken },
+        signal: controller.signal,
+      });
+      const contentType = response.headers.get("Content-Type") || "";
+      const cacheControl = response.headers.get("Cache-Control") || "";
+      if (response.redirected || !response.ok
+          || !contentType.toLowerCase().startsWith("text/event-stream")
+          || !cacheControl.toLowerCase().split(",").some(v => v.trim() === "no-store")
+          || !response.body) {
+        throw new Error("agent_stream_rejected");
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      const encoder = new TextEncoder();
+      let carry = "";
+      while (!closed) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        carry += decoder.decode(chunk.value, { stream: true });
+        if (carry.includes("\u0000") || /\r(?!\n)/.test(carry.slice(0, -1))) {
+          throw new Error("agent_stream_invalid_framing");
+        }
+        carry = carry.replace(/\r\n/g, "\n");
+        if (encoder.encode(carry).byteLength > AGENT_SSE_CARRY_MAX_BYTES) {
+          throw new Error("agent_stream_buffer_too_large");
+        }
+        let boundary;
+        while ((boundary = carry.indexOf("\n\n")) >= 0) {
+          const frame = carry.slice(0, boundary);
+          carry = carry.slice(boundary + 2);
+          parseAgentSseFrame(frame, onEvent);
+        }
+      }
+      carry += decoder.decode();
+      if (carry) throw new Error("agent_stream_truncated_frame");
+      if (!closed) fail();
+    } catch (_) {
+      fail();
+    }
+  })();
+  return {
+    close() {
+      if (closed) return;
+      closed = true;
+      controller.abort();
+    }
+  };
 }
-/* Open an SSE-style stream over the active transport (#0A). Mobile bridge mode uses
-   the native stream path and never falls back to EventSource. Desktop uses EventSource. */
-function openEventStream(path, onEvent, onError) {
+
+/* Open an SSE-style stream over the active transport (#0A). Agent streams carry their
+   capability as transport metadata; the generic events stream remains session-only. */
+function openEventStream(path, onEvent, onError, capToken = null) {
   if (BRIDGE) {
     const id = "s" + (++_bridgeSeq);
     const timer = setTimeout(() => {
@@ -504,7 +568,9 @@ function openEventStream(path, onEvent, onError) {
     }, BRIDGE_STREAM_TIMEOUT_MS);
     _bridgeStreams.set(id, { onEvent, onError, timer });
     _bridgeStats.streams++;
-    try { BRIDGE.postMessage(JSON.stringify({ t: "sub", id, path })); }
+    const subscription = capToken ? { t: "sub", id, path, cap_token: capToken }
+      : { t: "sub", id, path };
+    try { BRIDGE.postMessage(JSON.stringify(subscription)); }
     catch (e) {
       clearTimeout(timer);
       _bridgeStreams.delete(id);
@@ -519,6 +585,7 @@ function openEventStream(path, onEvent, onError) {
       }
     };
   }
+  if (capToken) return openAgentFetchStream(path, capToken, onEvent, onError);
   const es = new EventSource(path);
   es.onmessage = (e) => onEvent("message", e.data);
   es.addEventListener("change", () => onEvent("change", ""));
@@ -556,7 +623,13 @@ async function request(method, path, opts) {
   if (status >= 200 && status < 300 && d && d.status === "confirmation_required"
       && d.pending_action_id && !o.perActionToken) {
     const confirmation = await runBiometricConfirm(d.pending_action_id);
-    if (!confirmation.ok) throw new Error(nativeConfirmationMessage(confirmation.code));
+    if (!confirmation.ok) {
+      const error = new Error(nativeConfirmationMessage(confirmation.code));
+      error.code = "native_confirmation_denied";
+      error.nativePromptDenied = true;
+      error.responseReceived = true;
+      throw error;
+    }
     return request(method, path, { ...o, perActionToken: d.pending_action_id });
   }
   if (!Number.isFinite(status) || status < 200 || status >= 300) {
@@ -5476,6 +5549,7 @@ const AssistantState = {
   activeStream: null,
   pendingCardsById: new Map(),
   pendingCardNodesById: new Map(),
+  confirmAttemptsByPendingId: new Map(),
   lastUsage: null,
   model: null,
   draft: "",
@@ -6537,6 +6611,7 @@ function pendingStatus(pending) {
   const status = pending.status || "pending";
   if (status === "pending" && pending.expires_at_ms && Date.now() >= Number(pending.expires_at_ms)) {
     updateAgentPendingStatus(pending, "expired");
+    clearAgentPendingAuthority(pending);
     return "expired";
   }
   return status;
@@ -6547,24 +6622,70 @@ function updateAgentPendingStatus(record, status) {
   if (typeof record.onDisplayStatus === "function") record.onDisplayStatus(status);
 }
 
+function clearAgentPendingAuthority(record) {
+  if (!record) return;
+  AssistantState.confirmAttemptsByPendingId.delete(record.pending_id);
+  record.token = "";
+  record.action_hash = "";
+  record.session_id = "";
+  record.turn_request_id = "";
+  record.turn_id = "";
+}
+
+function getOrCreateAgentConfirmAttempt(record) {
+  const existing = AssistantState.confirmAttemptsByPendingId.get(record.pending_id);
+  if (existing) return existing;
+  const request = Object.freeze({
+    request_id: crypto.randomUUID(),
+    session_id: record.session_id,
+    turn_request_id: record.turn_request_id,
+    turn_id: record.turn_id,
+    pending: record.pending_id,
+    token: record.token,
+    action_hash: record.action_hash,
+  });
+  const attempt = { request, phase: "prepared" };
+  AssistantState.confirmAttemptsByPendingId.set(record.pending_id, attempt);
+  return attempt;
+}
+
 async function confirmAgentPending(pendingId) {
   const record = pendingRecord(pendingId);
-  if (!record || !record.token || !record.action_hash) return;
+  if (!record || !record.token || !record.action_hash || !record.session_id
+      || !record.turn_request_id || !record.turn_id) return;
+  const attempt = getOrCreateAgentConfirmAttempt(record);
+  attempt.phase = "submitted";
   updateAgentPendingStatus(record, "confirming");
   record.error = "";
   rerenderPendingCards(pendingId);
   try {
-    const d = await postJson("/api/v1/agent/confirm", CAP.agent, {
-      request_id: crypto.randomUUID(), pending: pendingId,
-      token: record.token, action_hash: record.action_hash,
-    });
+    await postJson("/api/v1/agent/confirm", CAP.agent, attempt.request);
     updateAgentPendingStatus(record, "confirmed");
     record.result = "Completed successfully.";
-    record.token = "";
-    record.action_hash = "";
+    clearAgentPendingAuthority(record);
   } catch (e) {
-    updateAgentPendingStatus(record, "error");
-    record.error = agentCompactValue(e.message || e, 180);
+    if (e && e.nativePromptDenied) {
+      AssistantState.confirmAttemptsByPendingId.delete(pendingId);
+      updateAgentPendingStatus(record, "pending");
+      record.error = nativeConfirmationMessage("cancelled");
+    } else if (!e || !e.responseReceived || e.code === "confirmation_retryable") {
+      attempt.phase = "retryable";
+      updateAgentPendingStatus(record, "retryable");
+      record.error = "Confirmation was not completed. Retry uses the same request.";
+    } else if (e.code === "confirmation_outcome_unknown"
+        || e.code === "request_outcome_unknown") {
+      updateAgentPendingStatus(record, "outcome_unknown");
+      record.error = "The action outcome could not be verified.";
+      clearAgentPendingAuthority(record);
+    } else {
+      const status = e.code === "confirmation_expired" ? "expired"
+        : e.code === "confirmation_cancelled" ? "cancelled" : "failed";
+      updateAgentPendingStatus(record, status);
+      record.error = status === "expired" ? "Confirmation expired."
+        : status === "cancelled" ? "Confirmation was cancelled."
+        : "The action was not confirmed.";
+      clearAgentPendingAuthority(record);
+    }
   }
   rerenderPendingCards(pendingId);
 }
@@ -6589,8 +6710,7 @@ async function cancelAgentPending(pendingId) {
       action_hash: record.action_hash,
     });
     updateAgentPendingStatus(record, "cancelled");
-    record.token = "";
-    record.action_hash = "";
+    clearAgentPendingAuthority(record);
     closeAssistantStream("pending-cancel");
   } catch (e) {
     updateAgentPendingStatus(record, "error");
@@ -6618,18 +6738,23 @@ async function cancelAgentTurn(turnId) {
 function renderAgentPendingCard(pending, trackNode = true) {
   const status = pendingStatus(pending);
   const risk = pending.risk ? `Risk: ${pending.risk}` : "Review required";
-  const done = status === "confirmed" || status === "cancelled";
+  const done = ["confirmed", "cancelled", "expired", "failed", "outcome_unknown"]
+    .includes(status);
   const waiting = status === "confirming" || status === "cancelling";
   const confirmDisabled = waiting || done || status === "expired";
   const cancelDisabled = waiting || done;
   const confirm = el("button", { class: "btn primary sm", type: "button", onclick: () => confirmAgentPending(pending.pending_id), "data-agent-pending-confirm": "1" },
-    icon("check", "icon-sm"), status === "confirming" ? "Confirming…" : "Confirm");
+    icon("check", "icon-sm"), status === "confirming" ? "Confirming…"
+      : status === "retryable" ? "Retry" : "Confirm");
   const cancel = el("button", { class: "btn sm", type: "button", onclick: () => cancelAgentPending(pending.pending_id), "data-agent-pending-cancel": "1" },
     icon("x", "icon-sm"), status === "cancelling" ? "Cancelling…" : "Cancel");
   if (confirmDisabled) confirm.setAttribute("disabled", "disabled");
   if (cancelDisabled) cancel.setAttribute("disabled", "disabled");
   const title = status === "confirmed" ? "Action confirmed"
     : status === "cancelled" ? "Action cancelled"
+      : status === "expired" ? "Confirmation expired"
+        : status === "outcome_unknown" ? "Outcome needs review"
+          : status === "failed" ? "Action not confirmed"
       : pending.preview || "Action requires confirmation";
   const terminalResult = pending.result
     || (status === "cancelled" ? "No changes were made." : "");
@@ -6701,6 +6826,20 @@ function agentSafeErrorCopy(code) {
     provider_response_read_failed: "The provider response could not be read.",
     provider_response_incomplete: "The AI account stopped before finishing. Try again.",
     provider_transport_failed: "The provider connection failed.",
+    pending_registration_unavailable: "Confirmation is temporarily unavailable.",
+    pending_owner_mismatch: "Confirmation is temporarily unavailable.",
+    pending_policy_mismatch: "Confirmation is temporarily unavailable.",
+    pending_registration_invalid: "Confirmation is temporarily unavailable.",
+    pending_capacity_unavailable: "Confirmation is temporarily unavailable.",
+    pending_registration_conflict: "Confirmation is temporarily unavailable.",
+    pending_maintenance_unavailable: "Confirmation is temporarily unavailable.",
+    pending_seal_unavailable: "Confirmation is temporarily unavailable.",
+    pending_quota_unavailable: "Confirmation is temporarily unavailable.",
+    pending_database_unavailable: "Confirmation is temporarily unavailable.",
+    pending_commit_unavailable: "Confirmation is temporarily unavailable.",
+    pending_action_invalid: "This action could not be prepared safely.",
+    pending_projection_unavailable: "Confirmation is temporarily unavailable.",
+    pending_transition_unavailable: "Confirmation is temporarily unavailable.",
     confirmation_unavailable: "Confirmation is temporarily unavailable.",
     session_busy: "This shared session is still in use. Try again shortly.",
     session_store_unavailable: "Shared session state is temporarily unavailable. Try again.",
@@ -7372,7 +7511,9 @@ async function handleAgentEvent(message, turnState) {
         preview: d.preview || "Action requires confirmation",
         risk: d.risk || "",
         expires_at_ms: d.expires_at_ms || null,
-        turn_id: turnState.turnId || "",
+        session_id: turnState.ownerProof?.session_id || "",
+        turn_request_id: turnState.ownerProof?.turn_request_id || "",
+        turn_id: turnState.ownerProof?.turn_id || turnState.turnId || "",
         status: "pending",
         result: "",
         error: "",
@@ -8147,6 +8288,7 @@ async function agentSend(text) {
     },
     isCurrent: isCurrentTurn,
     turnId: turn,
+    ownerProof: activityIdentity,
     finish,
     reconcileRequestStatus,
   };
@@ -8210,7 +8352,7 @@ async function agentSend(text) {
       if (AssistantState.activeMessage !== asst || AssistantState.activeTurnId !== turn) return;
       finish("⚠ connection lost");
     })();
-  });
+  }, CAP.agent);
   stream = openTurnStream();
   AssistantState.activeStream = stream;
   AssistantState.turnStreamReady = true;

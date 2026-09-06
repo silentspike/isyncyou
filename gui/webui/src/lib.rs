@@ -294,8 +294,8 @@ pub(crate) struct ProductPostRouteSpec {
 enum ProductReplayPolicy {
     /// The generic store may persist only a closed terminal status and result digest.
     DurableTerminal,
-    /// The route's own journal owns replay and retention. The global layer binds
-    /// the UUID only and never stores a response body.
+    /// The route owns replay and retention (or performs a fresh read). The global
+    /// layer binds the UUID only and never stores a response body.
     RouteOwned,
     /// The response contains short-lived authority and must never be replayed
     /// from the global store. An exact retry is reported as outcome unknown.
@@ -344,6 +344,7 @@ product_post_routes! {
     MailForward => ("/api/v1/mail/forward", 8 * 1024, Mail),
     MailMove => ("/api/v1/mail/move", 8 * 1024, Mail),
     MailRead => ("/api/v1/mail/read", 8 * 1024, Mail),
+    MailReadState => ("/api/v1/mail/read-state", 8 * 1024, Mail),
     MailFlag => ("/api/v1/mail/flag", 8 * 1024, Mail),
     MailCategories => ("/api/v1/mail/categories", 8 * 1024, Mail),
     MailDraft => ("/api/v1/mail/draft", 8 * 1024, Mail),
@@ -441,6 +442,7 @@ impl ProductPostRoute {
             | AgentPairingRevoke
             | AgentConnectivityPreflight
             | AgentOauthStart
+            | MailReadState
             | Share => ProductReplayPolicy::RouteOwned,
             Restore
             | Backup
@@ -785,6 +787,13 @@ fn valid_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_exact_base64url(value: &str, exact_len: usize) -> bool {
+    value.len() == exact_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn mutation_error_response(error: &str) -> ApiResponse {
@@ -1154,6 +1163,7 @@ fn scalar_product_fields(route: ProductPostRoute) -> Option<&'static [&'static s
         Settings => Some(&["poll_interval_secs"]),
         MailMove => Some(&["account", "id", "destination"]),
         MailRead => Some(&["account", "id", "is_read"]),
+        MailReadState => Some(&["account", "id"]),
         MailFlag => Some(&["account", "id", "status", "due", "tz"]),
         MailCategories => Some(&["account", "id", "categories"]),
         CalendarCreate => Some(&[
@@ -1505,6 +1515,9 @@ fn canonicalize_scalar_product_payload(
         }
         MailMove => {
             require_non_empty_scalar_fields(object, &["account", "id", "destination"])?;
+        }
+        MailReadState => {
+            require_non_empty_scalar_fields(object, &["account", "id"])?;
         }
         MailRead => {
             require_non_empty_scalar_fields(object, &["account", "id"])?;
@@ -2026,13 +2039,14 @@ fn validate_typed_product_request(
         AgentConfirm => {
             let request = serde_json::from_value::<AgentConfirmRequest>(value.clone())
                 .map_err(|_| no_store_json_error(400, "invalid product request"))?;
-            (valid_opaque_agent_id(&request.pending)
-                && !request.token.is_empty()
-                && request.token.len() <= 512
-                && !request.action_hash.is_empty()
-                && request.action_hash.len() <= 128)
-                .then_some(())
-                .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+            (valid_opaque_agent_id(&request.session_id)
+                && valid_client_request_id(&request.turn_request_id)
+                && valid_opaque_agent_id(&request.turn_id)
+                && valid_exact_base64url(&request.pending, 22)
+                && valid_exact_base64url(&request.token, 43)
+                && valid_sha256(&request.action_hash))
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
         }
         AgentTurnCancel => {
             let request = serde_json::from_value::<AgentTurnCancelRequest>(value.clone())
@@ -2380,6 +2394,83 @@ pub struct AgentPendingBinding {
     pub item: String,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentPendingOwnerProof {
+    pub session_id: String,
+    pub turn_request_id: String,
+    pub turn_id: String,
+}
+
+impl std::fmt::Debug for AgentPendingOwnerProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentPendingOwnerProof")
+            .field("session_id_present", &!self.session_id.is_empty())
+            .field("turn_request_id_present", &!self.turn_request_id.is_empty())
+            .field("turn_id_present", &!self.turn_id.is_empty())
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentPendingBindingCommand {
+    pub pending: String,
+    pub action_hash: String,
+    pub owner: AgentPendingOwnerProof,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentConfirmCommand {
+    pub pending: String,
+    pub token: String,
+    pub action_hash: String,
+    pub owner: AgentPendingOwnerProof,
+}
+
+impl std::fmt::Debug for AgentConfirmCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentConfirmCommand")
+            .field("pending_present", &!self.pending.is_empty())
+            .field("token_present", &!self.token.is_empty())
+            .field("action_hash_present", &!self.action_hash.is_empty())
+            .field("owner", &self.owner)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentClosedConfirmationCode {
+    Invalid,
+    Expired,
+    Cancelled,
+    Replayed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentPendingBindingOutcome {
+    Ready(AgentPendingBinding),
+    Rejected(AgentClosedConfirmationCode),
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosedConfirmationFailure {
+    PostConsumeValidationFailed,
+    AuditStartFailed,
+    ExecutorRejected,
+    ExecutorFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentConfirmOutcome {
+    Completed,
+    Failed(ClosedConfirmationFailure),
+    Rejected(AgentClosedConfirmationCode),
+    Retryable,
+    OutcomeUnknown,
+}
+
 /// The only provider/purpose pairs accepted by the connectivity preflight route.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -2494,13 +2585,31 @@ pub struct AgentUserPresenceConfirmRequest {
     pub action_hash: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfirmRequest {
     pub request_id: String,
+    pub session_id: String,
+    pub turn_request_id: String,
+    pub turn_id: String,
     pub pending: String,
     pub token: String,
     pub action_hash: String,
+}
+
+impl std::fmt::Debug for AgentConfirmRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentConfirmRequest")
+            .field("request_id_present", &!self.request_id.is_empty())
+            .field("session_id_present", &!self.session_id.is_empty())
+            .field("turn_request_id_present", &!self.turn_request_id.is_empty())
+            .field("turn_id_present", &!self.turn_id.is_empty())
+            .field("pending_present", &!self.pending.is_empty())
+            .field("token_present", &!self.token.is_empty())
+            .field("action_hash_present", &!self.action_hash.is_empty())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -2632,15 +2741,11 @@ pub trait AgentHandler: Send + Sync {
     }
     /// Peek the non-secret binding for a pending destructive action without checking
     /// or consuming its one-time Agent confirmation token.
-    fn pending_binding(
-        &self,
-        _pending_id: &str,
-        _action_hash: &str,
-    ) -> Result<AgentPendingBinding, String> {
-        Err("pending binding is not enabled on this server".into())
+    fn pending_binding(&self, _command: &AgentPendingBindingCommand) -> AgentPendingBindingOutcome {
+        AgentPendingBindingOutcome::Unavailable
     }
-    /// Confirm a pending destructive action with its one-time token; returns a summary.
-    fn confirm(&self, pending_id: &str, token: &str, action_hash: &str) -> Result<String, String>;
+    /// Confirm a pending destructive action without exposing executor output.
+    fn confirm(&self, command: &AgentConfirmCommand) -> AgentConfirmOutcome;
     /// Cancel an in-flight turn.
     fn cancel(&self, turn_id: &str);
     fn cancel_turn(&self, turn_id: &str) -> Result<(), String> {
@@ -3039,6 +3144,10 @@ pub trait OneDriveRiskHandler: Send + Sync {
 /// refused there. The web UI for these verbs lands in #563 — this trait + the
 /// endpoints are the backend they build on.
 pub trait MailWriteHandler: Send + Sync {
+    /// Read the current Graph `isRead` value for one opaque message id.
+    /// This is intentionally separate from StoreArchive reads so callers can
+    /// reconcile a live write without treating the local archive as Graph.
+    fn read_state(&self, account: &str, message_id: &str) -> Result<bool, String>;
     /// Compose and send a new message (saved to Sent Items).
     #[allow(clippy::too_many_arguments)] // a compose genuinely has many fields
     fn send(
@@ -4009,10 +4118,6 @@ impl Router {
                     Ok(id) => Some(ApiResponse::ok_json(&json!({
                         "status": "confirmation_required",
                         "pending_action_id": id,
-                        "op": op,
-                        "account": account,
-                        "service": service,
-                        "item": item,
                     }))),
                     Err(e) => {
                         let status = match e {
@@ -4275,6 +4380,15 @@ impl Router {
         }
     }
 
+    /// Check the independent Agent capability required before opening a turn stream.
+    /// The capability is transport metadata only and must never be placed in the target.
+    pub fn agent_stream_capability_authorized(&self, provided: Option<&str>) -> bool {
+        match (&self.agent_cap_token, provided) {
+            (Some(expected), Some(provided)) => ct_eq(expected.as_bytes(), provided.as_bytes()),
+            _ => false,
+        }
+    }
+
     /// Open a push stream for the Android in-process bridge (#0A) — the replacement for the
     /// two `EventSource` endpoints on the phone, where no loopback port exists to hold an
     /// SSE socket open. Items are ready-to-embed JSON event objects
@@ -4286,6 +4400,7 @@ impl Router {
         &self,
         target: &str,
         session_token: Option<&str>,
+        capability_token: Option<&str>,
     ) -> Option<std::sync::mpsc::Receiver<String>> {
         let req =
             ApiRequest::new("GET", target).with_session_token(session_token.map(str::to_string));
@@ -4294,6 +4409,9 @@ impl Router {
         }
         match req.path.as_str() {
             "/api/v1/events" => {
+                if capability_token.is_some() {
+                    return None;
+                }
                 let bus = self.events_bus()?.clone();
                 let (tx, rx) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
@@ -4316,6 +4434,9 @@ impl Router {
                 Some(rx)
             }
             "/api/v1/agent/stream" => {
+                if !self.agent_stream_capability_authorized(capability_token) {
+                    return None;
+                }
                 let turn = req
                     .query
                     .iter()
@@ -4438,17 +4559,25 @@ impl Router {
         }
 
         let response = execute(Some(&identity));
-        let confirmation_required = response.status == 200
-            && response.content_type == "application/json"
-            && serde_json::from_slice::<Value>(&response.body)
-                .ok()
-                .is_some_and(|value| {
-                    value.get("status").and_then(Value::as_str) == Some("confirmation_required")
-                });
-        if confirmation_required {
+        let response_code = (response.content_type == "application/json")
+            .then(|| serde_json::from_slice::<Value>(&response.body).ok())
+            .flatten()
+            .and_then(|value| {
+                value
+                    .get("status")
+                    .or_else(|| value.get("error"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        let confirmation_required =
+            response.status == 200 && response_code.as_deref() == Some("confirmation_required");
+        let confirmation_retryable = spec.route == ProductPostRoute::AgentConfirm
+            && response.status == 503
+            && response_code.as_deref() == Some("confirmation_retryable");
+        if confirmation_required || confirmation_retryable {
             // Native user presence is an intermediate state. The retry carrying
-            // the confirmed public handle must reach the handler, after which its
-            // terminal result becomes the replayable receipt.
+            // the confirmed public handle, or a host-proven pre-consume retry, must
+            // reach the handler. The global UUID binding remains authoritative.
             if store.abort(&identity).is_err() {
                 return ApiResponse::error(503, "request_store_unavailable");
             }
@@ -4579,6 +4708,9 @@ impl Router {
         // AC is exactly "pause a LIVE materialization"). They are still session-token-gated (checked
         // above) and cap-token-gated in the handler; only the store gate is skipped.
         const GATE_EXEMPT_POST: &[&str] = &[
+            // A body-based live read touches no archive Store and must remain
+            // available while that Store is being refreshed.
+            "/api/v1/mail/read-state",
             "/api/v1/onedrive/transfers/cancel",
             "/api/v1/onedrive/transfers/pause",
             "/api/v1/onedrive/transfers/retry",
@@ -4624,6 +4756,7 @@ impl Router {
                 ProductPostRoute::MailForward => self.mail_forward(req),
                 ProductPostRoute::MailMove => self.mail_move(req),
                 ProductPostRoute::MailRead => self.mail_read(req),
+                ProductPostRoute::MailReadState => self.mail_read_state(req),
                 ProductPostRoute::MailFlag => self.mail_flag(req),
                 ProductPostRoute::MailCategories => self.mail_categories(req),
                 ProductPostRoute::MailDraft => self.mail_draft(req),
@@ -4872,6 +5005,7 @@ impl Router {
             "/api/v1/onedrive/open" => self.onedrive_open(req),
             "/api/v1/contact/photo" => self.contact_photo(req),
             "/api/v1/debug/stats" => self.debug_stats(),
+            "/api/v1/mail/read-state" => ApiResponse::error(405, "method not allowed"),
             _ => ApiResponse::error(404, "not found"),
         }
     }
@@ -4930,6 +5064,30 @@ impl Router {
             ));
         }
         Ok(h)
+    }
+
+    fn mail_read_state(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.mail_gate(req) {
+            Ok(h) => h,
+            Err(response) => return response,
+        };
+        let parsed = match parse_strict_scalar_mutation(req, "mail read state", &["account", "id"])
+        {
+            Ok(parsed) => parsed,
+            Err(response) => return response,
+        };
+        let req = &parsed;
+        let (account, id) = match (
+            req.q("account").filter(|value| !value.is_empty()),
+            req.q("id").filter(|value| !value.is_empty()),
+        ) {
+            (Some(account), Some(id)) => (account, id),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        match h.read_state(account, id) {
+            Ok(is_read) => ApiResponse::ok_json(&json!({ "is_read": is_read })),
+            Err(_) => ApiResponse::error(502, "mail_read_state_failed"),
+        }
     }
 
     /// Audit + map a unit mail result to a response. NB: we deliberately do NOT
@@ -8081,18 +8239,34 @@ impl Router {
             Err(response) => return response,
         };
         if !valid_client_request_id(&request.request_id)
-            || !valid_opaque_agent_id(&request.pending)
-            || request.token.is_empty()
-            || request.token.len() > 512
-            || request.action_hash.is_empty()
-            || request.action_hash.len() > 128
+            || !valid_opaque_agent_id(&request.session_id)
+            || !valid_client_request_id(&request.turn_request_id)
+            || !valid_opaque_agent_id(&request.turn_id)
+            || !valid_exact_base64url(&request.pending, 22)
+            || !valid_exact_base64url(&request.token, 43)
+            || !valid_sha256(&request.action_hash)
         {
             return no_store_json_error(400, "invalid agent confirm request");
         }
+        let owner = AgentPendingOwnerProof {
+            session_id: request.session_id,
+            turn_request_id: request.turn_request_id,
+            turn_id: request.turn_id,
+        };
+        let binding_command = AgentPendingBindingCommand {
+            pending: request.pending.clone(),
+            action_hash: request.action_hash.clone(),
+            owner: owner.clone(),
+        };
         if self.biometric_gate {
-            let binding = match handler.pending_binding(&request.pending, &request.action_hash) {
-                Ok(binding) => binding,
-                Err(e) => return agent_confirm_error_response(&e),
+            let binding = match handler.pending_binding(&binding_command) {
+                AgentPendingBindingOutcome::Ready(binding) => binding,
+                AgentPendingBindingOutcome::Rejected(code) => {
+                    return agent_closed_confirmation_response(code)
+                }
+                AgentPendingBindingOutcome::Unavailable => {
+                    return no_store_json_error(503, "confirmation_retryable")
+                }
             };
             if let Some(r) = self.biometric_challenge(
                 &binding.op,
@@ -8104,12 +8278,23 @@ impl Router {
                 return r;
             }
         }
-        match handler.confirm(&request.pending, &request.token, &request.action_hash) {
-            Ok(_internal_summary) => ApiResponse::ok_json(&json!({
+        let command = AgentConfirmCommand {
+            pending: request.pending.clone(),
+            token: request.token,
+            action_hash: request.action_hash,
+            owner,
+        };
+        match handler.confirm(&command) {
+            AgentConfirmOutcome::Completed => ApiResponse::ok_json(&json!({
                 "confirmed": request.pending,
                 "result": "Completed successfully."
             })),
-            Err(e) => agent_confirm_error_response(&e),
+            AgentConfirmOutcome::Failed(_) => no_store_json_error(409, "confirmation_failed"),
+            AgentConfirmOutcome::Rejected(code) => agent_closed_confirmation_response(code),
+            AgentConfirmOutcome::Retryable => no_store_json_error(503, "confirmation_retryable"),
+            AgentConfirmOutcome::OutcomeUnknown => {
+                no_store_json_error(409, "confirmation_outcome_unknown")
+            }
         }
     }
 
@@ -9350,6 +9535,16 @@ fn agent_confirm_error_response(error: &str) -> ApiResponse {
     no_store_json_error(status, code)
 }
 
+fn agent_closed_confirmation_response(code: AgentClosedConfirmationCode) -> ApiResponse {
+    let code = match code {
+        AgentClosedConfirmationCode::Invalid => "confirmation_invalid",
+        AgentClosedConfirmationCode::Expired => "confirmation_expired",
+        AgentClosedConfirmationCode::Cancelled => "confirmation_cancelled",
+        AgentClosedConfirmationCode::Replayed => "confirmation_replayed",
+    };
+    no_store_json_error(409, code)
+}
+
 /// Default and maximum page size for the items listing.
 const DEFAULT_LIMIT: u32 = 200;
 const MAX_LIMIT: u32 = 1000;
@@ -10046,6 +10241,17 @@ mod tests {
         serde_json::from_slice(&resp.body).unwrap()
     }
 
+    fn assert_opaque_confirmation_challenge(value: &Value) {
+        let object = value.as_object().expect("confirmation challenge object");
+        assert_eq!(
+            object.len(),
+            2,
+            "challenge must expose only status and handle"
+        );
+        assert_eq!(value["status"], "confirmation_required");
+        assert!(value["pending_action_id"].as_str().is_some());
+    }
+
     fn strict_json_post(path: &str, body: Value, cap: Option<&str>) -> ApiRequest {
         ApiRequest::new("POST", path)
             .with_cap_token(cap.map(str::to_string))
@@ -10066,18 +10272,42 @@ mod tests {
         strict_json_post(&legacy_shape.path, Value::Object(body), Some(cap))
     }
 
+    const TEST_CONFIRM_SESSION_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const TEST_CONFIRM_TURN_REQUEST_ID: &str = "550e8400-e29b-41d4-a716-446655440020";
+    const TEST_CONFIRM_TURN_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+    const TEST_CONFIRM_PENDING_ID: &str = "AAAAAAAAAAAAAAAAAAAAAA";
+    const TEST_CONFIRM_TOKEN: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+    const TEST_CONFIRM_ACTION_HASH: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
     fn agent_confirm_request(action_hash: &str) -> ApiRequest {
         strict_json_post(
             "/api/v1/agent/confirm",
             json!({
                 "request_id": "550e8400-e29b-41d4-a716-446655440010",
-                "pending": "p1",
-                "token": "right",
+                "session_id": TEST_CONFIRM_SESSION_ID,
+                "turn_request_id": TEST_CONFIRM_TURN_REQUEST_ID,
+                "turn_id": TEST_CONFIRM_TURN_ID,
+                "pending": TEST_CONFIRM_PENDING_ID,
+                "token": TEST_CONFIRM_TOKEN,
                 "action_hash": action_hash,
             }),
             Some("agentsecret"),
         )
         .with_session_token(Some("sess".into()))
+    }
+
+    fn mutate_agent_confirm_request(
+        request: ApiRequest,
+        mutate: impl FnOnce(&mut serde_json::Map<String, Value>),
+    ) -> ApiRequest {
+        let mut body: Value = serde_json::from_slice(&request.body).unwrap();
+        mutate(body.as_object_mut().unwrap());
+        ApiRequest::new("POST", "/api/v1/agent/confirm")
+            .with_cap_token(Some("agentsecret".into()))
+            .with_session_token(Some("sess".into()))
+            .with_content_type(Some("application/json".into()))
+            .with_body(serde_json::to_vec(&body).unwrap())
     }
 
     #[test]
@@ -10626,11 +10856,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
         assert_eq!(ch.status, 200);
         let body = body_json(&ch);
-        assert_eq!(body["status"], "confirmation_required");
-        assert_eq!(body["op"], "restore-cloud");
-        assert_eq!(body["account"], "a");
-        assert_eq!(body["service"], "mail");
-        assert_eq!(body["item"], restore_cloud_pending_item("mail", "x"));
+        assert_opaque_confirmation_challenge(&body);
         assert!(restore.calls.lock().unwrap().is_empty());
 
         let pat = body["pending_action_id"].as_str().unwrap().to_string();
@@ -10762,8 +10988,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let ch = mobile.route(&post("/api/v1/backup?account=a&services=mail"));
         assert_eq!(ch.status, 200);
         let body = body_json(&ch);
-        assert_eq!(body["status"], "confirmation_required");
-        assert_eq!(body["op"], "backup");
+        assert_opaque_confirmation_challenge(&body);
         assert!(backup.calls.lock().unwrap().is_empty());
         let pat = body["pending_action_id"].as_str().unwrap().to_string();
 
@@ -10839,8 +11064,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         fn start_turn(&self, _a: &str, _p: &str) -> Result<String, String> {
             Err("product_not_ready".into())
         }
-        fn confirm(&self, _p: &str, _t: &str, _h: &str) -> Result<String, String> {
-            Err("n/a".into())
+        fn confirm(&self, _command: &AgentConfirmCommand) -> AgentConfirmOutcome {
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::ExecutorRejected)
         }
         fn cancel(&self, _t: &str) {}
         fn open_stream(&self, _t: &str) -> Option<std::sync::mpsc::Receiver<String>> {
@@ -10858,13 +11083,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             Err("not enabled".into())
         }
 
-        fn confirm(
-            &self,
-            _pending_id: &str,
-            _token: &str,
-            _action_hash: &str,
-        ) -> Result<String, String> {
-            Err("not enabled".into())
+        fn confirm(&self, _command: &AgentConfirmCommand) -> AgentConfirmOutcome {
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::ExecutorRejected)
         }
 
         fn cancel(&self, _turn_id: &str) {}
@@ -10931,13 +11151,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             Ok("01ARZ3NDEKTSV4RRFFQ69G5FAW".into())
         }
 
-        fn confirm(
-            &self,
-            _pending_id: &str,
-            _token: &str,
-            _action_hash: &str,
-        ) -> Result<String, String> {
-            Err("not enabled".into())
+        fn confirm(&self, _command: &AgentConfirmCommand) -> AgentConfirmOutcome {
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::ExecutorRejected)
         }
 
         fn cancel(&self, _turn_id: &str) {}
@@ -11242,11 +11457,14 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         fn start_turn(&self, _a: &str, _p: &str) -> Result<String, String> {
             Ok("turn-123".into())
         }
-        fn confirm(&self, pending: &str, token: &str, action_hash: &str) -> Result<String, String> {
-            if token == "right" && action_hash == "hash" {
-                Ok(format!("ran {pending}"))
+        fn confirm(&self, command: &AgentConfirmCommand) -> AgentConfirmOutcome {
+            if command.pending == TEST_CONFIRM_PENDING_ID
+                && command.token == TEST_CONFIRM_TOKEN
+                && command.action_hash == TEST_CONFIRM_ACTION_HASH
+            {
+                AgentConfirmOutcome::Completed
             } else {
-                Err("bad token".into())
+                AgentConfirmOutcome::Rejected(AgentClosedConfirmationCode::Invalid)
             }
         }
         fn cancel(&self, _t: &str) {}
@@ -11533,13 +11751,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             Err("not enabled".into())
         }
 
-        fn confirm(
-            &self,
-            _pending_id: &str,
-            _token: &str,
-            _action_hash: &str,
-        ) -> Result<String, String> {
-            Err("not enabled".into())
+        fn confirm(&self, _command: &AgentConfirmCommand) -> AgentConfirmOutcome {
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::ExecutorRejected)
         }
 
         fn cancel(&self, _turn_id: &str) {}
@@ -11630,8 +11843,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
     struct RecordingAgent {
         binding: AgentPendingBinding,
-        binding_calls: std::sync::Mutex<Vec<(String, String)>>,
-        confirm_calls: std::sync::Mutex<Vec<(String, String, String)>>,
+        binding_calls: std::sync::Mutex<Vec<AgentPendingBindingCommand>>,
+        confirm_calls: std::sync::Mutex<Vec<AgentConfirmCommand>>,
     }
 
     impl RecordingAgent {
@@ -11641,7 +11854,13 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                     op: "backup".into(),
                     account: "a".into(),
                     service: "agent".into(),
-                    item: "pending:2:p1:action_hash:4:hash".into(),
+                    item: format!(
+                        "pending:{}:{}:action_hash:{}:{}",
+                        TEST_CONFIRM_PENDING_ID.len(),
+                        TEST_CONFIRM_PENDING_ID,
+                        TEST_CONFIRM_ACTION_HASH.len(),
+                        TEST_CONFIRM_ACTION_HASH
+                    ),
                 },
                 binding_calls: std::sync::Mutex::new(Vec::new()),
                 confirm_calls: std::sync::Mutex::new(Vec::new()),
@@ -11660,31 +11879,91 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
         fn pending_binding(
             &self,
-            pending_id: &str,
-            action_hash: &str,
-        ) -> Result<AgentPendingBinding, String> {
-            self.binding_calls
-                .lock()
-                .unwrap()
-                .push((pending_id.to_string(), action_hash.to_string()));
-            if pending_id == "p1" && action_hash == "hash" {
-                Ok(self.binding.clone())
+            command: &AgentPendingBindingCommand,
+        ) -> AgentPendingBindingOutcome {
+            self.binding_calls.lock().unwrap().push(command.clone());
+            if command.pending == TEST_CONFIRM_PENDING_ID
+                && command.action_hash == TEST_CONFIRM_ACTION_HASH
+                && command.owner.session_id == TEST_CONFIRM_SESSION_ID
+                && command.owner.turn_request_id == TEST_CONFIRM_TURN_REQUEST_ID
+                && command.owner.turn_id == TEST_CONFIRM_TURN_ID
+            {
+                AgentPendingBindingOutcome::Ready(self.binding.clone())
             } else {
-                Err("ActionMismatch".into())
+                AgentPendingBindingOutcome::Rejected(AgentClosedConfirmationCode::Invalid)
             }
         }
 
-        fn confirm(&self, pending: &str, token: &str, action_hash: &str) -> Result<String, String> {
-            self.confirm_calls.lock().unwrap().push((
-                pending.to_string(),
-                token.to_string(),
-                action_hash.to_string(),
-            ));
-            if pending == "p1" && token == "right" && action_hash == "hash" {
-                Ok(format!("ran {pending}"))
+        fn confirm(&self, command: &AgentConfirmCommand) -> AgentConfirmOutcome {
+            self.confirm_calls.lock().unwrap().push(command.clone());
+            if command.pending == TEST_CONFIRM_PENDING_ID
+                && command.token == TEST_CONFIRM_TOKEN
+                && command.action_hash == TEST_CONFIRM_ACTION_HASH
+                && command.owner.session_id == TEST_CONFIRM_SESSION_ID
+                && command.owner.turn_request_id == TEST_CONFIRM_TURN_REQUEST_ID
+                && command.owner.turn_id == TEST_CONFIRM_TURN_ID
+            {
+                AgentConfirmOutcome::Completed
             } else {
-                Err("bad token".into())
+                AgentConfirmOutcome::Rejected(AgentClosedConfirmationCode::Invalid)
             }
+        }
+
+        fn cancel(&self, _turn_id: &str) {}
+
+        fn open_stream(&self, _turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>> {
+            None
+        }
+    }
+
+    struct FixedConfirmAgent {
+        outcome: AgentConfirmOutcome,
+        confirm_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FixedConfirmAgent {
+        fn new(outcome: AgentConfirmOutcome) -> Self {
+            Self {
+                outcome,
+                confirm_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn confirm_call_count(&self) -> usize {
+            self.confirm_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl AgentHandler for FixedConfirmAgent {
+        fn start_turn(&self, _account: &str, _prompt: &str) -> Result<String, String> {
+            Ok("turn-fixed".into())
+        }
+
+        fn pending_binding(
+            &self,
+            command: &AgentPendingBindingCommand,
+        ) -> AgentPendingBindingOutcome {
+            if command.pending == TEST_CONFIRM_PENDING_ID
+                && command.action_hash == TEST_CONFIRM_ACTION_HASH
+                && command.owner.session_id == TEST_CONFIRM_SESSION_ID
+                && command.owner.turn_request_id == TEST_CONFIRM_TURN_REQUEST_ID
+                && command.owner.turn_id == TEST_CONFIRM_TURN_ID
+            {
+                AgentPendingBindingOutcome::Ready(AgentPendingBinding {
+                    op: "backup".into(),
+                    account: "a".into(),
+                    service: "agent".into(),
+                    item: "opaque".into(),
+                })
+            } else {
+                AgentPendingBindingOutcome::Rejected(AgentClosedConfirmationCode::Invalid)
+            }
+        }
+
+        fn confirm(&self, _command: &AgentConfirmCommand) -> AgentConfirmOutcome {
+            self.confirm_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.outcome
         }
 
         fn cancel(&self, _turn_id: &str) {}
@@ -12084,9 +12363,12 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "/api/v1/agent/confirm",
             json!({
                 "request_id": "550e8400-e29b-41d4-a716-446655440001",
-                "pending": "p1",
-                "token": "wrong",
-                "action_hash": "hash",
+                "session_id": TEST_CONFIRM_SESSION_ID,
+                "turn_request_id": TEST_CONFIRM_TURN_REQUEST_ID,
+                "turn_id": TEST_CONFIRM_TURN_ID,
+                "pending": TEST_CONFIRM_PENDING_ID,
+                "token": "w".repeat(43),
+                "action_hash": TEST_CONFIRM_ACTION_HASH,
             }),
             Some("agentsecret"),
         );
@@ -12095,9 +12377,12 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "/api/v1/agent/confirm",
             json!({
                 "request_id": "550e8400-e29b-41d4-a716-446655440002",
-                "pending": "p1",
-                "token": "right",
-                "action_hash": "hash",
+                "session_id": TEST_CONFIRM_SESSION_ID,
+                "turn_request_id": TEST_CONFIRM_TURN_REQUEST_ID,
+                "turn_id": TEST_CONFIRM_TURN_ID,
+                "pending": TEST_CONFIRM_PENDING_ID,
+                "token": TEST_CONFIRM_TOKEN,
+                "action_hash": TEST_CONFIRM_ACTION_HASH,
             }),
             Some("agentsecret"),
         );
@@ -12197,8 +12482,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "/api/v1/agent/confirm",
             json!({
                 "request_id": "550e8400-e29b-41d4-a716-446655440003",
-                "pending": "p1",
-                "token": "right",
+                "session_id": TEST_CONFIRM_SESSION_ID,
+                "turn_request_id": TEST_CONFIRM_TURN_REQUEST_ID,
+                "turn_id": TEST_CONFIRM_TURN_ID,
+                "pending": TEST_CONFIRM_PENDING_ID,
+                "token": TEST_CONFIRM_TOKEN,
             }),
             Some("agentsecret"),
         ));
@@ -12207,8 +12495,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "/api/v1/agent/confirm",
             json!({
                 "request_id": "550e8400-e29b-41d4-a716-446655440004",
-                "pending": "p1",
-                "action_hash": "hash",
+                "session_id": TEST_CONFIRM_SESSION_ID,
+                "turn_request_id": TEST_CONFIRM_TURN_REQUEST_ID,
+                "turn_id": TEST_CONFIRM_TURN_ID,
+                "pending": TEST_CONFIRM_PENDING_ID,
+                "action_hash": TEST_CONFIRM_ACTION_HASH,
             }),
             Some("agentsecret"),
         ));
@@ -12235,9 +12526,12 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "/api/v1/agent/confirm",
             json!({
                 "request_id": "550e8400-e29b-41d4-a716-446655440005",
-                "pending": "p1",
-                "token": "right",
-                "action_hash": "hash",
+                "session_id": TEST_CONFIRM_SESSION_ID,
+                "turn_request_id": TEST_CONFIRM_TURN_REQUEST_ID,
+                "turn_id": TEST_CONFIRM_TURN_ID,
+                "pending": TEST_CONFIRM_PENDING_ID,
+                "token": TEST_CONFIRM_TOKEN,
+                "action_hash": TEST_CONFIRM_ACTION_HASH,
             }),
             Some("agentsecret"),
         ));
@@ -12249,6 +12543,294 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(!encoded.contains("ran p1"));
         assert!(!encoded.contains("live-write"));
         assert!(!encoded.contains("set_read"));
+    }
+
+    #[test]
+    fn agent_confirm_requires_session_turn_request_and_turn_owner_binding() {
+        let (_d, router) = setup();
+        let agent = std::sync::Arc::new(RecordingAgent::backup());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into());
+
+        for field in ["session_id", "turn_request_id", "turn_id"] {
+            let request = mutate_agent_confirm_request(
+                agent_confirm_request(TEST_CONFIRM_ACTION_HASH),
+                |body| {
+                    body.remove(field);
+                },
+            );
+            assert_eq!(router.route(&request).status, 400, "missing {field}");
+        }
+
+        let response = router.route(&agent_confirm_request(TEST_CONFIRM_ACTION_HASH));
+        assert_eq!(response.status, 200);
+        let call = agent.confirm_calls.lock().unwrap().last().unwrap().clone();
+        assert_eq!(call.owner.session_id, TEST_CONFIRM_SESSION_ID);
+        assert_eq!(call.owner.turn_request_id, TEST_CONFIRM_TURN_REQUEST_ID);
+        assert_eq!(call.owner.turn_id, TEST_CONFIRM_TURN_ID);
+    }
+
+    #[test]
+    fn agent_confirm_rejects_noncanonical_pending_token_and_hash_encodings() {
+        let (_d, router) = setup();
+        let router = router
+            .with_agent(
+                std::sync::Arc::new(RecordingAgent::backup()),
+                "agentsecret".into(),
+            )
+            .with_session_token("sess".into());
+        for (field, value) in [
+            ("pending", "short".to_string()),
+            ("pending", "A".repeat(21) + "="),
+            ("token", "B".repeat(42)),
+            ("token", "B".repeat(42) + "="),
+            ("action_hash", "A".repeat(64)),
+            ("action_hash", "a".repeat(63)),
+        ] {
+            let request = mutate_agent_confirm_request(
+                agent_confirm_request(TEST_CONFIRM_ACTION_HASH),
+                |body| {
+                    body.insert(field.into(), Value::String(value));
+                },
+            );
+            assert_eq!(router.route(&request).status, 400, "accepted {field}");
+        }
+    }
+
+    #[test]
+    fn agent_confirm_semantic_digest_excludes_token_but_includes_owner_and_action_binding() {
+        let spec = product_post_route("/api/v1/agent/confirm").unwrap();
+        let base = agent_confirm_request(TEST_CONFIRM_ACTION_HASH);
+        let token_changed = mutate_agent_confirm_request(base.clone(), |body| {
+            body.insert("token".into(), Value::String("C".repeat(43)));
+        });
+        let owner_changed = mutate_agent_confirm_request(base.clone(), |body| {
+            body.insert("turn_id".into(), Value::String("OTHER_TURN".into()));
+        });
+        let action_changed = mutate_agent_confirm_request(base.clone(), |body| {
+            body.insert("action_hash".into(), Value::String("b".repeat(64)));
+        });
+        let base_identity = canonical_product_identity(&base, spec).unwrap();
+        assert_eq!(
+            base_identity.payload_digest,
+            canonical_product_identity(&token_changed, spec)
+                .unwrap()
+                .payload_digest
+        );
+        assert_ne!(
+            base_identity.payload_digest,
+            canonical_product_identity(&owner_changed, spec)
+                .unwrap()
+                .payload_digest
+        );
+        assert_ne!(
+            base_identity.payload_digest,
+            canonical_product_identity(&action_changed, spec)
+                .unwrap()
+                .payload_digest
+        );
+    }
+
+    #[test]
+    fn agent_confirm_uses_session_scope_in_global_uuid_binding() {
+        let identity = canonical_product_identity(
+            &agent_confirm_request(TEST_CONFIRM_ACTION_HASH),
+            product_post_route("/api/v1/agent/confirm").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            identity.request_scope,
+            format!("session_id:{TEST_CONFIRM_SESSION_ID}")
+        );
+        assert_eq!(identity.route_domain, "post:/api/v1/agent/confirm");
+    }
+
+    #[test]
+    fn agent_confirm_same_request_replay_never_executes_twice() {
+        let (_d, router) = setup();
+        let agent = std::sync::Arc::new(RecordingAgent::backup());
+        let receipts = std::sync::Arc::new(MemoryDurableRequests::default());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_durable_requests(receipts.clone());
+        let first = router.route(&agent_confirm_request(TEST_CONFIRM_ACTION_HASH));
+        let replay = router.route(&agent_confirm_request(TEST_CONFIRM_ACTION_HASH));
+        assert_eq!(first.status, 200);
+        assert_eq!(replay.status, 200);
+        assert_eq!(agent.confirm_call_count(), 1);
+        assert_eq!(receipts.completed_receipt_count(), 1);
+    }
+
+    #[test]
+    fn agent_confirm_retryable_retains_in_memory_authority_and_global_uuid_binding() {
+        let (_d, router) = setup();
+        let agent = std::sync::Arc::new(FixedConfirmAgent::new(AgentConfirmOutcome::Retryable));
+        let receipts = std::sync::Arc::new(MemoryDurableRequests::default());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_durable_requests(receipts.clone());
+        let request = || agent_confirm_request(TEST_CONFIRM_ACTION_HASH);
+
+        assert_eq!(router.route(&request()).status, 503);
+        assert_eq!(router.route(&request()).status, 503);
+        assert_eq!(agent.confirm_call_count(), 2);
+        assert_eq!(receipts.binding_count(), 1);
+        assert_eq!(receipts.completed_receipt_count(), 0);
+    }
+
+    #[test]
+    fn agent_confirm_restart_with_stale_started_receipt_remains_request_outcome_unknown() {
+        let receipts = std::sync::Arc::new(MemoryDurableRequests::default());
+        let request = agent_confirm_request(TEST_CONFIRM_ACTION_HASH);
+        let identity = canonical_product_identity(
+            &request,
+            product_post_route("/api/v1/agent/confirm").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            receipts.begin(&identity).unwrap(),
+            DurableRequestBegin::Execute
+        );
+
+        let (_d, router) = setup();
+        let agent = std::sync::Arc::new(RecordingAgent::backup());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_durable_requests(receipts);
+        let response = router.route(&request);
+        assert_eq!(response.status, 409);
+        assert_eq!(body_json(&response)["error"], "request_outcome_unknown");
+        assert_eq!(agent.confirm_call_count(), 0);
+    }
+
+    #[test]
+    fn agent_confirm_restart_after_consumption_never_reenters_executor() {
+        let receipts = std::sync::Arc::new(MemoryDurableRequests::default());
+        let (_d, first_router) = setup();
+        let first_agent = std::sync::Arc::new(RecordingAgent::backup());
+        let first_router = first_router
+            .with_agent(first_agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_durable_requests(receipts.clone());
+        assert_eq!(
+            first_router
+                .route(&agent_confirm_request(TEST_CONFIRM_ACTION_HASH))
+                .status,
+            200
+        );
+        assert_eq!(first_agent.confirm_call_count(), 1);
+
+        let (_d2, restarted_router) = setup();
+        let restarted_agent = std::sync::Arc::new(RecordingAgent::backup());
+        let restarted_router = restarted_router
+            .with_agent(restarted_agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_durable_requests(receipts);
+        assert_eq!(
+            restarted_router
+                .route(&agent_confirm_request(TEST_CONFIRM_ACTION_HASH))
+                .status,
+            200
+        );
+        assert_eq!(restarted_agent.confirm_call_count(), 0);
+    }
+
+    #[test]
+    fn agent_confirm_invalid_states_return_closed_codes_without_raw_details() {
+        for (outcome, expected) in [
+            (
+                AgentConfirmOutcome::Rejected(AgentClosedConfirmationCode::Invalid),
+                "confirmation_invalid",
+            ),
+            (
+                AgentConfirmOutcome::Rejected(AgentClosedConfirmationCode::Expired),
+                "confirmation_expired",
+            ),
+            (
+                AgentConfirmOutcome::Rejected(AgentClosedConfirmationCode::Cancelled),
+                "confirmation_cancelled",
+            ),
+            (
+                AgentConfirmOutcome::Rejected(AgentClosedConfirmationCode::Replayed),
+                "confirmation_replayed",
+            ),
+            (
+                AgentConfirmOutcome::OutcomeUnknown,
+                "confirmation_outcome_unknown",
+            ),
+        ] {
+            let (_d, router) = setup();
+            let router = router
+                .with_agent(
+                    std::sync::Arc::new(FixedConfirmAgent::new(outcome)),
+                    "agentsecret".into(),
+                )
+                .with_session_token("sess".into());
+            let response = router.route(&agent_confirm_request(TEST_CONFIRM_ACTION_HASH));
+            assert_eq!(response.status, 409);
+            let encoded = String::from_utf8_lossy(&response.body);
+            assert!(encoded.contains(expected));
+            for forbidden in [
+                TEST_CONFIRM_TOKEN,
+                TEST_CONFIRM_ACTION_HASH,
+                TEST_CONFIRM_PENDING_ID,
+            ] {
+                assert!(!encoded.contains(forbidden));
+            }
+        }
+    }
+
+    #[test]
+    fn agent_confirm_request_and_owner_debug_omit_token_hash_ids_and_owner_values() {
+        let request: AgentConfirmRequest =
+            serde_json::from_slice(&agent_confirm_request(TEST_CONFIRM_ACTION_HASH).body).unwrap();
+        let owner = AgentPendingOwnerProof {
+            session_id: TEST_CONFIRM_SESSION_ID.into(),
+            turn_request_id: TEST_CONFIRM_TURN_REQUEST_ID.into(),
+            turn_id: TEST_CONFIRM_TURN_ID.into(),
+        };
+        let output = format!("{request:?} {owner:?}");
+        for secret in [
+            TEST_CONFIRM_TOKEN,
+            TEST_CONFIRM_ACTION_HASH,
+            TEST_CONFIRM_PENDING_ID,
+            TEST_CONFIRM_SESSION_ID,
+            TEST_CONFIRM_TURN_REQUEST_ID,
+            TEST_CONFIRM_TURN_ID,
+        ] {
+            assert!(!output.contains(secret));
+        }
+        assert!(output.contains("token_present: true"));
+        assert!(output.contains("turn_id_present: true"));
+    }
+
+    #[test]
+    fn agent_confirm_rejects_always_allow_remember_and_unknown_bypass_fields() {
+        let (_d, router) = setup();
+        let router = router
+            .with_agent(
+                std::sync::Arc::new(RecordingAgent::backup()),
+                "agentsecret".into(),
+            )
+            .with_session_token("sess".into());
+        for field in [
+            "always_allow",
+            "remember",
+            "policy_override",
+            "account_override",
+        ] {
+            let request = mutate_agent_confirm_request(
+                agent_confirm_request(TEST_CONFIRM_ACTION_HASH),
+                |body| {
+                    body.insert(field.into(), Value::Bool(true));
+                },
+            );
+            assert_eq!(router.route(&request).status, 400, "accepted {field}");
+        }
     }
 
     #[test]
@@ -12289,7 +12871,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
-    fn open_bridge_stream_gates_events_and_agent() {
+    fn bridge_agent_stream_requires_separate_session_and_agent_cap_before_opening_handler() {
         // #0A: the bridge push channel replaces both EventSource endpoints, with the same
         // session gate. Change stream pushes on notify; agent stream wraps each line.
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -12301,11 +12883,13 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into())
             .with_session_token("s".into());
         // Unauthorized → None (identical gate to the HTTP SSE path).
-        assert!(router.open_bridge_stream("/api/v1/events", None).is_none());
+        assert!(router
+            .open_bridge_stream("/api/v1/events", None, None)
+            .is_none());
         // Authorized change stream (trusted bridge token) → a change follows a notify. A
         // background notifier removes the capture-vs-notify race (mirrors the SSE test).
         let rx = router
-            .open_bridge_stream("/api/v1/events", Some("s"))
+            .open_bridge_stream("/api/v1/events", Some("s"), None)
             .expect("events stream");
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let (n, s2) = (bus.clone(), stop.clone());
@@ -12327,8 +12911,22 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         stop.store(true, Ordering::SeqCst);
         assert!(got_change, "change stream must push a change after notify");
         // Agent stream (session + turn) → the pre-serialized line wrapped as `data`.
+        assert!(router
+            .open_bridge_stream("/api/v1/agent/stream?turn=turn-123", Some("s"), None,)
+            .is_none());
+        assert!(router
+            .open_bridge_stream(
+                "/api/v1/agent/stream?turn=turn-123",
+                Some("s"),
+                Some("wrong"),
+            )
+            .is_none());
         let arx = router
-            .open_bridge_stream("/api/v1/agent/stream?turn=turn-123", Some("s"))
+            .open_bridge_stream(
+                "/api/v1/agent/stream?turn=turn-123",
+                Some("s"),
+                Some("agentsecret"),
+            )
             .expect("agent stream");
         let first = arx.recv_timeout(Duration::from_secs(2)).expect("an event");
         assert!(
@@ -12342,7 +12940,23 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         );
         // Unknown path → None.
         assert!(router
-            .open_bridge_stream("/api/v1/nope", Some("s"))
+            .open_bridge_stream("/api/v1/nope", Some("s"), None)
+            .is_none());
+    }
+
+    #[test]
+    fn generic_events_stream_remains_session_only() {
+        let bus = std::sync::Arc::new(EventBus::new());
+        let (_d, router) = setup();
+        let router = router
+            .with_events(bus)
+            .with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into())
+            .with_session_token("s".into());
+        assert!(router
+            .open_bridge_stream("/api/v1/events", Some("s"), None)
+            .is_some());
+        assert!(router
+            .open_bridge_stream("/api/v1/events", Some("s"), Some("agentsecret"))
             .is_none());
     }
 
@@ -12422,25 +13036,127 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
-    fn mobile_agent_confirm_requires_biometric_before_agent_token_consumption() {
+    fn mobile_agent_confirmation_challenge_returns_only_opaque_handle() {
         let (_d, router) = setup();
         let agent = std::sync::Arc::new(RecordingAgent::backup());
         let router = router
             .with_agent(agent.clone(), "agentsecret".into())
             .with_session_token("sess".into())
             .with_biometric_gate();
-        let req = agent_confirm_request("hash");
+        let req = agent_confirm_request(TEST_CONFIRM_ACTION_HASH);
 
         let resp = router.route(&req);
 
         assert_eq!(resp.status, 200);
         let body = body_json(&resp);
-        assert_eq!(body["status"], "confirmation_required");
-        assert_eq!(body["op"], "backup");
-        assert_eq!(body["account"], "a");
-        assert_eq!(body["service"], "agent");
-        assert_eq!(body["item"], "pending:2:p1:action_hash:4:hash");
+        assert_opaque_confirmation_challenge(&body);
+        assert_eq!(body.as_object().unwrap().len(), 2);
         assert_eq!(agent.confirm_call_count(), 0);
+    }
+
+    #[test]
+    fn mobile_agent_confirm_revalidates_owner_before_native_handle_consumption() {
+        let (_d, router) = setup();
+        let agent = std::sync::Arc::new(RecordingAgent::backup());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_biometric_gate();
+        let exact = agent_confirm_request(TEST_CONFIRM_ACTION_HASH);
+        let challenge = router.route(&exact);
+        let handle = body_json(&challenge)["pending_action_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(router.confirm_biometric(&handle));
+
+        let wrong_owner = mutate_agent_confirm_request(exact.clone(), |body| {
+            body.insert("turn_id".into(), Value::String("OTHER_TURN".into()));
+        })
+        .with_per_action_token(Some(handle.clone()));
+        assert_eq!(router.route(&wrong_owner).status, 409);
+        assert_eq!(agent.confirm_call_count(), 0);
+
+        let accepted = router.route(&exact.with_per_action_token(Some(handle)));
+        assert_eq!(accepted.status, 200);
+        assert_eq!(agent.confirm_call_count(), 1);
+    }
+
+    #[test]
+    fn agent_native_handle_cannot_bypass_owner_bound_agent_confirmation() {
+        let (_d, router) = setup();
+        let agent = std::sync::Arc::new(RecordingAgent::backup());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_biometric_gate();
+        let exact = agent_confirm_request(TEST_CONFIRM_ACTION_HASH);
+        let challenge = router.route(&exact);
+        let handle = body_json(&challenge)["pending_action_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(router.confirm_biometric(&handle));
+        let wrong_owner = mutate_agent_confirm_request(exact, |body| {
+            body.insert(
+                "turn_request_id".into(),
+                Value::String("550e8400-e29b-41d4-a716-446655440099".into()),
+            );
+        })
+        .with_per_action_token(Some(handle));
+        assert_eq!(router.route(&wrong_owner).status, 409);
+        assert_eq!(agent.confirm_call_count(), 0);
+    }
+
+    #[test]
+    fn agent_pending_confirmation_routes_existing_native_presence_gate() {
+        let (_d, router) = setup();
+        let agent = std::sync::Arc::new(RecordingAgent::backup());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_biometric_gate();
+        let request = agent_confirm_request(TEST_CONFIRM_ACTION_HASH);
+        let challenge = router.route(&request);
+        assert_eq!(body_json(&challenge)["status"], "confirmation_required");
+        let handle = body_json(&challenge)["pending_action_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(router.describe_biometric(&handle).is_ok());
+        assert!(router.confirm_biometric(&handle));
+        assert_eq!(
+            router
+                .route(&request.with_per_action_token(Some(handle)))
+                .status,
+            200
+        );
+        assert_eq!(agent.confirm_call_count(), 1);
+    }
+
+    #[test]
+    fn agent_stream_bridge_requires_session_and_agent_capability() {
+        let (_d, router) = setup();
+        let router = router
+            .with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into())
+            .with_session_token("session".into());
+        assert!(router
+            .open_bridge_stream(
+                "/api/v1/agent/stream?turn=turn-123",
+                Some("session"),
+                Some("agentsecret"),
+            )
+            .is_some());
+        for (session, capability) in [
+            (None, Some("agentsecret")),
+            (Some("session"), None),
+            (Some("wrong"), Some("agentsecret")),
+            (Some("session"), Some("wrong")),
+        ] {
+            assert!(router
+                .open_bridge_stream("/api/v1/agent/stream?turn=turn-123", session, capability,)
+                .is_none());
+        }
     }
 
     #[test]
@@ -12452,7 +13168,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .with_session_token("sess".into())
             .with_biometric_gate()
             .with_durable_requests(std::sync::Arc::new(MemoryDurableRequests::default()));
-        let auth = || agent_confirm_request("hash");
+        let auth = || agent_confirm_request(TEST_CONFIRM_ACTION_HASH);
 
         let first = router.route(&auth());
         let pat = body_json(&first)["pending_action_id"]
@@ -12477,7 +13193,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .with_agent(agent.clone(), "agentsecret".into())
             .with_session_token("sess".into())
             .with_biometric_gate();
-        let auth = || agent_confirm_request("hash");
+        let auth = || agent_confirm_request(TEST_CONFIRM_ACTION_HASH);
         let challenge = router.route(&auth());
         let pat = body_json(&challenge)["pending_action_id"]
             .as_str()
@@ -12500,13 +13216,14 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .with_agent(agent.clone(), "agentsecret".into())
             .with_session_token("sess".into())
             .with_biometric_gate();
-        let req = agent_confirm_request("wrong");
+        let req = agent_confirm_request(&"b".repeat(64));
 
         let resp = router.route(&req);
 
         assert_eq!(resp.status, 409);
         let body = String::from_utf8_lossy(&resp.body);
-        assert!(body.contains("ActionMismatch"));
+        assert!(body.contains("confirmation_invalid"));
+        assert!(!body.contains("ActionMismatch"));
         assert!(!body.contains("confirmation_required"));
         assert_eq!(agent.confirm_call_count(), 0);
     }
@@ -13412,6 +14129,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         }
     }
     impl MailWriteHandler for RecordMailWrite {
+        fn read_state(&self, _a: &str, id: &str) -> Result<bool, String> {
+            self.0.lock().unwrap().push(format!("read_state id={id}"));
+            Ok(false)
+        }
         #[allow(clippy::too_many_arguments)]
         fn send(
             &self,
@@ -14520,7 +15241,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 confirm_spec.path,
                 json!({
                     "request_id": "123e4567-e89b-42d3-a456-426614174111",
-                    "pending": "01JPENDING0000000000000000",
+                    "session_id": TEST_CONFIRM_SESSION_ID,
+                    "turn_request_id": TEST_CONFIRM_TURN_REQUEST_ID,
+                    "turn_id": TEST_CONFIRM_TURN_ID,
+                    "pending": TEST_CONFIRM_PENDING_ID,
                     "token": token,
                     "action_hash": action_hash
                 }),
@@ -14528,14 +15252,24 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             )
         };
         let first =
-            canonical_product_identity(&confirm("first-proof", &"a".repeat(64)), confirm_spec)
+            canonical_product_identity(&confirm(TEST_CONFIRM_TOKEN, &"a".repeat(64)), confirm_spec)
                 .unwrap();
-        let rotated_proof =
-            canonical_product_identity(&confirm("second-proof", &"a".repeat(64)), confirm_spec)
-                .unwrap();
-        let changed_effect =
-            canonical_product_identity(&confirm("second-proof", &"b".repeat(64)), confirm_spec)
-                .unwrap();
+        let rotated_proof = canonical_product_identity(
+            &confirm(
+                "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+                &"a".repeat(64),
+            ),
+            confirm_spec,
+        )
+        .unwrap();
+        let changed_effect = canonical_product_identity(
+            &confirm(
+                "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+                &"b".repeat(64),
+            ),
+            confirm_spec,
+        )
+        .unwrap();
         assert_eq!(first, rotated_proof);
         assert_ne!(first.payload_digest, changed_effect.payload_digest);
 
@@ -15159,12 +15893,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         ));
         assert_eq!(ch.status, 200);
         let j = body_json(&ch);
-        assert_eq!(j["status"], "confirmation_required");
-        assert_eq!(j["op"], "move-out-of-protected");
-        assert_eq!(
-            serde_json::from_str::<Value>(j["item"].as_str().unwrap()).unwrap(),
-            json!(["onedrive_move", "A:B", "P]1", "N:\"1"])
-        );
+        assert_opaque_confirmation_challenge(&j);
         let pat = j["pending_action_id"].as_str().unwrap().to_string();
         assert!(writes.moves.lock().unwrap().is_empty());
         assert_eq!(risk.move_calls(), 1);
@@ -15261,8 +15990,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         ));
         assert_eq!(ch.status, 200);
         let j = body_json(&ch);
-        assert_eq!(j["status"], "confirmation_required");
-        assert_eq!(j["op"], "move-out-of-protected");
+        assert_opaque_confirmation_challenge(&j);
         assert!(writes.moves.lock().unwrap().is_empty());
         assert_eq!(risk.move_calls(), 1);
     }
@@ -15300,12 +16028,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         ));
         assert_eq!(ch.status, 200);
         let j = body_json(&ch);
-        assert_eq!(j["status"], "confirmation_required");
-        assert_eq!(j["op"], "mode-switch-offline-large");
-        assert_eq!(
-            serde_json::from_str::<Value>(j["item"].as_str().unwrap()).unwrap(),
-            json!(["onedrive_mode_offline", "Photos"])
-        );
+        assert_opaque_confirmation_challenge(&j);
         assert!(
             !modes
                 .modes("a")
@@ -15411,12 +16134,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         ));
         assert_eq!(ch.status, 200);
         let j = body_json(&ch);
-        assert_eq!(j["status"], "confirmation_required");
-        assert_eq!(j["op"], "bulk");
-        assert_eq!(
-            serde_json::from_str::<Value>(j["item"].as_str().unwrap()).unwrap(),
-            json!(["onedrive_mode_online_account_cleanup", "Photos"])
-        );
+        assert_opaque_confirmation_challenge(&j);
         assert!(
             !modes
                 .modes("a")
@@ -15762,6 +16480,120 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             g0,
             "a self-write must not notify (would clobber optimistic UI from a stale re-fetch)"
         );
+    }
+
+    #[test]
+    fn mail_live_read_state_requires_session_and_capability_and_is_not_store_projection() {
+        let (_dir, router) = setup();
+        let mail = std::sync::Arc::new(RecordMailWrite::default());
+        let router = router
+            .with_mail_write(mail.clone(), "mail-cap".into())
+            .with_session_token("session".into());
+        let path = "/api/v1/mail/read-state";
+        let request = strict_json_post(
+            path,
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174008", "account": "a", "id": "m1"
+            }),
+            Some("mail-cap"),
+        );
+        assert_eq!(router.route(&request).status, 401);
+        assert_eq!(
+            router
+                .route(
+                    &request
+                        .clone()
+                        .with_session_token(Some("session".into()))
+                        .with_cap_token(None)
+                )
+                .status,
+            401
+        );
+        let response = router.route(&request.with_session_token(Some("session".into())));
+        assert_eq!(response.status, 200);
+        assert_eq!(body_json(&response), json!({"is_read": false}));
+        assert_eq!(
+            mail.0.lock().unwrap().as_slice(),
+            ["read_state id=m1"],
+            "the live-state route must invoke its Graph-backed handler"
+        );
+    }
+
+    #[test]
+    fn mail_live_read_state_rejects_query_unknown_duplicate_and_oversized_bodies() {
+        let (_dir, router) = setup();
+        let mail = std::sync::Arc::new(RecordMailWrite::default());
+        let router = router
+            .with_mail_write(mail.clone(), "mail-cap".into())
+            .with_session_token("session".into());
+        let authorize = |request: ApiRequest| {
+            request
+                .with_session_token(Some("session".into()))
+                .with_cap_token(Some("mail-cap".into()))
+        };
+        assert_eq!(
+            router
+                .route(&authorize(ApiRequest::get(
+                    "/api/v1/mail/read-state?account=a&id=m1"
+                )))
+                .status,
+            405
+        );
+        let valid =
+            json!({"request_id":"123e4567-e89b-42d3-a456-426614174008", "account":"a", "id":"m1"});
+        for body in [
+            json!({"request_id":"123e4567-e89b-42d3-a456-426614174008", "account":"a", "id":"m1", "is_read":true}).to_string(),
+            r#"{"request_id":"123e4567-e89b-42d3-a456-426614174008","account":"a","id":"m1","id":"m2"}"#.into(),
+            "{}".into(),
+        ] {
+            let request = authorize(ApiRequest::new("POST", "/api/v1/mail/read-state")
+                .with_content_type(Some("application/json".into())).with_body(body.into_bytes()));
+            assert_eq!(router.route(&request).status, 400);
+        }
+        assert_eq!(
+            router
+                .route(&authorize(strict_json_post(
+                    "/api/v1/mail/read-state?account=a&id=m1",
+                    valid,
+                    Some("mail-cap")
+                )))
+                .status,
+            400
+        );
+        assert_eq!(
+            router
+                .route(&authorize(
+                    ApiRequest::new("POST", "/api/v1/mail/read-state")
+                        .with_content_type(Some("application/json".into()))
+                        .with_body(vec![b' '; 8193])
+                ))
+                .status,
+            413
+        );
+        assert!(mail.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mail_live_read_state_replay_performs_fresh_read_without_terminal_receipt() {
+        let (_dir, router) = setup();
+        let mail = std::sync::Arc::new(RecordMailWrite::default());
+        let receipts = std::sync::Arc::new(MemoryDurableRequests::default());
+        let router = router
+            .with_mail_write(mail.clone(), "mail-cap".into())
+            .with_durable_requests(receipts.clone());
+        let request = strict_json_post(
+            "/api/v1/mail/read-state",
+            json!({
+                "request_id":"123e4567-e89b-42d3-a456-426614174008", "account":"a", "id":"m1"
+            }),
+            Some("mail-cap"),
+        );
+        for _ in 0..2 {
+            assert_eq!(body_json(&router.route(&request)), json!({"is_read":false}));
+        }
+        assert_eq!(mail.0.lock().unwrap().len(), 2);
+        assert_eq!(receipts.binding_count(), 1);
+        assert_eq!(receipts.completed_receipt_count(), 0);
     }
 
     /// app.js carries the mail-write cap token placeholder so #563's UI can POST.
@@ -16610,7 +17442,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "if (!isCurrentTurn()) return;",
             "activityProtocol = finishAssistantActivityState(",
             "activityProtocol, activityIdentity, \"cancelled\"",
-            "turn_id: turnState.turnId || \"\"",
+            "session_id: turnState.ownerProof?.session_id || \"\"",
+            "turn_request_id: turnState.ownerProof?.turn_request_id || \"\"",
+            "turn_id: turnState.ownerProof?.turn_id || turnState.turnId || \"\"",
         ] {
             assert!(
                 APP_JS.contains(needle),
@@ -16769,8 +17603,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     #[test]
     fn living_ui_pending_card_authority_and_terminal_controls_are_unchanged() {
         for needle in [
-            "postJson(\"/api/v1/agent/confirm\"",
-            "token: record.token, action_hash: record.action_hash",
+            "postJson(\"/api/v1/agent/confirm\", CAP.agent, attempt.request)",
+            "token: record.token,",
+            "action_hash: record.action_hash,",
             "postJson(\"/api/v1/agent/pending/cancel\"",
             "action_hash: record.action_hash",
             "done ? null : el(\"div\", { class: \"asst-pending-actions\" }",
@@ -16781,6 +17616,169 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 "pending authority changed: {needle}"
             );
         }
+    }
+
+    #[test]
+    fn agent_confirm_attempt_reuses_one_uuid_for_native_challenge_and_transport_retry() {
+        let factory = APP_JS
+            .split("function getOrCreateAgentConfirmAttempt")
+            .nth(1)
+            .unwrap()
+            .split("async function confirmAgentPending")
+            .next()
+            .unwrap();
+        assert!(factory.contains("if (existing) return existing;"));
+        assert_eq!(factory.matches("crypto.randomUUID()").count(), 1);
+        assert!(factory.contains("AssistantState.confirmAttemptsByPendingId.set"));
+        let submit = APP_JS
+            .split("async function confirmAgentPending")
+            .nth(1)
+            .unwrap()
+            .split("async function cancelAgentPending")
+            .next()
+            .unwrap();
+        assert!(submit.contains("postJson(\"/api/v1/agent/confirm\", CAP.agent, attempt.request)"));
+        assert!(APP_JS.contains(
+            "return request(method, path, { ...o, perActionToken: d.pending_action_id });"
+        ));
+    }
+
+    #[test]
+    fn agent_confirm_native_prompt_denial_discards_attempt_but_retains_pending_authority() {
+        let submit = APP_JS
+            .split("async function confirmAgentPending")
+            .nth(1)
+            .unwrap()
+            .split("async function cancelAgentPending")
+            .next()
+            .unwrap();
+        let denied = submit
+            .split("if (e && e.nativePromptDenied)")
+            .nth(1)
+            .unwrap()
+            .split("} else if")
+            .next()
+            .unwrap();
+        assert!(denied.contains("confirmAttemptsByPendingId.delete(pendingId)"));
+        assert!(denied.contains("updateAgentPendingStatus(record, \"pending\")"));
+        assert!(!denied.contains("clearAgentPendingAuthority"));
+        assert!(!denied.contains("record.token = \"\""));
+    }
+
+    #[test]
+    fn agent_confirm_outcome_unknown_clears_authority_and_reconciles_without_new_uuid() {
+        let submit = APP_JS
+            .split("async function confirmAgentPending")
+            .nth(1)
+            .unwrap()
+            .split("async function cancelAgentPending")
+            .next()
+            .unwrap();
+        let unknown = submit
+            .split("e.code === \"confirmation_outcome_unknown\"")
+            .nth(1)
+            .unwrap()
+            .split("} else {")
+            .next()
+            .unwrap();
+        assert!(unknown.contains("updateAgentPendingStatus(record, \"outcome_unknown\")"));
+        assert!(unknown.contains("clearAgentPendingAuthority(record)"));
+        assert!(!unknown.contains("crypto.randomUUID"));
+    }
+
+    #[test]
+    fn assistant_pending_confirmation_posts_exact_original_turn_owner_proof() {
+        let factory = APP_JS
+            .split("function getOrCreateAgentConfirmAttempt")
+            .nth(1)
+            .unwrap()
+            .split("async function confirmAgentPending")
+            .next()
+            .unwrap();
+        for field in [
+            "session_id: record.session_id",
+            "turn_request_id: record.turn_request_id",
+            "turn_id: record.turn_id",
+            "pending: record.pending_id",
+            "action_hash: record.action_hash",
+        ] {
+            assert!(factory.contains(field), "missing owner field: {field}");
+        }
+        assert!(APP_JS.contains(
+            "activityIdentity = Object.freeze({\n    session_id: sessionId, turn_request_id: requestId, turn_id: turn,"
+        ));
+    }
+
+    #[test]
+    fn assistant_pending_confirmation_authority_is_memory_only_and_erased_on_terminal_state() {
+        let state = APP_JS
+            .split("const AssistantState = {")
+            .nth(1)
+            .unwrap()
+            .split("function closeAssistantStream")
+            .next()
+            .unwrap();
+        assert!(state.contains("confirmAttemptsByPendingId: new Map()"));
+        let authority = APP_JS
+            .split("function clearAgentPendingAuthority")
+            .nth(1)
+            .unwrap()
+            .split("function getOrCreateAgentConfirmAttempt")
+            .next()
+            .unwrap();
+        for field in [
+            "record.token",
+            "record.action_hash",
+            "record.session_id",
+            "record.turn_id",
+        ] {
+            assert!(authority.contains(&format!("{field} = \"\"")));
+        }
+        assert!(!state.contains("localStorage"));
+        assert!(!state.contains("sessionStorage"));
+        assert!(!state.contains("indexedDB"));
+    }
+
+    #[test]
+    fn desktop_agent_fetch_stream_sends_cap_header_and_never_query_authority() {
+        let stream = APP_JS
+            .split("function openAgentFetchStream")
+            .nth(1)
+            .unwrap()
+            .split("function openEventStream")
+            .next()
+            .unwrap();
+        assert!(stream.contains("headers: { \"X-Capability-Token\": capToken }"));
+        assert!(stream.contains("credentials: \"same-origin\""));
+        assert!(!stream.contains("cap_token="));
+        assert!(!stream.contains("_st="));
+    }
+
+    #[test]
+    fn desktop_agent_sse_decoder_rejects_invalid_or_oversized_frames() {
+        assert!(APP_JS.contains("const AGENT_SSE_FRAME_MAX_BYTES = 72 * 1024;"));
+        assert!(APP_JS.contains("const AGENT_SSE_CARRY_MAX_BYTES = 144 * 1024;"));
+        assert!(APP_JS.contains("throw new Error(\"agent_stream_frame_too_large\")"));
+        assert!(APP_JS.contains("throw new Error(\"agent_stream_invalid_field\")"));
+        assert!(APP_JS.contains("throw new Error(\"agent_stream_invalid_framing\")"));
+        assert!(APP_JS.contains("throw new Error(\"agent_stream_truncated_frame\")"));
+        assert!(APP_JS.contains("new TextDecoder(\"utf-8\", { fatal: true })"));
+    }
+
+    #[test]
+    fn agent_stream_response_is_no_store_and_rejects_redirect_or_non_success() {
+        let stream = APP_JS
+            .split("function openAgentFetchStream")
+            .nth(1)
+            .unwrap()
+            .split("function openEventStream")
+            .next()
+            .unwrap();
+        assert!(stream.contains("redirect: \"error\""));
+        assert!(stream.contains("response.redirected || !response.ok"));
+        assert!(stream.contains("cache: \"no-store\""));
+        assert!(stream.contains("cacheControl.toLowerCase()"));
+        assert!(stream.contains("v.trim() === \"no-store\""));
     }
 
     #[test]
@@ -17069,14 +18067,18 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "AssistantState.pendingCardsById.set(pending.pending_id",
             "token: d.token || \"\"",
             "action_hash: d.action_hash || \"\"",
-            "postJson(\"/api/v1/agent/confirm\", CAP.agent, {",
+            "postJson(\"/api/v1/agent/confirm\", CAP.agent, attempt.request)",
             "postJson(\"/api/v1/agent/pending/cancel\", CAP.agent",
+            "confirmAttemptsByPendingId: new Map()",
+            "session_id: turnState.ownerProof?.session_id || \"\"",
+            "turn_request_id: turnState.ownerProof?.turn_request_id || \"\"",
             "updateAgentPendingStatus(record, \"confirming\")",
             "updateAgentPendingStatus(record, \"confirmed\")",
+            "updateAgentPendingStatus(record, \"retryable\")",
+            "updateAgentPendingStatus(record, \"outcome_unknown\")",
             "updateAgentPendingStatus(record, \"cancelling\")",
             "updateAgentPendingStatus(record, \"cancelled\")",
             "updateAgentPendingStatus(pending, \"expired\")",
-            "updateAgentPendingStatus(record, \"error\")",
             "confirm.setAttribute(\"disabled\", \"disabled\")",
             "cancel.setAttribute(\"disabled\", \"disabled\")",
             "\"data-agent-pending-confirm\": \"1\"",
@@ -17339,8 +18341,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
-    fn app_js_biometric_labels_cover_onedrive_risk_ops() {
-        for needle in [
+    fn app_js_delegates_onedrive_risk_labels_to_native_policy() {
+        for forbidden in [
+            "function biometricServiceLabel(service)",
             "\"move-out-of-protected\"",
             "Move out of offline folder",
             "\"mode-switch-offline-large\"",
@@ -17351,15 +18354,16 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "biometricServiceLabel(d.service)",
         ] {
             assert!(
-                APP_JS.contains(needle),
-                "app.js missing #723 biometric label invariant: {needle}"
+                !APP_JS.contains(forbidden),
+                "app.js must delegate #723 biometric labels to native policy: {forbidden}"
             );
         }
+        assert!(APP_JS.contains("BRIDGE.postMessage(JSON.stringify({ t: \"bio\", id, pat }))"));
     }
 
     #[test]
-    fn app_js_biometric_labels_cover_mobile_full_node_ops() {
-        for needle in [
+    fn app_js_delegates_mobile_full_node_labels_to_native_policy() {
+        for forbidden in [
             "function biometricServiceLabel(service)",
             "service === \"backup\" || service === \"agent\" ? \"iSyncYou\"",
             "\"backup\" ? \"Start backup\"",
@@ -17368,8 +18372,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "biometricServiceLabel(d.service)",
         ] {
             assert!(
-                APP_JS.contains(needle),
-                "app.js missing #625 biometric label invariant: {needle}"
+                !APP_JS.contains(forbidden),
+                "app.js must delegate #625 biometric labels to native policy: {forbidden}"
             );
         }
         for forbidden in ["body_html", "body_text", "recipient", "change"] {
@@ -21007,7 +22011,7 @@ Content-Type: text/html; charset=utf-8\r\n\
 
     #[test]
     fn android_user_presence_confirm_requires_armed_public_handle() {
-        mobile_agent_confirm_requires_biometric_before_agent_token_consumption();
+        mobile_agent_confirmation_challenge_returns_only_opaque_handle();
         mobile_agent_confirm_after_biometric_consumes_agent_token_once();
     }
 

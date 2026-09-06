@@ -7,7 +7,7 @@
 //! and is **single-use** (a replay fails). The token is bound to exactly one pending
 //! action — confirming returns that action and nothing else.
 
-use crate::tool::ToolAction;
+use crate::tool::{ToolAction, ToolPolicy};
 use crate::AgentError;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use base64::Engine;
@@ -17,10 +17,13 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 const ACTION_HASH_DOMAIN: &str = "isyncyou-agent-confirm-v1";
+const MAX_PENDING_TTL_MS: u64 = 120_000;
+const MAX_PENDING_PREVIEW_BYTES: usize = 512;
+const MAX_PENDING_OWNER_BYTES: usize = 128;
 
 /// A destructive action awaiting human confirmation. `id` + the (separately returned)
 /// one-time token are what the UI confirms with; `preview` is the human-readable diff.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct PendingAction {
     pub id: String,
     pub action: ToolAction,
@@ -30,18 +33,42 @@ pub struct PendingAction {
     pub expires_at_ms: u64,
 }
 
+impl std::fmt::Debug for PendingAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingAction")
+            .field("id_present", &!self.id.is_empty())
+            .field("op", &self.action.op())
+            .field("preview_present", &!self.preview.is_empty())
+            .field("action_hash_present", &!self.action_hash.is_empty())
+            .field("risk", &self.risk)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
 /// Non-secret binding fields for a pending destructive action. Mobile uses this
 /// to mint a native biometric-token challenge before the Agent confirmation token
 /// is consumed. `item` is intentionally bound to the pending id + action hash,
 /// not raw payload fields, so the biometric token cannot be reused across two
 /// pending actions with the same cloud item but different mutation payloads.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PendingActionBinding {
     pub op: String,
     pub account: String,
     pub service: String,
     pub item: String,
     pub expires_at_ms: u64,
+}
+
+impl std::fmt::Debug for PendingActionBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingActionBinding")
+            .field("op_present", &!self.op.is_empty())
+            .field("account_present", &!self.account.is_empty())
+            .field("service_present", &!self.service.is_empty())
+            .field("item_present", &!self.item.is_empty())
+            .finish()
+    }
 }
 
 struct Pending {
@@ -54,7 +81,7 @@ struct Pending {
     owner: PendingOwnerBinding,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PendingOwnerBinding {
     pub account: String,
     pub session_id: String,
@@ -62,7 +89,69 @@ pub struct PendingOwnerBinding {
     pub turn_id: String,
 }
 
-#[derive(Debug, Clone)]
+impl std::fmt::Debug for PendingOwnerBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingOwnerBinding")
+            .field("account_present", &!self.account.is_empty())
+            .field("session_id_present", &!self.session_id.is_empty())
+            .field("request_id_present", &!self.request_id.is_empty())
+            .field("turn_id_present", &!self.turn_id.is_empty())
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PendingOwnerProof {
+    pub session_id: String,
+    pub turn_request_id: String,
+    pub turn_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosedConfirmationCode {
+    Invalid,
+    Expired,
+    Cancelled,
+    Replayed,
+}
+
+#[derive(Clone, PartialEq)]
+pub enum PendingConfirmOutcome {
+    Confirmed(Box<ToolAction>),
+    Rejected(ClosedConfirmationCode),
+    RetainedRetryable,
+    ConsumedOrCommitUnknown,
+}
+
+impl std::fmt::Debug for PendingConfirmOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Confirmed(_) => f.write_str("Confirmed(<redacted>)"),
+            Self::Rejected(code) => f.debug_tuple("Rejected").field(code).finish(),
+            Self::RetainedRetryable => f.write_str("RetainedRetryable"),
+            Self::ConsumedOrCommitUnknown => f.write_str("ConsumedOrCommitUnknown"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingBindingOutcome<T> {
+    Ready(T),
+    Rejected(ClosedConfirmationCode),
+    Unavailable,
+}
+
+impl std::fmt::Debug for PendingOwnerProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingOwnerProof")
+            .field("session_id_present", &!self.session_id.is_empty())
+            .field("turn_request_id_present", &!self.turn_request_id.is_empty())
+            .field("turn_id_present", &!self.turn_id.is_empty())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct PersistedPendingAction {
     pub id: String,
     pub action: ToolAction,
@@ -75,6 +164,22 @@ pub struct PersistedPendingAction {
     pub owner: PendingOwnerBinding,
 }
 
+impl std::fmt::Debug for PersistedPendingAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PersistedPendingAction")
+            .field("id_present", &!self.id.is_empty())
+            .field("op", &self.action.op())
+            .field("preview_present", &!self.preview.is_empty())
+            .field("token_hash_present", &true)
+            .field("action_hash_present", &!self.action_hash.is_empty())
+            .field("risk", &self.risk)
+            .field("created_at_ms", &self.created_at_ms)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("owner", &self.owner)
+            .finish()
+    }
+}
+
 pub trait PendingPersistence: Send + Sync {
     fn insert(&self, pending: PersistedPendingAction) -> Result<(), ConfirmError>;
     fn confirm(
@@ -82,14 +187,16 @@ pub trait PendingPersistence: Send + Sync {
         pending_id: &str,
         token_hash: &[u8; 32],
         action_hash: &str,
+        owner: &PendingOwnerProof,
         now_ms: u64,
-    ) -> Result<ToolAction, ConfirmError>;
+    ) -> PendingConfirmOutcome;
     fn binding(
         &self,
         pending_id: &str,
         action_hash: &str,
+        owner: &PendingOwnerProof,
         now_ms: u64,
-    ) -> Result<PendingActionBinding, ConfirmError>;
+    ) -> PendingBindingOutcome<PendingActionBinding>;
     fn cancel(
         &self,
         pending_id: &str,
@@ -116,8 +223,44 @@ pub enum ConfirmError {
     BadToken,
     /// The caller's action hash does not match the registered action binding.
     ActionMismatch,
+    /// The caller does not own the originating session/request/turn.
+    OwnerMismatch,
+    /// The stored action is not confirmable under the current exhaustive policy.
+    PolicyMismatch,
+    /// Registration input was malformed or exceeded its bounded representation.
+    InvalidRegistration,
+    /// The durable confirmation store has reached its bounded capacity.
+    Capacity,
+    /// Another pending confirmation already owns the same durable binding.
+    Conflict,
+    /// Expired confirmation cleanup failed before registration.
+    MaintenanceUnavailable,
+    /// The bounded confirmation payload could not be sealed.
+    SealUnavailable,
+    /// Durable quota state could not be read or validated.
+    QuotaUnavailable,
+    /// The durable confirmation database operation failed.
+    DatabaseUnavailable,
+    /// The durable confirmation transaction could not be committed.
+    CommitUnavailable,
     /// The durable confirmation store could not complete the transition.
     Unavailable,
+}
+
+fn pending_registration_error(error: ConfirmError) -> &'static str {
+    match error {
+        ConfirmError::OwnerMismatch => "pending_owner_mismatch",
+        ConfirmError::PolicyMismatch => "pending_policy_mismatch",
+        ConfirmError::InvalidRegistration => "pending_registration_invalid",
+        ConfirmError::Capacity => "pending_capacity_unavailable",
+        ConfirmError::Conflict => "pending_registration_conflict",
+        ConfirmError::MaintenanceUnavailable => "pending_maintenance_unavailable",
+        ConfirmError::SealUnavailable => "pending_seal_unavailable",
+        ConfirmError::QuotaUnavailable => "pending_quota_unavailable",
+        ConfirmError::DatabaseUnavailable => "pending_database_unavailable",
+        ConfirmError::CommitUnavailable => "pending_commit_unavailable",
+        _ => "confirmation_unavailable",
+    }
 }
 
 /// Registry of pending destructive actions, keyed by pending id.
@@ -197,6 +340,29 @@ fn biometric_binding_item(pending_id: &str, action_hash: &str) -> String {
     )
 }
 
+fn valid_owner_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_PENDING_OWNER_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_owner(owner: &PendingOwnerBinding) -> bool {
+    !owner.account.is_empty()
+        && owner.account.len() <= MAX_PENDING_OWNER_BYTES
+        && !owner.account.chars().any(char::is_control)
+        && valid_owner_component(&owner.session_id)
+        && valid_owner_component(&owner.request_id)
+        && valid_owner_component(&owner.turn_id)
+}
+
+fn owner_proof_matches(owner: &PendingOwnerBinding, proof: &PendingOwnerProof) -> bool {
+    owner.session_id == proof.session_id
+        && owner.request_id == proof.turn_request_id
+        && owner.turn_id == proof.turn_id
+}
+
 impl PendingRegistry {
     pub fn new() -> Self {
         Self::default()
@@ -215,6 +381,7 @@ impl PendingRegistry {
 
     /// Register a destructive action and return its [`PendingAction`] plus the one-time
     /// confirmation token (give the token to the UI; never to the model).
+    #[cfg(test)]
     pub fn register(
         &self,
         action: ToolAction,
@@ -222,16 +389,17 @@ impl PendingRegistry {
         now_ms: u64,
         ttl_ms: u64,
     ) -> Result<(PendingAction, String), AgentError> {
+        let account = action.account().to_string();
         self.register_bound(
             action,
             preview,
             now_ms,
             ttl_ms,
             PendingOwnerBinding {
-                account: String::new(),
-                session_id: String::new(),
-                request_id: String::new(),
-                turn_id: String::new(),
+                account,
+                session_id: "test-session".into(),
+                request_id: "00000000-0000-4000-8000-000000000000".into(),
+                turn_id: "test-turn".into(),
             },
         )
     }
@@ -244,12 +412,27 @@ impl PendingRegistry {
         ttl_ms: u64,
         owner: PendingOwnerBinding,
     ) -> Result<(PendingAction, String), AgentError> {
+        let preview = preview.into();
+        if action.policy() != ToolPolicy::ConfirmedEffectNeverRepeat {
+            return Err(AgentError::Provider("not_confirmable".into()));
+        }
+        if !valid_owner(&owner)
+            || ttl_ms == 0
+            || ttl_ms > MAX_PENDING_TTL_MS
+            || preview.is_empty()
+            || preview.len() > MAX_PENDING_PREVIEW_BYTES
+        {
+            return Err(AgentError::Provider(
+                "pending_registration_unavailable".into(),
+            ));
+        }
+        let expires_at_ms = now_ms
+            .checked_add(ttl_ms)
+            .ok_or_else(|| AgentError::Provider("pending_registration_unavailable".into()))?;
         let id = random_b64(16)?;
         let token = random_b64(32)?;
-        let expires_at_ms = now_ms.saturating_add(ttl_ms);
         let action_hash = action_hash(&action, expires_at_ms)?;
         let risk = "destructive".to_string();
-        let preview = preview.into();
         if let Some(persistence) = &self.persistence {
             persistence
                 .insert(PersistedPendingAction {
@@ -263,7 +446,7 @@ impl PendingRegistry {
                     expires_at_ms,
                     owner,
                 })
-                .map_err(|_| AgentError::Provider("confirmation_unavailable".into()))?;
+                .map_err(|error| AgentError::Provider(pending_registration_error(error).into()))?;
         } else {
             self.inner.lock().unwrap().insert(
                 id.clone(),
@@ -298,30 +481,50 @@ impl PendingRegistry {
         pending_id: &str,
         token: &str,
         action_hash: &str,
+        owner: &PendingOwnerProof,
         now_ms: u64,
-    ) -> Result<ToolAction, ConfirmError> {
+    ) -> PendingConfirmOutcome {
         if let Some(persistence) = &self.persistence {
             return persistence.confirm(
                 pending_id,
                 &confirmation_token_hash(token),
                 action_hash,
+                owner,
                 now_ms,
             );
         }
-        let mut map = self.inner.lock().unwrap();
-        let pending = map.get(pending_id).ok_or(ConfirmError::NotFound)?;
+        let Ok(mut map) = self.inner.lock() else {
+            return PendingConfirmOutcome::RetainedRetryable;
+        };
+        let Some(pending) = map.get(pending_id) else {
+            return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Replayed);
+        };
+        if !owner_proof_matches(&pending.owner, owner) {
+            return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid);
+        }
         if now_ms >= pending.expires_at_ms {
             map.remove(pending_id);
-            return Err(ConfirmError::Expired);
+            return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Expired);
         }
         if !ct_eq(action_hash.as_bytes(), pending.action_hash.as_bytes()) {
-            return Err(ConfirmError::ActionMismatch);
+            return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid);
+        }
+        let Ok(recomputed_hash) =
+            crate::confirm::action_hash(&pending.action, pending.expires_at_ms)
+        else {
+            return PendingConfirmOutcome::RetainedRetryable;
+        };
+        if !ct_eq(recomputed_hash.as_bytes(), pending.action_hash.as_bytes())
+            || pending.action.policy() != ToolPolicy::ConfirmedEffectNeverRepeat
+            || pending.action.account() != pending.owner.account
+        {
+            return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid);
         }
         if !ct_eq(token.as_bytes(), pending.token.as_bytes()) {
-            return Err(ConfirmError::BadToken); // not consumed — the legit user can retry
+            return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid);
         }
         // Single-use: consume on success.
-        Ok(map.remove(pending_id).expect("present").action)
+        PendingConfirmOutcome::Confirmed(Box::new(map.remove(pending_id).expect("present").action))
     }
 
     /// Return a non-secret action binding without checking or consuming the
@@ -331,21 +534,40 @@ impl PendingRegistry {
         &self,
         pending_id: &str,
         action_hash: &str,
+        owner: &PendingOwnerProof,
         now_ms: u64,
-    ) -> Result<PendingActionBinding, ConfirmError> {
+    ) -> PendingBindingOutcome<PendingActionBinding> {
         if let Some(persistence) = &self.persistence {
-            return persistence.binding(pending_id, action_hash, now_ms);
+            return persistence.binding(pending_id, action_hash, owner, now_ms);
         }
-        let mut map = self.inner.lock().unwrap();
-        let pending = map.get(pending_id).ok_or(ConfirmError::NotFound)?;
+        let Ok(mut map) = self.inner.lock() else {
+            return PendingBindingOutcome::Unavailable;
+        };
+        let Some(pending) = map.get(pending_id) else {
+            return PendingBindingOutcome::Rejected(ClosedConfirmationCode::Replayed);
+        };
+        if !owner_proof_matches(&pending.owner, owner) {
+            return PendingBindingOutcome::Rejected(ClosedConfirmationCode::Invalid);
+        }
         if now_ms >= pending.expires_at_ms {
             map.remove(pending_id);
-            return Err(ConfirmError::Expired);
+            return PendingBindingOutcome::Rejected(ClosedConfirmationCode::Expired);
         }
         if !ct_eq(action_hash.as_bytes(), pending.action_hash.as_bytes()) {
-            return Err(ConfirmError::ActionMismatch);
+            return PendingBindingOutcome::Rejected(ClosedConfirmationCode::Invalid);
         }
-        Ok(PendingActionBinding {
+        let Ok(recomputed_hash) =
+            crate::confirm::action_hash(&pending.action, pending.expires_at_ms)
+        else {
+            return PendingBindingOutcome::Unavailable;
+        };
+        if !ct_eq(recomputed_hash.as_bytes(), pending.action_hash.as_bytes())
+            || pending.action.policy() != ToolPolicy::ConfirmedEffectNeverRepeat
+            || pending.action.account() != pending.owner.account
+        {
+            return PendingBindingOutcome::Rejected(ClosedConfirmationCode::Invalid);
+        }
+        PendingBindingOutcome::Ready(PendingActionBinding {
             op: pending.action.op().to_string(),
             account: pending.action.account().to_string(),
             service: pending.action.service().unwrap_or("agent").to_string(),
@@ -447,9 +669,96 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn pending_confirmation_outcome_and_binding_debug_redact_action_and_authority() {
+        let action = crate::tool::parse_action(&json!({
+            "op":"live-write", "account":"private-account", "service":"mail",
+            "target":"private-item", "change":{"verb":"set_read","is_read":true}
+        }))
+        .unwrap();
+        let outcome = PendingConfirmOutcome::Confirmed(Box::new(action));
+        let binding = PendingBindingOutcome::Ready(PendingActionBinding {
+            op: "private-op".into(),
+            account: "private-account".into(),
+            service: "private-service".into(),
+            item: "private-pending-private-hash".into(),
+            expires_at_ms: 123,
+        });
+        let diagnostic = format!("{outcome:?} {binding:?}");
+        for forbidden in ["private-", "set_read", "is_read"] {
+            assert!(!diagnostic.contains(forbidden));
+        }
+        assert_eq!(format!("{outcome:?}"), "Confirmed(<redacted>)");
+        assert!(diagnostic.contains("item_present: true"));
+    }
+
+    #[test]
+    fn pending_registration_failure_codes_are_closed_and_stable() {
+        assert_eq!(
+            pending_registration_error(ConfirmError::OwnerMismatch),
+            "pending_owner_mismatch"
+        );
+        assert_eq!(
+            pending_registration_error(ConfirmError::PolicyMismatch),
+            "pending_policy_mismatch"
+        );
+        assert_eq!(
+            pending_registration_error(ConfirmError::InvalidRegistration),
+            "pending_registration_invalid"
+        );
+        assert_eq!(
+            pending_registration_error(ConfirmError::Capacity),
+            "pending_capacity_unavailable"
+        );
+        assert_eq!(
+            pending_registration_error(ConfirmError::Conflict),
+            "pending_registration_conflict"
+        );
+        assert_eq!(
+            pending_registration_error(ConfirmError::MaintenanceUnavailable),
+            "pending_maintenance_unavailable"
+        );
+        assert_eq!(
+            pending_registration_error(ConfirmError::SealUnavailable),
+            "pending_seal_unavailable"
+        );
+        assert_eq!(
+            pending_registration_error(ConfirmError::QuotaUnavailable),
+            "pending_quota_unavailable"
+        );
+        assert_eq!(
+            pending_registration_error(ConfirmError::DatabaseUnavailable),
+            "pending_database_unavailable"
+        );
+        assert_eq!(
+            pending_registration_error(ConfirmError::CommitUnavailable),
+            "pending_commit_unavailable"
+        );
+        assert_eq!(
+            pending_registration_error(ConfirmError::Unavailable),
+            "confirmation_unavailable"
+        );
+    }
+
     fn backup() -> ToolAction {
         crate::tool::parse_action(&json!({"op":"backup","account":"me","services":["mail"]}))
             .unwrap()
+    }
+
+    fn test_proof() -> PendingOwnerProof {
+        PendingOwnerProof {
+            session_id: "test-session".into(),
+            turn_request_id: "00000000-0000-4000-8000-000000000000".into(),
+            turn_id: "test-turn".into(),
+        }
+    }
+
+    fn proof_for(owner: &PendingOwnerBinding) -> PendingOwnerProof {
+        PendingOwnerProof {
+            session_id: owner.session_id.clone(),
+            turn_request_id: owner.request_id.clone(),
+            turn_id: owner.turn_id.clone(),
+        }
     }
 
     #[test]
@@ -461,14 +770,26 @@ mod tests {
         assert_eq!(pending.risk, "destructive");
         assert_eq!(pending.expires_at_ms, 61_000);
         assert_eq!(pending.action_hash.len(), 64);
-        let action = reg
-            .confirm(&pending.id, &token, &pending.action_hash, 2_000)
-            .unwrap();
+        let PendingConfirmOutcome::Confirmed(action) = reg.confirm(
+            &pending.id,
+            &token,
+            &pending.action_hash,
+            &test_proof(),
+            2_000,
+        ) else {
+            panic!("valid authority must confirm");
+        };
         assert_eq!(action.op(), "backup");
         // replay → consumed
         assert_eq!(
-            reg.confirm(&pending.id, &token, &pending.action_hash, 2_001),
-            Err(ConfirmError::NotFound)
+            reg.confirm(
+                &pending.id,
+                &token,
+                &pending.action_hash,
+                &test_proof(),
+                2_001
+            ),
+            PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Replayed)
         );
         assert!(reg.is_empty());
     }
@@ -478,13 +799,20 @@ mod tests {
         let reg = PendingRegistry::new();
         let (pending, token) = reg.register(backup(), "p", 0, 60_000).unwrap();
         assert_eq!(
-            reg.confirm(&pending.id, "not-the-token", &pending.action_hash, 1),
-            Err(ConfirmError::BadToken)
+            reg.confirm(
+                &pending.id,
+                "not-the-token",
+                &pending.action_hash,
+                &test_proof(),
+                1
+            ),
+            PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid)
         );
         // still confirmable with the real token afterwards
-        assert!(reg
-            .confirm(&pending.id, &token, &pending.action_hash, 2)
-            .is_ok());
+        assert!(matches!(
+            reg.confirm(&pending.id, &token, &pending.action_hash, &test_proof(), 2),
+            PendingConfirmOutcome::Confirmed(_)
+        ));
     }
 
     #[test]
@@ -494,12 +822,13 @@ mod tests {
         let bad_hash = action_hash(&backup(), pending.expires_at_ms + 1).unwrap();
         assert_ne!(pending.action_hash, bad_hash);
         assert_eq!(
-            reg.confirm(&pending.id, &token, &bad_hash, 1),
-            Err(ConfirmError::ActionMismatch)
+            reg.confirm(&pending.id, &token, &bad_hash, &test_proof(), 1),
+            PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid)
         );
-        assert!(reg
-            .confirm(&pending.id, &token, &pending.action_hash, 2)
-            .is_ok());
+        assert!(matches!(
+            reg.confirm(&pending.id, &token, &pending.action_hash, &test_proof(), 2),
+            PendingConfirmOutcome::Confirmed(_)
+        ));
     }
 
     #[test]
@@ -507,9 +836,11 @@ mod tests {
         let reg = PendingRegistry::new();
         let (pending, token) = reg.register(backup(), "p", 0, 60_000).unwrap();
 
-        let binding = reg
-            .binding(&pending.id, &pending.action_hash, 1)
-            .expect("binding peek");
+        let PendingBindingOutcome::Ready(binding) =
+            reg.binding(&pending.id, &pending.action_hash, &test_proof(), 1)
+        else {
+            panic!("binding peek must succeed");
+        };
 
         assert_eq!(binding.op, "backup");
         assert_eq!(binding.account, "me");
@@ -518,9 +849,10 @@ mod tests {
         assert!(binding.item.contains(&pending.action_hash));
         assert_eq!(binding.expires_at_ms, pending.expires_at_ms);
         assert_eq!(reg.len(), 1, "peek must not consume the pending action");
-        assert!(reg
-            .confirm(&pending.id, &token, &pending.action_hash, 2)
-            .is_ok());
+        assert!(matches!(
+            reg.confirm(&pending.id, &token, &pending.action_hash, &test_proof(), 2),
+            PendingConfirmOutcome::Confirmed(_)
+        ));
     }
 
     #[test]
@@ -530,13 +862,14 @@ mod tests {
         let bad_hash = action_hash(&backup(), pending.expires_at_ms + 1).unwrap();
 
         assert_eq!(
-            reg.binding(&pending.id, &bad_hash, 1),
-            Err(ConfirmError::ActionMismatch)
+            reg.binding(&pending.id, &bad_hash, &test_proof(), 1),
+            PendingBindingOutcome::Rejected(ClosedConfirmationCode::Invalid)
         );
         assert_eq!(reg.len(), 1, "bad binding peek must not consume");
-        assert!(reg
-            .confirm(&pending.id, &token, &pending.action_hash, 2)
-            .is_ok());
+        assert!(matches!(
+            reg.confirm(&pending.id, &token, &pending.action_hash, &test_proof(), 2),
+            PendingConfirmOutcome::Confirmed(_)
+        ));
     }
 
     #[test]
@@ -546,8 +879,8 @@ mod tests {
         let (_p2, t2) = reg.register(backup(), "p2", 0, 60_000).unwrap();
         // t2 cannot confirm p1
         assert_eq!(
-            reg.confirm(&p1.id, &t2, &p1.action_hash, 1),
-            Err(ConfirmError::BadToken)
+            reg.confirm(&p1.id, &t2, &p1.action_hash, &test_proof(), 1),
+            PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid)
         );
     }
 
@@ -556,8 +889,14 @@ mod tests {
         let reg = PendingRegistry::new();
         let (pending, token) = reg.register(backup(), "p", 1_000, 5_000).unwrap();
         assert_eq!(
-            reg.confirm(&pending.id, &token, &pending.action_hash, 10_000),
-            Err(ConfirmError::Expired)
+            reg.confirm(
+                &pending.id,
+                &token,
+                &pending.action_hash,
+                &test_proof(),
+                10_000
+            ),
+            PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Expired)
         );
         assert!(reg.is_empty()); // swept
     }
@@ -566,8 +905,8 @@ mod tests {
     fn unknown_id_is_not_found() {
         let reg = PendingRegistry::new();
         assert_eq!(
-            reg.confirm("nope", "x", "hash", 0),
-            Err(ConfirmError::NotFound)
+            reg.confirm("nope", "x", "hash", &test_proof(), 0),
+            PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Replayed)
         );
     }
 
@@ -617,12 +956,31 @@ mod tests {
         assert_eq!(owner.turn_id, "turn");
         assert!(!reg.has_pending_for_turn("turn", 2_001).unwrap());
         assert_eq!(
-            reg.binding(&pending.id, &pending.action_hash, 2_001),
-            Err(ConfirmError::NotFound)
+            reg.binding(
+                &pending.id,
+                &pending.action_hash,
+                &PendingOwnerProof {
+                    session_id: "session".into(),
+                    turn_request_id: "request".into(),
+                    turn_id: "turn".into(),
+                },
+                2_001,
+            ),
+            PendingBindingOutcome::Rejected(ClosedConfirmationCode::Replayed)
         );
         assert_eq!(
-            reg.confirm(&pending.id, &token, &pending.action_hash, 2_001),
-            Err(ConfirmError::NotFound)
+            reg.confirm(
+                &pending.id,
+                &token,
+                &pending.action_hash,
+                &PendingOwnerProof {
+                    session_id: "session".into(),
+                    turn_request_id: "request".into(),
+                    turn_id: "turn".into(),
+                },
+                2_001,
+            ),
+            PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Replayed)
         );
     }
 
@@ -647,12 +1005,25 @@ mod tests {
         assert_eq!(reissued.action_hash, pending.action_hash);
         assert_ne!(new_token, old_token);
         assert_eq!(
-            reg.confirm(&pending.id, &old_token, &pending.action_hash, 2_001),
-            Err(ConfirmError::BadToken)
+            reg.confirm(
+                &pending.id,
+                &old_token,
+                &pending.action_hash,
+                &proof_for(&owner),
+                2_001,
+            ),
+            PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid)
         );
-        assert!(reg
-            .confirm(&pending.id, &new_token, &pending.action_hash, 2_002)
-            .is_ok());
+        assert!(matches!(
+            reg.confirm(
+                &pending.id,
+                &new_token,
+                &pending.action_hash,
+                &proof_for(&owner),
+                2_002,
+            ),
+            PendingConfirmOutcome::Confirmed(_)
+        ));
     }
 
     #[test]
@@ -674,5 +1045,61 @@ mod tests {
             .is_none());
         assert!(reg.reissue_for_owner(&owner, 61_000).unwrap().is_none());
         assert!(!reg.has_pending_for_turn("turn", 61_000).unwrap());
+    }
+
+    #[test]
+    fn pending_registration_rejects_read_class_and_ttl_overflow() {
+        let reg = PendingRegistry::new();
+        let read = crate::tool::parse_action(
+            &json!({"op":"read","account":"me","service":"mail","id":"item"}),
+        )
+        .unwrap();
+        let owner = PendingOwnerBinding {
+            account: "me".into(),
+            session_id: "session".into(),
+            request_id: "00000000-0000-4000-8000-000000000000".into(),
+            turn_id: "turn".into(),
+        };
+        assert!(reg
+            .register_bound(read, "read", 1_000, 60_000, owner.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("not_confirmable"));
+        assert!(reg
+            .register_bound(backup(), "backup", 1_000, 120_001, owner.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("pending_registration_unavailable"));
+        assert!(reg
+            .register_bound(backup(), "backup", u64::MAX - 1, 2, owner)
+            .unwrap_err()
+            .to_string()
+            .contains("pending_registration_unavailable"));
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn pending_registration_rejects_incomplete_owner_before_rng_or_persistence() {
+        let reg = PendingRegistry::new();
+        let valid = PendingOwnerBinding {
+            account: "me".into(),
+            session_id: "session".into(),
+            request_id: "00000000-0000-4000-8000-000000000000".into(),
+            turn_id: "turn".into(),
+        };
+        for field in ["account", "session", "request", "turn"] {
+            let mut owner = valid.clone();
+            match field {
+                "account" => owner.account.clear(),
+                "session" => owner.session_id.clear(),
+                "request" => owner.request_id.clear(),
+                "turn" => owner.turn_id.clear(),
+                _ => unreachable!(),
+            }
+            assert!(reg
+                .register_bound(backup(), "backup", 1_000, 60_000, owner)
+                .is_err());
+        }
+        assert!(reg.is_empty());
     }
 }

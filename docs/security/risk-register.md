@@ -137,6 +137,17 @@ README's [Known limitations](../../README.md#known-limitations).
 
 ---
 
+## R14 — Agent confirmation authority drift or cross-owner execution
+
+| | |
+|---|---|
+| **Risk** | Policy copies disagree about which ToolAction requires confirmation; a pending action is confirmed by a different session/turn/account; browser or native proof is replayed; or raw action/executor details leak through stream, audit, diagnostics, or evidence. |
+| **Impact** | High — an unapproved Microsoft 365 mutation could execute once, execute twice, target the wrong account, or disclose sensitive authority and item bindings. |
+| **Mitigation** | #642 centralizes authorization and recovery in one exhaustive ToolAction policy, binds durable pending state to the canonical original owner/account/action hash, revalidates it atomically before one-time consumption, and repeats semantic policy checks immediately before the existing executor. Android native presence is additive and single-use. Agent streams require session plus Agent capability; audit routing is exact; public success is fixed text; terminal projection failure after consumption becomes outcome-unknown without re-execution. |
+| **Status** | **In progress** — focused policy, store, router, stream, native, containment, and cleanup-controller tests exist on the #642 branch. REQ-AGENT-019 remains planned until the immutable implementation commit, aggregate gates, clean default-APK Pixel rows, exact-commit redacted evidence, protected PR checks, and `dev` landing complete. Design: [ADR-007](../adr/007-agent-architecture.md). |
+
+---
+
 ## How this register is maintained
 
 A risk is added the moment it is understood, with an honest status — not after it is

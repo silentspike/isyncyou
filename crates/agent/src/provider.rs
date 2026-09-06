@@ -1809,6 +1809,45 @@ mod tests {
     }
 
     #[test]
+    fn confirmation_required_public_json_omits_raw_action_and_owner_binding() {
+        let event = StreamEvent::ConfirmationRequired {
+            id: "pending-public".into(),
+            action: Box::new(ToolAction::Share {
+                account: "private-account".into(),
+                service: "onedrive".into(),
+                id: "private-item".into(),
+                mode: Some("invite".into()),
+                link_type: None,
+                scope: None,
+                recipients: vec!["private-recipient@example.invalid".into()],
+                role: Some("read".into()),
+                recipient: None,
+            }),
+            preview: "Share one item".into(),
+            action_hash: "a".repeat(64),
+            risk: "destructive".into(),
+            expires_at_ms: 60_000,
+            token: "transient-confirmation-token".into(),
+        };
+
+        let public = event.to_public_json();
+        let object = public.as_object().expect("public confirmation object");
+        assert_eq!(
+            object.get("event").and_then(serde_json::Value::as_str),
+            Some("confirmation_required")
+        );
+        assert!(!object.contains_key("action"));
+        assert!(!object.contains_key("account"));
+        assert!(!object.contains_key("session_id"));
+        assert!(!object.contains_key("request_id"));
+        assert!(!object.contains_key("turn_id"));
+        let encoded = public.to_string();
+        assert!(!encoded.contains("private-account"));
+        assert!(!encoded.contains("private-item"));
+        assert!(!encoded.contains("private-recipient"));
+    }
+
+    #[test]
     fn usage_public_json_keeps_only_provider_metadata() {
         let headers = BTreeMap::from([
             ("x-request-id".to_string(), "req-123".to_string()),
