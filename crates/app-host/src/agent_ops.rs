@@ -5,7 +5,28 @@ use isyncyou_store::MobileJob;
 use isyncyou_store::Store;
 
 use crate::mobile_jobs::MobileJobRuntime;
-use crate::{AgentConfirmedActionExecutor, ConfirmedActionResult};
+use crate::{
+    AgentConfirmedActionExecutor, ClosedExecutionCode, ConfirmedActionResult,
+    ConfirmedExecutionOutcome,
+};
+
+fn classify_confirmed_execution(
+    action: &isyncyou_agent::ToolAction,
+    execute: impl FnOnce() -> Result<ConfirmedActionResult, String>,
+) -> ConfirmedExecutionOutcome {
+    if action.policy() != isyncyou_agent::ToolPolicy::ConfirmedEffectNeverRepeat
+        || preview_for_pending_action(action).is_err()
+    {
+        return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
+    }
+    match execute() {
+        Ok(result) => ConfirmedExecutionOutcome::Completed(result),
+        // The existing writers/jobs expose strings, not authoritative execution
+        // certainty. Once dispatched, an error can mean a response was lost after
+        // acceptance. Never turn that uncertainty into a terminal failed claim.
+        Err(_) => ConfirmedExecutionOutcome::OutcomeUnknown,
+    }
+}
 
 #[cfg(any(
     feature = "agent-oauth-providers",
@@ -48,11 +69,29 @@ pub(crate) fn confirmed_executor_for_policy(
 ) -> Arc<dyn AgentConfirmedActionExecutor> {
     match policy {
         AgentOperationPolicy::DesktopEnabled => Arc::new(DesktopAgentOperations::new(cfg, gate)),
-        AgentOperationPolicy::MobileDisabled => Arc::new(MobileDisabledAgentOperations),
+        AgentOperationPolicy::MobileDisabled => Arc::new(MobileDisabledAgentOperations { cfg }),
         AgentOperationPolicy::MobileFullNode { mobile_jobs } => {
             Arc::new(MobileFullNodeAgentOperations::new(cfg, gate, mobile_jobs))
         }
     }
+}
+
+fn exact_account_key(
+    cfg: &Config,
+    action: &isyncyou_agent::ToolAction,
+) -> Result<String, ClosedExecutionCode> {
+    let requested = action.account();
+    let mut matching = cfg
+        .accounts
+        .iter()
+        .filter(|account| account.id == requested);
+    let Some(account) = matching.next() else {
+        return Err(ClosedExecutionCode::ExecutorRejected);
+    };
+    if matching.next().is_some() {
+        return Err(ClosedExecutionCode::ExecutorRejected);
+    }
+    Ok(account.id.clone())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -951,7 +990,7 @@ fn validate_live_write_action(
     match (service.as_str(), verb.as_str()) {
         ("mail", "set_read") => Ok(AgentLiveWriteIntent::Mail(MailLiveWrite::SetRead {
             target: required_target(target, change)?,
-            is_read: required_change_bool(change, "is_read")?,
+            is_read: required_change_bool_with_legacy_alias(change, "is_read", "value")?,
         })),
         ("mail", "set_flag") => {
             let flag_status = required_change_str(change, "flag_status")?;
@@ -1169,6 +1208,26 @@ fn required_change_bool(change: &serde_json::Value, key: &str) -> Result<bool, S
         .get(key)
         .and_then(serde_json::Value::as_bool)
         .ok_or_else(|| format!("invalid_live_write: missing bool {key}"))
+}
+
+fn required_change_bool_with_legacy_alias(
+    change: &serde_json::Value,
+    key: &str,
+    legacy_key: &str,
+) -> Result<bool, String> {
+    let object = change_object(change)?;
+    match (object.get(key), object.get(legacy_key)) {
+        (Some(_), Some(_)) => Err(format!(
+            "invalid_live_write: {key} and {legacy_key} are mutually exclusive"
+        )),
+        (Some(value), None) => value
+            .as_bool()
+            .ok_or_else(|| format!("invalid_live_write: {key} must be a bool")),
+        (None, Some(value)) => value
+            .as_bool()
+            .ok_or_else(|| format!("invalid_live_write: {legacy_key} must be a bool")),
+        (None, None) => Err(format!("invalid_live_write: missing bool {key}")),
+    }
 }
 
 fn required_object(change: &serde_json::Value, key: &str) -> Result<serde_json::Value, String> {
@@ -1538,6 +1597,62 @@ pub(crate) fn preview_for_pending_action(
             Err(format!("not_confirmable: {}", action.op()))
         }
     }
+}
+
+pub(crate) fn pending_action_validation_diagnostic(error: &str) -> &'static str {
+    if error.starts_with("unsupported_live_write_service:") {
+        "unsupported_service"
+    } else if error == "invalid_live_write: missing verb" {
+        "missing_verb"
+    } else if error == "invalid_live_write: change must be an object" {
+        "invalid_change_object"
+    } else if error == "invalid_live_write: missing target"
+        || error == "invalid_live_write: target is empty"
+    {
+        "missing_target"
+    } else if error == "invalid_live_write: target is too long"
+        || error == "invalid_live_write: target contains control characters"
+    {
+        "invalid_target"
+    } else if error == "invalid_live_write: missing bool is_read" {
+        "missing_read_boolean"
+    } else if error == "invalid_live_write: is_read and value are mutually exclusive" {
+        "ambiguous_read_boolean"
+    } else if error == "invalid_live_write: is_read must be a bool"
+        || error == "invalid_live_write: value must be a bool"
+    {
+        "invalid_read_boolean"
+    } else if error.starts_with("unsupported_live_write_operation:") {
+        "unsupported_operation"
+    } else {
+        "invalid_action"
+    }
+}
+
+pub(crate) fn log_pending_action_validation(error: &str) {
+    let category = pending_action_validation_diagnostic(error);
+    let message = format!("agent_pending_action_invalid={category}");
+    #[cfg(target_os = "android")]
+    {
+        use std::ffi::CString;
+        use std::os::raw::{c_char, c_int};
+
+        unsafe extern "C" {
+            fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int;
+        }
+
+        let Ok(tag) = CString::new("iSyncYou") else {
+            return;
+        };
+        let Ok(message) = CString::new(message) else {
+            return;
+        };
+        unsafe {
+            let _ = __android_log_write(4, tag.as_ptr(), message.as_ptr());
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    eprintln!("isyncyoud: {message}");
 }
 
 fn validate_services(kind: &str, services: &[String], allowed: &[&str]) -> Result<(), String> {
@@ -2127,8 +2242,8 @@ impl DesktopAgentOperations {
     }
 }
 
-impl AgentConfirmedActionExecutor for DesktopAgentOperations {
-    fn execute_confirmed(
+impl DesktopAgentOperations {
+    fn execute_confirmed_inner(
         &self,
         action: &isyncyou_agent::ToolAction,
     ) -> Result<ConfirmedActionResult, String> {
@@ -2209,17 +2324,33 @@ impl AgentConfirmedActionExecutor for DesktopAgentOperations {
     }
 }
 
-pub(crate) struct MobileDisabledAgentOperations;
+impl AgentConfirmedActionExecutor for DesktopAgentOperations {
+    fn resolved_account_key(
+        &self,
+        action: &isyncyou_agent::ToolAction,
+    ) -> Result<String, ClosedExecutionCode> {
+        exact_account_key(&self.cfg, action)
+    }
+
+    fn execute_confirmed(&self, action: &isyncyou_agent::ToolAction) -> ConfirmedExecutionOutcome {
+        classify_confirmed_execution(action, || self.execute_confirmed_inner(action))
+    }
+}
+
+pub(crate) struct MobileDisabledAgentOperations {
+    cfg: Config,
+}
 
 impl AgentConfirmedActionExecutor for MobileDisabledAgentOperations {
-    fn execute_confirmed(
+    fn resolved_account_key(
         &self,
-        _action: &isyncyou_agent::ToolAction,
-    ) -> Result<ConfirmedActionResult, String> {
-        Err(
-            "not_available_on_mobile: mobile disabled policy refused this confirmed operation"
-                .to_string(),
-        )
+        action: &isyncyou_agent::ToolAction,
+    ) -> Result<String, ClosedExecutionCode> {
+        exact_account_key(&self.cfg, action)
+    }
+
+    fn execute_confirmed(&self, _action: &isyncyou_agent::ToolAction) -> ConfirmedExecutionOutcome {
+        ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)
     }
 }
 
@@ -2265,8 +2396,8 @@ impl MobileFullNodeAgentOperations {
     }
 }
 
-impl AgentConfirmedActionExecutor for MobileFullNodeAgentOperations {
-    fn execute_confirmed(
+impl MobileFullNodeAgentOperations {
+    fn execute_confirmed_inner(
         &self,
         action: &isyncyou_agent::ToolAction,
     ) -> Result<ConfirmedActionResult, String> {
@@ -2340,12 +2471,100 @@ impl AgentConfirmedActionExecutor for MobileFullNodeAgentOperations {
     }
 }
 
+impl AgentConfirmedActionExecutor for MobileFullNodeAgentOperations {
+    fn resolved_account_key(
+        &self,
+        action: &isyncyou_agent::ToolAction,
+    ) -> Result<String, ClosedExecutionCode> {
+        exact_account_key(&self.cfg, action)
+    }
+
+    fn execute_confirmed(&self, action: &isyncyou_agent::ToolAction) -> ConfirmedExecutionOutcome {
+        if matches!(action, isyncyou_agent::ToolAction::LiveWrite { .. })
+            && ensure_mobile_live_write_allowlisted(action).is_err()
+        {
+            return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
+        }
+        classify_confirmed_execution(action, || self.execute_confirmed_inner(action))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::{mpsc, Mutex as StdMutex};
     use std::time::Duration;
+
+    #[test]
+    fn agent_confirm_production_send_accepted_then_disconnected_is_outcome_unknown() {
+        use std::io::Read;
+        use std::net::{Shutdown, TcpListener};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut connection = loop {
+                match listener.accept() {
+                    Ok((connection, _)) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "send request never arrived"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            };
+            connection
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 8192);
+                connection.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            assert!(request.starts_with(b"POST /me/messages/synthetic-draft/send HTTP/1.1\r\n"));
+            // The server has accepted the complete empty-body send request, but
+            // closes before returning its acknowledgement to the production client.
+            connection.shutdown(Shutdown::Both).unwrap();
+            1
+        });
+        crate::TEST_CONFIRMED_MAIL_CLIENT.with(|slot| {
+            *slot.borrow_mut() =
+                Some(isyncyou_graph::GraphClient::new("synthetic-token").with_base_url(endpoint));
+        });
+        let executor = DesktopAgentOperations::new(Config::default(), Arc::new(Mutex::new(())));
+        let action = isyncyou_agent::parse_action(&json!({
+            "op": "live-write", "account": "synthetic-account", "service": "mail",
+            "target": "synthetic-draft", "change": { "verb": "send_draft" }
+        }))
+        .unwrap();
+        assert!(matches!(
+            executor.execute_confirmed(&action),
+            ConfirmedExecutionOutcome::OutcomeUnknown
+        ));
+        assert_eq!(server.join().unwrap(), 1);
+        crate::TEST_CONFIRMED_MAIL_CLIENT.with(|slot| assert!(slot.borrow().is_none()));
+    }
+
+    #[test]
+    fn agent_confirm_invalid_action_is_rejected_before_dispatch() {
+        let action = isyncyou_agent::parse_action(&json!({
+            "op": "live-write", "account": "synthetic-account", "service": "mail",
+            "target": "synthetic-message", "change": { "verb": "set_read" }
+        }))
+        .unwrap();
+        assert!(matches!(
+            classify_confirmed_execution(&action, || panic!("must not dispatch")),
+            ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)
+        ));
+    }
 
     #[derive(Debug, Default)]
     struct BackupRuntimeState {
@@ -2647,6 +2866,47 @@ mod tests {
                 })
             )]
         );
+    }
+
+    #[test]
+    fn agent_live_write_mail_set_read_accepts_unambiguous_legacy_value() {
+        let action = isyncyou_agent::parse_action(&json!({
+            "op": "live-write",
+            "account": "me",
+            "service": "mail",
+            "target": "message-1",
+            "change": { "verb": "set_read", "value": true }
+        }))
+        .unwrap();
+
+        let intent = validate_live_write_action(&action).unwrap();
+        assert_eq!(
+            intent,
+            AgentLiveWriteIntent::Mail(MailLiveWrite::SetRead {
+                target: "message-1".into(),
+                is_read: true,
+            })
+        );
+    }
+
+    #[test]
+    fn agent_live_write_mail_set_read_rejects_ambiguous_boolean_fields() {
+        let action = isyncyou_agent::parse_action(&json!({
+            "op": "live-write",
+            "account": "me",
+            "service": "mail",
+            "target": "message-1",
+            "change": {
+                "verb": "set_read",
+                "is_read": true,
+                "value": true
+            }
+        }))
+        .unwrap();
+
+        assert!(validate_live_write_action(&action)
+            .unwrap_err()
+            .contains("mutually exclusive"));
     }
 
     #[test]
@@ -3004,6 +3264,28 @@ mod tests {
                 assert!(!preview.text.contains(internal));
             }
         }
+    }
+
+    #[test]
+    fn pending_action_validation_diagnostic_is_closed_and_value_free() {
+        assert_eq!(
+            pending_action_validation_diagnostic("invalid_live_write: missing target"),
+            "missing_target"
+        );
+        assert_eq!(
+            pending_action_validation_diagnostic("invalid_live_write: missing bool is_read"),
+            "missing_read_boolean"
+        );
+        assert_eq!(
+            pending_action_validation_diagnostic(
+                "unsupported_live_write_service: private-account-item"
+            ),
+            "unsupported_service"
+        );
+        assert_eq!(
+            pending_action_validation_diagnostic("private-account-item"),
+            "invalid_action"
+        );
     }
 
     #[test]

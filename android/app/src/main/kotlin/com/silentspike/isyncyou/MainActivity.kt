@@ -451,7 +451,8 @@ class MainActivity : FragmentActivity() {
             "sub" -> {
                 val jsId = validation.id
                 val path = obj.optString("path")
-                dispatchBridge { runBridgeStream(jsId, path, reply) }
+                val capabilityToken = obj.optString("cap_token", "")
+                dispatchBridge { runBridgeStream(jsId, path, capabilityToken, reply) }
             }
             "unsub" -> {
                 bridgeStreams.remove(validation.id)?.let { NativeEngine.nativeStreamClose(it) }
@@ -930,12 +931,17 @@ class MainActivity : FragmentActivity() {
     }
 
     /** Drain one push stream, forwarding each event to the WebView until it ends (#0A). */
-    private fun runBridgeStream(jsId: String, path: String, reply: JavaScriptReplyProxy) {
+    private fun runBridgeStream(
+        jsId: String,
+        path: String,
+        capabilityToken: String,
+        reply: JavaScriptReplyProxy,
+    ) {
         if (sessionToken.isBlank()) {
             reply.postMessage(streamEndJson(jsId))
             return
         }
-        val nativeId = NativeEngine.nativeStreamOpen(path, sessionToken)
+        val nativeId = NativeEngine.nativeStreamOpen(path, sessionToken, capabilityToken)
         if (nativeId <= 0L) {
             reply.postMessage(streamEndJson(jsId))
             return

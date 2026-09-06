@@ -116,6 +116,15 @@ class BiometricPolicyTest {
     }
 
     @Test
+    fun agent_pending_labels_cover_backup_restore_cloud_live_write_and_share() {
+        assertEquals("Start backup in iSyncYou", BiometricLabelPolicy.label("backup", "agent"))
+        assertEquals("Restore to cloud in Mail", BiometricLabelPolicy.label("restore-cloud", "mail"))
+        assertEquals("Run Agent write in Mail", BiometricLabelPolicy.label("live-write", "mail"))
+        assertEquals("Share in OneDrive", BiometricLabelPolicy.label("share", "onedrive"))
+        assertNull(BiometricLabelPolicy.label("live-write", "onedrive"))
+    }
+
+    @Test
     fun duplicatePendingHandleCannotOpenTwoPrompts() {
         val registry = BiometricPendingRegistry<String>()
         assertTrue(registry.register("pending-1", "request-1"))

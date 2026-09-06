@@ -122,6 +122,18 @@ class BridgeMessagePolicyTest {
             "s1",
         )
         assertValid(
+            BridgeMessagePolicy.validateEnvelope(
+                JSONObject()
+                    .put("t", "sub")
+                    .put("id", "s2")
+                    .put("path", "/api/v1/agent/stream?turn=turn-1")
+                    .put("cap_token", "a".repeat(32))
+                    .toString(),
+            ),
+            "sub",
+            "s2",
+        )
+        assertValid(
             BridgeMessagePolicy.validateEnvelope(JSONObject().put("t", "unsub").put("id", "u1").toString()),
             "unsub",
             "u1",
@@ -137,6 +149,33 @@ class BridgeMessagePolicyTest {
             BridgeMessagePolicy.validateEnvelope(JSONObject().put("t", "bio").put("id", "b2").toString()),
             "missing_pat",
         )
+    }
+
+    @Test
+    fun android_agent_stream_subscription_requires_cap_and_never_logs_or_reflects_it() {
+        val agent = JSONObject()
+            .put("t", "sub")
+            .put("id", "agent")
+            .put("path", "/api/v1/agent/stream?turn=turn-1")
+        assertInvalid(BridgeMessagePolicy.validateEnvelope(agent.toString()), "invalid_capability")
+        agent.put("cap_token", "A".repeat(32))
+        assertInvalid(BridgeMessagePolicy.validateEnvelope(agent.toString()), "invalid_capability")
+        agent.put("cap_token", "a".repeat(31))
+        assertInvalid(BridgeMessagePolicy.validateEnvelope(agent.toString()), "invalid_capability")
+        agent.put("cap_token", "0".repeat(32))
+        assertValid(BridgeMessagePolicy.validateEnvelope(agent.toString()), "sub", "agent")
+
+        val events = JSONObject()
+            .put("t", "sub")
+            .put("id", "events")
+            .put("path", "/api/v1/events")
+            .put("cap_token", "0".repeat(32))
+        assertInvalid(
+            BridgeMessagePolicy.validateEnvelope(events.toString()),
+            "unexpected_capability",
+        )
+        val accepted = BridgeMessagePolicy.validateEnvelope(agent.toString())
+        assertFalse(accepted.toString().contains("0".repeat(32)))
     }
 
     @Test

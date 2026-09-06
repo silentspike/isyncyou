@@ -23,6 +23,8 @@ object BridgeMessagePolicy {
     private val TYPES = setOf("req", "sub", "unsub", "bio", "native")
     private val HEADER_NAME = Regex("^[A-Za-z0-9-]{1,128}$")
     private val OPAQUE_ACTIVITY_ID = Regex("^[A-Za-z0-9_-]{22}$")
+    private val AGENT_CAPABILITY = Regex("^[0-9a-f]{32}$")
+    private const val AGENT_STREAM_PATH = "/api/v1/agent/stream"
     private val PROGRESS_STAGES = setOf("names", "bodies", "deep")
     private val PROGRESS_STATUSES = setOf(
         "queued",
@@ -330,21 +332,29 @@ object BridgeMessagePolicy {
     }
 
     private fun validateSubscription(obj: JSONObject, type: String, id: String): BridgeValidation {
-        if (!hasOnlyKeys(obj, setOf("t", "id", "path"))) {
-            return BridgeValidation(false, type, id, "unknown_field")
-        }
         val path = exactString(obj, "path")
-        return if (
+        if (
             path.isNullOrBlank() ||
             !path.startsWith('/') ||
             path.startsWith("//") ||
             path.contains('#') ||
             path.length > MAX_PATH_CHARS
         ) {
-            BridgeValidation(false, type, id, "missing_path")
-        } else {
-            BridgeValidation(true, type, id)
+            return BridgeValidation(false, type, id, "missing_path")
         }
+        val route = path.substringBefore('?')
+        if (route == AGENT_STREAM_PATH) {
+            if (!hasOnlyKeys(obj, setOf("t", "id", "path", "cap_token"))) {
+                return BridgeValidation(false, type, id, "unknown_field")
+            }
+            val capability = exactString(obj, "cap_token")
+            if (capability == null || !AGENT_CAPABILITY.matches(capability)) {
+                return BridgeValidation(false, type, id, "invalid_capability")
+            }
+        } else if (!hasOnlyKeys(obj, setOf("t", "id", "path"))) {
+            return BridgeValidation(false, type, id, "unexpected_capability")
+        }
+        return BridgeValidation(true, type, id)
     }
 
     private fun validateNative(obj: JSONObject, type: String, id: String): BridgeValidation {

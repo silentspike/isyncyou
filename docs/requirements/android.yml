@@ -294,7 +294,7 @@ requirements:
       - test: mobile_full_node_router_exposes_gated_restore_and_backup
       - test: standalone_full_node_serves_ui_and_gates_restore_backup
       - test: mobile_full_node_restore_backup_do_not_run_without_biometric_token
-      - test: mobile_agent_confirm_requires_biometric_before_agent_token_consumption
+      - test: mobile_agent_confirm_after_biometric_consumes_agent_token_once
       - test: mobile_agent_confirm_wrong_biometric_token_does_not_consume_agent_pending
       - test: mobile_agent_confirm_after_biometric_consumes_agent_token_once
       - test: mobile_agent_confirm_wrong_action_hash_does_not_mint_biometric_pending

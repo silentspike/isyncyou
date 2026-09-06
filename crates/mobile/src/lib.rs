@@ -164,6 +164,7 @@ fn install_test_mobile_encryption() {
     isyncyou_core::envelope::set_body_key(1, key);
     isyncyou_core::envelope::require_body_envelope_for_process();
     isyncyou_store::set_store_key(key.to_vec());
+    #[cfg(feature = "encrypted-store")]
     isyncyou_store::require_store_key_for_process();
     isyncyou_agent::set_process_credential_key(key);
     mark_mobile_encryption_ready();
@@ -187,6 +188,7 @@ fn install_mobile_body_key(key_id: i32, bytes: &[u8]) -> bool {
         isyncyou_core::envelope::set_body_key(key_id as u32, k);
         isyncyou_core::envelope::require_body_envelope_for_process();
         isyncyou_store::set_store_key(k.to_vec());
+        #[cfg(feature = "encrypted-store")]
         isyncyou_store::require_store_key_for_process();
         mark_mobile_encryption_ready();
     }))
@@ -617,9 +619,9 @@ fn streams() -> &'static Mutex<StreamRegistry> {
     STREAMS.get_or_init(|| Mutex::new(StreamRegistry::default()))
 }
 
-/// Open a bridge push stream (#0A) for `path`, session-gated. Returns a stream id (>0), or
-/// 0 when the engine hasn't started / the stream is unknown / the session is unauthorized.
-pub fn stream_open(path: &str, session_token: Option<&str>) -> i64 {
+/// Open a bridge push stream (#0A) for `path`. Agent streams require the independent
+/// capability token; the generic events stream rejects one.
+pub fn stream_open(path: &str, session_token: Option<&str>, capability_token: Option<&str>) -> i64 {
     let router = {
         let guard = cell().lock().unwrap_or_else(|e| e.into_inner());
         guard.as_ref().map(|s| Arc::clone(&s.router))
@@ -627,7 +629,16 @@ pub fn stream_open(path: &str, session_token: Option<&str>) -> i64 {
     let Some(router) = router else {
         return 0;
     };
-    let Some(rx) = router.open_bridge_stream(path, session_token) else {
+    stream_open_with_router(router, path, session_token, capability_token)
+}
+
+fn stream_open_with_router(
+    router: Arc<isyncyou_webui::Router>,
+    path: &str,
+    session_token: Option<&str>,
+    capability_token: Option<&str>,
+) -> i64 {
+    let Some(rx) = router.open_bridge_stream(path, session_token, capability_token) else {
         return 0;
     };
     let id = STREAM_SEQ.fetch_add(1, Ordering::SeqCst) as i64;
@@ -799,6 +810,7 @@ fn start_inner(
         return Err("agent credential storage setup failed; local data was not opened".into());
     }
     isyncyou_core::envelope::require_body_envelope_for_process();
+    #[cfg(feature = "encrypted-store")]
     isyncyou_store::require_store_key_for_process();
     let base = PathBuf::from(files_dir);
     cleanup_legacy_plaintext_mobile_state(&base)?;
@@ -1392,12 +1404,14 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeAssetReq
 
 /// JNI: open a bridge push stream (#0A), returning a stream id (>0) or 0. The session
 /// token is passed explicitly (the WebView can't set headers on a native stream open).
+/// The Agent capability is a separate in-memory argument and is never part of `path`.
 #[no_mangle]
 pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStreamOpen<'local>(
     mut env: jni::EnvUnowned<'local>,
     _class: jni::objects::JClass<'local>,
     path: jni::objects::JString<'local>,
     session_token: jni::objects::JString<'local>,
+    capability_token: jni::objects::JString<'local>,
 ) -> jni::sys::jlong {
     let path = match jni_get_string(&mut env, &path) {
         Some(s) => s,
@@ -1405,7 +1419,12 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStreamOp
     };
     let tok = jni_get_string(&mut env, &session_token).unwrap_or_default();
     let tok = if tok.is_empty() { None } else { Some(tok) };
-    std::panic::catch_unwind(AssertUnwindSafe(|| stream_open(&path, tok.as_deref()))).unwrap_or(0)
+    let cap = jni_get_string(&mut env, &capability_token).unwrap_or_default();
+    let cap = if cap.is_empty() { None } else { Some(cap) };
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        stream_open(&path, tok.as_deref(), cap.as_deref())
+    }))
+    .unwrap_or(0)
 }
 
 /// JNI: block for the next event on stream `id` (a JSON `{event,data}` object), or "" when
@@ -3018,18 +3037,91 @@ mod tests {
         start_engine(dir.path().to_str().unwrap()).expect("engine starts");
         let tok = session_token().expect("token");
         assert_eq!(
-            stream_open("/api/v1/events", None),
+            stream_open("/api/v1/events", None, None),
             0,
             "unauthorized → no stream"
         );
         assert_eq!(
-            stream_open("/api/v1/nope", Some(&tok)),
+            stream_open("/api/v1/nope", Some(&tok), None),
             0,
             "unknown path → no stream"
         );
-        let id = stream_open("/api/v1/events", Some(&tok));
+        let id = stream_open("/api/v1/events", Some(&tok), None);
         assert!(id > 0, "authorized events stream opens");
         stream_close(id);
         assert_eq!(stream_next(id), "", "a closed stream yields nothing");
+    }
+
+    #[test]
+    fn agent_stream_bridge_requires_session_and_agent_capability() {
+        struct StreamAgent;
+
+        impl isyncyou_webui::AgentHandler for StreamAgent {
+            fn start_turn(&self, _account: &str, _prompt: &str) -> Result<String, String> {
+                Ok("turn-123".into())
+            }
+
+            fn confirm(
+                &self,
+                _command: &isyncyou_webui::AgentConfirmCommand,
+            ) -> isyncyou_webui::AgentConfirmOutcome {
+                isyncyou_webui::AgentConfirmOutcome::Rejected(
+                    isyncyou_webui::AgentClosedConfirmationCode::Invalid,
+                )
+            }
+
+            fn cancel(&self, _turn_id: &str) {}
+
+            fn open_stream(&self, _turn_id: &str) -> Option<Receiver<String>> {
+                let (_tx, rx) = std::sync::mpsc::channel();
+                Some(rx)
+            }
+        }
+
+        let router = Arc::new(
+            isyncyou_webui::Router::new(Config::default())
+                .with_agent(Arc::new(StreamAgent), "agent-capability".into())
+                .with_session_token("session".into()),
+        );
+        let path = "/api/v1/agent/stream?turn=turn-123";
+
+        let id = stream_open_with_router(
+            Arc::clone(&router),
+            path,
+            Some("session"),
+            Some("agent-capability"),
+        );
+        assert!(id > 0);
+        stream_close(id);
+
+        for (session, capability) in [
+            (None, Some("agent-capability")),
+            (Some("session"), None),
+            (Some("wrong"), Some("agent-capability")),
+            (Some("session"), Some("wrong")),
+        ] {
+            assert_eq!(
+                stream_open_with_router(Arc::clone(&router), path, session, capability),
+                0
+            );
+        }
+        assert_eq!(
+            stream_open_with_router(
+                Arc::clone(&router),
+                "/api/v1/agent/stream?turn=turn-123&_cap=agent-capability",
+                Some("session"),
+                None,
+            ),
+            0
+        );
+        assert_eq!(
+            stream_open_with_router(
+                router,
+                "/api/v1/events",
+                Some("session"),
+                Some("agent-capability"),
+            ),
+            0
+        );
     }
 }

@@ -76,7 +76,7 @@ function sendSseMessage(res, obj) {
 async function sendStream(res, scenario, turn) {
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
-    "cache-control": "no-cache, no-transform",
+    "cache-control": "no-store",
     connection: "keep-alive",
   });
   if (scenario === "normal") {
@@ -270,6 +270,7 @@ function makeFixtureServer(evidence, options = {}) {
     viewHits: [],
     streamScenarios: [],
     requestStatusReads: [],
+    agentStreamAuthRejects: [],
   };
 
   // #639 T10: the host onboarding projection the wizard renders (per-provider readiness + steps).
@@ -492,13 +493,17 @@ function makeFixtureServer(evidence, options = {}) {
         requestScenarios.set(body.request_id, scenario);
         json(res, 200, { turn });
       } else if (req.method === "GET" && url.pathname === "/api/v1/agent/stream") {
+        if (options.requireAgentStreamCapability && !checkAgentCap(req)) {
+          state.agentStreamAuthRejects.push("missing_or_invalid_capability");
+          return json(res, 403, { error: "bad capability" });
+        }
         const turn = url.searchParams.get("turn") || "";
         const scenario = turns.get(turn) || "normal";
         state.streamScenarios.push({ turn, scenario });
         if (scenario === "slow-cancel") {
           res.writeHead(200, {
             "content-type": "text/event-stream; charset=utf-8",
-            "cache-control": "no-cache, no-transform",
+            "cache-control": "no-store",
             connection: "keep-alive",
           });
           res.write(": ready\n\n");
@@ -520,10 +525,11 @@ function makeFixtureServer(evidence, options = {}) {
         }
       } else if (req.method === "POST" && url.pathname === "/api/v1/agent/confirm") {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
-        state.confirmPosts.push(await readJson(req));
-        json(res, 200, {
-          result: '{"status":"ok","op":"live-write","account":"me","service":"mail","verb":"set_read"}',
-        });
+        const body = await readJson(req);
+        state.confirmPosts.push(body);
+        const controlled = options.confirmResponse?.({ body, attempt: state.confirmPosts.length });
+        if (controlled) return json(res, controlled.status, controlled.body);
+        json(res, 200, { result: "Completed successfully." });
       } else if (req.method === "POST" && url.pathname === "/api/v1/agent/pending/cancel") {
         if (!checkAgentCap(req)) return json(res, 403, { error: "bad capability" });
         state.cancelPosts.push(await readJson(req));
