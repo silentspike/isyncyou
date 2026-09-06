@@ -29,6 +29,28 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Event metadata can differ from current membership. Recheck the same
+          # actor policy immediately before taking any destructive action.
+          decision=$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" |
+            jq -er --arg repo "$REPOSITORY" --argjson number "$PR_NUMBER" '
+              .author_association as $association |
+              if .number != $number or .base.repo.full_name != $repo or
+                 (.user.login | type != "string") or .user.login == "" or
+                 (["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR",
+                   "FIRST_TIMER", "FIRST_TIME_CONTRIBUTOR", "NONE", "MANNEQUIN"] |
+                  index($association)) == null then
+                error("Invalid pull request metadata")
+              else . end |
+              if .author_association == "OWNER" or
+                 .author_association == "MEMBER" or
+                 .author_association == "COLLABORATOR" or
+                 (.user.login == "dependabot[bot]" and .head.repo.full_name == $repo)
+              then "allow"
+              else "close" end')
+          if [ "$decision" = allow ]; then
+            echo "Current PR metadata permits this author; no action needed."
+            exit 0
+          fi
           message=$(cat <<'EOF'
           Thank you for your interest in iSyncYou. This repository does not accept external pull requests.
 

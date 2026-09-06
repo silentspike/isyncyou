@@ -197,7 +197,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(surface) = self.surface.as_mut() {
                     let pm = render(&self.view);
                     let mut buf = surface.buffer_mut().expect("surface buffer");
-                    for (px, rgba) in buf.iter_mut().zip(pm.data().chunks_exact(4)) {
+                    for (px, rgba) in buf.iter_mut().zip(pm.data().as_chunks::<4>().0) {
                         *px = (rgba[0] as u32) << 16 | (rgba[1] as u32) << 8 | rgba[2] as u32;
                     }
                     buf.present().expect("present");

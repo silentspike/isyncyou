@@ -563,7 +563,12 @@ mod tests {
         // must contain pixels different from the background.
         let pm = render(&sample());
         let bg = pm.data()[0..3].to_vec();
-        let differs = pm.data().chunks_exact(4).any(|p| p[0..3] != bg[..]);
+        let differs = pm
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| p[0..3] != bg[..]);
         assert!(differs, "render produced a blank image");
     }
 
@@ -589,10 +594,10 @@ mod tests {
         };
         let pm = render(&v);
         // the otherwise blue/green theme has no strong red; the error pill + banner do.
-        let reddish = pm
-            .data()
-            .chunks_exact(4)
-            .any(|p| p[0] > 120 && p[0] as u16 > p[1] as u16 * 2 && p[0] as u16 > p[2] as u16 * 2);
+        let reddish =
+            pm.data().as_chunks::<4>().0.iter().any(|p| {
+                p[0] > 120 && p[0] as u16 > p[1] as u16 * 2 && p[0] as u16 > p[2] as u16 * 2
+            });
         assert!(
             reddish,
             "error state must paint a prominent red pill/banner"
