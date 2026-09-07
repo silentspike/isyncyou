@@ -461,7 +461,7 @@ jobs:
           targets: aarch64-linux-android
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: needs.preflight.outputs.mode == 'rc'
-      - uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
+      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2.87.5
         if: needs.preflight.outputs.mode == 'rc'
         with:
           tool: cargo-ndk
