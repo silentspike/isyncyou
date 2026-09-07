@@ -348,7 +348,7 @@ jobs:
         # workflow_dispatch from `main` sets github.ref to refs/heads/main; a tag push is
         # handled by the stable-release step below, so the two never both fire.
         if: needs.preflight.outputs.mode == 'rc'
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           tag_name: ${{ needs.preflight.outputs.release_tag }}
           # Pin the RC tag to the exact commit this run built (the push-to-main SHA).
@@ -386,7 +386,7 @@ jobs:
 
       - name: Publish release (on tag)
         if: needs.preflight.outputs.mode == 'stable'
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           # The git tag ref is already authoritative for provenance, but pin the
           # release object's target_commitish to the tag's commit too, so the displayed
