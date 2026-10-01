@@ -5843,6 +5843,7 @@ fn public_onboarding_error_code(code: Option<&str>) -> &'static str {
         Some("provider_busy") => "provider_busy",
         Some("lifecycle_invalid") => "lifecycle_invalid",
         Some("lifecycle_unavailable") => "lifecycle_unavailable",
+        Some("stale_lifecycle_fence") => "stale_lifecycle_fence",
         _ => "onboarding_failed",
     }
 }
@@ -13227,9 +13228,10 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             (self.credential_now_ms)(),
         ) {
             let code = match error.as_str() {
-                "provider_busy" | "lifecycle_invalid" | "lifecycle_unavailable" => {
-                    public_onboarding_error_code(Some(&error))
-                }
+                "provider_busy"
+                | "lifecycle_invalid"
+                | "lifecycle_unavailable"
+                | "stale_lifecycle_fence" => public_onboarding_error_code(Some(&error)),
                 _ => "exchange_intent_failed",
             };
             return fail(code, "oauth_commit_failed");
@@ -13354,9 +13356,10 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             (self.credential_now_ms)(),
         ) {
             let code = match error.as_str() {
-                "provider_busy" | "lifecycle_invalid" | "lifecycle_unavailable" => {
-                    public_onboarding_error_code(Some(&error))
-                }
+                "provider_busy"
+                | "lifecycle_invalid"
+                | "lifecycle_unavailable"
+                | "stale_lifecycle_fence" => public_onboarding_error_code(Some(&error)),
                 _ => "exchange_intent_failed",
             };
             return fail(code, "oauth_commit_failed");
@@ -22165,6 +22168,7 @@ mod tests {
             "lifecycle_binding_missing",
             "exchange_intent_failed",
             "onboarding_failed",
+            "stale_lifecycle_fence",
         ] {
             assert!(is_onboarding_error_code(code));
         }
@@ -22237,6 +22241,45 @@ mod tests {
             "provider_busy"
         );
         drop(restarted);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn claude_oauth_exchange_survives_later_codex_lifecycle_start() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("claude-codex-exchange-fence");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let started = agent
+            .oauth_start_request(isyncyou_webui::AgentOAuthStartRequest {
+                provider: "claude".into(),
+                request_id: "123e4567-e89b-42d3-a456-426614174240".into(),
+                lifecycle_operation_id: None,
+            })
+            .unwrap();
+        agent
+            .begin_connect_lifecycle(
+                ProductProviderId::Codex,
+                "123e4567-e89b-42d3-a456-426614174241",
+            )
+            .unwrap();
+        assert_eq!(
+            prepare_product_oauth_exchange(
+                &agent.cfg,
+                &root,
+                &agent.provider_leases,
+                ProductProviderId::Claude,
+                started.lifecycle_operation_id.as_deref().unwrap(),
+                &started.attempt_id,
+                now_ms(),
+            ),
+            Ok(())
+        );
+        drop(agent);
         let _ = std::fs::remove_dir_all(root);
     }
 
