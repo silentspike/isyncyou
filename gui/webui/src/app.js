@@ -5395,17 +5395,24 @@ async function startAiLogin(provider, lifecycleOperationId) {
     renderAssistantView($("#view"));
     return;
   }
+  if (AssistantState.oauthOpening) return;
+  AssistantState.oauthOpening = { provider, phase: "preparing" };
+  syncAgentOAuthOpeningUi();
   let guardId = null;
   try {
     guardId = await beginNetworkGuard("oauth");
     if (BRIDGE && !guardId) throw new Error("network_guard_unavailable");
     if (provider === "codex") CODEX_GUARD_ID = guardId;
     else AGENT_GUARD_ID = guardId;
+    AssistantState.oauthOpening.phase = "network";
+    syncAgentOAuthOpeningUi();
     await runConnectivityPreflight(provider, "oauth_start", guardId);
     const redirect = localCallbackRedirect("localhost");
     const manualCodeFlow = provider === "claude" && !redirect;
     const requestKey = `oauth-start:${provider}:${lifecycleOperationId || "connect"}`;
     const requestId = lifecycleRequestId(requestKey);
+    AssistantState.oauthOpening.phase = "authorizing";
+    syncAgentOAuthOpeningUi();
     const d = await postJson("/api/v1/agent/oauth/start", CAP.agent, {
       provider,
       request_id: requestId,
@@ -5420,6 +5427,8 @@ async function startAiLogin(provider, lifecycleOperationId) {
     clearLifecycleRequestId(requestKey);
     if (manualCodeFlow) showCodeStep();
     else showWaitingStep(provider);  // waiting UI + poll; completes when /callback fires
+    AssistantState.oauthOpening.phase = "opening";
+    syncAgentOAuthOpeningUi();
     toast("Opening sign-in in your browser…");
     await openExternalAuth(d.authorize_url, "agent_authorize");
   } catch (e) {
@@ -5429,11 +5438,59 @@ async function startAiLogin(provider, lifecycleOperationId) {
     if (CODEX_GUARD_ID === guardId) CODEX_GUARD_ID = null;
     if (e && e.connectivity) {
       rememberConnectivityIssue(e, () => startAiLogin(provider, lifecycleOperationId));
-      renderAssistantView($("#view"));
     } else {
       toast("Sign-in unavailable", "err");
     }
+    if (App.route === "assistant") await renderAssistantView($("#view"));
+  } finally {
+    AssistantState.oauthOpening = null;
+    syncAgentOAuthOpeningUi();
   }
+}
+
+function syncAgentOAuthOpeningUi() {
+  const opening = AssistantState.oauthOpening;
+  const controls = document.querySelectorAll(
+    "#asst-connect-claude, #asst-connect-codex, [data-agent-model-connect]",
+  );
+  controls.forEach(button => {
+    if (opening) {
+      if (!button._oauthIdle) button._oauthIdle = {
+        disabled: button.disabled, children: [...button.childNodes],
+      };
+      button.disabled = true;
+      const provider = button.dataset.agentModelConnect
+        || (button.id === "asst-connect-claude" ? "claude" : "codex");
+      if (provider === opening.provider) {
+        button.setAttribute("aria-busy", "true");
+        button.replaceChildren(el("span", { class: "spinner", "aria-hidden": "true" }),
+          el("span", { text: "Connecting…" }));
+      }
+    } else if (button._oauthIdle) {
+      button.disabled = button._oauthIdle.disabled;
+      button.replaceChildren(...button._oauthIdle.children);
+      button.removeAttribute("aria-busy");
+      delete button._oauthIdle;
+    }
+  });
+  let status = document.querySelector("[data-agent-oauth-opening]");
+  if (!opening) { if (status) status.remove(); return; }
+  const card = document.getElementById("asst-connect-card");
+  if (!card) return;
+  if (!status) {
+    status = el("div", { class: "assistant-loading", role: "status",
+      "aria-live": "polite", "data-agent-oauth-opening": "1" });
+    const actions = card.querySelector(".assistant-setup-actions");
+    if (actions) actions.before(status);
+    else card.prepend(status);
+  }
+  const copy = {
+    preparing: "Preparing sign-in…",
+    network: "Checking connection…",
+    authorizing: "Preparing secure sign-in…",
+    opening: "Opening browser…",
+  };
+  status.textContent = copy[opening.phase];
 }
 
 // After the browser login the engine's /callback stores the token; poll status until
@@ -5559,6 +5616,7 @@ const AssistantState = {
   activeMessage: null,
   connectivityIssue: null,
   pendingConnectProvider: null,
+  oauthOpening: null,
   pendingModelSelection: null,
   lifecycleRequestIds: new Map(),
   lifecycleAutoResume: new Set(),
@@ -5970,6 +6028,7 @@ async function renderAssistantView(view) {
   }
   const claudeReady = assistantProviderReady(st, "claude");
   if (OAUTH_ATTEMPTS.has("claude") && !claudeReady) showCodeStep();
+  syncAgentOAuthOpeningUi();
 }
 
 // #639 T10: the ordered official-sign-in -> custom-harness handoff steps the wizard proves. Keys
@@ -6317,6 +6376,7 @@ function agentModelSwitcher(st) {
   return wrap;
 }
 async function connectAgentProvider(provider, lifecycleNode = null) {
+  if (AssistantState.oauthOpening) return;
   if (!agentPrivacyConsentAccepted(provider)) {
     AssistantState.pendingConnectProvider = agentProviderConsentId(provider);
     await renderAssistantView($("#view"));
