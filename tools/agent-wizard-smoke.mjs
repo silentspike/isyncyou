@@ -81,6 +81,7 @@ function startServer(scenario) {
     if (url.pathname === "/api/v1/agent/status") return json(res, 200, statusFor(scenario));
     if (url.pathname === "/api/v1/agent/connectivity/preflight") return json(res, 200, { status: "ready", code: "ready", retryable: false, settings_hint: "none" });
     if (req.method === "POST" && url.pathname === "/api/v1/agent/oauth/start") {
+      requests.push({ route: "oauth_start" });
       if (scenario === "invalid_oauth_start") {
         return json(res, 200, { attempt_id: "attempt-invalid-response" });
       }
@@ -225,6 +226,113 @@ async function main() {
         cleanup.guard_retained === false, cleanup);
       await page.close();
       server.close();
+    }
+    // Delayed boundaries prove feedback before any network/native work completes.
+    for (const provider of ["claude", "codex"]) {
+      for (const width of [390, 1280]) {
+        const { server, port, requests } = await startServer("first_run");
+        const page = await browser.newPage({ viewport: { width, height: 844 } });
+        try {
+          await openAssistant(page, `http://127.0.0.1:${port}`);
+          await page.evaluate(async () => {
+            localStorage.setItem(AGENT_PRIVACY_CONSENT_KEY, JSON.stringify({
+              version: AGENT_PRIVACY_CONSENT_VERSION,
+              providers: { claude: { accepted: true }, codex: { accepted: true } },
+            }));
+            window.__openingTest = { guards: 0, browsers: 0 };
+            beginNetworkGuard = () => {
+              window.__openingTest.guards++;
+              return new Promise(resolve => { window.__openingTest.guard = resolve; });
+            };
+            runConnectivityPreflight = () => new Promise(resolve => {
+              window.__openingTest.preflight = resolve;
+            });
+            openExternalAuth = () => {
+              window.__openingTest.browsers++;
+              return new Promise(resolve => { window.__openingTest.browser = resolve; });
+            };
+            await renderAssistantView(document.getElementById("view"));
+          });
+          const label = `${provider}/${width}`;
+          await page.locator(`#asst-connect-${provider}`).click();
+          const immediate = await page.evaluate(() => ({
+            status: document.querySelector("[data-agent-oauth-opening]")?.textContent,
+            disabled: ["claude", "codex"].every(p => document.getElementById(`asst-connect-${p}`).disabled),
+            busy: document.querySelector('[aria-busy="true"]') !== null,
+            guards: window.__openingTest.guards,
+          }));
+          record(`${label} feedback precedes guard completion`,
+            immediate.status === "Preparing sign-in…" && immediate.disabled
+              && immediate.busy && immediate.guards === 1, immediate);
+          await page.evaluate(async () => {
+            await connectAgentProvider("codex");
+            await startAiLogin("claude");
+            await renderAssistantView(document.getElementById("view"));
+          });
+          record(`${label} duplicate start is ignored across rerender`,
+            await page.evaluate(() => window.__openingTest.guards === 1
+              && ["claude", "codex"].every(p => document.getElementById(`asst-connect-${p}`).disabled)
+              && document.querySelector("[data-agent-oauth-opening]")?.textContent === "Preparing sign-in…"));
+          await page.evaluate(() => window.__openingTest.guard(null));
+          await page.waitForFunction(() => !!window.__openingTest.preflight);
+          record(`${label} network phase is visible`,
+            await page.locator("[data-agent-oauth-opening]").innerText() === "Checking connection…");
+          await page.evaluate(() => window.__openingTest.preflight({ status: "ready" }));
+          await page.waitForFunction(() => !!window.__openingTest.browser);
+          record(`${label} browser phase is visible`,
+            await page.locator("[data-agent-oauth-opening]").innerText() === "Opening browser…");
+          const bounds = await page.locator("[data-agent-oauth-opening]").evaluate(node => {
+            const r = node.getBoundingClientRect();
+            return r.width > 0 && r.left >= 0 && r.right <= innerWidth && node.scrollWidth <= node.clientWidth;
+          });
+          record(`${label} progress fits viewport`, bounds);
+          await page.screenshot({ path: path.join(OUT_DIR, `oauth-opening-${provider}-${width}.png`), fullPage: true });
+          await page.evaluate(() => window.__openingTest.browser());
+          await page.waitForFunction(() => AssistantState.oauthOpening === null);
+          record(`${label} handoff clears opening state`,
+            await page.locator("[data-agent-oauth-opening]").count() === 0);
+          record(`${label} one start and one browser handoff`,
+            requests.filter(r => r.route === "oauth_start").length === 1
+              && await page.evaluate(() => window.__openingTest.browsers === 1));
+        } finally {
+          await page.close();
+          await new Promise(resolve => server.close(resolve));
+        }
+      }
+    }
+    for (const boundary of ["guard", "preflight", "oauth_response", "browser"]) {
+      const { server, port } = await startServer(boundary === "oauth_response" ? "invalid_oauth_start" : "first_run");
+      const page = await browser.newPage();
+      try {
+        await openAssistant(page, `http://127.0.0.1:${port}`);
+        await page.evaluate(async boundary => {
+          localStorage.setItem(AGENT_PRIVACY_CONSENT_KEY, JSON.stringify({
+            version: AGENT_PRIVACY_CONSENT_VERSION,
+            providers: { claude: { accepted: true }, codex: { accepted: true } },
+          }));
+          beginNetworkGuard = async () => {
+            if (boundary === "guard") throw new Error("network_guard_unavailable");
+            return null;
+          };
+          runConnectivityPreflight = async () => {
+            if (boundary === "preflight") throw Object.assign(new Error("connect_failed"), {
+              connectivity: { code: "connect_failed", retryable: true, settings_hint: "none" },
+            });
+          };
+          openExternalAuth = async () => { throw new Error("external_launch_failed"); };
+          await renderAssistantView(document.getElementById("view"));
+        }, boundary);
+        await page.locator("#asst-connect-claude").click();
+        await page.waitForFunction(() => AssistantState.oauthOpening === null
+          && document.getElementById("asst-connect-claude") && !document.getElementById("asst-connect-claude").disabled);
+        record(`${boundary} failure restores both connect controls`,
+          await page.evaluate(() => ["claude", "codex"].every(p => !document.getElementById(`asst-connect-${p}`).disabled)
+            && !document.querySelector("[data-agent-oauth-opening]")
+            && OAUTH_ATTEMPTS.size === 0));
+      } finally {
+        await page.close();
+        await new Promise(resolve => server.close(resolve));
+      }
     }
   } finally {
     await browser.close();
