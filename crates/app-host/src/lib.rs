@@ -5838,6 +5838,11 @@ fn public_onboarding_error_code(code: Option<&str>) -> &'static str {
         Some("authorization_failed") => "authorization_failed",
         Some("callback_invalid") => "callback_invalid",
         Some("journal_invalid") => "journal_invalid",
+        Some("lifecycle_binding_missing") => "lifecycle_binding_missing",
+        Some("exchange_intent_failed") => "exchange_intent_failed",
+        Some("provider_busy") => "provider_busy",
+        Some("lifecycle_invalid") => "lifecycle_invalid",
+        Some("lifecycle_unavailable") => "lifecycle_unavailable",
         _ => "onboarding_failed",
     }
 }
@@ -5847,22 +5852,7 @@ fn public_onboarding_error_code(code: Option<&str>) -> &'static str {
     feature = "agent-subscription-experimental"
 ))]
 fn is_onboarding_error_code(code: &str) -> bool {
-    matches!(
-        code,
-        "cancelled"
-            | "expired"
-            | "interrupted"
-            | "policy_unavailable"
-            | "transport_unavailable"
-            | "exchange_failed"
-            | "commit_failed"
-            | "same_account_selected"
-            | "candidate_identity_invalid"
-            | "candidate_revoke_unknown"
-            | "authorization_failed"
-            | "callback_invalid"
-            | "journal_invalid"
-    )
+    public_onboarding_error_code(Some(code)) == code
 }
 
 /// Persist an onboarding journal at a precomputed store id (#639) — bounded, authenticated, atomic.
@@ -6236,7 +6226,7 @@ fn record_onboarding_attempt_transition(
     journal.push(OnboardingTransition {
         state,
         generation: String::new(),
-        error_code,
+        error_code: error_code.map(|code| public_onboarding_error_code(Some(&code)).to_string()),
         recorded_at_ms: now_ms(),
     });
     let _ = store_indexed_onboarding_journal(
@@ -13227,7 +13217,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         else {
             return fail("lifecycle_binding_missing", "oauth_commit_failed");
         };
-        if prepare_product_oauth_exchange(
+        if let Err(error) = prepare_product_oauth_exchange(
             &self.cfg,
             &self.oauth_dir,
             &self.provider_leases,
@@ -13235,10 +13225,14 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             &binding.operation_id,
             attempt_id,
             (self.credential_now_ms)(),
-        )
-        .is_err()
-        {
-            return fail("exchange_intent_failed", "oauth_commit_failed");
+        ) {
+            let code = match error.as_str() {
+                "provider_busy" | "lifecycle_invalid" | "lifecycle_unavailable" => {
+                    public_onboarding_error_code(Some(&error))
+                }
+                _ => "exchange_intent_failed",
+            };
+            return fail(code, "oauth_commit_failed");
         }
         let fail_exchange = |closed_code: &str, wire_error: &str| {
             let _ = mark_product_oauth_exchange_unknown(
@@ -13350,7 +13344,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         else {
             return fail("lifecycle_binding_missing", "oauth_commit_failed");
         };
-        if prepare_product_oauth_exchange(
+        if let Err(error) = prepare_product_oauth_exchange(
             &self.cfg,
             &self.oauth_dir,
             &self.provider_leases,
@@ -13358,10 +13352,14 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             &binding.operation_id,
             &attempt_id,
             (self.credential_now_ms)(),
-        )
-        .is_err()
-        {
-            return fail("exchange_intent_failed", "oauth_commit_failed");
+        ) {
+            let code = match error.as_str() {
+                "provider_busy" | "lifecycle_invalid" | "lifecycle_unavailable" => {
+                    public_onboarding_error_code(Some(&error))
+                }
+                _ => "exchange_intent_failed",
+            };
+            return fail(code, "oauth_commit_failed");
         }
         let fail_exchange = |closed_code: &str, wire_error: &str| {
             let _ = mark_product_oauth_exchange_unknown(
@@ -22095,6 +22093,150 @@ mod tests {
         assert_eq!(onboarding["state"], "error_redacted");
         assert_eq!(onboarding["error_code"], "exchange_failed");
         assert!(!onboarding.to_string().contains("attempt-terminal"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn claude_oauth_failure_journal_reads_existing_preparation_codes_after_restart() {
+        let _env = AppHostCredentialEnvGuard::new();
+        for code in ["lifecycle_binding_missing", "exchange_intent_failed"] {
+            let root = apphost_credential_test_root(code);
+            let _ = std::fs::remove_dir_all(&root);
+            let recorded_at_ms = now_ms();
+            let journal = OnboardingAttemptJournalV1 {
+                transitions: vec![OnboardingTransition {
+                    state: ProductOnboardingState::ErrorRedacted,
+                    generation: String::new(),
+                    error_code: Some(code.to_string()),
+                    recorded_at_ms,
+                }],
+            };
+            store_indexed_onboarding_journal(
+                &root,
+                ProductProviderId::Claude,
+                &OnboardingAttemptJournalV1::journal_store_id("legacy-attempt"),
+                OnboardingJournalKind::Attempt,
+                &journal,
+                recorded_at_ms,
+            )
+            .unwrap();
+            let agent = DaemonAgent::new(Config::default(), root.clone());
+            let status = agent.provider_onboarding(ProductProviderId::Claude);
+            assert_eq!(status["state"], "error_redacted");
+            assert_eq!(status["error_code"], code);
+            assert!(!agent.provider_ready(ProductProviderId::Claude));
+            drop(agent);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn claude_oauth_failure_journal_never_persists_unrecognized_error_text() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("oauth-closed-errors");
+        let _ = std::fs::remove_dir_all(&root);
+        record_onboarding_attempt_transition(
+            &root,
+            ProductProviderId::Claude,
+            "attempt-terminal",
+            ProductOnboardingState::ErrorRedacted,
+            Some("private error with an OAuth code and a path".into()),
+        );
+        let journal = load_onboarding_journal(&root, "attempt-terminal").unwrap();
+        assert_eq!(
+            journal.terminal_error().unwrap().error_code.as_deref(),
+            Some("onboarding_failed")
+        );
+        assert!(!String::from_utf8(journal.to_json())
+            .unwrap()
+            .contains("private error"));
+        for code in [
+            "provider_busy",
+            "lifecycle_invalid",
+            "lifecycle_unavailable",
+            "lifecycle_binding_missing",
+            "exchange_intent_failed",
+            "onboarding_failed",
+        ] {
+            assert!(is_onboarding_error_code(code));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(
+        feature = "agent-oauth-providers",
+        not(feature = "agent-subscription-experimental")
+    ))]
+    #[test]
+    fn claude_oauth_failure_journal_preserves_busy_preparation_without_exchange() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("oauth-preparation-busy");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let started = agent
+            .oauth_start_request(isyncyou_webui::AgentOAuthStartRequest {
+                provider: "claude".into(),
+                request_id: "123e4567-e89b-42d3-a456-426614174240".into(),
+                lifecycle_operation_id: None,
+            })
+            .unwrap();
+        let state = match agent
+            .oauth_attempts
+            .lock()
+            .unwrap()
+            .get(&started.attempt_id)
+        {
+            Some(OAuthAttempt::Claude { state, .. }) => state.clone(),
+            _ => panic!("claude attempt missing"),
+        };
+        let lease = agent
+            .provider_leases
+            .acquire_shared(
+                &root,
+                ProductProviderId::Claude,
+                account_lifecycle::mint_operation_id().unwrap(),
+                account_lifecycle::ProviderOperationKind::Turn,
+            )
+            .unwrap();
+        let error = isyncyou_webui::AgentHandler::oauth_complete(
+            &agent,
+            &started.attempt_id,
+            &format!("unused-code#{state}"),
+        )
+        .unwrap_err();
+        assert_eq!(error, "oauth_commit_failed");
+        let status = agent.provider_onboarding(ProductProviderId::Claude);
+        assert_eq!(status["error_code"], "provider_busy");
+        assert!(!agent.has_active_attempt(ProductProviderId::Claude));
+        let repository = account_lifecycle_repository(&root).unwrap();
+        let active = repository
+            .active_operation(ProductProviderId::Claude)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            repository
+                .load_journal(&active.journal_record_id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            account_lifecycle::AccountLifecyclePhase::AwaitingOAuthLogin
+        );
+        drop(lease);
+        drop(agent);
+        let restarted = DaemonAgent::new(Config::default(), root.clone());
+        assert_eq!(
+            restarted.provider_onboarding(ProductProviderId::Claude)["error_code"],
+            "provider_busy"
+        );
+        drop(restarted);
         let _ = std::fs::remove_dir_all(root);
     }
 
