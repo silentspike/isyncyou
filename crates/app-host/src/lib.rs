@@ -23444,6 +23444,28 @@ mod tests {
             .unwrap();
         assert!(catalog.contains("claude-fable-5-1"));
         assert!(!catalog.contains("fixture-access"));
+        let snapshot = reopened.product_runtime_gate.lock().unwrap();
+        let started = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let (send, receive) = std::sync::mpsc::channel();
+            let barrier = &started;
+            let worker = &reopened;
+            scope.spawn(move || {
+                barrier.wait();
+                send.send(worker.refresh_model_catalog(ProductProviderId::Claude))
+                    .unwrap();
+            });
+            started.wait();
+            assert!(matches!(
+                receive.recv_timeout(std::time::Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            drop(snapshot);
+            assert!(receive
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .is_ok());
+        });
         reopened.store_credential(&credential).unwrap();
         assert!(model_catalog::load(&root, ProductProviderId::Claude).is_none());
         assert!(reopened.agent_settings().is_none());

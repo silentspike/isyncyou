@@ -4725,6 +4725,9 @@ impl Router {
         // AC is exactly "pause a LIVE materialization"). They are still session-token-gated (checked
         // above) and cap-token-gated in the handler; only the store gate is skipped.
         const GATE_EXEMPT_POST: &[&str] = &[
+            // Model selection is owned by the encrypted Agent settings/control stores,
+            // not the archive writer. Keep it responsive during an unrelated sync.
+            "/api/v1/agent/model",
             // A body-based live read touches no archive Store and must remain
             // available while that Store is being refreshed.
             "/api/v1/mail/read-state",
@@ -10696,6 +10699,30 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(
             response.status, 200,
             "Agent turn admission must not wait for the archive gate"
+        );
+    }
+
+    #[test]
+    fn model_catalog_selection_does_not_wait_for_archive_sync() {
+        let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let agent = std::sync::Arc::new(RecordingModelAgent::default());
+        let router = Router::with_gate(Config::default(), gate.clone())
+            .with_agent(agent.clone(), "agent-cap".into());
+        let held = gate.lock().unwrap();
+        let request = ApiRequest::new("POST", "/api/v1/agent/model")
+            .with_cap_token(Some("agent-cap".into()))
+            .with_content_type(Some("application/json".into()))
+            .with_body(br#"{"request_id":"123e4567-e89b-42d3-a456-426614174000","provider":"codex","model":"gpt-6.1-sol","reasoning_effort":"max"}"#.to_vec());
+        std::thread::scope(|scope| {
+            let (send, receive) = std::sync::mpsc::channel();
+            scope.spawn(move || send.send(router.route(&request).status).unwrap());
+            let response = receive.recv_timeout(std::time::Duration::from_secs(1));
+            drop(held);
+            assert_eq!(response.unwrap(), 200);
+        });
+        assert_eq!(
+            agent.selections.lock().unwrap()[0],
+            ("codex".into(), "gpt-6.1-sol".into(), Some("max".into()))
         );
     }
 
