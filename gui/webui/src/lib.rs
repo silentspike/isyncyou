@@ -8507,7 +8507,21 @@ impl Router {
                 headers: vec![],
                 body: body.into_bytes(),
             },
-            Err(_) => no_store_json_error(503, "model_catalog_unavailable"),
+            Err(code) => no_store_json_error(
+                503,
+                match code.as_str() {
+                    "model_catalog_auth_unavailable" => "model_catalog_auth_unavailable",
+                    "model_catalog_access_unavailable" => "model_catalog_access_unavailable",
+                    "model_catalog_rate_limited" => "model_catalog_rate_limited",
+                    "model_catalog_size_limit" => "model_catalog_size_limit",
+                    "model_catalog_invalid" => "model_catalog_invalid",
+                    "model_catalog_incomplete" => "model_catalog_incomplete",
+                    "model_catalog_busy" => "model_catalog_busy",
+                    "model_catalog_not_ready" => "model_catalog_not_ready",
+                    "model_catalog_timeout" => "model_catalog_timeout",
+                    _ => "model_catalog_unavailable",
+                },
+            ),
         }
     }
 
@@ -11168,6 +11182,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
     #[derive(Default)]
     struct RecordingModelAgent {
+        catalog_error: Option<String>,
         selections: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
         turns: std::sync::Mutex<Vec<AgentTurnRequest>>,
         turn_identities:
@@ -11176,6 +11191,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
     impl AgentHandler for RecordingModelAgent {
         fn model_catalog_json(&self, provider: &str) -> Result<String, String> {
+            if let Some(error) = &self.catalog_error {
+                return Err(error.clone());
+            }
             Ok(json!({"state":"ready", "provider":provider, "models":[{"id":"gpt-6.1-sol","label":"GPT-6.1 Sol"}]}).to_string())
         }
         fn start_turn(&self, _account: &str, _prompt: &str) -> Result<String, String> {
@@ -11265,6 +11283,31 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 .status,
             400
         );
+    }
+
+    #[test]
+    fn model_catalog_errors_expose_only_closed_codes() {
+        for (internal, public) in [
+            ("model_catalog_invalid", "model_catalog_invalid"),
+            (
+                "private provider body or token",
+                "model_catalog_unavailable",
+            ),
+        ] {
+            let (_directory, router) = setup();
+            let router = router.with_agent(
+                std::sync::Arc::new(RecordingModelAgent {
+                    catalog_error: Some(internal.into()),
+                    ..Default::default()
+                }),
+                "agentsecret".into(),
+            );
+            let request = ApiRequest::get("/api/v1/agent/models?provider=codex")
+                .with_cap_token(Some("agentsecret".into()));
+            let response = router.route(&request);
+            assert_eq!(response.status, 503);
+            assert_eq!(body_json(&response)["error"], public);
+        }
     }
 
     #[test]

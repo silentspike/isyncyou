@@ -318,6 +318,14 @@ impl DaemonAgent {
                                     "originator".into(),
                                     isyncyou_agent::oauth::CODEX_OAUTH_ORIGINATOR.into(),
                                 ),
+                                (
+                                    "user-agent".into(),
+                                    format!(
+                                        "{}/{}",
+                                        isyncyou_agent::oauth::CODEX_OAUTH_ORIGINATOR,
+                                        isyncyou_agent::CodexConfig::default().cli_version
+                                    ),
+                                ),
                             ],
                             meta,
                         )
@@ -345,9 +353,29 @@ impl DaemonAgent {
         };
         let response = isyncyou_agent::http::HttpTransport::shared()
             .and_then(|http| http.get_catalog_json(&url, &headers, MAX_CATALOG_WIRE_BYTES))
-            .map_err(|_| "model_catalog_unavailable")?;
-        if response.status != 200
-            || response.redirected
+            .map_err(|error| match error {
+                isyncyou_agent::AgentError::Transport(code)
+                    if code == "provider_metadata_size_limit" =>
+                {
+                    "model_catalog_size_limit"
+                }
+                isyncyou_agent::AgentError::Transport(code)
+                    if code == "provider_connect_timed_out" =>
+                {
+                    "model_catalog_timeout"
+                }
+                _ => "model_catalog_unavailable",
+            })?;
+        if response.status != 200 {
+            return Err(match response.status {
+                401 => "model_catalog_auth_unavailable",
+                403 => "model_catalog_access_unavailable",
+                429 => "model_catalog_rate_limited",
+                _ => "model_catalog_unavailable",
+            }
+            .into());
+        }
+        if response.redirected
             || !response
                 .content_type
                 .to_ascii_lowercase()
