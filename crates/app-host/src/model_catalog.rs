@@ -284,7 +284,7 @@ impl DaemonAgent {
         let (token, headers, meta) = {
             let _runtime = self
                 .product_runtime_gate
-                .try_lock()
+                .lock()
                 .map_err(|_| "model_catalog_busy")?;
             let _file = acquire_product_runtime_file_lock(&self.oauth_dir)?;
             match provider {
@@ -399,7 +399,7 @@ impl DaemonAgent {
         // lifecycle authority stable, while no runtime/file lock spans network I/O.
         let _runtime = self
             .product_runtime_gate
-            .try_lock()
+            .lock()
             .map_err(|_| "model_catalog_busy")?;
         let _file = acquire_product_runtime_file_lock(&self.oauth_dir)?;
         agent_credential_store(&self.oauth_dir)?
