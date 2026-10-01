@@ -5489,8 +5489,12 @@ function syncAgentOAuthOpeningUi() {
     network: "Checking connection…",
     authorizing: "Preparing secure sign-in…",
     opening: "Opening browser…",
+    completing: "Finishing sign-in…",
   };
   status.textContent = copy[opening.phase];
+  if (opening.phase === "completing") {
+    card.querySelectorAll("input, button").forEach(node => { node.disabled = true; });
+  }
 }
 
 // After the browser login the engine's /callback stores the token; poll status until
@@ -5569,14 +5573,23 @@ function showCodeStep() {
 }
 
 async function completeAiLogin() {
+  if (AssistantState.oauthOpening) return;
   const inp = document.getElementById("asst-code");
   const code = inp && inp.value.trim();
   if (!code) { toast("Paste the code first"); return; }
   const attemptId = OAUTH_ATTEMPTS.get("claude");
-  if (!attemptId) { toast("Start sign-in again.", "err"); return; }
   // #639 T10: the pasted code crosses the boundary only in this strict-JSON body — never a URL/query
   // param, never persisted. Clear the input immediately so it does not linger in the DOM.
   if (inp) inp.value = "";
+  if (!attemptId) {
+    toast("Start sign-in again.", "err");
+    await finishAgentGuard();
+    if (App.route === "assistant") await renderAssistantView($("#view"));
+    return;
+  }
+  AssistantState.oauthOpening = { provider: "claude", phase: "completing" };
+  syncAgentOAuthOpeningUi();
+  let completionAccepted = false;
   try {
     await postJson("/api/v1/agent/oauth/complete", CAP.agent, {
       request_id: crypto.randomUUID(),
@@ -5584,18 +5597,25 @@ async function completeAiLogin() {
       attempt_id: attemptId,
       pasted_code: code,
     });
+    completionAccepted = true;
     OAUTH_ATTEMPTS.delete("claude");
     await finishAgentGuard();
     const status = await api("/api/v1/agent/status");
     if (!(await handleCandidateCleanupStatus(status, "claude"))) {
       if (assistantProviderReady(status, "claude")) toast("Connected!");
       else toast("Sign-in needs attention", "err");
-      renderAssistantView($("#view"));
+      if (App.route === "assistant") await renderAssistantView($("#view"));
     }
   } catch (e) {
-    await cancelOAuthAttempt("claude");
+    if (!completionAccepted) await cancelOAuthAttempt("claude");
     await finishAgentGuard();
-    toast("Couldn't connect. Start sign-in again.", "err");
+    toast(completionAccepted
+      ? "Sign-in completed. Connection status is temporarily unavailable."
+      : "Couldn't connect. Start sign-in again.", "err");
+    if (App.route === "assistant") await renderAssistantView($("#view"));
+  } finally {
+    AssistantState.oauthOpening = null;
+    syncAgentOAuthOpeningUi();
   }
 }
 
