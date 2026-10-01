@@ -27,6 +27,8 @@ pub(super) struct Catalog {
     version: u32,
     generation: String,
     fetched_at_ms: u64,
+    #[serde(default)]
+    client_version: Option<String>,
     pub models: Vec<Model>,
 }
 
@@ -60,8 +62,14 @@ pub(super) fn load(root: &Path, provider: ProductProviderId) -> Option<Catalog> 
     let catalog: Catalog = serde_json::from_slice(raw.expose()).ok()?;
     (catalog.version == 1
         && catalog.generation == meta.generation
+        && catalog.client_version == catalog_client_version(provider)
         && valid_models(&catalog.models, provider))
     .then_some(catalog)
+}
+
+fn catalog_client_version(provider: ProductProviderId) -> Option<String> {
+    (provider == ProductProviderId::Codex)
+        .then(|| isyncyou_agent::CodexConfig::default().cli_version)
 }
 
 pub(super) fn model(root: &Path, provider: ProductProviderId, id: &str) -> Option<Model> {
@@ -352,6 +360,7 @@ impl DaemonAgent {
             version: 1,
             generation: meta.generation,
             fetched_at_ms: (self.credential_now_ms)(),
+            client_version: catalog_client_version(provider),
             models,
         };
         let raw = serde_json::to_vec(&catalog).map_err(|_| "model_catalog_invalid")?;

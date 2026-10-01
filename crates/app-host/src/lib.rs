@@ -23472,7 +23472,8 @@ mod tests {
         )
         .unwrap();
         let raw = serde_json::to_vec(&serde_json::json!({
-            "version":1,"generation":generation,"fetched_at_ms":now_ms(),"models":[{
+            "version":1,"generation":generation,"fetched_at_ms":now_ms(),
+            "client_version":isyncyou_agent::CodexConfig::default().cli_version,"models":[{
                 "id":"gpt-6.1-sol","label":"GPT-6.1 Sol","reasoning_efforts":["low","ultra"],"default_reasoning_effort":"ultra",
                 "context_window_tokens":null,"max_output_tokens":null,"use_responses_lite":true
             }]
@@ -23500,6 +23501,28 @@ mod tests {
             agent.agent_settings().unwrap().reasoning_effort,
             Some(isyncyou_agent::CodexReasoningEffort::Ultra)
         );
+        let mut obsolete: serde_json::Value = serde_json::from_slice(
+            agent_credential_store(&root)
+                .unwrap()
+                .get(
+                    isyncyou_agent::SecretClass::ProductSettings,
+                    "model-catalog-v1-codex",
+                )
+                .unwrap()
+                .unwrap()
+                .expose(),
+        )
+        .unwrap();
+        obsolete["client_version"] = serde_json::json!("0.144.5");
+        agent_credential_store(&root)
+            .unwrap()
+            .put(
+                isyncyou_agent::SecretClass::ProductSettings,
+                "model-catalog-v1-codex",
+                &isyncyou_agent::Secret::new(serde_json::to_vec(&obsolete).unwrap()),
+            )
+            .unwrap();
+        assert!(model_catalog::load(&root, ProductProviderId::Codex).is_none());
         drop(agent);
         let _ = std::fs::remove_dir_all(root);
     }

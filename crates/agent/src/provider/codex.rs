@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 /// Verified Codex-CLI mimicry recipe.
 pub(crate) const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 pub(super) const ORIGINATOR: &str = crate::oauth::CODEX_OAUTH_ORIGINATOR;
-pub(crate) const DEFAULT_CLI_VERSION: &str = "0.144.5";
+pub(crate) const DEFAULT_CLI_VERSION: &str = "0.159.3";
 const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 const MAX_REASONING_CONTEXT_BYTES: usize = 1024 * 1024;
 const MAX_REASONING_SUMMARY_BYTES: usize = 64 * 1024;
@@ -741,7 +741,7 @@ mod tests {
         );
         assert_eq!(c.model, "gpt-5.6-sol");
         assert_eq!(c.reasoning_effort, CodexReasoningEffort::Medium);
-        assert_eq!(c.cli_version, "0.144.5");
+        assert_eq!(c.cli_version, "0.159.3");
     }
 
     #[test]
@@ -855,7 +855,7 @@ mod tests {
         assert_eq!(get("authorization").unwrap(), "Bearer tok123");
         assert_eq!(get("chatgpt-account-id").unwrap(), "acct_123");
         assert_eq!(get("originator").unwrap(), "codex_cli_rs");
-        assert_eq!(get("user-agent").unwrap(), "codex_cli_rs/0.144.5");
+        assert_eq!(get("user-agent").unwrap(), "codex_cli_rs/0.159.3");
         assert_eq!(get("accept").unwrap(), "text/event-stream");
         assert_eq!(
             get("x-openai-internal-codex-responses-lite").unwrap(),
