@@ -564,7 +564,7 @@ def stream_live_turn(
 ) -> ProgressiveReducer:
     query = urllib.parse.urlencode({"turn": turn_id})
     request = client._request(  # type: ignore[attr-defined]
-        "GET", f"/api/v1/agent/stream?{query}", timeout=timeout
+        "GET", f"/api/v1/agent/stream?{query}", cap=True, timeout=timeout
     )
     reducer = ProgressiveReducer()
     deadline = time.monotonic() + timeout

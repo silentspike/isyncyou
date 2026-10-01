@@ -700,9 +700,9 @@ class AndroidProductAdapter:
             || (activity.runs.length >= 500 && Math.min(...activity.runs.map(run => run.id)) > Number(binding.audit_watermark))) return false;
           const newAudits = activity.runs.filter(run => run.kind === 'audit:agent-confirm'
             && Number(run.id) > Number(binding.audit_watermark));
-          return approved ? newAudits.some(run => {{
-            try {{return JSON.parse(run.summary).state === 'completed';}} catch (_) {{return false;}}
-          }}) : newAudits.length === 0;
+          return approved ? newAudits.some(run => run.status === 'completed'
+            && run.summary === 'schema_version=1 op=live-write service=mail state=completed code=none')
+            : newAudits.length === 0;
         }})()""")
         return value is True
 

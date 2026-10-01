@@ -1599,6 +1599,11 @@ pub(crate) fn preview_for_pending_action(
     }
 }
 
+#[cfg(any(
+    test,
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 pub(crate) fn pending_action_validation_diagnostic(error: &str) -> &'static str {
     if error.starts_with("unsupported_live_write_service:") {
         "unsupported_service"
@@ -1629,6 +1634,10 @@ pub(crate) fn pending_action_validation_diagnostic(error: &str) -> &'static str 
     }
 }
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 pub(crate) fn log_pending_action_validation(error: &str) {
     let category = pending_action_validation_diagnostic(error);
     let message = format!("agent_pending_action_invalid={category}");

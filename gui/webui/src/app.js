@@ -6673,7 +6673,7 @@ async function confirmAgentPending(pendingId) {
       updateAgentPendingStatus(record, "retryable");
       record.error = "Confirmation was not completed. Retry uses the same request.";
     } else if (e.code === "confirmation_outcome_unknown"
-        || e.code === "request_outcome_unknown") {
+        || e.code === "request_outcome_unknown" || e.code === "request_replayed") {
       updateAgentPendingStatus(record, "outcome_unknown");
       record.error = "The action outcome could not be verified.";
       clearAgentPendingAuthority(record);
@@ -7521,6 +7521,20 @@ async function handleAgentEvent(message, turnState) {
         action_hash: d.action_hash || "",
       };
       if (pending.pending_id) {
+        const previous = pendingRecord(pending.pending_id);
+        const attempt = AssistantState.confirmAttemptsByPendingId.get(pending.pending_id);
+        if (previous && attempt) {
+          const sameAuthority = ["token", "action_hash", "session_id", "turn_request_id", "turn_id"]
+            .every(field => attempt.request[field] === pending[field]);
+          if (!sameAuthority) {
+            updateAgentPendingStatus(previous, "outcome_unknown");
+            previous.error = "The action outcome could not be verified.";
+            clearAgentPendingAuthority(previous);
+          }
+          rerenderPendingCards(pending.pending_id);
+          break;
+        }
+        if (previous && !["pending", "retryable"].includes(previous.status)) break;
         AssistantState.pendingCardsById.set(pending.pending_id, pending);
       }
       turnState.onOperationConfirmation(pending);

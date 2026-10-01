@@ -12664,6 +12664,26 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn agent_confirm_unknown_receipt_replay_never_reenters_handler() {
+        let (_dir, router) = setup();
+        let agent =
+            std::sync::Arc::new(FixedConfirmAgent::new(AgentConfirmOutcome::OutcomeUnknown));
+        let receipts = std::sync::Arc::new(MemoryDurableRequests::default());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_durable_requests(receipts.clone());
+        let first = router.route(&agent_confirm_request(TEST_CONFIRM_ACTION_HASH));
+        assert_eq!(first.status, 409);
+        assert_eq!(body_json(&first)["error"], "confirmation_outcome_unknown");
+        let replay = router.route(&agent_confirm_request(TEST_CONFIRM_ACTION_HASH));
+        assert_eq!(replay.status, 409);
+        assert_eq!(body_json(&replay)["error"], "request_replayed");
+        assert_eq!(agent.confirm_call_count(), 1);
+        assert_eq!(receipts.completed_receipt_count(), 1);
+    }
+
+    #[test]
     fn agent_confirm_retryable_retains_in_memory_authority_and_global_uuid_binding() {
         let (_d, router) = setup();
         let agent = std::sync::Arc::new(FixedConfirmAgent::new(AgentConfirmOutcome::Retryable));

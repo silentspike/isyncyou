@@ -859,7 +859,7 @@ def select_or_create_session(client: RuntimeClient) -> str:
 
 def stream_turn(client: RuntimeClient, turn_id: str, timeout: float) -> dict[str, object]:
     query = urllib.parse.urlencode({"turn": turn_id})
-    request = client._request("GET", f"/api/v1/agent/stream?{query}", timeout=timeout)
+    request = client._request("GET", f"/api/v1/agent/stream?{query}", cap=True, timeout=timeout)
     names: list[str] = []
     untrusted_result = False
     terminal_reason = None
