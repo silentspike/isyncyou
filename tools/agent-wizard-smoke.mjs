@@ -73,12 +73,28 @@ function startServer(scenario) {
   const indexHtml = readText("gui/webui/src/index.html");
   const appCss = readText("gui/webui/src/app.css");
   const requests = [];
+  let completionAccepted = false;
+  let statusFailureSent = false;
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
     if (req.method === "GET" && url.pathname === "/") return text(res, 200, indexHtml, "text/html; charset=utf-8");
     if (req.method === "GET" && url.pathname === "/app.css") return text(res, 200, appCss, "text/css; charset=utf-8");
     if (req.method === "GET" && url.pathname === "/app.js") return text(res, 200, appJs, "text/javascript; charset=utf-8");
-    if (url.pathname === "/api/v1/agent/status") return json(res, 200, statusFor(scenario));
+    if (url.pathname === "/api/v1/agent/status") {
+      if (completionAccepted && scenario === "completion_status_failure" && !statusFailureSent) {
+        statusFailureSent = true;
+        return json(res, 503, { error: "status_unavailable" });
+      }
+      const status = statusFor(scenario);
+      if (completionAccepted && ["completion_success", "completion_status_failure"].includes(scenario)) {
+        status.connected = true;
+        status.claude = true;
+        status.credential_state.claude = "ready";
+        status.onboarding.providers.claude = onboardingNode("ready", true);
+        status.onboarding.selected_state = "ready";
+      }
+      return json(res, 200, status);
+    }
     if (url.pathname === "/api/v1/agent/connectivity/preflight") return json(res, 200, { status: "ready", code: "ready", retryable: false, settings_hint: "none" });
     if (req.method === "POST" && url.pathname === "/api/v1/agent/oauth/start") {
       requests.push({ route: "oauth_start" });
@@ -103,9 +119,12 @@ function startServer(scenario) {
         pasted_code_present: !!(parsed && parsed.pasted_code),
         query_empty: url.search === "",
       });
+      if (scenario === "completion_rejected") return json(res, 400, { error: "oauth complete failed" });
+      completionAccepted = true;
       return json(res, 200, { connected: true });
     }
     if (req.method === "POST" && url.pathname === "/api/v1/agent/oauth/cancel") {
+      requests.push({ route: "oauth_cancel" });
       return json(res, 200, { cancelled: true });
     }
     return json(res, 404, { error: "not found" });
@@ -189,6 +208,65 @@ async function main() {
         { request_count: requests.length, contract: requests[0] || null });
       await page.close();
       server.close();
+    }
+    for (const scenario of ["completion_success", "completion_rejected", "completion_status_failure", "missing_attempt"]) {
+      const { server, port, requests } = await startServer(scenario);
+      const page = await browser.newPage();
+      try {
+        await openAssistant(page, `http://127.0.0.1:${port}`);
+        await page.evaluate(scenario => {
+          window.__completionMessages = [];
+          toast = message => window.__completionMessages.push(message);
+          window.__completionGuards = [];
+          AGENT_GUARD_ID = "guard-completion";
+          endNetworkGuard = async id => window.__completionGuards.push(id);
+          if (scenario !== "missing_attempt") OAUTH_ATTEMPTS.set("claude", "attempt-fixture");
+          showCodeStep();
+          const original = postJson;
+          postJson = async (path, cap, body) => {
+            if (path === "/api/v1/agent/oauth/complete") {
+              await new Promise(resolve => { window.__releaseCompletion = resolve; });
+            }
+            return original(path, cap, body);
+          };
+        }, scenario);
+        await page.locator("#asst-code").fill("fixture-code#fixture-state");
+        await page.getByRole("button", { name: "Finish connecting" }).click();
+        if (scenario !== "missing_attempt") {
+          await page.waitForFunction(() => !!window.__releaseCompletion);
+          record(`${scenario} completion shows immediate progress and disables code controls`,
+            await page.evaluate(() => document.querySelector("[data-agent-oauth-opening]")?.textContent === "Finishing sign-in…"
+              && [...document.querySelectorAll("#asst-connect-card input, #asst-connect-card button")].every(node => node.disabled)
+              && document.getElementById("asst-code").value === ""));
+          await page.evaluate(async () => {
+            await completeAiLogin();
+            await renderAssistantView(document.getElementById("view"));
+          });
+          record(`${scenario} completion stays locked through rerender`,
+            await page.evaluate(() => document.querySelector("[data-agent-oauth-opening]")?.textContent === "Finishing sign-in…"
+              && [...document.querySelectorAll("#asst-connect-card input, #asst-connect-card button")].every(node => node.disabled)));
+          await page.evaluate(() => window.__releaseCompletion());
+        }
+        await page.waitForFunction(() => AssistantState.oauthOpening === null && !document.querySelector("#asst-code"));
+        record(`${scenario} no obsolete code form or attempt remains`,
+          await page.evaluate(() => !OAUTH_ATTEMPTS.has("claude") && !document.querySelector("[data-agent-oauth-opening]")));
+        record(`${scenario} completion is sent at most once`,
+          requests.filter(r => r.route === "oauth_complete").length === (scenario === "missing_attempt" ? 0 : 1));
+        if (scenario === "completion_status_failure") {
+          record("accepted completion with status failure is not cancelled or mislabeled as a failed login",
+            !requests.some(r => r.route === "oauth_cancel")
+              && await page.evaluate(() => window.__completionMessages.some(m => m.startsWith("Sign-in completed."))
+                && !window.__completionMessages.some(m => m.includes("Couldn't connect"))));
+        }
+        if (scenario === "completion_rejected" || scenario === "missing_attempt") {
+          record(`${scenario} clears its attempt and releases the exact guard`,
+            requests.filter(r => r.route === "oauth_cancel").length === (scenario === "missing_attempt" ? 0 : 1)
+              && await page.evaluate(() => AGENT_GUARD_ID === null && window.__completionGuards.length === 1));
+        }
+      } finally {
+        await page.close();
+        await new Promise(resolve => server.close(resolve));
+      }
     }
     // --- AC4: an incomplete OAuth-start response cancels its attempt and releases its guard.
     {
