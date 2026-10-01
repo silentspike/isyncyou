@@ -26,6 +26,11 @@ mod mobile_jobs;
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
+mod model_catalog;
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 mod product_session;
 
 pub use agent_ops::{run_backup_account, AgentOperationPolicy, BackupDelta, BackupRun};
@@ -3371,6 +3376,11 @@ pub struct DaemonAgent {
         allow(dead_code)
     )]
     credential_refresh_gate: Mutex<()>,
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    model_catalog_gates: [Mutex<()>; 2],
     /// #639: the in-process product-runtime snapshot gate. One hold spans a consistent selection,
     /// credential, activation, and harness snapshot (and the selection write), but never provider
     /// network I/O. Refresh retains only the provider-exclusive lifecycle lease across I/O, then
@@ -3570,6 +3580,11 @@ impl DaemonAgent {
             lifecycle_maintenance: None,
             credential_now_ms: Arc::new(now_ms),
             credential_refresh_gate: Mutex::new(()),
+            #[cfg(any(
+                feature = "agent-oauth-providers",
+                feature = "agent-subscription-experimental"
+            ))]
+            model_catalog_gates: [Mutex::new(()), Mutex::new(())],
             product_runtime_gate: Arc::new(Mutex::new(())),
             seq: AtomicU64::new(0),
             oauth_dir,
@@ -4290,6 +4305,12 @@ impl DaemonAgent {
                 let cfg = isyncyou_agent::CodexConfig {
                     account_id: credential.account_id,
                     model: model.to_string(),
+                    use_responses_lite: model_catalog::model(
+                        &self.oauth_dir,
+                        ProductProviderId::Codex,
+                        model,
+                    )
+                    .and_then(|model| model.use_responses_lite),
                     ..Default::default()
                 };
                 let provider =
@@ -4670,6 +4691,12 @@ impl DaemonAgent {
                     let config = isyncyou_agent::CodexConfig {
                         account_id: credential.account_id,
                         model: settings.model.clone(),
+                        use_responses_lite: model_catalog::model(
+                            &self.oauth_dir,
+                            ProductProviderId::Codex,
+                            &settings.model,
+                        )
+                        .and_then(|model| model.use_responses_lite),
                         reasoning_effort: settings.reasoning_effort.unwrap_or_default(),
                         ..Default::default()
                     };
@@ -7230,7 +7257,10 @@ struct AgentSettingsSnapshot {
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-fn provider_has_model(provider: ProductProviderId, model: &str) -> bool {
+fn provider_has_model(oauth_dir: &Path, provider: ProductProviderId, model: &str) -> bool {
+    if model_catalog::model(oauth_dir, provider, model).is_some() {
+        return true;
+    }
     let known = match provider {
         ProductProviderId::Claude => CLAUDE_MODELS,
         ProductProviderId::Codex => CODEX_MODELS,
@@ -7253,6 +7283,7 @@ struct ProductModelBudgets {
     feature = "agent-subscription-experimental"
 ))]
 fn product_model_budgets(
+    oauth_dir: &Path,
     provider: ProductProviderId,
     model: &str,
 ) -> Result<ProductModelBudgets, String> {
@@ -7260,18 +7291,23 @@ fn product_model_budgets(
         ProductProviderId::Claude => CLAUDE_MODELS,
         ProductProviderId::Codex => CODEX_MODELS,
     };
-    let spec = known
-        .iter()
-        .find(|spec| spec.id == model)
-        .ok_or_else(|| "unknown_model".to_string())?;
+    let discovered = model_catalog::model(oauth_dir, provider, model);
+    let legacy = known.iter().find(|spec| spec.id == model);
+    let (context_window_tokens, max_output_tokens) = if let Some(spec) = discovered {
+        (spec.context_window_tokens, spec.max_output_tokens)
+    } else if let Some(spec) = legacy {
+        (spec.context_window_tokens, spec.max_output_tokens)
+    } else {
+        return Err("unknown_model".into());
+    };
     Ok(ProductModelBudgets {
         context: isyncyou_agent::ContextBudget::for_model_limits(
-            spec.context_window_tokens,
-            spec.max_output_tokens,
+            context_window_tokens,
+            max_output_tokens,
         ),
         provider_input_limit: isyncyou_agent::ModelInputAllowance::for_model_limits(
-            spec.context_window_tokens,
-            spec.max_output_tokens,
+            context_window_tokens,
+            max_output_tokens,
         )
         .max_tokens,
     })
@@ -7306,7 +7342,7 @@ fn load_agent_provider_selection(oauth_dir: &Path) -> Option<AgentSettingsSnapsh
     }
     let provider = ProductProviderId::parse(value.get("provider")?.as_str()?)?;
     let model = value.get("model")?.as_str()?.to_string();
-    if !provider_has_model(provider, &model) {
+    if !provider_has_model(oauth_dir, provider, &model) {
         return None;
     }
     let reasoning_effort = match (provider, schema_version) {
@@ -7349,12 +7385,35 @@ fn store_agent_provider_selection_with_effort(
 ) -> Result<(), String> {
     let provider =
         ProductProviderId::parse(provider).ok_or_else(|| "unknown provider".to_string())?;
-    if !provider_has_model(provider, model) {
+    if !provider_has_model(oauth_dir, provider, model) {
         return Err("unknown model for provider".into());
+    }
+    if model_catalog::load(oauth_dir, provider)
+        .is_some_and(|catalog| !catalog.models.iter().any(|entry| entry.id == model))
+    {
+        return Err("model no longer available".into());
     }
     let reasoning_effort = match provider {
         ProductProviderId::Codex => {
-            isyncyou_agent::CodexReasoningEffort::parse(reasoning_effort.unwrap_or("medium"))
+            let discovered = model_catalog::model(oauth_dir, provider, model);
+            let effort = reasoning_effort
+                .or_else(|| {
+                    discovered
+                        .as_ref()
+                        .and_then(|model| model.default_reasoning_effort.as_deref())
+                })
+                .unwrap_or("medium");
+            if discovered.is_none() && !CODEX_REASONING_EFFORTS.iter().any(|(id, _)| *id == effort)
+            {
+                return Err("unknown reasoning effort".into());
+            }
+            if discovered
+                .as_ref()
+                .is_some_and(|model| !model.reasoning_efforts.iter().any(|value| value == effort))
+            {
+                return Err("unsupported reasoning effort".into());
+            }
+            isyncyou_agent::CodexReasoningEffort::parse(effort)
                 .ok_or_else(|| "unknown reasoning effort".to_string())?
                 .as_str()
                 .into()
@@ -12196,6 +12255,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                             .clone()
                             .ok_or_else(|| "provider_generation_changed".to_string())?;
                         let model_budgets = product_model_budgets(
+                            &worker.oauth_dir,
                             provider_binding.provider,
                             &provider_binding.model,
                         )?;
@@ -13597,6 +13657,14 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             status["usage"] = usage.to_public_json();
         }
         for provider in [ProductProviderId::Claude, ProductProviderId::Codex] {
+            if let Some(catalog) = model_catalog::load(&self.oauth_dir, provider) {
+                let projection = model_catalog::public(&catalog, "cached");
+                status["models"][provider.wire()] = projection["models"].clone();
+                status["model_catalog"][provider.wire()] = projection;
+            } else {
+                status["model_catalog"][provider.wire()] =
+                    serde_json::json!({"state":"not_loaded"});
+            }
             let counts = self.provider_leases.counts(provider);
             let node = &mut status["account_lifecycle"][provider.wire()];
             let active_operation = node
@@ -13650,6 +13718,16 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             .map_err(|_| "product_busy".to_string())?;
         let _file_gate = acquire_product_runtime_file_lock(&self.oauth_dir)?;
         self.set_agent_settings_with_effort(provider, model, reasoning_effort)
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn model_catalog_json(&self, provider: &str) -> Result<String, String> {
+        let provider =
+            ProductProviderId::parse(provider).ok_or("model_catalog_invalid_provider")?;
+        self.refresh_model_catalog(provider)
     }
 }
 
@@ -23323,11 +23401,127 @@ mod tests {
         feature = "agent-subscription-experimental"
     ))]
     #[test]
+    fn model_catalog_selection_survives_reopen_but_not_credential_rotation() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("discovered-model-selection");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let credential = StoredCredential {
+            access_token: "fixture-access".into(),
+            refresh_token: String::new(),
+            expires_at_ms: now_ms() + 3_600_000,
+        };
+        agent.store_credential(&credential).unwrap();
+        let generation = load_product_bundle_meta(&root, SUBSCRIPTION_CREDENTIAL_ID)
+            .unwrap()
+            .generation;
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "version":1, "generation": generation, "fetched_at_ms":now_ms(), "models":[{
+                "id":"claude-fable-5-1", "label":"Fable 5.1", "reasoning_efforts":[], "default_reasoning_effort":null,
+                "context_window_tokens":null, "max_output_tokens":4096, "use_responses_lite":null
+            }]
+        })).unwrap();
+        agent_credential_store(&root)
+            .unwrap()
+            .put(
+                isyncyou_agent::SecretClass::ProductSettings,
+                "model-catalog-v1-claude",
+                &isyncyou_agent::Secret::new(raw),
+            )
+            .unwrap();
+        agent
+            .set_agent_settings("claude", "claude-fable-5-1")
+            .unwrap();
+        assert!(agent.set_agent_settings("claude", DEFAULT_MODEL).is_err());
+        assert!(
+            product_model_budgets(&root, ProductProviderId::Claude, "claude-fable-5-1").is_ok()
+        );
+        drop(agent);
+        let reopened = DaemonAgent::new(Config::default(), root.clone());
+        assert_eq!(reopened.agent_settings().unwrap().model, "claude-fable-5-1");
+        let catalog = reopened
+            .refresh_model_catalog(ProductProviderId::Claude)
+            .unwrap();
+        assert!(catalog.contains("claude-fable-5-1"));
+        assert!(!catalog.contains("fixture-access"));
+        reopened.store_credential(&credential).unwrap();
+        assert!(model_catalog::load(&root, ProductProviderId::Claude).is_none());
+        assert!(reopened.agent_settings().is_none());
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn model_catalog_validates_selected_model_specific_efforts() {
+        let _env = AppHostCredentialEnvGuard::new();
+        let root = apphost_credential_test_root("discovered-model-efforts");
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = DaemonAgent::new(Config::default(), root.clone());
+        let generation = store_codex_blob(
+            &root,
+            &CodexStoredCredential {
+                access_token: "fixture-access".into(),
+                refresh_token: String::new(),
+                account_id: "fixture-account".into(),
+                expires_at_ms: now_ms() + 3_600_000,
+            },
+        )
+        .unwrap();
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "version":1,"generation":generation,"fetched_at_ms":now_ms(),"models":[{
+                "id":"gpt-6.1-sol","label":"GPT-6.1 Sol","reasoning_efforts":["low","ultra"],"default_reasoning_effort":"ultra",
+                "context_window_tokens":null,"max_output_tokens":null,"use_responses_lite":true
+            }]
+        })).unwrap();
+        agent_credential_store(&root)
+            .unwrap()
+            .put(
+                isyncyou_agent::SecretClass::ProductSettings,
+                "model-catalog-v1-codex",
+                &isyncyou_agent::Secret::new(raw),
+            )
+            .unwrap();
+        agent
+            .set_agent_settings_with_effort("codex", "gpt-6.1-sol", None)
+            .unwrap();
+        assert_eq!(
+            agent.agent_settings().unwrap().reasoning_effort,
+            Some(isyncyou_agent::CodexReasoningEffort::Ultra)
+        );
+        assert!(agent
+            .set_agent_settings_with_effort("codex", "gpt-6.1-sol", Some("high"))
+            .is_err());
+        assert!(agent.set_agent_settings("codex", "gpt-5.6-sol").is_err());
+        assert_eq!(
+            agent.agent_settings().unwrap().reasoning_effort,
+            Some(isyncyou_agent::CodexReasoningEffort::Ultra)
+        );
+        drop(agent);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
     fn product_model_catalog_supplies_conservative_context_budget() {
-        let claude = product_model_budgets(ProductProviderId::Claude, DEFAULT_MODEL)
-            .expect("catalogued Claude model");
-        let codex = product_model_budgets(ProductProviderId::Codex, CODEX_MODELS[0].id)
-            .expect("catalogued Codex model");
+        let claude = product_model_budgets(
+            Path::new("/nonexistent-model-catalog"),
+            ProductProviderId::Claude,
+            DEFAULT_MODEL,
+        )
+        .expect("catalogued Claude model");
+        let codex = product_model_budgets(
+            Path::new("/nonexistent-model-catalog"),
+            ProductProviderId::Codex,
+            CODEX_MODELS[0].id,
+        )
+        .expect("catalogued Codex model");
 
         assert_eq!(
             claude.context.max_tokens,
@@ -23351,7 +23545,11 @@ mod tests {
         );
         assert_eq!(codex.context.max_bytes, isyncyou_agent::MAX_CONTEXT_BYTES);
         assert_eq!(
-            product_model_budgets(ProductProviderId::Claude, "unreviewed-model"),
+            product_model_budgets(
+                Path::new("/nonexistent-model-catalog"),
+                ProductProviderId::Claude,
+                "unreviewed-model"
+            ),
             Err("unknown_model".to_string())
         );
     }

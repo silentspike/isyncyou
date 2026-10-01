@@ -96,6 +96,22 @@ function startServer(scenario) {
       return json(res, 200, status);
     }
     if (url.pathname === "/api/v1/agent/connectivity/preflight") return json(res, 200, { status: "ready", code: "ready", retryable: false, settings_hint: "none" });
+    if (url.pathname === "/api/v1/agent/models") {
+      if (req.headers["x-capability-token"] !== AGENT_CAP) return json(res, 401, { error: "capability_required" });
+      const provider = url.searchParams.get("provider");
+      requests.push({ route: "models", provider });
+      await sleep(180);
+      if (scenario === "catalog_failure") return json(res, 503, { error: "model_catalog_unavailable" });
+      const models = provider === "claude" ? [
+        { id: "claude-fable-5-1", label: "Fable 5.1", reasoning_efforts: [] },
+        { id: "claude-opus-5-5", label: "Opus 5.5", reasoning_efforts: [] },
+        { id: "claude-sonnet-5-5", label: "Sonnet 5.5", reasoning_efforts: [] },
+      ] : [
+        { id: "gpt-6-astra", label: "GPT-6 Astra", reasoning_efforts: [{ id: "low", label: "Light" }, { id: "high", label: "High" }], default_reasoning_effort: "high" },
+        { id: "gpt-6.1-sol", label: "GPT-6.1 Sol", reasoning_efforts: [{ id: "ultra", label: "Ultra" }], default_reasoning_effort: "ultra" },
+      ];
+      return json(res, 200, { state: "ready", models });
+    }
     if (req.method === "POST" && url.pathname === "/api/v1/agent/oauth/start") {
       requests.push({ route: "oauth_start" });
       if (scenario === "invalid_oauth_start") {
@@ -145,6 +161,51 @@ async function main() {
   const record = (name, ok, details) => { evidence.assertions.push({ name, ok, details }); if (!ok) console.log(`FAIL: ${name}`, JSON.stringify(details || {})); else console.log(`PASS: ${name}`); };
   const browser = await chromium.launch();
   try {
+    for (const scenario of ["catalog_success", "catalog_failure"]) {
+      const { server, port, requests } = await startServer(scenario);
+      const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+      try {
+        await openAssistant(page, `http://127.0.0.1:${port}`);
+        await page.evaluate(() => {
+          const st = { ...AssistantState.status, claude: true, codex: true, connected: true,
+            provider: "codex", model: "gpt-6.1-sol", reasoning_effort: "ultra",
+            credential_state: { claude: "ready", codex: "ready" },
+            onboarding: { selected_provider: "codex", providers: { claude: { state: "ready" }, codex: { state: "ready" } } },
+            model_catalog: { claude: { state: "not_loaded" }, codex: { state: "not_loaded" } },
+          };
+          rememberAssistantStatus(st);
+          document.getElementById("view").replaceChildren(agentModelSwitcher(st));
+          window.__modelSelections = [];
+          pickModel = async (...args) => window.__modelSelections.push(args);
+        });
+        const immediate = await page.locator(".mdl-trigger").evaluate(node => {
+          node.click(); return document.querySelector(".mdl-panel").textContent;
+        });
+        record(`${scenario} loading appears immediately`, immediate.includes("Loading models"));
+        await page.waitForFunction(() => AgentModelCatalogRequests.size === 0);
+        if (scenario === "catalog_success") {
+          record("catalog displays fresh Claude and GPT models", await page.locator('[data-agent-model-option="claude|claude-fable-5-1"]').isVisible()
+            && await page.locator('[data-agent-model-option="claude|claude-opus-5-5"]').isVisible()
+            && await page.locator('[data-agent-model-option="claude|claude-sonnet-5-5"]').isVisible()
+            && await page.locator('[data-agent-model-option="codex|gpt-6-astra"]').isVisible()
+            && await page.locator('[data-agent-model-option="codex|gpt-6.1-sol"]').isVisible());
+          record("effort is model-specific", await page.locator('[data-agent-effort-option="ultra"]').isVisible()
+            && await page.locator('[data-agent-effort-option="low"]').count() === 0);
+          await page.locator('[data-agent-model-option="codex|gpt-6-astra"]').click();
+          record("model switch chooses supported default instead of old effort", await page.evaluate(() => window.__modelSelections[0]?.join("|") === "codex|gpt-6-astra|high"));
+          record("picker fits mobile viewport", await page.locator(".mdl-panel").evaluate(node => {
+            const box = node.getBoundingClientRect(); return box.left >= 0 && box.right <= innerWidth && node.scrollWidth <= node.clientWidth;
+          }));
+        } else {
+          const failure = await page.locator(".mdl-panel").evaluate(node => ({ text: node.textContent, models: node.querySelectorAll("[data-agent-model-option]").length }));
+          record("catalog failure is visible without invented availability", failure.text.includes("could not be refreshed") && failure.models === 0, failure);
+        }
+        record(`${scenario} one authenticated fetch per provider`, requests.filter(entry => entry.route === "models").length === 2);
+      } finally {
+        await page.close();
+        await new Promise(resolve => server.close(resolve));
+      }
+    }
     // --- AC1: first-run wizard renders the ordered 8 steps.
     {
       const { server, port } = await startServer("first_run");
