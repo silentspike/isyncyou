@@ -390,7 +390,9 @@ function fixture(approved) {
     kind: approved ? 'operation_state' : 'pending_operation',
     code: approved ? 'completed' : 'confirmation_required'}}], refreshing: false, next_cursor: null};
   const activity = {runs: approved ? [{id: 1001, kind: 'audit:agent-confirm',
-    summary: JSON.stringify({state: 'completed'})}] : [{id: 1000, kind: 'audit:agent-confirm', summary: '{}'}]};
+    status: 'completed',
+    summary: 'schema_version=1 op=live-write service=mail state=completed code=none'}]
+    : [{id: 1000, kind: 'audit:agent-confirm', summary: '{}'}]};
   const context = {App: {account: 'synthetic-account'}, _bioPending: new Map(),
     AssistantState: {pendingCardsById: new Map([['synthetic-pending', record]]), confirmAttemptsByPendingId: new Map()},
     nativeConfirmationMessage: () => 'cancelled', request: async () => history,
@@ -417,7 +419,13 @@ function fixture(approved) {
       f.activity.runs = [expected, ...Array.from({length: 499}, (_, i) => ({id: 999 - i, kind: 'backup', summary: '{}'}))];
     }, true);
     if (!approved) await run(f => {f.activity.runs.push({id: 1001, kind: 'audit:agent-confirm', summary: '{}'});}, false);
-    else await run(f => {f.activity.runs = [];}, false);
+    else {
+      await run(f => {f.activity.runs = [];}, false);
+      await run(f => {f.activity.runs[0].status = 'failed';}, false);
+      await run(f => {f.activity.runs[0].summary = JSON.stringify({state: 'completed'});}, false);
+      await run(f => {f.activity.runs[0].summary += ' private-extra';}, false);
+      await run(f => {f.activity.runs[0].summary = 'schema_version=1 op=share service=onedrive state=completed code=none';}, false);
+    }
   }
 })().catch(error => {console.error(error); process.exit(1);});
 '''

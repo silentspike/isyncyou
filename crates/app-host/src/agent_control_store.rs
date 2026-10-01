@@ -10,6 +10,7 @@ use rusqlite::{
     params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use zeroize::Zeroizing;
@@ -498,6 +499,7 @@ struct SealedRowV1 {
 
 pub(crate) struct AgentControlStore {
     connection: Mutex<Connection>,
+    pending_unknown_projections: Mutex<BTreeMap<String, u64>>,
     row_wrap_key: Zeroizing<[u8; 32]>,
     installation_principal: Zeroizing<String>,
     installation_binding: String,
@@ -955,6 +957,7 @@ impl AgentControlStore {
         create_private_directory(&root.join("mutation-staging"))?;
         Ok(Self {
             connection: Mutex::new(connection),
+            pending_unknown_projections: Mutex::new(BTreeMap::new()),
             row_wrap_key,
             installation_principal: Zeroizing::new(installation_principal.to_owned()),
             installation_binding,
@@ -1319,28 +1322,69 @@ impl AgentControlStore {
         if !matches!(code, "completed" | "failed" | "outcome_unknown") {
             return Err("control_store_unavailable".into());
         }
+        let now = u64_to_i64(now_ms)?;
         let connection = self
             .connection
             .lock()
             .map_err(|_| "control_store_unavailable")?;
+        if code == "outcome_unknown" {
+            self.queue_pending_unknown_locked(&connection, pending_id, now_ms)?;
+        }
         let changed = connection
             .execute(
                 "UPDATE pending_confirm_projections
                  SET code=?3,created_at_ms=?4
                  WHERE pending_id=?1 AND owner_binding=?2 AND code='executing'",
-                params![
-                    pending_id,
-                    self.installation_binding,
-                    code,
-                    u64_to_i64(now_ms)?
-                ],
+                params![pending_id, self.installation_binding, code, now],
             )
             .map_err(|_| "control_store_unavailable")?;
         if changed == 1 {
+            self.pending_unknown_projections
+                .lock()
+                .map_err(|_| "control_store_unavailable")?
+                .remove(pending_id);
             Ok(())
         } else {
             Err("confirmation_outcome_unknown".into())
         }
+    }
+
+    fn queue_pending_unknown_locked(
+        &self,
+        connection: &Connection,
+        pending_id: &str,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        let executing: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pending_confirm_projections
+             WHERE pending_id=?1 AND owner_binding=?2 AND code='executing')",
+                params![pending_id, self.installation_binding],
+                |row| row.get(0),
+            )
+            .map_err(|_| "control_store_unavailable")?;
+        if !executing {
+            return Ok(());
+        }
+        let mut retries = self
+            .pending_unknown_projections
+            .lock()
+            .map_err(|_| "control_store_unavailable")?;
+        if !retries.contains_key(pending_id) && retries.len() >= MAX_CONFIRMATIONS as usize {
+            return Err("control_store_unavailable".into());
+        }
+        retries.insert(pending_id.to_owned(), now_ms);
+        Ok(())
+    }
+
+    fn abandon_pending_consume_locked(
+        &self,
+        connection: &Connection,
+        pending_id: &str,
+        now_ms: u64,
+    ) {
+        // Commit ambiguity is classified before another request can consume this ID.
+        let _ = self.queue_pending_unknown_locked(connection, pending_id, now_ms);
     }
 
     pub(crate) fn pending_confirm_projections(
@@ -1352,6 +1396,28 @@ impl AgentControlStore {
             .connection
             .lock()
             .map_err(|_| "control_store_unavailable")?;
+        // Retry only explicitly abandoned consumed actions, never active executors.
+        let mut retries = self
+            .pending_unknown_projections
+            .lock()
+            .map_err(|_| "control_store_unavailable")?;
+        let batch: Vec<_> = retries
+            .iter()
+            .take(limit as usize)
+            .map(|(id, time)| (id.clone(), *time))
+            .collect();
+        for (pending_id, now_ms) in batch {
+            connection
+                .execute(
+                    "UPDATE pending_confirm_projections
+                 SET code='outcome_unknown',created_at_ms=?3
+                 WHERE pending_id=?1 AND owner_binding=?2 AND code='executing'",
+                    params![pending_id, self.installation_binding, u64_to_i64(now_ms)?],
+                )
+                .map_err(|_| "control_store_unavailable")?;
+            retries.remove(&pending_id);
+        }
+        drop(retries);
         let mut statement = connection
             .prepare(
                 "SELECT pending_id,account_id,session_id,request_id,turn_id,code,created_at_ms
@@ -4776,9 +4842,11 @@ impl PendingPersistence for AgentControlStore {
             return PendingConfirmOutcome::RetainedRetryable;
         }
         if transaction.commit().is_err() {
+            self.abandon_pending_consume_locked(&connection, pending_id, now_ms);
             return PendingConfirmOutcome::ConsumedOrCommitUnknown;
         }
         if checkpoint_secure_erasure(&connection).is_err() {
+            self.abandon_pending_consume_locked(&connection, pending_id, now_ms);
             return PendingConfirmOutcome::ConsumedOrCommitUnknown;
         }
         PendingConfirmOutcome::Confirmed(Box::new(pending.action))
@@ -9115,6 +9183,147 @@ mod tests {
                 | PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Replayed)
         ));
         drop(registry);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirmation_store_rolled_back_consume_cannot_abandon_later_same_pending_execution() {
+        let root = temp_root("rolled-back-consume");
+        let credentials = credential_store(&root);
+        let store = Arc::new(
+            AgentControlStore::open(&root, &credentials, INSTALLATION_PRINCIPAL, 1).unwrap(),
+        );
+        let registry = PendingRegistry::with_persistence(store.clone());
+        let (pending, token) = registry
+            .register_bound(backup_action(), "backup", 1_000, 60_000, owner())
+            .unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "PRAGMA foreign_keys=ON;
+             CREATE TABLE test_consume_parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE test_consume_child(parent_id INTEGER REFERENCES test_consume_parent(id)
+               DEFERRABLE INITIALLY DEFERRED);
+             CREATE TRIGGER fail_consume_commit AFTER UPDATE OF state ON confirmation_intents
+               WHEN NEW.state='consumed' BEGIN
+               INSERT INTO test_consume_child(parent_id) VALUES(1); END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            registry.confirm(
+                &pending.id,
+                &token,
+                &pending.action_hash,
+                &owner_proof(),
+                2_000,
+            ),
+            PendingConfirmOutcome::ConsumedOrCommitUnknown
+        ));
+        assert!(store.pending_unknown_projections.lock().unwrap().is_empty());
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_consume_commit")
+            .unwrap();
+        assert!(matches!(
+            registry.confirm(
+                &pending.id,
+                &token,
+                &pending.action_hash,
+                &owner_proof(),
+                2_001,
+            ),
+            PendingConfirmOutcome::Confirmed(_)
+        ));
+        assert!(store.pending_confirm_projections(8).unwrap().is_empty());
+        let code: String = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT code FROM pending_confirm_projections WHERE pending_id=?1",
+                params![pending.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(code, "executing");
+        drop(registry);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirmation_store_unknown_projection_retries_without_abandoning_other_executors() {
+        let root = temp_root("unknown-projection-retry");
+        let credentials = credential_store(&root);
+        let store = Arc::new(
+            AgentControlStore::open(&root, &credentials, INSTALLATION_PRINCIPAL, 1).unwrap(),
+        );
+        let registry = PendingRegistry::with_persistence(store.clone());
+        let mut actions = Vec::new();
+        for index in 0..2 {
+            let mut binding = owner();
+            binding.turn_id = format!("turn-{index}");
+            let proof = PendingOwnerProof {
+                session_id: binding.session_id.clone(),
+                turn_request_id: binding.request_id.clone(),
+                turn_id: binding.turn_id.clone(),
+            };
+            let (pending, token) = registry
+                .register_bound(backup_action(), "backup", 1_000, 60_000, binding)
+                .unwrap();
+            assert!(matches!(
+                registry.confirm(&pending.id, &token, &pending.action_hash, &proof, 2_000,),
+                PendingConfirmOutcome::Confirmed(_)
+            ));
+            actions.push((pending, token, proof));
+        }
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_unknown_projection BEFORE UPDATE OF code
+             ON pending_confirm_projections WHEN NEW.code='outcome_unknown'
+             BEGIN SELECT RAISE(ABORT, 'controlled unknown projection failure'); END;",
+            )
+            .unwrap();
+        let (pending, token, proof) = &actions[0];
+        assert!(store
+            .finish_pending_confirmation(&pending.id, "outcome_unknown", 2_001)
+            .is_err());
+        assert!(store.pending_confirm_projections(8).is_err());
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_unknown_projection")
+            .unwrap();
+        let projections = store.pending_confirm_projections(8).unwrap();
+        assert_eq!(projections.len(), 1);
+        assert_eq!(projections[0].pending_id, pending.id);
+        assert_eq!(projections[0].code, "outcome_unknown");
+        let other: String = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT code FROM pending_confirm_projections WHERE pending_id=?1",
+                params![actions[1].0.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(other, "executing");
+        assert!(matches!(
+            registry.confirm(&pending.id, token, &pending.action_hash, proof, 2_002,),
+            PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Replayed)
+        ));
+        assert!(store.pending_unknown_projections.lock().unwrap().is_empty());
+        drop(registry);
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -605,6 +605,55 @@ async function main() {
         await firstCard.locator(".asst-pending-actions").count() === 0
         && (await firstCard.innerText()).includes("Completed successfully."));
 
+      const replaySafety = await page.evaluate(async () => {
+        const original = postJson;
+        const makeRecord = (id) => ({pending_id: id, token: "synthetic-token",
+          action_hash: "synthetic-hash", session_id: "synthetic-session",
+          turn_request_id: "synthetic-request", turn_id: "synthetic-turn", status: "pending"});
+        const record = makeRecord("replayed-unknown");
+        AssistantState.pendingCardsById.set(record.pending_id, record);
+        try {
+          postJson = async () => {
+            const error = new Error("request_replayed");
+            error.code = "request_replayed";
+            error.responseReceived = true;
+            throw error;
+          };
+          await confirmAgentPending(record.pending_id);
+          const replayUnknown = record.status === "outcome_unknown" && !record.token
+            && !AssistantState.confirmAttemptsByPendingId.has(record.pending_id);
+          const rotated = makeRecord("rotated-authority");
+          AssistantState.pendingCardsById.set(rotated.pending_id, rotated);
+          const attempt = getOrCreateAgentConfirmAttempt(rotated);
+          attempt.phase = "retryable";
+          updateAgentPendingStatus(rotated, "retryable");
+          const turn = {flushTokens() {}, stopTokenCaret() {},
+            ownerProof: {session_id: rotated.session_id, turn_request_id: rotated.turn_request_id,
+              turn_id: rotated.turn_id}, onOperationConfirmation() {}, setPending() {}};
+          await handleAgentEvent({event: "confirmation_required", pending_id: rotated.pending_id,
+            token: rotated.token, action_hash: rotated.action_hash}, turn);
+          const sameAttempt = getOrCreateAgentConfirmAttempt(rotated) === attempt
+            && pendingRecord(rotated.pending_id) === rotated && rotated.status === "retryable";
+          await handleAgentEvent({event: "confirmation_required", pending_id: rotated.pending_id,
+            token: "rotated-token", action_hash: rotated.action_hash}, turn);
+          const rotationClosed = rotated.status === "outcome_unknown" && !rotated.token
+            && !AssistantState.confirmAttemptsByPendingId.has(rotated.pending_id);
+          return {replayUnknown, sameAttempt, rotationClosed};
+        } finally {
+          postJson = original;
+          for (const id of ["replayed-unknown", "rotated-authority"]) {
+            clearAgentPendingAuthority(pendingRecord(id));
+            AssistantState.pendingCardsById.delete(id);
+          }
+        }
+      });
+      check(report, "error receipt replay preserves an unknown effect and erases authority",
+        replaySafety.replayUnknown);
+      check(report, "same authority event preserves the exact ambiguous confirmation attempt",
+        replaySafety.sameAttempt);
+      check(report, "rotated authority cannot replace an ambiguous confirmation attempt",
+        replaySafety.rotationClosed);
+
       for (const [prompt, preview] of [
         ["authorization restore", "Restore selected Microsoft 365 data"],
         ["authorization live write", "Update one Microsoft 365 item"],

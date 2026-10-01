@@ -10865,6 +10865,16 @@ impl DaemonAgent {
             Err("confirmation_outcome_unknown".into())
         }
     }
+
+    fn pending_confirmation_projection_unknown(
+        &self,
+        pending_id: &str,
+    ) -> isyncyou_webui::AgentConfirmOutcome {
+        agent_authorization_diagnostics().record_projection_failure();
+        let _ =
+            self.finish_pending_confirmation_state(pending_id, "outcome_unknown", unix_now_ms());
+        isyncyou_webui::AgentConfirmOutcome::OutcomeUnknown
+    }
 }
 
 #[cfg(any(
@@ -12535,7 +12545,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     isyncyou_webui::ClosedConfirmationFailure::PostConsumeValidationFailed,
                 )
             } else {
-                isyncyou_webui::AgentConfirmOutcome::OutcomeUnknown
+                self.pending_confirmation_projection_unknown(&command.pending)
             };
         }
         let resolved_account_key = match self.confirmed_executor.resolved_account_key(&action) {
@@ -12549,8 +12559,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                         isyncyou_webui::ClosedConfirmationFailure::PostConsumeValidationFailed,
                     )
                 } else {
-                    agent_authorization_diagnostics().record_projection_failure();
-                    isyncyou_webui::AgentConfirmOutcome::OutcomeUnknown
+                    self.pending_confirmation_projection_unknown(&command.pending)
                 };
             }
         };
@@ -12570,8 +12579,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                             isyncyou_webui::ClosedConfirmationFailure::PostConsumeValidationFailed,
                         )
                     } else {
-                        agent_authorization_diagnostics().record_projection_failure();
-                        isyncyou_webui::AgentConfirmOutcome::OutcomeUnknown
+                        self.pending_confirmation_projection_unknown(&command.pending)
                     };
                 }
             };
@@ -12589,8 +12597,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     isyncyou_webui::ClosedConfirmationFailure::AuditStartFailed,
                 )
             } else {
-                agent_authorization_diagnostics().record_projection_failure();
-                isyncyou_webui::AgentConfirmOutcome::OutcomeUnknown
+                self.pending_confirmation_projection_unknown(&command.pending)
             };
         }
         match self.confirmed_executor.execute_confirmed(&action) {
@@ -17771,6 +17778,57 @@ mod tests {
         assert_eq!(executor.call_count(), 0);
         assert_eq!(order.lock().unwrap().as_slice(), ["audit:started"]);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn agent_confirm_audit_start_and_failed_projection_failure_closes_consumed_state() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("must not execute", order.clone());
+        let audit = RecordingAuditSink::failing_start(order);
+        let root = temp_agent_root("audit-start-projection-fail");
+        let mut agent = DaemonAgent::new(Config::default(), root.clone());
+        agent.confirmed_executor = Arc::new(executor.clone());
+        agent.audit_sink = Arc::new(audit);
+        let owner = test_pending_owner(&backup_action());
+        let (pending, token) = agent
+            .pending
+            .register_bound(
+                backup_action(),
+                "backup",
+                unix_now_ms(),
+                AGENT_CONFIRM_TTL_MS,
+                owner.clone(),
+            )
+            .unwrap();
+        let store = agent.control_store.as_ref().unwrap();
+        store.fail_terminal_pending_projection_for_tests().unwrap();
+        assert_eq!(
+            isyncyou_webui::AgentHandler::confirm(
+                &agent,
+                &confirm_command_for_owner(&pending, &token, &owner),
+            ),
+            isyncyou_webui::AgentConfirmOutcome::OutcomeUnknown
+        );
+        assert_eq!(executor.call_count(), 0);
+        let projections = store.pending_confirm_projections(8).unwrap();
+        assert_eq!(projections.len(), 1);
+        assert_eq!(projections[0].code, "outcome_unknown");
+        assert_eq!(
+            isyncyou_webui::AgentHandler::confirm(
+                &agent,
+                &confirm_command_for_owner(&pending, &token, &owner),
+            ),
+            isyncyou_webui::AgentConfirmOutcome::Rejected(
+                isyncyou_webui::AgentClosedConfirmationCode::Replayed,
+            )
+        );
+        assert_eq!(executor.call_count(), 0);
+        drop(agent);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(any(
