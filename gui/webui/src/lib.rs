@@ -2154,7 +2154,18 @@ fn validate_typed_product_request(
                 && !request.model.is_empty()
                 && request.model.len() <= 128
                 && request.reasoning_effort.as_ref().is_none_or(|effort| {
-                    matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh")
+                    matches!(
+                        effort.as_str(),
+                        "none"
+                            | "minimal"
+                            | "low"
+                            | "medium"
+                            | "high"
+                            | "xhigh"
+                            | "max"
+                            | "ultra"
+                            | "persistent"
+                    )
                 }))
             .then_some(())
             .ok_or_else(|| no_store_json_error(400, "invalid product request"))
@@ -2944,6 +2955,11 @@ pub trait AgentHandler: Send + Sync {
     /// the connect card and the chat. Default: not connected.
     fn status_json(&self) -> String {
         "{\"connected\":false}".to_string()
+    }
+
+    /// Refresh the authenticated subscription catalog, not an API-key model list.
+    fn model_catalog_json(&self, _provider: &str) -> Result<String, String> {
+        Err("model_catalog_unavailable".into())
     }
 
     /// Set the active provider + model (the in-app model switcher). The offered models are
@@ -4691,6 +4707,7 @@ impl Router {
             // by the sync pass, so taking that gate here would let an unrelated M365 sync stall
             // the Assistant bridge until its 15-second watchdog expires.
             "/api/v1/agent/status",
+            "/api/v1/agent/models",
             "/api/v1/agent/session/list",
             "/api/v1/agent/session/history",
             "/api/v1/agent/request/status",
@@ -4858,6 +4875,7 @@ impl Router {
             // Agent connection status (session-gated by the /api/v1/ gate above; read-only,
             // so no capability token). The Assistant UI reads it to switch connect⇄chat.
             "/api/v1/agent/status" => self.agent_status(req),
+            "/api/v1/agent/models" => self.agent_models(req),
             "/api/v1/agent/session/list" => self.agent_session_list(req),
             "/api/v1/agent/session/history" => self.agent_session_history(req),
             "/api/v1/agent/request/status" => self.agent_request_status(req),
@@ -8465,6 +8483,34 @@ impl Router {
         }
     }
 
+    fn agent_models(&self, req: &ApiRequest) -> ApiResponse {
+        if req.method != "GET" {
+            return no_store_json_error(405, "method_not_allowed");
+        }
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return error,
+        };
+        if req.query.len() != 1 {
+            return no_store_json_error(400, "model_catalog_invalid_provider");
+        }
+        let Some(provider) = req
+            .q("provider")
+            .filter(|value| matches!(*value, "claude" | "codex"))
+        else {
+            return no_store_json_error(400, "model_catalog_invalid_provider");
+        };
+        match handler.model_catalog_json(provider) {
+            Ok(body) => ApiResponse {
+                status: 200,
+                content_type: "application/json".into(),
+                headers: vec![],
+                body: body.into_bytes(),
+            },
+            Err(_) => no_store_json_error(503, "model_catalog_unavailable"),
+        }
+    }
+
     /// Begin the agent provider OAuth login. Cap+session gated
     /// (the app initiates it); returns the authorize URL the UI opens in the system
     /// browser. `redirect` is the loopback callback the client supplies (its origin).
@@ -11129,6 +11175,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     impl AgentHandler for RecordingModelAgent {
+        fn model_catalog_json(&self, provider: &str) -> Result<String, String> {
+            Ok(json!({"state":"ready", "provider":provider, "models":[{"id":"gpt-6.1-sol","label":"GPT-6.1 Sol"}]}).to_string())
+        }
         fn start_turn(&self, _account: &str, _prompt: &str) -> Result<String, String> {
             Err("not enabled".into())
         }
@@ -11174,6 +11223,48 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             ));
             Ok(())
         }
+    }
+
+    #[test]
+    fn model_catalog_route_requires_session_capability_and_closed_provider() {
+        let (_directory, router) = setup();
+        let router = router
+            .with_agent(
+                std::sync::Arc::new(RecordingModelAgent::default()),
+                "agentsecret".into(),
+            )
+            .with_session_token("session".into());
+        let path = "/api/v1/agent/models?provider=codex";
+        assert_eq!(router.route(&ApiRequest::get(path)).status, 401);
+        assert_eq!(
+            router
+                .route(&ApiRequest::get(path).with_session_token(Some("session".into())))
+                .status,
+            401
+        );
+        let request = ApiRequest::get(path)
+            .with_session_token(Some("session".into()))
+            .with_cap_token(Some("agentsecret".into()));
+        let response = router.route(&request);
+        assert_eq!(response.status, 200);
+        assert_eq!(body_json(&response)["models"][0]["id"], "gpt-6.1-sol");
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("cache-control")
+                    && value == "no-store")
+        );
+        assert_eq!(
+            router
+                .route(
+                    &ApiRequest::get("/api/v1/agent/models?provider=unknown")
+                        .with_session_token(Some("session".into()))
+                        .with_cap_token(Some("agentsecret".into()))
+                )
+                .status,
+            400
+        );
     }
 
     #[test]
@@ -18156,14 +18247,14 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "if (provider === \"claude\") return \"Claude\";",
             "if (provider === \"codex\") return \"ChatGPT\";",
             "const list = models[prov] || [];",
-            "if (!connected || !list.length) return;",
+            "if (!connected) return;",
             "\"data-agent-model-option\": val",
             "\"data-agent-model-connect\": \"claude\"",
             "\"data-agent-model-connect\": \"codex\"",
             "async function connectAgentProvider(provider, lifecycleNode = null)",
             "AssistantState.pendingConnectProvider = agentProviderConsentId(provider);",
             "if (OAUTH_ATTEMPTS.has(\"claude\") && !claudeReady) showCodeStep();",
-            "const efforts = st.reasoning_efforts || [];",
+            "const efforts = agentModelEfforts(st, st.provider, st.model);",
             "data-agent-effort-option",
             "if (provider === \"codex\") body.reasoning_effort = reasoningEffort || \"medium\";",
             "await postJson(\"/api/v1/agent/model\", CAP.agent, body);",

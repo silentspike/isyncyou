@@ -5680,6 +5680,9 @@ function closeAssistantStream(_reason) {
 
 function rememberAssistantStatus(st) {
   AssistantState.status = st || {};
+  for (const provider of ["claude", "codex"]) {
+    if (st?.model_catalog?.[provider]?.state === "not_loaded") AgentModelCatalogs.delete(provider);
+  }
   AssistantState.lastUsage = st && st.usage ? st.usage : null;
   AssistantState.model = st && (st.provider || st.model)
     ? { provider: st.provider || "", model: st.model || "" }
@@ -6316,9 +6319,51 @@ function agentProviderLabel(provider) {
   if (provider === "codex") return "ChatGPT";
   return "Assistant";
 }
+const AgentModelCatalogs = new Map();
+const AgentModelCatalogRequests = new Map();
+function agentModelCatalog(st, provider) {
+  if (!assistantProviderReady(st, provider)) {
+    AgentModelCatalogs.delete(provider);
+    return { models: [] };
+  }
+  return AgentModelCatalogs.get(provider) || st.model_catalog?.[provider]
+    || { state: "legacy", models: st.models?.[provider] || [] };
+}
+function agentModelEfforts(st, provider, model) {
+  const entry = (agentModelCatalog(st, provider).models || []).find((entry) => entry.id === model);
+  return entry?.reasoning_efforts || st.reasoning_efforts || [];
+}
+async function refreshAssistantModelCatalog(st, wrap) {
+  const refreshPanel = () => {
+    if (!wrap.isConnected) return;
+    const next = agentModelSwitcher(AssistantState.status || st);
+    const panel = next.querySelector(".mdl-panel");
+    if (panel) wrap.querySelector(".mdl-panel").replaceWith(panel);
+    const label = next.querySelector(".mdl-cur");
+    if (label) wrap.querySelector(".mdl-cur").textContent = label.textContent;
+  };
+  await Promise.all(["claude", "codex"].filter((provider) => assistantProviderReady(st, provider)).map(async (provider) => {
+    let pending = AgentModelCatalogRequests.get(provider);
+    if (!pending) {
+      const previous = agentModelCatalog(st, provider);
+      AgentModelCatalogs.set(provider, { ...previous, state: "loading" });
+      pending = request("GET", "/api/v1/agent/models?provider=" + provider, { capToken: CAP.agent })
+        .then((catalog) => {
+          if (catalog.state !== "ready" || !Array.isArray(catalog.models)) throw new Error("model_catalog_invalid");
+          AgentModelCatalogs.set(provider, catalog);
+        }).catch(() => {
+          AgentModelCatalogs.set(provider, { ...previous, state: "unavailable" });
+        }).finally(() => AgentModelCatalogRequests.delete(provider));
+      AgentModelCatalogRequests.set(provider, pending);
+    }
+    refreshPanel();
+    await pending;
+    refreshPanel();
+  }));
+}
 function agentModelSwitcher(st) {
-  const models = st.models || {};
-  const efforts = st.reasoning_efforts || [];
+  const models = Object.fromEntries(["claude", "codex"].map((provider) => [provider, agentModelCatalog(st, provider).models || []]));
+  const efforts = agentModelEfforts(st, st.provider, st.model);
   const currentEffort = st.reasoning_effort || "medium";
   const cur = (st.provider || "") + "|" + (st.model || "");
   const curLabel = () => {
@@ -6335,13 +6380,20 @@ function agentModelSwitcher(st) {
   const rows = [];
   const addGroup = (prov, connected) => {
     const list = models[prov] || [];
-    if (!connected || !list.length) return;
+    if (!connected) return;
     const tag = agentProviderLabel(prov);
     rows.push(el("div", { class: "mdl-group" }, tag));
+    const catalog = agentModelCatalog(st, prov);
+    if (["loading", "not_loaded", "unavailable"].includes(catalog.state)) {
+      rows.push(el("div", { class: "mdl-group", role: "status", text: catalog.state === "unavailable" ? "Model list could not be refreshed" : "Loading models…" }));
+    }
     list.forEach((m) => {
       const val = prov + "|" + m.id;
+      const supported = m.reasoning_efforts || st.reasoning_efforts || [];
+      const effort = supported.some((value) => value.id === currentEffort) ? currentEffort
+        : m.default_reasoning_effort || supported[0]?.id || "medium";
       rows.push(el("button",
-        { class: "mdl-item" + (val === cur ? " active" : ""), type: "button", role: "option", "data-agent-model-option": val, onclick: () => pickModel(prov, m.id, prov === "codex" ? currentEffort : null) },
+        { class: "mdl-item" + (val === cur ? " active" : ""), type: "button", role: "option", ...(["loading", "not_loaded"].includes(catalog.state) ? { disabled: "disabled" } : {}), "data-agent-model-option": val, onclick: () => pickModel(prov, m.id, prov === "codex" ? effort : null) },
         el("span", { class: "mdl-dot" }),
         el("span", { class: "mdl-lbl", text: tag + " · " + m.label })));
     });
@@ -6388,7 +6440,10 @@ function agentModelSwitcher(st) {
     { class: "mdl-trigger", type: "button", "aria-haspopup": "listbox", title: "Switch model",
       onclick: (ev) => {
         ev.stopPropagation();
-        if (wrap.classList.toggle("open")) document.addEventListener("pointerdown", closeOutside, true);
+        if (wrap.classList.toggle("open")) {
+          document.addEventListener("pointerdown", closeOutside, true);
+          refreshAssistantModelCatalog(st, wrap);
+        }
         else document.removeEventListener("pointerdown", closeOutside, true);
       } },
     el("span", { class: "mdl-cur", text: curLabel() }), icon("chevron-down", "mdl-caret"));
@@ -6429,7 +6484,7 @@ async function pickModel(provider, model, reasoningEffort = null) {
     const st = await api("/api/v1/agent/status");
     rememberAssistantStatus(st);
     const effortLabel = provider === "codex"
-      ? (AssistantState.status?.reasoning_efforts || []).find((x) => x.id === (reasoningEffort || "medium"))?.label
+      ? agentModelEfforts(AssistantState.status || {}, provider, model).find((x) => x.id === (reasoningEffort || "medium"))?.label
       : null;
     toast("Model: " + agentProviderLabel(provider) + " · " + model + (effortLabel ? " · " + effortLabel : ""));
     renderAssistantView($("#view"));

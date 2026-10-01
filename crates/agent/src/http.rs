@@ -434,15 +434,27 @@ mod live {
             url: &str,
             max_body_bytes: usize,
         ) -> Result<PublicJsonResponse, AgentError> {
+            self.get_catalog_json(url, &[], max_body_bytes)
+        }
+
+        /// Bounded metadata GET; redirects are forbidden so auth cannot leave the origin.
+        pub fn get_catalog_json(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            max_body_bytes: usize,
+        ) -> Result<PublicJsonResponse, AgentError> {
             use std::io::Read as _;
 
             Self::ensure_test_network_allowed()?;
-            let response = self
+            let mut request = self
                 .probe_client
                 .get(url)
-                .header(reqwest::header::ACCEPT, "application/json")
-                .send()
-                .map_err(safe_reqwest_transport_error)?;
+                .header(reqwest::header::ACCEPT, "application/json");
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+            let response = request.send().map_err(safe_reqwest_transport_error)?;
             if response
                 .content_length()
                 .is_some_and(|length| length > max_body_bytes as u64)

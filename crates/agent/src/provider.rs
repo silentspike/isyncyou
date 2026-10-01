@@ -435,6 +435,7 @@ pub(crate) enum ProviderRequestBinding<'a> {
         account_id: &'a str,
         model: &'a str,
         reasoning_effort: codex::CodexReasoningEffort,
+        responses_lite: bool,
         instructions: &'a str,
     },
 }
@@ -592,7 +593,10 @@ fn attest_product_harness(
     let stream_true = obj.get("stream") == Some(&serde_json::Value::Bool(true));
     let responses_lite = matches!(
         binding,
-        ProviderRequestBinding::Codex { model, .. } if codex::uses_responses_lite(model)
+        ProviderRequestBinding::Codex {
+            responses_lite: true,
+            ..
+        }
     );
     let tools = if responses_lite {
         obj.get("input")
@@ -745,6 +749,7 @@ fn attest_product_harness(
                 model,
                 reasoning_effort,
                 instructions,
+                ..
             } = binding
             else {
                 return Err(harness_violation("codex binding mismatch"));
@@ -940,6 +945,9 @@ pub fn attest_static_product_harness(
                     access_token: "static-attestation-probe",
                     account_id: "static-account-binding",
                     model: &codex::CodexConfig::default().model,
+                    responses_lite: codex::uses_responses_lite(
+                        &codex::CodexConfig::default().model,
+                    ),
                     reasoning_effort: codex::CodexConfig::default().reasoning_effort,
                     instructions: expected_system,
                 },
@@ -1371,6 +1379,7 @@ mod tests {
                 access_token: "codex-oauth-token",
                 account_id: "codex-account-identity",
                 model: "codex-test",
+                responses_lite: false,
                 reasoning_effort: codex::CodexReasoningEffort::Medium,
                 instructions: "iSyncYou controlled system prompt",
             },
