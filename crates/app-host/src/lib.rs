@@ -10908,8 +10908,9 @@ impl DaemonAgent {
                 .control_store
                 .as_ref()
                 .ok_or_else(|| "confirmation_outcome_unknown".to_string())?;
+            // Commit the terminal outbox locally before acknowledging the effect.
+            // Existing maintenance retries its OneDrive projection, including after restart.
             store.finish_pending_confirmation(pending_id, code, completed_at_ms)?;
-            reconcile_pending_confirm_projections(&self.cfg, &self.oauth_dir, store, 1);
             Ok(())
         }
         #[cfg(not(any(
@@ -17978,6 +17979,113 @@ mod tests {
         assert_eq!(projections[0].code, "completed");
         drop(agent);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn agent_confirm_defers_transcript_projection_and_preserves_terminal_outbox_after_restart() {
+        for session_id in ["legacy-local", "01JSESSION00000000000000028"] {
+            for completed in [true, false] {
+                let order = Arc::new(StdMutex::new(Vec::new()));
+                let executor = RecordingConfirmedExecutor::ok("internal", order.clone());
+                if !completed {
+                    *executor.result.lock().unwrap() =
+                        ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorFailed);
+                }
+                let root = temp_agent_root("confirm-deferred-projection");
+                let mut agent = DaemonAgent::new(Config::default(), root.clone());
+                // Drive maintenance explicitly so the test controls projection timing.
+                drop(agent.lifecycle_maintenance.take());
+                agent.confirmed_executor = Arc::new(executor.clone());
+                agent.audit_sink = Arc::new(RecordingAuditSink::new(order));
+                let mut owner = test_pending_owner(&backup_action());
+                owner.session_id = session_id.into();
+                let (pending, token) = agent
+                    .pending
+                    .register_bound(
+                        backup_action(),
+                        "backup mail",
+                        unix_now_ms(),
+                        AGENT_CONFIRM_TTL_MS,
+                        owner.clone(),
+                    )
+                    .unwrap();
+                let expected = if completed {
+                    isyncyou_webui::AgentConfirmOutcome::Completed
+                } else {
+                    isyncyou_webui::AgentConfirmOutcome::Failed(
+                        isyncyou_webui::ClosedConfirmationFailure::ExecutorFailed,
+                    )
+                };
+                assert_eq!(
+                    isyncyou_webui::AgentHandler::confirm(
+                        &agent,
+                        &confirm_command_for_owner(&pending, &token, &owner),
+                    ),
+                    expected
+                );
+                assert_eq!(executor.call_count(), 1);
+                let terminal_code = if completed { "completed" } else { "failed" };
+                let projections = agent
+                    .control_store
+                    .as_ref()
+                    .unwrap()
+                    .pending_confirm_projections(8)
+                    .unwrap();
+                assert_eq!(projections.len(), 1);
+                assert_eq!(projections[0].code, terminal_code);
+                assert_eq!(projections[0].owner, owner);
+                // Inline reconciliation used to remove the legacy-local row before
+                // returning. Both local and cloud owners must now remain queued.
+                drop(agent);
+
+                let store = open_agent_control_store(&root).unwrap();
+                assert_eq!(
+                    store
+                        .recover_interrupted_pending_confirmations(unix_now_ms())
+                        .unwrap(),
+                    0
+                );
+                let projections = store.pending_confirm_projections(8).unwrap();
+                assert_eq!(projections.len(), 1);
+                assert_eq!(projections[0].pending_id, pending.id);
+                assert_eq!(projections[0].code, terminal_code);
+                assert_eq!(projections[0].owner, owner);
+                let registry = isyncyou_agent::PendingRegistry::with_persistence(store.clone());
+                assert!(matches!(
+                    registry.confirm(
+                        &pending.id,
+                        &token,
+                        &pending.action_hash,
+                        &isyncyou_agent::PendingOwnerProof {
+                            session_id: owner.session_id.clone(),
+                            turn_request_id: owner.request_id.clone(),
+                            turn_id: owner.turn_id.clone(),
+                        },
+                        unix_now_ms(),
+                    ),
+                    isyncyou_agent::PendingConfirmOutcome::Rejected(
+                        isyncyou_agent::ClosedConfirmationCode::Replayed
+                    )
+                ));
+                reconcile_pending_confirm_projections(&Config::default(), &root, &store, 8);
+                let remaining = store.pending_confirm_projections(8).unwrap();
+                if session_id == "legacy-local" {
+                    assert!(remaining.is_empty());
+                } else {
+                    // Missing cloud transport leaves the durable retry intact.
+                    assert_eq!(remaining.len(), 1);
+                    assert_eq!(remaining[0].code, terminal_code);
+                }
+                assert_eq!(executor.call_count(), 1);
+                drop(registry);
+                drop(store);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
     }
 
     #[test]
