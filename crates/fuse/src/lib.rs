@@ -18,8 +18,9 @@ use std::collections::HashMap;
 
 #[cfg(unix)]
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
+    INodeNo, LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
 #[cfg(unix)]
 use std::ffi::OsStr;
@@ -528,7 +529,7 @@ fn file_attr(node: &Node, uid: u32, gid: u32, writable: bool) -> FileAttr {
         .map(|s| UNIX_EPOCH + Duration::from_secs(s as u64))
         .unwrap_or(UNIX_EPOCH);
     FileAttr {
-        ino: node.ino,
+        ino: INodeNo(node.ino),
         size: node.size,
         blocks: node.size.div_ceil(512),
         atime: when,
@@ -994,11 +995,11 @@ fn hydration_worker(
 ) {
     while let Ok(job) = rx.recv() {
         let Some(meta) = nodes.get(&job.ino) else {
-            job.reply.error(libc::ENOENT);
+            job.reply.error(Errno::ENOENT);
             continue;
         };
         if meta.is_dir {
-            job.reply.error(libc::EISDIR);
+            job.reply.error(Errno::EISDIR);
             continue;
         }
         let path = cache_dir.join(cache_file_name(&meta.remote_id));
@@ -1013,13 +1014,13 @@ fn hydration_worker(
                 o.on_done(&meta.name, &meta.remote_id, result.is_ok());
             }
             if result.is_err() {
-                job.reply.error(libc::EIO);
+                job.reply.error(Errno::EIO);
                 continue;
             }
         }
         match std::fs::read(&path) {
             Ok(data) => job.reply.data(&slice_bytes(&data, job.offset, job.size)),
-            Err(_) => job.reply.error(libc::EIO),
+            Err(_) => job.reply.error(Errno::EIO),
         }
     }
 }
@@ -1046,44 +1047,53 @@ impl MountedFs {
 
 #[cfg(unix)]
 impl Filesystem for MountedFs {
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        match name.to_str().and_then(|n| self.tree.lookup(parent, n)) {
-            Some(n) => reply.entry(&TTL, &file_attr(n, self.uid, self.gid, false), 0),
-            None => reply.error(libc::ENOENT),
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        match name.to_str().and_then(|n| self.tree.lookup(parent.0, n)) {
+            Some(n) => reply.entry(
+                &TTL,
+                &file_attr(n, self.uid, self.gid, false),
+                Generation(0),
+            ),
+            None => reply.error(Errno::ENOENT),
         }
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        match self.tree.node(ino) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        match self.tree.node(ino.0) {
             Some(n) => reply.attr(&TTL, &file_attr(n, self.uid, self.gid, false)),
-            None => reply.error(libc::ENOENT),
+            None => reply.error(Errno::ENOENT),
         }
     }
 
-    fn open(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
-        reply.opened(0, 0);
+    fn open(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        reply.opened(FileHandle(0), FopenFlags::empty());
     }
 
     fn read(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        let Ok(offset) = i64::try_from(offset) else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let ino = ino.0;
         let (is_dir, rid) = match self.tree.node(ino) {
             Some(n) => (n.is_dir, n.remote_id.clone()),
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
         if is_dir {
-            reply.error(libc::EISDIR);
+            reply.error(Errno::EISDIR);
             return;
         }
         // Fast path: already materialized → serve inline (does not touch the worker,
@@ -1092,7 +1102,7 @@ impl Filesystem for MountedFs {
         if path.exists() {
             match std::fs::read(&path) {
                 Ok(data) => reply.data(&slice_bytes(&data, offset, size)),
-                Err(_) => reply.error(libc::EIO),
+                Err(_) => reply.error(Errno::EIO),
             }
             return;
         }
@@ -1105,27 +1115,28 @@ impl Filesystem for MountedFs {
         };
         if let Err(e) = self.read_tx.send(job) {
             // Worker gone (shutting down): fail this read rather than hang.
-            e.0.reply.error(libc::EIO);
+            e.0.reply.error(Errno::EIO);
         }
     }
 
     fn readdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        let ino = ino.0;
         let (is_dir, parent) = match self.tree.node(ino) {
             Some(n) => (n.is_dir, n.parent),
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
         if !is_dir {
-            reply.error(libc::ENOTDIR);
+            reply.error(Errno::ENOTDIR);
             return;
         }
         let mut entries: Vec<(u64, FileType, String)> = vec![
@@ -1141,7 +1152,7 @@ impl Filesystem for MountedFs {
             entries.push((c.ino, kind, c.name.clone()));
         }
         for (i, (cino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
-            if reply.add(cino, (i + 1) as i64, kind, &name) {
+            if reply.add(INodeNo(cino), (i + 1) as u64, kind, &name) {
                 break;
             }
         }
@@ -1166,7 +1177,14 @@ pub fn mount(fs: PlaceholderFs, mountpoint: &std::path::Path) -> std::io::Result
         ]
     };
     if fs.is_rw() {
-        return fuser::mount2(fs, mountpoint, &base_opts());
+        let mut config = fuser::Config::default();
+        config.mount_options = base_opts();
+        config.n_threads = Some(1);
+        return fuser::mount(
+            WritableMountedFs(std::sync::Mutex::new(fs)),
+            mountpoint,
+            &config,
+        );
     }
     // Read-only: split the fs into a dispatch-thread metadata view (MountedFs) and a
     // worker that owns the hydrator, connected by a channel.
@@ -1207,36 +1225,57 @@ pub fn mount(fs: PlaceholderFs, mountpoint: &std::path::Path) -> std::io::Result
     };
     let mut opts = base_opts();
     opts.push(MountOption::RO);
-    fuser::mount2(mounted, mountpoint, &opts)
+    let mut config = fuser::Config::default();
+    config.mount_options = opts;
+    config.n_threads = Some(1);
+    fuser::mount(mounted, mountpoint, &config)
 }
 
 #[cfg(unix)]
-impl Filesystem for PlaceholderFs {
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let rw = self.is_rw();
-        match name.to_str().and_then(|n| self.tree.lookup(parent, n)) {
-            Some(n) => reply.entry(&TTL, &file_attr(n, self.uid, self.gid, rw), 0),
-            None => reply.error(libc::ENOENT),
+struct WritableMountedFs(std::sync::Mutex<PlaceholderFs>);
+
+#[cfg(unix)]
+impl WritableMountedFs {
+    fn state(&self) -> Result<std::sync::MutexGuard<'_, PlaceholderFs>, Errno> {
+        self.0.lock().map_err(|_| Errno::EIO)
+    }
+}
+
+#[cfg(unix)]
+impl Filesystem for WritableMountedFs {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let Ok(fs) = self.state() else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        let rw = fs.is_rw();
+        match name.to_str().and_then(|n| fs.tree.lookup(parent.0, n)) {
+            Some(n) => reply.entry(&TTL, &file_attr(n, fs.uid, fs.gid, rw), Generation(0)),
+            None => reply.error(Errno::ENOENT),
         }
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        let rw = self.is_rw();
-        match self.tree.node(ino) {
-            Some(n) => reply.attr(&TTL, &file_attr(n, self.uid, self.gid, rw)),
-            None => reply.error(libc::ENOENT),
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let Ok(fs) = self.state() else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        let rw = fs.is_rw();
+        match fs.tree.node(ino.0) {
+            Some(n) => reply.attr(&TTL, &file_attr(n, fs.uid, fs.gid, rw)),
+            None => reply.error(Errno::ENOENT),
         }
     }
 
-    fn open(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
-        reply.opened(0, 0);
+    fn open(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        reply.opened(FileHandle(0), FopenFlags::empty());
     }
 
     #[allow(clippy::too_many_arguments)]
     fn create(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
         _mode: u32,
         _umask: u32,
@@ -1244,106 +1283,140 @@ impl Filesystem for PlaceholderFs {
         reply: ReplyCreate,
     ) {
         let Some(name) = name.to_str() else {
-            reply.error(libc::EINVAL);
+            reply.error(Errno::EINVAL);
             return;
         };
-        match self.create_file(parent, name) {
+        let Ok(mut fs) = self.state() else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        match fs.create_file(parent.0, name) {
             Ok(ino) => {
-                let attr = file_attr(self.tree.node(ino).unwrap(), self.uid, self.gid, true);
-                reply.created(&TTL, &attr, 0, 0, 0);
+                let attr = file_attr(fs.tree.node(ino).unwrap(), fs.uid, fs.gid, true);
+                reply.created(
+                    &TTL,
+                    &attr,
+                    Generation(0),
+                    FileHandle(0),
+                    FopenFlags::empty(),
+                );
             }
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
     fn mkdir(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
         _mode: u32,
         _umask: u32,
         reply: ReplyEntry,
     ) {
         let Some(name) = name.to_str() else {
-            reply.error(libc::EINVAL);
+            reply.error(Errno::EINVAL);
             return;
         };
-        match self.mkdir_child(parent, name) {
+        let Ok(mut fs) = self.state() else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        match fs.mkdir_child(parent.0, name) {
             Ok(ino) => {
-                let attr = file_attr(self.tree.node(ino).unwrap(), self.uid, self.gid, true);
-                reply.entry(&TTL, &attr, 0);
+                let attr = file_attr(fs.tree.node(ino).unwrap(), fs.uid, fs.gid, true);
+                reply.entry(&TTL, &attr, Generation(0));
             }
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
-    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let Some(name) = name.to_str() else {
-            reply.error(libc::EINVAL);
+            reply.error(Errno::EINVAL);
             return;
         };
-        match self.unlink_child(parent, name) {
+        let Ok(mut fs) = self.state() else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        match fs.unlink_child(parent.0, name) {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
-    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let Some(name) = name.to_str() else {
-            reply.error(libc::EINVAL);
+            reply.error(Errno::EINVAL);
             return;
         };
-        match self.rmdir_child(parent, name) {
+        let Ok(mut fs) = self.state() else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        match fs.rmdir_child(parent.0, name) {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
     fn rename(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
-        newparent: u64,
+        newparent: INodeNo,
         newname: &OsStr,
-        _flags: u32,
+        _flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
         let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
-            reply.error(libc::EINVAL);
+            reply.error(Errno::EINVAL);
             return;
         };
-        match self.rename_child(parent, name, newparent, newname) {
+        let Ok(mut fs) = self.state() else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        match fs.rename_child(parent.0, name, newparent.0, newname) {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn write(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        match self.write_at(ino, offset, data) {
+        let Ok(offset) = i64::try_from(offset) else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let Ok(mut fs) = self.state() else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        match fs.write_at(ino.0, offset, data) {
             Ok(n) => reply.written(n),
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn setattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
         _mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
@@ -1351,33 +1424,38 @@ impl Filesystem for PlaceholderFs {
         _atime: Option<TimeOrNow>,
         _mtime: Option<TimeOrNow>,
         _ctime: Option<std::time::SystemTime>,
-        _fh: Option<u64>,
+        _fh: Option<FileHandle>,
         _crtime: Option<std::time::SystemTime>,
         _chgtime: Option<std::time::SystemTime>,
         _bkuptime: Option<std::time::SystemTime>,
-        _flags: Option<u32>,
+        _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        let Ok(mut fs) = self.state() else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        let ino = ino.0;
         // we only honor truncate/extend (size); other attrs are accepted as no-ops
         if let Some(sz) = size {
-            if let Err(e) = self.truncate(ino, sz) {
-                reply.error(e);
+            if let Err(e) = fs.truncate(ino, sz) {
+                reply.error(Errno::from_i32(e));
                 return;
             }
         }
-        let rw = self.is_rw();
-        match self.tree.node(ino) {
-            Some(n) => reply.attr(&TTL, &file_attr(n, self.uid, self.gid, rw)),
-            None => reply.error(libc::ENOENT),
+        let rw = fs.is_rw();
+        match fs.tree.node(ino) {
+            Some(n) => reply.attr(&TTL, &file_attr(n, fs.uid, fs.gid, rw)),
+            None => reply.error(Errno::ENOENT),
         }
     }
 
     fn flush(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _lock_owner: u64,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
         // Upload only on release (final close), not on every flush: a write sequence
@@ -1388,68 +1466,85 @@ impl Filesystem for PlaceholderFs {
     }
 
     fn release(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        match self.flush_ino(ino) {
+        let Ok(mut fs) = self.state() else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        match fs.flush_ino(ino.0) {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
     fn read(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        match self.read_slice(ino, offset, size) {
+        let Ok(offset) = i64::try_from(offset) else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let Ok(mut fs) = self.state() else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        match fs.read_slice(ino.0, offset, size) {
             Ok(d) => reply.data(&d),
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
     fn readdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        let Ok(mut fs) = self.state() else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        let ino = ino.0;
         // Pull cloud changes before listing — but only on the first call of an
         // enumeration (offset 0), so a mid-readdir reconcile can't shift the
         // children under the offset-based paging.
         if offset == 0 {
-            self.maybe_refresh();
+            fs.maybe_refresh();
         }
-        let (is_dir, parent) = match self.tree.node(ino) {
+        let (is_dir, parent) = match fs.tree.node(ino) {
             Some(n) => (n.is_dir, n.parent),
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
         if !is_dir {
-            reply.error(libc::ENOTDIR);
+            reply.error(Errno::ENOTDIR);
             return;
         }
         let mut entries: Vec<(u64, FileType, String)> = vec![
             (ino, FileType::Directory, ".".to_string()),
             (parent, FileType::Directory, "..".to_string()),
         ];
-        for c in self.tree.children(ino) {
+        for c in fs.tree.children(ino) {
             let kind = if c.is_dir {
                 FileType::Directory
             } else {
@@ -1459,7 +1554,7 @@ impl Filesystem for PlaceholderFs {
         }
         for (i, (cino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
             // reply.add returns true when the reply buffer is full
-            if reply.add(cino, (i + 1) as i64, kind, &name) {
+            if reply.add(INodeNo(cino), (i + 1) as u64, kind, &name) {
                 break;
             }
         }
@@ -1841,6 +1936,55 @@ mod fs_tests {
         *rec.lock().unwrap() = None;
         fs.flush_ino(ino).unwrap();
         assert!(rec.lock().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_adapter_preserves_buffer_and_single_upload_across_locks() {
+        fn requires_filesystem<T: Filesystem>() {}
+        requires_filesystem::<WritableMountedFs>();
+        let dir = tempfile::tempdir().unwrap();
+        let tree = Tree::from_items(&[file("f1", None, "data.bin", 3)]);
+        let ino = tree.lookup(ROOT_INO, "data.bin").unwrap().ino;
+        let last = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let adapter = WritableMountedFs(std::sync::Mutex::new(
+            PlaceholderFs::new(tree, Box::new(FailingHydrator), dir.path().join("c"))
+                .with_uploader(Box::new(RecordingUploader { last: last.clone() })),
+        ));
+        adapter.state().unwrap().truncate(ino, 0).unwrap();
+        adapter
+            .state()
+            .unwrap()
+            .write_at(ino, 0, b"updated")
+            .unwrap();
+        assert_eq!(
+            adapter.state().unwrap().read_slice(ino, 0, 100).unwrap(),
+            b"updated"
+        );
+        adapter.state().unwrap().flush_ino(ino).unwrap();
+        assert_eq!(
+            *last.lock().unwrap(),
+            Some(("f1".into(), b"updated".to_vec()))
+        );
+        *last.lock().unwrap() = None;
+        adapter.state().unwrap().flush_ino(ino).unwrap();
+        assert!(last.lock().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_adapter_poison_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = WritableMountedFs(std::sync::Mutex::new(PlaceholderFs::new(
+            Tree::from_items(&[]),
+            Box::new(FailingHydrator),
+            dir.path().join("c"),
+        )));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = adapter.state().unwrap();
+            panic!("controlled adapter failure");
+        }));
+        assert!(matches!(adapter.state(), Err(Errno::EIO)));
     }
 
     #[test]

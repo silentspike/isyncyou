@@ -6,6 +6,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+
+- Refresh stable Rust, Android, WebUI test and CI dependencies; pin Rust 1.99.0,
+  Android SDK 37.2, NDK r30/API 34, AGP 9.4.1 and Gradle 9.8.0. Android now requires
+  Android 14 or newer. Align native build manifests with Cargo Remote v2 without
+  changing existing account or credential storage formats.
+
 ### Added
 
 **Exhaustive Agent authorization policy (#642)**

@@ -746,7 +746,7 @@ pub mod flow {
     }
 
     fn authorization_code_client() -> Result<reqwest::blocking::Client, String> {
-        reqwest::blocking::Client::builder()
+        crate::http::client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
@@ -786,7 +786,9 @@ pub mod flow {
     }
 
     fn client() -> reqwest::blocking::Client {
-        reqwest::blocking::Client::new()
+        crate::http::client_builder()
+            .build()
+            .expect("OAuth HTTP client initialization")
     }
 
     /// Begin the device-code flow; returns the code/URI to present to the user.

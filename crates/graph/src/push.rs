@@ -83,7 +83,9 @@ fn sign_assertion(sa: &ServiceAccount, now_unix: u64) -> Result<String, String> 
 
 #[cfg(feature = "http")]
 fn client() -> reqwest::blocking::Client {
-    reqwest::blocking::Client::new()
+    crate::http::client_builder()
+        .build()
+        .expect("FCM HTTP client initialization")
 }
 
 /// Exchange the signed assertion for a short-lived OAuth2 access token.

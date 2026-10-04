@@ -68,7 +68,6 @@ skip = [
     { crate = "windows_x86_64_gnu@0.52.6", reason = "transitive Windows target split from ring/rustls versus notify" },
     { crate = "windows_x86_64_gnullvm@0.52.6", reason = "transitive Windows target split from ring/rustls versus notify" },
     { crate = "windows_x86_64_msvc@0.52.6", reason = "transitive Windows target split from ring/rustls versus notify" },
-    { crate = "wit-bindgen@0.51.0", reason = "transitive split from tempfile WASI dependencies" },
 ]
 
 [sources]

@@ -334,14 +334,14 @@ mod live {
 
     impl HttpTransport {
         pub fn new() -> Result<Self, AgentError> {
-            let client = reqwest::blocking::Client::builder()
+            let client = blocking_client_builder()
                 .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
                 .timeout(PROVIDER_TURN_TIMEOUT)
                 .build()
                 .map_err(|_| {
                     AgentError::Transport("provider_transport_initialization_failed".into())
                 })?;
-            let probe_client = reqwest::blocking::Client::builder()
+            let probe_client = blocking_client_builder()
                 .connect_timeout(PREFLIGHT_CONNECT_TIMEOUT)
                 .timeout(PREFLIGHT_NETWORK_TIMEOUT)
                 .redirect(reqwest::redirect::Policy::none())
@@ -641,7 +641,7 @@ mod live {
         ) -> Result<u16, super::SecretJsonTransportError> {
             Self::ensure_test_network_allowed()
                 .map_err(|_| super::SecretJsonTransportError::ConnectFailed)?;
-            let client = reqwest::blocking::Client::builder()
+            let client = blocking_client_builder()
                 .connect_timeout(timeout)
                 .timeout(timeout)
                 .redirect(reqwest::redirect::Policy::none())
@@ -715,8 +715,27 @@ mod live {
         reqwest::Method::HEAD
     }
 
+    fn trusted_roots() -> impl Iterator<Item = reqwest::Certificate> {
+        // reqwest 0.13 no longer selects ring implicitly with rustls-no-provider.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .map(|certificate| {
+                reqwest::Certificate::from_der(certificate.as_ref()).expect("validated WebPKI root")
+            })
+    }
+
+    fn blocking_client_builder() -> reqwest::blocking::ClientBuilder {
+        reqwest::blocking::Client::builder()
+            .tls_certs_only(trusted_roots())
+            .retry(reqwest::retry::never())
+    }
+
     fn async_sse_client_builder() -> reqwest::ClientBuilder {
-        reqwest::Client::builder().connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+        reqwest::Client::builder()
+            .tls_certs_only(trusted_roots())
+            .retry(reqwest::retry::never())
+            .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
     }
 
     fn error_source_is_tls(error: &(dyn std::error::Error + 'static)) -> bool {

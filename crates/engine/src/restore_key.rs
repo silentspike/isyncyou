@@ -8,7 +8,7 @@
 //! per-install random value kept on disk (never logged), so keys are not guessable
 //! across installs.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::io::Write;
 use std::path::Path;
@@ -131,6 +131,14 @@ mod tests {
     use super::*;
 
     const SECRET: &[u8] = b"test-secret-0123456789abcdef";
+
+    #[test]
+    fn restore_key_preserves_pre_upgrade_wire_digest() {
+        assert_eq!(
+            idempotency_key(SECRET, "acc", "mail", "id1", b"body"),
+            "4326a4e0a1782792af1f8d3ed8ec9abc224fafd3780ac6b0f108eb5ceee65b23"
+        );
+    }
 
     #[test]
     fn key_is_deterministic_and_hex() {

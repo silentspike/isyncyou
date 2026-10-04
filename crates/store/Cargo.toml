@@ -9,7 +9,7 @@ authors.workspace = true
 
 [dependencies]
 rusqlite = { workspace = true, features = ["hooks"] }
-sha2 = "0.10"
+sha2 = "0.11"
 thiserror = { workspace = true }
 fs2 = "0.4"
 

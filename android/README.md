@@ -10,7 +10,7 @@ web UI (`gui/webui/`), so the Kotlin stays small.
 ## Build (remote Rust + local Gradle/Kotlin)
 
 Standard Gradle project (migrated from the old manual `build.sh`, #573). Needs a
-JDK (17+) and an Android SDK with `build-tools;34.0.0` + `platforms;android-34`.
+JDK (17+) and an Android SDK with `build-tools;37.0.0` + `platforms;android-37.2`.
 Point the SDK via
 `local.properties` (`sdk.dir=…`, gitignored) or `ANDROID_HOME`.
 
@@ -23,10 +23,13 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 The remote step cross-compiles the embedded engine into
 `app/src/main/jniLibs/arm64-v8a/libisyncyou_mobile.so` and writes a binding manifest.
 Gradle never invokes `cargo` or `rustc`; `preBuild` validates the source commit, ABI,
-feature set, NDK version, and library hash before packaging. Missing or stale native
-output fails closed. The designated remote builder needs Rust 1.95.0, the requested
-Android targets, and NDK r27d at `/opt/android-ndk-r27d` (overridable with
-`ISY_REMOTE_ANDROID_NDK_HOME`). On launch, `MainActivity` calls `NativeEngine.nativeStart`,
+feature set, NDK version, native API, Rust toolchain, and library hash before packaging.
+Missing or stale native output fails closed. Cargo Remote v2 must provide the
+`android-r30` profile (NDK 30.0.16248370, native API 34, arm64 and x86_64 targets).
+The Rust version is read from the repository's pinned `rust-toolchain.toml`; do not
+inject server-owned `RUSTUP_TOOLCHAIN`, compiler, or linker environment variables.
+An unmigrated legacy builder or missing profile is not a supported fallback.
+On launch, `MainActivity` calls `NativeEngine.nativeStart`,
 gets the loopback port + session token, and loads the local UI:
 
 ```sh
@@ -54,7 +57,8 @@ applies the `com.google.gms.google-services` plugin. The daemon-side sender live
 
 ## Notes
 
-- `applicationId = com.silentspike.isyncyou`, `minSdk 24`, `targetSdk 34`.
+- `applicationId = com.silentspike.isyncyou`, `minSdk 34` (Android 14), `targetSdk 37`.
+- AGP provides built-in Kotlin. Do not apply the legacy Kotlin Android plugin.
 - **No global cleartext.** `res/xml/network_security_config.xml` permits plain HTTP **only**
   to `127.0.0.1` (the in-process engine); everything else — including Microsoft Graph — is
   HTTPS-only. The old global `usesCleartextTraffic="true"` is removed (#89 P5).
