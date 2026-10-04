@@ -31,11 +31,16 @@ jobs:
           set -euo pipefail
           # Event metadata can differ from current membership. Recheck the same
           # actor policy immediately before taking any destructive action.
-          decision=$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" |
+          metadata=$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")
+          decision=$(printf '%s' "$metadata" |
             jq -er --arg repo "$REPOSITORY" --argjson number "$PR_NUMBER" '
               .author_association as $association |
               if .number != $number or .base.repo.full_name != $repo or
                  (.user.login | type != "string") or .user.login == "" or
+                 (.user.login | test("^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\\[bot\\])?$")) != true or
+                 (.user.type != "User" and .user.type != "Bot") or
+                 (.user.id | type != "number") or .user.id <= 0 or
+                 (.user.id | floor) != .user.id or
                  (["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR",
                    "FIRST_TIMER", "FIRST_TIME_CONTRIBUTOR", "NONE", "MANNEQUIN"] |
                   index($association)) == null then
@@ -50,6 +55,27 @@ jobs:
           if [ "$decision" = allow ]; then
             echo "Current PR metadata permits this author; no action needed."
             exit 0
+          fi
+          # Association metadata can under-report an authorized repository writer.
+          # Verify effective permission, never mere public read access or a login list.
+          author=$(printf '%s' "$metadata" | jq -r '
+            .user | if .type == "User" then .login else empty end')
+          if [ -n "$author" ]; then
+            author_id=$(printf '%s' "$metadata" | jq -er '
+              .user.id | select(type == "number" and . > 0 and . == floor)')
+            permission=$(gh api "repos/${REPOSITORY}/collaborators/${author}/permission" |
+              jq -er --arg author "$author" --argjson id "$author_id" '
+                if .user.login != $author or .user.id != $id or .user.type != "User"
+                then error("Invalid repository permission metadata")
+                else . end |
+                .permission as $permission |
+                if (["admin", "write", "read", "none"] | index($permission)) == null
+                then error("Invalid repository permission metadata")
+                else $permission end')
+            if [ "$permission" = admin ] || [ "$permission" = write ]; then
+              echo "Current repository permission permits this author; no action needed."
+              exit 0
+            fi
           fi
           message=$(cat <<'EOF'
           Thank you for your interest in iSyncYou. This repository does not accept external pull requests.
