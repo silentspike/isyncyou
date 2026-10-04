@@ -85,12 +85,18 @@ class ExternalContributionPolicyTests(unittest.TestCase):
         self.assertIn("isyncyou-feedback", chooser)
         self.assertIn("security/advisories/new", chooser)
 
-    def run_policy(self, metadata: dict, api_status: int = 0) -> tuple[int, list]:
+    def run_policy(
+        self, metadata: dict, api_status: int = 0,
+        permission: dict | None = None, permission_status: int = 0,
+    ) -> tuple[int, list]:
         """Execute the actual workflow shell with real jq and isolated GitHub I/O."""
         script = textwrap.dedent(self.workflow.split("        run: |\n", 1)[1])
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+            if permission is None:
+                permission = {"permission": "none", "user": metadata.get("user", {})}
+            (root / "permission.json").write_text(json.dumps(permission), encoding="utf-8")
             fake_gh = root / "gh"
             fake_gh.write_text(
                 "#!/usr/bin/env python3\n"
@@ -102,6 +108,10 @@ class ExternalContributionPolicyTests(unittest.TestCase):
                 "    if int(os.environ['POLICY_API_STATUS']):\n"
                 "        sys.exit(int(os.environ['POLICY_API_STATUS']))\n"
                 "    print((root / 'metadata.json').read_text())\n"
+                "elif len(sys.argv) == 3 and sys.argv[1] == 'api' and sys.argv[2].startswith('repos/example/project/collaborators/') and sys.argv[2].endswith('/permission'):\n"
+                "    if int(os.environ['POLICY_PERMISSION_STATUS']):\n"
+                "        sys.exit(int(os.environ['POLICY_PERMISSION_STATUS']))\n"
+                "    print((root / 'permission.json').read_text())\n"
                 "elif sys.argv[1:4] not in (['api', '--method', 'PATCH'], ['api', '--method', 'POST']):\n"
                 "    sys.exit(99)\n",
                 encoding="utf-8",
@@ -112,6 +122,7 @@ class ExternalContributionPolicyTests(unittest.TestCase):
                 "PATH": f"{root}:{os.environ['PATH']}",
                 "POLICY_FIXTURE": str(root),
                 "POLICY_API_STATUS": str(api_status),
+                "POLICY_PERMISSION_STATUS": str(permission_status),
                 "REPOSITORY": "example/project",
                 "PR_NUMBER": "123",
             }
@@ -131,7 +142,7 @@ class ExternalContributionPolicyTests(unittest.TestCase):
             "number": 123,
             "base": {"repo": {"full_name": "example/project"}},
             "head": {"repo": {"full_name": head_repo}},
-            "user": {"login": login},
+            "user": {"login": login, "id": 42, "type": "Bot" if login.endswith("[bot]") else "User"},
             "author_association": association,
         }
 
@@ -147,10 +158,55 @@ class ExternalContributionPolicyTests(unittest.TestCase):
             with self.subTest(association=association):
                 code, calls = self.run_policy(self.metadata(association))
                 self.assertEqual(code, 0)
-                self.assertEqual(len(calls), 3)
-                self.assertEqual(calls[1][:4], ["api", "--method", "PATCH", "repos/example/project/pulls/123"])
-                self.assertIn("state=closed", calls[1])
-                self.assertEqual(calls[2][:4], ["api", "--method", "POST", "repos/example/project/issues/123/comments"])
+                self.assertEqual(len(calls), 4)
+                self.assertEqual(calls[1], ["api", "repos/example/project/collaborators/external-user/permission"])
+                self.assertEqual(calls[2][:4], ["api", "--method", "PATCH", "repos/example/project/pulls/123"])
+                self.assertIn("state=closed", calls[2])
+                self.assertEqual(calls[3][:4], ["api", "--method", "POST", "repos/example/project/issues/123/comments"])
+
+    def test_underreported_association_preserves_verified_repository_writer(self) -> None:
+        for association in ("NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR"):
+            for permission in ("write", "admin"):
+                for head_repo in ("example/project", "example/fork"):
+                    with self.subTest(association=association, permission=permission, head_repo=head_repo):
+                        metadata = self.metadata(association, head_repo=head_repo)
+                        code, calls = self.run_policy(metadata, permission={
+                            "permission": permission, "user": metadata["user"],
+                        })
+                        self.assertEqual(code, 0)
+                        self.assertEqual(len(calls), 2)
+
+    def test_public_read_access_does_not_establish_writer_trust(self) -> None:
+        metadata = self.metadata()
+        code, calls = self.run_policy(metadata, permission={
+            "permission": "read", "user": metadata["user"],
+        })
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 4)
+        self.assertIn("state=closed", calls[2])
+
+    def test_permission_api_failure_never_closes_a_potential_writer(self) -> None:
+        code, calls = self.run_policy(self.metadata(), permission_status=1)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(len(calls), 2)
+
+    def test_permission_response_must_match_exact_pr_author(self) -> None:
+        metadata = self.metadata()
+        for mutation in ({"login": "different-user"}, {"id": 43}, {"type": "Bot"}):
+            with self.subTest(mutation=mutation):
+                code, calls = self.run_policy(metadata, permission={
+                    "permission": "admin", "user": {**metadata["user"], **mutation},
+                })
+                self.assertNotEqual(code, 0)
+                self.assertEqual(len(calls), 2)
+
+    def test_invalid_permission_response_stops_before_mutation(self) -> None:
+        metadata = self.metadata()
+        for permission in ({}, {"permission": "unexpected", "user": metadata["user"]}):
+            with self.subTest(permission=permission):
+                code, calls = self.run_policy(metadata, permission=permission)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(len(calls), 2)
 
     def test_dependabot_allowance_requires_same_repository(self) -> None:
         for repository, expected_calls in (("example/project", 1), ("example/fork", 3)):
@@ -167,6 +223,8 @@ class ExternalContributionPolicyTests(unittest.TestCase):
     def test_invalid_metadata_stops_before_mutation(self) -> None:
         for mutation in ({}, {"number": 456}, {"author_association": None},
                          {"author_association": "unexpected"}, {"user": {"login": ""}},
+                         {"user": {"login": "bad/path", "id": 42, "type": "User"}},
+                         {"user": {"login": "external-user", "id": 0, "type": "User"}},
                          {"base": {"repo": {"full_name": "example/other"}}}):
             with self.subTest(mutation=mutation):
                 metadata = {**self.metadata(), **mutation} if mutation else {}
