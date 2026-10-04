@@ -21,7 +21,9 @@ class MobileJobWorkerInstrumentedTest {
         val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
         var info: WorkInfo
         do {
-            info = manager.getWorkInfoById(request.id).get(5, TimeUnit.SECONDS)
+            info = requireNotNull(manager.getWorkInfoById(request.id).get(5, TimeUnit.SECONDS)) {
+                "enqueued process probe work is missing"
+            }
             if (info.state.isFinished) break
             Thread.sleep(100)
         } while (System.nanoTime() < deadline)
