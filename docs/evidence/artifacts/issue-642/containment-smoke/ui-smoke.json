@@ -1,0 +1,166 @@
+{
+  "evidence_version": 1,
+  "scenario": "containment",
+  "ok": true,
+  "assertions": [
+    {
+      "name": "internal account aliases use a user-facing fallback",
+      "status": "pass"
+    },
+    {
+      "name": "configured Microsoft account name remains visible",
+      "status": "pass"
+    },
+    {
+      "name": "account switcher never renders internal account aliases",
+      "status": "pass"
+    },
+    {
+      "name": "agent stream rejects missing and wrong capability before handler open",
+      "status": "pass"
+    },
+    {
+      "name": "all ten action projections use closed user-facing tool rows",
+      "status": "pass"
+    },
+    {
+      "name": "tool rows omit raw account item recipient and change fields",
+      "status": "pass"
+    },
+    {
+      "name": "backup projection creates one bounded pending card",
+      "status": "pass"
+    },
+    {
+      "name": "ambiguous confirmation retry reuses one exact request and owner proof",
+      "status": "pass"
+    },
+    {
+      "name": "confirmed card removes authority controls and exposes fixed success only",
+      "status": "pass"
+    },
+    {
+      "name": "error receipt replay preserves an unknown effect and erases authority",
+      "status": "pass"
+    },
+    {
+      "name": "same authority event preserves the exact ambiguous confirmation attempt",
+      "status": "pass"
+    },
+    {
+      "name": "rotated authority cannot replace an ambiguous confirmation attempt",
+      "status": "pass"
+    },
+    {
+      "name": "authorization restore uses its closed pending preview",
+      "status": "pass"
+    },
+    {
+      "name": "authorization restore cancellation removes authority controls",
+      "status": "pass"
+    },
+    {
+      "name": "authorization live write uses its closed pending preview",
+      "status": "pass"
+    },
+    {
+      "name": "authorization live write cancellation removes authority controls",
+      "status": "pass"
+    },
+    {
+      "name": "authorization share uses its closed pending preview",
+      "status": "pass"
+    },
+    {
+      "name": "authorization share cancellation removes authority controls",
+      "status": "pass"
+    },
+    {
+      "name": "terminal cards erase in-memory confirmation authority",
+      "status": "pass"
+    },
+    {
+      "name": "browser storage contains no pending token hash owner or native authority",
+      "status": "pass"
+    },
+    {
+      "name": "repeated invalid progress produces one bounded warning",
+      "status": "pass"
+    },
+    {
+      "name": "rejected partial progress produces no citations",
+      "status": "pass"
+    },
+    {
+      "name": "terminal teardown erases reducer results and rejects stale events",
+      "status": "pass"
+    },
+    {
+      "name": "rejected partial results cannot add citations",
+      "status": "pass"
+    },
+    {
+      "name": "stale queued events cannot register pending actions",
+      "status": "pass"
+    },
+    {
+      "name": "running counter regression remains rejected",
+      "status": "pass"
+    },
+    {
+      "name": "terminal paths release stream renderer and token resources",
+      "status": "pass"
+    },
+    {
+      "name": "browser emits no console or page errors",
+      "status": "pass"
+    },
+    {
+      "name": "browser emits no CSP violations",
+      "status": "pass"
+    },
+    {
+      "name": "browser has no unexpected failed or non-self request",
+      "status": "pass"
+    },
+    {
+      "name": "fixture has no missing routes or internal errors",
+      "status": "pass"
+    }
+  ],
+  "assertion_count": 31,
+  "console_error_count": 0,
+  "page_error_count": 0,
+  "csp_violation_count": 0,
+  "failed_request_count": 0,
+  "non_self_request_count": 0,
+  "performance": {},
+  "reducer_bounds": {
+    "stage_limit": 256,
+    "stage_over": "limited",
+    "activities": 4,
+    "activity_over": "limited",
+    "results": 200,
+    "result_over": "limited",
+    "terminal_results": 0,
+    "stale": "stale",
+    "post_terminal": 1,
+    "rejected_citations": 0,
+    "stale_pending_delta": 0,
+    "running_regression": "invalid",
+    "terminal_reconciled": "accept",
+    "reconciled_status": "complete",
+    "reconciled_scanned": 50,
+    "reconciled_hits": 4,
+    "reconciled_total": null,
+    "reconciled_diagnostic": 1
+  },
+  "screenshots": [],
+  "authorization_projection": {
+    "tool_row_count": 10,
+    "pending_card_count": 1
+  },
+  "failed_request_routes": [],
+  "expected_cancelled_request_count": 0,
+  "expected_terminal_close_count": 4
+}

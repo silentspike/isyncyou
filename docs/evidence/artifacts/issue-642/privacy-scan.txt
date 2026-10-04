@@ -1,0 +1,22 @@
+Issue #642 privacy and security qualification
+Implementation: 8d6e79fb48bad2afbccff4888579803b20fe3041
+
+PASS branch Gitleaks: no leaks.
+PASS pinned CI Semgrep: 136 rules on 78 tracked files, zero findings.
+PASS deterministic public/model/audit confirmation projection and redaction tests.
+PASS exact-account audit routing; no first-account fallback.
+PASS fixed public success response; internal executor result never returned.
+PASS HTTP and Android bridge stream session plus Agent capability rejection tests.
+PASS browser containment fixture: 31 assertions, no authority in browser storage.
+PASS default APK marker scan: no product test hooks or experimental local client.
+
+Raw build/Gradle/device logs, private operating files, account identities, device
+identifiers, credentials, OAuth codes, callback data, native handles, confirmation
+tokens, raw tool results and account content are excluded from this package.
+Synthetic browser screenshots contain fixture data only.
+
+Both required native scenarios were independently observed on the unchanged
+implementation APK. Graph/Store unread cleanup and foreground restoration were
+verified separately; cleanup does not supply a missing scenario PASS. The earlier
+expired approval and incorrectly accepted denial attempt are excluded from the
+accepted rows. No protected CI, independent review or dev landing is claimed.

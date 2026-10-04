@@ -1,0 +1,118 @@
+{
+  "manifest_version": "1",
+  "generated_at": "2026-10-04T18:03:39Z",
+  "commit": "8d6e79fb48bad2afbccff4888579803b20fe3041",
+  "entries": [
+    {
+      "id": "EV-001",
+      "requirement": "REQ-AGENT-019",
+      "claim": "One exhaustive policy maps all ten current actions to the specified authorization and recovery pairs.",
+      "method": "test",
+      "command": "cargo remote -- test --workspace --features isyncyou-agent/agent-oauth-providers,isyncyou-agent/onedrive,isyncyou-app-host/agent-oauth-providers --no-fail-fast",
+      "test": "tool_authorization_and_recovery_policy_is_one_exhaustive_matrix",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-642/authorization-policy-matrix.json"
+    },
+    {
+      "id": "EV-002",
+      "requirement": "REQ-AGENT-019",
+      "claim": "Durable confirmation rejects a different session, original turn request or turn without consuming valid authority.",
+      "method": "test",
+      "command": "cargo remote -- test --workspace --features isyncyou-agent/agent-oauth-providers,isyncyou-agent/onedrive,isyncyou-app-host/agent-oauth-providers --no-fail-fast",
+      "test": "confirmation_store_rejects_session_request_or_turn_owner_mismatch_without_consumption",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-642/authorization-policy-matrix.json"
+    },
+    {
+      "id": "EV-003",
+      "requirement": "REQ-AGENT-019",
+      "claim": "Hostile archived content can cause a proposal but cannot authorize an unconfirmed effect.",
+      "method": "test",
+      "command": "cargo remote -- test --workspace --features isyncyou-agent/agent-oauth-providers,isyncyou-agent/onedrive,isyncyou-app-host/agent-oauth-providers --no-fail-fast",
+      "test": "hostile_body_can_propose_but_cannot_authorize_or_execute_effect",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-642/prompt-injection-containment.json",
+      "notes": "Deterministic FakeProvider and archive execution, not a probabilistic live-model safety claim."
+    },
+    {
+      "id": "EV-004",
+      "requirement": "REQ-AGENT-019",
+      "claim": "A production send accepted before a lost response remains outcome-unknown and consumed authority is not executed again.",
+      "method": "test",
+      "command": "cargo remote -- test --workspace --features isyncyou-agent/agent-oauth-providers,isyncyou-agent/onedrive,isyncyou-app-host/agent-oauth-providers --no-fail-fast",
+      "test": "agent_confirm_production_send_accepted_then_disconnected_is_outcome_unknown",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-642/authorization-policy-matrix.json"
+    },
+    {
+      "id": "EV-005",
+      "requirement": "REQ-AGENT-019",
+      "claim": "Confirmation returns after the durable local terminal outbox commit, without synchronous cloud transcript projection; encrypted-store restart preserves the result and rejects replay.",
+      "method": "test",
+      "command": "cargo remote -- test --workspace --features isyncyou-agent/agent-oauth-providers,isyncyou-agent/onedrive,isyncyou-app-host/agent-oauth-providers --no-fail-fast",
+      "test": "agent_confirm_defers_transcript_projection_and_preserves_terminal_outbox_after_restart",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-642/authorization-policy-matrix.json"
+    },
+    {
+      "id": "EV-006",
+      "requirement": "REQ-AGENT-019",
+      "claim": "The browser fixture verifies closed public projections, memory-only authority, stable retry identity, terminal buttons and capability rejection.",
+      "method": "command",
+      "command": "node tools/agent-living-ui-smoke.mjs --scenario containment --out /tmp/issue-642-final-containment-8d6e79f",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-642/containment-smoke/ui-smoke.json",
+      "notes": "31 assertions. The separate all and wizard reports cover 51 and 73 assertions. Artifact bytes and hashes are indexed in ui-smoke.json."
+    },
+    {
+      "id": "EV-007",
+      "requirement": "REQ-AGENT-019",
+      "claim": "The exact implementation passes the product-feature workspace aggregate and the required local lint, minimal-mobile and security gates.",
+      "method": "command",
+      "command": "cargo remote -- test --workspace --features isyncyou-agent/agent-oauth-providers,isyncyou-agent/onedrive,isyncyou-app-host/agent-oauth-providers --no-fail-fast",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-642/host-gates.txt",
+      "notes": "Actual commands, exits, nonzero counts, remote job identifiers and aggregate log hash are recorded. Optional ignores do not prove device acceptance or protected CI."
+    },
+    {
+      "id": "EV-008",
+      "requirement": "REQ-AGENT-019",
+      "claim": "The unchanged default APK matches the exact native implementation, installed base hash, signing and alignment checks, and has no test-hook or experimental local-client marker.",
+      "method": "probe",
+      "command": "jq -e '.implementation_commit == \"8d6e79fb48bad2afbccff4888579803b20fe3041\" and .apk_sha256 == .installed_base_apk_sha256 and .remote_native_sha256 == .packaged_native_sha256 and .android_exit_code == 0 and .apksigner_verify == \"pass\" and .zipalign_16k == \"pass\" and .native_hook_markers_found == [] and .experimental_drift_marker_found == false and .physical_acceptance_state == \"pass\"' docs/evidence/artifacts/issue-642/default-apk.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-642/default-apk.json",
+      "notes": "Validates reduced real build/install facts. Twelve instrumentation passes and six explicit optional assumption skips are distinguished from the actual approval and denial observations."
+    },
+    {
+      "id": "EV-009",
+      "requirement": "REQ-AGENT-019",
+      "claim": "A real default-APK native approval executes the requested controlled mail effect; a separately observed actual native denial performs no effect.",
+      "method": "probe",
+      "command": "jq -e '.implementation_commit == \"8d6e79fb48bad2afbccff4888579803b20fe3041\" and .rows.P1.result == \"pass\" and .rows.P1.effect_observed and .rows.P1.scenario_verified and .rows.P2.result == \"pass\" and .rows.P2.effect_observed == false and .rows.P2.scenario_verified and ([.rows[] | .native_prompt_observed and .observation_graph_verified and .observation_store_verified and .cleanup_done] | all) and .foreground_restored' docs/evidence/artifacts/issue-642/pixel-native-confirmation.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-642/pixel-native-confirmation.json",
+      "notes": "The command validates reduced observations from the existing product UI, actual system prompt and independent Graph/Store readbacks. It is not a live-row generator. Failed earlier observations remain excluded; accepted P1 and P2 use the same unchanged APK."
+    },
+    {
+      "id": "EV-010",
+      "requirement": "REQ-AGENT-019",
+      "claim": "Registered cleanup obligations are verified through both Graph and Store before foreground restoration and device-lock release.",
+      "method": "probe",
+      "command": "jq -e '.cleanup_result == \"pass\" and .acceptance_result == \"pass\" and ([.rows[] | .cleanup_registered_before_submission and .final_graph_unread_verified and .final_store_unread_verified and .cleanup_done] | all) and .prior_foreground_restored and .device_lock_released and .cleanup_supplies_missing_scenario_pass == false' docs/evidence/artifacts/issue-642/graph-and-store-revert.json",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-642/graph-and-store-revert.json",
+      "notes": "One controller connection failure required a separately verified cleanup retry. At that readback targets were already unread; no unrecorded revert-write response is claimed."
+    },
+    {
+      "id": "EV-011",
+      "requirement": "REQ-AGENT-019",
+      "claim": "Product feature inspection and runtime harness testing retain exactly the iSyncYou tool without experimental local-client authority.",
+      "method": "command",
+      "command": "cargo remote -- tree -e features -p isyncyou-daemon -p isyncyou-mobile",
+      "result": "pass",
+      "artifact": "docs/evidence/artifacts/issue-642/feature-graphs.json",
+      "notes": "Runtime authority is separately covered by discovered_model_protocol_and_effort_keep_only_isyncyou_harness in the exact workspace aggregate. The feature graph alone is not that proof."
+    }
+  ]
+}

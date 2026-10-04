@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "implementation_commit": "8d6e79fb48bad2afbccff4888579803b20fe3041",
+  "row": "H2",
+  "method": "deterministic_fake_provider",
+  "test": "hostile_body_can_propose_but_cannot_authorize_or_execute_effect",
+  "test_result": "pass",
+  "command": "cargo remote -- test --workspace --features isyncyou-agent/agent-oauth-providers,isyncyou-agent/onedrive,isyncyou-app-host/agent-oauth-providers --no-fail-fast",
+  "original_private_log_sha256": "76a5c73aa992bb17b83d7f0d98c7a88e16bfcafaf23aa586a581c4196824cd71",
+  "claims_live_provider_behavior": false,
+  "claims_model_cannot_propose_unsafe_action": false,
+  "claim": "A hostile retrieved body may lead to an effect proposal, but cannot create confirmation authority or cause unconfirmed execution.",
+  "raw_fixture_body_included": false,
+  "authority_material_included": false,
+  "raw_provider_frame_included": false,
+  "remote_job_id": "fc131c51b6d1bd0f93a020e4"
+}

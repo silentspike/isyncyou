@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "implementation_commit": "8d6e79fb48bad2afbccff4888579803b20fe3041",
+  "commands": [
+    "cargo remote -- tree -e features -p isyncyou-daemon -p isyncyou-mobile"
+  ],
+  "remote_job_id": "2008f6630783b0b923503e5c",
+  "exit_code": 0,
+  "daemon_product_graph": "pass",
+  "mobile_product_graph": "pass",
+  "experimental_agent_subscription_present": false,
+  "one_tool_runtime_contract_test": "discovered_model_protocol_and_effort_keep_only_isyncyou_harness",
+  "one_tool_runtime_contract_test_result": "pass",
+  "forbidden_ops_not_in_schema": [
+    "shell",
+    "arbitrary-filesystem",
+    "os-command",
+    "device",
+    "free-form-http"
+  ],
+  "graph_alone_proves_runtime_authority": false
+}

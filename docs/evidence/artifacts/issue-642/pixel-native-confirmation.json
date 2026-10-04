@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "scope": "issue-642-default-apk",
+  "apk_sha256": "3d3d4472eb9360c63b8f8244b908bd086b673683081fb153fad70f1f20849ded",
+  "rows": {
+    "P1": {
+      "result": "pass",
+      "effect_observed": true,
+      "revert_write_acknowledged": false,
+      "graph_verified": true,
+      "store_verified": true,
+      "cleanup_done": true,
+      "native_prompt_observed": true,
+      "scenario_verified": true,
+      "observation_graph_verified": true,
+      "observation_store_verified": true
+    },
+    "P2": {
+      "result": "pass",
+      "effect_observed": false,
+      "revert_write_acknowledged": false,
+      "graph_verified": true,
+      "store_verified": true,
+      "cleanup_done": true,
+      "native_prompt_observed": true,
+      "scenario_verified": true,
+      "observation_graph_verified": true,
+      "observation_store_verified": true
+    }
+  },
+  "cleanup_retry_was_required": true,
+  "foreground_restored": true,
+  "redaction": {
+    "account_identity_included": false,
+    "item_or_request_reference_included": false,
+    "device_identity_included": false,
+    "confirmation_authority_included": false,
+    "raw_platform_output_included": false
+  },
+  "implementation_commit": "8d6e79fb48bad2afbccff4888579803b20fe3041",
+  "qualification": {
+    "separate_observed_runs_on_same_artifact": true,
+    "prior_denial_attempt_accepted_instead_of_denied": true,
+    "prior_failed_observation_relabelled": false,
+    "approval_requests_for_accepted_row": 1,
+    "denial_requests_for_accepted_row": 1,
+    "earlier_expired_approval_not_used_for_acceptance": true,
+    "earlier_cleanup_controller_connection_failed": true,
+    "later_cleanup_independently_verified_before_lock_release": true,
+    "restored_graph_and_store_unread": true,
+    "revert_write_acknowledgement_not_claimed_when_already_unread": true
+  }
+}

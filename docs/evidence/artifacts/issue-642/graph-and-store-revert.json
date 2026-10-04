@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "implementation_commit": "8d6e79fb48bad2afbccff4888579803b20fe3041",
+  "scope": "default-apk-observation-and-cleanup",
+  "cleanup_result": "pass",
+  "acceptance_result": "pass",
+  "rows": {
+    "P1": {
+      "cleanup_registered_before_submission": true,
+      "native_prompt_observed": true,
+      "approval_verified": true,
+      "graph_and_store_effect_verified": true,
+      "revert_write_acknowledged": false,
+      "final_graph_unread_verified": true,
+      "final_store_unread_verified": true,
+      "cleanup_done": true
+    },
+    "P2": {
+      "cleanup_registered_before_submission": true,
+      "native_prompt_observed": true,
+      "denial_verified": true,
+      "graph_and_store_no_effect_verified": true,
+      "revert_write_acknowledged": false,
+      "final_graph_unread_verified": true,
+      "final_store_unread_verified": true,
+      "cleanup_done": true
+    }
+  },
+  "prior_foreground_restored": true,
+  "device_lock_released": true,
+  "cleanup_retry_was_required": true,
+  "cleanup_supplies_missing_scenario_pass": false,
+  "private_account_item_and_device_bindings_included": false,
+  "qualification_note": "Approval and actual native denial were independently observed in separate runs of the same unchanged APK. The earlier second prompt was accepted, not denied, and is not denial evidence. After a controller connection failure, cleanup was separately retried and both targets were verified unread. No revert response is claimed for a target already unread at that readback."
+}
