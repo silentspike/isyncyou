@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "issue": 642,
+  "initial_bootstrap": {
+    "source": "historical local Task-0 readback, not a reconstruction from current GitHub state",
+    "date": "2026-08-03",
+    "branch": "feature/ag-642",
+    "base_commit": "ad0aa12cb3ab76473b5085c9cb73e1dad65c9345",
+    "clean_initial_diff": true,
+    "open_pr_count": 0
+  },
+  "current_qualification_readback": {
+    "checked_at": "2026-10-04T18:03:39Z",
+    "implementation_commit": "8d6e79fb48bad2afbccff4888579803b20fe3041",
+    "origin_dev": "1f8904551f59ae6f402480a96f8fa4c28e182964",
+    "issue_state": "OPEN",
+    "issue_status": "status:in-progress",
+    "closed_foundations": [617, 620, 621, 626, 628, 643, 644],
+    "merged_ancestral_prs": [
+      {"number": 791, "merge_commit": "5dd1073e759bbbf006ca95eb2bacc72b84017c7e"},
+      {"number": 820, "merge_commit": "bbca96bfaca7de087bc00409fd6c15e96efee382"},
+      {"number": 831, "merge_commit": "23d51e4e5feff89cd2cc2d46ff9928e061c289cc"},
+      {"number": 832, "merge_commit": "886b314a7df890cf08381a523f8ec60ddf7817ef"},
+      {"number": 833, "merge_commit": "5ef6dd66ed75c4d05a3104edcbedbc2783d3c283"}
+    ],
+    "open_dependency_prs": [873, 874, 875, 876, 877],
+    "open_pr_semantic_review": "Action-pin updates only; no Agent authorization, confirmation, stream or native-presence contract change. Existing approved build-maintenance paths overlap and must be reconciled if dev moves before landing.",
+    "feature_branch_pushed": false,
+    "pull_request_opened": false,
+    "landing_target": "dev"
+  },
+  "historical_bootstrap_is_current_live_proof": false,
+  "release_or_promotion_action_performed": false
+}

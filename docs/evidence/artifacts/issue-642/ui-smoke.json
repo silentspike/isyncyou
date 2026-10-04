@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "implementation_commit": "8d6e79fb48bad2afbccff4888579803b20fe3041",
+  "row": "H3",
+  "method": "deterministic_browser_fixture",
+  "all_assertions_passed": 51,
+  "containment_assertions_passed": 31,
+  "wizard_assertions_passed": 73,
+  "commands": [
+    "node tools/agent-living-ui-smoke.mjs --out /tmp/issue-642-final-ui-8d6e79f",
+    "node tools/agent-living-ui-smoke.mjs --scenario containment --out /tmp/issue-642-final-containment-8d6e79f",
+    "node tools/agent-wizard-smoke.mjs --out /tmp/issue-642-final-wizard-8d6e79f"
+  ],
+  "real_account_or_provider_claimed": false,
+  "physical_approval_or_denial_claimed": false,
+  "artifact_sha256": {
+    "ui-smoke/ui-smoke.json": "3d1f7fd86c4e3d64f57a2381e142c01bdd5a0a57e0a79b3d31dbf230fedaaad7",
+    "ui-smoke/desktop-running.png": "c7841754fe8fa65dec2f679e04d928b1200f54ad862e5e1114600eb90bc54e76",
+    "ui-smoke/desktop-terminal.png": "4bf356bafbfa614022e9ff0552ab217755d970d695f2f46e146066dc89077d07",
+    "ui-smoke/mobile-terminal.png": "ca03d61e4fe38b8d9a8ee678c42ce0d5ee361e60315c6867f458223c0ad969ad",
+    "ui-smoke/reduced-motion.png": "1db86775dfd4362c9fb29775fc2d23bc820d089b17fc28a3669e480220cf70dd",
+    "containment-smoke/ui-smoke.json": "88a5dca901642a06227945712647a49e45edd93951239f529b92dd68c7a57277"
+  },
+  "screenshots_visually_inspected": true,
+  "claims_no_possible_model_proposal": false
+}

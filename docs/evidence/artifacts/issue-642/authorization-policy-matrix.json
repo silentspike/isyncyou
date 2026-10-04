@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "implementation_commit": "8d6e79fb48bad2afbccff4888579803b20fe3041",
+  "row": "H1",
+  "method": "deterministic_runtime_tests",
+  "result": "pass",
+  "authority_source": "ToolAction::policy",
+  "actions": [
+    {
+      "op": "search",
+      "class": "Read",
+      "recovery": "RepeatableReadAndCompare"
+    },
+    {
+      "op": "deep-search",
+      "class": "Read",
+      "recovery": "RepeatableReadAndCompare"
+    },
+    {
+      "op": "read",
+      "class": "Read",
+      "recovery": "RepeatableReadAndCompare"
+    },
+    {
+      "op": "list",
+      "class": "Read",
+      "recovery": "RepeatableReadAndCompare"
+    },
+    {
+      "op": "export",
+      "class": "Read",
+      "recovery": "RepeatableReadAndCompare"
+    },
+    {
+      "op": "restore-local",
+      "class": "Read",
+      "recovery": "IdempotentLocalMaterialize"
+    },
+    {
+      "op": "backup",
+      "class": "Destructive",
+      "recovery": "NeverRepeat"
+    },
+    {
+      "op": "restore-cloud",
+      "class": "Destructive",
+      "recovery": "NeverRepeat"
+    },
+    {
+      "op": "live-write",
+      "class": "Destructive",
+      "recovery": "NeverRepeat"
+    },
+    {
+      "op": "share",
+      "class": "Destructive",
+      "recovery": "NeverRepeat"
+    }
+  ],
+  "passed_tests": [
+    "tool_authorization_and_recovery_policy_is_one_exhaustive_matrix",
+    "tool_policy_rejects_invalid_authorization_recovery_pairs",
+    "read_policy_is_exactly_search_deep_read_list_export_restore_local",
+    "confirmed_effect_policy_is_exactly_backup_restore_cloud_live_write_share",
+    "destructive_action_stops_for_confirmation_without_executing",
+    "each_confirmed_effect_routes_once_through_existing_executor",
+    "confirmation_store_rejects_session_request_or_turn_owner_mismatch_without_consumption",
+    "confirmation_store_recomputes_persisted_action_hash_before_consumption",
+    "confirmation_store_rejects_read_or_reclassified_action_before_consumption",
+    "confirmation_store_cancel_confirm_race_has_one_terminal_winner",
+    "confirmation_store_owner_policy_failure_survives_restart_with_zero_effect",
+    "agent_confirm_same_request_replay_never_executes_twice",
+    "agent_confirm_restart_with_stale_started_receipt_remains_request_outcome_unknown",
+    "agent_confirm_production_send_accepted_then_disconnected_is_outcome_unknown",
+    "agent_confirm_projection_commit_failure_after_known_success_returns_unknown_without_reexecution",
+    "agent_confirm_projection_commit_failure_after_known_failure_returns_unknown_without_reexecution",
+    "agent_confirm_finish_audit_failure_preserves_known_completed_effect",
+    "agent_confirm_response_hides_internal_executor_summary",
+    "mobile_agent_confirm_after_biometric_consumes_agent_token_once",
+    "mobile_agent_confirm_wrong_biometric_token_does_not_consume_agent_pending",
+    "mobile_agent_confirm_revalidates_owner_before_native_handle_consumption",
+    "agent_confirm_rejects_always_allow_remember_and_unknown_bypass_fields",
+    "agent_confirm_defers_transcript_projection_and_preserves_terminal_outbox_after_restart"
+  ],
+  "original_private_log_sha256": "76a5c73aa992bb17b83d7f0d98c7a88e16bfcafaf23aa586a581c4196824cd71",
+  "native_physical_acceptance_claimed": false,
+  "live_cloud_effect_claimed": false,
+  "command": "cargo remote -- test --workspace --features isyncyou-agent/agent-oauth-providers,isyncyou-agent/onedrive,isyncyou-app-host/agent-oauth-providers --no-fail-fast",
+  "remote_job_id": "fc131c51b6d1bd0f93a020e4"
+}
