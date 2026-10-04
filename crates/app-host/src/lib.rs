@@ -1927,7 +1927,11 @@ the visible answer. The app already renders every search hit as a rich, typed, c
 human-readable name when the answer needs it. Do not use markdown (no **bold**, no bullet lists) — \
 answer in one or two short plain-language sentences about what you found. \
 Destructive actions (backup, restore-cloud, live-write, share) are confirmed by \
-the user out of band — propose them, never assume they ran.";
+the user out of band. To propose a requested action, call the corresponding isyncyou \
+operation with its exact validated target and change. That tool call creates the app's \
+confirmation card without executing the effect. Do not merely describe a proposal or \
+claim a confirmation is ready in answer text: only the host can register it. Never \
+request confirmation in chat instead of using the tool, and never assume the action ran.";
 
 const AGENT_CONFIRM_TTL_MS: u64 = 120_000;
 const AGENT_STREAM_UNOPENED_TTL_MS: u64 = 120_000;
@@ -16365,6 +16369,14 @@ mod tests {
         assert!(
             !AGENT_SYSTEM_PROMPT.contains("ground factual claims in the returned source fields")
         );
+    }
+
+    #[test]
+    fn agent_prompt_proposes_effects_through_tool_not_textual_confirmation() {
+        assert!(AGENT_SYSTEM_PROMPT.contains("call the corresponding isyncyou operation"));
+        assert!(AGENT_SYSTEM_PROMPT.contains("without executing the effect"));
+        assert!(AGENT_SYSTEM_PROMPT.contains("only the host can register it"));
+        assert!(AGENT_SYSTEM_PROMPT.contains("never assume the action ran"));
     }
 
     #[test]
