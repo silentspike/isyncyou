@@ -24,11 +24,15 @@ scan_binary() {
 
 verify_feature_matrix() {
   cd "$ROOT"
-  cargo metadata --no-deps --format-version 1 >"$TMP_ROOT/metadata.json"
+  cargo remote -- metadata --no-deps --format-version 1 >"$TMP_ROOT/metadata-output.txt"
+  # v2 emits job status around Cargo output; require one structured metadata object.
+  jq -Rsc 'split("\n") | map(fromjson? | select(.packages? != null and .workspace_root? != null))
+    | if length == 1 then .[0] else error("remote metadata output is ambiguous") end' \
+    "$TMP_ROOT/metadata-output.txt" >"$TMP_ROOT/metadata.json"
   # This toolchain emits no tree when cargo writes directly to a regular file.
-  cargo tree -p isyncyou-daemon -e normal -f '{p} features={f}' \
+  cargo remote -- tree -p isyncyou-daemon -e normal -f '{p} features={f}' \
     | cat >"$TMP_ROOT/default-tree.txt"
-  cargo tree -p isyncyou-daemon --features agent-subscription-experimental \
+  cargo remote -- tree -p isyncyou-daemon --features agent-subscription-experimental \
     -e normal -f '{p} features={f}' | cat >"$TMP_ROOT/experimental-tree.txt"
 
   if rg -q 'agent-subscription-experimental' "$TMP_ROOT/default-tree.txt"; then
@@ -63,7 +67,7 @@ verify_feature_matrix() {
 verify_release_exclusion() {
   cd "$ROOT"
   mkdir -p target/release
-  cargo remote --no-copy-lock -d 1.95.0 -c release/isyncyoud -- \
+  cargo remote --no-copy-lock -c release/isyncyoud -- \
     build --locked --release -p isyncyou-daemon
   [[ -x target/release/isyncyoud ]] || die "release daemon is unavailable"
   scan_binary target/release/isyncyoud

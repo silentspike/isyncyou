@@ -312,15 +312,29 @@ const PREFER_IMMUTABLE_ID: &str = r#"IdType="ImmutableId", outlook.timezone="UTC
 const GRAPH_BATCH_REQUEST_LIMIT: usize = 20;
 const TODO_DELETE_BATCH_PARALLELISM: usize = 4;
 
-/// The default HTTP client for Graph calls (#0.4): a request timeout so a hung
-/// connection can never wedge a sync/read pass, plus a connect timeout. Falls back to
-/// a plain client if the builder ever fails (it doesn't in practice).
-fn default_client() -> reqwest::blocking::Client {
+/// Keep the WebPKI trust roots used before reqwest 0.13 on desktop and Android.
+/// Only the ledger/operation layer may decide to retry a potentially effectful call.
+pub(crate) fn client_builder() -> reqwest::blocking::ClientBuilder {
+    // Preserve the pre-upgrade crypto backend; repeated installation is harmless.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     reqwest::blocking::Client::builder()
+        .tls_certs_only(
+            webpki_root_certs::TLS_SERVER_ROOT_CERTS
+                .iter()
+                .map(|certificate| {
+                    reqwest::Certificate::from_der(certificate.as_ref())
+                        .expect("validated WebPKI root")
+                }),
+        )
+        .retry(reqwest::retry::never())
+}
+
+fn default_client() -> reqwest::blocking::Client {
+    client_builder()
         .timeout(Duration::from_secs(60))
         .connect_timeout(Duration::from_secs(15))
         .build()
-        .unwrap_or_else(|_| reqwest::blocking::Client::new())
+        .expect("Graph HTTP client initialization")
 }
 
 impl GraphClient {
@@ -423,7 +437,7 @@ fn bounded_client(
     if request_timeout.is_zero() || connect_timeout.is_zero() || connect_timeout > request_timeout {
         return Err(UploadError::Parse("invalid Graph timeout policy".into()));
     }
-    reqwest::blocking::Client::builder()
+    client_builder()
         .timeout(request_timeout)
         .connect_timeout(connect_timeout)
         .build()

@@ -66,3 +66,22 @@ local-HTTP daemon. (Removed at #89 — see "Implementation status".)
   serves the UI over loopback (the same `include_str!` assets the daemon serves), the app
   needs no asset-origin loader. `usesCleartextTraffic` is removed globally and scoped to
   `127.0.0.1` via `network_security_config.xml` (Graph is HTTPS).
+
+## Current dependency and builder baseline (2026-10-04)
+
+The historical toolchain and Gradle-owned Rust task above are superseded by the
+separate native-artifact boundary. Gradle packages a commit/ABI/feature/hash-bound
+library and never invokes Rust locally. Local native builds use Cargo Remote v2's
+additive `android-r30` profile; GitHub-hosted CI keeps the explicit runner-only
+backend. Both build paths target native API 34 with NDK 30.0.16248370 and read the
+exact Rust version from `rust-toolchain.toml` (currently 1.99.0).
+
+The maintained Android baseline is minSdk 34 (Android 14), targetSdk 37 and
+compileSdk 37.2, with build-tools 37.0.0, AGP 9.4.1, built-in Kotlin overridden to
+2.4.20, and the checksum-pinned Gradle 9.8.0 wrapper. Older Android installations
+cannot install this build. An unavailable remote profile or mismatched native
+manifest fails closed; an old NDK or local Rust build is not a fallback.
+
+Changing this baseline requires fresh native/Gradle/platform qualification. Old
+APK and issue evidence does not prove the updated artifact. See
+`android/README.md` and `tools/build-android-native.sh` for the executable boundary.

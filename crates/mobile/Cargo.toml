@@ -24,7 +24,7 @@ libc = "0.2"
 
 [features]
 # Android ships SQLCipher (#0B): the vendored-OpenSSL arm64 cross-build works via
-# cargo-ndk + NDK r27, so the phone's store DB is encrypted at rest with a
+# Cargo Remote Android profile + NDK r30, so the phone's store DB is encrypted at rest with a
 # hardware-backed (Android Keystore) key. Body files get their own AES-256-GCM
 # envelope (`isyncyou-core::envelope`). With no key installed the store still opens
 # plaintext (host tests), so only the on-device run is encrypted.

@@ -8,6 +8,6 @@
     "ui-smoke": "node tools/ci-ui-smoke.mjs"
   },
   "devDependencies": {
-    "playwright": "1.61.1"
+    "playwright": "1.63.0"
   }
 }

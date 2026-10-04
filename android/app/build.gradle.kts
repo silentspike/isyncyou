@@ -3,7 +3,6 @@ import java.util.Properties
 
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
 }
 
 // Firebase google-services plugin (FCM, #575): processes app/google-services.json.
@@ -94,15 +93,18 @@ val requestedCargoTestFeatures = System.getenv("ISY_CARGO_FEATURES")
 
 android {
     namespace = "com.silentspike.isyncyou"
-    compileSdk = 34
+    compileSdk {
+        version = release(37) { minorApiLevel = 2 }
+    }
+    buildToolsVersion = "37.0.0"
     // Single source of truth for the NDK used by the separate native build step.
     // Gradle never invokes Cargo or rustc; it only packages a validated artifact.
-    ndkVersion = System.getenv("ISY_NDK_VERSION") ?: "27.3.13750724"
+    ndkVersion = System.getenv("ISY_NDK_VERSION") ?: "30.0.16248370"
 
     defaultConfig {
         applicationId = "com.silentspike.isyncyou"
-        minSdk = 24
-        targetSdk = 34
+        minSdk = 34
+        targetSdk = 37
         versionCode = (System.getenv("ISY_VERSION_CODE") ?: "1").toInt()
         versionName = System.getenv("ISY_VERSION_NAME") ?: "0.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -144,29 +146,26 @@ android {
     buildFeatures {
         buildConfig = true
     }
-    kotlinOptions {
-        jvmTarget = "17"
-    }
 }
 
 dependencies {
-    implementation("androidx.core:core-ktx:1.13.1")
-    implementation("androidx.webkit:webkit:1.11.0")
+    implementation("androidx.core:core-ktx:1.19.1")
+    implementation("androidx.webkit:webkit:1.17.1")
     // Biometric per-action confirmation for destructive ops (#onedrive-mobile 0.6).
     // Pulls androidx.fragment; MainActivity is a FragmentActivity for BiometricPrompt.
     implementation("androidx.biometric:biometric:1.1.0")
     // WorkManager is the only production executor for durable mobile jobs (#626).
-    implementation("androidx.work:work-runtime-ktx:2.9.1")
+    implementation("androidx.work:work-runtime-ktx:2.12.0")
     // Firebase Cloud Messaging via the BoM (#575) — version-aligned, messaging only.
-    implementation(platform("com.google.firebase:firebase-bom:33.7.0"))
+    implementation(platform("com.google.firebase:firebase-bom:34.19.0"))
     implementation("com.google.firebase:firebase-messaging")
 
     testImplementation("junit:junit:4.13.2")
-    testImplementation("org.json:json:20240303")
-    testImplementation("androidx.work:work-runtime-ktx:2.9.1")
-    androidTestImplementation("androidx.test.ext:junit:1.2.1")
-    androidTestImplementation("androidx.test:core:1.6.1")
-    androidTestImplementation("androidx.test:runner:1.6.2")
+    testImplementation("org.json:json:20260814")
+    testImplementation("androidx.work:work-runtime-ktx:2.12.0")
+    androidTestImplementation("androidx.test.ext:junit:1.3.0")
+    androidTestImplementation("androidx.test:core:1.7.0")
+    androidTestImplementation("androidx.test:runner:1.7.0")
 }
 
 fun sha256(file: File): String {
@@ -198,7 +197,7 @@ fun gitOutput(vararg args: String): String {
 // tools/build-android-native.sh, whose default backend is cargo remote; GitHub Actions
 // may opt into its runner-only backend. This task fails closed on missing, stale, or
 // mismatched native output and never starts Cargo or rustc itself.
-val validateRemoteNativeArtifact by tasks.registering {
+val validateRemoteNativeArtifact = tasks.register("validateRemoteNativeArtifact") {
     val nativeDir = file("src/main/jniLibs")
     val manifestFile = nativeDir.resolve("isyncyou-native.properties")
     inputs.files(manifestFile, androidAbis.map { nativeDir.resolve("$it/libisyncyou_mobile.so") })
@@ -210,7 +209,7 @@ val validateRemoteNativeArtifact by tasks.registering {
             )
         }
 
-        val nativeInputs = listOf("Cargo.toml", "Cargo.lock", "crates", "gui/webui")
+        val nativeInputs = listOf("Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "tools/build-android-native.sh", "crates", "gui/webui")
         val dirtyInputs = gitOutput("status", "--porcelain", "--untracked-files=all", "--", *nativeInputs.toTypedArray())
         if (dirtyInputs.isNotEmpty()) {
             throw GradleException(
@@ -226,6 +225,8 @@ val validateRemoteNativeArtifact by tasks.registering {
         val expectedAbis = androidAbis.sorted().joinToString(",")
         val expectedFeatures = requestedCargoTestFeatures.sorted().joinToString(",")
         val expectedNdk = android.ndkVersion
+        val expectedRust = System.getenv("ISY_RUST_TOOLCHAIN") ?: rootProject.file("../rust-toolchain.toml")
+            .readLines().single { it.startsWith("channel = ") }.substringAfter('"').substringBefore('"')
 
         val bindings = mapOf(
             "schema" to "1",
@@ -233,6 +234,8 @@ val validateRemoteNativeArtifact by tasks.registering {
             "abis" to expectedAbis,
             "features" to expectedFeatures,
             "ndk_version" to expectedNdk,
+            "android_api" to "34",
+            "rust_toolchain" to expectedRust,
         )
         bindings.forEach { (key, expected) ->
             val actual = manifest.getProperty(key)

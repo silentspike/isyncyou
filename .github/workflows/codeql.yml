@@ -56,20 +56,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         if: matrix.language == 'java-kotlin'
         with:
-          toolchain: "1.95.0"
+          toolchain: "1.99.0"
           targets: aarch64-linux-android
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+      - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
         if: matrix.language == 'java-kotlin'
         with:
           tool: cargo-ndk
       # sdkmanager onto PATH + licenses (preinstalled SDK isn't on PATH → bare call 127).
-      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         if: matrix.language == 'java-kotlin'
       - name: Install the pinned NDK (matches android.ndkVersion)
         if: matrix.language == 'java-kotlin'
-        run: yes | sdkmanager --install "ndk;27.3.13750724"
+        run: sdkmanager --install "ndk;30.0.16248370" "platforms;android-37.2" "build-tools;37.0.0"
 
-      - uses: github/codeql-action/init@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
+      - uses: github/codeql-action/init@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
@@ -82,6 +82,6 @@ jobs:
           tools/build-android-native.sh
           cd android && ./gradlew :app:assembleDebug
 
-      - uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+      - uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
         with:
           category: "/language:${{ matrix.language }}"

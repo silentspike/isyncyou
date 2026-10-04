@@ -397,6 +397,8 @@ pub(crate) struct LifecycleAuditEvent {
 type LifecycleAuditHook = Arc<dyn Fn(&LifecycleAuditEvent) + Send + Sync>;
 
 impl LifecycleDiagnostics {
+    // Retain the equivalent API available at the supported Rust 1.95 MSRV.
+    #[allow(deprecated)]
     pub(crate) fn record_audit_failure(&self) {
         let _ = self.audit_failures.fetch_update(
             std::sync::atomic::Ordering::AcqRel,

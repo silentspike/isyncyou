@@ -558,6 +558,8 @@ struct AgentAuthorizationDiagnostics {
 }
 
 impl AgentAuthorizationDiagnostics {
+    // Retain the equivalent API available at the supported Rust 1.95 MSRV.
+    #[allow(deprecated)]
     fn increment(counter: &AtomicU64) {
         let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             Some(value.saturating_add(1))
