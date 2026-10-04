@@ -437,6 +437,7 @@ fn ingest_message(
     store.upsert_item(&it)?;
     // Capture the full Graph message JSON beside the .eml (completeness, #562).
     write_message_json(archive_root, id, msg)?;
+    store.invalidate_preview_json(account, SERVICE, id)?;
     Ok(Ingest::Upserted)
 }
 
@@ -533,6 +534,56 @@ mod tests {
         assert_eq!(v["importance"], "high");
         assert_eq!(v["ccRecipients"][0]["emailAddress"]["address"], "c@x.com");
         assert_eq!(v["webLink"], "https://outlook.live.com/mail/0/x");
+    }
+
+    #[test]
+    fn mail_metadata_delta_invalidates_cached_read_state_without_mime_change() {
+        let store = Store::open_in_memory().unwrap();
+        let arch = tempfile::tempdir().unwrap();
+        let mut message = msg("metadata-fixture", "Controlled metadata fixture");
+        message["isRead"] = json!(true);
+        ingest_message(&store, "acc", "FA", &message, "t1", arch.path()).unwrap();
+        store
+            .set_preview_json("acc", SERVICE, "metadata-fixture", r#"{"isRead":true}"#)
+            .unwrap();
+        store
+            .upsert_item(&Item::new(
+                "other",
+                SERVICE,
+                "metadata-fixture",
+                "Other",
+                "message",
+            ))
+            .unwrap();
+        store
+            .set_preview_json("other", SERVICE, "metadata-fixture", r#"{"isRead":true}"#)
+            .unwrap();
+
+        message["isRead"] = json!(false);
+        ingest_message(&store, "acc", "FA", &message, "t2", arch.path()).unwrap();
+        assert!(store
+            .get_item("acc", SERVICE, "metadata-fixture")
+            .unwrap()
+            .unwrap()
+            .preview_json
+            .is_none());
+        assert!(store
+            .get_item("other", SERVICE, "metadata-fixture")
+            .unwrap()
+            .unwrap()
+            .preview_json
+            .is_some());
+        let sidecar: Value = serde_json::from_slice(
+            &isyncyou_core::envelope::read_body(&shard_path(
+                arch.path(),
+                SERVICE,
+                "metadata-fixture",
+                "json",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sidecar["isRead"], false);
     }
 
     #[test]
