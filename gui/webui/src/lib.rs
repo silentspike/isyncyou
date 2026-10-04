@@ -9038,9 +9038,9 @@ impl Router {
                                 strict_body_by_id.as_ref(),
                             );
                             // Fast path (schema v12): a mail row whose `preview` was
-                            // already computed is served straight from the DB column —
-                            // no `.eml`/`.json` read, no MIME parse, no attachment decode.
-                            // This is the hot mailbox-load path once bodies are warmed.
+                            // already computed reuses the MIME-derived DB fields.
+                            // Mutable Outlook sidecar metadata is refreshed separately;
+                            // no MIME parse or attachment decode is needed on this path.
                             let cached = service == "mail"
                                 && it
                                     .preview_json
@@ -9048,6 +9048,13 @@ impl Router {
                                     .and_then(|s| serde_json::from_str::<Value>(s).ok())
                                     .map(|pv| v["preview"] = pv)
                                     .is_some();
+                            if cached {
+                                if let (Some(root), Some(rel)) =
+                                    (archive_root.as_ref(), it.local_path.as_deref())
+                                {
+                                    merge_mail_sidecar_preview(&mut v["preview"], root, rel);
+                                }
+                            }
                             if !cached {
                                 if let (Some(root), Some(rel)) =
                                     (archive_root.as_ref(), it.local_path.as_ref())
@@ -10088,13 +10095,45 @@ fn onedrive_preview(o: &Value) -> Value {
     })
 }
 
-/// Build a mail item's `preview` (#562). A `message` carries the `.eml`-parsed
-/// fields (from/to/cc/subject/snippet/date/has_html/size), the attachment list,
-/// and the structured Outlook fields merged from its `<id>.json` sidecar
-/// (categories/isRead/flag/importance/inferenceClassification/bcc/conversationId/
-/// webLink/isDraft/receipt flags). A `category` item exposes its displayName +
-/// colour so the UI can build a colour map. `bytes` is the item's `local_path`
-/// body (`.eml` for a message, `.json` for a category).
+/// Refresh mutable Outlook metadata without reparsing a cached MIME body.
+fn merge_mail_sidecar_preview(preview: &mut Value, root: &std::path::Path, rel: &str) {
+    let Some(jrel) = rel.strip_suffix(".eml").map(|s| format!("{s}.json")) else {
+        return;
+    };
+    let Some(jb) = read_under_root(root, &jrel) else {
+        return;
+    };
+    let Ok(o) = serde_json::from_slice::<Value>(&jb) else {
+        return;
+    };
+    if !preview.is_object() || !o.is_object() {
+        return;
+    }
+    for key in [
+        "categories",
+        "isRead",
+        "importance",
+        "inferenceClassification",
+        "conversationId",
+        "webLink",
+        "isDraft",
+        "isDeliveryReceiptRequested",
+        "isReadReceiptRequested",
+    ] {
+        preview[key] = o[key].clone();
+    }
+    preview["flag"] = o["flag"]["flagStatus"].clone();
+    if let Some(bcc) = o["bccRecipients"].as_array() {
+        preview["bcc"] = Value::Array(
+            bcc.iter()
+                .filter_map(|r| r["emailAddress"]["address"].as_str())
+                .map(|s| json!(s))
+                .collect(),
+        );
+    }
+}
+
+/// Merge MIME fields and structured Outlook sidecar metadata into a preview.
 fn mail_preview_enrichment(
     v: &mut Value,
     it: &Item,
@@ -10128,32 +10167,7 @@ fn mail_preview_enrichment(
                 })
                 .collect();
             preview["attachment_list"] = Value::Array(atts);
-            // Merge the structured Outlook fields from the <id>.json sidecar.
-            if let Some(jrel) = rel.strip_suffix(".eml").map(|s| format!("{s}.json")) {
-                if let Some(jb) = read_under_root(root, &jrel) {
-                    if let Ok(o) = serde_json::from_slice::<Value>(&jb) {
-                        preview["categories"] = o["categories"].clone();
-                        preview["isRead"] = o["isRead"].clone();
-                        preview["flag"] = o["flag"]["flagStatus"].clone();
-                        preview["importance"] = o["importance"].clone();
-                        preview["inferenceClassification"] = o["inferenceClassification"].clone();
-                        preview["conversationId"] = o["conversationId"].clone();
-                        preview["webLink"] = o["webLink"].clone();
-                        preview["isDraft"] = o["isDraft"].clone();
-                        preview["isDeliveryReceiptRequested"] =
-                            o["isDeliveryReceiptRequested"].clone();
-                        preview["isReadReceiptRequested"] = o["isReadReceiptRequested"].clone();
-                        if let Some(bcc) = o["bccRecipients"].as_array() {
-                            preview["bcc"] = Value::Array(
-                                bcc.iter()
-                                    .filter_map(|r| r["emailAddress"]["address"].as_str())
-                                    .map(|s| json!(s))
-                                    .collect(),
-                            );
-                        }
-                    }
-                }
-            }
+            merge_mail_sidecar_preview(&mut preview, root, rel);
             v["preview"] = preview;
         }
         "category" => {
@@ -10507,6 +10521,62 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let cat = items.iter().find(|i| i["remote_id"] == "c1").unwrap();
         assert_eq!(cat["preview"]["displayName"], "Red category");
         assert_eq!(cat["preview"]["color"], "preset0");
+    }
+
+    #[test]
+    fn items_mail_cached_preview_tracks_sidecar_read_state_without_mime_reparse() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        let rel = "mail/aa/bb/cached.eml";
+        std::fs::create_dir_all(arch.join("mail/aa/bb")).unwrap();
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            let mut item = Item::new("a", "mail", "m1", "Cached fixture", "message");
+            item.local_path = Some(rel.into());
+            store.upsert_item(&item).unwrap();
+            store
+                .set_preview_json(
+                    "a",
+                    "mail",
+                    "m1",
+                    &json!({
+                        "subject": "Cached fixture", "snippet": "Cached MIME content",
+                        "from": "sender@example.test", "isRead": true,
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+        }
+        let router = Router::new(Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a@example.test".into(),
+                sync_root: dir.path().join("od"),
+                archive_root: arch.clone(),
+                cache_root: Default::default(),
+                mount_point: None,
+            }],
+            ..Default::default()
+        });
+        // The MIME file is deliberately absent: a warm preview must not reparse it.
+        for is_read in [false, true, false] {
+            std::fs::write(
+                arch.join("mail/aa/bb/cached.json"),
+                serde_json::to_vec(&json!({"isRead": is_read,
+                    "flag": {"flagStatus": "notFlagged"}}))
+                .unwrap(),
+            )
+            .unwrap();
+            let response = router.route(&ApiRequest::get(
+                "/api/v1/items?account=a&service=mail&limit=100",
+            ));
+            assert_eq!(response.status, 200);
+            let value = body_json(&response);
+            let preview = &value["items"][0]["preview"];
+            assert_eq!(preview["isRead"], is_read);
+            assert_eq!(preview["snippet"], "Cached MIME content");
+            assert_eq!(preview["from"], "sender@example.test");
+        }
     }
 
     #[test]
