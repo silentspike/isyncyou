@@ -19,8 +19,8 @@ isyncyou-connectors = { path = "../connectors", features = ["http"], default-fea
 serde_json = { workspace = true }
 # Content-derived idempotency key for crash-safe restore (ADR-001). RustCrypto,
 # permissive (MIT/Apache), no system deps.
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 
 [dev-dependencies]
 # Temp files for the ledger Upload/Replace body-source tests (#655).

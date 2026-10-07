@@ -4,9 +4,10 @@ umask 077
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 JNI_DIR="$ROOT/android/app/src/main/jniLibs"
-NDK_VERSION=${ISY_NDK_VERSION:-27.3.13750724}
-RUST_TOOLCHAIN=${ISY_RUST_TOOLCHAIN:-1.95.0}
-REMOTE_NDK=${ISY_REMOTE_ANDROID_NDK_HOME:-/opt/android-ndk-r27d}
+NDK_VERSION=${ISY_NDK_VERSION:-30.0.16248370}
+RUST_TOOLCHAIN=${ISY_RUST_TOOLCHAIN:-$(sed -n 's/^channel = "\([^"]*\)"/\1/p' "$ROOT/rust-toolchain.toml")}
+ANDROID_API=34
+REMOTE_PROFILE=android-r30
 BUILDER=${ISY_ANDROID_NATIVE_BUILDER:-remote}
 ABIS=${ISY_ANDROID_ABIS:-arm64-v8a}
 FEATURES=${ISY_CARGO_FEATURES:-}
@@ -64,10 +65,8 @@ declare -A targets=(
   [arm64-v8a]=aarch64-linux-android
   [x86_64]=x86_64-linux-android
 )
-declare -A linkers=(
-  [arm64-v8a]=aarch64-linux-android24-clang
-  [x86_64]=x86_64-linux-android24-clang
-)
+[[ $NDK_VERSION == 30.0.16248370 ]] || die "NDK version differs from the pinned remote profile"
+[[ $RUST_TOOLCHAIN =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "an exact Rust toolchain is required"
 
 for abi in "${abi_values[@]}"; do
   [[ -n $abi && ${targets[$abi]+present} ]] || die "unsupported ABI '$abi'"
@@ -91,7 +90,7 @@ else
 fi
 
 cd "$ROOT"
-native_status=$(git status --porcelain --untracked-files=all -- Cargo.toml Cargo.lock crates gui/webui)
+native_status=$(git status --porcelain --untracked-files=all -- Cargo.toml Cargo.lock rust-toolchain.toml tools/build-android-native.sh crates gui/webui)
 [[ -z $native_status ]] || die "Rust/WebUI inputs are dirty; commit them before producing a bound APK artifact"
 source_commit=$(git rev-parse HEAD)
 
@@ -109,15 +108,9 @@ for abi in "${canonical_abis[@]}"; do
 
   case $BUILDER in
     remote)
-      remote_bin="$REMOTE_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
       mkdir -p "$ROOT/target/$target/release"
-      target_env=$(printf 'RUST_BACKTRACE=1 RUSTUP_TOOLCHAIN=%s RUSTFLAGS=%q CARGO_TARGET_%s_LINKER=%s/%s CC_%s=%s/%s AR_%s=%s/llvm-ar' \
-        "$RUST_TOOLCHAIN" "$ANDROID_PAGE_RUSTFLAGS" \
-        "$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')" \
-        "$remote_bin" "${linkers[$abi]}" \
-        "$(printf '%s' "$target" | tr '-' '_')" "$remote_bin" "${linkers[$abi]}" \
-        "$(printf '%s' "$target" | tr '-' '_')" "$remote_bin")
-      cargo remote --no-copy-lock -d "$RUST_TOOLCHAIN" -b "$target_env" \
+      target_env=$(printf 'RUST_BACKTRACE=1 RUSTFLAGS=%q' "$ANDROID_PAGE_RUSTFLAGS")
+      cargo remote --no-copy-lock --profile "$REMOTE_PROFILE" -d "$RUST_TOOLCHAIN" -b "$target_env" \
         -c "$target/release/libisyncyou_mobile.so" -- \
         build --locked --release -p isyncyou-mobile --target "$target" "${feature_args[@]}"
       source_library="$ROOT/target/$target/release/libisyncyou_mobile.so"
@@ -128,7 +121,7 @@ for abi in "${canonical_abis[@]}"; do
       local_ndk=${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-${ANDROID_HOME:-}/ndk/$NDK_VERSION}}
       [[ -n $local_ndk ]] || die "ANDROID_NDK_HOME is required on the GitHub runner"
       env RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$ANDROID_PAGE_RUSTFLAGS" \
-        cargo "+$RUST_TOOLCHAIN" ndk -t "$abi" -o "$stage" \
+        cargo "+$RUST_TOOLCHAIN" ndk --platform "$ANDROID_API" -t "$abi" -o "$stage" \
         build --locked --release -p isyncyou-mobile "${feature_args[@]}"
       source_library="$stage/$abi/libisyncyou_mobile.so"
       ;;
@@ -150,6 +143,7 @@ done
   printf 'abis=%s\n' "$(IFS=,; printf '%s' "${canonical_abis[*]}")"
   printf 'features=%s\n' "$(IFS=,; printf '%s' "${canonical_features[*]}")"
   printf 'ndk_version=%s\n' "$NDK_VERSION"
+  printf 'android_api=%s\n' "$ANDROID_API"
   printf 'rust_toolchain=%s\n' "$RUST_TOOLCHAIN"
   printf 'builder=%s\n' "$BUILDER"
   for abi in "${canonical_abis[@]}"; do

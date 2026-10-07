@@ -200,17 +200,17 @@ jobs:
       - uses: gradle/actions/wrapper-validation@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
-          toolchain: "1.95.0"
+          toolchain: "1.99.0"
           targets: aarch64-linux-android
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+      - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
         with:
           tool: cargo-ndk
       # Puts sdkmanager on PATH + accepts licenses (the runner's preinstalled SDK is
       # not on PATH — a bare `sdkmanager` call exits 127).
-      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
       - name: Install the pinned NDK (matches android.ndkVersion)
-        run: yes | sdkmanager --install "ndk;27.3.13750724"
+        run: sdkmanager --install "ndk;30.0.16248370" "platforms;android-37.2" "build-tools;37.0.0"
       - name: Build the debug APK
         env:
           ISY_ANDROID_NATIVE_BUILDER: github-actions
@@ -282,15 +282,15 @@ jobs:
       - uses: gradle/actions/wrapper-validation@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
-          toolchain: "1.95.0"
+          toolchain: "1.99.0"
           targets: x86_64-linux-android
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+      - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
         with:
           tool: cargo-ndk
-      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
       - name: Install the pinned NDK (matches android.ndkVersion)
-        run: yes | sdkmanager --install "ndk;27.3.13750724"
+        run: sdkmanager --install "ndk;30.0.16248370" "platforms;android-37.2" "build-tools;37.0.0"
       - name: Build the x86_64 debug APK for the emulator
         env:
           ISY_ANDROID_ABIS: x86_64

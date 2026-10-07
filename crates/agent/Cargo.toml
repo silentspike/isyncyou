@@ -19,8 +19,9 @@ argon2 = "0.6"
 # Live LLM HTTP transport (the agent's OWN client, not GraphClient). Off by default so
 # the pure-logic build (loop, tools, FakeProvider) stays fast and dependency-light;
 # the retry/backoff classification is pure and tested without this feature.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "stream"], optional = true }
-rustls = { version = "0.23", default-features = false, optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider", "json", "stream", "form", "query"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
+webpki-root-certs = { version = "1", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "time"], optional = true }
 futures-util = { version = "0.3", optional = true }
 # Real archive retrieval (Store + Config + export). Optional/off by default so the
@@ -52,7 +53,7 @@ path = "examples/reduce_local_drift.rs"
 required-features = ["agent-subscription-experimental"]
 
 [features]
-http = ["dep:reqwest", "dep:rustls", "dep:tokio", "dep:futures-util"]
+http = ["dep:reqwest", "dep:rustls", "dep:webpki-root-certs", "dep:tokio", "dep:futures-util"]
 onedrive = ["dep:isyncyou-graph", "isyncyou-graph/http", "dep:time"]
 # Match the desktop encrypted profile so store's rusqlite bundling resolves and unifies
 # with the rest of the workspace (everyone on encrypted-store → no bundling conflict).

@@ -397,6 +397,8 @@ pub(crate) struct LifecycleAuditEvent {
 type LifecycleAuditHook = Arc<dyn Fn(&LifecycleAuditEvent) + Send + Sync>;
 
 impl LifecycleDiagnostics {
+    // Retain the equivalent API available at the supported Rust 1.95 MSRV.
+    #[allow(deprecated)]
     pub(crate) fn record_audit_failure(&self) {
         let _ = self.audit_failures.fetch_update(
             std::sync::atomic::Ordering::AcqRel,
@@ -1334,19 +1336,7 @@ impl LifecycleRepository {
         let context = self
             .load_existing()?
             .ok_or(LifecycleRecordError::StaleFence)?;
-        let active = context
-            .authority
-            .active_operations
-            .get(&journal.prepared.provider)
-            .ok_or(LifecycleRecordError::StaleFence)?;
-        if active.prepared.operation_id != journal.prepared.operation_id
-            || active.operation_etag != journal.operation_etag
-            || active.journal_record_id != id
-            || context.authority.lifecycle_epoch != journal.prepared.lifecycle_epoch
-            || context.authority.fence_epoch != journal.prepared.fence_epoch
-        {
-            return Err(LifecycleRecordError::StaleFence);
-        }
+        validate_active_journal(&context.authority, id, journal)?;
         self.put_journal(id, journal)
     }
 
@@ -1617,14 +1607,8 @@ impl LifecycleRepository {
             .authority
             .active_operations
             .get(&journal.prepared.provider);
-        if let Some(active) = active {
-            if active.prepared.operation_id != journal.prepared.operation_id
-                || active.operation_etag != journal.operation_etag
-                || context.authority.lifecycle_epoch != journal.prepared.lifecycle_epoch
-                || context.authority.fence_epoch != journal.prepared.fence_epoch
-            {
-                return Err(LifecycleRecordError::StaleFence);
-            }
+        if active.is_some() {
+            validate_active_journal(&context.authority, id, &journal)?;
         } else {
             self.delete_journal(id)?;
             return Ok(receipt);
@@ -1664,18 +1648,7 @@ impl LifecycleRepository {
         let mut context = self
             .load_existing()?
             .ok_or(LifecycleRecordError::StaleFence)?;
-        let active = context
-            .authority
-            .active_operations
-            .get(&journal.prepared.provider)
-            .ok_or(LifecycleRecordError::StaleFence)?;
-        if active.prepared.operation_id != journal.prepared.operation_id
-            || active.operation_etag != journal.operation_etag
-            || context.authority.lifecycle_epoch != journal.prepared.lifecycle_epoch
-            || context.authority.fence_epoch != journal.prepared.fence_epoch
-        {
-            return Err(LifecycleRecordError::StaleFence);
-        }
+        validate_active_journal(&context.authority, id, &journal)?;
         if let Some(etag) = context
             .authority
             .current_credential_etags
@@ -1887,8 +1860,13 @@ impl LifecycleRepository {
             candidate.terminal_at_ms = Some(now_ms);
             self.put_candidate(candidate_id, &candidate)?;
         }
-        let receipt =
-            self.finish_oauth_operation(&journal, Some(result_generation), "connected", now_ms)?;
+        let receipt = self.finish_oauth_operation(
+            id,
+            &journal,
+            Some(result_generation),
+            "connected",
+            now_ms,
+        )?;
         Ok((receipt, journal.prepared.provider))
     }
 
@@ -1926,13 +1904,14 @@ impl LifecycleRepository {
         journal.closed_code = Some(terminal_code.to_string());
         self.write_journal_fenced(id, &journal)?;
         self.emit_transition_audit(&journal);
-        let receipt = self.finish_oauth_operation(&journal, None, terminal_code, now_ms)?;
+        let receipt = self.finish_oauth_operation(id, &journal, None, terminal_code, now_ms)?;
         self.cleanup_terminal_operation_artifacts(journal.prepared.provider)?;
         Ok(receipt)
     }
 
     fn finish_oauth_operation(
         &self,
+        id: &str,
         journal: &AccountLifecycleJournalV1,
         result_generation: Option<&str>,
         terminal_code: &str,
@@ -1941,18 +1920,7 @@ impl LifecycleRepository {
         let mut context = self
             .load_existing()?
             .ok_or(LifecycleRecordError::StaleFence)?;
-        let active = context
-            .authority
-            .active_operations
-            .get(&journal.prepared.provider)
-            .ok_or(LifecycleRecordError::StaleFence)?;
-        if active.prepared.operation_id != journal.prepared.operation_id
-            || active.operation_etag != journal.operation_etag
-            || context.authority.lifecycle_epoch != journal.prepared.lifecycle_epoch
-            || context.authority.fence_epoch != journal.prepared.fence_epoch
-        {
-            return Err(LifecycleRecordError::StaleFence);
-        }
+        validate_active_journal(&context.authority, id, journal)?;
         let result_credential_etag = result_generation
             .map(|generation| {
                 self.credential_etag_for_epoch(
@@ -2301,6 +2269,29 @@ impl LifecycleRepository {
             .put_bounded(class, id, &isyncyou_agent::Secret::new(bytes), envelope_max)
             .map_err(|_| LifecycleRecordError::Store)
     }
+}
+
+fn validate_active_journal(
+    authority: &AccountLifecycleAuthorityV1,
+    id: &str,
+    journal: &AccountLifecycleJournalV1,
+) -> Result<(), LifecycleRecordError> {
+    let active = authority
+        .active_operations
+        .get(&journal.prepared.provider)
+        .ok_or(LifecycleRecordError::StaleFence)?;
+    // Global epochs allocate monotonically across providers; the exact active
+    // provider operation, not the latest allocation for another provider, fences writes.
+    if active.prepared != journal.prepared
+        || active.operation_etag != journal.operation_etag
+        || active.journal_record_id != id
+        || authority.lifecycle_key_version != journal.prepared.lifecycle_key_version
+        || authority.lifecycle_epoch < journal.prepared.lifecycle_epoch
+        || authority.fence_epoch < journal.prepared.fence_epoch
+    {
+        return Err(LifecycleRecordError::StaleFence);
+    }
+    Ok(())
 }
 
 fn disconnect_receipt(
@@ -3414,6 +3405,13 @@ mod tests {
         let mut stale = advance_to_revoke_in_flight(&repo, &operation);
         let mut context = repo.load_existing().unwrap().unwrap();
         context.authority.fence_epoch += 1;
+        context
+            .authority
+            .active_operations
+            .get_mut(&ProductProviderId::Codex)
+            .unwrap()
+            .prepared
+            .fence_epoch = context.authority.fence_epoch;
         repo.put_authority(context.principal(), &context.authority)
             .unwrap();
         stale.phase = AccountLifecyclePhase::RevokedPendingCleanup;
@@ -3421,6 +3419,189 @@ mod tests {
             repo.write_journal_fenced(&operation.journal_record_id, &stale),
             Err(LifecycleRecordError::StaleFence)
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_operation_fence_survives_other_provider_exchange_and_promotion() {
+        for (first, second) in [
+            (ProductProviderId::Claude, ProductProviderId::Codex),
+            (ProductProviderId::Codex, ProductProviderId::Claude),
+        ] {
+            let root = temp_root("independent-provider-fences");
+            let repo = repository(&root);
+            let mut operations = Vec::new();
+            for (provider, request_id) in [
+                (first, "123e4567-e89b-42d3-a456-426614174240"),
+                (second, "123e4567-e89b-42d3-a456-426614174241"),
+            ] {
+                let operation = repo
+                    .begin_operation(
+                        provider,
+                        AccountLifecycleRoute::OAuthStart,
+                        AccountLifecycleMode::Connect,
+                        request_id,
+                        None,
+                        None,
+                        None,
+                        None,
+                        1_000,
+                    )
+                    .unwrap();
+                repo.await_oauth_login(&operation.journal_record_id, 2_000)
+                    .unwrap();
+                operations.push((provider, operation));
+            }
+            // Reopening retains the original provider fences without a migration or reseeding.
+            let repo = repository(&root);
+            for (index, (provider, operation)) in operations.iter().enumerate() {
+                repo.prepare_exchange(
+                    &operation.journal_record_id,
+                    "0123456789abcdef0123456789abcdef",
+                    3_000,
+                )
+                .unwrap();
+                let candidate_id = repo
+                    .candidate_record_id(*provider, &operation.operation_id)
+                    .unwrap();
+                let mut oauth_candidate = candidate(OAuthCandidateState::GrantBearing);
+                oauth_candidate.provider = *provider;
+                oauth_candidate.operation_id = operation.operation_id.clone();
+                oauth_candidate.record_id = candidate_id.clone();
+                repo.publish_candidate(&operation.journal_record_id, &oauth_candidate, 4_000)
+                    .unwrap();
+                repo.begin_candidate_validation(&operation.journal_record_id, 5_000)
+                    .unwrap();
+                let generation = if index == 0 {
+                    "123e4567-e89b-42d3-a456-426614174242"
+                } else {
+                    "123e4567-e89b-42d3-a456-426614174243"
+                };
+                repo.bind_candidate_generation(
+                    &operation.journal_record_id,
+                    &candidate_id,
+                    generation,
+                )
+                .unwrap();
+                repo.checkpoint_candidate_promoted(
+                    &operation.journal_record_id,
+                    &candidate_id,
+                    generation,
+                    6_000,
+                )
+                .unwrap();
+                repo.cleanup_terminal_operation_artifacts(*provider)
+                    .unwrap();
+                assert!(repo.active_operation(*provider).unwrap().is_none());
+                assert!(repo
+                    .load_journal(&operation.journal_record_id)
+                    .unwrap()
+                    .is_none());
+                if index == 0 {
+                    assert_eq!(
+                        repo.active_operation(second)
+                            .unwrap()
+                            .unwrap()
+                            .prepared
+                            .operation_id,
+                        operations[1].1.operation_id
+                    );
+                }
+            }
+            assert_eq!(
+                repo.load_existing()
+                    .unwrap()
+                    .unwrap()
+                    .authority
+                    .current_credential_etags
+                    .len(),
+                2
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn provider_operation_fence_disconnect_preserves_other_pending_login() {
+        let root = temp_root("disconnect-independent-fence");
+        let repo = repository(&root);
+        let disconnect = begin_disconnect_fixture(&repo, "123e4567-e89b-42d3-a456-426614174240");
+        let login = repo
+            .begin_operation(
+                ProductProviderId::Claude,
+                AccountLifecycleRoute::OAuthStart,
+                AccountLifecycleMode::Connect,
+                "123e4567-e89b-42d3-a456-426614174241",
+                None,
+                None,
+                None,
+                None,
+                1_000,
+            )
+            .unwrap();
+        repo.await_oauth_login(&login.journal_record_id, 2_000)
+            .unwrap();
+        advance_to_cleanup(&repo, &disconnect);
+        repo.complete_disconnect(&disconnect.journal_record_id, 4_000)
+            .unwrap();
+        assert!(repo
+            .active_operation(ProductProviderId::Codex)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            repo.active_operation(ProductProviderId::Claude)
+                .unwrap()
+                .unwrap()
+                .prepared
+                .operation_id,
+            login.operation_id
+        );
+        repo.prepare_exchange(
+            &login.journal_record_id,
+            "0123456789abcdef0123456789abcdef",
+            5_000,
+        )
+        .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_operation_fence_rejects_modified_binding_key_rotation_and_counter_rollback() {
+        let root = temp_root("provider-fence-negative");
+        let repo = repository(&root);
+        let operation = begin_disconnect_fixture(&repo, "123e4567-e89b-42d3-a456-426614174240");
+        let journal = repo
+            .load_journal(&operation.journal_record_id)
+            .unwrap()
+            .unwrap();
+        let context = repo.load_existing().unwrap().unwrap();
+        let mut changed = journal.clone();
+        changed.prepared.payload_digest = "p".repeat(DIGEST_LEN);
+        assert_eq!(
+            repo.write_journal_fenced(&operation.journal_record_id, &changed),
+            Err(LifecycleRecordError::StaleFence)
+        );
+        changed = journal.clone();
+        changed.operation_etag = "e".repeat(DIGEST_LEN);
+        assert_eq!(
+            repo.write_journal_fenced(&operation.journal_record_id, &changed),
+            Err(LifecycleRecordError::StaleFence)
+        );
+        assert_eq!(
+            repo.write_journal_fenced(&"i".repeat(DIGEST_LEN), &journal),
+            Err(LifecycleRecordError::StaleFence)
+        );
+        for (key_version, lifecycle_epoch, fence_epoch) in [(2, 1, 1), (1, 0, 1), (1, 1, 0)] {
+            let mut authority = context.authority.clone();
+            authority.lifecycle_key_version = key_version;
+            authority.lifecycle_epoch = lifecycle_epoch;
+            authority.fence_epoch = fence_epoch;
+            repo.put_authority(context.principal(), &authority).unwrap();
+            assert_eq!(
+                repo.write_journal_fenced(&operation.journal_record_id, &journal),
+                Err(LifecycleRecordError::StaleFence)
+            );
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3734,8 +3915,14 @@ mod tests {
         promoted.terminal_at_ms = Some(6_000);
         repo.put_candidate(&candidate_id, &promoted).unwrap();
 
-        repo.finish_oauth_operation(&terminal, Some(generation), "connected", 6_000)
-            .unwrap();
+        repo.finish_oauth_operation(
+            &operation.journal_record_id,
+            &terminal,
+            Some(generation),
+            "connected",
+            6_000,
+        )
+        .unwrap();
         let context = repo.load_existing().unwrap().unwrap();
         assert!(!context
             .authority

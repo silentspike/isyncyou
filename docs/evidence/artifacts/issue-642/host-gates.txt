@@ -1,0 +1,65 @@
+Issue #642 implementation host gates
+Implementation: 8d6e79fb48bad2afbccff4888579803b20fe3041
+Source tree: 03f1e6d02a6b4f6cfb8847d60f3ff841f3dd2605
+Date: 2026-10-04
+
+PASS cargo remote -- test --workspace --features isyncyou-agent/agent-oauth-providers,isyncyou-agent/onedrive,isyncyou-app-host/agent-oauth-providers --no-fail-fast
+Remote job: fc131c51b6d1bd0f93a020e4, exit 0, 117.72 seconds.
+One aggregate covers the affected product feature union.
+Agent: 482 unit and 1 integration passed; 1 optional live test ignored.
+App-host: 592 unit and 6 integration passed; 6 optional unit tests ignored.
+WebUI: 387 tests passed. Mobile: 33 tests passed.
+Connectors: 139 passed / 24 optional ignored; Store: 65 passed; Core: 103 passed;
+Graph: 122 passed / 7 optional ignored; Engine: 123 passed.
+Child-process summaries are included in parent counts, not added again.
+Every executed suite reports zero failures. Optional live/platform ignores do
+not establish physical acceptance. Empty targets are not filtered PASS claims.
+Remote log SHA-256: 76a5c73aa992bb17b83d7f0d98c7a88e16bfcafaf23aa586a581c4196824cd71
+
+PASS cargo remote -- clippy --workspace --all-targets --features isyncyou-agent/agent-oauth-providers,isyncyou-agent/onedrive,isyncyou-app-host/agent-oauth-providers -- -D warnings
+Remote job: 8386408a48496fabd15545bc, exit 0, 3.61 seconds.
+PASS cargo remote -- test -p isyncyou-mobile --all-targets --no-default-features
+Remote job: e8972bea153a6b3dd3764008, exit 0, 2.62 seconds.
+Mobile minimal: 33 tests passed.
+PASS cargo remote -- clippy -p isyncyou-mobile --all-targets --no-default-features -- -D warnings
+Remote job: 374bd1c69af363e61764ea59, exit 0, 1.07 seconds.
+PASS cargo-remote-fmt --check
+Remote job: 819bf705f140d8e64c80a961, exit 0, 1.32 seconds.
+PASS cargo remote --profile android-r30 -- deny --locked check
+Remote job: 91b361c2e320e03076fe1082, exit 0, 1.31 seconds.
+Observed: advisories ok, bans ok, licenses ok, sources ok.
+Existing duplicate-dependency warnings are permitted by the current deny policy.
+PASS cargo remote -- tree -e features -p isyncyou-daemon -p isyncyou-mobile
+Remote job: 2008f6630783b0b923503e5c, exit 0, 0.79 seconds.
+Neither product graph contains agent-subscription-experimental.
+
+PASS python3 -m unittest tools.test_agent_authorization_policy_device_probe tools.test_agent_epic_closeout_probe tools.test_agent_progressive_search_probe tools.test_android_native_build_boundary
+60 tests passed in 8.860 seconds; deterministic tests, not physical-device evidence.
+PASS node --check gui/webui/src/app.js
+PASS python3 -m py_compile tools/*.py
+PASS actionlint (checksum-verified official v1.7.12 temporary tool)
+PASS npm ci
+PASS python3 tools/check_traceability.py
+Observed: 75 total / 74 implemented / 1 planned.
+REQ-AGENT-019 was planned in the tested implementation commit. Its status changes
+only in the later requirement/evidence closeout after both physical rows pass.
+PASS git diff --check
+PASS gitleaks git --log-opts=origin/dev..HEAD --redact --no-banner
+PASS pinned CI Semgrep image/rules: 136 rules actually ran on 78 tracked files,
+zero findings and no rule timeouts.
+
+PASS Living UI all scenario, tools/agent-living-ui-smoke.mjs: 51 assertions.
+PASS Living UI containment scenario: 31 assertions, separate report.
+PASS Wizard, tools/agent-wizard-smoke.mjs: 73 assertions.
+These tools ran with explicit private output directories. Their generated
+reports and screenshots are preserved separately, without raw runtime paths.
+
+All Rust commands executed on Cargo Remote v2, serially in this workspace, without
+copying unused test binaries or overlapping Android. No source or lockfile changed.
+Raw logs remain private; only closed facts and original log digests appear here.
+PASS required physical rows: actual native approval with independent Graph/Store
+effect, and actual native Back denial with independent no-effect observation.
+Both were observed on the unchanged exact-commit default APK; historical failed
+observations were not relabeled. Cleanup, restored unread state and foreground
+restoration were independently verified before device-lock release.
+This file makes no independent acceptance, protected CI, PR, merge or release claim.

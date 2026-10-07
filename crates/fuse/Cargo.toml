@@ -15,7 +15,7 @@ isyncyou-store = { path = "../store" }
 # so a Windows build of a dependent (the daemon) never pulls libfuse.
 [target.'cfg(unix)'.dependencies]
 # default-features off => no libfuse link / no pkg-config; mount via fusermount3.
-fuser = { version = "0.16", default-features = false }
+fuser = { version = "0.18", default-features = false }
 libc = "0.2"
 
 [dev-dependencies]

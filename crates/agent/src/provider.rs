@@ -435,6 +435,7 @@ pub(crate) enum ProviderRequestBinding<'a> {
         account_id: &'a str,
         model: &'a str,
         reasoning_effort: codex::CodexReasoningEffort,
+        responses_lite: bool,
         instructions: &'a str,
     },
 }
@@ -592,7 +593,10 @@ fn attest_product_harness(
     let stream_true = obj.get("stream") == Some(&serde_json::Value::Bool(true));
     let responses_lite = matches!(
         binding,
-        ProviderRequestBinding::Codex { model, .. } if codex::uses_responses_lite(model)
+        ProviderRequestBinding::Codex {
+            responses_lite: true,
+            ..
+        }
     );
     let tools = if responses_lite {
         obj.get("input")
@@ -745,6 +749,7 @@ fn attest_product_harness(
                 model,
                 reasoning_effort,
                 instructions,
+                ..
             } = binding
             else {
                 return Err(harness_violation("codex binding mismatch"));
@@ -940,6 +945,9 @@ pub fn attest_static_product_harness(
                     access_token: "static-attestation-probe",
                     account_id: "static-account-binding",
                     model: &codex::CodexConfig::default().model,
+                    responses_lite: codex::uses_responses_lite(
+                        &codex::CodexConfig::default().model,
+                    ),
                     reasoning_effort: codex::CodexConfig::default().reasoning_effort,
                     instructions: expected_system,
                 },
@@ -1371,6 +1379,7 @@ mod tests {
                 access_token: "codex-oauth-token",
                 account_id: "codex-account-identity",
                 model: "codex-test",
+                responses_lite: false,
                 reasoning_effort: codex::CodexReasoningEffort::Medium,
                 instructions: "iSyncYou controlled system prompt",
             },
@@ -1806,6 +1815,45 @@ mod tests {
                 assert_eq!(parsed["phase"], "provider_started");
             }
         }
+    }
+
+    #[test]
+    fn confirmation_required_public_json_omits_raw_action_and_owner_binding() {
+        let event = StreamEvent::ConfirmationRequired {
+            id: "pending-public".into(),
+            action: Box::new(ToolAction::Share {
+                account: "private-account".into(),
+                service: "onedrive".into(),
+                id: "private-item".into(),
+                mode: Some("invite".into()),
+                link_type: None,
+                scope: None,
+                recipients: vec!["private-recipient@example.invalid".into()],
+                role: Some("read".into()),
+                recipient: None,
+            }),
+            preview: "Share one item".into(),
+            action_hash: "a".repeat(64),
+            risk: "destructive".into(),
+            expires_at_ms: 60_000,
+            token: "transient-confirmation-token".into(),
+        };
+
+        let public = event.to_public_json();
+        let object = public.as_object().expect("public confirmation object");
+        assert_eq!(
+            object.get("event").and_then(serde_json::Value::as_str),
+            Some("confirmation_required")
+        );
+        assert!(!object.contains_key("action"));
+        assert!(!object.contains_key("account"));
+        assert!(!object.contains_key("session_id"));
+        assert!(!object.contains_key("request_id"));
+        assert!(!object.contains_key("turn_id"));
+        let encoded = public.to_string();
+        assert!(!encoded.contains("private-account"));
+        assert!(!encoded.contains("private-item"));
+        assert!(!encoded.contains("private-recipient"));
     }
 
     #[test]

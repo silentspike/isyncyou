@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "issue": 642,
+  "implementation_commit": "8d6e79fb48bad2afbccff4888579803b20fe3041",
+  "source_tree": "03f1e6d02a6b4f6cfb8847d60f3ff841f3dd2605",
+  "base_commit": "1f8904551f59ae6f402480a96f8fa4c28e182964",
+  "branch": "feature/ag-642",
+  "landing_target": "dev",
+  "implementation_commits": 15,
+  "implementation_changed_files": 74,
+  "implementation_insertions": 10579,
+  "implementation_deletions": 2333,
+  "tracked_implementation_inputs_clean_at_freeze": true,
+  "obsolete_issue_622_or_628_evidence_in_diff": false,
+  "local_operating_files_or_local_issue_plan_in_index": false,
+  "database_schema_migration": false,
+  "cargo_lock_changed": true,
+  "workflow_changed": true,
+  "additional_owner_authorized_work": "Stable dependency and build-profile maintenance plus affected OAuth, model-selection, mail-cache and confirmation-latency corrections; no release operation.",
+  "push_or_pr_performed": false,
+  "release_action_performed": false,
+  "claim_boundary": "Exact-commit host/UI/default-APK/instrumentation gates and separately observed real approval and native denial pass. No protected CI, independent acceptance, merge or closure claim."
+}

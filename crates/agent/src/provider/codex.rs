@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 /// Verified Codex-CLI mimicry recipe.
 pub(crate) const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 pub(super) const ORIGINATOR: &str = crate::oauth::CODEX_OAUTH_ORIGINATOR;
-pub(crate) const DEFAULT_CLI_VERSION: &str = "0.144.5";
+pub(crate) const DEFAULT_CLI_VERSION: &str = "0.159.3";
 const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 const MAX_REASONING_CONTEXT_BYTES: usize = 1024 * 1024;
 const MAX_REASONING_SUMMARY_BYTES: usize = 64 * 1024;
@@ -28,29 +28,44 @@ const MAX_REASONING_ITEMS_PER_ROUND: usize = 4;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CodexReasoningEffort {
+    None,
+    Minimal,
     Low,
     #[default]
     Medium,
     High,
     XHigh,
+    Max,
+    Ultra,
+    Persistent,
 }
 
 impl CodexReasoningEffort {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
             Self::XHigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
+            Self::Persistent => "persistent",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
+            "none" => Some(Self::None),
+            "minimal" => Some(Self::Minimal),
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
             "xhigh" => Some(Self::XHigh),
+            "max" => Some(Self::Max),
+            "ultra" => Some(Self::Ultra),
+            "persistent" => Some(Self::Persistent),
             _ => None,
         }
     }
@@ -67,6 +82,8 @@ pub struct CodexConfig {
     pub cli_version: String,
     pub model: String,
     pub reasoning_effort: CodexReasoningEffort,
+    /// Validated provider catalog protocol, absent for legacy saved selections.
+    pub use_responses_lite: Option<bool>,
 }
 
 impl Default for CodexConfig {
@@ -77,6 +94,7 @@ impl Default for CodexConfig {
             cli_version: DEFAULT_CLI_VERSION.to_string(),
             model: DEFAULT_MODEL.to_string(),
             reasoning_effort: CodexReasoningEffort::default(),
+            use_responses_lite: None,
         }
     }
 }
@@ -110,8 +128,8 @@ pub(super) fn uses_responses_lite(model: &str) -> bool {
     matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna")
 }
 
-fn prepare_input(model: &str, instructions: &str, mut input: Vec<Value>) -> Vec<Value> {
-    if !uses_responses_lite(model) {
+fn prepare_input(responses_lite: bool, instructions: &str, mut input: Vec<Value>) -> Vec<Value> {
+    if !responses_lite {
         return input;
     }
     let mut prefix = vec![json!({
@@ -230,9 +248,25 @@ pub(crate) fn build_request(
     instructions: &str,
     history: &[Message],
 ) -> Value {
-    let input = prepare_input(model, instructions, build_input(history));
+    build_request_with_protocol(
+        model,
+        reasoning_effort,
+        instructions,
+        history,
+        uses_responses_lite(model),
+    )
+}
+
+fn build_request_with_protocol(
+    model: &str,
+    reasoning_effort: CodexReasoningEffort,
+    instructions: &str,
+    history: &[Message],
+    responses_lite: bool,
+) -> Value {
+    let input = prepare_input(responses_lite, instructions, build_input(history));
     let tool_choice = tool_choice_for_input(&input);
-    if uses_responses_lite(model) {
+    if responses_lite {
         return json!({
             "model": model,
             "reasoning": {
@@ -550,7 +584,11 @@ mod live {
                 // once; a duplicate content-type header makes the ChatGPT backend 400.
                 ("accept".to_string(), "text/event-stream".to_string()),
             ];
-            if uses_responses_lite(&self.cfg.model) {
+            if self
+                .cfg
+                .use_responses_lite
+                .unwrap_or_else(|| uses_responses_lite(&self.cfg.model))
+            {
                 headers.push((
                     "x-openai-internal-codex-responses-lite".to_string(),
                     "true".to_string(),
@@ -592,19 +630,28 @@ mod live {
                     account_id: &self.cfg.account_id,
                     model: &self.cfg.model,
                     reasoning_effort: self.cfg.reasoning_effort,
+                    responses_lite: self
+                        .cfg
+                        .use_responses_lite
+                        .unwrap_or_else(|| uses_responses_lite(&self.cfg.model)),
                     instructions: &self.instructions,
                 },
                 self.cfg.responses_url.clone(),
                 self.request_headers(),
                 {
-                    let mut body = build_request(
+                    let responses_lite = self
+                        .cfg
+                        .use_responses_lite
+                        .unwrap_or_else(|| uses_responses_lite(&self.cfg.model));
+                    let mut body = build_request_with_protocol(
                         &self.cfg.model,
                         self.cfg.reasoning_effort,
                         &self.instructions,
                         history,
+                        responses_lite,
                     );
                     body["input"] = Value::Array(prepare_input(
-                        &self.cfg.model,
+                        responses_lite,
                         &self.instructions,
                         build_input_with_reasoning(history, &self.reasoning_rounds, assistant_base),
                     ));
@@ -694,7 +741,7 @@ mod tests {
         );
         assert_eq!(c.model, "gpt-5.6-sol");
         assert_eq!(c.reasoning_effort, CodexReasoningEffort::Medium);
-        assert_eq!(c.cli_version, "0.144.5");
+        assert_eq!(c.cli_version, "0.159.3");
     }
 
     #[test]
@@ -719,6 +766,27 @@ mod tests {
         assert_eq!(body["input"][1]["content"][0]["text"], "be terse");
         assert_eq!(body["input"][2]["role"], "user");
         assert_eq!(body["input"][2]["content"][0]["type"], "input_text");
+    }
+
+    #[test]
+    fn discovered_model_protocol_and_effort_keep_only_isyncyou_harness() {
+        for lite in [true, false] {
+            let body = build_request_with_protocol(
+                "gpt-6.1-sol",
+                CodexReasoningEffort::Ultra,
+                "iSyncYou",
+                &[Message::user("hello")],
+                lite,
+            );
+            assert_eq!(body["reasoning"]["effort"], "ultra");
+            assert_eq!(body["store"], false);
+            if lite {
+                assert_eq!(body["input"][0]["tools"][0]["name"], "isyncyou");
+                assert!(body.get("tools").is_none());
+            } else {
+                assert_eq!(body["tools"][0]["name"], "isyncyou");
+            }
+        }
     }
 
     #[test]
@@ -787,7 +855,7 @@ mod tests {
         assert_eq!(get("authorization").unwrap(), "Bearer tok123");
         assert_eq!(get("chatgpt-account-id").unwrap(), "acct_123");
         assert_eq!(get("originator").unwrap(), "codex_cli_rs");
-        assert_eq!(get("user-agent").unwrap(), "codex_cli_rs/0.144.5");
+        assert_eq!(get("user-agent").unwrap(), "codex_cli_rs/0.159.3");
         assert_eq!(get("accept").unwrap(), "text/event-stream");
         assert_eq!(
             get("x-openai-internal-codex-responses-lite").unwrap(),

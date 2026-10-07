@@ -6,7 +6,23 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+
+- Refresh stable Rust, Android, WebUI test and CI dependencies; pin Rust 1.99.0,
+  Android SDK 37.2, NDK r30/API 34, AGP 9.4.1 and Gradle 9.8.0. Android now requires
+  Android 14 or newer. Align native build manifests with Cargo Remote v2 without
+  changing existing account or credential storage formats.
+
 ### Added
+
+**Exhaustive Agent authorization policy (#642)**
+- `agent`+`app-host`+`webui`+`android`: centralized immediate versus confirmed-effect
+  policy, bound pending authority to the original turn owner, added atomic confirmation
+  revalidation and fail-closed post-consumption handling, capability-gated Agent streams,
+  closed audit/public projections, and a crash-safe controlled-device cleanup reducer.
+- Preserve ambiguous production executor outcomes, keep reconciliation bindings in
+  bounded authenticated request bodies, and require independent native, scenario,
+  Graph, and archive observations before device evidence can pass after cleanup.
 
 **Living Agent activity UI (#644)**
 - `webui`: added bounded turn-local activity plans, monotonic stage and result

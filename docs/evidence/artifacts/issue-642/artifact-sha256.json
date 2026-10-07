@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "implementation_commit": "8d6e79fb48bad2afbccff4888579803b20fe3041",
+  "algorithm": "sha256",
+  "path_scope": "docs/evidence/artifacts/issue-642",
+  "self_digest_excluded": true,
+  "artifacts": {
+    "authorization-policy-matrix.json": "66376a300c0908fd25daf8f17ce2b529c7cb620696cfc002db0fb25ecf90aafc",
+    "containment-smoke/ui-smoke.json": "88a5dca901642a06227945712647a49e45edd93951239f529b92dd68c7a57277",
+    "default-apk.json": "892f4b4fdd04a65ebb8388cd590126886a4a96b311cd1ca77b00fd40cb7b0594",
+    "feature-graphs.json": "314499dc4d8a4140240c8d11abc0fb07e3ed2afbc142deb1aaa74b75f11e29f0",
+    "graph-and-store-revert.json": "9f9fb942246726a4c414ec51a8c2d57897819536158d63a8c59d8a64a81fc340",
+    "host-gates.txt": "937bf90cfbdb53a1f24ebf6704a45376981aef90bb545bf3bbd225c57ce97ab9",
+    "implementation-readback.json": "c876ec325338586fae1df3a899e45104c5da9aa073cd7984faf0770bb6ea424d",
+    "pixel-native-confirmation.json": "ffd33f6c74568d01e4c06624d5acaf8c61672e5d36e84a70dff3207c2e938abd",
+    "privacy-scan.txt": "5a2987881593231eb2de8968757dd439dcdfefca5f64b60bc232b62b8571afdc",
+    "prompt-injection-containment.json": "a5c91faccefcfb157a6711030cc7ed1320090725dd4203d821579e3b38efe741",
+    "start-readback.json": "1bd192718a9d35ffefc0aeaeb2391894b68d01bb6a38bd58246ae276032f2969",
+    "ui-smoke/desktop-running.png": "c7841754fe8fa65dec2f679e04d928b1200f54ad862e5e1114600eb90bc54e76",
+    "ui-smoke/desktop-terminal.png": "4bf356bafbfa614022e9ff0552ab217755d970d695f2f46e146066dc89077d07",
+    "ui-smoke/mobile-terminal.png": "ca03d61e4fe38b8d9a8ee678c42ce0d5ee361e60315c6867f458223c0ad969ad",
+    "ui-smoke/reduced-motion.png": "1db86775dfd4362c9fb29775fc2d23bc820d089b17fc28a3669e480220cf70dd",
+    "ui-smoke/ui-smoke.json": "3d1f7fd86c4e3d64f57a2381e142c01bdd5a0a57e0a79b3d31dbf230fedaaad7",
+    "ui-smoke.json": "71a13aacef671575e3031fbe3f4c25e00c31d1e034b212831848baec03cf880d"
+  }
+}

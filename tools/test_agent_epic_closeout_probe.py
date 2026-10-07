@@ -1,5 +1,6 @@
 import argparse
 import copy
+import http.cookiejar
 import importlib.util
 import json
 import socket
@@ -7,11 +8,13 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
+import urllib.request
 import zipfile
 from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 
 MODULE_PATH = Path(__file__).with_name("agent-epic-closeout-probe.py")
@@ -113,6 +116,8 @@ class AndroidBridgeHandler(BaseHTTPRequestHandler):
 class RetrievalHandler(BaseHTTPRequestHandler):
     request_id = None
     turn_posts = 0
+    stream_opens = 0
+    stream_query_keys = set()
     cap = "agent-capability-value-opaque"
 
     def send_bytes(self, content_type, body, *, cookie=False):
@@ -167,6 +172,16 @@ class RetrievalHandler(BaseHTTPRequestHandler):
                 }
             )
         elif parsed.path == "/api/v1/agent/stream":
+            if "isy_session=opaque" not in self.headers.get("Cookie", "").split("; "):
+                self.send_response(401)
+                self.end_headers()
+                return
+            if not self.cap_ready():
+                self.send_response(403)
+                self.end_headers()
+                return
+            type(self).stream_opens += 1
+            type(self).stream_query_keys = set(query)
             body = (
                 b'data: {"event":"token","text":"PRIVATE ANSWER"}\n\n'
                 b'data: {"event":"tool_result","id":"private-id",'
@@ -585,6 +600,8 @@ class CloseoutProbeTest(unittest.TestCase):
         self.assertEqual(MODULE.CONTROL_REQUEST_TIMEOUT_SECONDS, 10.0)
         RetrievalHandler.request_id = None
         RetrievalHandler.turn_posts = 0
+        RetrievalHandler.stream_opens = 0
+        RetrievalHandler.stream_query_keys = set()
         server = ThreadingHTTPServer(("127.0.0.1", 0), RetrievalHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -609,6 +626,8 @@ class CloseoutProbeTest(unittest.TestCase):
                 self.assertTrue(result["transcript_rehydrated"])
                 self.assertTrue(result["all_sources_listed_and_viewable"])
                 self.assertEqual(RetrievalHandler.turn_posts, 2)
+                self.assertEqual(RetrievalHandler.stream_opens, 1)
+                self.assertEqual(RetrievalHandler.stream_query_keys, {"turn"})
                 rendered = json.dumps(result)
                 for forbidden in (
                     "PRIVATE ANSWER",
@@ -624,6 +643,72 @@ class CloseoutProbeTest(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
+
+    def test_stream_fixture_rejects_missing_wrong_and_query_only_capability(self):
+        RetrievalHandler.stream_opens = 0
+        server = ThreadingHTTPServer(("127.0.0.1", 0), RetrievalHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base = f"http://127.0.0.1:{server.server_port}"
+            client, _, _, _, _ = MODULE.wait_for_runtime(base, None, 2.0)
+            client.load_agent_capability()
+            for label, header, query in (
+                ("missing", None, {"turn": "fixture-turn"}),
+                ("wrong", "wrong-capability", {"turn": "fixture-turn"}),
+                ("query_only", None, {"turn": "fixture-turn", "cap_token": client.agent_cap}),
+            ):
+                with self.subTest(case=label):
+                    request = client._request(
+                        "GET", "/api/v1/agent/stream?" + urlencode(query)
+                    )
+                    if header is not None:
+                        request.add_header("X-Capability-Token", header)
+                    with self.assertRaises(urllib.error.HTTPError) as caught:
+                        with client.opener.open(request, timeout=2.0) as response:
+                            response.read()
+                    try:
+                        self.assertEqual(caught.exception.code, 403)
+                    finally:
+                        caught.exception.close()
+                    self.assertEqual(RetrievalHandler.stream_opens, 0)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_stream_caller_rejects_wrong_capability_and_missing_session(self):
+        RetrievalHandler.stream_opens = 0
+        server = ThreadingHTTPServer(("127.0.0.1", 0), RetrievalHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base = f"http://127.0.0.1:{server.server_port}"
+            client, _, _, _, _ = MODULE.wait_for_runtime(base, None, 2.0)
+            client.agent_cap = "wrong-capability"
+            for label, status in (("wrong_capability", 403), ("missing_session", 401)):
+                with self.subTest(case=label):
+                    if label == "missing_session":
+                        client.agent_cap = RetrievalHandler.cap
+                        client.jar.clear()
+                    with self.assertRaisesRegex(MODULE.ProbeError, "^turn_stream_unavailable$") as caught:
+                        MODULE.stream_turn(client, "fixture-turn", 2.0)
+                    self.assertIsInstance(caught.exception.__cause__, urllib.error.HTTPError)
+                    self.assertEqual(caught.exception.__cause__.code, status)
+                    self.assertEqual(RetrievalHandler.stream_opens, 0)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_stream_requires_loaded_capability_before_network(self):
+        jar = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        client = MODULE.RuntimeClient(base="http://127.0.0.1:1", jar=jar, opener=opener)
+        with mock.patch.object(opener, "open") as open_request:
+            with self.assertRaisesRegex(MODULE.ProbeError, "^agent_capability_unavailable$"):
+                MODULE.stream_turn(client, "fixture-turn", 2.0)
+            open_request.assert_not_called()
 
     def test_retrieval_timeout_reports_only_closed_persisted_request_state(self):
         RetrievalHandler.request_id = None

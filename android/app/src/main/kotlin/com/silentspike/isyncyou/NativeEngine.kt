@@ -49,9 +49,9 @@ object NativeEngine {
 
     /**
      * Open a bridge push stream (the SSE replacement, #0A) for [path], gated by
-     * [sessionToken]. Returns a stream id (>0), or 0 if unknown/unauthorized/not started.
+     * [sessionToken]. Agent streams additionally require [capabilityToken].
      */
-    external fun nativeStreamOpen(path: String, sessionToken: String): Long
+    external fun nativeStreamOpen(path: String, sessionToken: String, capabilityToken: String): Long
 
     /**
      * Block for the next event on stream [id] (a JSON `{event,data}` object), or "" when the

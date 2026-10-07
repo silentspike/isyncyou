@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "implementation_commit": "8d6e79fb48bad2afbccff4888579803b20fe3041",
+  "scope": "default-apk-build-jvm-instrumentation-and-installation",
+  "apk_sha256": "3d3d4472eb9360c63b8f8244b908bd086b673683081fb153fad70f1f20849ded",
+  "remote_native_sha256": "f0c9f44733c2c87f15706e04ab27586dabc07e41a8e1592bbbb553932305b9a4",
+  "packaged_native_sha256": "f0c9f44733c2c87f15706e04ab27586dabc07e41a8e1592bbbb553932305b9a4",
+  "abi": "arm64-v8a",
+  "native_builder": "remote",
+  "native_remote_job_id": "6b47117d92e72c2f53beada9",
+  "rust_toolchain": "1.99.0",
+  "ndk_version": "30.0.16248370",
+  "android_api": 34,
+  "additional_cargo_features": [],
+  "native_manifest_source_commit": "8d6e79fb48bad2afbccff4888579803b20fe3041",
+  "final_android_command": "env -u ISY_CARGO_FEATURES ./gradlew --no-daemon -Pandroid.injected.androidTest.leaveApksInstalledAfterRun=true :app:testDebugUnitTest :app:lintDebug :app:connectedDebugAndroidTest",
+  "android_exit_code": 0,
+  "android_elapsed_seconds": 47.4,
+  "jvm_execution_note": "Successful incremental validation on the exact implementation. The unchanged JVM task results contain 71 passes; this is not a claim they were reexecuted.",
+  "jvm_tests": {
+    "suites": 12,
+    "tests": 71,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "lint_debug": "pass",
+  "assemble_debug": "pass",
+  "apksigner_verify": "pass",
+  "zipalign_16k": "pass",
+  "instrumentation": {
+    "tests": 18,
+    "passed": 12,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 6,
+    "skipped_tests": [
+      "AgentAccountLifecycleHookInstrumentedTest.lifecycleHookIsFeatureGatedOwnerOnlyClosedAndOneShot",
+      "AgentCredentialKeyStoreInstrumentedTest.agentCredentialKeyStoreInstallsAndSealsProviderCredentialStore",
+      "AgentSessionKdfBenchmarkInstrumentedTest.agentSessionKdfBenchmarkProducesEvidenceJson",
+      "BiometricPromptInstrumentedTest.physicalStrongCryptoPromptUnlocksKeystoreCipher",
+      "BiometricPromptInstrumentedTest.pixelStrongBiometricEnrollmentPrecondition",
+      "NetworkPreflightHookInstrumentedTest.networkPreflightHookIsFeatureGatedOwnerOnlyAndOneShot"
+    ],
+    "report_interpretation": "The Gradle run exits zero. Its XML writes six org.junit.AssumptionViolatedException entries as failures; these are explicit optional precondition skips, not executed test passes. The initial private reducer rejected that XML until the exception classes were inspected.",
+    "physical_approval_or_denial_claimed": false
+  },
+  "installed_base_apk_sha256": "3d3d4472eb9360c63b8f8244b908bd086b673683081fb153fad70f1f20849ded",
+  "installed_base_byte_identity": "pass",
+  "leave_apks_installed_override": true,
+  "credential_key_file_continuity": "not_recorded_after_initial_report_reducer_rejection",
+  "post_instrumentation_connections_verified": {
+    "m365_reader": true,
+    "m365_writer": true,
+    "codex": true,
+    "controlled_m365_identity": true
+  },
+  "no_reauthentication_during_final_device_attempt": true,
+  "prior_foreground_verified_restored": true,
+  "device_lock_released": true,
+  "native_hook_markers_checked": [
+    "ISY_MOBILE_JOB_DEVICE_HOOK_V1",
+    "ISY_AGENT_NETWORK_DEVICE_HOOK_V1",
+    "ISY_AGENT_CREDENTIAL_STORE_SELF_TEST_V1",
+    "ISY_AGENT_ACCOUNT_LIFECYCLE_DEVICE_HOOK_V1"
+  ],
+  "native_hook_markers_found": [],
+  "experimental_drift_marker_found": false,
+  "experimental_feature_in_product_graph": false,
+  "physical_acceptance_claimed": true,
+  "physical_acceptance_state": "pass",
+  "physical_acceptance_artifact": "pixel-native-confirmation.json"
+}

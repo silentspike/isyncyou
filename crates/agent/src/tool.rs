@@ -125,35 +125,60 @@ pub enum RecoveryPolicy {
     NeverRepeat,
 }
 
-impl ToolAction {
-    pub fn recovery_policy(&self) -> RecoveryPolicy {
+/// The single authorization/recovery policy for every tool action.
+///
+/// Keeping both decisions in one value prevents a confirmed cloud effect from
+/// accidentally becoming replayable, and keeps `RestoreLocal` immediate while
+/// acknowledging its idempotent local filesystem effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolPolicy {
+    ImmediateRepeatableRead,
+    ImmediateIdempotentLocalMaterialize,
+    ConfirmedEffectNeverRepeat,
+}
+
+impl ToolPolicy {
+    pub const fn class(self) -> ToolClass {
         match self {
-            ToolAction::Search { .. }
-            | ToolAction::DeepSearch { .. }
-            | ToolAction::Read { .. }
-            | ToolAction::List { .. }
-            | ToolAction::Export { .. } => RecoveryPolicy::RepeatableReadAndCompare,
-            ToolAction::RestoreLocal { .. } => RecoveryPolicy::IdempotentLocalMaterialize,
-            ToolAction::Backup { .. }
-            | ToolAction::RestoreCloud { .. }
-            | ToolAction::LiveWrite { .. }
-            | ToolAction::Share { .. } => RecoveryPolicy::NeverRepeat,
+            Self::ImmediateRepeatableRead | Self::ImmediateIdempotentLocalMaterialize => {
+                ToolClass::Read
+            }
+            Self::ConfirmedEffectNeverRepeat => ToolClass::Destructive,
         }
     }
-    /// Classify the action (REQ-AGENT-002).
-    pub fn class(&self) -> ToolClass {
+
+    pub const fn recovery(self) -> RecoveryPolicy {
+        match self {
+            Self::ImmediateRepeatableRead => RecoveryPolicy::RepeatableReadAndCompare,
+            Self::ImmediateIdempotentLocalMaterialize => RecoveryPolicy::IdempotentLocalMaterialize,
+            Self::ConfirmedEffectNeverRepeat => RecoveryPolicy::NeverRepeat,
+        }
+    }
+}
+
+impl ToolAction {
+    pub const fn policy(&self) -> ToolPolicy {
         match self {
             ToolAction::Search { .. }
             | ToolAction::DeepSearch { .. }
             | ToolAction::Read { .. }
             | ToolAction::List { .. }
-            | ToolAction::Export { .. }
-            | ToolAction::RestoreLocal { .. } => ToolClass::Read,
+            | ToolAction::Export { .. } => ToolPolicy::ImmediateRepeatableRead,
+            ToolAction::RestoreLocal { .. } => ToolPolicy::ImmediateIdempotentLocalMaterialize,
             ToolAction::Backup { .. }
             | ToolAction::RestoreCloud { .. }
             | ToolAction::LiveWrite { .. }
-            | ToolAction::Share { .. } => ToolClass::Destructive,
+            | ToolAction::Share { .. } => ToolPolicy::ConfirmedEffectNeverRepeat,
         }
+    }
+
+    pub fn recovery_policy(&self) -> RecoveryPolicy {
+        self.policy().recovery()
+    }
+
+    /// Classify the action (REQ-AGENT-002).
+    pub fn class(&self) -> ToolClass {
+        self.policy().class()
     }
 
     /// The subcommand name (matches the wire `op`).
@@ -275,8 +300,20 @@ pub fn parse_action(input: &serde_json::Value) -> Result<ToolAction, String> {
 /// until its action-specific projection moves into the shared read-output contract.
 pub fn public_tool_call_input(
     action: &ToolAction,
-    raw_input: &serde_json::Value,
+    _raw_input: &serde_json::Value,
 ) -> serde_json::Value {
+    fn public_service(service: &str) -> Option<&str> {
+        match service {
+            "mail" | "calendar" | "contacts" | "todo" | "onenote" | "onedrive" => Some(service),
+            _ => None,
+        }
+    }
+
+    fn closed_value<'a>(value: Option<&'a String>, allowed: &[&str]) -> Option<&'a str> {
+        let value = value?.as_str();
+        allowed.contains(&value).then_some(value)
+    }
+
     match action {
         ToolAction::Search { services, .. } => {
             return serde_json::json!({
@@ -292,18 +329,13 @@ pub fn public_tool_call_input(
                 "redacted": true
             });
         }
-        _ if action.class() == ToolClass::Read => return raw_input.clone(),
         _ => {}
     }
     let mut out = serde_json::Map::new();
     out.insert("op".to_string(), serde_json::json!(action.op()));
-    out.insert("account".to_string(), serde_json::json!(action.account()));
     out.insert("redacted".to_string(), serde_json::json!(true));
-    if let Some(service) = action.service() {
+    if let Some(service) = action.service().and_then(public_service) {
         out.insert("service".to_string(), serde_json::json!(service));
-    }
-    if let Some(item) = action.item_or_target() {
-        out.insert("item".to_string(), serde_json::json!(item));
     }
     match action {
         ToolAction::Backup { services, .. } => {
@@ -314,7 +346,29 @@ pub fn public_tool_call_input(
         }
         ToolAction::LiveWrite { change, .. } => {
             if let Some(verb) = change.get("verb").and_then(serde_json::Value::as_str) {
-                out.insert("verb".to_string(), serde_json::json!(verb));
+                if [
+                    "set_read",
+                    "set_flag",
+                    "set_categories",
+                    "move",
+                    "create_draft",
+                    "send_draft",
+                    "create",
+                    "update",
+                    "delete",
+                    "respond",
+                    "complete",
+                    "checklist_add",
+                    "checklist_toggle",
+                    "checklist_delete",
+                    "list_create",
+                    "list_delete",
+                    "append",
+                ]
+                .contains(&verb)
+                {
+                    out.insert("verb".to_string(), serde_json::json!(verb));
+                }
             }
         }
         ToolAction::Share {
@@ -326,16 +380,18 @@ pub fn public_tool_call_input(
             role,
             ..
         } => {
-            if let Some(mode) = mode {
+            if let Some(mode) = closed_value(mode.as_ref(), &["link", "invite"]) {
                 out.insert("mode".to_string(), serde_json::json!(mode));
             }
-            if let Some(link_type) = link_type {
+            if let Some(link_type) = closed_value(link_type.as_ref(), &["view", "edit", "embed"]) {
                 out.insert("link_type".to_string(), serde_json::json!(link_type));
             }
-            if let Some(scope) = scope {
+            if let Some(scope) =
+                closed_value(scope.as_ref(), &["anonymous", "organization", "users"])
+            {
                 out.insert("scope".to_string(), serde_json::json!(scope));
             }
-            if let Some(role) = role {
+            if let Some(role) = closed_value(role.as_ref(), &["read", "write"]) {
                 out.insert("role".to_string(), serde_json::json!(role));
             }
             out.insert(
@@ -402,7 +458,24 @@ pub fn tool_schema() -> serde_json::Value {
                 "recipients": { "type": "array", "items": { "type": "string" } },
                 "role": { "type": "string", "enum": ["read", "write"] },
                 "recipient": { "type": "string" },
-                "change": {}
+                "change": {
+                    "type": "object",
+                    "description": "A live-write change. Every change requires verb. For mail read state use exactly verb=set_read with the boolean is_read field.",
+                    "properties": {
+                        "verb": {
+                            "type": "string",
+                            "enum": [
+                                "set_read", "set_flag", "set_categories", "move",
+                                "create_draft", "send_draft", "create", "update",
+                                "delete", "respond", "complete", "checklist_add",
+                                "checklist_toggle", "checklist_delete", "list_create",
+                                "list_delete", "append"
+                            ]
+                        },
+                        "is_read": { "type": "boolean" }
+                    },
+                    "required": ["verb"]
+                }
             },
             "required": ["op"]
         }
@@ -429,6 +502,21 @@ mod tests {
         );
         assert_eq!(action.class(), ToolClass::Read);
         assert_eq!(action.op(), "search");
+    }
+
+    #[test]
+    fn tool_schema_requires_canonical_live_write_verb_and_read_field() {
+        let schema = tool_schema();
+        let change = &schema["input_schema"]["properties"]["change"];
+        assert_eq!(change["type"], "object");
+        assert_eq!(change["required"], serde_json::json!(["verb"]));
+        assert_eq!(change["properties"]["is_read"]["type"], "boolean");
+        assert!(change["properties"].get("value").is_none());
+        assert!(change["properties"]["verb"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|verb| verb == "set_read"));
     }
 
     #[test]
@@ -630,6 +718,146 @@ mod tests {
         ];
         for (input, expected) in actions {
             assert_eq!(parse_action(&input).unwrap().recovery_policy(), expected);
+        }
+    }
+
+    fn all_policy_actions() -> Vec<ToolAction> {
+        vec![
+            parse_action(&json!({"op":"search","account":"private-account","query":"private-query"})).unwrap(),
+            parse_action(&json!({"op":"deep-search","activity_id":"abcdefghijklmnopqrstuv","continuation":"private-continuation","candidates":["private-candidate"]})).unwrap(),
+            parse_action(&json!({"op":"read","account":"private-account","service":"mail","id":"private-item"})).unwrap(),
+            parse_action(&json!({"op":"list","account":"private-account","service":"mail","parent":"private-parent","limit":10,"offset":20})).unwrap(),
+            parse_action(&json!({"op":"export","account":"private-account","service":"mail","id":"private-item"})).unwrap(),
+            parse_action(&json!({"op":"restore-local","account":"private-account","service":"onedrive","id":"private-item"})).unwrap(),
+            parse_action(&json!({"op":"backup","account":"private-account","services":["mail"]})).unwrap(),
+            parse_action(&json!({"op":"restore-cloud","account":"private-account","service":"mail","id":"private-item"})).unwrap(),
+            parse_action(&json!({"op":"live-write","account":"private-account","service":"mail","target":"private-item","change":{"verb":"set_read","secret":"private-change"}})).unwrap(),
+            parse_action(&json!({"op":"share","account":"private-account","service":"onedrive","id":"private-item","mode":"invite","recipients":["private@example.invalid"],"role":"read"})).unwrap(),
+        ]
+    }
+
+    #[test]
+    fn tool_authorization_and_recovery_policy_is_one_exhaustive_matrix() {
+        let expected = [
+            ToolPolicy::ImmediateRepeatableRead,
+            ToolPolicy::ImmediateRepeatableRead,
+            ToolPolicy::ImmediateRepeatableRead,
+            ToolPolicy::ImmediateRepeatableRead,
+            ToolPolicy::ImmediateRepeatableRead,
+            ToolPolicy::ImmediateIdempotentLocalMaterialize,
+            ToolPolicy::ConfirmedEffectNeverRepeat,
+            ToolPolicy::ConfirmedEffectNeverRepeat,
+            ToolPolicy::ConfirmedEffectNeverRepeat,
+            ToolPolicy::ConfirmedEffectNeverRepeat,
+        ];
+        for (action, expected) in all_policy_actions().iter().zip(expected) {
+            assert_eq!(action.policy(), expected, "{} policy", action.op());
+            assert_eq!(action.class(), expected.class(), "{} class", action.op());
+            assert_eq!(
+                action.recovery_policy(),
+                expected.recovery(),
+                "{} recovery",
+                action.op()
+            );
+        }
+    }
+
+    #[test]
+    fn read_policy_is_exactly_search_deep_read_list_export_restore_local() {
+        let read_ops = all_policy_actions()
+            .into_iter()
+            .filter(|action| action.class() == ToolClass::Read)
+            .map(|action| action.op())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            read_ops,
+            [
+                "search",
+                "deep-search",
+                "read",
+                "list",
+                "export",
+                "restore-local"
+            ]
+        );
+    }
+
+    #[test]
+    fn confirmed_effect_policy_is_exactly_backup_restore_cloud_live_write_share() {
+        let confirmed_ops = all_policy_actions()
+            .into_iter()
+            .filter(|action| action.policy() == ToolPolicy::ConfirmedEffectNeverRepeat)
+            .map(|action| action.op())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            confirmed_ops,
+            ["backup", "restore-cloud", "live-write", "share"]
+        );
+    }
+
+    #[test]
+    fn tool_policy_rejects_invalid_authorization_recovery_pairs() {
+        let valid_pairs = [
+            (
+                ToolPolicy::ImmediateRepeatableRead.class(),
+                ToolPolicy::ImmediateRepeatableRead.recovery(),
+            ),
+            (
+                ToolPolicy::ImmediateIdempotentLocalMaterialize.class(),
+                ToolPolicy::ImmediateIdempotentLocalMaterialize.recovery(),
+            ),
+            (
+                ToolPolicy::ConfirmedEffectNeverRepeat.class(),
+                ToolPolicy::ConfirmedEffectNeverRepeat.recovery(),
+            ),
+        ];
+        assert!(!valid_pairs.contains(&(ToolClass::Read, RecoveryPolicy::NeverRepeat)));
+        assert!(!valid_pairs.contains(&(
+            ToolClass::Destructive,
+            RecoveryPolicy::RepeatableReadAndCompare,
+        )));
+        assert!(!valid_pairs.contains(&(
+            ToolClass::Destructive,
+            RecoveryPolicy::IdempotentLocalMaterialize,
+        )));
+    }
+
+    #[test]
+    fn public_tool_call_projection_is_exhaustive_for_every_action() {
+        for action in all_policy_actions() {
+            let public = public_tool_call_input(&action, &json!({"raw":"private-raw"}));
+            assert_eq!(public["op"], action.op());
+            assert_eq!(public["redacted"], true);
+            assert!(public.as_object().is_some());
+        }
+    }
+
+    #[test]
+    fn public_tool_call_projection_omits_account_item_recipient_change_and_authority_material() {
+        for action in all_policy_actions() {
+            let encoded = public_tool_call_input(
+                &action,
+                &json!({"token":"private-token","action_hash":"private-hash"}),
+            )
+            .to_string();
+            for forbidden in [
+                "private-account",
+                "private-item",
+                "private-parent",
+                "private-query",
+                "private-continuation",
+                "private-candidate",
+                "private-change",
+                "private@example.invalid",
+                "private-token",
+                "private-hash",
+            ] {
+                assert!(
+                    !encoded.contains(forbidden),
+                    "{} leaked {forbidden}",
+                    action.op()
+                );
+            }
         }
     }
 

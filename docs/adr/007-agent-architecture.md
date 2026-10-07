@@ -208,6 +208,28 @@ The constraints that force the shape of this decision:
     to the prior harness remain non-resumable. Rich activity rendering and elapsed-turn
     timers remain the separately scoped #644 consumer.
 
+17. **Exhaustive Agent authorization (REQ-AGENT-019, S-AG.17/#642).** One
+    compiler-exhaustive `ToolAction` policy returns both the authorization class and
+    recovery policy. Search, DeepSearch, Read, List, Export, and RestoreLocal are
+    immediate; Backup, RestoreCloud, LiveWrite, and Share require durable confirmation.
+    Registration rejects any non-confirmable action and binds the canonical action hash,
+    local account selection, expiry, and original session/request/turn owner.
+
+    Confirmation is one atomic control-store transition that revalidates owner, account,
+    action bytes/hash, current policy, expiry, cancellation, and token before consuming
+    authority. App-host repeats the semantic policy check immediately before routing the
+    already typed action through the existing executor. A consumed action never gains new
+    authority: an ambiguous executor result or failed terminal projection is
+    `confirmation_outcome_unknown` and cannot be retried or re-executed.
+
+    Android's native presence handle is an additional single-use gate before the same
+    durable transition, not a second source of authority. Agent streams require both the
+    process session and Agent capability on desktop and bridge transports. Provider,
+    public stream, browser, audit, diagnostic, and evidence projections are separate:
+    public success is the fixed `Completed successfully.` response, while raw actions,
+    owner bindings, confirmation material, account/item identifiers, and executor results
+    remain internal. Exact audit routing has no fallback account.
+
 ## Consequences
 
 - **Cost:** a new crate, a second HTTP client (small, blocking, rustls), and a genuinely

@@ -56,7 +56,7 @@ requirements:
       - test: confirm_rejects_action_hash_mismatch_without_consuming
       - test: confirm_rejects_token_from_another_pending
       - test: expired_confirmation_token_is_rejected_and_swept
-      - test: agent_confirm_audits_once_and_calls_executor_once
+      - test: agent_confirm_typed_success_reaches_existing_executor_and_router_response
       - test: agent_confirm_replay_rejected_and_executor_not_called_twice
       - test: daemon_agent_confirm_runs_executor_once_and_replay_fails
   - id: REQ-AGENT-004
@@ -146,8 +146,8 @@ requirements:
       - test: daemon_agent_unopened_stream_is_swept
       - test: agent_chat_alias_and_legacy_turn_query_are_rejected
       - test: mobile_agent_routes_require_session_token_even_with_cap_token
-      - test: agent_stream_sse_requires_session_token_on_mobile
-      - test: open_bridge_stream_gates_events_and_agent
+      - test: http_agent_stream_requires_session_and_agent_cap_before_opening_handler
+      - test: bridge_agent_stream_requires_separate_session_and_agent_cap_before_opening_handler
   - id: REQ-AGENT-008
     title: Provider policy — Claude/Codex app OAuth product path, FakeProvider CI fallback
     statement: >
@@ -332,8 +332,8 @@ requirements:
       - test: agent_live_write_mail_set_read_routes_existing_writer
       - test: agent_share_link_confirm_routes_through_ledger_handler
       - test: agent_confirm_mobile_policy_refuses_before_mutation
-      - test: agent_confirm_revalidates_action_before_execution
-      - test: agent_confirm_result_summary_is_json_and_redacted
+      - test: agent_confirm_revalidates_policy_immediately_before_executor
+      - test: agent_confirm_response_hides_internal_executor_summary
       - file: docs/evidence/issue-624-manifest.json
   - id: REQ-AGENT-013
     title: Network-critical product OAuth and streamed turns remain diagnosable on Android
@@ -569,3 +569,47 @@ requirements:
       - test: living_ui_reduced_motion_preserves_content_and_interaction
       - file: tools/agent-living-ui-smoke.mjs
       - file: docs/evidence/issue-644-manifest.json
+
+  - id: REQ-AGENT-019
+    title: Agent authorization is exhaustive, owner-bound, and fail-closed
+    statement: >
+      Every current isyncyou ToolAction has one exhaustive authorization and recovery
+      policy. Read-class actions execute immediately; backup, restore-cloud,
+      live-write, and share can execute only after durable registration and atomic
+      confirmation revalidate the original session, request, turn, account, action
+      hash, policy, expiry, cancellation state, and one-time token. Android adds native
+      user presence without becoming an alternate authority. Public, model, browser,
+      audit, diagnostic, and evidence projections never expose raw actions, owner
+      bindings, confirmation authority, or internal executor results. (S-AG.17, #642)
+    status: planned
+    design: docs/adr/007-agent-architecture.md
+    acceptance:
+      - One exhaustive ToolAction policy maps all six immediate actions and all four confirmed-effect actions to both authorization and recovery behavior without a wildcard default.
+      - Pending registration and confirmation reject policy drift, wrong owner or account, changed action hash, expiry, cancellation, replay, and malformed authority before executor entry.
+      - A confirmed effect reaches the existing executor at most once; consumed authority is never recreated or retried after an ambiguous outcome or terminal projection-write failure.
+      - Android requires the existing one-time native presence handle in addition to the same durable owner-bound Agent authority.
+      - Agent confirmation streams require both session and Agent capability, while successful confirmation returns only the fixed public completion text.
+      - Public tool, pending, audit, error, browser-storage, log, and evidence projections contain no raw action payload, account or item binding, token, hash, native handle, or internal result.
+    verified_by:
+      - test: tool_authorization_and_recovery_policy_is_one_exhaustive_matrix
+      - test: confirmation_store_rejects_session_request_or_turn_owner_mismatch_without_consumption
+      - test: agent_confirm_typed_success_reaches_existing_executor_and_router_response
+      - test: agent_confirm_does_not_hold_executor_archive_gate
+      - test: agent_confirm_router_audit_and_all_effects_share_gate_without_relocking
+      - test: agent_audit_write_waits_for_archive_gate_and_releases_it
+      - test: agent_confirm_mobile_enqueue_waits_for_archive_writer_and_retains_both_jobs
+      - test: agent_confirm_projection_commit_failure_after_known_success_returns_unknown_without_reexecution
+      - test: agent_confirm_projection_commit_failure_after_known_failure_returns_unknown_without_reexecution
+      - test: agent_confirm_defers_transcript_projection_and_preserves_terminal_outbox_after_restart
+      - test: agent_confirm_production_send_accepted_then_disconnected_is_outcome_unknown
+      - test: pending_confirmation_outcome_and_binding_debug_redact_action_and_authority
+      - test: mail_live_read_state_rejects_query_unknown_duplicate_and_oversized_bodies
+      - test: mail_live_read_state_replay_performs_fresh_read_without_terminal_receipt
+      - test: hostile_body_can_propose_but_cannot_authorize_or_execute_effect
+      - test: agent_stream_bridge_requires_session_and_agent_capability
+      - test: agent_native_handle_is_single_use_not_persisted_and_wrong_handle_fails
+      - test: android_agent_stream_subscription_requires_cap_and_never_logs_or_reflects_it
+      - file: tools/test_agent_authorization_policy_device_probe.py
+      - file: tools/agent-living-ui-smoke.mjs
+      - file: tools/agent-authorization-policy-device-probe.py
+      - file: docs/evidence/issue-642-manifest.json

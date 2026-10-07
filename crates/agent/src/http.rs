@@ -334,14 +334,14 @@ mod live {
 
     impl HttpTransport {
         pub fn new() -> Result<Self, AgentError> {
-            let client = reqwest::blocking::Client::builder()
+            let client = blocking_client_builder()
                 .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
                 .timeout(PROVIDER_TURN_TIMEOUT)
                 .build()
                 .map_err(|_| {
                     AgentError::Transport("provider_transport_initialization_failed".into())
                 })?;
-            let probe_client = reqwest::blocking::Client::builder()
+            let probe_client = blocking_client_builder()
                 .connect_timeout(PREFLIGHT_CONNECT_TIMEOUT)
                 .timeout(PREFLIGHT_NETWORK_TIMEOUT)
                 .redirect(reqwest::redirect::Policy::none())
@@ -434,15 +434,27 @@ mod live {
             url: &str,
             max_body_bytes: usize,
         ) -> Result<PublicJsonResponse, AgentError> {
+            self.get_catalog_json(url, &[], max_body_bytes)
+        }
+
+        /// Bounded metadata GET; redirects are forbidden so auth cannot leave the origin.
+        pub fn get_catalog_json(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            max_body_bytes: usize,
+        ) -> Result<PublicJsonResponse, AgentError> {
             use std::io::Read as _;
 
             Self::ensure_test_network_allowed()?;
-            let response = self
+            let mut request = self
                 .probe_client
                 .get(url)
-                .header(reqwest::header::ACCEPT, "application/json")
-                .send()
-                .map_err(safe_reqwest_transport_error)?;
+                .header(reqwest::header::ACCEPT, "application/json");
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+            let response = request.send().map_err(safe_reqwest_transport_error)?;
             if response
                 .content_length()
                 .is_some_and(|length| length > max_body_bytes as u64)
@@ -629,7 +641,7 @@ mod live {
         ) -> Result<u16, super::SecretJsonTransportError> {
             Self::ensure_test_network_allowed()
                 .map_err(|_| super::SecretJsonTransportError::ConnectFailed)?;
-            let client = reqwest::blocking::Client::builder()
+            let client = blocking_client_builder()
                 .connect_timeout(timeout)
                 .timeout(timeout)
                 .redirect(reqwest::redirect::Policy::none())
@@ -703,8 +715,27 @@ mod live {
         reqwest::Method::HEAD
     }
 
+    fn trusted_roots() -> impl Iterator<Item = reqwest::Certificate> {
+        // reqwest 0.13 no longer selects ring implicitly with rustls-no-provider.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .map(|certificate| {
+                reqwest::Certificate::from_der(certificate.as_ref()).expect("validated WebPKI root")
+            })
+    }
+
+    fn blocking_client_builder() -> reqwest::blocking::ClientBuilder {
+        reqwest::blocking::Client::builder()
+            .tls_certs_only(trusted_roots())
+            .retry(reqwest::retry::never())
+    }
+
     fn async_sse_client_builder() -> reqwest::ClientBuilder {
-        reqwest::Client::builder().connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+        reqwest::Client::builder()
+            .tls_certs_only(trusted_roots())
+            .retry(reqwest::retry::never())
+            .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
     }
 
     fn error_source_is_tls(error: &(dyn std::error::Error + 'static)) -> bool {

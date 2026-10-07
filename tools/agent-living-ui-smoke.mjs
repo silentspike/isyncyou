@@ -38,7 +38,7 @@ const FIXTURE_TERMINAL_TURNS = new Set();
 function startSse(res) {
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
-    "cache-control": "no-cache, no-transform",
+    "cache-control": "no-store",
     connection: "keep-alive",
   });
 }
@@ -162,6 +162,57 @@ async function backupStream(res, turn) {
   res.end();
 }
 
+async function authorizationContainmentStream(res, turn, scenario) {
+  startSse(res);
+  await sleep(80);
+  const actions = [
+    ["search", "mail"],
+    ["deep-search", "mail"],
+    ["read", "onedrive"],
+    ["list", "calendar"],
+    ["export", "contacts"],
+    ["restore-local", "onenote"],
+    ["backup", "mail"],
+    ["restore-cloud", "mail"],
+    ["live-write", "mail"],
+    ["share", "onedrive"],
+  ];
+  for (const [op, service] of actions) {
+    sendSseMessage(res, {
+      event: "tool_call",
+      name: "isyncyou",
+      input: {
+        op,
+        service,
+        account: "private-account-alias",
+        id: "private-item-id",
+        recipient: "private@example.invalid",
+        change: { body: "private-body" },
+      },
+    });
+  }
+  const previews = {
+    "authorization-backup": ["0", "Back up selected Microsoft 365 data"],
+    "authorization-restore": ["1", "Restore selected Microsoft 365 data"],
+    "authorization-live-write": ["2", "Update one Microsoft 365 item"],
+    "authorization-share": ["3", "Share one OneDrive item"],
+  };
+  const [index, preview] = previews[scenario] || previews["authorization-backup"];
+  sendSseMessage(res, {
+    event: "confirmation_required",
+    pending_id: `policy-pending-${index}-${turn}`,
+    token: `policy-token-${index}-${turn}`,
+    action_hash: index.repeat(64),
+    preview,
+    risk: "Requires your approval",
+    expires_at_ms: Date.now() + 300000,
+  });
+  FIXTURE_TERMINAL_TURNS.add(turn);
+  sendSseMessage(res, { event: "done", reason: "pending_confirmation" });
+  await sleep(20);
+  res.end();
+}
+
 async function failureStream(res, turn) {
   startSse(res);
   await sleep(80);
@@ -200,6 +251,9 @@ async function invalidProgressStream(res, turn) {
 async function sendLivingStream(res, scenario, turn) {
   if (scenario === "search") return searchStream(res, turn);
   if (scenario === "backup") return backupStream(res, turn);
+  if (scenario.startsWith("authorization-")) {
+    return authorizationContainmentStream(res, turn, scenario);
+  }
   if (scenario === "error") return failureStream(res, turn);
   if (scenario === "invalid-progress") return invalidProgressStream(res, turn);
   return directStream(res, turn);
@@ -207,6 +261,10 @@ async function sendLivingStream(res, scenario, turn) {
 
 function scenarioForPrompt(prompt) {
   const value = String(prompt).toLowerCase();
+  if (value.includes("authorization restore")) return "authorization-restore";
+  if (value.includes("authorization live write")) return "authorization-live-write";
+  if (value.includes("authorization share")) return "authorization-share";
+  if (value.includes("authorization containment")) return "authorization-backup";
   if (value.includes("living search") || value.includes("living reduced")) return "search";
   if (value.includes("living backup")) return "backup";
   if (value.includes("living failure")) return "error";
@@ -378,7 +436,11 @@ async function main() {
     fixture404: [], fixtureErrors: [], console_errors: [], page_errors: [], browser_requests: [],
     runtime_transports: [], external_launches: [], non_fixture_origin_requests: [], assertions: [], screenshots: {},
   };
-  const fixture = makeFixtureServer(fixtureEvidence, { scenarioForPrompt, sendStream: sendLivingStream });
+  const fixture = makeFixtureServer(fixtureEvidence, {
+    scenarioForPrompt,
+    sendStream: sendLivingStream,
+    requireAgentStreamCapability: true,
+  });
   fixture.setAgent("claude", "claude-sonnet-4");
   let browser;
   try {
@@ -470,6 +532,159 @@ async function main() {
 
     let lifecycle;
     if (SCENARIO === "containment") {
+      const unauthorizedPath = `${origin}/api/v1/agent/stream?turn=unauthorized-probe`;
+      const [missingStreamCap, wrongStreamCap] = await Promise.all([
+        context.request.get(unauthorizedPath),
+        context.request.get(unauthorizedPath, {
+          headers: { "X-Capability-Token": "wrong" },
+        }),
+      ]);
+      const unauthorizedStreams = [missingStreamCap.status(), wrongStreamCap.status()];
+      check(report, "agent stream rejects missing and wrong capability before handler open",
+        unauthorizedStreams.every(status => status === 403)
+        && fixture.state.agentStreamAuthRejects.length === 2
+        && fixture.state.streamScenarios.length === 0);
+
+      const authorization = await sendPrompt(page, "authorization containment");
+      const authorizationText = await authorization.innerText();
+      report.authorization_projection = {
+        tool_row_count: await authorization.locator('[data-agent-tool-row="tool_call"]').count(),
+        pending_card_count: await authorization.locator('[data-agent-pending-card="1"]').count(),
+      };
+      check(report, "all ten action projections use closed user-facing tool rows",
+        report.authorization_projection.tool_row_count === 10);
+      check(report, "tool rows omit raw account item recipient and change fields",
+        !authorizationText.includes("private-account-alias")
+        && !authorizationText.includes("private-item-id")
+        && !authorizationText.includes("private@example.invalid")
+        && !authorizationText.includes("private-body"));
+      check(report, "backup projection creates one bounded pending card",
+        await authorization.locator('[data-agent-pending-card="1"]').count() === 1
+        && await authorization.locator('[data-agent-pending-confirm="1"]').count() === 1
+        && await authorization.locator('[data-agent-pending-cancel="1"]').count() === 1);
+
+      await page.evaluate(() => {
+        const originalPostJson = postJson;
+        window.__issue642ConfirmRequests = [];
+        window.__issue642RestorePostJson = () => { postJson = originalPostJson; };
+        postJson = async (path, capToken, value) => {
+          if (path !== "/api/v1/agent/confirm") return originalPostJson(path, capToken, value);
+          window.__issue642ConfirmRequests.push(structuredClone(value));
+          if (window.__issue642ConfirmRequests.length === 1) {
+            const error = new Error("confirmation_retryable");
+            error.code = "confirmation_retryable";
+            error.responseReceived = true;
+            throw error;
+          }
+          return { result: "Completed successfully." };
+        };
+      });
+      const firstCard = authorization.locator('[data-agent-pending-card="1"]').first();
+      await firstCard.locator('[data-agent-pending-confirm="1"]').click();
+      await firstCard.locator('[data-agent-pending-confirm="1"]', { hasText: "Retry" }).waitFor();
+      await firstCard.locator('[data-agent-pending-confirm="1"]', { hasText: "Retry" }).click();
+      await firstCard.getByText("Completed successfully.").waitFor();
+      const confirmRequests = await page.evaluate(() => {
+        const captured = window.__issue642ConfirmRequests.map(value => structuredClone(value));
+        window.__issue642RestorePostJson();
+        delete window.__issue642RestorePostJson;
+        delete window.__issue642ConfirmRequests;
+        return captured;
+      });
+      const [firstRequest, secondRequest] = confirmRequests;
+      check(report, "ambiguous confirmation retry reuses one exact request and owner proof",
+        confirmRequests.length === 2
+        && firstRequest.request_id === secondRequest.request_id
+        && firstRequest.session_id === secondRequest.session_id
+        && firstRequest.turn_request_id === secondRequest.turn_request_id
+        && firstRequest.turn_id === secondRequest.turn_id
+        && firstRequest.pending === secondRequest.pending
+        && firstRequest.action_hash === secondRequest.action_hash
+        && firstRequest.token === secondRequest.token);
+      check(report, "confirmed card removes authority controls and exposes fixed success only",
+        await firstCard.locator(".asst-pending-actions").count() === 0
+        && (await firstCard.innerText()).includes("Completed successfully."));
+
+      const replaySafety = await page.evaluate(async () => {
+        const original = postJson;
+        const makeRecord = (id) => ({pending_id: id, token: "synthetic-token",
+          action_hash: "synthetic-hash", session_id: "synthetic-session",
+          turn_request_id: "synthetic-request", turn_id: "synthetic-turn", status: "pending"});
+        const record = makeRecord("replayed-unknown");
+        AssistantState.pendingCardsById.set(record.pending_id, record);
+        try {
+          postJson = async () => {
+            const error = new Error("request_replayed");
+            error.code = "request_replayed";
+            error.responseReceived = true;
+            throw error;
+          };
+          await confirmAgentPending(record.pending_id);
+          const replayUnknown = record.status === "outcome_unknown" && !record.token
+            && !AssistantState.confirmAttemptsByPendingId.has(record.pending_id);
+          const rotated = makeRecord("rotated-authority");
+          AssistantState.pendingCardsById.set(rotated.pending_id, rotated);
+          const attempt = getOrCreateAgentConfirmAttempt(rotated);
+          attempt.phase = "retryable";
+          updateAgentPendingStatus(rotated, "retryable");
+          const turn = {flushTokens() {}, stopTokenCaret() {},
+            ownerProof: {session_id: rotated.session_id, turn_request_id: rotated.turn_request_id,
+              turn_id: rotated.turn_id}, onOperationConfirmation() {}, setPending() {}};
+          await handleAgentEvent({event: "confirmation_required", pending_id: rotated.pending_id,
+            token: rotated.token, action_hash: rotated.action_hash}, turn);
+          const sameAttempt = getOrCreateAgentConfirmAttempt(rotated) === attempt
+            && pendingRecord(rotated.pending_id) === rotated && rotated.status === "retryable";
+          await handleAgentEvent({event: "confirmation_required", pending_id: rotated.pending_id,
+            token: "rotated-token", action_hash: rotated.action_hash}, turn);
+          const rotationClosed = rotated.status === "outcome_unknown" && !rotated.token
+            && !AssistantState.confirmAttemptsByPendingId.has(rotated.pending_id);
+          return {replayUnknown, sameAttempt, rotationClosed};
+        } finally {
+          postJson = original;
+          for (const id of ["replayed-unknown", "rotated-authority"]) {
+            clearAgentPendingAuthority(pendingRecord(id));
+            AssistantState.pendingCardsById.delete(id);
+          }
+        }
+      });
+      check(report, "error receipt replay preserves an unknown effect and erases authority",
+        replaySafety.replayUnknown);
+      check(report, "same authority event preserves the exact ambiguous confirmation attempt",
+        replaySafety.sameAttempt);
+      check(report, "rotated authority cannot replace an ambiguous confirmation attempt",
+        replaySafety.rotationClosed);
+
+      for (const [prompt, preview] of [
+        ["authorization restore", "Restore selected Microsoft 365 data"],
+        ["authorization live write", "Update one Microsoft 365 item"],
+        ["authorization share", "Share one OneDrive item"],
+      ]) {
+        const message = await sendPrompt(page, prompt);
+        const card = message.locator('[data-agent-pending-card="1"]');
+        check(report, `${prompt} uses its closed pending preview`,
+          await card.count() === 1 && (await card.innerText()).includes(preview));
+        await card.locator('[data-agent-pending-cancel="1"]').click();
+        await card.getByText("No changes were made.").waitFor();
+        check(report, `${prompt} cancellation removes authority controls`,
+          await card.locator(".asst-pending-actions").count() === 0);
+      }
+      const authorityState = await page.evaluate(() => ({
+        attempts: AssistantState.confirmAttemptsByPendingId.size,
+        live_authority: [...AssistantState.pendingCardsById.values()].filter(record =>
+          record.token || record.action_hash || record.session_id
+          || record.turn_request_id || record.turn_id).length,
+        persisted: JSON.stringify({
+          local: Object.fromEntries(Object.entries(localStorage)),
+          session: Object.fromEntries(Object.entries(sessionStorage)),
+        }),
+      }));
+      check(report, "terminal cards erase in-memory confirmation authority",
+        authorityState.attempts === 0 && authorityState.live_authority === 0
+        && await page.locator(".asst-pending-actions").count() === 0);
+      check(report, "browser storage contains no pending token hash owner or native authority",
+        !/policy-(pending|token)|action_hash|turn_request_id|native.*handle/i
+          .test(authorityState.persisted));
+
       const invalidProgress = await sendPrompt(page, "living invalid progress");
       check(report, "repeated invalid progress produces one bounded warning",
         await invalidProgress.locator('[data-agent-stream-error="1"]').count() === 1);

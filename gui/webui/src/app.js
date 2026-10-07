@@ -466,33 +466,97 @@ function nativeConfirmationMessage(code) {
   if (code === "busy") return "Another confirmation is already open";
   return "Could not confirm this action";
 }
-/* A short human label for the biometric sheet from the challenge payload (#0.6). */
-function biometricServiceLabel(service) {
-  return service === "onedrive" ? "OneDrive"
-    : service === "backup" || service === "agent" ? "iSyncYou"
-    : service === "mail" ? "Mail"
-    : service === "calendar" ? "Calendar"
-    : service === "contacts" ? "Contacts"
-    : service === "todo" ? "To Do"
-    : service === "onenote" ? "OneNote"
-    : service || "Microsoft 365";
+const AGENT_SSE_FRAME_MAX_BYTES = 72 * 1024;
+const AGENT_SSE_CARRY_MAX_BYTES = 144 * 1024;
+
+function parseAgentSseFrame(frame, onEvent) {
+  if (new TextEncoder().encode(frame).byteLength > AGENT_SSE_FRAME_MAX_BYTES) {
+    throw new Error("agent_stream_frame_too_large");
+  }
+  let eventName = "message";
+  const data = [];
+  for (const line of frame.split("\n")) {
+    if (!line || line.startsWith(":")) continue;
+    if (line.startsWith("event:")) {
+      eventName = line.slice(6).replace(/^ /, "");
+    } else if (line.startsWith("data:")) {
+      data.push(line.slice(5).replace(/^ /, ""));
+    } else {
+      throw new Error("agent_stream_invalid_field");
+    }
+  }
+  if (data.length) onEvent(eventName, data.join("\n"));
 }
-function biometricLabel(d) {
-  const verb = d.op === "delete" ? "Delete" : d.op === "share" ? "Share"
-    : d.op === "backup" ? "Start backup"
-    : d.op === "restore-cloud" ? "Restore to cloud"
-    : d.op === "live-write" ? "Run Agent write"
-    : d.op === "move-out-of-protected" ? "Move out of offline folder"
-    : d.op === "mode-switch-offline-large" ? "Make folder offline"
-    : d.op === "bulk" && d.service === "todo" ? "Delete selected tasks"
-    : d.op === "bulk" ? "Bulk OneDrive change"
-    : d.op ? d.op.charAt(0).toUpperCase() + d.op.slice(1) : "Confirm";
-  const service = biometricServiceLabel(d.service);
-  return `${verb} in ${service}`;
+
+function openAgentFetchStream(path, capToken, onEvent, onError) {
+  const controller = new AbortController();
+  let closed = false;
+  let failed = false;
+  const fail = () => {
+    if (closed || failed) return;
+    failed = true;
+    controller.abort();
+    if (onError) onError();
+  };
+  void (async () => {
+    try {
+      const response = await fetch(path, {
+        method: "GET",
+        credentials: "same-origin",
+        cache: "no-store",
+        redirect: "error",
+        headers: { "X-Capability-Token": capToken },
+        signal: controller.signal,
+      });
+      const contentType = response.headers.get("Content-Type") || "";
+      const cacheControl = response.headers.get("Cache-Control") || "";
+      if (response.redirected || !response.ok
+          || !contentType.toLowerCase().startsWith("text/event-stream")
+          || !cacheControl.toLowerCase().split(",").some(v => v.trim() === "no-store")
+          || !response.body) {
+        throw new Error("agent_stream_rejected");
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      const encoder = new TextEncoder();
+      let carry = "";
+      while (!closed) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        carry += decoder.decode(chunk.value, { stream: true });
+        if (carry.includes("\u0000") || /\r(?!\n)/.test(carry.slice(0, -1))) {
+          throw new Error("agent_stream_invalid_framing");
+        }
+        carry = carry.replace(/\r\n/g, "\n");
+        if (encoder.encode(carry).byteLength > AGENT_SSE_CARRY_MAX_BYTES) {
+          throw new Error("agent_stream_buffer_too_large");
+        }
+        let boundary;
+        while ((boundary = carry.indexOf("\n\n")) >= 0) {
+          const frame = carry.slice(0, boundary);
+          carry = carry.slice(boundary + 2);
+          parseAgentSseFrame(frame, onEvent);
+        }
+      }
+      carry += decoder.decode();
+      if (carry) throw new Error("agent_stream_truncated_frame");
+      if (!closed) fail();
+    } catch (_) {
+      fail();
+    }
+  })();
+  return {
+    close() {
+      if (closed) return;
+      closed = true;
+      controller.abort();
+    }
+  };
 }
-/* Open an SSE-style stream over the active transport (#0A). Mobile bridge mode uses
-   the native stream path and never falls back to EventSource. Desktop uses EventSource. */
-function openEventStream(path, onEvent, onError) {
+
+/* Open an SSE-style stream over the active transport (#0A). Agent streams carry their
+   capability as transport metadata; the generic events stream remains session-only. */
+function openEventStream(path, onEvent, onError, capToken = null) {
   if (BRIDGE) {
     const id = "s" + (++_bridgeSeq);
     const timer = setTimeout(() => {
@@ -504,7 +568,9 @@ function openEventStream(path, onEvent, onError) {
     }, BRIDGE_STREAM_TIMEOUT_MS);
     _bridgeStreams.set(id, { onEvent, onError, timer });
     _bridgeStats.streams++;
-    try { BRIDGE.postMessage(JSON.stringify({ t: "sub", id, path })); }
+    const subscription = capToken ? { t: "sub", id, path, cap_token: capToken }
+      : { t: "sub", id, path };
+    try { BRIDGE.postMessage(JSON.stringify(subscription)); }
     catch (e) {
       clearTimeout(timer);
       _bridgeStreams.delete(id);
@@ -519,6 +585,7 @@ function openEventStream(path, onEvent, onError) {
       }
     };
   }
+  if (capToken) return openAgentFetchStream(path, capToken, onEvent, onError);
   const es = new EventSource(path);
   es.onmessage = (e) => onEvent("message", e.data);
   es.addEventListener("change", () => onEvent("change", ""));
@@ -556,7 +623,13 @@ async function request(method, path, opts) {
   if (status >= 200 && status < 300 && d && d.status === "confirmation_required"
       && d.pending_action_id && !o.perActionToken) {
     const confirmation = await runBiometricConfirm(d.pending_action_id);
-    if (!confirmation.ok) throw new Error(nativeConfirmationMessage(confirmation.code));
+    if (!confirmation.ok) {
+      const error = new Error(nativeConfirmationMessage(confirmation.code));
+      error.code = "native_confirmation_denied";
+      error.nativePromptDenied = true;
+      error.responseReceived = true;
+      throw error;
+    }
     return request(method, path, { ...o, perActionToken: d.pending_action_id });
   }
   if (!Number.isFinite(status) || status < 200 || status >= 300) {
@@ -5322,17 +5395,24 @@ async function startAiLogin(provider, lifecycleOperationId) {
     renderAssistantView($("#view"));
     return;
   }
+  if (AssistantState.oauthOpening) return;
+  AssistantState.oauthOpening = { provider, phase: "preparing" };
+  syncAgentOAuthOpeningUi();
   let guardId = null;
   try {
     guardId = await beginNetworkGuard("oauth");
     if (BRIDGE && !guardId) throw new Error("network_guard_unavailable");
     if (provider === "codex") CODEX_GUARD_ID = guardId;
     else AGENT_GUARD_ID = guardId;
+    AssistantState.oauthOpening.phase = "network";
+    syncAgentOAuthOpeningUi();
     await runConnectivityPreflight(provider, "oauth_start", guardId);
     const redirect = localCallbackRedirect("localhost");
     const manualCodeFlow = provider === "claude" && !redirect;
     const requestKey = `oauth-start:${provider}:${lifecycleOperationId || "connect"}`;
     const requestId = lifecycleRequestId(requestKey);
+    AssistantState.oauthOpening.phase = "authorizing";
+    syncAgentOAuthOpeningUi();
     const d = await postJson("/api/v1/agent/oauth/start", CAP.agent, {
       provider,
       request_id: requestId,
@@ -5347,6 +5427,8 @@ async function startAiLogin(provider, lifecycleOperationId) {
     clearLifecycleRequestId(requestKey);
     if (manualCodeFlow) showCodeStep();
     else showWaitingStep(provider);  // waiting UI + poll; completes when /callback fires
+    AssistantState.oauthOpening.phase = "opening";
+    syncAgentOAuthOpeningUi();
     toast("Opening sign-in in your browser…");
     await openExternalAuth(d.authorize_url, "agent_authorize");
   } catch (e) {
@@ -5356,10 +5438,62 @@ async function startAiLogin(provider, lifecycleOperationId) {
     if (CODEX_GUARD_ID === guardId) CODEX_GUARD_ID = null;
     if (e && e.connectivity) {
       rememberConnectivityIssue(e, () => startAiLogin(provider, lifecycleOperationId));
-      renderAssistantView($("#view"));
     } else {
       toast("Sign-in unavailable", "err");
     }
+    if (App.route === "assistant") await renderAssistantView($("#view"));
+  } finally {
+    AssistantState.oauthOpening = null;
+    syncAgentOAuthOpeningUi();
+  }
+}
+
+function syncAgentOAuthOpeningUi() {
+  const opening = AssistantState.oauthOpening;
+  const controls = document.querySelectorAll(
+    "#asst-connect-claude, #asst-connect-codex, [data-agent-model-connect]",
+  );
+  controls.forEach(button => {
+    if (opening) {
+      if (!button._oauthIdle) button._oauthIdle = {
+        disabled: button.disabled, children: [...button.childNodes],
+      };
+      button.disabled = true;
+      const provider = button.dataset.agentModelConnect
+        || (button.id === "asst-connect-claude" ? "claude" : "codex");
+      if (provider === opening.provider) {
+        button.setAttribute("aria-busy", "true");
+        button.replaceChildren(el("span", { class: "spinner", "aria-hidden": "true" }),
+          el("span", { text: "Connecting…" }));
+      }
+    } else if (button._oauthIdle) {
+      button.disabled = button._oauthIdle.disabled;
+      button.replaceChildren(...button._oauthIdle.children);
+      button.removeAttribute("aria-busy");
+      delete button._oauthIdle;
+    }
+  });
+  let status = document.querySelector("[data-agent-oauth-opening]");
+  if (!opening) { if (status) status.remove(); return; }
+  const card = document.getElementById("asst-connect-card");
+  if (!card) return;
+  if (!status) {
+    status = el("div", { class: "assistant-loading", role: "status",
+      "aria-live": "polite", "data-agent-oauth-opening": "1" });
+    const actions = card.querySelector(".assistant-setup-actions");
+    if (actions) actions.before(status);
+    else card.prepend(status);
+  }
+  const copy = {
+    preparing: "Preparing sign-in…",
+    network: "Checking connection…",
+    authorizing: "Preparing secure sign-in…",
+    opening: "Opening browser…",
+    completing: "Finishing sign-in…",
+  };
+  status.textContent = copy[opening.phase];
+  if (opening.phase === "completing") {
+    card.querySelectorAll("input, button").forEach(node => { node.disabled = true; });
   }
 }
 
@@ -5439,14 +5573,23 @@ function showCodeStep() {
 }
 
 async function completeAiLogin() {
+  if (AssistantState.oauthOpening) return;
   const inp = document.getElementById("asst-code");
   const code = inp && inp.value.trim();
   if (!code) { toast("Paste the code first"); return; }
   const attemptId = OAUTH_ATTEMPTS.get("claude");
-  if (!attemptId) { toast("Start sign-in again.", "err"); return; }
   // #639 T10: the pasted code crosses the boundary only in this strict-JSON body — never a URL/query
   // param, never persisted. Clear the input immediately so it does not linger in the DOM.
   if (inp) inp.value = "";
+  if (!attemptId) {
+    toast("Start sign-in again.", "err");
+    await finishAgentGuard();
+    if (App.route === "assistant") await renderAssistantView($("#view"));
+    return;
+  }
+  AssistantState.oauthOpening = { provider: "claude", phase: "completing" };
+  syncAgentOAuthOpeningUi();
+  let completionAccepted = false;
   try {
     await postJson("/api/v1/agent/oauth/complete", CAP.agent, {
       request_id: crypto.randomUUID(),
@@ -5454,18 +5597,25 @@ async function completeAiLogin() {
       attempt_id: attemptId,
       pasted_code: code,
     });
+    completionAccepted = true;
     OAUTH_ATTEMPTS.delete("claude");
     await finishAgentGuard();
     const status = await api("/api/v1/agent/status");
     if (!(await handleCandidateCleanupStatus(status, "claude"))) {
       if (assistantProviderReady(status, "claude")) toast("Connected!");
       else toast("Sign-in needs attention", "err");
-      renderAssistantView($("#view"));
+      if (App.route === "assistant") await renderAssistantView($("#view"));
     }
   } catch (e) {
-    await cancelOAuthAttempt("claude");
+    if (!completionAccepted) await cancelOAuthAttempt("claude");
     await finishAgentGuard();
-    toast("Couldn't connect. Start sign-in again.", "err");
+    toast(completionAccepted
+      ? "Sign-in completed. Connection status is temporarily unavailable."
+      : "Couldn't connect. Start sign-in again.", "err");
+    if (App.route === "assistant") await renderAssistantView($("#view"));
+  } finally {
+    AssistantState.oauthOpening = null;
+    syncAgentOAuthOpeningUi();
   }
 }
 
@@ -5476,6 +5626,7 @@ const AssistantState = {
   activeStream: null,
   pendingCardsById: new Map(),
   pendingCardNodesById: new Map(),
+  confirmAttemptsByPendingId: new Map(),
   lastUsage: null,
   model: null,
   draft: "",
@@ -5485,6 +5636,7 @@ const AssistantState = {
   activeMessage: null,
   connectivityIssue: null,
   pendingConnectProvider: null,
+  oauthOpening: null,
   pendingModelSelection: null,
   lifecycleRequestIds: new Map(),
   lifecycleAutoResume: new Set(),
@@ -5528,6 +5680,9 @@ function closeAssistantStream(_reason) {
 
 function rememberAssistantStatus(st) {
   AssistantState.status = st || {};
+  for (const provider of ["claude", "codex"]) {
+    if (st?.model_catalog?.[provider]?.state === "not_loaded") AgentModelCatalogs.delete(provider);
+  }
   AssistantState.lastUsage = st && st.usage ? st.usage : null;
   AssistantState.model = st && (st.provider || st.model)
     ? { provider: st.provider || "", model: st.model || "" }
@@ -5896,6 +6051,7 @@ async function renderAssistantView(view) {
   }
   const claudeReady = assistantProviderReady(st, "claude");
   if (OAUTH_ATTEMPTS.has("claude") && !claudeReady) showCodeStep();
+  syncAgentOAuthOpeningUi();
 }
 
 // #639 T10: the ordered official-sign-in -> custom-harness handoff steps the wizard proves. Keys
@@ -6163,9 +6319,51 @@ function agentProviderLabel(provider) {
   if (provider === "codex") return "ChatGPT";
   return "Assistant";
 }
+const AgentModelCatalogs = new Map();
+const AgentModelCatalogRequests = new Map();
+function agentModelCatalog(st, provider) {
+  if (!assistantProviderReady(st, provider)) {
+    AgentModelCatalogs.delete(provider);
+    return { models: [] };
+  }
+  return AgentModelCatalogs.get(provider) || st.model_catalog?.[provider]
+    || { state: "legacy", models: st.models?.[provider] || [] };
+}
+function agentModelEfforts(st, provider, model) {
+  const entry = (agentModelCatalog(st, provider).models || []).find((entry) => entry.id === model);
+  return entry?.reasoning_efforts || st.reasoning_efforts || [];
+}
+async function refreshAssistantModelCatalog(st, wrap) {
+  const refreshPanel = () => {
+    if (!wrap.isConnected) return;
+    const next = agentModelSwitcher(AssistantState.status || st);
+    const panel = next.querySelector(".mdl-panel");
+    if (panel) wrap.querySelector(".mdl-panel").replaceWith(panel);
+    const label = next.querySelector(".mdl-cur");
+    if (label) wrap.querySelector(".mdl-cur").textContent = label.textContent;
+  };
+  await Promise.all(["claude", "codex"].filter((provider) => assistantProviderReady(st, provider)).map(async (provider) => {
+    let pending = AgentModelCatalogRequests.get(provider);
+    if (!pending) {
+      const previous = agentModelCatalog(st, provider);
+      AgentModelCatalogs.set(provider, { ...previous, state: "loading" });
+      pending = request("GET", "/api/v1/agent/models?provider=" + provider, { capToken: CAP.agent })
+        .then((catalog) => {
+          if (catalog.state !== "ready" || !Array.isArray(catalog.models)) throw new Error("model_catalog_invalid");
+          AgentModelCatalogs.set(provider, catalog);
+        }).catch(() => {
+          AgentModelCatalogs.set(provider, { ...previous, state: "unavailable" });
+        }).finally(() => AgentModelCatalogRequests.delete(provider));
+      AgentModelCatalogRequests.set(provider, pending);
+    }
+    refreshPanel();
+    await pending;
+    refreshPanel();
+  }));
+}
 function agentModelSwitcher(st) {
-  const models = st.models || {};
-  const efforts = st.reasoning_efforts || [];
+  const models = Object.fromEntries(["claude", "codex"].map((provider) => [provider, agentModelCatalog(st, provider).models || []]));
+  const efforts = agentModelEfforts(st, st.provider, st.model);
   const currentEffort = st.reasoning_effort || "medium";
   const cur = (st.provider || "") + "|" + (st.model || "");
   const curLabel = () => {
@@ -6182,13 +6380,20 @@ function agentModelSwitcher(st) {
   const rows = [];
   const addGroup = (prov, connected) => {
     const list = models[prov] || [];
-    if (!connected || !list.length) return;
+    if (!connected) return;
     const tag = agentProviderLabel(prov);
     rows.push(el("div", { class: "mdl-group" }, tag));
+    const catalog = agentModelCatalog(st, prov);
+    if (["loading", "not_loaded", "unavailable"].includes(catalog.state)) {
+      rows.push(el("div", { class: "mdl-group", role: "status", text: catalog.state === "unavailable" ? "Model list could not be refreshed" : "Loading models…" }));
+    }
     list.forEach((m) => {
       const val = prov + "|" + m.id;
+      const supported = m.reasoning_efforts || st.reasoning_efforts || [];
+      const effort = supported.some((value) => value.id === currentEffort) ? currentEffort
+        : m.default_reasoning_effort || supported[0]?.id || "medium";
       rows.push(el("button",
-        { class: "mdl-item" + (val === cur ? " active" : ""), type: "button", role: "option", "data-agent-model-option": val, onclick: () => pickModel(prov, m.id, prov === "codex" ? currentEffort : null) },
+        { class: "mdl-item" + (val === cur ? " active" : ""), type: "button", role: "option", ...(["loading", "not_loaded"].includes(catalog.state) ? { disabled: "disabled" } : {}), "data-agent-model-option": val, onclick: () => pickModel(prov, m.id, prov === "codex" ? effort : null) },
         el("span", { class: "mdl-dot" }),
         el("span", { class: "mdl-lbl", text: tag + " · " + m.label })));
     });
@@ -6235,7 +6440,10 @@ function agentModelSwitcher(st) {
     { class: "mdl-trigger", type: "button", "aria-haspopup": "listbox", title: "Switch model",
       onclick: (ev) => {
         ev.stopPropagation();
-        if (wrap.classList.toggle("open")) document.addEventListener("pointerdown", closeOutside, true);
+        if (wrap.classList.toggle("open")) {
+          document.addEventListener("pointerdown", closeOutside, true);
+          refreshAssistantModelCatalog(st, wrap);
+        }
         else document.removeEventListener("pointerdown", closeOutside, true);
       } },
     el("span", { class: "mdl-cur", text: curLabel() }), icon("chevron-down", "mdl-caret"));
@@ -6243,6 +6451,7 @@ function agentModelSwitcher(st) {
   return wrap;
 }
 async function connectAgentProvider(provider, lifecycleNode = null) {
+  if (AssistantState.oauthOpening) return;
   if (!agentPrivacyConsentAccepted(provider)) {
     AssistantState.pendingConnectProvider = agentProviderConsentId(provider);
     await renderAssistantView($("#view"));
@@ -6275,7 +6484,7 @@ async function pickModel(provider, model, reasoningEffort = null) {
     const st = await api("/api/v1/agent/status");
     rememberAssistantStatus(st);
     const effortLabel = provider === "codex"
-      ? (AssistantState.status?.reasoning_efforts || []).find((x) => x.id === (reasoningEffort || "medium"))?.label
+      ? agentModelEfforts(AssistantState.status || {}, provider, model).find((x) => x.id === (reasoningEffort || "medium"))?.label
       : null;
     toast("Model: " + agentProviderLabel(provider) + " · " + model + (effortLabel ? " · " + effortLabel : ""));
     renderAssistantView($("#view"));
@@ -6537,6 +6746,7 @@ function pendingStatus(pending) {
   const status = pending.status || "pending";
   if (status === "pending" && pending.expires_at_ms && Date.now() >= Number(pending.expires_at_ms)) {
     updateAgentPendingStatus(pending, "expired");
+    clearAgentPendingAuthority(pending);
     return "expired";
   }
   return status;
@@ -6547,24 +6757,70 @@ function updateAgentPendingStatus(record, status) {
   if (typeof record.onDisplayStatus === "function") record.onDisplayStatus(status);
 }
 
+function clearAgentPendingAuthority(record) {
+  if (!record) return;
+  AssistantState.confirmAttemptsByPendingId.delete(record.pending_id);
+  record.token = "";
+  record.action_hash = "";
+  record.session_id = "";
+  record.turn_request_id = "";
+  record.turn_id = "";
+}
+
+function getOrCreateAgentConfirmAttempt(record) {
+  const existing = AssistantState.confirmAttemptsByPendingId.get(record.pending_id);
+  if (existing) return existing;
+  const request = Object.freeze({
+    request_id: crypto.randomUUID(),
+    session_id: record.session_id,
+    turn_request_id: record.turn_request_id,
+    turn_id: record.turn_id,
+    pending: record.pending_id,
+    token: record.token,
+    action_hash: record.action_hash,
+  });
+  const attempt = { request, phase: "prepared" };
+  AssistantState.confirmAttemptsByPendingId.set(record.pending_id, attempt);
+  return attempt;
+}
+
 async function confirmAgentPending(pendingId) {
   const record = pendingRecord(pendingId);
-  if (!record || !record.token || !record.action_hash) return;
+  if (!record || !record.token || !record.action_hash || !record.session_id
+      || !record.turn_request_id || !record.turn_id) return;
+  const attempt = getOrCreateAgentConfirmAttempt(record);
+  attempt.phase = "submitted";
   updateAgentPendingStatus(record, "confirming");
   record.error = "";
   rerenderPendingCards(pendingId);
   try {
-    const d = await postJson("/api/v1/agent/confirm", CAP.agent, {
-      request_id: crypto.randomUUID(), pending: pendingId,
-      token: record.token, action_hash: record.action_hash,
-    });
+    await postJson("/api/v1/agent/confirm", CAP.agent, attempt.request);
     updateAgentPendingStatus(record, "confirmed");
     record.result = "Completed successfully.";
-    record.token = "";
-    record.action_hash = "";
+    clearAgentPendingAuthority(record);
   } catch (e) {
-    updateAgentPendingStatus(record, "error");
-    record.error = agentCompactValue(e.message || e, 180);
+    if (e && e.nativePromptDenied) {
+      AssistantState.confirmAttemptsByPendingId.delete(pendingId);
+      updateAgentPendingStatus(record, "pending");
+      record.error = nativeConfirmationMessage("cancelled");
+    } else if (!e || !e.responseReceived || e.code === "confirmation_retryable") {
+      attempt.phase = "retryable";
+      updateAgentPendingStatus(record, "retryable");
+      record.error = "Confirmation was not completed. Retry uses the same request.";
+    } else if (e.code === "confirmation_outcome_unknown"
+        || e.code === "request_outcome_unknown" || e.code === "request_replayed") {
+      updateAgentPendingStatus(record, "outcome_unknown");
+      record.error = "The action outcome could not be verified.";
+      clearAgentPendingAuthority(record);
+    } else {
+      const status = e.code === "confirmation_expired" ? "expired"
+        : e.code === "confirmation_cancelled" ? "cancelled" : "failed";
+      updateAgentPendingStatus(record, status);
+      record.error = status === "expired" ? "Confirmation expired."
+        : status === "cancelled" ? "Confirmation was cancelled."
+        : "The action was not confirmed.";
+      clearAgentPendingAuthority(record);
+    }
   }
   rerenderPendingCards(pendingId);
 }
@@ -6589,8 +6845,7 @@ async function cancelAgentPending(pendingId) {
       action_hash: record.action_hash,
     });
     updateAgentPendingStatus(record, "cancelled");
-    record.token = "";
-    record.action_hash = "";
+    clearAgentPendingAuthority(record);
     closeAssistantStream("pending-cancel");
   } catch (e) {
     updateAgentPendingStatus(record, "error");
@@ -6618,18 +6873,23 @@ async function cancelAgentTurn(turnId) {
 function renderAgentPendingCard(pending, trackNode = true) {
   const status = pendingStatus(pending);
   const risk = pending.risk ? `Risk: ${pending.risk}` : "Review required";
-  const done = status === "confirmed" || status === "cancelled";
+  const done = ["confirmed", "cancelled", "expired", "failed", "outcome_unknown"]
+    .includes(status);
   const waiting = status === "confirming" || status === "cancelling";
   const confirmDisabled = waiting || done || status === "expired";
   const cancelDisabled = waiting || done;
   const confirm = el("button", { class: "btn primary sm", type: "button", onclick: () => confirmAgentPending(pending.pending_id), "data-agent-pending-confirm": "1" },
-    icon("check", "icon-sm"), status === "confirming" ? "Confirming…" : "Confirm");
+    icon("check", "icon-sm"), status === "confirming" ? "Confirming…"
+      : status === "retryable" ? "Retry" : "Confirm");
   const cancel = el("button", { class: "btn sm", type: "button", onclick: () => cancelAgentPending(pending.pending_id), "data-agent-pending-cancel": "1" },
     icon("x", "icon-sm"), status === "cancelling" ? "Cancelling…" : "Cancel");
   if (confirmDisabled) confirm.setAttribute("disabled", "disabled");
   if (cancelDisabled) cancel.setAttribute("disabled", "disabled");
   const title = status === "confirmed" ? "Action confirmed"
     : status === "cancelled" ? "Action cancelled"
+      : status === "expired" ? "Confirmation expired"
+        : status === "outcome_unknown" ? "Outcome needs review"
+          : status === "failed" ? "Action not confirmed"
       : pending.preview || "Action requires confirmation";
   const terminalResult = pending.result
     || (status === "cancelled" ? "No changes were made." : "");
@@ -6701,6 +6961,20 @@ function agentSafeErrorCopy(code) {
     provider_response_read_failed: "The provider response could not be read.",
     provider_response_incomplete: "The AI account stopped before finishing. Try again.",
     provider_transport_failed: "The provider connection failed.",
+    pending_registration_unavailable: "Confirmation is temporarily unavailable.",
+    pending_owner_mismatch: "Confirmation is temporarily unavailable.",
+    pending_policy_mismatch: "Confirmation is temporarily unavailable.",
+    pending_registration_invalid: "Confirmation is temporarily unavailable.",
+    pending_capacity_unavailable: "Confirmation is temporarily unavailable.",
+    pending_registration_conflict: "Confirmation is temporarily unavailable.",
+    pending_maintenance_unavailable: "Confirmation is temporarily unavailable.",
+    pending_seal_unavailable: "Confirmation is temporarily unavailable.",
+    pending_quota_unavailable: "Confirmation is temporarily unavailable.",
+    pending_database_unavailable: "Confirmation is temporarily unavailable.",
+    pending_commit_unavailable: "Confirmation is temporarily unavailable.",
+    pending_action_invalid: "This action could not be prepared safely.",
+    pending_projection_unavailable: "Confirmation is temporarily unavailable.",
+    pending_transition_unavailable: "Confirmation is temporarily unavailable.",
     confirmation_unavailable: "Confirmation is temporarily unavailable.",
     session_busy: "This shared session is still in use. Try again shortly.",
     session_store_unavailable: "Shared session state is temporarily unavailable. Try again.",
@@ -7372,7 +7646,9 @@ async function handleAgentEvent(message, turnState) {
         preview: d.preview || "Action requires confirmation",
         risk: d.risk || "",
         expires_at_ms: d.expires_at_ms || null,
-        turn_id: turnState.turnId || "",
+        session_id: turnState.ownerProof?.session_id || "",
+        turn_request_id: turnState.ownerProof?.turn_request_id || "",
+        turn_id: turnState.ownerProof?.turn_id || turnState.turnId || "",
         status: "pending",
         result: "",
         error: "",
@@ -7380,6 +7656,20 @@ async function handleAgentEvent(message, turnState) {
         action_hash: d.action_hash || "",
       };
       if (pending.pending_id) {
+        const previous = pendingRecord(pending.pending_id);
+        const attempt = AssistantState.confirmAttemptsByPendingId.get(pending.pending_id);
+        if (previous && attempt) {
+          const sameAuthority = ["token", "action_hash", "session_id", "turn_request_id", "turn_id"]
+            .every(field => attempt.request[field] === pending[field]);
+          if (!sameAuthority) {
+            updateAgentPendingStatus(previous, "outcome_unknown");
+            previous.error = "The action outcome could not be verified.";
+            clearAgentPendingAuthority(previous);
+          }
+          rerenderPendingCards(pending.pending_id);
+          break;
+        }
+        if (previous && !["pending", "retryable"].includes(previous.status)) break;
         AssistantState.pendingCardsById.set(pending.pending_id, pending);
       }
       turnState.onOperationConfirmation(pending);
@@ -8147,6 +8437,7 @@ async function agentSend(text) {
     },
     isCurrent: isCurrentTurn,
     turnId: turn,
+    ownerProof: activityIdentity,
     finish,
     reconcileRequestStatus,
   };
@@ -8210,7 +8501,7 @@ async function agentSend(text) {
       if (AssistantState.activeMessage !== asst || AssistantState.activeTurnId !== turn) return;
       finish("⚠ connection lost");
     })();
-  });
+  }, CAP.agent);
   stream = openTurnStream();
   AssistantState.activeStream = stream;
   AssistantState.turnStreamReady = true;

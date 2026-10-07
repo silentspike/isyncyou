@@ -1150,6 +1150,20 @@ impl Store {
         Ok(())
     }
 
+    /// A metadata delta can change the sidecar without changing the MIME body.
+    pub fn invalidate_preview_json(
+        &self,
+        account: &str,
+        service: &str,
+        remote_id: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE items SET preview_json=NULL WHERE account_id=?1 AND service=?2 AND remote_id=?3",
+            params![account, service, remote_id],
+        )?;
+        Ok(())
+    }
+
     /// Update a OneDrive item's content-state fields (schema v14): the body lifecycle
     /// (`content_state`, `body_location`, `body_state`, `materialized_at`). Written by the
     /// download/materialize paths so `has_body` derives from `body_state=='available'`
