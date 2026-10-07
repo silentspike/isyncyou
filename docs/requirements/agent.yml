@@ -581,7 +581,7 @@ requirements:
       user presence without becoming an alternate authority. Public, model, browser,
       audit, diagnostic, and evidence projections never expose raw actions, owner
       bindings, confirmation authority, or internal executor results. (S-AG.17, #642)
-    status: implemented
+    status: planned
     design: docs/adr/007-agent-architecture.md
     acceptance:
       - One exhaustive ToolAction policy maps all six immediate actions and all four confirmed-effect actions to both authorization and recovery behavior without a wildcard default.
@@ -594,6 +594,10 @@ requirements:
       - test: tool_authorization_and_recovery_policy_is_one_exhaustive_matrix
       - test: confirmation_store_rejects_session_request_or_turn_owner_mismatch_without_consumption
       - test: agent_confirm_typed_success_reaches_existing_executor_and_router_response
+      - test: agent_confirm_does_not_hold_executor_archive_gate
+      - test: agent_confirm_router_audit_and_all_effects_share_gate_without_relocking
+      - test: agent_audit_write_waits_for_archive_gate_and_releases_it
+      - test: agent_confirm_mobile_enqueue_waits_for_archive_writer_and_retains_both_jobs
       - test: agent_confirm_projection_commit_failure_after_known_success_returns_unknown_without_reexecution
       - test: agent_confirm_projection_commit_failure_after_known_failure_returns_unknown_without_reexecution
       - test: agent_confirm_defers_transcript_projection_and_preserves_terminal_outbox_after_restart

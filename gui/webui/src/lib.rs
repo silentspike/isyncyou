@@ -4728,6 +4728,9 @@ impl Router {
             // Model selection is owned by the encrypted Agent settings/control stores,
             // not the archive writer. Keep it responsive during an unrelated sync.
             "/api/v1/agent/model",
+            // The confirmed executor and audit sink own their archive access gates.
+            // Holding the same gate here would deadlock after consuming authority.
+            "/api/v1/agent/confirm",
             // A body-based live read touches no archive Store and must remain
             // available while that Store is being refreshed.
             "/api/v1/mail/read-state",
@@ -10770,6 +10773,33 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             response.status, 200,
             "Agent turn admission must not wait for the archive gate"
         );
+    }
+
+    #[test]
+    fn agent_confirm_does_not_hold_executor_archive_gate() {
+        let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let agent = std::sync::Arc::new(FixedConfirmAgent::new(AgentConfirmOutcome::Completed));
+        let router = Router::with_gate(Config::default(), gate.clone())
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into());
+        let held = gate.lock().unwrap();
+        std::thread::scope(|scope| {
+            let (send, receive) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                send.send(
+                    router
+                        .route(&agent_confirm_request(TEST_CONFIRM_ACTION_HASH))
+                        .status,
+                )
+                .unwrap();
+            });
+            let response = receive.recv_timeout(std::time::Duration::from_secs(1));
+            // Release even when the route regresses, so the test fails without hanging.
+            drop(held);
+            assert_eq!(response.unwrap(), 200);
+        });
+        assert_eq!(agent.confirm_call_count(), 1);
+        assert!(gate.try_lock().is_ok());
     }
 
     #[test]

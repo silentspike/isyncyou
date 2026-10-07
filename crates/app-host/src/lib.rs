@@ -407,6 +407,7 @@ pub trait AgentAuditSink: Send + Sync {
 
 struct StoreAgentAuditSink {
     cfg: Config,
+    gate: Arc<Mutex<()>>,
 }
 
 impl StoreAgentAuditSink {
@@ -428,6 +429,9 @@ impl AgentAuditSink for StoreAgentAuditSink {
         let path = self
             .store_path(routing)
             .ok_or(AgentAuditError::UnknownRoutingKey)?;
+        // Confirm is router-gate exempt; serialize only this archive write,
+        // releasing the gate before the executor acquires it for its own work.
+        let _gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
         let store = Store::open(path).map_err(|_| AgentAuditError::Unavailable)?;
         let now = unix_now();
         store
@@ -3454,7 +3458,10 @@ impl DaemonAgent {
             feature = "agent-subscription-experimental"
         ))]
         remove_legacy_codex_callback_diagnostics(&oauth_dir);
-        let audit_sink = Arc::new(StoreAgentAuditSink { cfg: cfg.clone() });
+        let audit_sink = Arc::new(StoreAgentAuditSink {
+            cfg: cfg.clone(),
+            gate: gate.clone(),
+        });
         let confirmed_executor =
             agent_ops::confirmed_executor_for_policy(operation_policy, cfg.clone(), gate);
         #[cfg(any(
@@ -17349,6 +17356,180 @@ mod tests {
     }
 
     #[test]
+    fn agent_confirm_router_audit_and_all_effects_share_gate_without_relocking() {
+        struct GatedExecutor {
+            gate: Arc<Mutex<()>>,
+            inner: RecordingConfirmedExecutor,
+        }
+        impl AgentConfirmedActionExecutor for GatedExecutor {
+            fn resolved_account_key(
+                &self,
+                action: &isyncyou_agent::ToolAction,
+            ) -> Result<String, ClosedExecutionCode> {
+                self.inner.resolved_account_key(action)
+            }
+            fn execute_confirmed(
+                &self,
+                action: &isyncyou_agent::ToolAction,
+            ) -> ConfirmedExecutionOutcome {
+                let _guard = self
+                    .gate
+                    .try_lock()
+                    .expect("executor owns the archive gate");
+                self.inner.execute_confirmed(action)
+            }
+        }
+        struct GatedAudit(StoreAgentAuditSink);
+        impl AgentAuditSink for GatedAudit {
+            fn record_authorization(
+                &self,
+                routing: &AgentAuditRoutingKey,
+                event: &AgentAuthorizationAuditV1,
+            ) -> Result<(), AgentAuditError> {
+                // Fail promptly if the router or executor still holds the gate;
+                // the production sink then acquires it for the actual Store write.
+                drop(
+                    self.0
+                        .gate
+                        .try_lock()
+                        .map_err(|_| AgentAuditError::Unavailable)?,
+                );
+                self.0.record_authorization(routing, event)
+            }
+        }
+
+        let root = temp_agent_root("confirm-shared-gate");
+        let cfg = test_config_with_account(&root, "me");
+        std::fs::create_dir_all(&cfg.accounts[0].archive_root).unwrap();
+        let gate = Arc::new(Mutex::new(()));
+        let executor = RecordingConfirmedExecutor::ok("internal", Arc::default());
+        let agent = Arc::new(DaemonAgent::with_test_confirm_components(
+            cfg.clone(),
+            root.clone(),
+            Arc::new(GatedExecutor {
+                gate: gate.clone(),
+                inner: executor.clone(),
+            }),
+            Arc::new(GatedAudit(StoreAgentAuditSink {
+                cfg: cfg.clone(),
+                gate: gate.clone(),
+            })),
+        ));
+        let router = isyncyou_webui::Router::with_gate(cfg.clone(), gate.clone())
+            .with_agent(agent.clone(), "agent-capability".into())
+            .with_session_token("session-authority".into());
+        for (index, value) in [
+            serde_json::json!({"op":"backup","account":"me","services":["mail"]}),
+            serde_json::json!({"op":"restore-cloud","account":"me","service":"mail","id":"item"}),
+            serde_json::json!({"op":"live-write","account":"me","service":"mail","target":"item","change":{"verb":"set_read","is_read":true}}),
+            serde_json::json!({"op":"share","account":"me","service":"onedrive","id":"item","mode":"link","link_type":"view","scope":"organization"}),
+        ].into_iter().enumerate() {
+            let action = isyncyou_agent::parse_action(&value).unwrap();
+            let preview = agent_ops::preview_for_pending_action(&action).unwrap();
+            let (pending, token) = register_test_pending(&agent, action, &preview.text, unix_now_ms(), AGENT_CONFIRM_TTL_MS);
+            let request = isyncyou_webui::ApiRequest::new("POST", "/api/v1/agent/confirm")
+                .with_session_token(Some("session-authority".into()))
+                .with_cap_token(Some("agent-capability".into()))
+                .with_content_type(Some("application/json".into()))
+                .with_body(serde_json::to_vec(&serde_json::json!({
+                    "request_id": format!("550e8400-e29b-41d4-a716-4466554400{index:02}"),
+                    "session_id": "test-session",
+                    "turn_request_id": "00000000-0000-4000-8000-000000000000",
+                    "turn_id": "test-turn",
+                    "pending": pending.id,
+                    "token": token,
+                    "action_hash": pending.action_hash,
+                })).unwrap());
+            assert_eq!(router.route(&request).status, 200);
+            assert_eq!(executor.call_count(), index + 1);
+            let _ = router.route(&request);
+            assert_eq!(executor.call_count(), index + 1, "consumed authority cannot execute twice");
+            assert!(gate.try_lock().is_ok());
+        }
+        let store = Store::open(cfg.accounts[0].archive_root.join(".isyncyou-store.db")).unwrap();
+        let runs = store.recent_runs("me", 16).unwrap();
+        assert_eq!(runs.iter().filter(|run| run.status == "started").count(), 4);
+        assert_eq!(
+            runs.iter().filter(|run| run.status == "completed").count(),
+            4
+        );
+        drop(store);
+        drop(router);
+        drop(agent);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_confirm_mobile_enqueue_waits_for_archive_writer_and_retains_both_jobs() {
+        let root = temp_agent_root("confirm-mobile-enqueue-gate");
+        let mut cfg = test_config_with_account(&root, "me");
+        cfg.restore.cloud_restore_enabled = true;
+        std::fs::create_dir_all(&cfg.accounts[0].archive_root).unwrap();
+        let gate = Arc::new(Mutex::new(()));
+        let jobs = Arc::new(mobile_jobs::MobileJobRuntime::new(
+            cfg.clone(),
+            gate.clone(),
+            Arc::new(isyncyou_webui::EventBus::new()),
+        ));
+        let executor = agent_ops::confirmed_executor_for_policy(
+            AgentOperationPolicy::MobileFullNode { mobile_jobs: jobs },
+            cfg.clone(),
+            gate.clone(),
+        );
+        let actions = [
+            backup_action(),
+            isyncyou_agent::parse_action(&serde_json::json!({
+                "op":"restore-cloud","account":"me","service":"mail","id":"item"
+            }))
+            .unwrap(),
+        ];
+        let held = gate.lock().unwrap();
+        let store = Store::open(cfg.accounts[0].archive_root.join(".isyncyou-store.db")).unwrap();
+        std::thread::scope(|scope| {
+            let (started_send, started_receive) = std::sync::mpsc::channel();
+            let (send, receive) = std::sync::mpsc::channel();
+            for action in &actions {
+                let executor = executor.clone();
+                let send = send.clone();
+                let started_send = started_send.clone();
+                scope.spawn(move || {
+                    started_send.send(()).unwrap();
+                    send.send(executor.execute_confirmed(action)).unwrap();
+                });
+            }
+            for _ in 0..2 {
+                started_receive
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap();
+            }
+            // Outlast Store's five-second retry: without the gate, enqueue loses
+            // the job after consumed authority instead of waiting for the writer.
+            let blocked = receive.recv_timeout(Duration::from_secs(6));
+            drop(store);
+            drop(held);
+            assert!(matches!(
+                blocked,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            for _ in 0..2 {
+                assert!(matches!(
+                    receive.recv_timeout(Duration::from_secs(2)).unwrap(),
+                    ConfirmedExecutionOutcome::Completed(_)
+                ));
+            }
+        });
+        assert!(gate.try_lock().is_ok());
+        let store = Store::open(cfg.accounts[0].archive_root.join(".isyncyou-store.db")).unwrap();
+        let queued = store.list_mobile_jobs("me", 8).unwrap();
+        assert_eq!(queued.len(), 2);
+        assert!(queued
+            .iter()
+            .all(|job| job.state == isyncyou_store::MobileJobState::Queued));
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn each_confirmed_effect_routes_once_through_existing_executor() {
         let order = Arc::new(StdMutex::new(Vec::new()));
         let executor = RecordingConfirmedExecutor::ok("internal", order.clone());
@@ -18285,6 +18466,53 @@ mod tests {
     }
 
     #[test]
+    fn agent_audit_write_waits_for_archive_gate_and_releases_it() {
+        let root = temp_agent_root("audit-shared-gate");
+        let cfg = test_config_with_account(&root, "me");
+        std::fs::create_dir_all(&cfg.accounts[0].archive_root).unwrap();
+        let gate = Arc::new(Mutex::new(()));
+        let sink = StoreAgentAuditSink {
+            cfg: cfg.clone(),
+            gate: gate.clone(),
+        };
+        let event = AgentAuthorizationAuditV1 {
+            schema_version: 1,
+            op: isyncyou_core::pending::ConfirmationOperation::Backup,
+            service: Some(isyncyou_core::pending::ConfirmationService::Backup),
+            state: AuthorizationAuditState::Started,
+            code: None,
+        };
+        let held = gate.lock().unwrap();
+        std::thread::scope(|scope| {
+            let (started_send, started_receive) = std::sync::mpsc::channel();
+            let (send, receive) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                started_send.send(()).unwrap();
+                send.send(sink.record_authorization(&AgentAuditRoutingKey("me".into()), &event))
+                    .unwrap();
+            });
+            started_receive
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            let blocked = receive.recv_timeout(Duration::from_millis(50));
+            drop(held);
+            assert!(matches!(
+                blocked,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert_eq!(
+                receive.recv_timeout(Duration::from_secs(2)).unwrap(),
+                Ok(())
+            );
+        });
+        assert!(gate.try_lock().is_ok());
+        let store = Store::open(cfg.accounts[0].archive_root.join(".isyncyou-store.db")).unwrap();
+        assert_eq!(store.recent_runs("me", 2).unwrap().len(), 1);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn agent_audit_unknown_routing_key_never_falls_back_to_first_account() {
         let root = temp_agent_root("audit-unknown-route");
         let cfg = Config {
@@ -18298,7 +18526,10 @@ mod tests {
             }],
             ..Default::default()
         };
-        let sink = StoreAgentAuditSink { cfg };
+        let sink = StoreAgentAuditSink {
+            cfg,
+            gate: Arc::new(Mutex::new(())),
+        };
         let event = AgentAuthorizationAuditV1 {
             schema_version: 1,
             op: isyncyou_core::pending::ConfirmationOperation::Backup,
@@ -18938,9 +19169,12 @@ mod tests {
         let executor = agent_ops::confirmed_executor_for_policy(
             AgentOperationPolicy::DesktopEnabled,
             cfg.clone(),
-            gate,
+            gate.clone(),
         );
-        let audit = Arc::new(StoreAgentAuditSink { cfg: cfg.clone() });
+        let audit = Arc::new(StoreAgentAuditSink {
+            cfg: cfg.clone(),
+            gate,
+        });
         let subject = format!("isyncyou issue 624 live confirm {}", unix_now());
         let recipient = std::env::var("ISY624_M365_DRAFT_TO")
             .unwrap_or_else(|_| "recipient@example.invalid".to_string());
@@ -19100,9 +19334,12 @@ mod tests {
         let executor = agent_ops::confirmed_executor_for_policy(
             AgentOperationPolicy::DesktopEnabled,
             cfg.clone(),
-            gate,
+            gate.clone(),
         );
-        let audit = Arc::new(StoreAgentAuditSink { cfg: cfg.clone() });
+        let audit = Arc::new(StoreAgentAuditSink {
+            cfg: cfg.clone(),
+            gate,
+        });
         let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
             id: "tool-1".into(),
             input: serde_json::json!({
@@ -19184,9 +19421,12 @@ mod tests {
         let executor = agent_ops::confirmed_executor_for_policy(
             AgentOperationPolicy::DesktopEnabled,
             cfg.clone(),
-            gate,
+            gate.clone(),
         );
-        let audit = Arc::new(StoreAgentAuditSink { cfg: cfg.clone() });
+        let audit = Arc::new(StoreAgentAuditSink {
+            cfg: cfg.clone(),
+            gate,
+        });
         let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
             id: "tool-1".into(),
             input: serde_json::json!({
@@ -19261,9 +19501,12 @@ mod tests {
         let executor = agent_ops::confirmed_executor_for_policy(
             AgentOperationPolicy::DesktopEnabled,
             cfg.clone(),
-            gate,
+            gate.clone(),
         );
-        let audit = Arc::new(StoreAgentAuditSink { cfg: cfg.clone() });
+        let audit = Arc::new(StoreAgentAuditSink {
+            cfg: cfg.clone(),
+            gate,
+        });
         let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
             id: "tool-1".into(),
             input: serde_json::json!({
