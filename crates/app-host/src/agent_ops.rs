@@ -2412,6 +2412,7 @@ impl MobileFullNodeAgentOperations {
     ) -> Result<ConfirmedActionResult, String> {
         match action {
             isyncyou_agent::ToolAction::Backup { account, services } => {
+                let _gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
                 let job = self.mobile_jobs.enqueue_backup(account, services)?;
                 Ok(Self::queued_job_result(
                     "backup",
@@ -2425,6 +2426,7 @@ impl MobileFullNodeAgentOperations {
                 service,
                 id,
             } => {
+                let _gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
                 let job = self
                     .mobile_jobs
                     .enqueue_restore_cloud(account, service, id)?;

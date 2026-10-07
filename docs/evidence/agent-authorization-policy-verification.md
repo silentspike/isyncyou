@@ -1,10 +1,34 @@
 # Agent Authorization Policy Verification
 
 Issue: #642, S-AG.17, REQ-AGENT-019.
-Status: **LOCAL AND DEVICE GATES PASS; protected PR and review remain pending.**
+Status: **HISTORICAL QUALIFICATION; post-review lock correction requires fresh qualification.**
 Implementation commit: `8d6e79fb48bad2afbccff4888579803b20fe3041`.
 Implementation tree: `03f1e6d02a6b4f6cfb8847d60f3ff841f3dd2605`.
 Date: 2026-10-04. Landing target: `dev` only.
+
+## Post-Review Correction
+
+Independent review on 2026-10-07 identified an archive-gate deadlock in the
+confirmed Backup, RestoreCloud and Share route. The router held the same mutex
+that the existing executor acquires after confirmation authority consumption.
+The historical LiveWrite physical row did not exercise that nested lock.
+
+The correction exempts AgentConfirm from the router archive gate and makes the
+production audit sink acquire that shared gate only for its own Store write.
+Executor archive locking, session/capability checks, native proof, consumption
+and terminal outbox behavior remain unchanged. Runtime regression coverage
+includes all four effects through the router, real audit writes, one executor
+invocation per pending action and archive-write serialization.
+
+Android Backup and RestoreCloud now also acquire the shared gate just for
+durable job enqueue. A production MobileFullNode regression holds the archive
+writer longer than Store's lock retry and verifies both jobs are queued after
+release, rather than losing consumed confirmation to a Store-open timeout.
+
+The artifacts and manifest below retain their original immutable implementation
+identity. They are not qualification of the corrected source. REQ-AGENT-019 is
+planned again until the new implementation, required device/evidence gates and
+independent review are complete. No merge or issue closure is claimed.
 
 ## Proven Scope
 
