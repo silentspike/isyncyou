@@ -13,11 +13,17 @@ isyncyou-graph = { path = "../graph" }
 isyncyou-store = { path = "../store", default-features = false }
 isyncyou-pathmap = { path = "../pathmap" }
 serde_json = { workspace = true }
+ring = "0.17"
+icalendar = { version = "=0.17.13", features = ["parser", "recurrence"] }
+vcard-rs = { version = "=0.4.0", features = ["parser", "jcard", "encoding", "base64"] }
 thiserror = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"], optional = true }
+quick-xml = "0.41"
+url = "2"
 
 [features]
 # Enable the live reqwest transport (pulls graph's http feature).
-http = ["isyncyou-graph/http"]
+http = ["isyncyou-graph/http", "dep:reqwest"]
 # Forward the store at-rest-encryption profile so the whole dep chain (engine,
 # webui) can pick plain-store for Android. Desktop default = encrypted-store.
 default = ["encrypted-store"]

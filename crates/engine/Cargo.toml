@@ -21,6 +21,11 @@ serde_json = { workspace = true }
 # permissive (MIT/Apache), no system deps.
 hmac = "0.12"
 sha2 = "0.10"
+base64 = "0.23"
+ring = "0.17"
+fs2 = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+keyring-core = { version = "1", optional = true }
 
 [dev-dependencies]
 # Temp files for the ledger Upload/Replace body-source tests (#655).
@@ -30,6 +35,6 @@ tempfile = "3"
 # Desktop/CLI/daemon keep both defaults; the Android mobile crate depends on the
 # engine with `default-features = false` (no D-Bus keyring, plain sqlite store).
 default = ["encrypted-store", "desktop-keyring"]
-desktop-keyring = ["isyncyou-graph/desktop-keyring"]
+desktop-keyring = ["isyncyou-graph/desktop-keyring", "dep:keyring-core"]
 encrypted-store = ["isyncyou-store/encrypted-store", "isyncyou-connectors/encrypted-store"]
 plain-store = ["isyncyou-store/plain-store", "isyncyou-connectors/plain-store"]

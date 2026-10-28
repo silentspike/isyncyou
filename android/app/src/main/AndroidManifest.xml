@@ -30,30 +30,19 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTop"
             android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
-        </activity>
-
-        <!-- FCM: when the app is backgrounded the system posts the notification, so
-             point it at our brand icon + accent colour instead of the default (#576). -->
-        <meta-data
-            android:name="com.google.firebase.messaging.default_notification_icon"
-            android:resource="@drawable/ic_stat_isyncyou"/>
-        <meta-data
-            android:name="com.google.firebase.messaging.default_notification_color"
-            android:resource="@color/brand_indigo"/>
-
-        <!-- FCM push receiver (#575) — wakes the app to post a notification. -->
-        <service
-            android:name=".IsyncMessagingService"
-            android:exported="false">
             <intent-filter>
-                <action android:name="com.google.firebase.MESSAGING_EVENT"/>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="${applicationId}"/>
             </intent-filter>
-        </service>
+        </activity>
 
         <!-- #640: bounded interactive OAuth/refresh/turn guard. It is not the #626
              WorkManager foreground service and does not imply universal network reachability. -->
@@ -61,6 +50,16 @@
             android:name=".NetworkCriticalGuardService"
             android:exported="false"
             android:foregroundServiceType="dataSync"/>
+
+        <receiver android:name=".UnifiedPushReceiver" android:enabled="true" android:exported="true">
+            <intent-filter>
+                <action android:name="org.unifiedpush.android.connector.MESSAGE"/>
+                <action android:name="org.unifiedpush.android.connector.UNREGISTERED"/>
+                <action android:name="org.unifiedpush.android.connector.NEW_ENDPOINT"/>
+                <action android:name="org.unifiedpush.android.connector.REGISTRATION_FAILED"/>
+                <action android:name="org.unifiedpush.android.connector.TEMP_UNAVAILABLE"/>
+            </intent-filter>
+        </receiver>
 
         <!-- WorkManager's long-running Worker delegates to this service. Android 14+
              rejects the foreground transition unless both the manifest and the

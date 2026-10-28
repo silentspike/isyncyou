@@ -171,6 +171,95 @@ fn make_executor(
         restore_root,
     ))
 }
+
+#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+struct ProviderMailExecutor { cfg: Config, account: String }
+
+#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+impl isyncyou_agent::ToolExecutor for ProviderMailExecutor {
+    fn execute_read(&self, action: &isyncyou_agent::ToolAction) -> Result<String, isyncyou_agent::AgentError> {
+        use isyncyou_agent::{AgentError, ToolAction};
+        if action.account() != self.account { return Err(AgentError::ToolArgs("account mismatch".into())); }
+        let origin = match self.cfg.provider_accounts.get(&self.account) {
+            Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) => origin,
+            None => return Err(AgentError::Provider("provider unavailable".into())),
+        };
+        let store = isyncyou_engine::provider_store::open_readonly(&self.cfg, &self.account)
+            .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
+        match action {
+            ToolAction::Search { services, query, limit, .. } if services.is_empty() || services.iter().any(|s| s == "mail") => {
+                if query.trim().is_empty() || query.len() > 1024 { return Err(AgentError::ToolArgs("invalid search query".into())); }
+                let literal_query = format!("\"{}\"", query.replace('"', "\"\""));
+                let rows = store.search_provider_mail(&self.account, origin, &literal_query, limit.unwrap_or(20).clamp(1, 100) as usize)
+                    .map_err(|_| AgentError::Provider("provider search unavailable".into()))?;
+                let mut results = Vec::new();
+                for (scope, item) in rows {
+                    let metadata: serde_json::Value = serde_json::from_slice(&item.raw).map_err(|_| AgentError::Provider("provider cache invalid".into()))?;
+                    results.push(serde_json::json!({"account":self.account,"provider":origin,"service":"mail","id":item.remote_id,"blob_id":metadata["blobId"],"mailbox_ids":metadata["mailboxIds"],"subject":metadata["subject"],"preview":metadata["preview"],"provenance":"local","observed_at":store.provider_observed_at(&scope).ok().flatten()}));
+                }
+                Ok(serde_json::json!({"results":results,"provenance":"local","freshness":"last observed, not live"}).to_string())
+            }
+            ToolAction::Read { service, id, max_bytes, .. } if service == "mail" => {
+                let client = isyncyou_engine::self_hosted_mail::client(&self.cfg, &self.account).map_err(|_| AgentError::Provider("provider unavailable".into()))?;
+                let body = isyncyou_engine::self_hosted_mail::read_body(&self.cfg, &self.account, &client, id, max_bytes.unwrap_or(65536).clamp(1, 1024 * 1024) as usize)
+                    .map_err(|_| AgentError::Provider("provider body unavailable".into()))?;
+                Ok(serde_json::json!({"account":self.account,"provider":origin,"service":"mail","id":id,"provenance":"live","observed_at":unix_now(),"content":body}).to_string())
+            }
+            ToolAction::List { service, parent, limit, offset, .. } if service == "mail" && parent.as_deref() == Some("identities") => {
+                let client = isyncyou_engine::self_hosted_mail::client(&self.cfg, &self.account).map_err(|_| AgentError::Provider("provider unavailable".into()))?;
+                let identities = isyncyou_engine::self_hosted_mail::sending_identities(&self.cfg, &self.account, &client).map_err(|_| AgentError::Provider("provider identities unavailable".into()))?;
+                let start = offset.unwrap_or(0) as usize;
+                let selected: Vec<_> = identities.into_iter().skip(start).take(limit.unwrap_or(20).clamp(1,100) as usize).collect();
+                Ok(serde_json::json!({"account":self.account,"provider":origin,"service":"mail","kind":"identities","provenance":"live","observed_at":unix_now(),"results":selected}).to_string())
+            }
+            ToolAction::List { service, parent, limit, offset, .. } if service == "mail" && parent.as_deref() == Some("mailboxes") => {
+                let scopes = store.provider_scopes(&self.account, origin, "mailboxes").map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
+                let [scope] = scopes.as_slice() else { return Err(AgentError::Provider("provider scope unavailable".into())); };
+                if offset.unwrap_or(0) != 0 { return Err(AgentError::ToolArgs("provider mailbox offset unavailable".into())); }
+                let page = store.provider_objects_page(scope, "", limit.unwrap_or(20).clamp(1,100) as usize).map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
+                let values: Vec<serde_json::Value> = page.iter().map(|o| serde_json::from_slice(&o.raw)).collect::<Result<_, _>>().map_err(|_| AgentError::Provider("provider cache invalid".into()))?;
+                Ok(serde_json::json!({"account":self.account,"provider":origin,"service":"mail","kind":"mailboxes","provenance":"local","observed_at":store.provider_observed_at(scope).ok().flatten(),"results":values}).to_string())
+            }
+            _ => Err(AgentError::Provider("provider operation unavailable".into())),
+        }
+    }
+    fn execute_read_with_context(&self, action: &isyncyou_agent::ToolAction, context: isyncyou_agent::ReadExecutionContext<'_, '_>) -> Result<isyncyou_agent::ReadExecutionOutputV2, isyncyou_agent::AgentError> {
+        let content = self.execute_read(action)?;
+        context.input_budget.charge(&content)?;
+        if matches!(action, isyncyou_agent::ToolAction::Search { .. }) {
+            use base64::Engine as _;
+            use ring::rand::SecureRandom as _;
+            let mut id = [0u8; 16];
+            ring::rand::SystemRandom::new().fill(&mut id).map_err(|_| isyncyou_agent::AgentError::Provider("search identity unavailable".into()))?;
+            let count = serde_json::from_str::<serde_json::Value>(&content).ok().and_then(|v| v["results"].as_array().map(|a| a.len())).unwrap_or(0);
+            Ok(isyncyou_agent::ReadExecutionOutputV2::Search(isyncyou_agent::SeparatedSearchOutputV2 {
+                provider_content: content,
+                public_projection: isyncyou_agent::PublicToolResultV1 {
+                    schema_version: isyncyou_agent::activity::ACTIVITY_SCHEMA_VERSION,
+                    operation: "search".into(), activity_id: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id),
+                    visible_hits: count as u32, coverage_complete: false, budget_reached: true,
+                    continuation_available: false, sources: Vec::new(),
+                },
+                assistant_sources: Vec::new(),
+            }))
+        } else {
+            let output = isyncyou_agent::ExistingSharedReadOutputV2 { content, untrusted: true, assistant_sources: Vec::new() };
+            if matches!(action, isyncyou_agent::ToolAction::List { .. }) { Ok(isyncyou_agent::ReadExecutionOutputV2::List(output)) }
+            else { Ok(isyncyou_agent::ReadExecutionOutputV2::Read(output)) }
+        }
+    }
+}
+
+#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+fn make_account_executor(account: &str, archive_root: PathBuf, cfg: &Config) -> Box<dyn isyncyou_agent::ToolExecutor + Send> {
+    if cfg.provider_accounts.contains_key(account) {
+        Box::new(ProviderMailExecutor { cfg: cfg.clone(), account: account.into() })
+    } else { make_executor(account, archive_root) }
+}
+#[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
+fn make_account_executor(account: &str, archive_root: PathBuf, _cfg: &Config) -> Box<dyn isyncyou_agent::ToolExecutor + Send> {
+    make_executor(account, archive_root)
+}
 #[cfg(not(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
@@ -300,23 +389,104 @@ impl ConfirmedActionResult {
     }
 }
 
-/// Narrow seam for destructive actions after human confirmation.
-pub trait AgentConfirmedActionExecutor: Send + Sync {
-    fn execute_confirmed(
-        &self,
-        action: &isyncyou_agent::ToolAction,
-    ) -> Result<ConfirmedActionResult, String>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosedExecutionCode {
+    ExecutorRejected,
+    ExecutorFailed,
 }
 
-/// Narrow audit seam for confirmed agent actions. The live implementation writes the
-/// same durable account run log used by Router audit paths; tests use an in-memory sink.
-pub trait AgentAuditSink: Send + Sync {
-    fn record_confirm(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmedExecutionOutcome {
+    Completed(ConfirmedActionResult),
+    Failed(ClosedExecutionCode),
+    OutcomeUnknown,
+}
+
+/// Narrow seam for destructive actions after human confirmation.
+pub trait AgentConfirmedActionExecutor: Send + Sync {
+    fn resolved_account_key(
         &self,
         action: &isyncyou_agent::ToolAction,
-        status: &str,
-        summary: &str,
-    ) -> Result<(), String>;
+    ) -> Result<String, ClosedExecutionCode>;
+
+    fn execute_confirmed(&self, action: &isyncyou_agent::ToolAction) -> ConfirmedExecutionOutcome;
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentAuditRoutingKey(String);
+
+impl std::fmt::Debug for AgentAuditRoutingKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AgentAuditRoutingKey([redacted])")
+    }
+}
+
+impl std::fmt::Display for AgentAuditRoutingKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[redacted]")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorizationAuditState {
+    Started,
+    Completed,
+    Failed,
+    OutcomeUnknown,
+}
+
+impl AuthorizationAuditState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::OutcomeUnknown => "outcome_unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosedAuthorizationCode {
+    ExecutorRejected,
+    ExecutorFailed,
+    EffectOutcomeUnknown,
+}
+
+impl ClosedAuthorizationCode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExecutorRejected => "executor_rejected",
+            Self::ExecutorFailed => "executor_failed",
+            Self::EffectOutcomeUnknown => "effect_outcome_unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentAuthorizationAuditV1 {
+    schema_version: u8,
+    op: isyncyou_core::pending::ConfirmationOperation,
+    service: Option<isyncyou_core::pending::ConfirmationService>,
+    state: AuthorizationAuditState,
+    code: Option<ClosedAuthorizationCode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentAuditError {
+    UnknownRoutingKey,
+    Unavailable,
+}
+
+/// Narrow audit seam for confirmed Agent actions. Only a private routing key and a
+/// closed projection cross this boundary; raw actions and executor text stay inside
+/// app-host.
+pub trait AgentAuditSink: Send + Sync {
+    fn record_authorization(
+        &self,
+        routing: &AgentAuditRoutingKey,
+        event: &AgentAuthorizationAuditV1,
+    ) -> Result<(), AgentAuditError>;
 }
 
 struct StoreAgentAuditSink {
@@ -324,40 +494,37 @@ struct StoreAgentAuditSink {
 }
 
 impl StoreAgentAuditSink {
-    fn store_path(&self, account: &str) -> Option<PathBuf> {
+    fn store_path(&self, routing: &AgentAuditRoutingKey) -> Option<PathBuf> {
         self.cfg
             .accounts
             .iter()
-            .find(|a| a.id == account)
-            .or_else(|| self.cfg.accounts.first())
+            .find(|account| account.id == routing.0)
             .map(|a| a.archive_root.join(".isyncyou-store.db"))
     }
 }
 
 impl AgentAuditSink for StoreAgentAuditSink {
-    fn record_confirm(
+    fn record_authorization(
         &self,
-        action: &isyncyou_agent::ToolAction,
-        status: &str,
-        summary: &str,
-    ) -> Result<(), String> {
-        let account = action.account();
+        routing: &AgentAuditRoutingKey,
+        event: &AgentAuthorizationAuditV1,
+    ) -> Result<(), AgentAuditError> {
         let path = self
-            .store_path(account)
-            .ok_or_else(|| format!("unknown account '{account}'"))?;
-        let store = Store::open(path).map_err(|e| e.to_string())?;
+            .store_path(routing)
+            .ok_or(AgentAuditError::UnknownRoutingKey)?;
+        let store = Store::open(path).map_err(|_| AgentAuditError::Unavailable)?;
         let now = unix_now();
         store
             .add_run(
-                account,
+                &routing.0,
                 "audit:agent-confirm",
                 &now,
                 &now,
-                status,
-                &agent_audit_summary(summary),
+                event.state.as_str(),
+                &agent_authorization_audit_summary(event),
             )
             .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|_| AgentAuditError::Unavailable)
     }
 }
 
@@ -414,40 +581,85 @@ fn record_account_lifecycle_transition_audit(
     }
 }
 
-fn agent_action_summary(action: &isyncyou_agent::ToolAction) -> String {
-    let mut parts = vec![
-        format!("op={}", action.op()),
-        format!(
-            "account={}",
-            agent_ops::redact_agent_operation_text(action.account())
+fn agent_authorization_audit_context(
+    action: &isyncyou_agent::ToolAction,
+    resolved_account_key: String,
+) -> Result<(AgentAuditRoutingKey, AgentAuthorizationAuditV1), AgentAuditError> {
+    use isyncyou_agent::ToolAction;
+    use isyncyou_core::pending::{ConfirmationOperation, ConfirmationService};
+
+    let (op, service) = match action {
+        ToolAction::Backup { .. } => (
+            ConfirmationOperation::Backup,
+            Some(ConfirmationService::Backup),
         ),
-    ];
-    if let Some(service) = action.service() {
-        parts.push(format!(
-            "service={}",
-            agent_ops::redact_agent_operation_text(service)
-        ));
-    }
-    parts.join(" ")
+        ToolAction::RestoreCloud { service, .. } => (
+            ConfirmationOperation::RestoreCloud,
+            Some(ConfirmationService::parse(service).ok_or(AgentAuditError::Unavailable)?),
+        ),
+        ToolAction::LiveWrite { service, .. } => (
+            ConfirmationOperation::LiveWrite,
+            Some(ConfirmationService::parse(service).ok_or(AgentAuditError::Unavailable)?),
+        ),
+        ToolAction::Share { .. } => (
+            ConfirmationOperation::Share,
+            Some(ConfirmationService::Onedrive),
+        ),
+        ToolAction::Search { .. }
+        | ToolAction::DeepSearch { .. }
+        | ToolAction::Read { .. }
+        | ToolAction::List { .. }
+        | ToolAction::Export { .. }
+        | ToolAction::RestoreLocal { .. } => return Err(AgentAuditError::Unavailable),
+    };
+    Ok((
+        AgentAuditRoutingKey(resolved_account_key),
+        AgentAuthorizationAuditV1 {
+            schema_version: 1,
+            op,
+            service,
+            state: AuthorizationAuditState::Started,
+            code: None,
+        },
+    ))
 }
 
-fn agent_audit_summary(summary: &str) -> String {
-    const MAX: usize = 400;
-    let mut out: String = summary.chars().take(MAX).collect();
-    if summary.chars().count() > MAX {
-        out.push_str("...");
-    }
-    out
+fn agent_authorization_audit_summary(event: &AgentAuthorizationAuditV1) -> String {
+    format!(
+        "schema_version={} op={} service={} state={} code={}",
+        event.schema_version,
+        event.op.as_str(),
+        event.service.map_or("none", |service| service.as_str()),
+        event.state.as_str(),
+        event.code.map_or("none", |code| code.as_str()),
+    )
 }
 
-fn agent_safe_executor_error(error: &str) -> &'static str {
-    if error.contains("not_implemented") {
-        "not_implemented"
-    } else if error.contains("not_available_on_mobile") {
-        "not_available_on_mobile"
-    } else {
-        "execution_failed"
+#[derive(Default)]
+struct AgentAuthorizationDiagnostics {
+    audit_write_failures: AtomicU64,
+    projection_commit_failures: AtomicU64,
+}
+
+impl AgentAuthorizationDiagnostics {
+    fn increment(counter: &AtomicU64) {
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            Some(value.saturating_add(1))
+        });
     }
+
+    fn record_audit_failure(&self) {
+        Self::increment(&self.audit_write_failures);
+    }
+
+    fn record_projection_failure(&self) {
+        Self::increment(&self.projection_commit_failures);
+    }
+}
+
+fn agent_authorization_diagnostics() -> &'static AgentAuthorizationDiagnostics {
+    static DIAGNOSTICS: OnceLock<AgentAuthorizationDiagnostics> = OnceLock::new();
+    DIAGNOSTICS.get_or_init(AgentAuthorizationDiagnostics::default)
 }
 
 fn agent_safe_turn_error(error: &isyncyou_agent::AgentError) -> &'static str {
@@ -603,6 +815,21 @@ fn agent_safe_outcome_diagnostic(code: &str) -> &'static str {
         "provider_transport_failed" => "provider_transport_failed",
         "provider_generation_changed" => "provider_generation_changed",
         "provider_step_limit_reached" => "provider_step_limit_reached",
+        "pending_registration_unavailable" => "pending_registration_unavailable",
+        "pending_owner_mismatch" => "pending_owner_mismatch",
+        "pending_policy_mismatch" => "pending_policy_mismatch",
+        "pending_registration_invalid" => "pending_registration_invalid",
+        "pending_capacity_unavailable" => "pending_capacity_unavailable",
+        "pending_registration_conflict" => "pending_registration_conflict",
+        "pending_maintenance_unavailable" => "pending_maintenance_unavailable",
+        "pending_seal_unavailable" => "pending_seal_unavailable",
+        "pending_quota_unavailable" => "pending_quota_unavailable",
+        "pending_database_unavailable" => "pending_database_unavailable",
+        "pending_commit_unavailable" => "pending_commit_unavailable",
+        "pending_action_invalid" => "pending_action_invalid",
+        "pending_projection_unavailable" => "pending_projection_unavailable",
+        "pending_transition_unavailable" => "pending_transition_unavailable",
+        "confirmation_unavailable" => "confirmation_unavailable",
         "session_store_unavailable" => "session_store_unavailable",
         "session_transport_unavailable" => "session_transport_unavailable",
         "session_transport_timed_out" => "session_transport_timed_out",
@@ -632,6 +859,23 @@ fn agent_safe_turn_start_error(error: &str) -> &'static str {
         "provider_generation_changed" => "provider_generation_changed",
         "request_id_conflict" => "request_id_conflict",
         "turn_outcome_unknown" => "turn_outcome_unknown",
+        "pending_registration_unavailable" => "pending_registration_unavailable",
+        "pending_owner_mismatch" => "pending_owner_mismatch",
+        "pending_policy_mismatch" => "pending_policy_mismatch",
+        "pending_registration_invalid" => "pending_registration_invalid",
+        "pending_capacity_unavailable" => "pending_capacity_unavailable",
+        "pending_registration_conflict" => "pending_registration_conflict",
+        "pending_maintenance_unavailable" => "pending_maintenance_unavailable",
+        "pending_seal_unavailable" => "pending_seal_unavailable",
+        "pending_quota_unavailable" => "pending_quota_unavailable",
+        "pending_database_unavailable" => "pending_database_unavailable",
+        "pending_commit_unavailable" => "pending_commit_unavailable",
+        "pending_action_invalid" => "pending_action_invalid",
+        "pending_projection_unavailable" => "pending_projection_unavailable",
+        "pending_transition_unavailable" => "pending_transition_unavailable",
+        "confirmation_unavailable" => "confirmation_unavailable",
+        "lease_lost" => "lease_lost",
+        "session_state_invalid" => "session_state_invalid",
         "session_account_mismatch" => "session_account_mismatch",
         "session_busy" => "session_busy",
         "manifest_conflict" => "session_busy",
@@ -1514,7 +1758,24 @@ fn terminal_error_events_after_persistence(
 )]
 fn pending_setup_error_code(error: &str) -> &'static str {
     match error {
+        "pending_registration_unavailable" => "pending_registration_unavailable",
+        "pending_owner_mismatch" => "pending_owner_mismatch",
+        "pending_policy_mismatch" => "pending_policy_mismatch",
+        "pending_registration_invalid" => "pending_registration_invalid",
+        "pending_capacity_unavailable" => "pending_capacity_unavailable",
+        "pending_registration_conflict" => "pending_registration_conflict",
+        "pending_maintenance_unavailable" => "pending_maintenance_unavailable",
+        "pending_seal_unavailable" => "pending_seal_unavailable",
+        "pending_quota_unavailable" => "pending_quota_unavailable",
+        "pending_database_unavailable" => "pending_database_unavailable",
+        "pending_commit_unavailable" => "pending_commit_unavailable",
+        "pending_action_invalid" => "pending_action_invalid",
+        "pending_projection_unavailable" => "pending_projection_unavailable",
+        "turn_registry_unavailable" => "pending_transition_unavailable",
+        "confirmation_unavailable" => "confirmation_unavailable",
         "lease_lost" | "manifest_conflict" => "lease_lost",
+        "session_store_unavailable" => "session_store_unavailable",
+        "invalid_session_record" | "invalid_request_journal" => "session_state_invalid",
         "session_transport_unavailable" => "session_transport_unavailable",
         "session_transport_timed_out" => "session_transport_timed_out",
         "session_name_resolution_failed" => "session_name_resolution_failed",
@@ -7075,6 +7336,10 @@ fn provider_has_model(provider: ProductProviderId, model: &str) -> bool {
     known.iter().any(|spec| spec.id == model)
 }
 
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProductModelBudgets {
     context: isyncyou_agent::ContextBudget,
@@ -9954,6 +10219,7 @@ impl DaemonAgent {
         let prompt = prompt.to_owned();
         let account_id = account.to_owned();
         let archive_root = self.archive_root_for(&account_id);
+        let executor_cfg = self.cfg.clone();
         let pending = self.pending.clone();
         let turns = Arc::clone(&self.turns);
         let hot_request_statuses = Arc::clone(&self.hot_request_statuses);
@@ -9984,7 +10250,7 @@ impl DaemonAgent {
                     feature = "agent-subscription-experimental"
                 ))]
                 let _operation_lease = operation_lease;
-                let exec = make_executor(&account_id, archive_root);
+                let exec = make_account_executor(&account_id, archive_root, &executor_cfg);
                 let mut product_turn = thread_product_turn
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -10091,9 +10357,10 @@ impl DaemonAgent {
                     }
                     Ok(isyncyou_agent::TurnOutcome::PendingConfirmation { action, .. }) => {
                         let action = *action;
-                        let preview = match agent_ops::preview_for_pending_action(&action) {
+                        let preview = match agent_ops::preview_for_pending_action_with_config(&executor_cfg, &action) {
                             Ok(preview) => preview,
-                            Err(_) => {
+                            Err(error) => {
+                                agent_ops::log_pending_action_validation(&error);
                                 let cancelled = matches!(
                                     TurnRegistry::begin_terminal(&turn_state, &cancellation),
                                     Ok(TerminalTransition::Cancelled)
@@ -10109,7 +10376,7 @@ impl DaemonAgent {
                                 } else {
                                     (
                                         isyncyou_agent::TurnTerminalStatus::Error,
-                                        Some("confirmation_unavailable".into()),
+                                        Some("pending_action_invalid".into()),
                                         isyncyou_agent::RequestPhase::Failed,
                                         isyncyou_agent::DoneReason::Error,
                                     )
@@ -10146,7 +10413,7 @@ impl DaemonAgent {
                                 } else {
                                     terminal_error_events_after_persistence(
                                         persisted,
-                                        "confirmation_unavailable",
+                                        "pending_action_invalid",
                                     )
                                 };
                                 for event in events {
@@ -10182,7 +10449,10 @@ impl DaemonAgent {
                                     AGENT_CONFIRM_TTL_MS,
                                     owner,
                                 )
-                                .map_err(|_| "confirmation_unavailable".to_string())?;
+                                .map_err(|error| match error {
+                                    isyncyou_agent::AgentError::Provider(code) => code,
+                                    _ => "pending_registration_unavailable".to_string(),
+                                })?;
                             let persisted = product_turn.take().map_or(Ok(()), |runtime| {
                                 cache_product_session_context(
                                     &hot_session_history,
@@ -10195,7 +10465,12 @@ impl DaemonAgent {
                                     &pending_action.action_hash,
                                     unix_now_ms(),
                                 );
-                                return Err(error);
+                                let safe = pending_setup_error_code(&error);
+                                return Err(if safe == "confirmation_unavailable" {
+                                    "pending_projection_unavailable".into()
+                                } else {
+                                    error
+                                });
                             }
                             terminal_persisted = true;
                             cache_persisted_request_phase(
@@ -11732,6 +12007,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         // turn thread can build the real store-backed retrieval executor for it.
         let account_id = account.to_string();
         let archive_root = self.archive_root_for(&account_id);
+        let executor_cfg = self.cfg.clone();
         let pending = self.pending.clone();
         #[cfg(any(
             feature = "agent-oauth-providers",
@@ -11746,7 +12022,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     feature = "agent-subscription-experimental"
                 ))]
                 let _operation_lease = operation_lease;
-                let exec = make_executor(&account_id, archive_root);
+                let exec = make_account_executor(&account_id, archive_root, &executor_cfg);
                 let mut history = vec![isyncyou_agent::Message::user(prompt)];
                 let mut events = isyncyou_agent::FallibleTurnEventSink::new(|event| {
                     hub.emit(&tid, event)
@@ -11780,7 +12056,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     }
                     Ok(isyncyou_agent::TurnOutcome::PendingConfirmation { action, .. }) => {
                         let action = *action;
-                        let preview = match agent_ops::preview_for_pending_action(&action) {
+                        let preview = match agent_ops::preview_for_pending_action_with_config(&executor_cfg, &action) {
                             Ok(preview) => preview,
                             Err(e) => {
                                 let _ = hub.emit(
@@ -12252,68 +12528,278 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
 
     fn pending_binding(
         &self,
-        pending_id: &str,
-        action_hash: &str,
-    ) -> Result<isyncyou_webui::AgentPendingBinding, String> {
-        let binding = self
-            .pending
-            .binding(pending_id, action_hash, unix_now_ms())
-            .map_err(|e| format!("{e:?}"))?;
-        Ok(isyncyou_webui::AgentPendingBinding {
-            op: binding.op,
-            account: binding.account,
-            service: binding.service,
-            item: binding.item,
-        })
+        command: &isyncyou_webui::AgentPendingBindingCommand,
+    ) -> isyncyou_webui::AgentPendingBindingOutcome {
+        let owner = isyncyou_agent::PendingOwnerProof {
+            session_id: command.owner.session_id.clone(),
+            turn_request_id: command.owner.turn_request_id.clone(),
+            turn_id: command.owner.turn_id.clone(),
+        };
+        match self.pending.binding(
+            &command.pending,
+            &command.action_hash,
+            &owner,
+            unix_now_ms(),
+        ) {
+            isyncyou_agent::PendingBindingOutcome::Ready(binding) => {
+                isyncyou_webui::AgentPendingBindingOutcome::Ready(
+                    isyncyou_webui::AgentPendingBinding {
+                        op: binding.op,
+                        account: binding.account,
+                        service: binding.service,
+                        item: binding.item,
+                    },
+                )
+            }
+            isyncyou_agent::PendingBindingOutcome::Rejected(code) => {
+                isyncyou_webui::AgentPendingBindingOutcome::Rejected(match code {
+                    isyncyou_agent::ClosedConfirmationCode::Invalid => {
+                        isyncyou_webui::AgentClosedConfirmationCode::Invalid
+                    }
+                    isyncyou_agent::ClosedConfirmationCode::Expired => {
+                        isyncyou_webui::AgentClosedConfirmationCode::Expired
+                    }
+                    isyncyou_agent::ClosedConfirmationCode::Cancelled => {
+                        isyncyou_webui::AgentClosedConfirmationCode::Cancelled
+                    }
+                    isyncyou_agent::ClosedConfirmationCode::Replayed => {
+                        isyncyou_webui::AgentClosedConfirmationCode::Replayed
+                    }
+                })
+            }
+            isyncyou_agent::PendingBindingOutcome::Unavailable => {
+                isyncyou_webui::AgentPendingBindingOutcome::Unavailable
+            }
+        }
     }
 
-    fn confirm(&self, pending_id: &str, token: &str, action_hash: &str) -> Result<String, String> {
-        let action = self
-            .pending
-            .confirm(pending_id, token, action_hash, unix_now_ms())
-            .map_err(|e| format!("{e:?}"))?;
-        self.turns.remove_pending(pending_id);
-        if let Err(error) = agent_ops::preview_for_pending_action(&action) {
-            self.finish_pending_confirmation_state(pending_id, "failed", unix_now_ms())?;
-            return Err(format!(
-                "invalid_confirmed_action: {}",
-                agent_ops::redact_agent_operation_text(&error)
-            ));
+    fn confirm(
+        &self,
+        command: &isyncyou_webui::AgentConfirmCommand,
+    ) -> isyncyou_webui::AgentConfirmOutcome {
+        let owner = isyncyou_agent::PendingOwnerProof {
+            session_id: command.owner.session_id.clone(),
+            turn_request_id: command.owner.turn_request_id.clone(),
+            turn_id: command.owner.turn_id.clone(),
+        };
+        let action = match self.pending.confirm(
+            &command.pending,
+            &command.token,
+            &command.action_hash,
+            &owner,
+            unix_now_ms(),
+        ) {
+            isyncyou_agent::PendingConfirmOutcome::Confirmed(action) => action,
+            isyncyou_agent::PendingConfirmOutcome::Rejected(code) => {
+                return isyncyou_webui::AgentConfirmOutcome::Rejected(match code {
+                    isyncyou_agent::ClosedConfirmationCode::Invalid => {
+                        isyncyou_webui::AgentClosedConfirmationCode::Invalid
+                    }
+                    isyncyou_agent::ClosedConfirmationCode::Expired => {
+                        isyncyou_webui::AgentClosedConfirmationCode::Expired
+                    }
+                    isyncyou_agent::ClosedConfirmationCode::Cancelled => {
+                        isyncyou_webui::AgentClosedConfirmationCode::Cancelled
+                    }
+                    isyncyou_agent::ClosedConfirmationCode::Replayed => {
+                        isyncyou_webui::AgentClosedConfirmationCode::Replayed
+                    }
+                })
+            }
+            isyncyou_agent::PendingConfirmOutcome::RetainedRetryable => {
+                return isyncyou_webui::AgentConfirmOutcome::Retryable
+            }
+            isyncyou_agent::PendingConfirmOutcome::ConsumedOrCommitUnknown => {
+                self.turns.remove_pending(&command.pending);
+                return isyncyou_webui::AgentConfirmOutcome::OutcomeUnknown;
+            }
+        };
+        self.turns.remove_pending(&command.pending);
+        if action.policy() != isyncyou_agent::ToolPolicy::ConfirmedEffectNeverRepeat
+            || agent_ops::preview_for_pending_action(&action).is_err()
+        {
+            return if self
+                .finish_pending_confirmation_state(&command.pending, "failed", unix_now_ms())
+                .is_ok()
+            {
+                isyncyou_webui::AgentConfirmOutcome::Failed(
+                    isyncyou_webui::ClosedConfirmationFailure::PostConsumeValidationFailed,
+                )
+            } else {
+                isyncyou_webui::AgentConfirmOutcome::OutcomeUnknown
+            };
         }
-        let action_summary = agent_action_summary(&action);
+        let resolved_account_key = match self.confirmed_executor.resolved_account_key(&action) {
+            Ok(account) => account,
+            Err(_) => {
+                return if self
+                    .finish_pending_confirmation_state(&command.pending, "failed", unix_now_ms())
+                    .is_ok()
+                {
+                    isyncyou_webui::AgentConfirmOutcome::Failed(
+                        isyncyou_webui::ClosedConfirmationFailure::PostConsumeValidationFailed,
+                    )
+                } else {
+                    agent_authorization_diagnostics().record_projection_failure();
+                    isyncyou_webui::AgentConfirmOutcome::OutcomeUnknown
+                };
+            }
+        };
+        let (audit_routing, audit_started) =
+            match agent_authorization_audit_context(&action, resolved_account_key) {
+                Ok(context) => context,
+                Err(_) => {
+                    return if self
+                        .finish_pending_confirmation_state(
+                            &command.pending,
+                            "failed",
+                            unix_now_ms(),
+                        )
+                        .is_ok()
+                    {
+                        isyncyou_webui::AgentConfirmOutcome::Failed(
+                            isyncyou_webui::ClosedConfirmationFailure::PostConsumeValidationFailed,
+                        )
+                    } else {
+                        agent_authorization_diagnostics().record_projection_failure();
+                        isyncyou_webui::AgentConfirmOutcome::OutcomeUnknown
+                    };
+                }
+            };
         if self
             .audit_sink
-            .record_confirm(&action, "started", &action_summary)
+            .record_authorization(&audit_routing, &audit_started)
             .is_err()
         {
-            self.finish_pending_confirmation_state(pending_id, "failed", unix_now_ms())?;
-            return Err("audit_start_failed".into());
+            agent_authorization_diagnostics().record_audit_failure();
+            return if self
+                .finish_pending_confirmation_state(&command.pending, "failed", unix_now_ms())
+                .is_ok()
+            {
+                isyncyou_webui::AgentConfirmOutcome::Failed(
+                    isyncyou_webui::ClosedConfirmationFailure::AuditStartFailed,
+                )
+            } else {
+                agent_authorization_diagnostics().record_projection_failure();
+                isyncyou_webui::AgentConfirmOutcome::OutcomeUnknown
+            };
         }
         match self.confirmed_executor.execute_confirmed(&action) {
-            Ok(result) => {
-                let safe_summary = agent_ops::redact_agent_operation_text(&result.summary);
-                let audit_result = self
+            ConfirmedExecutionOutcome::Completed(_internal_result) => {
+                if self
+                    .finish_pending_confirmation_state(&command.pending, "completed", unix_now_ms())
+                    .is_err()
+                {
+                    agent_authorization_diagnostics().record_projection_failure();
+                    let _ = self.finish_pending_confirmation_state(
+                        &command.pending,
+                        "outcome_unknown",
+                        unix_now_ms(),
+                    );
+                    let event = AgentAuthorizationAuditV1 {
+                        state: AuthorizationAuditState::OutcomeUnknown,
+                        code: Some(ClosedAuthorizationCode::EffectOutcomeUnknown),
+                        ..audit_started
+                    };
+                    if self
+                        .audit_sink
+                        .record_authorization(&audit_routing, &event)
+                        .is_err()
+                    {
+                        agent_authorization_diagnostics().record_audit_failure();
+                    }
+                    return isyncyou_webui::AgentConfirmOutcome::OutcomeUnknown;
+                }
+                let event = AgentAuthorizationAuditV1 {
+                    state: AuthorizationAuditState::Completed,
+                    code: None,
+                    ..audit_started
+                };
+                if self
                     .audit_sink
-                    .record_confirm(&action, "ok", &format!("{action_summary} ok"))
-                    .map_err(|_| "audit_finish_failed".to_string());
-                self.finish_pending_confirmation_state(pending_id, "completed", unix_now_ms())?;
-                audit_result?;
-                serde_json::to_string(&serde_json::json!({
-                    "status": "ok",
-                    "op": action.op(),
-                    "summary": safe_summary,
-                }))
-                .map_err(|e| e.to_string())
+                    .record_authorization(&audit_routing, &event)
+                    .is_err()
+                {
+                    agent_authorization_diagnostics().record_audit_failure();
+                }
+                isyncyou_webui::AgentConfirmOutcome::Completed
             }
-            Err(e) => {
-                let safe = agent_safe_executor_error(&e);
-                let audit_result = self
+            ConfirmedExecutionOutcome::Failed(code) => {
+                if self
+                    .finish_pending_confirmation_state(&command.pending, "failed", unix_now_ms())
+                    .is_err()
+                {
+                    agent_authorization_diagnostics().record_projection_failure();
+                    let _ = self.finish_pending_confirmation_state(
+                        &command.pending,
+                        "outcome_unknown",
+                        unix_now_ms(),
+                    );
+                    let event = AgentAuthorizationAuditV1 {
+                        state: AuthorizationAuditState::OutcomeUnknown,
+                        code: Some(ClosedAuthorizationCode::EffectOutcomeUnknown),
+                        ..audit_started
+                    };
+                    if self
+                        .audit_sink
+                        .record_authorization(&audit_routing, &event)
+                        .is_err()
+                    {
+                        agent_authorization_diagnostics().record_audit_failure();
+                    }
+                    return isyncyou_webui::AgentConfirmOutcome::OutcomeUnknown;
+                }
+                let audit_code = match code {
+                    ClosedExecutionCode::ExecutorRejected => {
+                        ClosedAuthorizationCode::ExecutorRejected
+                    }
+                    ClosedExecutionCode::ExecutorFailed => ClosedAuthorizationCode::ExecutorFailed,
+                };
+                let event = AgentAuthorizationAuditV1 {
+                    state: AuthorizationAuditState::Failed,
+                    code: Some(audit_code),
+                    ..audit_started
+                };
+                if self
                     .audit_sink
-                    .record_confirm(&action, "error", &format!("{action_summary} error={safe}"))
-                    .map_err(|_| "audit_finish_failed".to_string());
-                self.finish_pending_confirmation_state(pending_id, "failed", unix_now_ms())?;
-                audit_result?;
-                Err(format!("{} failed: {safe}", action.op()))
+                    .record_authorization(&audit_routing, &event)
+                    .is_err()
+                {
+                    agent_authorization_diagnostics().record_audit_failure();
+                }
+                isyncyou_webui::AgentConfirmOutcome::Failed(match code {
+                    ClosedExecutionCode::ExecutorRejected => {
+                        isyncyou_webui::ClosedConfirmationFailure::ExecutorRejected
+                    }
+                    ClosedExecutionCode::ExecutorFailed => {
+                        isyncyou_webui::ClosedConfirmationFailure::ExecutorFailed
+                    }
+                })
+            }
+            ConfirmedExecutionOutcome::OutcomeUnknown => {
+                if self
+                    .finish_pending_confirmation_state(
+                        &command.pending,
+                        "outcome_unknown",
+                        unix_now_ms(),
+                    )
+                    .is_err()
+                {
+                    agent_authorization_diagnostics().record_projection_failure();
+                }
+                let event = AgentAuthorizationAuditV1 {
+                    state: AuthorizationAuditState::OutcomeUnknown,
+                    code: Some(ClosedAuthorizationCode::EffectOutcomeUnknown),
+                    ..audit_started
+                };
+                if self
+                    .audit_sink
+                    .record_authorization(&audit_routing, &event)
+                    .is_err()
+                {
+                    agent_authorization_diagnostics().record_audit_failure();
+                }
+                isyncyou_webui::AgentConfirmOutcome::OutcomeUnknown
             }
         }
     }
@@ -13272,11 +13758,9 @@ pub struct DaemonSettings {
 impl isyncyou_webui::SettingsHandler for DaemonSettings {
     fn set_poll_interval_secs(&self, secs: u64) -> Result<(), String> {
         let secs = secs.clamp(1, 3600);
-        // apply to the running loop immediately, then persist for the next start
+        Config::update_atomically(&self.config_path, |cfg| { cfg.sync.poll_interval_secs = secs; Ok(()) })?;
         self.live_interval.store(secs, Ordering::Relaxed);
-        let mut cfg = Config::load(&self.config_path)?;
-        cfg.sync.poll_interval_secs = secs;
-        cfg.save(&self.config_path)
+        Ok(())
     }
 }
 
@@ -13301,18 +13785,14 @@ impl isyncyou_webui::OneDriveModeHandler for DaemonOneDriveMode {
         folder_id: &str,
         mode: Option<OneDriveMode>,
     ) -> Result<(), String> {
-        let mut cfg = Config::load(&self.config_path)?;
-        let modes = cfg.onedrive_modes.entry(account.to_string()).or_default();
-        match mode {
-            Some(m) => {
-                modes.folder_modes.insert(folder_id.to_string(), m);
+        Config::update_atomically(&self.config_path, |cfg| {
+            let modes = cfg.onedrive_modes.entry(account.to_string()).or_default();
+            match mode {
+                Some(m) => { modes.folder_modes.insert(folder_id.to_string(), m); }
+                None => { modes.folder_modes.remove(folder_id); }
             }
-            None => {
-                modes.folder_modes.remove(folder_id);
-            }
-        }
-        cfg.validate().map_err(|errs| errs.join("; "))?;
-        cfg.save(&self.config_path)
+            Ok(())
+        })
     }
 }
 
@@ -13324,7 +13804,106 @@ impl isyncyou_webui::OneDriveModeHandler for DaemonOneDriveMode {
 pub struct DaemonMailWrite {
     cfg: Config,
 }
+
+#[cfg(test)]
+thread_local! {
+    // One-shot, thread-local credential factory seam for real HTTP regression
+    // tests. Product builds have no alternate credential or endpoint source.
+    static TEST_CONFIRMED_MAIL_CLIENT: std::cell::RefCell<Option<isyncyou_graph::GraphClient>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl DaemonMailWrite {
+    fn confirmed_mail_client(&self, account: &str) -> Result<isyncyou_graph::GraphClient, String> {
+        #[cfg(test)]
+        if let Some(client) = TEST_CONFIRMED_MAIL_CLIENT.with(|slot| slot.borrow_mut().take()) {
+            return Ok(client);
+        }
+        isyncyou_engine::mail_writer(&self.cfg, account)
+    }
+}
+
+fn graph_message_read_state_path(message_id: &str) -> String {
+    let encoded_id = message_id
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect::<String>();
+    format!("/me/messages/{encoded_id}?$select=id,isRead")
+}
+
 impl isyncyou_webui::MailWriteHandler for DaemonMailWrite {
+    fn provider_store(&self, account: &str) -> Result<isyncyou_store::Store, String> {
+        isyncyou_engine::provider_store::open_readonly(&self.cfg, account)
+    }
+    fn provider_create_draft(&self, account: &str, request_id: &str, subject: &str, body: &str, to: &[String]) -> Result<serde_json::Value, String> {
+        let store = isyncyou_engine::provider_store::open(&self.cfg, account)?;
+        let client = isyncyou_engine::self_hosted_mail::client(&self.cfg, account)?;
+        let scope = isyncyou_engine::self_hosted_mail::mailbox_scope(&self.cfg, account, &client)?;
+        let mut after = String::new();
+        let mut draft = None;
+        let mut count = 0usize;
+        loop {
+            let page = store.provider_objects_page(&scope, &after, 200).map_err(|_| "provider_mailboxes_unavailable")?;
+            if page.is_empty() { break; }
+            for object in page {
+                after = object.remote_id.clone(); count += 1;
+                if count > 1000 { return Err("provider_mailboxes_limit".into()); }
+                let value: serde_json::Value = serde_json::from_slice(&object.raw).map_err(|_| "provider_mailbox_invalid")?;
+                if value["role"].as_str() == Some("drafts") {
+                    if draft.replace(object.remote_id).is_some() { return Err("provider_drafts_ambiguous".into()); }
+                }
+            }
+        }
+        let draft = draft.ok_or("provider_drafts_unavailable")?;
+        let recipients: Vec<serde_json::Value> = to.iter().map(|email| serde_json::json!({"email":email})).collect();
+        let email = serde_json::json!({"mailboxIds":{draft:true}, "keywords":{"$draft":true}, "subject":subject, "to":recipients,
+            "bodyValues":{"body":{"value":body}}, "htmlBody":[{"partId":"body","type":"text/html"}]});
+        match isyncyou_engine::self_hosted_mail::create_draft(&self.cfg, account, &store, &client, request_id, &email)? {
+            isyncyou_engine::self_hosted_mail::SendOutcome::Confirmed(id) => {
+                let synced = isyncyou_engine::self_hosted_mail::sync(&self.cfg, account, &store, &client).is_ok();
+                Ok(serde_json::json!({"draft_id":id, "sync_state":if synced {"synced"} else {"pending"}}))
+            }
+            isyncyou_engine::self_hosted_mail::SendOutcome::Rejected => Err("provider_draft_rejected".into()),
+            _ => Err("provider_draft_outcome_unknown".into()),
+        }
+    }
+    fn provider_read_body(&self, account: &str, message_id: &str) -> Result<String, String> {
+        let client = isyncyou_engine::self_hosted_mail::client(&self.cfg, account)?;
+        let response = isyncyou_engine::self_hosted_mail::read_body(&self.cfg, account, &client, message_id, 1024 * 1024)?;
+        let rows = response["list"].as_array().ok_or("provider_body_invalid")?;
+        if rows.len() != 1 || rows[0]["id"].as_str() != Some(message_id) { return Err("provider_body_unavailable".into()); }
+        let item = &rows[0];
+        let mut out = String::new();
+        let mut truncated = false;
+        let parts = item["textBody"].as_array().filter(|p| !p.is_empty()).or_else(|| item["htmlBody"].as_array()).ok_or("provider_body_unavailable")?;
+        for part in parts {
+            let Some(id) = part["partId"].as_str() else { continue; };
+            let value = &item["bodyValues"][id];
+            if let Some(text) = value["value"].as_str() {
+                if !out.is_empty() { out.push('\n'); }
+                out.push_str(text);
+                truncated |= value["isTruncated"].as_bool().unwrap_or(false);
+            }
+        }
+        if truncated { out.push_str("\n\n[Message body truncated by the provider.]"); }
+        if out.is_empty() { return Err("provider_body_unavailable".into()); }
+        Ok(out)
+    }
+    fn read_state(&self, account: &str, message_id: &str) -> Result<bool, String> {
+        let graph = isyncyou_engine::mail_writer(&self.cfg, account)?;
+        let value = graph
+            .get_json(&graph_message_read_state_path(message_id))
+            .map_err(|error| error.to_string())?;
+        value
+            .get("isRead")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| "mail read state response is missing isRead".to_string())
+    }
     #[allow(clippy::too_many_arguments)]
     fn send(
         &self,
@@ -13399,7 +13978,7 @@ impl isyncyou_webui::MailWriteHandler for DaemonMailWrite {
         isyncyou_engine::MailWriter::move_to(&w, message_id, destination_id)
     }
     fn set_read(&self, account: &str, message_id: &str, is_read: bool) -> Result<(), String> {
-        let w = isyncyou_engine::mail_writer(&self.cfg, account)?;
+        let w = self.confirmed_mail_client(account)?;
         isyncyou_engine::MailWriter::set_read(&w, message_id, is_read)
     }
     fn set_flag(
@@ -13433,7 +14012,7 @@ impl isyncyou_webui::MailWriteHandler for DaemonMailWrite {
         isyncyou_engine::MailWriter::create_draft(&w, subject, body_html, to)
     }
     fn send_draft(&self, account: &str, message_id: &str) -> Result<(), String> {
-        let w = isyncyou_engine::mail_writer(&self.cfg, account)?;
+        let w = self.confirmed_mail_client(account)?;
         isyncyou_engine::MailWriter::send_draft(&w, message_id)
     }
 }
@@ -13766,6 +14345,9 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
         account: &str,
         role: isyncyou_webui::AccountAuthRole,
     ) -> Result<serde_json::Value, String> {
+        if self.cfg.provider_accounts.contains_key(account) {
+            return self.start_provider_login(account, role);
+        }
         let role_config = microsoft_role_config(&self.cfg, account, role)?;
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
             .map_err(|_| "account_callback_unavailable".to_string())?;
@@ -13907,6 +14489,11 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
         account: &str,
         role: isyncyou_webui::AccountAuthRole,
     ) -> Result<serde_json::Value, String> {
+        if self.cfg.provider_accounts.contains_key(account) {
+            isyncyou_engine::provider_auth::logout_self_hosted(&self.cfg, account)
+                .map_err(|_| "provider_sign_out_unavailable".to_string())?;
+            return Ok(serde_json::json!({"removed": 1, "role": role.as_str(), "message": "Provider account disconnected"}));
+        }
         let removed = match role {
             isyncyou_webui::AccountAuthRole::Reader => {
                 isyncyou_engine::auth::sign_out_reader(&self.cfg, account)?
@@ -13923,6 +14510,18 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
     }
 
     fn status(&self, account: &str) -> isyncyou_webui::AccountAuthStatus {
+        if self.cfg.provider_accounts.contains_key(account) {
+            let connected = isyncyou_engine::provider_auth::self_hosted_auth_status(&self.cfg, account).unwrap_or(false);
+            let status = isyncyou_webui::AccountRoleStatus {
+                state: if connected { isyncyou_webui::AccountAuthState::Connected } else { isyncyou_webui::AccountAuthState::Disconnected },
+                // A locally available refresh grant is not proof of current server identity.
+                identity_verified: false,
+            };
+            return isyncyou_webui::AccountAuthStatus {
+                reader: status,
+                writer: status,
+            };
+        }
         isyncyou_webui::AccountAuthStatus {
             reader: microsoft_role_status(isyncyou_engine::auth::read_token_cache_path(
                 &self.cfg, account,
@@ -13932,6 +14531,95 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
             )),
         }
     }
+}
+
+impl DaemonAccountAuth {
+    fn start_provider_login(&self, account: &str, role: isyncyou_webui::AccountAuthRole) -> Result<serde_json::Value, String> {
+        const CALLBACK: &str = "http://127.0.0.1:53682/oauth/callback";
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 53682))
+            .map_err(|_| "account_callback_unavailable".to_string())?;
+        let attempt = isyncyou_engine::provider_auth::start_self_hosted_auth(&self.cfg, account, CALLBACK)
+            .map_err(|_| "provider_sign_in_unavailable".to_string())?;
+        let authorization_uri = attempt.authorization_uri.clone();
+        let id = LOGIN_SEQ.fetch_add(1, Ordering::SeqCst);
+        let state = Arc::new(Mutex::new(LoginState {
+            account: account.to_string(), role, started_at: std::time::Instant::now(),
+            exchange_in_flight: false, done: false, error_code: None,
+        }));
+        {
+            let mut logins = self.logins.lock().map_err(|_| "account_login_unavailable".to_string())?;
+            logins.retain(|_, login| login.lock().is_ok_and(|state| !state.done && state.error_code.is_none() && state.started_at.elapsed() < MICROSOFT_LOGIN_TTL));
+            if logins.len() >= MICROSOFT_LOGIN_LIMIT { return Err("account_login_busy".into()); }
+            logins.insert(id, Arc::clone(&state));
+        }
+        if std::thread::Builder::new().name("provider-account-callback".into())
+            .spawn(move || provider_callback_serve(listener, state, attempt)).is_err() {
+            if let Ok(mut logins) = self.logins.lock() { logins.remove(&id); }
+            return Err("account_callback_unavailable".into());
+        }
+        Ok(serde_json::json!({"flow":"authorization_code_pkce", "role":role.as_str(), "login_id":id.to_string(), "authorization_uri":authorization_uri}))
+    }
+}
+
+fn provider_callback_serve(listener: std::net::TcpListener, state: Arc<Mutex<LoginState>>, attempt: isyncyou_engine::provider_auth::AuthAttempt) {
+    use std::io::Read;
+    let deadline = std::time::Instant::now() + MICROSOFT_LOGIN_TTL;
+    if listener.set_nonblocking(true).is_err() {
+        if let Ok(mut state) = state.lock() { state.error_code = Some("account_callback_unavailable"); }
+        return;
+    }
+    while std::time::Instant::now() < deadline {
+        if state.lock().map_or(true, |state| state.done || state.error_code.is_some()) { return; }
+        let mut stream = match listener.accept() {
+            Ok((stream, peer)) if peer.ip().is_loopback() => stream,
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => { std::thread::sleep(Duration::from_millis(50)); continue; }
+            Err(_) => break,
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut head = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 1024];
+        while head.len() <= MICROSOFT_CALLBACK_HEAD_LIMIT && !head.ends_with(b"\r\n\r\n") {
+            match stream.read(&mut chunk) { Ok(0) | Err(_) => break, Ok(n) => head.extend_from_slice(&chunk[..n]) }
+        }
+        let request = if head.len() <= MICROSOFT_CALLBACK_HEAD_LIMIT && head.ends_with(b"\r\n\r\n") { std::str::from_utf8(&head).ok() } else { None };
+        let Some(request) = request else { write_microsoft_callback_page(&mut stream, MICROSOFT_ERROR_HTML); continue; };
+        let mut lines = request.split("\r\n");
+        let mut line = lines.next().unwrap_or("").split_whitespace();
+        let method = line.next().unwrap_or("");
+        let target = line.next().unwrap_or("");
+        let version = line.next().unwrap_or("");
+        let valid = method == "GET" && version == "HTTP/1.1" && line.next().is_none()
+            && target.starts_with("/oauth/callback?")
+            && microsoft_callback_headers_valid(lines, "127.0.0.1:53682");
+        let callback = format!("http://127.0.0.1:53682{target}");
+        if !valid || isyncyou_engine::provider_auth::validate_callback(&attempt, &callback).is_err() {
+            write_microsoft_callback_page(&mut stream, MICROSOFT_ERROR_HTML);
+            continue;
+        }
+        let allowed = state.lock().is_ok_and(|mut state| {
+            if state.done || state.error_code.is_some() || state.exchange_in_flight { false }
+            else { state.exchange_in_flight = true; true }
+        });
+        if !allowed { write_microsoft_callback_page(&mut stream, MICROSOFT_ERROR_HTML); return; }
+        let result = isyncyou_engine::provider_auth::finish_self_hosted_auth(attempt, &callback);
+        let success = result.is_ok();
+        if let Ok(mut state) = state.lock() {
+            state.exchange_in_flight = false;
+            if success {
+                state.done = true;
+            } else {
+                state.error_code = Some(if result.as_ref().err().map(String::as_str) == Some("System keyring unavailable") {
+                    "account_keyring_unavailable"
+                } else {
+                    "account_authorization_failed"
+                });
+            }
+        }
+        write_microsoft_callback_page(&mut stream, if success { MICROSOFT_SUCCESS_HTML } else { MICROSOFT_ERROR_HTML });
+        return;
+    }
+    if let Ok(mut state) = state.lock() { if !state.done && state.error_code.is_none() { state.error_code = Some("account_login_expired"); } }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -14868,7 +15556,13 @@ impl isyncyou_webui::MutationIntentHandler for DaemonMutationIntents {
                 )?;
                 let body = std::str::from_utf8(&bytes)
                     .map_err(|_| "mutation_intent_invalid".to_string())?;
-                match operation.as_str() {
+                if self.mail.cfg.provider_accounts.contains_key(&account) {
+                    if operation != "draft" || !cc.is_empty() || !bcc.is_empty() || read_receipt || importance.is_some() {
+                        Err("provider_operation_unavailable".into())
+                    } else {
+                        self.mail.provider_create_draft(&account, intent_id, &subject, body, &recipients)
+                    }
+                } else { match operation.as_str() {
                     "send" => self.mail.send(
                         &account,
                         &subject,
@@ -14887,7 +15581,7 @@ impl isyncyou_webui::MutationIntentHandler for DaemonMutationIntents {
                         .map(|_| ()),
                     _ => Err("mutation_intent_invalid".into()),
                 }
-                .map(|()| serde_json::json!({ "ok": true }))
+                .map(|()| serde_json::json!({ "ok": true })) }
             }
             isyncyou_webui::MutationPurpose::OnenoteBody {
                 account,
@@ -16173,7 +16867,8 @@ mod tests {
     #[derive(Clone)]
     struct RecordingConfirmedExecutor {
         calls: Arc<StdMutex<Vec<isyncyou_agent::ToolAction>>>,
-        result: Arc<StdMutex<Result<ConfirmedActionResult, String>>>,
+        result: Arc<StdMutex<ConfirmedExecutionOutcome>>,
+        resolved_account: Arc<StdMutex<Option<Result<String, ClosedExecutionCode>>>>,
         order: Arc<StdMutex<Vec<String>>>,
     }
 
@@ -16181,33 +16876,55 @@ mod tests {
         fn ok(summary: &str, order: Arc<StdMutex<Vec<String>>>) -> Self {
             Self {
                 calls: Arc::new(StdMutex::new(Vec::new())),
-                result: Arc::new(StdMutex::new(Ok(ConfirmedActionResult::new(summary)))),
+                result: Arc::new(StdMutex::new(ConfirmedExecutionOutcome::Completed(
+                    ConfirmedActionResult::new(summary),
+                ))),
+                resolved_account: Arc::new(StdMutex::new(None)),
                 order,
             }
         }
 
-        fn err(error: &str, order: Arc<StdMutex<Vec<String>>>) -> Self {
+        fn err(_error: &str, order: Arc<StdMutex<Vec<String>>>) -> Self {
             Self {
                 calls: Arc::new(StdMutex::new(Vec::new())),
-                result: Arc::new(StdMutex::new(Err(error.to_string()))),
+                result: Arc::new(StdMutex::new(ConfirmedExecutionOutcome::Failed(
+                    ClosedExecutionCode::ExecutorFailed,
+                ))),
+                resolved_account: Arc::new(StdMutex::new(None)),
                 order,
             }
         }
 
-        fn set_error(&self, error: impl Into<String>) {
-            *self.result.lock().unwrap() = Err(error.into());
+        fn set_error(&self, _error: impl Into<String>) {
+            *self.result.lock().unwrap() =
+                ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorFailed);
         }
 
         fn call_count(&self) -> usize {
             self.calls.lock().unwrap().len()
         }
+
+        fn set_resolved_account(&self, account: Result<&str, ClosedExecutionCode>) {
+            *self.resolved_account.lock().unwrap() = Some(account.map(str::to_owned));
+        }
     }
 
     impl AgentConfirmedActionExecutor for RecordingConfirmedExecutor {
+        fn resolved_account_key(
+            &self,
+            action: &isyncyou_agent::ToolAction,
+        ) -> Result<String, ClosedExecutionCode> {
+            self.resolved_account
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| Ok(action.account().to_string()))
+        }
+
         fn execute_confirmed(
             &self,
             action: &isyncyou_agent::ToolAction,
-        ) -> Result<ConfirmedActionResult, String> {
+        ) -> ConfirmedExecutionOutcome {
             self.order.lock().unwrap().push("execute".to_string());
             self.calls.lock().unwrap().push(action.clone());
             self.result.lock().unwrap().clone()
@@ -16217,6 +16934,7 @@ mod tests {
     #[derive(Clone)]
     struct RecordingAuditSink {
         events: Arc<StdMutex<Vec<(String, String, String)>>>,
+        routes: Arc<StdMutex<Vec<String>>>,
         order: Arc<StdMutex<Vec<String>>>,
         fail_status: Option<String>,
     }
@@ -16225,6 +16943,7 @@ mod tests {
         fn new(order: Arc<StdMutex<Vec<String>>>) -> Self {
             Self {
                 events: Arc::new(StdMutex::new(Vec::new())),
+                routes: Arc::new(StdMutex::new(Vec::new())),
                 order,
                 fail_status: None,
             }
@@ -16247,23 +16966,28 @@ mod tests {
         fn events(&self) -> Vec<(String, String, String)> {
             self.events.lock().unwrap().clone()
         }
+
+        fn routes(&self) -> Vec<String> {
+            self.routes.lock().unwrap().clone()
+        }
     }
 
     impl AgentAuditSink for RecordingAuditSink {
-        fn record_confirm(
+        fn record_authorization(
             &self,
-            action: &isyncyou_agent::ToolAction,
-            status: &str,
-            summary: &str,
-        ) -> Result<(), String> {
+            routing: &AgentAuditRoutingKey,
+            event: &AgentAuthorizationAuditV1,
+        ) -> Result<(), AgentAuditError> {
+            let status = event.state.as_str();
             self.order.lock().unwrap().push(format!("audit:{status}"));
             if self.fail_status.as_deref() == Some(status) {
-                return Err(format!("audit_{status}_failed"));
+                return Err(AgentAuditError::Unavailable);
             }
+            self.routes.lock().unwrap().push(routing.0.clone());
             self.events.lock().unwrap().push((
-                action.op().to_string(),
+                event.op.as_str().to_string(),
                 status.to_string(),
-                summary.to_string(),
+                agent_authorization_audit_summary(event),
             ));
             Ok(())
         }
@@ -16276,6 +17000,94 @@ mod tests {
         .unwrap()
     }
 
+    fn test_pending_owner(
+        action: &isyncyou_agent::ToolAction,
+    ) -> isyncyou_agent::PendingOwnerBinding {
+        isyncyou_agent::PendingOwnerBinding {
+            account: action.account().to_string(),
+            session_id: "test-session".into(),
+            request_id: "00000000-0000-4000-8000-000000000000".into(),
+            turn_id: "test-turn".into(),
+        }
+    }
+
+    fn test_owner_proof() -> isyncyou_webui::AgentPendingOwnerProof {
+        isyncyou_webui::AgentPendingOwnerProof {
+            session_id: "test-session".into(),
+            turn_request_id: "00000000-0000-4000-8000-000000000000".into(),
+            turn_id: "test-turn".into(),
+        }
+    }
+
+    fn register_test_pending(
+        agent: &DaemonAgent,
+        action: isyncyou_agent::ToolAction,
+        preview: &str,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> (isyncyou_agent::PendingAction, String) {
+        let owner = test_pending_owner(&action);
+        agent
+            .pending
+            .register_bound(action, preview, now_ms, ttl_ms, owner)
+            .unwrap()
+    }
+
+    fn test_confirm_command(
+        pending: &isyncyou_agent::PendingAction,
+        token: &str,
+    ) -> isyncyou_webui::AgentConfirmCommand {
+        isyncyou_webui::AgentConfirmCommand {
+            pending: pending.id.clone(),
+            token: token.to_string(),
+            action_hash: pending.action_hash.clone(),
+            owner: test_owner_proof(),
+        }
+    }
+
+    fn confirm_command_for_owner(
+        pending: &isyncyou_agent::PendingAction,
+        token: &str,
+        owner: &isyncyou_agent::PendingOwnerBinding,
+    ) -> isyncyou_webui::AgentConfirmCommand {
+        isyncyou_webui::AgentConfirmCommand {
+            pending: pending.id.clone(),
+            token: token.to_string(),
+            action_hash: pending.action_hash.clone(),
+            owner: isyncyou_webui::AgentPendingOwnerProof {
+                session_id: owner.session_id.clone(),
+                turn_request_id: owner.request_id.clone(),
+                turn_id: owner.turn_id.clone(),
+            },
+        }
+    }
+
+    fn confirm_test_pending(
+        agent: &DaemonAgent,
+        pending: &isyncyou_agent::PendingAction,
+        token: &str,
+    ) -> isyncyou_webui::AgentConfirmOutcome {
+        isyncyou_webui::AgentHandler::confirm(agent, &test_confirm_command(pending, token))
+    }
+
+    fn legacy_turn_confirm_command(
+        turn_id: &str,
+        pending: String,
+        token: String,
+        action_hash: String,
+    ) -> isyncyou_webui::AgentConfirmCommand {
+        isyncyou_webui::AgentConfirmCommand {
+            pending,
+            token,
+            action_hash,
+            owner: isyncyou_webui::AgentPendingOwnerProof {
+                session_id: "legacy-local".into(),
+                turn_request_id: format!("legacy-{turn_id}"),
+                turn_id: turn_id.to_string(),
+            },
+        }
+    }
+
     fn temp_agent_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "isy-apphost-agent-{name}-{}-{}",
@@ -16285,6 +17097,20 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    fn test_config_with_account(root: &Path, account: &str) -> Config {
+        Config {
+            accounts: vec![isyncyou_core::AccountConfig {
+                id: account.into(),
+                username: "controlled".into(),
+                sync_root: root.join("sync"),
+                archive_root: root.join("archive"),
+                cache_root: root.join("cache"),
+                mount_point: None,
+            }],
+            ..Default::default()
+        }
     }
 
     fn production_source_before_final_test_module(source: &str) -> &str {
@@ -16618,47 +17444,109 @@ mod tests {
     }
 
     #[test]
-    fn agent_confirm_audits_once_and_calls_executor_once() {
+    fn agent_confirm_typed_success_reaches_existing_executor_and_router_response() {
         let order = Arc::new(StdMutex::new(Vec::new()));
         let executor = RecordingConfirmedExecutor::ok("backup accepted", order.clone());
         let audit = RecordingAuditSink::new(order.clone());
         let root = temp_agent_root("confirm-ok");
+        let agent = Arc::new(DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor.clone()),
+            Arc::new(audit.clone()),
+        ));
+        let (pending, token) = register_test_pending(
+            &agent,
+            backup_action(),
+            "backup mail",
+            unix_now_ms(),
+            AGENT_CONFIRM_TTL_MS,
+        );
+
+        let router = isyncyou_webui::Router::new(Config::default())
+            .with_agent(
+                agent as Arc<dyn isyncyou_webui::AgentHandler>,
+                "agent-capability".into(),
+            )
+            .with_session_token("session-authority".into());
+        let response = router.route(
+            &isyncyou_webui::ApiRequest::new("POST", "/api/v1/agent/confirm")
+                .with_session_token(Some("session-authority".into()))
+                .with_cap_token(Some("agent-capability".into()))
+                .with_content_type(Some("application/json".into()))
+                .with_body(
+                    serde_json::to_vec(&serde_json::json!({
+                        "request_id": "550e8400-e29b-41d4-a716-446655440042",
+                        "session_id": "test-session",
+                        "turn_request_id": "00000000-0000-4000-8000-000000000000",
+                        "turn_id": "test-turn",
+                        "pending": pending.id,
+                        "token": token,
+                        "action_hash": pending.action_hash,
+                    }))
+                    .unwrap(),
+                ),
+        );
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["result"],
+            "Completed successfully."
+        );
+        assert_eq!(executor.call_count(), 1);
+        assert_eq!(
+            order.lock().unwrap().as_slice(),
+            ["audit:started", "execute", "audit:completed"]
+        );
+        let events = audit.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].1, "started");
+        assert_eq!(events[1].1, "completed");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn each_confirmed_effect_routes_once_through_existing_executor() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("internal", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("confirm-all-effects");
         let agent = DaemonAgent::with_test_confirm_components(
             Config::default(),
             root.clone(),
             Arc::new(executor.clone()),
             Arc::new(audit.clone()),
         );
-        let (pending, token) = agent
-            .pending
-            .register(
-                backup_action(),
-                "backup mail",
+        let actions = [
+            serde_json::json!({"op":"backup","account":"me","services":["mail"]}),
+            serde_json::json!({
+                "op":"restore-cloud","account":"me","service":"mail","id":"item"
+            }),
+            serde_json::json!({
+                "op":"live-write","account":"me","service":"mail","target":"item",
+                "change":{"verb":"set_read","is_read":true}
+            }),
+            serde_json::json!({
+                "op":"share","account":"me","service":"onedrive","id":"item",
+                "mode":"link","link_type":"view","scope":"organization"
+            }),
+        ];
+        for value in actions {
+            let action = isyncyou_agent::parse_action(&value).unwrap();
+            let preview = agent_ops::preview_for_pending_action(&action).unwrap();
+            let (pending, token) = register_test_pending(
+                &agent,
+                action,
+                &preview.text,
                 unix_now_ms(),
                 AGENT_CONFIRM_TTL_MS,
-            )
-            .unwrap();
-
-        let result = isyncyou_webui::AgentHandler::confirm(
-            &agent,
-            &pending.id,
-            &token,
-            &pending.action_hash,
-        )
-        .unwrap();
-        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(result["status"], "ok");
-        assert_eq!(result["op"], "backup");
-        assert_eq!(result["summary"], "backup accepted");
-        assert_eq!(executor.call_count(), 1);
-        assert_eq!(
-            order.lock().unwrap().as_slice(),
-            ["audit:started", "execute", "audit:ok"]
-        );
-        let events = audit.events();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].1, "started");
-        assert_eq!(events[1].1, "ok");
+            );
+            assert_eq!(
+                confirm_test_pending(&agent, &pending, &token),
+                isyncyou_webui::AgentConfirmOutcome::Completed
+            );
+        }
+        assert_eq!(executor.call_count(), 4);
+        assert_eq!(audit.events().len(), 8);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -16668,42 +17556,42 @@ mod tests {
         let audit = RecordingAuditSink::new(order);
         let root = temp_agent_root("confirm-desktop-policy");
         let mut agent = DaemonAgent::new_with_policy(
-            Config::default(),
+            test_config_with_account(&root, "me"),
             root.clone(),
             AgentOperationPolicy::DesktopEnabled,
             Arc::new(Mutex::new(())),
         );
         agent.pending = Arc::new(isyncyou_agent::PendingRegistry::new());
         agent.audit_sink = Arc::new(audit.clone());
-        let (pending, token) = agent
-            .pending
-            .register(
-                backup_action(),
-                "backup mail",
-                unix_now_ms(),
-                AGENT_CONFIRM_TTL_MS,
-            )
-            .unwrap();
-
-        let err = isyncyou_webui::AgentHandler::confirm(
+        let (pending, token) = register_test_pending(
             &agent,
-            &pending.id,
-            &token,
-            &pending.action_hash,
-        )
-        .unwrap_err();
+            backup_action(),
+            "backup mail",
+            unix_now_ms(),
+            AGENT_CONFIRM_TTL_MS,
+        );
 
-        assert_eq!(err, "backup failed: execution_failed");
+        assert_eq!(
+            confirm_test_pending(&agent, &pending, &token),
+            isyncyou_webui::AgentConfirmOutcome::OutcomeUnknown
+        );
         let events = audit.events();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].1, "started");
-        assert_eq!(events[1].1, "error");
+        assert_eq!(events[1].1, "outcome_unknown");
         assert!(!events[1].2.contains("not_available_on_mobile"));
+        assert_eq!(
+            confirm_test_pending(&agent, &pending, &token),
+            isyncyou_webui::AgentConfirmOutcome::Rejected(
+                isyncyou_webui::AgentClosedConfirmationCode::Replayed
+            )
+        );
+        assert_eq!(audit.events().len(), 2);
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn agent_confirm_revalidates_action_before_execution() {
+    fn agent_confirm_revalidates_policy_immediately_before_executor() {
         let order = Arc::new(StdMutex::new(Vec::new()));
         let executor = RecordingConfirmedExecutor::ok("must not run", order.clone());
         let audit = RecordingAuditSink::new(order);
@@ -16725,28 +17613,20 @@ mod tests {
             }
         }))
         .unwrap();
-        let (pending, token) = agent
-            .pending
-            .register(
-                action,
-                "invalid live write",
-                unix_now_ms(),
-                AGENT_CONFIRM_TTL_MS,
-            )
-            .unwrap();
-
-        let err = isyncyou_webui::AgentHandler::confirm(
+        let (pending, token) = register_test_pending(
             &agent,
-            &pending.id,
-            &token,
-            &pending.action_hash,
-        )
-        .unwrap_err();
+            action,
+            "invalid live write",
+            unix_now_ms(),
+            AGENT_CONFIRM_TTL_MS,
+        );
 
-        assert!(err.contains("invalid_confirmed_action"));
-        assert!(err.contains("missing verb"));
-        assert!(!err.contains("raw-body-sentinel"));
-        assert!(!err.contains("recipient@example.com"));
+        assert_eq!(
+            confirm_test_pending(&agent, &pending, &token),
+            isyncyou_webui::AgentConfirmOutcome::Failed(
+                isyncyou_webui::ClosedConfirmationFailure::PostConsumeValidationFailed
+            )
+        );
         assert_eq!(executor.call_count(), 0);
         assert!(audit.events().is_empty());
         let _ = std::fs::remove_dir_all(root);
@@ -16771,33 +17651,23 @@ mod tests {
             "query": "status"
         }))
         .unwrap();
-        let (pending, token) = agent
+        assert!(agent
             .pending
-            .register(
-                action,
+            .register_bound(
+                action.clone(),
                 "search should not confirm",
                 unix_now_ms(),
                 AGENT_CONFIRM_TTL_MS,
+                test_pending_owner(&action),
             )
-            .unwrap();
-
-        let err = isyncyou_webui::AgentHandler::confirm(
-            &agent,
-            &pending.id,
-            &token,
-            &pending.action_hash,
-        )
-        .unwrap_err();
-
-        assert!(err.contains("invalid_confirmed_action"));
-        assert!(err.contains("not_confirmable: search"));
+            .is_err());
         assert_eq!(executor.call_count(), 0);
         assert!(audit.events().is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn agent_confirm_result_summary_is_json_and_redacted() {
+    fn agent_confirm_response_hides_internal_executor_summary() {
         let order = Arc::new(StdMutex::new(Vec::new()));
         let executor = RecordingConfirmedExecutor::ok(
             "backup wrote https://tenant.example/item?code=secret for owner@example.com",
@@ -16811,32 +17681,18 @@ mod tests {
             Arc::new(executor.clone()),
             Arc::new(audit.clone()),
         );
-        let (pending, token) = agent
-            .pending
-            .register(
-                backup_action(),
-                "backup mail",
-                unix_now_ms(),
-                AGENT_CONFIRM_TTL_MS,
-            )
-            .unwrap();
-
-        let result = isyncyou_webui::AgentHandler::confirm(
+        let (pending, token) = register_test_pending(
             &agent,
-            &pending.id,
-            &token,
-            &pending.action_hash,
-        )
-        .unwrap();
-        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
-        let summary = result["summary"].as_str().unwrap();
+            backup_action(),
+            "backup mail",
+            unix_now_ms(),
+            AGENT_CONFIRM_TTL_MS,
+        );
 
-        assert_eq!(result["status"], "ok");
-        assert_eq!(result["op"], "backup");
-        assert!(summary.contains("<redacted-url>"));
-        assert!(summary.contains("<redacted-email>"));
-        assert!(!summary.contains("tenant.example"));
-        assert!(!summary.contains("owner@example.com"));
+        assert_eq!(
+            confirm_test_pending(&agent, &pending, &token),
+            isyncyou_webui::AgentConfirmOutcome::Completed
+        );
         assert_eq!(executor.call_count(), 1);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -16853,26 +17709,24 @@ mod tests {
             Arc::new(executor.clone()),
             Arc::new(audit.clone()),
         );
-        let (pending, token) = agent
-            .pending
-            .register(
-                backup_action(),
-                "backup mail",
-                unix_now_ms(),
-                AGENT_CONFIRM_TTL_MS,
-            )
-            .unwrap();
-
-        isyncyou_webui::AgentHandler::confirm(&agent, &pending.id, &token, &pending.action_hash)
-            .unwrap();
-        let replay = isyncyou_webui::AgentHandler::confirm(
+        let (pending, token) = register_test_pending(
             &agent,
-            &pending.id,
-            &token,
-            &pending.action_hash,
-        )
-        .unwrap_err();
-        assert!(replay.contains("NotFound"));
+            backup_action(),
+            "backup mail",
+            unix_now_ms(),
+            AGENT_CONFIRM_TTL_MS,
+        );
+
+        assert_eq!(
+            confirm_test_pending(&agent, &pending, &token),
+            isyncyou_webui::AgentConfirmOutcome::Completed
+        );
+        assert_eq!(
+            confirm_test_pending(&agent, &pending, &token),
+            isyncyou_webui::AgentConfirmOutcome::Rejected(
+                isyncyou_webui::AgentClosedConfirmationCode::Replayed
+            )
+        );
         assert_eq!(executor.call_count(), 1);
         assert_eq!(audit.events().len(), 2);
         let _ = std::fs::remove_dir_all(root);
@@ -16890,37 +17744,33 @@ mod tests {
             Arc::new(executor.clone()),
             Arc::new(audit.clone()),
         );
-        let (pending, token) = agent
-            .pending
-            .register(
-                backup_action(),
-                "backup mail",
-                unix_now_ms(),
-                AGENT_CONFIRM_TTL_MS,
-            )
-            .unwrap();
+        let (pending, token) = register_test_pending(
+            &agent,
+            backup_action(),
+            "backup mail",
+            unix_now_ms(),
+            AGENT_CONFIRM_TTL_MS,
+        );
         executor.set_error(format!(
             "provider token leaked? token={token} cap=cap-secret"
         ));
 
-        let err = isyncyou_webui::AgentHandler::confirm(
-            &agent,
-            &pending.id,
-            &token,
-            &pending.action_hash,
-        )
-        .unwrap_err();
-        assert_eq!(err, "backup failed: execution_failed");
+        assert_eq!(
+            confirm_test_pending(&agent, &pending, &token),
+            isyncyou_webui::AgentConfirmOutcome::Failed(
+                isyncyou_webui::ClosedConfirmationFailure::ExecutorFailed
+            )
+        );
         assert_eq!(executor.call_count(), 1);
         assert_eq!(
             order.lock().unwrap().as_slice(),
-            ["audit:started", "execute", "audit:error"]
+            ["audit:started", "execute", "audit:failed"]
         );
         let audit_text = serde_json::to_string(&audit.events()).unwrap();
         assert!(!audit_text.contains(&token));
         assert!(!audit_text.contains("cap-secret"));
         assert!(!audit_text.contains("provider token leaked"));
-        assert!(audit_text.contains("execution_failed"));
+        assert!(audit_text.contains("executor_failed"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -16946,22 +17796,20 @@ mod tests {
             "id": "https://tenant.example/item?code=secret user@example.com"
         }))
         .unwrap();
-        let (pending, token) = agent
-            .pending
-            .register(action, "restore cloud", unix_now_ms(), AGENT_CONFIRM_TTL_MS)
-            .unwrap();
-
-        let err = isyncyou_webui::AgentHandler::confirm(
+        let (pending, token) = register_test_pending(
             &agent,
-            &pending.id,
-            &token,
-            &pending.action_hash,
-        )
-        .unwrap_err();
+            action,
+            "restore cloud",
+            unix_now_ms(),
+            AGENT_CONFIRM_TTL_MS,
+        );
 
-        assert_eq!(err, "restore-cloud failed: execution_failed");
-        assert!(!err.contains("tenant.example"));
-        assert!(!err.contains("user@example.com"));
+        assert_eq!(
+            confirm_test_pending(&agent, &pending, &token),
+            isyncyou_webui::AgentConfirmOutcome::Failed(
+                isyncyou_webui::ClosedConfirmationFailure::ExecutorFailed
+            )
+        );
         let audit_text = serde_json::to_string(&audit.events()).unwrap();
         assert!(!audit_text.contains("tenant.example"));
         assert!(!audit_text.contains("owner@example.com"));
@@ -16969,8 +17817,8 @@ mod tests {
         assert!(!audit_text.contains("oauth-code"));
         assert!(!audit_text.contains("restore failed for"));
         assert!(!audit_text.contains("<redacted-url>"));
-        assert!(audit_text.contains("<redacted-email>"));
-        assert!(audit_text.contains("execution_failed"));
+        assert!(!audit_text.contains("<redacted-email>"));
+        assert!(audit_text.contains("executor_failed"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -16987,14 +17835,16 @@ mod tests {
         }))
         .unwrap();
 
-        let summary = agent_action_summary(&action);
+        let (_, event) =
+            agent_authorization_audit_context(&action, "resolved-account".into()).unwrap();
+        let summary = agent_authorization_audit_summary(&event);
 
         assert!(summary.contains("op=share"));
         assert!(summary.contains("service=onedrive"));
         assert!(!summary.contains("item-1"));
         assert!(!summary.contains("owner@example.com"));
         assert!(!summary.contains("recipient@example.com"));
-        assert!(summary.contains("<redacted-email>"));
+        assert!(!summary.contains("<redacted-email>"));
     }
 
     #[test]
@@ -17008,7 +17858,9 @@ mod tests {
         }))
         .unwrap();
 
-        let summary = agent_action_summary(&action);
+        let (_, event) =
+            agent_authorization_audit_context(&action, "resolved-account".into()).unwrap();
+        let summary = agent_authorization_audit_summary(&event);
 
         assert!(summary.contains("op=live-write"));
         assert!(summary.contains("service=todo"));
@@ -17031,7 +17883,9 @@ mod tests {
         }))
         .unwrap();
 
-        let summary = agent_action_summary(&action);
+        let (_, event) =
+            agent_authorization_audit_context(&action, "resolved-account".into()).unwrap();
+        let summary = agent_authorization_audit_summary(&event);
 
         assert!(summary.contains("op=live-write"));
         assert!(summary.contains("service=mail"));
@@ -17039,7 +17893,7 @@ mod tests {
         assert!(!summary.contains("recipient@example.com"));
         assert!(!summary.contains("raw-body-sentinel"));
         assert!(!summary.contains("private subject"));
-        assert!(summary.contains("<redacted-email>"));
+        assert!(!summary.contains("<redacted-email>"));
     }
 
     #[test]
@@ -17067,17 +17921,25 @@ mod tests {
             }
         }))
         .unwrap();
-        let (pending, _token) = agent
-            .pending
-            .register(action, "live write", unix_now_ms(), AGENT_CONFIRM_TTL_MS)
-            .unwrap();
-
-        let binding = isyncyou_webui::AgentHandler::pending_binding(
+        let (pending, _token) = register_test_pending(
             &agent,
-            &pending.id,
-            &pending.action_hash,
-        )
-        .unwrap();
+            action,
+            "live write",
+            unix_now_ms(),
+            AGENT_CONFIRM_TTL_MS,
+        );
+
+        let binding = match isyncyou_webui::AgentHandler::pending_binding(
+            &agent,
+            &isyncyou_webui::AgentPendingBindingCommand {
+                pending: pending.id.clone(),
+                action_hash: pending.action_hash.clone(),
+                owner: test_owner_proof(),
+            },
+        ) {
+            isyncyou_webui::AgentPendingBindingOutcome::Ready(binding) => binding,
+            other => panic!("unexpected pending binding outcome: {other:?}"),
+        };
         let text = serde_json::to_string(&serde_json::json!({
             "op": binding.op,
             "account": binding.account,
@@ -17110,28 +17972,35 @@ mod tests {
             Arc::new(audit.clone()),
         );
 
-        let unknown =
-            isyncyou_webui::AgentHandler::confirm(&agent, "missing", "token", "hash").unwrap_err();
-        assert!(unknown.contains("NotFound"));
-        let (pending, token) = agent
-            .pending
-            .register(backup_action(), "backup mail", 0, 1)
-            .unwrap();
-        let expired = isyncyou_webui::AgentHandler::confirm(
+        let unknown = isyncyou_webui::AgentHandler::confirm(
             &agent,
-            &pending.id,
-            &token,
-            &pending.action_hash,
-        )
-        .unwrap_err();
-        assert!(expired.contains("Expired"));
+            &isyncyou_webui::AgentConfirmCommand {
+                pending: "missing".into(),
+                token: "token".into(),
+                action_hash: "hash".into(),
+                owner: test_owner_proof(),
+            },
+        );
+        assert_eq!(
+            unknown,
+            isyncyou_webui::AgentConfirmOutcome::Rejected(
+                isyncyou_webui::AgentClosedConfirmationCode::Replayed
+            )
+        );
+        let (pending, token) = register_test_pending(&agent, backup_action(), "backup mail", 0, 1);
+        assert_eq!(
+            confirm_test_pending(&agent, &pending, &token),
+            isyncyou_webui::AgentConfirmOutcome::Rejected(
+                isyncyou_webui::AgentClosedConfirmationCode::Expired
+            )
+        );
         assert_eq!(executor.call_count(), 0);
         assert!(audit.events().is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn agent_confirm_audit_start_failure_does_not_execute() {
+    fn agent_confirm_audit_start_failure_executes_zero_effects() {
         let order = Arc::new(StdMutex::new(Vec::new()));
         let executor = RecordingConfirmedExecutor::ok("backup accepted", order.clone());
         let audit = RecordingAuditSink::failing_start(order.clone());
@@ -17142,24 +18011,20 @@ mod tests {
             Arc::new(executor.clone()),
             Arc::new(audit),
         );
-        let (pending, token) = agent
-            .pending
-            .register(
-                backup_action(),
-                "backup mail",
-                unix_now_ms(),
-                AGENT_CONFIRM_TTL_MS,
-            )
-            .unwrap();
-
-        let err = isyncyou_webui::AgentHandler::confirm(
+        let (pending, token) = register_test_pending(
             &agent,
-            &pending.id,
-            &token,
-            &pending.action_hash,
-        )
-        .unwrap_err();
-        assert_eq!(err, "audit_start_failed");
+            backup_action(),
+            "backup mail",
+            unix_now_ms(),
+            AGENT_CONFIRM_TTL_MS,
+        );
+
+        assert_eq!(
+            confirm_test_pending(&agent, &pending, &token),
+            isyncyou_webui::AgentConfirmOutcome::Failed(
+                isyncyou_webui::ClosedConfirmationFailure::AuditStartFailed
+            )
+        );
         assert_eq!(executor.call_count(), 0);
         assert_eq!(order.lock().unwrap().as_slice(), ["audit:started"]);
         let _ = std::fs::remove_dir_all(root);
@@ -17170,17 +18035,17 @@ mod tests {
         feature = "agent-subscription-experimental"
     ))]
     #[test]
-    fn confirmed_action_terminal_state_survives_finish_audit_failure() {
+    fn agent_confirm_finish_audit_failure_preserves_known_completed_effect() {
         let order = Arc::new(StdMutex::new(Vec::new()));
         let executor = RecordingConfirmedExecutor::ok("backup accepted", order.clone());
-        let audit = RecordingAuditSink::failing_status(order.clone(), "ok");
+        let audit = RecordingAuditSink::failing_status(order.clone(), "completed");
         let root = temp_agent_root("confirm-finish-audit-fail");
         let mut agent = DaemonAgent::new(Config::default(), root.clone());
         agent.confirmed_executor = Arc::new(executor.clone());
         agent.audit_sink = Arc::new(audit);
         assert!(agent.pending.is_persistent());
         let owner = isyncyou_agent::PendingOwnerBinding {
-            account: "controlled".into(),
+            account: "me".into(),
             session_id: "01JSESSION00000000000000028".into(),
             request_id: "019f0000-0000-4000-8000-000000000028".into(),
             turn_id: "01JTURN0000000000000000028".into(),
@@ -17192,22 +18057,21 @@ mod tests {
                 "backup mail",
                 unix_now_ms(),
                 AGENT_CONFIRM_TTL_MS,
-                owner,
+                owner.clone(),
             )
             .unwrap();
 
-        let error = isyncyou_webui::AgentHandler::confirm(
-            &agent,
-            &pending.id,
-            &token,
-            &pending.action_hash,
-        )
-        .unwrap_err();
-        assert_eq!(error, "audit_finish_failed");
+        assert_eq!(
+            isyncyou_webui::AgentHandler::confirm(
+                &agent,
+                &confirm_command_for_owner(&pending, &token, &owner),
+            ),
+            isyncyou_webui::AgentConfirmOutcome::Completed
+        );
         assert_eq!(executor.call_count(), 1);
         assert_eq!(
             order.lock().unwrap().as_slice(),
-            ["audit:started", "execute", "audit:ok"]
+            ["audit:started", "execute", "audit:completed"]
         );
         let projections = agent
             .control_store
@@ -17223,46 +18087,424 @@ mod tests {
     }
 
     #[test]
+    fn agent_confirm_owner_mismatch_never_calls_audit_or_executor() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("must not run", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("confirm-owner-mismatch");
+        let agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor.clone()),
+            Arc::new(audit.clone()),
+        );
+        let (pending, token) = register_test_pending(
+            &agent,
+            backup_action(),
+            "backup mail",
+            unix_now_ms(),
+            AGENT_CONFIRM_TTL_MS,
+        );
+        let mut command = test_confirm_command(&pending, &token);
+        command.owner.turn_id = "different-turn".into();
+
+        assert_eq!(
+            isyncyou_webui::AgentHandler::confirm(&agent, &command),
+            isyncyou_webui::AgentConfirmOutcome::Rejected(
+                isyncyou_webui::AgentClosedConfirmationCode::Invalid
+            )
+        );
+        assert_eq!(executor.call_count(), 0);
+        assert!(audit.events().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_confirm_hash_or_policy_mismatch_never_calls_executor() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("must not run", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("confirm-hash-policy-mismatch");
+        let agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor.clone()),
+            Arc::new(audit.clone()),
+        );
+        let (pending, token) = register_test_pending(
+            &agent,
+            backup_action(),
+            "backup mail",
+            unix_now_ms(),
+            AGENT_CONFIRM_TTL_MS,
+        );
+        let mut command = test_confirm_command(&pending, &token);
+        command.action_hash = "b".repeat(64);
+        assert_eq!(
+            isyncyou_webui::AgentHandler::confirm(&agent, &command),
+            isyncyou_webui::AgentConfirmOutcome::Rejected(
+                isyncyou_webui::AgentClosedConfirmationCode::Invalid
+            )
+        );
+
+        let read = isyncyou_agent::parse_action(&serde_json::json!({
+            "op": "read",
+            "account": "me",
+            "service": "mail",
+            "id": "item"
+        }))
+        .unwrap();
+        assert!(agent
+            .pending
+            .register_bound(
+                read.clone(),
+                "read",
+                unix_now_ms(),
+                AGENT_CONFIRM_TTL_MS,
+                test_pending_owner(&read),
+            )
+            .is_err());
+        assert_eq!(executor.call_count(), 0);
+        assert!(audit.events().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_confirm_audit_projection_omits_account_recipient_item_and_raw_payload() {
+        let actions = [
+            serde_json::json!({
+                "op": "restore-cloud",
+                "account": "private-account",
+                "service": "mail",
+                "id": "private-item"
+            }),
+            serde_json::json!({
+                "op": "live-write",
+                "account": "private-account",
+                "service": "mail",
+                "target": "private-target",
+                "change": {"verb":"set_read","value":true,"body":"private-body"}
+            }),
+            serde_json::json!({
+                "op": "share",
+                "account": "private-account",
+                "service": "onedrive",
+                "id": "private-item",
+                "mode": "invite",
+                "recipients": ["private-recipient@example.invalid"],
+                "role": "read"
+            }),
+        ];
+        for value in actions {
+            let action = isyncyou_agent::parse_action(&value).unwrap();
+            let (_, event) =
+                agent_authorization_audit_context(&action, "resolved-account".into()).unwrap();
+            let summary = agent_authorization_audit_summary(&event);
+            for forbidden in [
+                "private-account",
+                "private-item",
+                "private-target",
+                "private-body",
+                "private-recipient",
+                "resolved-account",
+            ] {
+                assert!(!summary.contains(forbidden));
+            }
+        }
+    }
+
+    #[test]
+    fn agent_audit_sink_accepts_only_routing_key_and_closed_projection() {
+        fn record(
+            sink: &dyn AgentAuditSink,
+            routing: &AgentAuditRoutingKey,
+            event: &AgentAuthorizationAuditV1,
+        ) -> Result<(), AgentAuditError> {
+            sink.record_authorization(routing, event)
+        }
+
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let sink = RecordingAuditSink::new(order);
+        let routing = AgentAuditRoutingKey("resolved-account".into());
+        let event = AgentAuthorizationAuditV1 {
+            schema_version: 1,
+            op: isyncyou_core::pending::ConfirmationOperation::Backup,
+            service: Some(isyncyou_core::pending::ConfirmationService::Backup),
+            state: AuthorizationAuditState::Started,
+            code: None,
+        };
+        record(&sink, &routing, &event).unwrap();
+        assert_eq!(sink.events().len(), 1);
+    }
+
+    #[test]
+    fn agent_audit_routing_key_debug_and_display_are_redacted() {
+        let private = "private-resolved-account";
+        let routing = AgentAuditRoutingKey(private.into());
+        for rendered in [format!("{routing:?}"), routing.to_string()] {
+            assert!(!rendered.contains(private));
+            assert!(rendered.contains("redacted"));
+        }
+    }
+
+    #[test]
+    fn agent_audit_failure_counter_saturates_without_payload_or_identifier() {
+        let diagnostics = AgentAuthorizationDiagnostics::default();
+        diagnostics
+            .audit_write_failures
+            .store(u64::MAX, Ordering::Relaxed);
+        diagnostics.record_audit_failure();
+        assert_eq!(
+            diagnostics.audit_write_failures.load(Ordering::Relaxed),
+            u64::MAX
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                diagnostics.audit_write_failures.load(Ordering::Relaxed)
+            ),
+            u64::MAX.to_string()
+        );
+    }
+
+    #[test]
+    fn agent_projection_commit_failure_counter_saturates_without_payload_or_identifier() {
+        let diagnostics = AgentAuthorizationDiagnostics::default();
+        diagnostics
+            .projection_commit_failures
+            .store(u64::MAX, Ordering::Relaxed);
+        diagnostics.record_projection_failure();
+        assert_eq!(
+            diagnostics
+                .projection_commit_failures
+                .load(Ordering::Relaxed),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn agent_audit_unknown_routing_key_never_falls_back_to_first_account() {
+        let root = temp_agent_root("audit-unknown-route");
+        let cfg = Config {
+            accounts: vec![isyncyou_core::AccountConfig {
+                id: "configured-account".into(),
+                username: "controlled".into(),
+                sync_root: root.join("sync"),
+                archive_root: root.join("archive"),
+                cache_root: root.join("cache"),
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let sink = StoreAgentAuditSink { cfg };
+        let event = AgentAuthorizationAuditV1 {
+            schema_version: 1,
+            op: isyncyou_core::pending::ConfirmationOperation::Backup,
+            service: Some(isyncyou_core::pending::ConfirmationService::Backup),
+            state: AuthorizationAuditState::Started,
+            code: None,
+        };
+        assert_eq!(
+            sink.record_authorization(&AgentAuditRoutingKey("unknown".into()), &event),
+            Err(AgentAuditError::UnknownRoutingKey)
+        );
+        assert!(!root.join("archive/.isyncyou-store.db").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_audit_routing_key_uses_exact_resolved_account_not_action_alias() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("backup accepted", order.clone());
+        executor.set_resolved_account(Ok("exact-configured-account"));
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("audit-exact-route");
+        let agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor),
+            Arc::new(audit.clone()),
+        );
+        let (pending, token) = register_test_pending(
+            &agent,
+            backup_action(),
+            "backup mail",
+            unix_now_ms(),
+            AGENT_CONFIRM_TTL_MS,
+        );
+        assert_eq!(
+            confirm_test_pending(&agent, &pending, &token),
+            isyncyou_webui::AgentConfirmOutcome::Completed
+        );
+        assert_eq!(audit.routes(), vec!["exact-configured-account"; 2]);
+        assert!(!audit.routes().iter().any(|route| route == "me"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    fn assert_terminal_projection_failure_is_unknown(
+        label: &str,
+        execution: ConfirmedExecutionOutcome,
+    ) {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("internal", order.clone());
+        *executor.result.lock().unwrap() = execution;
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root(label);
+        let mut agent = DaemonAgent::new(Config::default(), root.clone());
+        agent.confirmed_executor = Arc::new(executor.clone());
+        agent.audit_sink = Arc::new(audit.clone());
+        let owner = test_pending_owner(&backup_action());
+        let (pending, token) = agent
+            .pending
+            .register_bound(
+                backup_action(),
+                "backup mail",
+                unix_now_ms(),
+                AGENT_CONFIRM_TTL_MS,
+                owner.clone(),
+            )
+            .unwrap();
+        agent
+            .control_store
+            .as_ref()
+            .unwrap()
+            .fail_terminal_pending_projection_for_tests()
+            .unwrap();
+
+        assert_eq!(
+            isyncyou_webui::AgentHandler::confirm(
+                &agent,
+                &confirm_command_for_owner(&pending, &token, &owner),
+            ),
+            isyncyou_webui::AgentConfirmOutcome::OutcomeUnknown
+        );
+        assert_eq!(executor.call_count(), 1);
+        assert_eq!(audit.events().len(), 2);
+        assert_eq!(audit.events()[0].1, "started");
+        assert_eq!(audit.events()[1].1, "outcome_unknown");
+        assert!(audit.events()[1].2.contains("effect_outcome_unknown"));
+        assert_eq!(
+            isyncyou_webui::AgentHandler::confirm(
+                &agent,
+                &confirm_command_for_owner(&pending, &token, &owner),
+            ),
+            isyncyou_webui::AgentConfirmOutcome::Rejected(
+                isyncyou_webui::AgentClosedConfirmationCode::Replayed
+            )
+        );
+        assert_eq!(executor.call_count(), 1);
+        drop(agent);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn agent_confirm_projection_commit_failure_after_known_success_returns_unknown_without_reexecution(
+    ) {
+        assert_terminal_projection_failure_is_unknown(
+            "projection-fail-success",
+            ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new("private result")),
+        );
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn agent_confirm_projection_commit_failure_after_known_failure_returns_unknown_without_reexecution(
+    ) {
+        assert_terminal_projection_failure_is_unknown(
+            "projection-fail-failure",
+            ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorFailed),
+        );
+    }
+
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
+    #[test]
+    fn agent_projection_commit_failure_attempts_only_closed_outcome_unknown_audit() {
+        assert_terminal_projection_failure_is_unknown(
+            "projection-fail-audit",
+            ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new(
+                "private account item recipient result",
+            )),
+        );
+    }
+
+    #[test]
+    fn agent_confirm_only_ambiguous_effect_or_projection_commit_maps_outcome_unknown() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("unused", order.clone());
+        *executor.result.lock().unwrap() = ConfirmedExecutionOutcome::OutcomeUnknown;
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("ambiguous-effect");
+        let agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root.clone(),
+            Arc::new(executor.clone()),
+            Arc::new(audit),
+        );
+        let (pending, token) = register_test_pending(
+            &agent,
+            backup_action(),
+            "backup mail",
+            unix_now_ms(),
+            AGENT_CONFIRM_TTL_MS,
+        );
+        assert_eq!(
+            confirm_test_pending(&agent, &pending, &token),
+            isyncyou_webui::AgentConfirmOutcome::OutcomeUnknown
+        );
+        assert_eq!(executor.call_count(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn agent_confirm_mobile_policy_refuses_before_mutation() {
         let order = Arc::new(StdMutex::new(Vec::new()));
         let audit = RecordingAuditSink::new(order.clone());
         let root = temp_agent_root("confirm-mobile-disabled");
         let mut agent = DaemonAgent::new_with_policy(
-            Config::default(),
+            test_config_with_account(&root, "me"),
             root.clone(),
             AgentOperationPolicy::MobileDisabled,
             Arc::new(Mutex::new(())),
         );
         agent.pending = Arc::new(isyncyou_agent::PendingRegistry::new());
         agent.audit_sink = Arc::new(audit.clone());
-        let (pending, token) = agent
-            .pending
-            .register(
-                backup_action(),
-                "backup mail",
-                unix_now_ms(),
-                AGENT_CONFIRM_TTL_MS,
-            )
-            .unwrap();
-
-        let err = isyncyou_webui::AgentHandler::confirm(
+        let (pending, token) = register_test_pending(
             &agent,
-            &pending.id,
-            &token,
-            &pending.action_hash,
-        )
-        .unwrap_err();
+            backup_action(),
+            "backup mail",
+            unix_now_ms(),
+            AGENT_CONFIRM_TTL_MS,
+        );
 
-        assert_eq!(err, "backup failed: not_available_on_mobile");
+        assert_eq!(
+            confirm_test_pending(&agent, &pending, &token),
+            isyncyou_webui::AgentConfirmOutcome::Failed(
+                isyncyou_webui::ClosedConfirmationFailure::ExecutorRejected
+            )
+        );
         assert_eq!(
             order.lock().unwrap().as_slice(),
-            ["audit:started", "audit:error"]
+            ["audit:started", "audit:failed"]
         );
         let events = audit.events();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].1, "started");
-        assert_eq!(events[1].1, "error");
-        assert!(events[1].2.contains("not_available_on_mobile"));
+        assert_eq!(events[1].1, "failed");
+        assert!(events[1].2.contains("executor_rejected"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -17341,6 +18583,50 @@ mod tests {
         assert!(!pending_id.is_empty());
         assert_eq!(executor.call_count(), 0);
         assert!(audit.events().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn daemon_agent_legacy_set_read_value_registers_pending_without_executing() {
+        let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
+            id: "tool-1".into(),
+            input: serde_json::json!({
+                "op":"live-write",
+                "account":"me",
+                "service":"mail",
+                "target":"message-1",
+                "change":{"verb":"set_read","value":true}
+            }),
+        }]];
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("must not run", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("legacy-set-read-pending");
+        let agent = DaemonAgent::with_test_provider_script_and_confirm_components(
+            Config::default(),
+            root.clone(),
+            script,
+            Arc::new(executor.clone()),
+            Arc::new(audit),
+        );
+
+        let turn = isyncyou_webui::AgentHandler::start_turn(&agent, "me", "mark it read").unwrap();
+        let rx = isyncyou_webui::AgentHandler::open_stream(&agent, &turn).expect("turn stream");
+        let mut preview = None;
+        for _ in 0..8 {
+            let line = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("agent stream event");
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if event["event"] == "confirmation_required" {
+                preview = event["preview"].as_str().map(str::to_string);
+                break;
+            }
+        }
+
+        assert_eq!(preview.as_deref(), Some("Mark this email as read"));
+        assert_eq!(agent.pending.len(), 1);
+        assert_eq!(executor.call_count(), 0);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -17533,7 +18819,7 @@ mod tests {
         agent: &DaemonAgent,
         prompt: &str,
         expected_op: &str,
-    ) -> (String, String, String) {
+    ) -> isyncyou_webui::AgentConfirmCommand {
         let turn = isyncyou_webui::AgentHandler::start_turn(agent, "me", prompt).unwrap();
         let rx = isyncyou_webui::AgentHandler::open_stream(agent, &turn).expect("turn stream");
         let mut pending_id = String::new();
@@ -17564,7 +18850,7 @@ mod tests {
         assert!(!pending_id.is_empty());
         assert!(!confirm_token.is_empty());
         assert!(!action_hash.is_empty());
-        (pending_id, confirm_token, action_hash)
+        legacy_turn_confirm_command(&turn, pending_id, confirm_token, action_hash)
     }
 
     fn issue_624_url_segment(value: &str) -> String {
@@ -17578,6 +18864,14 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn mail_live_read_state_graph_path_encodes_opaque_message_id() {
+        assert_eq!(
+            graph_message_read_state_path("AB+/cd="),
+            "/me/messages/AB%2B%2Fcd%3D?$select=id,isRead"
+        );
     }
 
     struct Issue624DraftCleanup {
@@ -17612,6 +18906,23 @@ mod tests {
                 let _ = graph.delete_message(&id);
             }
         }
+    }
+
+    fn issue_624_find_draft_id(token: &str, subject: &str) -> String {
+        let graph = isyncyou_graph::GraphClient::new(token.to_string());
+        let response = graph
+            .get_json("/me/mailFolders/drafts/messages?$select=id,subject&$top=100")
+            .expect("list controlled drafts after confirmation");
+        response["value"]
+            .as_array()
+            .and_then(|items| {
+                items.iter().find_map(|item| {
+                    (item["subject"].as_str() == Some(subject))
+                        .then(|| item["id"].as_str().map(str::to_string))
+                        .flatten()
+                })
+            })
+            .expect("confirmed create_draft is independently visible in Graph")
     }
 
     #[test]
@@ -17693,26 +19004,12 @@ mod tests {
             token: access_token,
             draft_id: None,
         };
-        let confirm = isyncyou_webui::AgentHandler::confirm(
-            &agent,
-            &pending_id,
-            &confirm_token,
-            &action_hash,
-        )
-        .unwrap();
-        let body: serde_json::Value = serde_json::from_str(&confirm).unwrap();
-        assert_eq!(body["status"], "ok");
-        assert_eq!(body["op"], "live-write");
-        let summary: serde_json::Value =
-            serde_json::from_str(body["summary"].as_str().unwrap()).unwrap();
-        assert_eq!(summary["op"], "live-write");
-        assert_eq!(summary["service"], "mail");
-        assert_eq!(summary["verb"], "create_draft");
-        let draft_id = summary["result_id"]
-            .as_str()
-            .filter(|id| !id.is_empty())
-            .map(String::from)
-            .expect("confirmed create_draft returns a draft id");
+        let command = legacy_turn_confirm_command(&turn, pending_id, confirm_token, action_hash);
+        assert_eq!(
+            isyncyou_webui::AgentHandler::confirm(&agent, &command),
+            isyncyou_webui::AgentConfirmOutcome::Completed
+        );
+        let draft_id = issue_624_find_draft_id(&cleanup.token, &subject);
         cleanup.set(draft_id);
         cleanup.cleanup();
         let _ = std::fs::remove_dir_all(root);
@@ -17852,22 +19149,11 @@ mod tests {
             }
         }
         assert!(!pending_id.is_empty());
-        let confirm = isyncyou_webui::AgentHandler::confirm(
-            &agent,
-            &pending_id,
-            &confirm_token,
-            &action_hash,
-        )
-        .unwrap();
-        let body: serde_json::Value = serde_json::from_str(&confirm).unwrap();
-        assert_eq!(body["status"], "ok");
-        assert_eq!(body["op"], "share");
-        let summary: serde_json::Value =
-            serde_json::from_str(body["summary"].as_str().unwrap()).unwrap();
-        assert_eq!(summary["op"], "share");
-        assert_eq!(summary["mode"], "link");
-        assert_eq!(summary["link_type"], "view");
-        assert_eq!(summary["scope"], "anonymous");
+        let command = legacy_turn_confirm_command(&turn, pending_id, confirm_token, action_hash);
+        assert_eq!(
+            isyncyou_webui::AgentHandler::confirm(&agent, &command),
+            isyncyou_webui::AgentConfirmOutcome::Completed
+        );
 
         let permissions = graph
             .list_permissions_detailed(cleanup.item_id.as_ref().unwrap())
@@ -17915,22 +19201,11 @@ mod tests {
             audit,
         );
 
-        let (pending_id, confirm_token, action_hash) =
-            issue_624_collect_pending(&agent, "run a controlled mail backup", "backup");
-        let confirm = isyncyou_webui::AgentHandler::confirm(
-            &agent,
-            &pending_id,
-            &confirm_token,
-            &action_hash,
-        )
-        .unwrap();
-        let body: serde_json::Value = serde_json::from_str(&confirm).unwrap();
-        assert_eq!(body["status"], "ok");
-        assert_eq!(body["op"], "backup");
-        let summary = body["summary"].as_str().unwrap();
-        assert!(summary.contains("mail:"));
-        assert!(!summary.contains("Bearer "));
-        assert!(!summary.contains("access_token"));
+        let command = issue_624_collect_pending(&agent, "run a controlled mail backup", "backup");
+        assert_eq!(
+            isyncyou_webui::AgentHandler::confirm(&agent, &command),
+            isyncyou_webui::AgentConfirmOutcome::Completed
+        );
 
         let store =
             isyncyou_store::Store::open(cfg.accounts[0].archive_root.join(".isyncyou-store.db"))
@@ -18004,28 +19279,30 @@ mod tests {
             audit,
         );
 
-        let (pending_id, confirm_token, action_hash) =
+        let command =
             issue_624_collect_pending(&agent, "restore controlled archived mail", "restore-cloud");
-        let confirm = isyncyou_webui::AgentHandler::confirm(
-            &agent,
-            &pending_id,
-            &confirm_token,
-            &action_hash,
-        )
-        .unwrap();
-        let body: serde_json::Value = serde_json::from_str(&confirm).unwrap();
-        assert_eq!(body["status"], "ok");
-        assert_eq!(body["op"], "restore-cloud");
-        let summary: serde_json::Value =
-            serde_json::from_str(body["summary"].as_str().unwrap()).unwrap();
-        assert_eq!(summary["op"], "restore-cloud");
-        assert_eq!(summary["service"], "mail");
-        assert_eq!(summary["source_id"], source_id);
-        let new_id = summary["new_id"]
-            .as_str()
+        assert_eq!(
+            isyncyou_webui::AgentHandler::confirm(&agent, &command),
+            isyncyou_webui::AgentConfirmOutcome::Completed
+        );
+
+        let bytes = isyncyou_core::envelope::read_body(&archive.join(&rel)).unwrap();
+        let secret =
+            isyncyou_engine::load_or_create_secret(&archive.join(".isyncyou-restore-secret"))
+                .unwrap();
+        let key = isyncyou_engine::idempotency_key(&secret, "me", "mail", &source_id, &bytes);
+        let op_id = format!("me:{key}");
+        let store = isyncyou_store::Store::open(archive.join(".isyncyou-store.db")).unwrap();
+        let op = store
+            .get_restore_operation(&op_id)
+            .unwrap()
+            .expect("restore-cloud records a ledger operation");
+        assert_eq!(op.state, isyncyou_store::RestoreState::Committed);
+        let new_id = op
+            .new_cloud_id
+            .clone()
             .filter(|id| !id.is_empty())
-            .expect("restore-cloud returns new message id")
-            .to_string();
+            .expect("restore-cloud ledger records new message id");
         let mut cleanup = Issue624DraftCleanup {
             token: access_token,
             draft_id: None,
@@ -18042,18 +19319,6 @@ mod tests {
         assert_eq!(restored["id"].as_str(), Some(new_id.as_str()));
         assert_eq!(restored["subject"].as_str(), Some(subject.as_str()));
 
-        let bytes = isyncyou_core::envelope::read_body(&archive.join(&rel)).unwrap();
-        let secret =
-            isyncyou_engine::load_or_create_secret(&archive.join(".isyncyou-restore-secret"))
-                .unwrap();
-        let key = isyncyou_engine::idempotency_key(&secret, "me", "mail", &source_id, &bytes);
-        let op_id = format!("me:{key}");
-        let store = isyncyou_store::Store::open(archive.join(".isyncyou-store.db")).unwrap();
-        let op = store
-            .get_restore_operation(&op_id)
-            .unwrap()
-            .expect("restore-cloud records a ledger operation");
-        assert_eq!(op.state, isyncyou_store::RestoreState::Committed);
         assert_eq!(op.new_cloud_id.as_deref(), Some(new_id.as_str()));
         cleanup.cleanup();
         let _ = std::fs::remove_dir_all(root);
@@ -18137,19 +19402,21 @@ mod tests {
             }
         }
         assert!(!pending_id.is_empty());
-        let result =
-            isyncyou_webui::AgentHandler::confirm(&agent, &pending_id, &token, &action_hash)
-                .unwrap();
-        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(result["summary"], "backup accepted");
-        let replay =
-            isyncyou_webui::AgentHandler::confirm(&agent, &pending_id, &token, &action_hash)
-                .unwrap_err();
-        assert!(replay.contains("NotFound"));
+        let command = legacy_turn_confirm_command(&turn, pending_id, token, action_hash);
+        assert_eq!(
+            isyncyou_webui::AgentHandler::confirm(&agent, &command),
+            isyncyou_webui::AgentConfirmOutcome::Completed
+        );
+        assert_eq!(
+            isyncyou_webui::AgentHandler::confirm(&agent, &command),
+            isyncyou_webui::AgentConfirmOutcome::Rejected(
+                isyncyou_webui::AgentClosedConfirmationCode::Replayed
+            )
+        );
         assert_eq!(executor.call_count(), 1);
         assert_eq!(
             order.lock().unwrap().as_slice(),
-            ["audit:started", "execute", "audit:ok"]
+            ["audit:started", "execute", "audit:completed"]
         );
         assert_eq!(audit.events().len(), 2);
         let _ = std::fs::remove_dir_all(root);
@@ -18647,32 +19914,27 @@ mod tests {
             Arc::new(executor.clone()),
             Arc::new(audit.clone()),
         );
-        let (pending, token) = agent
-            .pending
-            .register(
-                backup_action(),
-                "backup mail",
-                unix_now_ms(),
-                AGENT_CONFIRM_TTL_MS,
-            )
-            .unwrap();
+        let (pending, token) = register_test_pending(
+            &agent,
+            backup_action(),
+            "backup mail",
+            unix_now_ms(),
+            AGENT_CONFIRM_TTL_MS,
+        );
         executor.set_error(format!(
             "raw executor failure includes confirmation token {token}"
         ));
 
-        let err = isyncyou_webui::AgentHandler::confirm(
-            &agent,
-            &pending.id,
-            &token,
-            &pending.action_hash,
-        )
-        .unwrap_err();
-        assert_eq!(err, "backup failed: execution_failed");
-        assert!(!err.contains(&token));
+        assert_eq!(
+            confirm_test_pending(&agent, &pending, &token),
+            isyncyou_webui::AgentConfirmOutcome::Failed(
+                isyncyou_webui::ClosedConfirmationFailure::ExecutorFailed
+            )
+        );
         let audit_text = serde_json::to_string(&audit.events()).unwrap();
         assert!(!audit_text.contains(&token));
         assert!(!audit_text.contains("raw executor failure"));
-        assert!(audit_text.contains("execution_failed"));
+        assert!(audit_text.contains("executor_failed"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -18753,16 +20015,17 @@ mod tests {
             !pending_id.is_empty(),
             "registered pending id should be streamed"
         );
-        let result =
-            isyncyou_webui::AgentHandler::confirm(&agent, &pending_id, &token, &action_hash)
-                .unwrap();
-        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(result["status"], "ok");
-        assert_eq!(result["op"], "backup");
-        let replay =
-            isyncyou_webui::AgentHandler::confirm(&agent, &pending_id, &token, &action_hash)
-                .unwrap_err();
-        assert!(replay.contains("NotFound"));
+        let command = legacy_turn_confirm_command(&turn, pending_id, token, action_hash);
+        assert_eq!(
+            isyncyou_webui::AgentHandler::confirm(&agent, &command),
+            isyncyou_webui::AgentConfirmOutcome::Completed
+        );
+        assert_eq!(
+            isyncyou_webui::AgentHandler::confirm(&agent, &command),
+            isyncyou_webui::AgentConfirmOutcome::Rejected(
+                isyncyou_webui::AgentClosedConfirmationCode::Replayed
+            )
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -28775,7 +30038,75 @@ fn pending_setup_error_is_emitted_only_after_terminal_persistence() {
 #[cfg(test)]
 #[test]
 fn pending_setup_preserves_closed_session_failure_codes() {
+    assert_eq!(
+        pending_setup_error_code("pending_registration_unavailable"),
+        "pending_registration_unavailable"
+    );
+    assert_eq!(
+        pending_setup_error_code("confirmation_unavailable"),
+        "confirmation_unavailable"
+    );
+    assert_eq!(
+        pending_setup_error_code("pending_owner_mismatch"),
+        "pending_owner_mismatch"
+    );
+    assert_eq!(
+        pending_setup_error_code("pending_policy_mismatch"),
+        "pending_policy_mismatch"
+    );
+    assert_eq!(
+        pending_setup_error_code("pending_registration_invalid"),
+        "pending_registration_invalid"
+    );
+    assert_eq!(
+        pending_setup_error_code("pending_capacity_unavailable"),
+        "pending_capacity_unavailable"
+    );
+    assert_eq!(
+        pending_setup_error_code("pending_registration_conflict"),
+        "pending_registration_conflict"
+    );
+    assert_eq!(
+        pending_setup_error_code("pending_maintenance_unavailable"),
+        "pending_maintenance_unavailable"
+    );
+    assert_eq!(
+        pending_setup_error_code("pending_seal_unavailable"),
+        "pending_seal_unavailable"
+    );
+    assert_eq!(
+        pending_setup_error_code("pending_quota_unavailable"),
+        "pending_quota_unavailable"
+    );
+    assert_eq!(
+        pending_setup_error_code("pending_database_unavailable"),
+        "pending_database_unavailable"
+    );
+    assert_eq!(
+        pending_setup_error_code("pending_commit_unavailable"),
+        "pending_commit_unavailable"
+    );
+    assert_eq!(
+        pending_setup_error_code("pending_action_invalid"),
+        "pending_action_invalid"
+    );
+    assert_eq!(
+        pending_setup_error_code("pending_projection_unavailable"),
+        "pending_projection_unavailable"
+    );
+    assert_eq!(
+        pending_setup_error_code("turn_registry_unavailable"),
+        "pending_transition_unavailable"
+    );
     assert_eq!(pending_setup_error_code("lease_lost"), "lease_lost");
+    assert_eq!(
+        pending_setup_error_code("session_store_unavailable"),
+        "session_store_unavailable"
+    );
+    assert_eq!(
+        pending_setup_error_code("invalid_request_journal"),
+        "session_state_invalid"
+    );
     assert_eq!(
         pending_setup_error_code("session_transport_timed_out"),
         "session_transport_timed_out"
@@ -29095,16 +30426,33 @@ fn pending_confirmation_replay_returns_fresh_confirmable_token() {
         }
     ));
     assert_ne!(new_token, old_token);
+    let proof = isyncyou_agent::PendingOwnerProof {
+        session_id: owner.session_id.clone(),
+        turn_request_id: owner.request_id.clone(),
+        turn_id: owner.turn_id.clone(),
+    };
     assert_eq!(
-        agent
-            .pending
-            .confirm(&pending.id, &old_token, &pending.action_hash, unix_now_ms()),
-        Err(isyncyou_agent::ConfirmError::BadToken)
+        agent.pending.confirm(
+            &pending.id,
+            &old_token,
+            &pending.action_hash,
+            &proof,
+            unix_now_ms(),
+        ),
+        isyncyou_agent::PendingConfirmOutcome::Rejected(
+            isyncyou_agent::ClosedConfirmationCode::Invalid
+        )
     );
-    assert!(agent
-        .pending
-        .confirm(&pending.id, &new_token, &pending.action_hash, unix_now_ms())
-        .is_ok());
+    assert!(matches!(
+        agent.pending.confirm(
+            &pending.id,
+            &new_token,
+            &pending.action_hash,
+            &proof,
+            unix_now_ms(),
+        ),
+        isyncyou_agent::PendingConfirmOutcome::Confirmed(_)
+    ));
     assert!(agent
         .turns
         .turns
@@ -29135,20 +30483,15 @@ fn pending_cancel_returns_before_session_projection_and_retries_from_durable_que
         "services": ["mail"]
     }))
     .unwrap();
+    let owner = isyncyou_agent::PendingOwnerBinding {
+        account: "missing-account".into(),
+        session_id: "session-v2".into(),
+        request_id: "019f0000-0000-4000-8000-000000000001".into(),
+        turn_id: "turn-v2".into(),
+    };
     let (pending, token) = agent
         .pending
-        .register_bound(
-            action,
-            "backup",
-            unix_now_ms(),
-            60_000,
-            isyncyou_agent::PendingOwnerBinding {
-                account: "missing-account".into(),
-                session_id: "session-v2".into(),
-                request_id: "019f0000-0000-4000-8000-000000000001".into(),
-                turn_id: "turn-v2".into(),
-            },
-        )
+        .register_bound(action, "backup", unix_now_ms(), 60_000, owner.clone())
         .unwrap();
 
     let started = std::time::Instant::now();
@@ -29156,10 +30499,20 @@ fn pending_cancel_returns_before_session_projection_and_retries_from_durable_que
         .unwrap();
     assert!(started.elapsed() < Duration::from_secs(1));
     assert_eq!(
-        agent
-            .pending
-            .confirm(&pending.id, &token, &pending.action_hash, unix_now_ms()),
-        Err(isyncyou_agent::ConfirmError::NotFound)
+        agent.pending.confirm(
+            &pending.id,
+            &token,
+            &pending.action_hash,
+            &isyncyou_agent::PendingOwnerProof {
+                session_id: owner.session_id,
+                turn_request_id: owner.request_id,
+                turn_id: owner.turn_id,
+            },
+            unix_now_ms(),
+        ),
+        isyncyou_agent::PendingConfirmOutcome::Rejected(
+            isyncyou_agent::ClosedConfirmationCode::Cancelled
+        )
     );
     let store = agent.control_store.as_ref().unwrap();
     let projections = store.pending_cancel_projections(8).unwrap();
@@ -29324,6 +30677,29 @@ fn microsoft_callback_pages_are_no_store_and_sanitize_address_bar() {
         MICROSOFT_CALLBACK_CSP,
         "default-src 'none'; script-src 'sha256-6WBFjYLCKl4KY1+Jlv3zS070QLtF9Gt4OU5pdzNkjXk='"
     );
+}
+
+#[cfg(test)]
+#[test]
+fn self_hosted_account_never_reports_microsoft_status() {
+    use isyncyou_webui::{AccountAuthHandler, AccountAuthState};
+
+    let mut cfg = Config::default();
+    cfg.provider_accounts.insert(
+        "account-slot".into(),
+        isyncyou_core::config::ProviderConfig::SelfHosted {
+            origin: "https://example.invalid".into(),
+            client_id: "client".into(),
+        },
+    );
+    let auth = DaemonAccountAuth {
+        cfg,
+        logins: Mutex::new(std::collections::HashMap::new()),
+    };
+    let status = auth.status("account-slot");
+    assert_eq!(status.reader.state, AccountAuthState::Disconnected);
+    assert_eq!(status.writer.state, AccountAuthState::Disconnected);
+    assert!(auth.logins.lock().unwrap().is_empty());
 }
 
 #[cfg(test)]

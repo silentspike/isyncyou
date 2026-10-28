@@ -542,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_lookup_is_non_consuming_and_payload_free() {
+    fn agent_native_descriptor_contains_only_closed_operation_and_service() {
         let reg = PendingActionRegistry::new();
         let id = reg
             .register(
@@ -610,6 +610,26 @@ mod tests {
         // replay → consumed / gone
         assert_eq!(
             reg.consume(&id, "delete", "me", "calendar", "ev1", 3_001),
+            Err(ConsumeError::NotFound)
+        );
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn agent_native_handle_is_single_use_not_persisted_and_wrong_handle_fails() {
+        let reg = PendingActionRegistry::new();
+        let id = reg
+            .register("live-write", "me", "mail", "opaque", 1_000, 60_000)
+            .unwrap();
+        assert!(!reg.confirm_biometric("wrong-handle", 2_000));
+        assert_eq!(reg.len(), 1);
+        assert!(reg.confirm_biometric(&id, 2_001));
+        assert_eq!(
+            reg.consume(&id, "live-write", "me", "mail", "opaque", 2_002),
+            Ok(())
+        );
+        assert_eq!(
+            reg.consume(&id, "live-write", "me", "mail", "opaque", 2_003),
             Err(ConsumeError::NotFound)
         );
         assert!(reg.is_empty());

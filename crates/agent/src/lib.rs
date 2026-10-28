@@ -60,7 +60,8 @@ pub use activity::{
 };
 pub use archive::{ArchiveSource, ItemRef};
 pub use confirm::{
-    action_hash, ConfirmError, PendingAction, PendingActionBinding, PendingOwnerBinding,
+    action_hash, ClosedConfirmationCode, ConfirmError, PendingAction, PendingActionBinding,
+    PendingBindingOutcome, PendingConfirmOutcome, PendingOwnerBinding, PendingOwnerProof,
     PendingPersistence, PendingRegistry, PersistedPendingAction,
 };
 pub use connectivity::{
@@ -126,7 +127,7 @@ pub use session_v2::{
 pub use stream::{AgentStreamHub, CancellationToken};
 pub use tool::{
     help_text, parse_action, registry_tool_names, tool_schema, RecoveryPolicy, ToolAction,
-    ToolClass, TOOL_NAME,
+    ToolClass, ToolPolicy, TOOL_NAME,
 };
 pub use turn::{
     run_turn, run_turn_cancellable, run_turn_observed, run_turn_observed_with_sink,

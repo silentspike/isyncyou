@@ -3,7 +3,8 @@
 // added here when that story lands.
 plugins {
     id("com.android.application") version "8.5.2" apply false
-    id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+    // UnifiedPush connector 3.3.x publishes Kotlin 2.3 metadata.
+    id("org.jetbrains.kotlin.android") version "2.3.0" apply false
     // Firebase google-services plugin (FCM, story 2 / #575) — applied in :app.
     id("com.google.gms.google-services") version "4.4.2" apply false
 }

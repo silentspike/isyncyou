@@ -9,6 +9,8 @@
 //! `/api/v1/*` route. Tokens are NEVER logged or exposed to WebView JavaScript.
 
 use isyncyou_core::{AccountConfig, Config, OneDriveMode};
+mod provider_credentials;
+mod provider_auth_mobile;
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -164,6 +166,7 @@ fn install_test_mobile_encryption() {
     isyncyou_core::envelope::set_body_key(1, key);
     isyncyou_core::envelope::require_body_envelope_for_process();
     isyncyou_store::set_store_key(key.to_vec());
+    #[cfg(feature = "encrypted-store")]
     isyncyou_store::require_store_key_for_process();
     isyncyou_agent::set_process_credential_key(key);
     mark_mobile_encryption_ready();
@@ -187,6 +190,7 @@ fn install_mobile_body_key(key_id: i32, bytes: &[u8]) -> bool {
         isyncyou_core::envelope::set_body_key(key_id as u32, k);
         isyncyou_core::envelope::require_body_envelope_for_process();
         isyncyou_store::set_store_key(k.to_vec());
+        #[cfg(feature = "encrypted-store")]
         isyncyou_store::require_store_key_for_process();
         mark_mobile_encryption_ready();
     }))
@@ -617,9 +621,9 @@ fn streams() -> &'static Mutex<StreamRegistry> {
     STREAMS.get_or_init(|| Mutex::new(StreamRegistry::default()))
 }
 
-/// Open a bridge push stream (#0A) for `path`, session-gated. Returns a stream id (>0), or
-/// 0 when the engine hasn't started / the stream is unknown / the session is unauthorized.
-pub fn stream_open(path: &str, session_token: Option<&str>) -> i64 {
+/// Open a bridge push stream (#0A) for `path`. Agent streams require the independent
+/// capability token; the generic events stream rejects one.
+pub fn stream_open(path: &str, session_token: Option<&str>, capability_token: Option<&str>) -> i64 {
     let router = {
         let guard = cell().lock().unwrap_or_else(|e| e.into_inner());
         guard.as_ref().map(|s| Arc::clone(&s.router))
@@ -627,7 +631,16 @@ pub fn stream_open(path: &str, session_token: Option<&str>) -> i64 {
     let Some(router) = router else {
         return 0;
     };
-    let Some(rx) = router.open_bridge_stream(path, session_token) else {
+    stream_open_with_router(router, path, session_token, capability_token)
+}
+
+fn stream_open_with_router(
+    router: Arc<isyncyou_webui::Router>,
+    path: &str,
+    session_token: Option<&str>,
+    capability_token: Option<&str>,
+) -> i64 {
+    let Some(rx) = router.open_bridge_stream(path, session_token, capability_token) else {
         return 0;
     };
     let id = STREAM_SEQ.fetch_add(1, Ordering::SeqCst) as i64;
@@ -799,8 +812,11 @@ fn start_inner(
         return Err("agent credential storage setup failed; local data was not opened".into());
     }
     isyncyou_core::envelope::require_body_envelope_for_process();
+    #[cfg(feature = "encrypted-store")]
     isyncyou_store::require_store_key_for_process();
     let base = PathBuf::from(files_dir);
+    #[cfg(target_os = "android")]
+    provider_credentials::install(&base)?;
     cleanup_legacy_plaintext_mobile_state(&base)?;
     let (archive_root, sync_root, cache_root) = mobile_roots(&base);
     // OneDrive online/sync-mode lazy previews live here, apart from the offline working
@@ -811,18 +827,16 @@ fn start_inner(
     let config_path = base.join("isyncyou.toml");
 
     // Load the persisted config so user settings — notably the per-folder `onedrive_modes` the
-    // Mode-3 offline pass (#655) acts on — survive restarts; fall back to a fresh default on
-    // first run or a parse error. The account's storage roots (and the companion poll interval)
+    // Mode-3 offline pass (#655) acts on — survive restarts. Invalid existing configuration
+    // fails closed rather than replacing account setup. The account's storage roots
     // are ALWAYS re-derived from `files_dir` below, so a persisted config can never point the
     // engine at a stale device path.
-    let mut cfg = Config::load(&config_path).unwrap_or_default();
-    prepare_mobile_config_for_files_dir(&mut cfg, &base)?;
-    // A phone is a cache/live companion, not the desktop's 5 s near-real-time loop:
-    // poll every 30 s to spare battery/mobile-data and cut the periodic view refresh
-    // frequency (the live-refresh is otherwise driven every poll a change lands).
-    cfg.sync.poll_interval_secs = 30;
-    // Persist so DaemonSettings (which reads/writes the config file) works on-device.
-    cfg.save(&config_path)?;
+    let cfg = Config::update_atomically(&config_path, |cfg| {
+        prepare_mobile_config_for_files_dir(cfg, &base)?;
+        // The phone is a cache/live companion, not the desktop's 5 s loop.
+        cfg.sync.poll_interval_secs = 30;
+        Ok(cfg.clone())
+    })?;
 
     // An unguessable per-process token gating the whole data API (#89 P1).
     let session_token = isyncyou_app_host::mint_cap_token();
@@ -895,6 +909,9 @@ fn run_onedrive_scoped_pass(
     gate: &Arc<Mutex<()>>,
     progress: &isyncyou_app_host::SharedProgress,
 ) -> bool {
+    if cfg.provider_accounts.contains_key(ACCOUNT) {
+        return false;
+    }
     if !has_onedrive_explicit_scopes(cfg, ACCOUNT) {
         return false;
     }
@@ -922,6 +939,43 @@ fn run_onedrive_scoped_pass(
     }
 }
 
+/// Run the shared JMAP delta against the same encrypted store used by the UI.
+/// A plain or unavailable store fails closed before any provider object is written.
+fn refresh_self_hosted_data(cfg: &Config, base: &Path) -> (bool, bool) {
+    let mut changed = false;
+    let mut successful = true;
+    let mut seen = false;
+    for account in &cfg.accounts {
+        if !cfg.provider_accounts.contains_key(&account.id) { continue; }
+        seen = true;
+        let protected = isyncyou_engine::provider_store::open(cfg, &account.id)
+            .map(|store| store.protected_provider_storage()).unwrap_or(false);
+        if !protected { successful = false; continue; }
+        let result = (|| -> Result<usize, String> {
+            let store = isyncyou_engine::provider_store::open(cfg, &account.id)
+                .map_err(|_| "Protected provider store unavailable")?;
+            if !store.protected_provider_storage() { return Err("Protected provider store unavailable".into()); }
+            let client = isyncyou_engine::self_hosted_mail::client(cfg, &account.id)?;
+            isyncyou_engine::self_hosted_mail::sync(cfg, &account.id, &store, &client)
+        })();
+        match result {
+            Ok(count) => changed |= count > 0,
+            Err(_) => successful = false,
+        }
+        // DAV opens the same encrypted store itself, so the mail store above must
+        // have been dropped before starting this independent protocol pass.
+        if let Ok(credentials) = provider_credentials::AndroidProviderCredentialStore::new(base) {
+            match isyncyou_engine::dav_live::sync_all_with_store(
+                cfg, &account.id, "/.well-known/caldav", &credentials,
+            ) {
+                Ok(report) => { changed |= report.changes > 0; successful &= report.failed == 0; }
+                Err(_) => successful = false,
+            }
+        } else { successful = false; }
+    }
+    (changed, seen && successful)
+}
+
 fn refresh_loop(
     mut cfg: Config,
     base: PathBuf,
@@ -934,13 +988,16 @@ fn refresh_loop(
     let reload_warned = AtomicBool::new(false);
     loop {
         let secs = interval.load(Ordering::Relaxed).max(5);
-        std::thread::sleep(Duration::from_secs(secs));
+        let generation = wait_for_provider_refresh(Duration::from_secs(secs));
         // Isolate a refresh panic so the loop (and the app) survives.
-        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let successful = std::panic::catch_unwind(AssertUnwindSafe(|| {
             cfg = load_mobile_loop_config(&config_path, &base, &cfg, &reload_warned);
-            let refreshed = {
+            let (refreshed, provider_successful) = {
                 let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
-                match isyncyou_engine::auth::resolve_cache_refresh_token(&cfg, ACCOUNT) {
+                let (self_hosted_changed, provider_successful) = refresh_self_hosted_data(&cfg, &base);
+                let microsoft_changed = if cfg.provider_accounts.contains_key(ACCOUNT) {
+                    false
+                } else { match isyncyou_engine::auth::resolve_cache_refresh_token(&cfg, ACCOUNT) {
                     Ok(read) => {
                         let write =
                             isyncyou_engine::auth::resolve_cached_restore_token(&cfg, ACCOUNT).ok();
@@ -953,7 +1010,8 @@ fn refresh_loop(
                             .unwrap_or(false)
                     }
                     Err(_) => false, // not signed in yet — skip quietly
-                }
+                }};
+                (self_hosted_changed || microsoft_changed, provider_successful)
             };
             // #655/#718: after the read-only cache refresh, run the mobile scoped OneDrive pass
             // for any explicit Sync/Offline folders, then wake SSE if either changed data.
@@ -961,8 +1019,68 @@ fn refresh_loop(
             if refreshed || onedrive_changed {
                 events.notify(); // wake SSE subscribers so the UI refetches
             }
-        }));
+            provider_successful
+        })).unwrap_or(false);
+        finish_provider_refresh(generation, successful);
     }
+}
+
+#[derive(Default)]
+struct RefreshSignal { requested: u64, completed: u64, successful: bool }
+
+fn provider_refresh_wakeup() -> &'static (Mutex<RefreshSignal>, std::sync::Condvar) {
+    static WAKE: OnceLock<(Mutex<RefreshSignal>, std::sync::Condvar)> = OnceLock::new();
+    WAKE.get_or_init(|| (Mutex::new(RefreshSignal::default()), std::sync::Condvar::new()))
+}
+
+fn wait_for_provider_refresh(timeout: Duration) -> u64 {
+    let (flag, wake) = provider_refresh_wakeup();
+    let guard = flag.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut guard, _) = wake.wait_timeout_while(guard, timeout, |state| state.requested == state.completed)
+        .unwrap_or_else(|e| e.into_inner());
+    if guard.requested == guard.completed { guard.requested = guard.requested.saturating_add(1); }
+    guard.requested
+}
+
+fn wake_provider_refresh() -> u64 {
+    let (flag, wake) = provider_refresh_wakeup();
+    let mut state = flag.lock().unwrap_or_else(|e| e.into_inner());
+    state.requested = state.requested.saturating_add(1);
+    let generation = state.requested;
+    wake.notify_all();
+    generation
+}
+
+fn finish_provider_refresh(generation: u64, successful: bool) {
+    let (flag, wake) = provider_refresh_wakeup();
+    let mut state = flag.lock().unwrap_or_else(|e| e.into_inner());
+    state.completed = state.completed.max(generation);
+    state.successful = successful;
+    wake.notify_all();
+}
+
+fn wait_for_completed_refresh(generation: u64, timeout: Duration) -> bool {
+    let (flag, wake) = provider_refresh_wakeup();
+    let guard = flag.lock().unwrap_or_else(|e| e.into_inner());
+    let (guard, _) = wake.wait_timeout_while(guard, timeout, |state| state.completed < generation)
+        .unwrap_or_else(|e| e.into_inner());
+    guard.completed >= generation && guard.successful
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeWakeProviderRefresh<'a>(
+    _env: jni::EnvUnowned<'a>, _class: jni::objects::JClass<'a>,
+) {
+    let _ = wake_provider_refresh();
+}
+
+/// Wait for a successful provider pass; timeout, partial errors and panic fail closed.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeWaitProviderRefresh<'a>(
+    _env: jni::EnvUnowned<'a>, _class: jni::objects::JClass<'a>,
+) -> jni::sys::jint {
+    let generation = wake_provider_refresh();
+    i32::from(wait_for_completed_refresh(generation, Duration::from_secs(120)))
 }
 
 // ----------------------------------------------------------------- JNI surface
@@ -1392,12 +1510,14 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeAssetReq
 
 /// JNI: open a bridge push stream (#0A), returning a stream id (>0) or 0. The session
 /// token is passed explicitly (the WebView can't set headers on a native stream open).
+/// The Agent capability is a separate in-memory argument and is never part of `path`.
 #[no_mangle]
 pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStreamOpen<'local>(
     mut env: jni::EnvUnowned<'local>,
     _class: jni::objects::JClass<'local>,
     path: jni::objects::JString<'local>,
     session_token: jni::objects::JString<'local>,
+    capability_token: jni::objects::JString<'local>,
 ) -> jni::sys::jlong {
     let path = match jni_get_string(&mut env, &path) {
         Some(s) => s,
@@ -1405,7 +1525,12 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStreamOp
     };
     let tok = jni_get_string(&mut env, &session_token).unwrap_or_default();
     let tok = if tok.is_empty() { None } else { Some(tok) };
-    std::panic::catch_unwind(AssertUnwindSafe(|| stream_open(&path, tok.as_deref()))).unwrap_or(0)
+    let cap = jni_get_string(&mut env, &capability_token).unwrap_or_default();
+    let cap = if cap.is_empty() { None } else { Some(cap) };
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        stream_open(&path, tok.as_deref(), cap.as_deref())
+    }))
+    .unwrap_or(0)
 }
 
 /// JNI: block for the next event on stream `id` (a JSON `{event,data}` object), or "" when
@@ -2436,6 +2561,18 @@ mod tests {
     }
 
     #[test]
+    fn mobile_bootstrap_does_not_replace_invalid_existing_config() {
+        let _guard = mobile_key_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("isyncyou.toml");
+        let invalid = "not valid = [";
+        std::fs::write(&path, invalid).unwrap();
+        install_test_mobile_encryption();
+        assert!(start_inner(dir.path().to_str().unwrap()).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), invalid);
+    }
+
+    #[test]
     fn mobile_start_inner_clears_legacy_plaintext_cache_but_keeps_tokens() {
         let _guard = mobile_key_test_guard();
         install_test_mobile_encryption();
@@ -3018,18 +3155,91 @@ mod tests {
         start_engine(dir.path().to_str().unwrap()).expect("engine starts");
         let tok = session_token().expect("token");
         assert_eq!(
-            stream_open("/api/v1/events", None),
+            stream_open("/api/v1/events", None, None),
             0,
             "unauthorized → no stream"
         );
         assert_eq!(
-            stream_open("/api/v1/nope", Some(&tok)),
+            stream_open("/api/v1/nope", Some(&tok), None),
             0,
             "unknown path → no stream"
         );
-        let id = stream_open("/api/v1/events", Some(&tok));
+        let id = stream_open("/api/v1/events", Some(&tok), None);
         assert!(id > 0, "authorized events stream opens");
         stream_close(id);
         assert_eq!(stream_next(id), "", "a closed stream yields nothing");
+    }
+
+    #[test]
+    fn agent_stream_bridge_requires_session_and_agent_capability() {
+        struct StreamAgent;
+
+        impl isyncyou_webui::AgentHandler for StreamAgent {
+            fn start_turn(&self, _account: &str, _prompt: &str) -> Result<String, String> {
+                Ok("turn-123".into())
+            }
+
+            fn confirm(
+                &self,
+                _command: &isyncyou_webui::AgentConfirmCommand,
+            ) -> isyncyou_webui::AgentConfirmOutcome {
+                isyncyou_webui::AgentConfirmOutcome::Rejected(
+                    isyncyou_webui::AgentClosedConfirmationCode::Invalid,
+                )
+            }
+
+            fn cancel(&self, _turn_id: &str) {}
+
+            fn open_stream(&self, _turn_id: &str) -> Option<Receiver<String>> {
+                let (_tx, rx) = std::sync::mpsc::channel();
+                Some(rx)
+            }
+        }
+
+        let router = Arc::new(
+            isyncyou_webui::Router::new(Config::default())
+                .with_agent(Arc::new(StreamAgent), "agent-capability".into())
+                .with_session_token("session".into()),
+        );
+        let path = "/api/v1/agent/stream?turn=turn-123";
+
+        let id = stream_open_with_router(
+            Arc::clone(&router),
+            path,
+            Some("session"),
+            Some("agent-capability"),
+        );
+        assert!(id > 0);
+        stream_close(id);
+
+        for (session, capability) in [
+            (None, Some("agent-capability")),
+            (Some("session"), None),
+            (Some("wrong"), Some("agent-capability")),
+            (Some("session"), Some("wrong")),
+        ] {
+            assert_eq!(
+                stream_open_with_router(Arc::clone(&router), path, session, capability),
+                0
+            );
+        }
+        assert_eq!(
+            stream_open_with_router(
+                Arc::clone(&router),
+                "/api/v1/agent/stream?turn=turn-123&_cap=agent-capability",
+                Some("session"),
+                None,
+            ),
+            0
+        );
+        assert_eq!(
+            stream_open_with_router(
+                router,
+                "/api/v1/events",
+                Some("session"),
+                Some("agent-capability"),
+            ),
+            0
+        );
     }
 }

@@ -159,9 +159,22 @@ object BiometricLabelPolicy {
     )
 
     fun label(op: String, service: String): String? {
+        if (!isAllowedPair(op, service)) return null
         if (op == "bulk" && service == "todo") return "Delete selected tasks in To Do"
         val verb = verbs[op] ?: return null
         val serviceName = services[service] ?: return null
         return "$verb in $serviceName"
+    }
+
+    private fun isAllowedPair(op: String, service: String): Boolean = when (op) {
+        "delete" -> service in setOf("calendar", "contacts", "todo", "onenote", "onedrive")
+        "share", "external-share", "upload", "replace", "move-out-of-protected",
+        "mode-switch-offline-large", "conflict-keep-mine" -> service == "onedrive"
+        "backup" -> service == "backup" || service == "agent"
+        "restore-cloud" -> service in setOf("mail", "calendar", "contacts", "todo", "onenote")
+        "live-write" -> service in setOf("mail", "calendar", "contacts", "todo", "onenote")
+        "bulk" -> service == "onedrive" || service == "todo"
+        "user-presence" -> service == "agent"
+        else -> false
     }
 }

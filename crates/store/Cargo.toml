@@ -12,6 +12,7 @@ rusqlite = { workspace = true, features = ["hooks"] }
 sha2 = "0.10"
 thiserror = { workspace = true }
 fs2 = "0.4"
+serde_json = { workspace = true }
 
 [features]
 # At-rest encryption profile. `encrypted-store` (desktop default) compiles

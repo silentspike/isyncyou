@@ -1,8 +1,9 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use isyncyou_agent::{
-    AgentCredentialStore, ConfirmError, FileLock, PairingClaimV2, PairingCodeV2,
-    PairingDescriptorV2, PairingPayload, PairingSourceSecretV2, PendingActionBinding,
-    PendingOwnerBinding, PendingPersistence, PersistedPendingAction, ToolAction,
+    AgentCredentialStore, ClosedConfirmationCode, ConfirmError, FileLock, PairingClaimV2,
+    PairingCodeV2, PairingDescriptorV2, PairingPayload, PairingSourceSecretV2,
+    PendingActionBinding, PendingBindingOutcome, PendingConfirmOutcome, PendingOwnerBinding,
+    PendingOwnerProof, PendingPersistence, PersistedPendingAction, ToolAction, ToolPolicy,
 };
 use ring::{aead, hkdf, rand::SecureRandom as _};
 use rusqlite::{
@@ -42,7 +43,6 @@ const MAX_AGENT_TURN_ADMISSION_BYTES: usize = 40 * 1024;
 type MutationCommitRow = (Vec<u8>, i64, String, i64, String, Option<String>, String);
 type MutationIntentCreateRow = (String, String, Vec<u8>, i64, String, i64, String);
 type UserPresenceRow = (String, String, i64, Option<Vec<u8>>, Option<Vec<u8>>);
-type PendingRow = (String, u64, String, Option<Vec<u8>>);
 type PendingConfirmRow = (
     String,
     i64,
@@ -516,6 +516,20 @@ impl std::fmt::Debug for AgentControlStore {
 }
 
 impl AgentControlStore {
+    #[cfg(test)]
+    pub(crate) fn fail_terminal_pending_projection_for_tests(&self) -> Result<(), String> {
+        self.connection
+            .lock()
+            .map_err(|_| "control_store_unavailable".to_string())?
+            .execute_batch(
+                "CREATE TRIGGER fail_terminal_pending_projection
+                 BEFORE UPDATE OF code ON pending_confirm_projections
+                 WHEN NEW.code IN ('completed','failed')
+                 BEGIN SELECT RAISE(ABORT, 'controlled terminal projection failure'); END;",
+            )
+            .map_err(|_| "control_store_unavailable".to_string())
+    }
+
     pub(crate) fn open(
         base_dir: &Path,
         credential_store: &AgentCredentialStore,
@@ -1302,7 +1316,7 @@ impl AgentControlStore {
         code: &str,
         now_ms: u64,
     ) -> Result<(), String> {
-        if !matches!(code, "completed" | "failed") {
+        if !matches!(code, "completed" | "failed" | "outcome_unknown") {
             return Err("control_store_unavailable".into());
         }
         let connection = self
@@ -3385,32 +3399,6 @@ impl AgentControlStore {
         }
     }
 
-    fn load_pending(&self, intent_id: &str) -> Result<Option<PendingRow>, ConfirmError> {
-        let connection = self
-            .connection
-            .lock()
-            .map_err(|_| ConfirmError::Unavailable)?;
-        connection
-            .query_row(
-                "SELECT state, expires_at_ms, action_hash, sealed_payload
-                 FROM confirmation_intents
-                 WHERE intent_id=?1 AND owner_binding=?2",
-                params![intent_id, self.installation_binding],
-                |row| {
-                    let expires: i64 = row.get(1)?;
-                    Ok((
-                        row.get(0)?,
-                        u64::try_from(expires)
-                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, expires))?,
-                        row.get(2)?,
-                        row.get(3)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|_| ConfirmError::Unavailable)
-    }
-
     fn decrypt_pending(
         &self,
         intent_id: &str,
@@ -3426,35 +3414,6 @@ impl AgentControlStore {
         (pending.version == 1)
             .then_some(pending)
             .ok_or(ConfirmError::Unavailable)
-    }
-
-    fn erase_with_state(
-        &self,
-        intent_id: &str,
-        state: &str,
-        now_ms: u64,
-    ) -> Result<(), ConfirmError> {
-        let connection = self
-            .connection
-            .lock()
-            .map_err(|_| ConfirmError::Unavailable)?;
-        let changed = connection
-            .execute(
-                "UPDATE confirmation_intents
-                 SET state=?1, sealed_payload=NULL, terminal_expires_at_ms=?4, logical_bytes=0
-                 WHERE intent_id=?2 AND owner_binding=?3 AND state='pending'",
-                params![
-                    state,
-                    intent_id,
-                    self.installation_binding,
-                    control_tombstone_expiry(now_ms).map_err(|_| ConfirmError::Unavailable)?
-                ],
-            )
-            .map_err(|_| ConfirmError::Unavailable)?;
-        if changed != 1 {
-            return Err(ConfirmError::NotFound);
-        }
-        checkpoint_secure_erasure(&connection).map_err(|_| ConfirmError::Unavailable)
     }
 
     pub(crate) fn bind_product_request(
@@ -4542,7 +4501,13 @@ fn derive_control_subkeys(control_root: &[u8; 32]) -> Result<ControlSubkeys, Str
 impl PendingPersistence for AgentControlStore {
     fn insert(&self, pending: PersistedPendingAction) -> Result<(), ConfirmError> {
         self.reap_expired(pending.created_at_ms, 256)
-            .map_err(|_| ConfirmError::Unavailable)?;
+            .map_err(|_| ConfirmError::MaintenanceUnavailable)?;
+        if pending.action.account() != pending.owner.account {
+            return Err(ConfirmError::OwnerMismatch);
+        }
+        if pending.action.policy() != ToolPolicy::ConfirmedEffectNeverRepeat {
+            return Err(ConfirmError::PolicyMismatch);
+        }
         if pending.id.is_empty()
             || pending.action_hash.len() != 64
             || pending.owner.account.is_empty()
@@ -4550,7 +4515,7 @@ impl PendingPersistence for AgentControlStore {
             || pending.owner.request_id.is_empty()
             || pending.owner.turn_id.is_empty()
         {
-            return Err(ConfirmError::Unavailable);
+            return Err(ConfirmError::InvalidRegistration);
         }
         let secret = PendingSecretV1 {
             version: 1,
@@ -4559,30 +4524,37 @@ impl PendingPersistence for AgentControlStore {
             token_hash: URL_SAFE_NO_PAD.encode(pending.token_hash),
             risk: pending.risk,
         };
-        let plaintext = serde_json::to_vec(&secret).map_err(|_| ConfirmError::Unavailable)?;
+        let plaintext =
+            serde_json::to_vec(&secret).map_err(|_| ConfirmError::InvalidRegistration)?;
         if plaintext.len() > MAX_PENDING_PLAINTEXT {
-            return Err(ConfirmError::Unavailable);
+            return Err(ConfirmError::InvalidRegistration);
         }
         let sealed = seal_row(&self.row_wrap_key, "agent-tool", &pending.id, &plaintext)
-            .map_err(|_| ConfirmError::Unavailable)?;
+            .map_err(|_| ConfirmError::SealUnavailable)?;
         let logical_bytes = i64::try_from(sealed.len()).map_err(|_| ConfirmError::Unavailable)?;
         let expires = u64_to_i64(pending.expires_at_ms).map_err(|_| ConfirmError::Unavailable)?;
         let mut connection = self
             .connection
             .lock()
-            .map_err(|_| ConfirmError::Unavailable)?;
+            .map_err(|_| ConfirmError::DatabaseUnavailable)?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|_| ConfirmError::Unavailable)?;
+            .map_err(|_| ConfirmError::DatabaseUnavailable)?;
         let count: i64 = transaction
             .query_row("SELECT COUNT(*) FROM confirmation_intents", [], |row| {
                 row.get(0)
             })
-            .map_err(|_| ConfirmError::Unavailable)?;
-        if count >= MAX_CONFIRMATIONS || enforce_control_quota(&transaction, logical_bytes).is_err()
-        {
-            return Err(ConfirmError::Unavailable);
+            .map_err(|_| ConfirmError::DatabaseUnavailable)?;
+        if count >= MAX_CONFIRMATIONS {
+            return Err(ConfirmError::Capacity);
         }
+        enforce_control_quota(&transaction, logical_bytes).map_err(|error| {
+            if error == "control_store_quota_exceeded" {
+                ConfirmError::Capacity
+            } else {
+                ConfirmError::QuotaUnavailable
+            }
+        })?;
         transaction
             .execute(
                 "INSERT INTO confirmation_intents(
@@ -4602,8 +4574,17 @@ impl PendingPersistence for AgentControlStore {
                     logical_bytes,
                 ],
             )
-            .map_err(|_| ConfirmError::Unavailable)?;
-        transaction.commit().map_err(|_| ConfirmError::Unavailable)
+            .map_err(|error| match error {
+                rusqlite::Error::SqliteFailure(inner, _)
+                    if inner.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    ConfirmError::Conflict
+                }
+                _ => ConfirmError::DatabaseUnavailable,
+            })?;
+        transaction
+            .commit()
+            .map_err(|_| ConfirmError::CommitUnavailable)
     }
 
     fn confirm(
@@ -4611,16 +4592,17 @@ impl PendingPersistence for AgentControlStore {
         pending_id: &str,
         token_hash: &[u8; 32],
         action_hash: &str,
+        owner: &PendingOwnerProof,
         now_ms: u64,
-    ) -> Result<ToolAction, ConfirmError> {
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| ConfirmError::Unavailable)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|_| ConfirmError::Unavailable)?;
-        let row: Option<PendingConfirmRow> = transaction
+    ) -> PendingConfirmOutcome {
+        let Ok(mut connection) = self.connection.lock() else {
+            return PendingConfirmOutcome::RetainedRetryable;
+        };
+        let Ok(transaction) = connection.transaction_with_behavior(TransactionBehavior::Immediate)
+        else {
+            return PendingConfirmOutcome::RetainedRetryable;
+        };
+        let row: Option<PendingConfirmRow> = match transaction
             .query_row(
                 "SELECT state,expires_at_ms,action_hash,sealed_payload,
                             account_id,session_id,request_id,turn_id
@@ -4641,7 +4623,10 @@ impl PendingPersistence for AgentControlStore {
                 },
             )
             .optional()
-            .map_err(|_| ConfirmError::Unavailable)?;
+        {
+            Ok(row) => row,
+            Err(_) => return PendingConfirmOutcome::RetainedRetryable,
+        };
         let Some((
             state,
             expires,
@@ -4653,64 +4638,107 @@ impl PendingPersistence for AgentControlStore {
             turn_id,
         )) = row
         else {
-            return Err(ConfirmError::NotFound);
+            return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Replayed);
         };
-        if state != "pending" {
-            return Err(ConfirmError::NotFound);
+        match state.as_str() {
+            "pending" => {}
+            "cancelled" => {
+                return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Cancelled)
+            }
+            "expired" => return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Expired),
+            "consumed" => return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Replayed),
+            _ => return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid),
         }
-        let now = u64_to_i64(now_ms).map_err(|_| ConfirmError::Unavailable)?;
+        if session_id != owner.session_id
+            || request_id != owner.turn_request_id
+            || turn_id != owner.turn_id
+        {
+            return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid);
+        }
+        let Ok(now) = u64_to_i64(now_ms) else {
+            return PendingConfirmOutcome::RetainedRetryable;
+        };
         if now >= expires {
-            transaction
+            let terminal_expiry = match control_tombstone_expiry(now_ms) {
+                Ok(expiry) => expiry,
+                Err(_) => return PendingConfirmOutcome::RetainedRetryable,
+            };
+            if transaction
                 .execute(
                     "UPDATE confirmation_intents
                      SET state='expired',sealed_payload=NULL,terminal_expires_at_ms=?3,
                          logical_bytes=0
                      WHERE intent_id=?1 AND owner_binding=?2 AND state='pending'",
-                    params![
-                        pending_id,
-                        self.installation_binding,
-                        control_tombstone_expiry(now_ms).map_err(|_| ConfirmError::Unavailable)?
-                    ],
+                    params![pending_id, self.installation_binding, terminal_expiry],
                 )
-                .map_err(|_| ConfirmError::Unavailable)?;
-            transaction
-                .commit()
-                .map_err(|_| ConfirmError::Unavailable)?;
-            checkpoint_secure_erasure(&connection).map_err(|_| ConfirmError::Unavailable)?;
-            return Err(ConfirmError::Expired);
+                .is_err()
+            {
+                return PendingConfirmOutcome::RetainedRetryable;
+            }
+            if transaction.commit().is_err() {
+                return PendingConfirmOutcome::ConsumedOrCommitUnknown;
+            }
+            let _ = checkpoint_secure_erasure(&connection);
+            return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Expired);
         }
         if !constant_time_eq(action_hash.as_bytes(), expected_action_hash.as_bytes()) {
-            return Err(ConfirmError::ActionMismatch);
+            return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid);
         }
-        let pending = self.decrypt_pending(
+        let pending = match self.decrypt_pending(
             pending_id,
-            sealed.as_deref().ok_or(ConfirmError::Unavailable)?,
-        )?;
-        let expected_token = URL_SAFE_NO_PAD
-            .decode(pending.token_hash)
-            .map_err(|_| ConfirmError::Unavailable)?;
-        if !constant_time_eq(token_hash, &expected_token) {
-            return Err(ConfirmError::BadToken);
+            match sealed.as_deref() {
+                Some(sealed) => sealed,
+                None => return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid),
+            },
+        ) {
+            Ok(pending) => pending,
+            Err(_) => return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid),
+        };
+        let Ok(expires_u64) = u64::try_from(expires) else {
+            return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid);
+        };
+        if pending.version != 1
+            || pending.action.account() != account
+            || pending.action.policy() != ToolPolicy::ConfirmedEffectNeverRepeat
+        {
+            return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid);
         }
-        let terminal_expires_at_ms =
-            control_tombstone_expiry(now_ms).map_err(|_| ConfirmError::Unavailable)?;
-        let changed = transaction
-            .execute(
-                "UPDATE confirmation_intents
+        let Ok(recomputed_hash) = isyncyou_agent::action_hash(&pending.action, expires_u64) else {
+            return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid);
+        };
+        if !constant_time_eq(recomputed_hash.as_bytes(), expected_action_hash.as_bytes())
+            || !constant_time_eq(recomputed_hash.as_bytes(), action_hash.as_bytes())
+        {
+            return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid);
+        }
+        let expected_token = match URL_SAFE_NO_PAD.decode(pending.token_hash) {
+            Ok(token) if token.len() == 32 => token,
+            _ => return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid),
+        };
+        if !constant_time_eq(token_hash, &expected_token) {
+            return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid);
+        }
+        let Ok(terminal_expires_at_ms) = control_tombstone_expiry(now_ms) else {
+            return PendingConfirmOutcome::RetainedRetryable;
+        };
+        let changed = match transaction.execute(
+            "UPDATE confirmation_intents
                  SET state='consumed',sealed_payload=NULL,terminal_expires_at_ms=?3,
                      logical_bytes=0
                  WHERE intent_id=?1 AND owner_binding=?2 AND state='pending'",
-                params![
-                    pending_id,
-                    self.installation_binding,
-                    terminal_expires_at_ms
-                ],
-            )
-            .map_err(|_| ConfirmError::Unavailable)?;
+            params![
+                pending_id,
+                self.installation_binding,
+                terminal_expires_at_ms
+            ],
+        ) {
+            Ok(changed) => changed,
+            Err(_) => return PendingConfirmOutcome::RetainedRetryable,
+        };
         if changed != 1 {
-            return Err(ConfirmError::NotFound);
+            return PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Replayed);
         }
-        let projection_bytes = i64::try_from(
+        let projection_bytes = match i64::try_from(
             pending_id
                 .len()
                 .saturating_add(account.len())
@@ -4719,11 +4747,14 @@ impl PendingPersistence for AgentControlStore {
                 .saturating_add(turn_id.len())
                 .saturating_add(self.installation_binding.len())
                 .saturating_add(128),
-        )
-        .map_err(|_| ConfirmError::Unavailable)?;
-        enforce_control_quota(&transaction, projection_bytes)
-            .map_err(|_| ConfirmError::Unavailable)?;
-        transaction
+        ) {
+            Ok(bytes) => bytes,
+            Err(_) => return PendingConfirmOutcome::RetainedRetryable,
+        };
+        if enforce_control_quota(&transaction, projection_bytes).is_err() {
+            return PendingConfirmOutcome::RetainedRetryable;
+        }
+        if transaction
             .execute(
                 "INSERT INTO pending_confirm_projections(
                    pending_id,account_id,session_id,request_id,turn_id,owner_binding,
@@ -4740,39 +4771,135 @@ impl PendingPersistence for AgentControlStore {
                     projection_bytes,
                 ],
             )
-            .map_err(|_| ConfirmError::Unavailable)?;
-        transaction
-            .commit()
-            .map_err(|_| ConfirmError::Unavailable)?;
-        checkpoint_secure_erasure(&connection).map_err(|_| ConfirmError::Unavailable)?;
-        Ok(pending.action)
+            .is_err()
+        {
+            return PendingConfirmOutcome::RetainedRetryable;
+        }
+        if transaction.commit().is_err() {
+            return PendingConfirmOutcome::ConsumedOrCommitUnknown;
+        }
+        if checkpoint_secure_erasure(&connection).is_err() {
+            return PendingConfirmOutcome::ConsumedOrCommitUnknown;
+        }
+        PendingConfirmOutcome::Confirmed(Box::new(pending.action))
     }
 
     fn binding(
         &self,
         pending_id: &str,
         action_hash: &str,
+        owner: &PendingOwnerProof,
         now_ms: u64,
-    ) -> Result<PendingActionBinding, ConfirmError> {
-        let Some((state, expires, expected_action_hash, sealed)) = self.load_pending(pending_id)?
-        else {
-            return Err(ConfirmError::NotFound);
+    ) -> PendingBindingOutcome<PendingActionBinding> {
+        let Ok(mut connection) = self.connection.lock() else {
+            return PendingBindingOutcome::Unavailable;
         };
-        if state != "pending" {
-            return Err(ConfirmError::NotFound);
+        let Ok(transaction) = connection.transaction_with_behavior(TransactionBehavior::Immediate)
+        else {
+            return PendingBindingOutcome::Unavailable;
+        };
+        let row: Option<PendingConfirmRow> = match transaction
+            .query_row(
+                "SELECT state,expires_at_ms,action_hash,sealed_payload,
+                        account_id,session_id,request_id,turn_id
+                 FROM confirmation_intents
+                 WHERE intent_id=?1 AND owner_binding=?2",
+                params![pending_id, self.installation_binding],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .optional()
+        {
+            Ok(row) => row,
+            Err(_) => return PendingBindingOutcome::Unavailable,
+        };
+        let Some((
+            state,
+            expires,
+            expected_action_hash,
+            sealed,
+            account,
+            session_id,
+            request_id,
+            turn_id,
+        )) = row
+        else {
+            return PendingBindingOutcome::Rejected(ClosedConfirmationCode::Replayed);
+        };
+        match state.as_str() {
+            "pending" => {}
+            "cancelled" => {
+                return PendingBindingOutcome::Rejected(ClosedConfirmationCode::Cancelled)
+            }
+            "expired" => return PendingBindingOutcome::Rejected(ClosedConfirmationCode::Expired),
+            "consumed" => return PendingBindingOutcome::Rejected(ClosedConfirmationCode::Replayed),
+            _ => return PendingBindingOutcome::Rejected(ClosedConfirmationCode::Invalid),
         }
-        if now_ms >= expires {
-            self.erase_with_state(pending_id, "expired", now_ms)?;
-            return Err(ConfirmError::Expired);
+        if session_id != owner.session_id
+            || request_id != owner.turn_request_id
+            || turn_id != owner.turn_id
+        {
+            return PendingBindingOutcome::Rejected(ClosedConfirmationCode::Invalid);
+        }
+        let Ok(expires_u64) = u64::try_from(expires) else {
+            return PendingBindingOutcome::Rejected(ClosedConfirmationCode::Invalid);
+        };
+        if now_ms >= expires_u64 {
+            let Ok(terminal_expiry) = control_tombstone_expiry(now_ms) else {
+                return PendingBindingOutcome::Unavailable;
+            };
+            if transaction
+                .execute(
+                    "UPDATE confirmation_intents
+                     SET state='expired',sealed_payload=NULL,terminal_expires_at_ms=?3,
+                         logical_bytes=0
+                     WHERE intent_id=?1 AND owner_binding=?2 AND state='pending'",
+                    params![pending_id, self.installation_binding, terminal_expiry],
+                )
+                .is_err()
+                || transaction.commit().is_err()
+            {
+                return PendingBindingOutcome::Unavailable;
+            }
+            let _ = checkpoint_secure_erasure(&connection);
+            return PendingBindingOutcome::Rejected(ClosedConfirmationCode::Expired);
         }
         if !constant_time_eq(action_hash.as_bytes(), expected_action_hash.as_bytes()) {
-            return Err(ConfirmError::ActionMismatch);
+            return PendingBindingOutcome::Rejected(ClosedConfirmationCode::Invalid);
         }
-        let pending = self.decrypt_pending(
-            pending_id,
-            sealed.as_deref().ok_or(ConfirmError::Unavailable)?,
-        )?;
-        Ok(PendingActionBinding {
+        let pending = match sealed
+            .as_deref()
+            .ok_or(ConfirmError::Unavailable)
+            .and_then(|sealed| self.decrypt_pending(pending_id, sealed))
+        {
+            Ok(pending) => pending,
+            Err(_) => return PendingBindingOutcome::Rejected(ClosedConfirmationCode::Invalid),
+        };
+        if pending.version != 1
+            || pending.action.account() != account
+            || pending.action.policy() != ToolPolicy::ConfirmedEffectNeverRepeat
+        {
+            return PendingBindingOutcome::Rejected(ClosedConfirmationCode::Invalid);
+        }
+        let Ok(recomputed_hash) = isyncyou_agent::action_hash(&pending.action, expires_u64) else {
+            return PendingBindingOutcome::Rejected(ClosedConfirmationCode::Invalid);
+        };
+        if !constant_time_eq(recomputed_hash.as_bytes(), expected_action_hash.as_bytes())
+            || !constant_time_eq(recomputed_hash.as_bytes(), action_hash.as_bytes())
+        {
+            return PendingBindingOutcome::Rejected(ClosedConfirmationCode::Invalid);
+        }
+        PendingBindingOutcome::Ready(PendingActionBinding {
             op: pending.action.op().to_owned(),
             account: pending.action.account().to_owned(),
             service: pending.action.service().unwrap_or("agent").to_owned(),
@@ -4783,7 +4910,7 @@ impl PendingPersistence for AgentControlStore {
                 action_hash.len(),
                 action_hash
             ),
-            expires_at_ms: expires,
+            expires_at_ms: expires_u64,
         })
     }
 
@@ -6765,6 +6892,68 @@ mod tests {
         }
     }
 
+    fn owner_proof() -> PendingOwnerProof {
+        let owner = owner();
+        PendingOwnerProof {
+            session_id: owner.session_id,
+            turn_request_id: owner.request_id,
+            turn_id: owner.turn_id,
+        }
+    }
+
+    fn insert_pre_642_pending_fixture(
+        control: &AgentControlStore,
+        pending_id: &str,
+        token: &str,
+        owner: &PendingOwnerBinding,
+    ) -> (ToolAction, String) {
+        let action = backup_action();
+        let expires_at_ms = 61_000;
+        let action_hash = isyncyou_agent::action_hash(&action, expires_at_ms).unwrap();
+        let mut token_digest = ring::digest::Context::new(&ring::digest::SHA256);
+        token_digest.update(b"isyncyou-confirmation-token-v1\0");
+        token_digest.update(token.as_bytes());
+        let secret = PendingSecretV1 {
+            version: 1,
+            action: action.clone(),
+            preview: "Backup mail".into(),
+            token_hash: URL_SAFE_NO_PAD.encode(token_digest.finish().as_ref()),
+            risk: "destructive".into(),
+        };
+        let sealed = seal_row(
+            &control.row_wrap_key,
+            "agent-tool",
+            pending_id,
+            &serde_json::to_vec(&secret).unwrap(),
+        )
+        .unwrap();
+        let logical_bytes = i64::try_from(sealed.len()).unwrap();
+        control
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO confirmation_intents(
+                   intent_id,account_id,session_id,request_id,turn_id,owner_binding,
+                   action_hash,expires_at_ms,state,sealed_payload,logical_bytes
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'pending',?9,?10)",
+                params![
+                    pending_id,
+                    &owner.account,
+                    &owner.session_id,
+                    &owner.request_id,
+                    &owner.turn_id,
+                    &control.installation_binding,
+                    &action_hash,
+                    i64::try_from(expires_at_ms).unwrap(),
+                    sealed,
+                    logical_bytes,
+                ],
+            )
+            .unwrap();
+        (action, action_hash)
+    }
+
     #[test]
     fn agent_control_store_debug_redacts_local_path_and_installation_binding() {
         let root = temp_root("debug-redaction");
@@ -8517,7 +8706,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmation_store_survives_restart_and_consumes_exactly_once() {
+    fn confirmation_store_bad_token_does_not_consume_valid_authority() {
         let root = temp_root("restart");
         let store = credential_store(&root);
         let persistence =
@@ -8527,8 +8716,14 @@ mod tests {
             .register_bound(backup_action(), "backup", 1_000, 60_000, owner())
             .unwrap();
         assert_eq!(
-            registry.confirm(&pending.id, "wrong", &pending.action_hash, 2_000),
-            Err(ConfirmError::BadToken)
+            registry.confirm(
+                &pending.id,
+                "wrong",
+                &pending.action_hash,
+                &owner_proof(),
+                2_000,
+            ),
+            PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid)
         );
         drop(registry);
 
@@ -8536,21 +8731,395 @@ mod tests {
             AgentControlStore::open(&root, &store, INSTALLATION_PRINCIPAL, 1).unwrap();
         let registry = PendingRegistry::with_persistence(Arc::new(persistence));
         assert_eq!(
-            registry
-                .confirm(&pending.id, &token, &pending.action_hash, 2_001)
-                .unwrap(),
-            backup_action()
+            registry.confirm(
+                &pending.id,
+                &token,
+                &pending.action_hash,
+                &owner_proof(),
+                2_001,
+            ),
+            PendingConfirmOutcome::Confirmed(Box::new(backup_action()))
         );
         assert_eq!(
-            registry.confirm(&pending.id, &token, &pending.action_hash, 2_002),
-            Err(ConfirmError::NotFound)
+            registry.confirm(
+                &pending.id,
+                &token,
+                &pending.action_hash,
+                &owner_proof(),
+                2_002,
+            ),
+            PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Replayed)
         );
         drop(registry);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn confirmed_action_projection_is_atomic_terminal_and_restart_recoverable() {
+    fn confirmation_store_rejects_session_request_or_turn_owner_mismatch_without_consumption() {
+        let root = temp_root("owner-mismatch");
+        let store = credential_store(&root);
+        let persistence =
+            AgentControlStore::open(&root, &store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let registry = PendingRegistry::with_persistence(Arc::new(persistence));
+        let (pending, token) = registry
+            .register_bound(backup_action(), "backup", 1_000, 60_000, owner())
+            .unwrap();
+
+        for component in ["session", "request", "turn"] {
+            let mut proof = owner_proof();
+            match component {
+                "session" => proof.session_id = "wrong-session".into(),
+                "request" => proof.turn_request_id = "019f0000-0000-4000-8000-000000000099".into(),
+                "turn" => proof.turn_id = "wrong-turn".into(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                registry.confirm(&pending.id, &token, &pending.action_hash, &proof, 2_000),
+                PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid)
+            );
+        }
+        assert_eq!(
+            registry.confirm(
+                &pending.id,
+                &token,
+                &pending.action_hash,
+                &owner_proof(),
+                2_001,
+            ),
+            PendingConfirmOutcome::Confirmed(Box::new(backup_action()))
+        );
+        drop(registry);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirmation_store_recomputes_persisted_action_hash_before_consumption() {
+        let root = temp_root("recomputed-hash");
+        let store = credential_store(&root);
+        let persistence =
+            Arc::new(AgentControlStore::open(&root, &store, INSTALLATION_PRINCIPAL, 1).unwrap());
+        let registry = PendingRegistry::with_persistence(persistence.clone());
+        let (pending, token) = registry
+            .register_bound(backup_action(), "backup", 1_000, 60_000, owner())
+            .unwrap();
+        let forged_hash = "b".repeat(64);
+        persistence
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE confirmation_intents SET action_hash=?1 WHERE intent_id=?2",
+                params![forged_hash, pending.id],
+            )
+            .unwrap();
+        assert_eq!(
+            registry.confirm(&pending.id, &token, &forged_hash, &owner_proof(), 2_000),
+            PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid)
+        );
+        persistence
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE confirmation_intents SET action_hash=?1 WHERE intent_id=?2",
+                params![pending.action_hash, pending.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            registry.confirm(
+                &pending.id,
+                &token,
+                &pending.action_hash,
+                &owner_proof(),
+                2_001,
+            ),
+            PendingConfirmOutcome::Confirmed(_)
+        ));
+        drop(registry);
+        drop(persistence);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirmation_store_rejects_action_account_row_mismatch() {
+        let root = temp_root("account-row-mismatch");
+        let store = credential_store(&root);
+        let persistence =
+            Arc::new(AgentControlStore::open(&root, &store, INSTALLATION_PRINCIPAL, 1).unwrap());
+        let registry = PendingRegistry::with_persistence(persistence.clone());
+        let (pending, token) = registry
+            .register_bound(backup_action(), "backup", 1_000, 60_000, owner())
+            .unwrap();
+        persistence
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE confirmation_intents SET account_id='other-account' WHERE intent_id=?1",
+                params![pending.id],
+            )
+            .unwrap();
+        assert_eq!(
+            registry.confirm(
+                &pending.id,
+                &token,
+                &pending.action_hash,
+                &owner_proof(),
+                2_000,
+            ),
+            PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid)
+        );
+        let state: String = persistence
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM confirmation_intents WHERE intent_id=?1",
+                params![pending.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "pending");
+        drop(registry);
+        drop(persistence);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirmation_store_rejects_read_or_reclassified_action_before_consumption() {
+        let root = temp_root("reclassified-action");
+        let store = credential_store(&root);
+        let persistence =
+            Arc::new(AgentControlStore::open(&root, &store, INSTALLATION_PRINCIPAL, 1).unwrap());
+        let registry = PendingRegistry::with_persistence(persistence.clone());
+        let (pending, token) = registry
+            .register_bound(backup_action(), "backup", 1_000, 60_000, owner())
+            .unwrap();
+        let original_sealed: Vec<u8> = persistence
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT sealed_payload FROM confirmation_intents WHERE intent_id=?1",
+                params![pending.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut secret = persistence
+            .decrypt_pending(&pending.id, &original_sealed)
+            .unwrap();
+        secret.action = parse_action(&json!({
+            "op": "read",
+            "account": "controlled",
+            "service": "mail",
+            "id": "private-item"
+        }))
+        .unwrap();
+        let reclassified = seal_row(
+            &persistence.row_wrap_key,
+            "agent-tool",
+            &pending.id,
+            &serde_json::to_vec(&secret).unwrap(),
+        )
+        .unwrap();
+        persistence
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE confirmation_intents SET sealed_payload=?1 WHERE intent_id=?2",
+                params![reclassified, pending.id],
+            )
+            .unwrap();
+        assert_eq!(
+            registry.confirm(
+                &pending.id,
+                &token,
+                &pending.action_hash,
+                &owner_proof(),
+                2_000,
+            ),
+            PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid)
+        );
+        persistence
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE confirmation_intents SET sealed_payload=?1 WHERE intent_id=?2",
+                params![original_sealed, pending.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            registry.confirm(
+                &pending.id,
+                &token,
+                &pending.action_hash,
+                &owner_proof(),
+                2_001,
+            ),
+            PendingConfirmOutcome::Confirmed(_)
+        ));
+        drop(registry);
+        drop(persistence);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirmation_store_owner_policy_failure_survives_restart_with_zero_effect() {
+        let root = temp_root("owner-policy-restart");
+        let store = credential_store(&root);
+        let persistence =
+            AgentControlStore::open(&root, &store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let registry = PendingRegistry::with_persistence(Arc::new(persistence));
+        let (pending, token) = registry
+            .register_bound(backup_action(), "backup", 1_000, 60_000, owner())
+            .unwrap();
+        let mut wrong_owner = owner_proof();
+        wrong_owner.turn_id = "wrong-turn".into();
+        assert_eq!(
+            registry.confirm(
+                &pending.id,
+                &token,
+                &pending.action_hash,
+                &wrong_owner,
+                2_000,
+            ),
+            PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid)
+        );
+        drop(registry);
+
+        let persistence =
+            Arc::new(AgentControlStore::open(&root, &store, INSTALLATION_PRINCIPAL, 1).unwrap());
+        assert!(persistence
+            .pending_confirm_projections(8)
+            .unwrap()
+            .is_empty());
+        let registry = PendingRegistry::with_persistence(persistence);
+        assert_eq!(
+            registry.confirm(
+                &pending.id,
+                &token,
+                &pending.action_hash,
+                &owner_proof(),
+                2_001,
+            ),
+            PendingConfirmOutcome::Confirmed(Box::new(backup_action()))
+        );
+        drop(registry);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirmation_store_valid_pre_642_v1_row_confirms_under_new_owner_checks() {
+        let root = temp_root("pre-642-valid");
+        let store = credential_store(&root);
+        let control = AgentControlStore::open(&root, &store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let pending_id = "pre-642-valid-pending";
+        let token = "pre-642-valid-token";
+        let (action, action_hash) =
+            insert_pre_642_pending_fixture(&control, pending_id, token, &owner());
+        drop(control);
+
+        let reopened = AgentControlStore::open(&root, &store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let registry = PendingRegistry::with_persistence(Arc::new(reopened));
+        assert_eq!(
+            registry.confirm(pending_id, token, &action_hash, &owner_proof(), 2_000),
+            PendingConfirmOutcome::Confirmed(Box::new(action))
+        );
+        drop(registry);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirmation_store_incomplete_legacy_owner_fails_closed_and_remains_cancellable() {
+        let root = temp_root("pre-642-incomplete-owner");
+        let store = credential_store(&root);
+        let control = AgentControlStore::open(&root, &store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let pending_id = "pre-642-incomplete-pending";
+        let token = "pre-642-incomplete-token";
+        let (_, action_hash) =
+            insert_pre_642_pending_fixture(&control, pending_id, token, &owner());
+        control
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE confirmation_intents SET turn_id='' WHERE intent_id=?1",
+                params![pending_id],
+            )
+            .unwrap();
+        drop(control);
+
+        let reopened = AgentControlStore::open(&root, &store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let registry = PendingRegistry::with_persistence(Arc::new(reopened));
+        assert_eq!(
+            registry.confirm(pending_id, token, &action_hash, &owner_proof(), 2_000),
+            PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid)
+        );
+        let cancelled = registry.cancel(pending_id, &action_hash, 2_001).unwrap();
+        assert!(cancelled.turn_id.is_empty());
+        assert_eq!(
+            registry.confirm(pending_id, token, &action_hash, &owner_proof(), 2_002),
+            PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Cancelled)
+        );
+        drop(registry);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirmation_store_cancel_confirm_race_has_one_terminal_winner() {
+        use std::sync::Barrier;
+
+        let root = temp_root("cancel-confirm-race");
+        let store = credential_store(&root);
+        let persistence =
+            AgentControlStore::open(&root, &store, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let registry = Arc::new(PendingRegistry::with_persistence(Arc::new(persistence)));
+        let (pending, token) = registry
+            .register_bound(backup_action(), "backup", 1_000, 60_000, owner())
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let confirm_registry = registry.clone();
+        let confirm_barrier = barrier.clone();
+        let confirm_pending = pending.clone();
+        let confirm_token = token.clone();
+        let confirm = std::thread::spawn(move || {
+            confirm_barrier.wait();
+            confirm_registry.confirm(
+                &confirm_pending.id,
+                &confirm_token,
+                &confirm_pending.action_hash,
+                &owner_proof(),
+                2_000,
+            )
+        });
+        let cancel_registry = registry.clone();
+        let cancel_barrier = barrier.clone();
+        let cancel_pending = pending.clone();
+        let cancel = std::thread::spawn(move || {
+            cancel_barrier.wait();
+            cancel_registry.cancel(&cancel_pending.id, &cancel_pending.action_hash, 2_000)
+        });
+        barrier.wait();
+        let confirm = confirm.join().unwrap();
+        let cancel = cancel.join().unwrap();
+        assert_ne!(
+            matches!(confirm, PendingConfirmOutcome::Confirmed(_)),
+            cancel.is_ok()
+        );
+        assert!(matches!(
+            confirm,
+            PendingConfirmOutcome::Confirmed(_)
+                | PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Cancelled)
+                | PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Replayed)
+        ));
+        drop(registry);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_confirm_crash_after_consume_remains_outcome_unknown_without_reexecution() {
         let root = temp_root("confirm-projection");
         let credential_store = credential_store(&root);
         let persistence = Arc::new(
@@ -8567,9 +9136,16 @@ mod tests {
                 expected_owner.clone(),
             )
             .unwrap();
-        registry
-            .confirm(&pending.id, &token, &pending.action_hash, 2_000)
-            .unwrap();
+        assert!(matches!(
+            registry.confirm(
+                &pending.id,
+                &token,
+                &pending.action_hash,
+                &owner_proof(),
+                2_000,
+            ),
+            PendingConfirmOutcome::Confirmed(_)
+        ));
         assert!(persistence
             .pending_confirm_projections(8)
             .unwrap()
@@ -8609,9 +9185,16 @@ mod tests {
         let (pending, token) = registry
             .register_bound(backup_action(), "backup", 3_000, 60_000, owner())
             .unwrap();
-        registry
-            .confirm(&pending.id, &token, &pending.action_hash, 3_001)
-            .unwrap();
+        assert!(matches!(
+            registry.confirm(
+                &pending.id,
+                &token,
+                &pending.action_hash,
+                &owner_proof(),
+                3_001,
+            ),
+            PendingConfirmOutcome::Confirmed(_)
+        ));
         drop(registry);
         drop(persistence);
 
@@ -8653,8 +9236,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            registry.confirm(&pending.id, &token, &pending.action_hash, 2_000),
-            Err(ConfirmError::Unavailable)
+            registry.confirm(
+                &pending.id,
+                &token,
+                &pending.action_hash,
+                &owner_proof(),
+                2_000,
+            ),
+            PendingConfirmOutcome::RetainedRetryable
         );
         persistence
             .connection
@@ -8663,10 +9252,14 @@ mod tests {
             .execute_batch("DROP TRIGGER fail_confirm_projection")
             .unwrap();
         assert_eq!(
-            registry
-                .confirm(&pending.id, &token, &pending.action_hash, 2_001)
-                .unwrap(),
-            backup_action()
+            registry.confirm(
+                &pending.id,
+                &token,
+                &pending.action_hash,
+                &owner_proof(),
+                2_001,
+            ),
+            PendingConfirmOutcome::Confirmed(Box::new(backup_action()))
         );
         drop(registry);
         drop(persistence);
@@ -8685,9 +9278,16 @@ mod tests {
         let (confirmed, token) = registry
             .register_bound(backup_action(), "backup", 1_000, 60_000, owner())
             .unwrap();
-        registry
-            .confirm(&confirmed.id, &token, &confirmed.action_hash, 2_000)
-            .unwrap();
+        assert!(matches!(
+            registry.confirm(
+                &confirmed.id,
+                &token,
+                &confirmed.action_hash,
+                &owner_proof(),
+                2_000,
+            ),
+            PendingConfirmOutcome::Confirmed(_)
+        ));
         persistence
             .finish_pending_confirmation(&confirmed.id, "completed", 2_001)
             .unwrap();
@@ -8743,7 +9343,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_replay_after_restart_rotates_token_for_exact_owner() {
+    fn replayed_pending_rotates_token_but_preserves_exact_owner_and_action_hash() {
         let root = temp_root("pending-replay-restart");
         let store = credential_store(&root);
         let persistence =
@@ -8772,14 +9372,24 @@ mod tests {
         assert_eq!(reissued.action_hash, pending.action_hash);
         assert_ne!(new_token, old_token);
         assert_eq!(
-            registry.confirm(&pending.id, &old_token, &pending.action_hash, 2_001),
-            Err(ConfirmError::BadToken)
+            registry.confirm(
+                &pending.id,
+                &old_token,
+                &pending.action_hash,
+                &owner_proof(),
+                2_001,
+            ),
+            PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Invalid)
         );
         assert_eq!(
-            registry
-                .confirm(&pending.id, &new_token, &pending.action_hash, 2_002)
-                .unwrap(),
-            backup_action()
+            registry.confirm(
+                &pending.id,
+                &new_token,
+                &pending.action_hash,
+                &owner_proof(),
+                2_002,
+            ),
+            PendingConfirmOutcome::Confirmed(Box::new(backup_action()))
         );
         drop(registry);
         std::fs::remove_dir_all(root).unwrap();
@@ -8798,7 +9408,7 @@ mod tests {
         assert!(matches!(
             registry.register_bound(backup_action(), "second", 1_001, 60_000, owner()),
             Err(isyncyou_agent::AgentError::Provider(code))
-                if code == "confirmation_unavailable"
+                if code == "pending_registration_conflict"
         ));
         drop(registry);
         std::fs::remove_dir_all(root).unwrap();
@@ -9047,8 +9657,14 @@ mod tests {
             .unwrap();
         assert_eq!(persistence.reap_expired(61_000, 16).unwrap(), 1);
         assert_eq!(
-            registry.confirm(&pending.id, &token, &pending.action_hash, 61_000),
-            Err(ConfirmError::NotFound)
+            registry.confirm(
+                &pending.id,
+                &token,
+                &pending.action_hash,
+                &owner_proof(),
+                61_000,
+            ),
+            PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Expired)
         );
         let connection = persistence.connection.lock().unwrap();
         let (state, payload, bytes): (String, Option<Vec<u8>>, i64) = connection
@@ -9135,12 +9751,18 @@ mod tests {
         assert_eq!(first, expected_owner);
         assert_eq!(retry, expected_owner);
         assert_eq!(
-            registry.confirm(&pending.id, &token, &pending.action_hash, 2_001),
-            Err(ConfirmError::NotFound)
+            registry.confirm(
+                &pending.id,
+                &token,
+                &pending.action_hash,
+                &owner_proof(),
+                2_001,
+            ),
+            PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Cancelled)
         );
         assert_eq!(
-            registry.binding(&pending.id, &pending.action_hash, 2_001),
-            Err(ConfirmError::NotFound)
+            registry.binding(&pending.id, &pending.action_hash, &owner_proof(), 2_001,),
+            PendingBindingOutcome::Rejected(ClosedConfirmationCode::Cancelled)
         );
 
         let connection = persistence.connection.lock().unwrap();
@@ -9207,10 +9829,14 @@ mod tests {
             .execute_batch("DROP TRIGGER fail_cancel_projection")
             .unwrap();
         assert_eq!(
-            registry
-                .confirm(&pending.id, &token, &pending.action_hash, 2_001)
-                .unwrap(),
-            backup_action()
+            registry.confirm(
+                &pending.id,
+                &token,
+                &pending.action_hash,
+                &owner_proof(),
+                2_001,
+            ),
+            PendingConfirmOutcome::Confirmed(Box::new(backup_action()))
         );
 
         drop(registry);
@@ -12002,7 +12628,7 @@ mod tests {
         );
         let registry = isyncyou_agent::PendingRegistry::with_persistence(store.clone());
         let owner = PendingOwnerBinding {
-            account: "me".into(),
+            account: "controlled".into(),
             session_id: "session".into(),
             request_id: "request".into(),
             turn_id: "turn".into(),

@@ -42,6 +42,8 @@ pub enum StoreError {
     InvalidMobileJob(String),
     #[error("invalid progressive search: {0}")]
     InvalidProgressiveSearch(String),
+    #[error("provider object exceeds the permitted page size")]
+    ProviderObjectTooLarge,
 }
 
 impl StoreError {
@@ -95,7 +97,10 @@ fn bounded_fts_snippet(value: String) -> String {
 }
 
 /// Current schema version. Bump + add a migration step when the schema changes.
-pub const SCHEMA_VERSION: i64 = 16;
+pub const SCHEMA_VERSION: i64 = 17;
+
+mod provider;
+pub use provider::{ProviderCapture, ProviderChange, ProviderCollectionSnapshot, ProviderEvent, ProviderExportSnapshot, ProviderObject, ProviderScope, ProviderSubmission};
 
 pub const STORE_KEY_ENV: &str = "ISYNCYOU_STORE_KEY";
 pub const STORE_KEY_FILE_ENV: &str = "ISYNCYOU_STORE_KEY_FILE";
@@ -737,6 +742,7 @@ pub struct MobileJob {
 pub struct Store {
     conn: Connection,
     _lock: Option<File>,
+    protected: bool,
 }
 
 impl Store {
@@ -782,6 +788,7 @@ impl Store {
         Ok(Store {
             conn,
             _lock: Some(lock),
+            protected: true,
         })
     }
 
@@ -793,6 +800,7 @@ impl Store {
         Ok(Store {
             conn,
             _lock: Some(lock),
+            protected: false,
         })
     }
 
@@ -825,12 +833,28 @@ impl Store {
         }
         let conn = Connection::open_with_flags(path, flags)?;
         #[cfg(feature = "encrypted-store")]
+        let protected = secret.is_some();
+        #[cfg(feature = "encrypted-store")]
         if let Some(secret) = secret {
             apply_sqlcipher_key(&conn, &secret)?;
             let _: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         }
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        Ok(Store { conn, _lock: None })
+        #[cfg(not(feature = "encrypted-store"))]
+        let protected = false;
+        Ok(Store { conn, _lock: None, protected })
+    }
+
+    /// Open an existing encrypted provider store for concurrent reads without
+    /// creating a database or acquiring the writer lock.
+    #[cfg(feature = "encrypted-store")]
+    pub fn open_readonly_encrypted(path: impl AsRef<Path>, secret: &[u8]) -> Result<Self> {
+        if secret.is_empty() { return Err(StoreError::InvalidStoreSecret("secret must not be empty".into())); }
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        apply_sqlcipher_key(&conn,secret)?;
+        let _: i64 = conn.query_row("PRAGMA user_version",[],|r| r.get(0))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Store { conn, _lock:None, protected:true })
     }
 
     /// In-memory store for tests (no lock, no WAL).
@@ -838,8 +862,11 @@ impl Store {
         let conn = Connection::open_in_memory()?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&conn)?;
-        Ok(Store { conn, _lock: None })
+        Ok(Store { conn, _lock: None, protected: true })
     }
+
+    /// Whether this store uses encrypted persistence or exists only in memory.
+    pub fn protected_provider_storage(&self) -> bool { self.protected }
 
     /// Consume this read handle and begin one consistent progressive-search snapshot.
     ///
@@ -3045,6 +3072,9 @@ fn migrate(conn: &Connection) -> Result<()> {
     if v < 16 {
         conn.execute_batch(MIGRATION_V16)?;
     }
+    if v < 17 {
+        conn.execute_batch(provider::MIGRATION)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -3054,6 +3084,40 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[cfg(feature = "encrypted-store")]
+    #[test]
+    fn encrypted_provider_readonly_requires_existing_database_and_correct_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.db");
+        assert!(Store::open_readonly_encrypted(&missing,b"secret").is_err());
+        assert!(!missing.exists());
+        let path = dir.path().join("provider.db");
+        let writer = Store::open_encrypted(&path,b"secret").unwrap();
+        writer.upsert_item(&Item::new("a","mail","m","subject","message")).unwrap();
+        let reader = Store::open_readonly_encrypted(&path,b"secret").unwrap();
+        assert_eq!(reader.get_item("a","mail","m").unwrap().unwrap().name,"subject");
+        assert!(Store::open_readonly_encrypted(&path,b"wrong").is_err());
+    }
+
+    #[cfg(feature = "encrypted-store")]
+    #[test]
+    fn abandoned_provider_staging_preserves_observed_versions_and_published_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider.db");
+        let scope = ProviderScope { account_id:"a".into(),origin:"https://example.test".into(),service:"contacts".into(),collection:"c".into() };
+        let writer = Store::open_encrypted(&path,b"secret").unwrap();
+        writer.apply_provider_page(&scope,&[],"original").unwrap();
+        writer.begin_provider_staging(&scope,"abandoned").unwrap();
+        writer.stage_provider_objects(&scope,"abandoned",&[ProviderObject {remote_id:"id".into(),etag:None,raw:b"observed".to_vec()}]).unwrap();
+        drop(writer);
+        let recovered = Store::open_encrypted(&path,b"secret").unwrap();
+        recovered.recover_abandoned_provider_staging().unwrap();
+        assert_eq!(recovered.provider_cursor(&scope).unwrap().as_deref(),Some("original"));
+        assert!(recovered.provider_objects(&scope).unwrap().is_empty());
+        assert_eq!(recovered.provider_captures_for("a","https://example.test",0,10).unwrap()[0].object.raw,b"observed");
+        assert!(recovered.finish_provider_staging(&scope,"abandoned","new").is_err());
+    }
 
     fn item(acc: &str, id: &str, name: &str) -> Item {
         Item::new(acc, "onedrive", id, name, "file")

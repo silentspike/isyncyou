@@ -49,9 +49,9 @@ object NativeEngine {
 
     /**
      * Open a bridge push stream (the SSE replacement, #0A) for [path], gated by
-     * [sessionToken]. Returns a stream id (>0), or 0 if unknown/unauthorized/not started.
+     * [sessionToken]. Agent streams additionally require [capabilityToken].
      */
-    external fun nativeStreamOpen(path: String, sessionToken: String): Long
+    external fun nativeStreamOpen(path: String, sessionToken: String, capabilityToken: String): Long
 
     /**
      * Block for the next event on stream [id] (a JSON `{event,data}` object), or "" when the
@@ -76,6 +76,20 @@ object NativeEngine {
      * 1 on success, 0 on a bad key length or native install failure.
      */
     external fun nativeSetAgentCredentialKey(key: ByteArray): Int
+
+    /** Native-owned PKCE attempt; the returned URL must only be opened by Android. */
+    external fun nativeProviderBegin(filesDir: String, account: String, redirect: String): String
+    external fun nativeProviderFinish(filesDir: String, callback: String): Int
+    external fun nativeProviderStatus(filesDir: String, account: String): Int
+    external fun nativeProviderLogout(filesDir: String, account: String): Int
+    external fun nativeProviderCancel()
+    external fun nativeWakeProviderRefresh()
+    /** Wait for a completed provider pass; partial errors and timeout return zero. */
+    external fun nativeWaitProviderRefresh(): Int
+
+    /** Native-only push broker response may contain short-lived distributor credentials. */
+    external fun nativeProviderBroker(filesDir: String, account: String, operation: String, request: String): String
+    external fun nativeProviderPush(filesDir: String, account: String, operation: String, request: String): String
 
     /**
      * #619 evidence hook: available only when the Rust library is built with

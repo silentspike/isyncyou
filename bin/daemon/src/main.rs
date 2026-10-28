@@ -664,19 +664,21 @@ fn sync_loop(
             // Keep the per-service archive fresh too (live client, #563 AC-5): an
             // incremental mail pass so new cloud mail lands in the store and the
             // SSE notify below surfaces it without a manual reload.
-            match isyncyou_app_host::run_backup_account(&cfg, &acc.id, &gate, &[]) {
-                Ok(run) => {
-                    eprintln!("isyncyoud: backup {} -> {}", acc.id, run.summary);
-                    // Push (#576): notify the phone when new content was archived. The
-                    // FCM token must have been registered by the UI; otherwise no-op.
-                    if let Some(body) = run.delta.notification() {
-                        let n = push.notify("iSyncYou — backup complete", &body);
-                        if n > 0 {
-                            eprintln!("isyncyoud: push '{body}' sent to {n} device(s)");
+            if !cfg.provider_accounts.contains_key(&acc.id) {
+                match isyncyou_app_host::run_backup_account(&cfg, &acc.id, &gate, &[]) {
+                    Ok(run) => {
+                        eprintln!("isyncyoud: backup {} -> {}", acc.id, run.summary);
+                        // Push (#576): notify the phone when new content was archived. The
+                        // FCM token must have been registered by the UI; otherwise no-op.
+                        if let Some(body) = run.delta.notification() {
+                            let n = push.notify("iSyncYou — backup complete", &body);
+                            if n > 0 {
+                                eprintln!("isyncyoud: push '{body}' sent to {n} device(s)");
+                            }
                         }
                     }
+                    Err(e) => eprintln!("isyncyoud: backup {} skipped: {e}", acc.id),
                 }
-                Err(e) => eprintln!("isyncyoud: backup {} skipped: {e}", acc.id),
             }
         }
         // wake SSE subscribers so the UI refetches the active view (near-real-time)
@@ -736,14 +738,36 @@ fn sync_account(
     host: &str,
 ) -> Result<String, String> {
     let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
-    let token = isyncyou_engine::auth::resolve_cached_sync_token(cfg, account)?;
     let store_path = cfg
         .accounts
         .iter()
         .find(|a| a.id == account)
         .map(|a| a.archive_root.join(".isyncyou-store.db"))
         .ok_or_else(|| format!("no account '{account}'"))?;
+    if cfg.provider_accounts.contains_key(account) {
+        let store = isyncyou_engine::provider_store::open(cfg, account)?;
+        let started = unix_now();
+        let result = isyncyou_engine::self_hosted_mail::client(cfg, account).and_then(|client| {
+            isyncyou_engine::self_hosted_mail::sync(cfg, account, &store, &client)
+        });
+        let finished = unix_now();
+        let (status, summary) = match &result {
+            Ok(count) => (
+                "ok",
+                format!("Provider mail synchronization: {count} changes"),
+            ),
+            Err(_) => ("error", "Provider mail synchronization failed".to_string()),
+        };
+        if store
+            .add_run(account, "sync", &started, &finished, status, &summary)
+            .is_err()
+        {
+            eprintln!("isyncyoud: could not record provider sync run");
+        }
+        return result.map(|_| summary);
+    }
     let store = Store::open(store_path).map_err(|e| e.to_string())?;
+    let token = isyncyou_engine::auth::resolve_cached_sync_token(cfg, account)?;
     let mut client = isyncyou_graph::GraphClient::new(token);
     let mut map = MappingTable::new();
     let started = unix_now();
@@ -777,6 +801,12 @@ fn token_keepalive_loop(cfg: Config, secs: u64) {
         std::thread::sleep(Duration::from_secs(secs));
         let mut refreshed = 0usize;
         for acc in &cfg.accounts {
+            if cfg.provider_accounts.contains_key(&acc.id) {
+                if isyncyou_engine::provider_auth::self_hosted_access_token(&cfg, &acc.id).is_ok() {
+                    refreshed += 1;
+                }
+                continue;
+            }
             match isyncyou_engine::auth::resolve_cached_read_token(&cfg, &acc.id) {
                 Ok(_) => refreshed += 1,
                 Err(e) => {
