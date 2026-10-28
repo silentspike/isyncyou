@@ -16551,7 +16551,7 @@ pub fn build_live_router(
             mint_cap_token(),
         )
         .with_events(events);
-    with_mutation_intents_if_available(router, &agent, cfg)
+    with_mutation_intents_if_available(router, &agent, cfg, config_path)
 }
 
 #[cfg(any(
@@ -16562,6 +16562,7 @@ fn with_mutation_intents_if_available(
     router: isyncyou_webui::Router,
     agent: &Arc<DaemonAgent>,
     cfg: Config,
+    config_path: PathBuf,
 ) -> isyncyou_webui::Router {
     match agent.shared_control_store() {
         Some(store) => router
@@ -16590,6 +16591,7 @@ fn with_mutation_intents_if_available(
     router: isyncyou_webui::Router,
     _agent: &Arc<DaemonAgent>,
     _cfg: Config,
+    _config_path: PathBuf,
 ) -> isyncyou_webui::Router {
     router
 }
