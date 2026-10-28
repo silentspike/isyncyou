@@ -351,7 +351,7 @@ pub fn revoke_quarantined_grant_with_store(cfg:&Config, account_id:&str, recover
     let mut map=load_quarantine(store,account_id,&origin)?;
     let token = map.get(recovery_id).ok_or("Quarantined grant not found")?;
     let (_,_,endpoint) = metadata(&origin)?;
-    let response = client()?.post(endpoint).form(&[("token",token),("token_type_hint","refresh_token"),("client_id",&client_id)]).send().map_err(|_| "Grant revocation unconfirmed")?;
+    let response = client()?.post(endpoint).form(&[("token",token.as_str()),("token_type_hint","refresh_token"),("client_id",client_id.as_str())]).send().map_err(|_| "Grant revocation unconfirmed")?;
     if !response.status().is_success() { return Err("Grant revocation unconfirmed".into()); }
     map.remove(recovery_id);
     save_quarantine(store,account_id,&origin,&map)
