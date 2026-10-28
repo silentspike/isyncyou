@@ -61,6 +61,49 @@ CREATE TABLE provider_stage_objects (
 );
 "#;
 
+pub(super) const MIGRATION_V18: &str = r#"
+ALTER TABLE provider_mutations ADD COLUMN target_id TEXT;
+CREATE UNIQUE INDEX provider_mutation_target_unknown ON provider_mutations(account_id,origin,service,remote_account,target_id) WHERE state='unknown' AND target_id IS NOT NULL;
+CREATE TABLE provider_dav_index (
+ account_id TEXT NOT NULL, origin TEXT NOT NULL, service TEXT NOT NULL,
+ collection TEXT NOT NULL, remote_id TEXT NOT NULL,
+ valid INTEGER NOT NULL, uid TEXT, kind TEXT, parent_uid TEXT,
+ PRIMARY KEY(account_id,origin,service,collection,remote_id)
+);
+CREATE INDEX provider_dav_uid ON provider_dav_index(account_id,origin,service,collection,uid);
+CREATE TABLE provider_stage_dav_index (
+ account_id TEXT NOT NULL, origin TEXT NOT NULL, service TEXT NOT NULL,
+ collection TEXT NOT NULL, generation TEXT NOT NULL, remote_id TEXT NOT NULL,
+ valid INTEGER NOT NULL, uid TEXT, kind TEXT, parent_uid TEXT,
+ PRIMARY KEY(account_id,origin,service,collection,generation,remote_id)
+);
+CREATE TABLE provider_sessions (
+ account_id TEXT NOT NULL, origin TEXT NOT NULL, session_id TEXT NOT NULL,
+ version INTEGER NOT NULL, manifest BLOB NOT NULL, object_bytes INTEGER NOT NULL DEFAULT 0, object_count INTEGER NOT NULL DEFAULT 0,
+ PRIMARY KEY(account_id,origin,session_id)
+);
+CREATE TABLE provider_session_quotas (
+ account_id TEXT NOT NULL, origin TEXT NOT NULL, total_bytes INTEGER NOT NULL DEFAULT 0,
+ session_count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(account_id,origin)
+);
+CREATE TABLE provider_session_objects (
+ account_id TEXT NOT NULL, origin TEXT NOT NULL, session_id TEXT NOT NULL,
+ class TEXT NOT NULL, object_id TEXT NOT NULL, payload BLOB NOT NULL,
+ PRIMARY KEY(account_id,origin,session_id,class,object_id)
+);
+CREATE TABLE provider_alarm_claims (
+ account_id TEXT NOT NULL, origin TEXT NOT NULL, service TEXT NOT NULL, collection TEXT NOT NULL,
+ uid TEXT NOT NULL, recurrence_id TEXT NOT NULL, alarm_id TEXT NOT NULL, trigger_at TEXT NOT NULL,
+ state TEXT NOT NULL,
+ PRIMARY KEY(account_id,origin,service,collection,uid,recurrence_id,alarm_id,trigger_at)
+);
+CREATE INDEX provider_alarm_pending ON provider_alarm_claims(account_id,origin,service,collection,state,trigger_at);
+CREATE TABLE provider_alarm_quotas (
+ account_id TEXT NOT NULL, origin TEXT NOT NULL, claim_count INTEGER NOT NULL DEFAULT 0,
+ PRIMARY KEY(account_id,origin)
+);
+"#;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderScope {
     pub account_id: String,
@@ -74,6 +117,26 @@ pub struct ProviderObject {
     pub remote_id: String,
     pub etag: Option<String>,
     pub raw: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderDavIndex {
+    Valid { uid:String, kind:String, parent_uid:Option<String> },
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderDavIndexEntry {
+    pub remote_id: String,
+    pub index: ProviderDavIndex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderAlarmIdentity {
+    pub uid:String,
+    pub recurrence_id:String,
+    pub alarm_id:String,
+    pub trigger_at:String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +196,153 @@ pub enum ProviderChange {
 }
 
 impl Store {
+    /// Claim one target while any prior effect on it is unresolved.
+    pub fn claim_provider_target_mutation(&self, scope:&ProviderScope, operation:&str, kind:&str, target_id:&str, intent:&str, digest:&str) -> Result<bool> {
+        if !self.protected_provider_storage() { return Err(StoreError::MissingStoreKey); }
+        if target_id.is_empty() { return Err(StoreError::IllegalTransition("empty mutation target".into())); }
+        Ok(self.conn.execute("INSERT OR IGNORE INTO provider_mutations(account_id,origin,service,remote_account,operation_id,kind,intent_json,intent_digest,state,target_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'unknown',?9)",params![scope.account_id,scope.origin,scope.service,scope.collection,operation,kind,intent,digest,target_id])? == 1)
+    }
+    /// Persist before alarm dispatch. Existing pending claims must be recovered
+    /// using an idempotent platform notification identity, never blindly replayed.
+    pub fn claim_provider_alarm(&self, scope:&ProviderScope, alarm:&ProviderAlarmIdentity) -> Result<bool> {
+        if !self.protected_provider_storage() { return Err(StoreError::MissingStoreKey); }
+        if scope.service != "calendar" || alarm.uid.is_empty() || alarm.alarm_id.is_empty() || alarm.trigger_at.is_empty() || [alarm.uid.len(),alarm.recurrence_id.len(),alarm.alarm_id.len(),alarm.trigger_at.len()].into_iter().any(|length| length > 4096) { return Err(StoreError::IllegalTransition("invalid alarm identity".into())); }
+        let tx = self.conn.unchecked_transaction()?;
+        let inserted = tx.execute("INSERT OR IGNORE INTO provider_alarm_claims(account_id,origin,service,collection,uid,recurrence_id,alarm_id,trigger_at,state) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'pending')",params![scope.account_id,scope.origin,scope.service,scope.collection,alarm.uid,alarm.recurrence_id,alarm.alarm_id,alarm.trigger_at])? == 1;
+        if inserted {
+            tx.execute("INSERT OR IGNORE INTO provider_alarm_quotas(account_id,origin) VALUES (?1,?2)",params![scope.account_id,scope.origin])?;
+            if tx.execute("UPDATE provider_alarm_quotas SET claim_count=claim_count+1 WHERE account_id=?1 AND origin=?2 AND claim_count<100000",params![scope.account_id,scope.origin])? != 1 { return Err(StoreError::ProviderObjectTooLarge); }
+        }
+        tx.commit()?; Ok(inserted)
+    }
+
+    pub fn finish_provider_alarm(&self, scope:&ProviderScope, alarm:&ProviderAlarmIdentity) -> Result<bool> {
+        if !self.protected_provider_storage() { return Err(StoreError::MissingStoreKey); }
+        Ok(self.conn.execute("UPDATE provider_alarm_claims SET state='delivered' WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND uid=?5 AND recurrence_id=?6 AND alarm_id=?7 AND trigger_at=?8 AND state='pending'",params![scope.account_id,scope.origin,scope.service,scope.collection,alarm.uid,alarm.recurrence_id,alarm.alarm_id,alarm.trigger_at])? == 1)
+    }
+
+    pub fn pending_provider_alarms(&self, scope:&ProviderScope, limit:usize) -> Result<Vec<ProviderAlarmIdentity>> {
+        if !self.protected_provider_storage() { return Err(StoreError::MissingStoreKey); }
+        let mut stmt=self.conn.prepare("SELECT uid,recurrence_id,alarm_id,trigger_at FROM provider_alarm_claims WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND state='pending' ORDER BY trigger_at,uid LIMIT ?5")?;
+        let rows=stmt.query_map(params![scope.account_id,scope.origin,scope.service,scope.collection,limit.min(200) as i64],|r| Ok(ProviderAlarmIdentity {uid:r.get(0)?,recurrence_id:r.get(1)?,alarm_id:r.get(2)?,trigger_at:r.get(3)?}))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>,_>>()?)
+    }
+    /// Detect any persisted provider state before binding an unverified identity.
+    pub fn provider_contains_data(&self) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_objects UNION ALL SELECT 1 FROM provider_capture_outbox UNION ALL SELECT 1 FROM provider_stage_objects UNION ALL SELECT 1 FROM provider_submissions UNION ALL SELECT 1 FROM provider_mutations UNION ALL SELECT 1 FROM provider_sessions LIMIT 1)",[],|r| r.get(0))?)
+    }
+    /// Create a sealed local session manifest; an existing session is never overwritten.
+    pub fn local_session_create(&self, scope:&ProviderScope, session:&str, manifest:&[u8]) -> Result<bool> {
+        if !self.protected_provider_storage() { return Err(StoreError::MissingStoreKey); }
+        validate_session(scope,session)?;
+        if manifest.is_empty() || manifest.len() > 96 * 1024 { return Err(StoreError::ProviderObjectTooLarge); }
+        let tx = self.conn.unchecked_transaction()?;
+        let inserted = tx.execute("INSERT OR IGNORE INTO provider_sessions(account_id,origin,session_id,version,manifest) VALUES (?1,?2,?3,1,?4)",params![scope.account_id,scope.origin,session,manifest])? == 1;
+        if inserted {
+            tx.execute("INSERT OR IGNORE INTO provider_session_quotas(account_id,origin) VALUES (?1,?2)",params![scope.account_id,scope.origin])?;
+            if tx.execute("UPDATE provider_session_quotas SET session_count=session_count+1 WHERE account_id=?1 AND origin=?2 AND session_count<100",params![scope.account_id,scope.origin])? != 1 { return Err(StoreError::ProviderObjectTooLarge); }
+        }
+        if !inserted {
+            let existing:Vec<u8> = tx.query_row("SELECT manifest FROM provider_sessions WHERE account_id=?1 AND origin=?2 AND session_id=?3",params![scope.account_id,scope.origin,session],|r| r.get(0))?;
+            if existing != manifest { return Err(StoreError::IllegalTransition("session already exists".into())); }
+        }
+        tx.commit()?; Ok(inserted)
+    }
+
+    pub fn local_session_manifest(&self, scope:&ProviderScope, session:&str) -> Result<Option<(String,Vec<u8>)>> {
+        if !self.protected_provider_storage() { return Err(StoreError::MissingStoreKey); }
+        validate_session(scope,session)?;
+        Ok(self.conn.query_row("SELECT version,manifest FROM provider_sessions WHERE account_id=?1 AND origin=?2 AND session_id=?3",params![scope.account_id,scope.origin,session],|r| Ok((r.get::<_,i64>(0)?.to_string(),r.get(1)?))).optional()?)
+    }
+
+    /// Compare-and-swap against a monotonically increasing etag (no ABA).
+    pub fn local_session_cas(&self, scope:&ProviderScope, session:&str, expected_etag:&str, new_manifest:&[u8]) -> Result<Option<String>> {
+        if !self.protected_provider_storage() { return Err(StoreError::MissingStoreKey); }
+        validate_session(scope,session)?;
+        if new_manifest.is_empty() || new_manifest.len() > 96 * 1024 { return Err(StoreError::ProviderObjectTooLarge); }
+        let version:i64 = expected_etag.parse().map_err(|_| StoreError::IllegalTransition("invalid session etag".into()))?;
+        if expected_etag != version.to_string() { return Err(StoreError::IllegalTransition("invalid session etag".into())); }
+        let next = version.checked_add(1).filter(|_| version>0).ok_or_else(|| StoreError::IllegalTransition("invalid session etag".into()))?;
+        let changed = self.conn.execute("UPDATE provider_sessions SET version=?5,manifest=?6 WHERE account_id=?1 AND origin=?2 AND session_id=?3 AND version=?4",params![scope.account_id,scope.origin,session,version,next,new_manifest])?;
+        Ok((changed == 1).then(|| next.to_string()))
+    }
+
+    /// Immutable insert is idempotent only for byte-identical payloads.
+    pub fn local_session_stage(&self, scope:&ProviderScope, session:&str, class:&str, id:&str, bytes:&[u8]) -> Result<()> {
+        if !self.protected_provider_storage() { return Err(StoreError::MissingStoreKey); }
+        validate_session(scope,session)?;
+        if class.is_empty() || class.len()>128 || id.is_empty() || id.len()>256 { return Err(StoreError::IllegalTransition("invalid session object identity".into())); }
+        if bytes.is_empty() || bytes.len() > 5 * 1024 * 1024 { return Err(StoreError::ProviderObjectTooLarge); }
+        let tx = self.conn.unchecked_transaction()?;
+        let exists:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_sessions WHERE account_id=?1 AND origin=?2 AND session_id=?3)",params![scope.account_id,scope.origin,session],|r| r.get(0))?;
+        if !exists { return Err(StoreError::IllegalTransition("session missing".into())); }
+        let inserted = tx.execute("INSERT OR IGNORE INTO provider_session_objects(account_id,origin,session_id,class,object_id,payload) VALUES (?1,?2,?3,?4,?5,?6)",params![scope.account_id,scope.origin,session,class,id,bytes])? == 1;
+        if inserted {
+            if tx.execute("UPDATE provider_sessions SET object_bytes=object_bytes+?4,object_count=object_count+1 WHERE account_id=?1 AND origin=?2 AND session_id=?3 AND object_bytes+?4<=134217728 AND object_count<20000",params![scope.account_id,scope.origin,session,bytes.len() as i64])? != 1 { return Err(StoreError::ProviderObjectTooLarge); }
+            if tx.execute("UPDATE provider_session_quotas SET total_bytes=total_bytes+?3 WHERE account_id=?1 AND origin=?2 AND total_bytes+?3<=1073741824",params![scope.account_id,scope.origin,bytes.len() as i64])? != 1 { return Err(StoreError::ProviderObjectTooLarge); }
+        }
+        if !inserted {
+            let existing:Vec<u8> = tx.query_row("SELECT payload FROM provider_session_objects WHERE account_id=?1 AND origin=?2 AND session_id=?3 AND class=?4 AND object_id=?5",params![scope.account_id,scope.origin,session,class,id],|r| r.get(0))?;
+            if existing != bytes { return Err(StoreError::IllegalTransition("immutable session object conflict".into())); }
+        }
+        tx.commit()?; Ok(())
+    }
+
+    pub fn local_session_load(&self, scope:&ProviderScope, session:&str, class:&str, id:&str) -> Result<Option<Vec<u8>>> {
+        if !self.protected_provider_storage() { return Err(StoreError::MissingStoreKey); }
+        validate_session(scope,session)?;
+        Ok(self.conn.query_row("SELECT payload FROM provider_session_objects WHERE account_id=?1 AND origin=?2 AND session_id=?3 AND class=?4 AND object_id=?5",params![scope.account_id,scope.origin,session,class,id],|r| r.get(0)).optional()?)
+    }
+
+    pub fn local_sessions(&self, scope:&ProviderScope, after:&str, limit:usize) -> Result<Vec<String>> {
+        if !self.protected_provider_storage() { return Err(StoreError::MissingStoreKey); }
+        if scope.account_id.is_empty() || scope.origin.is_empty() { return Err(StoreError::IllegalTransition("invalid session identity".into())); }
+        let mut stmt=self.conn.prepare("SELECT session_id FROM provider_sessions WHERE account_id=?1 AND origin=?2 AND session_id>?3 ORDER BY session_id LIMIT ?4")?;
+        let rows=stmt.query_map(params![scope.account_id,scope.origin,after,limit.min(100) as i64],|r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>,_>>()?)
+    }
+    /// Apply DAV resource/index changes and checkpoint in one transaction.
+    pub fn apply_provider_dav_page(&self, scope:&ProviderScope, changes:&[(ProviderChange,Option<ProviderDavIndex>)], cursor:&str) -> Result<()> {
+        if !self.protected_provider_storage() { return Err(StoreError::MissingStoreKey); }
+        if scope.service != "calendar" { return Err(StoreError::InvalidProgressiveSearch("DAV index requires calendar scope".into())); }
+        let tx = self.conn.unchecked_transaction()?;
+        for (change,index) in changes {
+            match (change,index) {
+                (ProviderChange::Upsert(object),Some(index)) => { apply_changes(&tx,scope,std::slice::from_ref(change),cursor)?; write_dav_index(&tx,scope,&object.remote_id,index)?; }
+                (ProviderChange::Destroyed(_),None) => apply_changes(&tx,scope,std::slice::from_ref(change),cursor)?,
+                _ => return Err(StoreError::InvalidProgressiveSearch("DAV resource/index mismatch".into())),
+            }
+        }
+        apply_changes(&tx,scope,&[],cursor)?;
+        tx.commit()?; Ok(())
+    }
+
+    /// Stage the parsed identity only after the corresponding raw resource was staged.
+    pub fn stage_provider_dav_index(&self, scope:&ProviderScope, generation:&str, remote_id:&str, index:&ProviderDavIndex) -> Result<()> {
+        if !self.protected_provider_storage() { return Err(StoreError::MissingStoreKey); }
+        if scope.service != "calendar" { return Err(StoreError::InvalidProgressiveSearch("DAV index requires calendar scope".into())); }
+        let tx = self.conn.unchecked_transaction()?;
+        let exists:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_stage_objects WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5 AND remote_id=?6)",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,remote_id],|r| r.get(0))?;
+        if !exists { return Err(StoreError::InvalidProgressiveSearch("staged DAV resource missing".into())); }
+        let (valid,uid,kind,parent) = dav_index_fields(index)?;
+        tx.execute("INSERT INTO provider_stage_dav_index(account_id,origin,service,collection,generation,remote_id,valid,uid,kind,parent_uid) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(account_id,origin,service,collection,generation,remote_id) DO UPDATE SET valid=excluded.valid,uid=excluded.uid,kind=excluded.kind,parent_uid=excluded.parent_uid",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,remote_id,valid,uid,kind,parent])?;
+        tx.commit()?; Ok(())
+    }
+
+    pub fn provider_dav_uid_lookup(&self, scope:&ProviderScope, uid:&str) -> Result<Vec<ProviderDavIndexEntry>> {
+        let mut stmt = self.conn.prepare("SELECT remote_id,kind,parent_uid FROM provider_dav_index WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND uid=?5 AND valid=1 ORDER BY remote_id LIMIT 2")?;
+        let rows = stmt.query_map(params![scope.account_id,scope.origin,scope.service,scope.collection,uid],|r| Ok(ProviderDavIndexEntry {remote_id:r.get(0)?,index:ProviderDavIndex::Valid {uid:uid.into(),kind:r.get(1)?,parent_uid:r.get(2)?}}))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Any invalid or unindexed resource makes parent graph changes fail closed.
+    pub fn provider_dav_index_incomplete_count(&self, scope:&ProviderScope) -> Result<i64> {
+        Ok(self.conn.query_row("SELECT COUNT(*) FROM provider_objects p LEFT JOIN provider_dav_index i ON i.account_id=p.account_id AND i.origin=p.origin AND i.service=p.service AND i.collection=p.collection AND i.remote_id=p.remote_id WHERE p.account_id=?1 AND p.origin=?2 AND p.service=?3 AND p.collection=?4 AND (i.remote_id IS NULL OR i.valid=0)",params![scope.account_id,scope.origin,scope.service,scope.collection],|r| r.get(0))?)
+    }
+
+    pub fn provider_dav_unindexed_count(&self, scope:&ProviderScope) -> Result<i64> {
+        Ok(self.conn.query_row("SELECT COUNT(*) FROM provider_objects p LEFT JOIN provider_dav_index i ON i.account_id=p.account_id AND i.origin=p.origin AND i.service=p.service AND i.collection=p.collection AND i.remote_id=p.remote_id WHERE p.account_id=?1 AND p.origin=?2 AND p.service=?3 AND p.collection=?4 AND i.remote_id IS NULL",params![scope.account_id,scope.origin,scope.service,scope.collection],|r| r.get(0))?)
+    }
     /// Reclaim interrupted staging only while holding the on-disk writer lock.
     /// Preserve every staged observation in the capture outbox before removal.
     pub fn recover_abandoned_provider_staging(&self) -> Result<()> {
@@ -146,6 +356,7 @@ impl Store {
             after = rowid; capture_observation(&tx,&scope,&object)?;
         }
         tx.execute("DELETE FROM provider_stage_objects",[])?;
+        tx.execute("DELETE FROM provider_stage_dav_index",[])?;
         tx.execute("DELETE FROM provider_stage_runs",[])?;
         tx.commit()?; Ok(())
     }
@@ -185,6 +396,10 @@ impl Store {
         let base = base.ok_or_else(|| StoreError::InvalidProgressiveSearch("staging generation not found".into()))?;
         let current: Option<(Option<String>,bool)> = tx.query_row("SELECT cursor,accessible FROM provider_collections WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4",params![scope.account_id,scope.origin,scope.service,scope.collection],|r| Ok((r.get(0)?,r.get(1)?))).optional()?;
         if base != (current.as_ref().and_then(|v| v.0.clone()), current.as_ref().map(|v| v.1)) { return Err(StoreError::InvalidProgressiveSearch("provider scope changed during staging".into())); }
+        if scope.service == "calendar" {
+            let missing:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_stage_objects p LEFT JOIN provider_stage_dav_index i ON i.account_id=p.account_id AND i.origin=p.origin AND i.service=p.service AND i.collection=p.collection AND i.generation=p.generation AND i.remote_id=p.remote_id WHERE p.account_id=?1 AND p.origin=?2 AND p.service=?3 AND p.collection=?4 AND p.generation=?5 AND i.remote_id IS NULL)",params![scope.account_id,scope.origin,scope.service,scope.collection,generation],|r| r.get(0))?;
+            if missing { return Err(StoreError::InvalidProgressiveSearch("staged DAV index incomplete".into())); }
+        }
         let mut after = String::new();
         loop {
             let id: Option<String> = tx.query_row("SELECT p.remote_id FROM provider_objects p WHERE p.account_id=?1 AND p.origin=?2 AND p.service=?3 AND p.collection=?4 AND p.remote_id>?6 AND NOT EXISTS(SELECT 1 FROM provider_stage_objects s WHERE s.account_id=p.account_id AND s.origin=p.origin AND s.service=p.service AND s.collection=p.collection AND s.generation=?5 AND s.remote_id=p.remote_id) ORDER BY p.remote_id LIMIT 1",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,after],|r| r.get(0)).optional()?;
@@ -195,11 +410,20 @@ impl Store {
         loop {
             let object: Option<ProviderObject> = tx.query_row("SELECT remote_id,etag,raw FROM provider_stage_objects WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5 AND remote_id>?6 ORDER BY remote_id LIMIT 1",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,after],|r| Ok(ProviderObject {remote_id:r.get(0)?,etag:r.get(1)?,raw:r.get(2)?})).optional()?;
             let Some(object) = object else { break; };
-            after = object.remote_id.clone(); apply_changes(&tx,scope,&[ProviderChange::Upsert(object)],cursor)?;
+            after = object.remote_id.clone();
+            let index = if scope.service == "calendar" {
+                Some(tx.query_row("SELECT valid,uid,kind,parent_uid FROM provider_stage_dav_index WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5 AND remote_id=?6",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,after],|r| {
+                    let valid:bool=r.get(0)?;
+                    if valid { Ok(ProviderDavIndex::Valid { uid:r.get(1)?,kind:r.get(2)?,parent_uid:r.get(3)? }) } else { Ok(ProviderDavIndex::Invalid) }
+                })?)
+            } else { None };
+            apply_changes(&tx,scope,&[ProviderChange::Upsert(object)],cursor)?;
+            if let Some(index) = index { write_dav_index(&tx,scope,&after,&index)?; }
         }
         apply_changes(&tx,scope,&[],cursor)?;
         tx.execute("UPDATE provider_collections SET complete=1 WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4",params![scope.account_id,scope.origin,scope.service,scope.collection])?;
         tx.execute("DELETE FROM provider_stage_objects WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5",params![scope.account_id,scope.origin,scope.service,scope.collection,generation])?;
+        tx.execute("DELETE FROM provider_stage_dav_index WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5",params![scope.account_id,scope.origin,scope.service,scope.collection,generation])?;
         tx.execute("DELETE FROM provider_stage_runs WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5",params![scope.account_id,scope.origin,scope.service,scope.collection,generation])?;
         tx.commit()?; Ok(())
     }
@@ -215,6 +439,7 @@ impl Store {
             after = object.remote_id.clone(); capture_observation(&tx,scope,&object)?;
         }
         tx.execute("DELETE FROM provider_stage_objects WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5",params![scope.account_id,scope.origin,scope.service,scope.collection,generation])?;
+        tx.execute("DELETE FROM provider_stage_dav_index WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5",params![scope.account_id,scope.origin,scope.service,scope.collection,generation])?;
         tx.execute("DELETE FROM provider_stage_runs WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5",params![scope.account_id,scope.origin,scope.service,scope.collection,generation])?;
         tx.commit()?; Ok(())
     }
@@ -226,6 +451,7 @@ impl Store {
         let active: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_stage_runs WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5)",params![scope.account_id,scope.origin,scope.service,scope.collection,generation],|r| r.get(0))?;
         if !active { return Err(StoreError::InvalidProgressiveSearch("staging generation not found".into())); }
         tx.execute("DELETE FROM provider_stage_objects WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5 AND remote_id=?6",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,id])?;
+        tx.execute("DELETE FROM provider_stage_dav_index WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5 AND remote_id=?6",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,id])?;
         tx.commit()?; Ok(())
     }
 
@@ -237,6 +463,7 @@ impl Store {
         let active: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_stage_runs WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5)",params![scope.account_id,scope.origin,scope.service,scope.collection,generation],|r| r.get(0))?;
         if !active { return Err(StoreError::InvalidProgressiveSearch("staging generation not found".into())); }
         capture_observation(&tx,scope,object)?;
+        tx.execute("DELETE FROM provider_stage_dav_index WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5 AND remote_id=?6",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,object.remote_id])?;
         tx.execute("INSERT INTO provider_stage_objects(account_id,origin,service,collection,generation,remote_id,etag,raw) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(account_id,origin,service,collection,generation,remote_id) DO UPDATE SET etag=excluded.etag,raw=excluded.raw",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,object.remote_id,object.etag,object.raw])?;
         tx.commit()?; Ok(())
     }
@@ -294,7 +521,14 @@ impl Store {
 
     pub fn finish_provider_mutation(&self, scope: &ProviderScope, operation: &str, result_id: Option<&str>) -> Result<bool> {
         let state = if result_id.is_some() { "confirmed" } else { "rejected" };
-        Ok(self.conn.execute("UPDATE provider_mutations SET state=?6,result_id=?7 WHERE account_id=?1 AND origin=?2 AND service=?3 AND remote_account=?4 AND operation_id=?5 AND state='unknown'", params![scope.account_id,scope.origin,scope.service,scope.collection,operation,state,result_id])? == 1)
+        Ok(self.conn.execute("UPDATE provider_mutations SET state=?6,result_id=COALESCE(?7,result_id) WHERE account_id=?1 AND origin=?2 AND service=?3 AND remote_account=?4 AND operation_id=?5 AND state='unknown'", params![scope.account_id,scope.origin,scope.service,scope.collection,operation,state,result_id])? == 1)
+    }
+
+    /// Persist a native result identity while verification is still pending.
+    pub fn checkpoint_provider_mutation(&self, scope:&ProviderScope, operation:&str, expected_digest:&str, native_id:&str) -> Result<bool> {
+        if !self.protected_provider_storage() { return Err(StoreError::MissingStoreKey); }
+        if native_id.is_empty() { return Err(StoreError::IllegalTransition("empty native result identity".into())); }
+        Ok(self.conn.execute("UPDATE provider_mutations SET result_id=?7 WHERE account_id=?1 AND origin=?2 AND service=?3 AND remote_account=?4 AND operation_id=?5 AND intent_digest=?6 AND state='unknown' AND (result_id IS NULL OR result_id=?7)",params![scope.account_id,scope.origin,scope.service,scope.collection,operation,expected_digest,native_id])? == 1)
     }
 
     pub fn provider_mutation_intent(&self, scope: &ProviderScope, operation: &str) -> Result<Option<(String,String,String,String,Option<String>)>> {
@@ -477,6 +711,7 @@ fn reconcile_snapshot(tx: &rusqlite::Transaction<'_>, scope: &ProviderScope, obj
 fn apply_changes(tx: &rusqlite::Transaction<'_>, scope: &ProviderScope, changes: &[ProviderChange], cursor: &str) -> Result<()> {
         for change in changes {
             let id = match change { ProviderChange::Upsert(object) => &object.remote_id, ProviderChange::Destroyed(id) => id };
+            if scope.service == "calendar" { tx.execute("DELETE FROM provider_dav_index WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND remote_id=?5",params![scope.account_id,scope.origin,scope.service,scope.collection,id])?; }
             let previous = tx.query_row("SELECT etag,raw FROM provider_objects WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND remote_id=?5", params![scope.account_id,scope.origin,scope.service,scope.collection,id], |r| Ok((r.get::<_, Option<String>>(0)?,r.get::<_, Vec<u8>>(1)?))).optional()?;
             if let Some((etag, raw)) = previous {
                 let digest = format!("{:x}", Sha256::digest(&raw));
@@ -509,6 +744,27 @@ fn apply_changes(tx: &rusqlite::Transaction<'_>, scope: &ProviderScope, changes:
         }
         tx.execute("INSERT INTO provider_collections(account_id,origin,service,collection,cursor,observed_at,accessible) VALUES (?1,?2,?3,?4,?5,CAST(strftime('%s','now') AS INTEGER),1) ON CONFLICT(account_id,origin,service,collection) DO UPDATE SET cursor=excluded.cursor,observed_at=excluded.observed_at,accessible=1", params![scope.account_id,scope.origin,scope.service,scope.collection,cursor])?;
         Ok(())
+}
+
+fn dav_index_fields(index:&ProviderDavIndex) -> Result<(bool,Option<&str>,Option<&str>,Option<&str>)> {
+    match index {
+        ProviderDavIndex::Invalid => Ok((false,None,None,None)),
+        ProviderDavIndex::Valid { uid,kind,parent_uid } => {
+            if uid.is_empty() || uid.len()>4096 || !matches!(kind.as_str(),"event"|"task") || (kind == "event" && parent_uid.is_some()) || parent_uid.as_ref().is_some_and(|p| p.is_empty() || p.len()>4096) { return Err(StoreError::InvalidProgressiveSearch("invalid DAV identity index".into())); }
+            Ok((true,Some(uid),Some(kind),parent_uid.as_deref()))
+        }
+    }
+}
+
+fn validate_session(scope:&ProviderScope, session:&str) -> Result<()> {
+    if scope.account_id.is_empty() || scope.origin.is_empty() || session.is_empty() || session.len()>128 { return Err(StoreError::IllegalTransition("invalid session identity".into())); }
+    Ok(())
+}
+
+fn write_dav_index(tx:&rusqlite::Transaction<'_>, scope:&ProviderScope, remote_id:&str, index:&ProviderDavIndex) -> Result<()> {
+    let (valid,uid,kind,parent) = dav_index_fields(index)?;
+    tx.execute("INSERT INTO provider_dav_index(account_id,origin,service,collection,remote_id,valid,uid,kind,parent_uid) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![scope.account_id,scope.origin,scope.service,scope.collection,remote_id,valid,uid,kind,parent])?;
+    Ok(())
 }
 
 fn capture_version(etag: Option<&str>, raw: &[u8]) -> String {
@@ -597,6 +853,32 @@ mod tests {
     }
 
     #[test]
+    fn rejected_submission_allows_new_approval_but_unknown_or_confirmed_do_not() {
+        let store = Store::open_in_memory().unwrap();
+        let scope = ProviderScope { account_id:"a".into(),origin:"https://example.test".into(),service:"mail".into(),collection:"remote".into() };
+        let mut op = ProviderSubmission { scope:scope.clone(),operation_id:"a".into(),draft_id:"draft".into(),identity_id:"identity".into(),email_state:"state".into(),snapshot_digest:"digest".into(),creation_id:"creation".into(),intent_json:"{}".into(),state:"unknown".into(),submission_id:None,sent_update:None };
+        assert!(store.claim_provider_submission(&op).unwrap());
+        op.operation_id = "b".into();
+        assert!(!store.claim_provider_submission(&op).unwrap());
+        assert!(store.reject_provider_submission(&scope,"a").unwrap());
+        assert!(store.claim_provider_submission(&op).unwrap());
+        assert!(store.confirm_provider_submission(&scope,"b","native","applied").unwrap());
+        op.operation_id = "c".into();
+        assert!(!store.claim_provider_submission(&op).unwrap());
+        assert_eq!(store.provider_submission(&scope,"b").unwrap().unwrap().state,"confirmed");
+    }
+
+    #[test]
+    fn unresolved_target_mutation_blocks_new_operation_until_rejected() {
+        let store=Store::open_in_memory().unwrap();
+        let scope=ProviderScope {account_id:"a".into(),origin:"https://example.test".into(),service:"mail".into(),collection:"remote".into()};
+        assert!(store.claim_provider_target_mutation(&scope,"first","set_read","id","{}","digest").unwrap());
+        assert!(!store.claim_provider_target_mutation(&scope,"second","set_read","id","{}","digest").unwrap());
+        assert!(store.finish_provider_mutation(&scope,"first",None).unwrap());
+        assert!(store.claim_provider_target_mutation(&scope,"second","set_read","id","{}","digest").unwrap());
+    }
+
+    #[test]
     fn persistent_plain_store_rejects_provider_content() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open_plain(dir.path().join("plain.db")).unwrap();
@@ -642,5 +924,64 @@ mod tests {
         assert_eq!(store.provider_objects(&scope).unwrap(),vec![new]);
         assert_eq!(store.provider_cursor(&scope).unwrap().as_deref(),Some("s2"));
         assert!(store.provider_export_snapshot("a","https://one.example").unwrap().collections[0].complete);
+    }
+
+    #[test]
+    fn dav_index_is_atomic_scoped_and_missing_index_fails_closed() {
+        let store = Store::open_in_memory().unwrap();
+        let scope = ProviderScope {account_id:"a".into(),origin:"https://example.test".into(),service:"calendar".into(),collection:"/cal/".into()};
+        let item = ProviderObject {remote_id:"/cal/task.ics".into(),etag:Some("v1".into()),raw:b"BEGIN:VCALENDAR".to_vec()};
+        let index = ProviderDavIndex::Valid {uid:"task1".into(),kind:"task".into(),parent_uid:Some("parent".into())};
+        store.apply_provider_dav_page(&scope,&[(ProviderChange::Upsert(item.clone()),Some(index.clone()))],"one").unwrap();
+        assert_eq!(store.provider_dav_uid_lookup(&scope,"task1").unwrap().len(),1);
+        assert_eq!(store.provider_dav_index_incomplete_count(&scope).unwrap(),0);
+        let invalid = ProviderDavIndex::Valid {uid:"".into(),kind:"task".into(),parent_uid:None};
+        assert!(store.apply_provider_dav_page(&scope,&[(ProviderChange::Upsert(item.clone()),Some(invalid))],"bad").is_err());
+        assert_eq!(store.provider_cursor(&scope).unwrap().as_deref(),Some("one"));
+        assert_eq!(store.provider_dav_uid_lookup(&scope,"task1").unwrap().len(),1);
+        store.begin_provider_staging(&scope,"stage").unwrap();
+        store.stage_provider_objects(&scope,"stage",std::slice::from_ref(&item)).unwrap();
+        assert!(store.finish_provider_staging(&scope,"stage","two").is_err());
+        store.stage_provider_dav_index(&scope,"stage",&item.remote_id,&index).unwrap();
+        store.finish_provider_staging(&scope,"stage","two").unwrap();
+        assert_eq!(store.provider_dav_uid_lookup(&scope,"task1").unwrap().len(),1);
+        store.apply_provider_page(&scope,&[ProviderChange::Upsert(item)],"three").unwrap();
+        assert_eq!(store.provider_dav_index_incomplete_count(&scope).unwrap(),1);
+    }
+
+    #[test]
+    fn local_sessions_are_scoped_immutable_and_cas_prevents_aba() {
+        let store=Store::open_in_memory().unwrap();
+        let scope=ProviderScope {account_id:"a".into(),origin:"https://one.example".into(),service:"agent".into(),collection:"".into()};
+        let other=ProviderScope {origin:"https://other.example".into(),..scope.clone()};
+        assert!(store.local_session_create(&scope,"session",b"sealed1").unwrap());
+        assert!(!store.local_session_create(&scope,"session",b"sealed1").unwrap());
+        assert!(store.local_session_create(&scope,"session",b"different").is_err());
+        assert!(store.local_session_manifest(&other,"session").unwrap().is_none());
+        store.local_session_stage(&scope,"session","record","id",b"ciphertext").unwrap();
+        store.local_session_stage(&scope,"session","record","id",b"ciphertext").unwrap();
+        assert!(store.local_session_stage(&scope,"session","record","id",b"other").is_err());
+        assert_eq!(store.local_session_cas(&scope,"session","1",b"sealed2").unwrap().as_deref(),Some("2"));
+        assert!(store.local_session_cas(&scope,"session","1",b"sealed3").unwrap().is_none());
+        assert_eq!(store.local_session_cas(&scope,"session","2",b"sealed1").unwrap().as_deref(),Some("3"));
+        assert!(store.local_session_cas(&scope,"session","1",b"sealed4").unwrap().is_none());
+        store.conn.execute("UPDATE provider_sessions SET object_bytes=134217728 WHERE account_id=?1 AND origin=?2 AND session_id=?3",params![scope.account_id,scope.origin,"session"]).unwrap();
+        assert!(matches!(store.local_session_stage(&scope,"session","record","overflow",b"x"),Err(StoreError::ProviderObjectTooLarge)));
+        assert!(store.local_session_load(&scope,"session","record","overflow").unwrap().is_none());
+    }
+
+    #[test]
+    fn alarm_claims_distinguish_occurrence_and_survive_pending_state() {
+        let store=Store::open_in_memory().unwrap();
+        let scope=ProviderScope {account_id:"a".into(),origin:"https://example.test".into(),service:"calendar".into(),collection:"c".into()};
+        let alarm=ProviderAlarmIdentity {uid:"task".into(),recurrence_id:"occurrence1".into(),alarm_id:"alarm".into(),trigger_at:"2026-10-28T10:00:00Z".into()};
+        assert!(store.claim_provider_alarm(&scope,&alarm).unwrap());
+        assert!(!store.claim_provider_alarm(&scope,&alarm).unwrap());
+        let other=ProviderAlarmIdentity {recurrence_id:"occurrence2".into(),..alarm.clone()};
+        assert!(store.claim_provider_alarm(&scope,&other).unwrap());
+        assert_eq!(store.pending_provider_alarms(&scope,10).unwrap().len(),2);
+        assert!(store.finish_provider_alarm(&scope,&alarm).unwrap());
+        assert!(!store.finish_provider_alarm(&scope,&alarm).unwrap());
+        assert_eq!(store.pending_provider_alarms(&scope,10).unwrap(),vec![other]);
     }
 }

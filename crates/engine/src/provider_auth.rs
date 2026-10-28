@@ -28,13 +28,31 @@ pub struct AuthAttempt {
     origin: String,
     client_id: String,
     token_endpoint: String,
+    revocation_endpoint: String,
     redirect_uri: String,
     verifier: String,
     state: String,
     cache_path: PathBuf,
     account_id: String,
+    expected_username: String,
+    account_config: Config,
     started_at: u64,
 }
+
+/// Typed completion state. No variant contains credentials or provider payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthFinishError {
+    Failed(String),
+    RevocationPending,
+    RevocationUnrecoverable,
+}
+impl std::fmt::Display for AuthFinishError {
+    fn fmt(&self, f:&mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self { Self::Failed(message)=>f.write_str(message), Self::RevocationPending=>f.write_str("Grant revocation pending"), Self::RevocationUnrecoverable=>f.write_str("Grant revocation unconfirmed and local recovery unavailable") }
+    }
+}
+impl From<String> for AuthFinishError { fn from(value:String)->Self { Self::Failed(value) } }
+impl From<&str> for AuthFinishError { fn from(value:&str)->Self { Self::Failed(value.into()) } }
 
 fn client() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
@@ -171,8 +189,10 @@ pub fn start_self_hosted_auth(
     if !valid_redirect(redirect_uri) {
         return Err("Invalid OAuth callback".into());
     }
+    if !quarantined_grants(cfg,id)?.is_empty() { return Err("Previous grant revocation requires recovery before signing in again".into()); }
     let (origin, client_id, cache_path) = account(cfg, id)?;
-    let (authorization, token_endpoint, _) = metadata(&origin)?;
+    let expected_username = cfg.accounts.iter().find(|account| account.id == id).ok_or("Account missing")?.username.clone();
+    let (authorization, token_endpoint, revocation_endpoint) = metadata(&origin)?;
     let verifier = random()?;
     let state = random()?;
     let challenge = URL_SAFE_NO_PAD.encode(digest::digest(&digest::SHA256, verifier.as_bytes()));
@@ -191,11 +211,14 @@ pub fn start_self_hosted_auth(
         origin,
         client_id,
         token_endpoint,
+        revocation_endpoint,
         redirect_uri: redirect_uri.into(),
         verifier,
         state,
         cache_path,
         account_id: id.into(),
+        expected_username,
+        account_config: cfg.clone(),
         started_at: now(),
     })
 }
@@ -203,8 +226,12 @@ pub fn start_self_hosted_auth(
 /// Consumes an attempt, validates exact callback, state and issuer, then saves to
 /// the OS keyring. A missing keyring is an explicit error, never a file fallback.
 pub fn finish_self_hosted_auth(attempt: AuthAttempt, callback: &str) -> Result<(), String> {
+    finish_self_hosted_auth_detailed(attempt,callback).map_err(|error| error.to_string())
+}
+
+pub fn finish_self_hosted_auth_detailed(attempt: AuthAttempt, callback: &str) -> Result<(), AuthFinishError> {
     #[cfg(target_os = "android")]
-    return finish_self_hosted_auth_with_store(
+    return finish_self_hosted_auth_detailed_with_store(
         attempt,
         callback,
         crate::provider_credential::platform_store()?,
@@ -216,7 +243,7 @@ pub fn finish_self_hosted_auth(attempt: AuthAttempt, callback: &str) -> Result<(
             account: attempt.account_id.clone(),
             origin: attempt.origin.clone(),
         };
-        finish_self_hosted_auth_with_store(attempt, callback, &store)
+        finish_self_hosted_auth_detailed_with_store(attempt, callback, &store)
     }
 }
 
@@ -225,6 +252,14 @@ pub fn finish_self_hosted_auth_with_store(
     callback: &str,
     store: &dyn ProviderCredentialStore,
 ) -> Result<(), String> {
+    finish_self_hosted_auth_detailed_with_store(attempt,callback,store).map_err(|error| error.to_string())
+}
+
+pub fn finish_self_hosted_auth_detailed_with_store(
+    attempt: AuthAttempt,
+    callback: &str,
+    store: &dyn ProviderCredentialStore,
+) -> Result<(), AuthFinishError> {
     let code = callback_code(&attempt, callback)?.ok_or("Authorization rejected")?;
     let response = client()?
         .post(&attempt.token_endpoint)
@@ -240,19 +275,144 @@ pub fn finish_self_hosted_auth_with_store(
     let token: TokenResponse = serde_json::from_value(json_response(response)?)
         .map_err(|_| "Invalid OAuth token response")?;
     if token.access_token.is_empty() || token.refresh_token.as_deref().is_none_or(str::is_empty) {
-        return Err("Incomplete OAuth token response".into());
+        return Err(AuthFinishError::Failed("Incomplete OAuth token response".into()));
     }
+    let subject = verify_userinfo(&attempt.origin,&token.access_token,&attempt.expected_username);
     let _lock = lock(&attempt.cache_path)?;
+    let subject = match subject.and_then(|subject| { bind_subject(&attempt,store,&subject)?; Ok(subject) }) {
+        Ok(subject) => subject,
+        Err(error) => {
+            return match revoke_unaccepted_grant(&attempt,store,&token) {
+                Ok(()) => Err(AuthFinishError::Failed(error)),
+                Err(recovery) => Err(recovery),
+            };
+        }
+    };
     let cache = TokenCache::from_response(&token, now());
-    store.replace(
+    let saved = store.replace(
         &attempt.account_id,
         &attempt.origin,
         &ProviderCredential {
             access_token: cache.access_token,
             refresh_token: cache.refresh_token,
             expires_at: cache.expires_at,
+            subject: Some(subject),
         },
-    )
+    );
+    match saved {
+        Ok(()) => Ok(()),
+        Err(error) => match revoke_unaccepted_grant(&attempt,store,&token) {
+            Ok(()) => Err(AuthFinishError::Failed(error)),
+            Err(recovery) => Err(recovery),
+        }
+    }
+}
+
+fn quarantine_key(account:&str) -> String { format!("isyncyou-internal:quarantine-index:{:x}",Sha256::digest(account.as_bytes())) }
+
+fn load_quarantine(store:&dyn ProviderCredentialStore,account:&str,origin:&str) -> Result<std::collections::BTreeMap<String,String>,String> {
+    let Some(record) = store.load(&quarantine_key(account),origin)? else { return Ok(Default::default()); };
+    if record.access_token.len()>65536 { return Err("Invalid grant recovery state".into()); }
+    let map:std::collections::BTreeMap<String,String> = serde_json::from_str(&record.access_token).map_err(|_| "Invalid grant recovery state")?;
+    if map.len()>32 || map.iter().any(|(id,token)| !valid_recovery_id(id) || token.is_empty()) { return Err("Invalid grant recovery state".into()); }
+    Ok(map)
+}
+fn save_quarantine(store:&dyn ProviderCredentialStore,account:&str,origin:&str,map:&std::collections::BTreeMap<String,String>) -> Result<(),String> {
+    let encoded=serde_json::to_string(map).map_err(|_| "Invalid grant recovery state")?;
+    if encoded.len()>65536 || map.len()>32 { return Err("Grant recovery storage is full".into()); }
+    store.replace(&quarantine_key(account),origin,&ProviderCredential {access_token:encoded,refresh_token:None,expires_at:0,subject:None})
+}
+fn valid_recovery_id(id:&str) -> bool { id.len()==64 && id.bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) }
+
+fn revoke_unaccepted_grant(attempt:&AuthAttempt, store:&dyn ProviderCredentialStore, token:&TokenResponse) -> Result<(),AuthFinishError> {
+    let refresh = token.refresh_token.as_deref().filter(|value| !value.is_empty()).ok_or(AuthFinishError::RevocationUnrecoverable)?;
+    let id = format!("{:x}",Sha256::digest(attempt.state.as_bytes()));
+    let saved = (|| -> Result<(),String> {
+        let mut map=load_quarantine(store,&attempt.account_id,&attempt.origin)?;
+        if map.contains_key(&id) { return Err("Duplicate grant recovery identity".into()); }
+        map.insert(id.clone(),refresh.into());
+        save_quarantine(store,&attempt.account_id,&attempt.origin,&map)
+    })().is_ok();
+    let revoked = client().and_then(|http| http.post(&attempt.revocation_endpoint).form(&[("token",refresh),("token_type_hint","refresh_token"),("client_id",&attempt.client_id)]).send().map_err(|_| "Grant revocation unconfirmed".to_string())).is_ok_and(|response| response.status().is_success());
+    if !revoked { return Err(if saved { AuthFinishError::RevocationPending } else { AuthFinishError::RevocationUnrecoverable }); }
+    if saved {
+        let mut map=load_quarantine(store,&attempt.account_id,&attempt.origin).map_err(|_| AuthFinishError::RevocationPending)?;
+        map.remove(&id);
+        save_quarantine(store,&attempt.account_id,&attempt.origin,&map).map_err(|_| AuthFinishError::RevocationPending)?;
+    }
+    Ok(())
+}
+
+/// Retry revocation of an explicitly identified quarantined grant; never returns tokens.
+pub fn revoke_quarantined_grant_with_store(cfg:&Config, account_id:&str, recovery_id:&str, store:&dyn ProviderCredentialStore) -> Result<(),String> {
+    let (origin,client_id,path) = account(cfg,account_id)?;
+    if !valid_recovery_id(recovery_id) { return Err("Invalid recovery identity".into()); }
+    let _lock = lock(&path)?;
+    let mut map=load_quarantine(store,account_id,&origin)?;
+    let token = map.get(recovery_id).ok_or("Quarantined grant not found")?;
+    let (_,_,endpoint) = metadata(&origin)?;
+    let response = client()?.post(endpoint).form(&[("token",token),("token_type_hint","refresh_token"),("client_id",&client_id)]).send().map_err(|_| "Grant revocation unconfirmed")?;
+    if !response.status().is_success() { return Err("Grant revocation unconfirmed".into()); }
+    map.remove(recovery_id);
+    save_quarantine(store,account_id,&origin,&map)
+}
+
+pub fn revoke_quarantined_grant(cfg:&Config, account_id:&str, recovery_id:&str) -> Result<(),String> {
+    #[cfg(target_os = "android")]
+    return revoke_quarantined_grant_with_store(cfg,account_id,recovery_id,crate::provider_credential::platform_store()?);
+    #[cfg(not(target_os = "android"))]
+    {
+        let (origin,_,path) = account(cfg,account_id)?;
+        let store = DesktopCredentialStore { path, account:account_id.into(), origin };
+        revoke_quarantined_grant_with_store(cfg,account_id,recovery_id,&store)
+    }
+}
+
+/// List only opaque recovery IDs; never return quarantined credentials.
+pub fn quarantined_grants_with_store(cfg:&Config,account_id:&str,store:&dyn ProviderCredentialStore)->Result<Vec<String>,String> {
+    let (origin,_,path)=account(cfg,account_id)?;
+    let _lock=lock(&path)?;
+    Ok(load_quarantine(store,account_id,&origin)?.into_keys().collect())
+}
+
+pub fn quarantined_grants(cfg:&Config,account_id:&str)->Result<Vec<String>,String> {
+    #[cfg(target_os = "android")]
+    return quarantined_grants_with_store(cfg,account_id,crate::provider_credential::platform_store()?);
+    #[cfg(not(target_os = "android"))]
+    {
+        let (origin,_,path)=account(cfg,account_id)?;
+        let store=DesktopCredentialStore {path,account:account_id.into(),origin};
+        quarantined_grants_with_store(cfg,account_id,&store)
+    }
+}
+
+fn bind_subject(attempt:&AuthAttempt, store:&dyn ProviderCredentialStore, subject:&str) -> Result<(),String> {
+    let binding_id = format!("isyncyou-internal:subject:{:x}",Sha256::digest(attempt.account_id.as_bytes()));
+    match store.load(&binding_id,&attempt.origin)? {
+        Some(binding) if binding.subject.as_deref() == Some(subject) => Ok(()),
+        Some(_) => Err("Signed-in identity differs from the account previously bound to this provider".into()),
+        None => {
+            if store.load(&attempt.account_id,&attempt.origin)?.is_some() || crate::provider_store::has_cached_data(&attempt.account_config,&attempt.account_id)? {
+                return Err("Existing provider data lacks a verified identity binding".into());
+            }
+            store.replace(&binding_id,&attempt.origin,&ProviderCredential {access_token:subject.into(),refresh_token:None,expires_at:0,subject:Some(subject.into())})
+        }
+    }
+}
+
+fn verify_userinfo(origin:&str, token:&str, expected_username:&str) -> Result<String,String> {
+    let base = reqwest::Url::parse(origin).map_err(|_| "Invalid provider origin")?;
+    let discovery = json_response(client()?.get(base.join("/.well-known/openid-configuration").map_err(|_| "Invalid provider origin")?).send().map_err(|_| "Identity discovery unavailable")?)?;
+    if discovery["issuer"].as_str() != Some(origin) { return Err("OAuth issuer mismatch".into()); }
+    let endpoint = same_origin(&base,discovery["userinfo_endpoint"].as_str().ok_or("Identity endpoint unavailable")?)?;
+    let identity = json_response(client()?.get(endpoint).bearer_auth(token).send().map_err(|_| "Identity lookup unavailable")?)?;
+    validate_userinfo(&identity,expected_username)
+}
+
+fn validate_userinfo(identity:&Value, expected_username:&str) -> Result<String,String> {
+    let subject = identity["sub"].as_str().filter(|value| !value.is_empty() && value.len() <= 4096).ok_or("Identity subject missing")?;
+    if identity["preferred_username"].as_str() != Some(expected_username) && identity["email"].as_str() != Some(expected_username) { return Err("Signed-in account does not match configured username".into()); }
+    Ok(subject.into())
 }
 
 /// Reject unrelated loopback requests without consuming the pending attempt.
@@ -342,6 +502,10 @@ pub fn self_hosted_access_token_with_store(
     let (origin, client_id, path) = account(cfg, id)?;
     let _lock = lock(&path)?;
     let mut cached = store.load(id, &origin)?.ok_or("Provider login required")?;
+    if cached.subject.as_deref().is_none_or(str::is_empty) { return Err("Provider account identity must be verified by signing in again".into()); }
+    let binding_id = format!("isyncyou-internal:subject:{:x}",Sha256::digest(id.as_bytes()));
+    let binding = store.load(&binding_id,&origin)?.ok_or("Provider account identity binding missing")?;
+    if binding.subject != cached.subject { return Err("Provider account identity binding mismatch".into()); }
     if !cached.access_token.is_empty() && now() < cached.expires_at {
         return Ok(cached.access_token);
     }
@@ -361,7 +525,7 @@ pub fn self_hosted_access_token_with_store(
         .map_err(|_| "OAuth refresh unavailable")?;
     let token: TokenResponse = serde_json::from_value(json_response(response)?)
         .map_err(|_| "Invalid OAuth refresh response")?;
-    if token.access_token.is_empty() {
+    if token.access_token.is_empty() || token.refresh_token.as_deref() == Some("") {
         return Err("Invalid OAuth refresh response".into());
     }
     let previous = cached.refresh_token.take();
@@ -370,6 +534,7 @@ pub fn self_hosted_access_token_with_store(
         access_token: cache.access_token,
         refresh_token: cache.refresh_token.or(previous),
         expires_at: cache.expires_at,
+        subject: cached.subject,
     };
     store.replace(id, &origin, &cached)?;
     Ok(cached.access_token)
@@ -396,19 +561,30 @@ struct DesktopCredentialStore {
     origin: String,
 }
 #[cfg(not(target_os = "android"))]
+impl DesktopCredentialStore {
+    fn path_for(&self, account:&str, origin:&str) -> Result<PathBuf,String> {
+        if origin != self.origin { return Err("Credential account mismatch".into()); }
+        if account == self.account { return Ok(self.path.clone()); }
+        if self.account.starts_with("isyncyou-internal:") { return Err("Credential account mismatch".into()); }
+        let binding = format!("isyncyou-internal:subject:{:x}",Sha256::digest(self.account.as_bytes()));
+        if account == binding { return Ok(self.path.with_extension("subject.json")); }
+        if account == quarantine_key(&self.account) { return Ok(self.path.with_extension("quarantine.json")); }
+        Err("Credential account mismatch".into())
+    }
+}
+#[cfg(not(target_os = "android"))]
 impl ProviderCredentialStore for DesktopCredentialStore {
     fn load(&self, account: &str, origin: &str) -> Result<Option<ProviderCredential>, String> {
-        if account != self.account || origin != self.origin {
-            return Err("Credential account mismatch".into());
-        }
-        if !self.path.exists() {
+        let path = self.path_for(account,origin)?;
+        if !path.exists() {
             return Ok(None);
         }
-        let token = load_keyring(&self.path)?;
+        let token = load_keyring(&path)?;
         Ok(Some(ProviderCredential {
             access_token: token.access_token,
             refresh_token: token.refresh_token,
             expires_at: token.expires_at,
+            subject: token.account_subject,
         }))
     }
     fn replace(
@@ -417,23 +593,19 @@ impl ProviderCredentialStore for DesktopCredentialStore {
         origin: &str,
         credential: &ProviderCredential,
     ) -> Result<(), String> {
-        if account != self.account || origin != self.origin {
-            return Err("Credential account mismatch".into());
-        }
+        let path = self.path_for(account,origin)?;
         TokenCache {
             access_token: credential.access_token.clone(),
             refresh_token: credential.refresh_token.clone(),
             expires_at: credential.expires_at,
-            account_subject: None,
+            account_subject: credential.subject.clone(),
         }
-        .save_to_keyring(&self.path)
+        .save_to_keyring(&path)
         .map_err(|_| "System keyring unavailable".into())
     }
     fn delete(&self, account: &str, origin: &str) -> Result<(), String> {
-        if account != self.account || origin != self.origin {
-            return Err("Credential account mismatch".into());
-        }
-        delete_desktop_credential(&self.path)
+        let path = self.path_for(account,origin)?;
+        delete_desktop_credential(&path)
     }
 }
 
@@ -485,10 +657,12 @@ pub fn self_hosted_auth_status_with_store(
     let Some(token) = store.load(id, &origin)? else {
         return Ok(false);
     };
+    let binding_id = format!("isyncyou-internal:subject:{:x}",Sha256::digest(id.as_bytes()));
+    let binding = store.load(&binding_id,&origin)?;
     Ok(token
         .refresh_token
         .as_deref()
-        .is_some_and(|value| !value.is_empty()))
+        .is_some_and(|value| !value.is_empty()) && token.subject.as_deref().is_some_and(|value| !value.is_empty()) && binding.is_some_and(|value| value.subject == token.subject))
 }
 
 /// Revoke the installation grant first, then remove its local keyring entry.
@@ -603,6 +777,7 @@ fn provider_database_key_with_store(
                     access_token: encoded.clone(),
                     refresh_token: None,
                     expires_at: 0,
+                    subject: None,
                 },
             )?;
             encoded
@@ -621,10 +796,59 @@ fn provider_database_key_with_store(
 mod tests {
     use super::*;
 
+    #[test]
+    fn userinfo_requires_exact_configured_identity_and_stable_subject() {
+        let identity = serde_json::json!({"sub":"subject-1","preferred_username":"user@example.test"});
+        assert_eq!(validate_userinfo(&identity,"user@example.test").unwrap(),"subject-1");
+        assert!(validate_userinfo(&identity,"other@example.test").is_err());
+        assert!(validate_userinfo(&serde_json::json!({"sub":"","email":"user@example.test"}),"user@example.test").is_err());
+    }
+
+    #[test]
+    fn quarantined_grant_index_is_scoped_and_exposes_only_opaque_ids() {
+        struct Keys(std::sync::Mutex<std::collections::HashMap<(String,String),ProviderCredential>>);
+        impl ProviderCredentialStore for Keys {
+            fn load(&self,a:&str,o:&str)->Result<Option<ProviderCredential>,String>{Ok(self.0.lock().unwrap().get(&(a.into(),o.into())).cloned())}
+            fn replace(&self,a:&str,o:&str,c:&ProviderCredential)->Result<(),String>{self.0.lock().unwrap().insert((a.into(),o.into()),c.clone());Ok(())}
+            fn delete(&self,a:&str,o:&str)->Result<(),String>{self.0.lock().unwrap().remove(&(a.into(),o.into()));Ok(())}
+        }
+        let keys=Keys(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let id="a".repeat(64);
+        let mut map=std::collections::BTreeMap::new(); map.insert(id.clone(),"refresh-secret".into());
+        save_quarantine(&keys,"a","https://one.example",&map).unwrap();
+        assert_eq!(load_quarantine(&keys,"a","https://one.example").unwrap().keys().cloned().collect::<Vec<_>>(),vec![id]);
+        assert!(load_quarantine(&keys,"a","https://other.example").unwrap().is_empty());
+        assert!(load_quarantine(&keys,"b","https://one.example").unwrap().is_empty());
+        #[cfg(feature = "encrypted-store")]
+        {
+            let dir=tempfile::tempdir().unwrap();
+            let mut cfg=Config::default();
+            cfg.accounts.push(isyncyou_core::AccountConfig {id:"a".into(),username:"user".into(),sync_root:PathBuf::new(),archive_root:dir.path().into(),cache_root:PathBuf::new(),mount_point:None});
+            cfg.provider_accounts.insert("a".into(),ProviderConfig::SelfHosted {origin:"https://one.example".into(),client_id:"client".into()});
+            let attempt=AuthAttempt {authorization_uri:String::new(),origin:"https://one.example".into(),client_id:"client".into(),token_endpoint:String::new(),revocation_endpoint:String::new(),redirect_uri:String::new(),verifier:String::new(),state:String::new(),cache_path:PathBuf::new(),account_id:"a".into(),expected_username:"user".into(),account_config:cfg,started_at:now()};
+            bind_subject(&attempt,&keys,"subject-one").unwrap();
+            bind_subject(&attempt,&keys,"subject-one").unwrap();
+            assert!(bind_subject(&attempt,&keys,"subject-two").is_err());
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn desktop_identity_and_quarantine_paths_are_separate_and_account_bound() {
+        let store = DesktopCredentialStore {path:PathBuf::from("/tmp/provider-token.json"),account:"a".into(),origin:"https://example.test".into()};
+        let binding=format!("isyncyou-internal:subject:{:x}",Sha256::digest(b"a"));
+        let quarantine=quarantine_key("a");
+        let token_path=store.path_for("a","https://example.test").unwrap();
+        assert_ne!(store.path_for(&binding,"https://example.test").unwrap(),token_path);
+        assert_ne!(store.path_for(&quarantine,"https://example.test").unwrap(),token_path);
+        assert!(store.path_for(&binding,"https://other.test").is_err());
+        assert!(store.path_for("other","https://example.test").is_err());
+    }
+
     struct FakeStore(std::sync::Mutex<Option<ProviderCredential>>);
     impl ProviderCredentialStore for FakeStore {
         fn load(&self, account: &str, origin: &str) -> Result<Option<ProviderCredential>, String> {
-            if account != "a" || origin != "https://example.test" {
+            if (account != "a" && account != format!("isyncyou-internal:subject:{:x}",Sha256::digest(b"a"))) || origin != "https://example.test" {
                 return Err("wrong scope".into());
             }
             Ok(self.0.lock().unwrap().clone())
@@ -673,12 +897,16 @@ mod tests {
             access_token: "secret".into(),
             refresh_token: Some("refresh".into()),
             expires_at: now() + 600,
+            subject: Some("stable-subject".into()),
         })));
         assert!(self_hosted_auth_status_with_store(&cfg, "a", &store).unwrap());
         assert_eq!(
             self_hosted_access_token_with_store(&cfg, "a", &store).unwrap(),
             "secret"
         );
+        store.0.lock().unwrap().as_mut().unwrap().subject = None;
+        assert!(!self_hosted_auth_status_with_store(&cfg,"a",&store).unwrap());
+        assert!(self_hosted_access_token_with_store(&cfg,"a",&store).is_err());
         cfg.provider_accounts.insert(
             "a".into(),
             ProviderConfig::SelfHosted {
@@ -753,11 +981,14 @@ mod tests {
             origin: "https://example.test".into(),
             client_id: "client".into(),
             token_endpoint: "https://example.test/token".into(),
+            revocation_endpoint: "https://example.test/revoke".into(),
             redirect_uri: "http://127.0.0.1:53682/oauth/callback".into(),
             verifier: "secret".into(),
             state: "expected".into(),
             cache_path: PathBuf::new(),
             account_id: "a".into(),
+            expected_username: "user".into(),
+            account_config: Config::default(),
             started_at: now(),
         };
         assert!(validate_callback(&attempt, "http://127.0.0.1:53682/oauth/callback?code=a&state=wrong&iss=https%3A%2F%2Fexample.test").is_err());

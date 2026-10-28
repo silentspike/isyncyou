@@ -329,10 +329,11 @@ fn run(args: &Args) -> Result<(), String> {
             let (cfg_w, sched_w) = (cfg.clone(), sched.clone());
             move || watch_loop(cfg_w, sched_w)
         });
-        let (cfg2, gate2, sched2) = (cfg, gate, sched.clone());
+        let (gate2, sched2) = (gate, sched.clone());
         let (interval2, events2) = (live_interval.clone(), events.clone());
         let push2 = push_notifier.clone();
-        std::thread::spawn(move || sync_loop(cfg2, gate2, interval2, sched2, events2, push2));
+        let config_path2 = args.config.clone();
+        std::thread::spawn(move || sync_loop(config_path2, gate2, interval2, sched2, events2, push2));
         router = router.with_sync_control(sched, cap_token);
     }
 
@@ -630,7 +631,7 @@ fn recover_pending_restores(cfg: &Config) {
 /// refetch. An explicit `now` trigger always runs. A pass that errors (no cached
 /// token, a network blip) is logged and never kills the loop.
 fn sync_loop(
-    cfg: Config,
+    config_path: PathBuf,
     gate: Arc<Mutex<()>>,
     interval: Arc<AtomicU64>,
     sched: Arc<Scheduler>,
@@ -656,16 +657,20 @@ fn sync_loop(
         if !run {
             continue;
         }
-        for acc in &cfg.accounts {
-            match sync_account(&cfg, &acc.id, &gate, &host) {
+        let current = match Config::load(&config_path) {
+            Ok(current) if current.validate().is_ok() => current,
+            _ => { eprintln!("isyncyoud: sync skipped because configuration is unavailable"); continue; }
+        };
+        for acc in &current.accounts {
+            match sync_account(&current, &acc.id, &gate, &host) {
                 Ok(summary) => eprintln!("isyncyoud: sync {} -> {summary}", acc.id),
                 Err(e) => eprintln!("isyncyoud: sync {} skipped: {e}", acc.id),
             }
             // Keep the per-service archive fresh too (live client, #563 AC-5): an
             // incremental mail pass so new cloud mail lands in the store and the
             // SSE notify below surfaces it without a manual reload.
-            if !cfg.provider_accounts.contains_key(&acc.id) {
-                match isyncyou_app_host::run_backup_account(&cfg, &acc.id, &gate, &[]) {
+            if !current.provider_accounts.contains_key(&acc.id) {
+            match isyncyou_app_host::run_backup_account(&current, &acc.id, &gate, &[]) {
                     Ok(run) => {
                         eprintln!("isyncyoud: backup {} -> {}", acc.id, run.summary);
                         // Push (#576): notify the phone when new content was archived. The

@@ -44,6 +44,8 @@ pub enum StoreError {
     InvalidProgressiveSearch(String),
     #[error("provider object exceeds the permitted page size")]
     ProviderObjectTooLarge,
+    #[error("store schema version {0} is newer than this application supports")]
+    FutureSchema(i64),
 }
 
 impl StoreError {
@@ -97,10 +99,10 @@ fn bounded_fts_snippet(value: String) -> String {
 }
 
 /// Current schema version. Bump + add a migration step when the schema changes.
-pub const SCHEMA_VERSION: i64 = 17;
+pub const SCHEMA_VERSION: i64 = 18;
 
 mod provider;
-pub use provider::{ProviderCapture, ProviderChange, ProviderCollectionSnapshot, ProviderEvent, ProviderExportSnapshot, ProviderObject, ProviderScope, ProviderSubmission};
+pub use provider::{ProviderAlarmIdentity, ProviderCapture, ProviderChange, ProviderCollectionSnapshot, ProviderDavIndex, ProviderDavIndexEntry, ProviderEvent, ProviderExportSnapshot, ProviderObject, ProviderScope, ProviderSubmission};
 
 pub const STORE_KEY_ENV: &str = "ISYNCYOU_STORE_KEY";
 pub const STORE_KEY_FILE_ENV: &str = "ISYNCYOU_STORE_KEY_FILE";
@@ -3024,6 +3026,9 @@ fn map_restore_op(r: &rusqlite::Row) -> rusqlite::Result<RestoreOperation> {
 
 fn migrate(conn: &Connection) -> Result<()> {
     let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if v > SCHEMA_VERSION { return Err(StoreError::FutureSchema(v)); }
+    let tx = conn.unchecked_transaction()?;
+    let conn = &*tx;
     if v < 1 {
         conn.execute_batch(MIGRATION_V1)?;
     }
@@ -3075,7 +3080,11 @@ fn migrate(conn: &Connection) -> Result<()> {
     if v < 17 {
         conn.execute_batch(provider::MIGRATION)?;
     }
+    if v < 18 {
+        conn.execute_batch(provider::MIGRATION_V18)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -3084,6 +3093,24 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn failed_provider_migration_rolls_back_schema_and_version() {
+        let store=Store::open_in_memory().unwrap();
+        store.conn.execute_batch("DROP TABLE provider_dav_index; DROP TABLE provider_stage_dav_index; DROP TABLE provider_sessions; DROP TABLE provider_session_objects; DROP TABLE provider_session_quotas; PRAGMA user_version=17; CREATE TABLE provider_sessions(blocker INTEGER);").unwrap();
+        assert!(migrate(&store.conn).is_err());
+        assert_eq!(store.schema_version().unwrap(),17);
+        let created:i64=store.conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='provider_dav_index'",[],|r| r.get(0)).unwrap();
+        assert_eq!(created,0);
+    }
+
+    #[test]
+    fn future_schema_is_rejected_without_version_downgrade() {
+        let store=Store::open_in_memory().unwrap();
+        store.conn.pragma_update(None,"user_version",SCHEMA_VERSION+1).unwrap();
+        assert!(matches!(migrate(&store.conn),Err(StoreError::FutureSchema(_))));
+        assert_eq!(store.schema_version().unwrap(),SCHEMA_VERSION+1);
+    }
 
     #[cfg(feature = "encrypted-store")]
     #[test]

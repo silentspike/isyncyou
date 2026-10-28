@@ -111,10 +111,16 @@ impl ProviderCredentialStore for AndroidProviderCredentialStore {
         let expires_at = value["expires_at"]
             .as_u64()
             .ok_or("Invalid Android credential")?;
+        let subject = match &value["subject"] {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+            _ => return Err("Invalid Android credential".into()),
+        };
         Ok(Some(ProviderCredential {
             access_token: access.into(),
             refresh_token: refresh,
             expires_at,
+            subject,
         }))
     }
 
@@ -125,11 +131,11 @@ impl ProviderCredentialStore for AndroidProviderCredentialStore {
         credential: &ProviderCredential,
     ) -> Result<(), String> {
         let id = Self::id(account, origin)?;
-        if credential.access_token.is_empty() || credential.refresh_token.as_deref() == Some("") {
+        if credential.access_token.is_empty() || credential.refresh_token.as_deref() == Some("") || credential.subject.as_deref() == Some("") {
             return Err("Invalid Android credential".into());
         }
         let value = serde_json::json!({"v":1,"access_token":credential.access_token,
-            "refresh_token":credential.refresh_token,"expires_at":credential.expires_at});
+            "refresh_token":credential.refresh_token,"expires_at":credential.expires_at,"subject":credential.subject});
         let bytes = serde_json::to_vec(&value).map_err(|_| "Android credential encoding failed")?;
         if bytes.len() > 65536 {
             return Err("Android credential too large".into());
@@ -179,6 +185,7 @@ mod tests {
             access_token: "access-sentinel".into(),
             refresh_token: Some("refresh-sentinel".into()),
             expires_at: 123,
+            subject: Some("subject-sentinel".into()),
         };
         store
             .replace("one", "https://example.test", &credential)
@@ -193,10 +200,14 @@ mod tests {
                 .as_deref(),
             Some("refresh-sentinel")
         );
+        assert_eq!(reopened.load("one", "https://example.test").unwrap().unwrap().subject.as_deref(), Some("subject-sentinel"));
         assert!(reopened
             .load("other", "https://example.test")
             .unwrap()
             .is_none());
+        let internal = ProviderCredential { access_token: "database-key".into(), refresh_token: None, expires_at: 0, subject: None };
+        reopened.replace("isyncyou-internal:store:a", "https://example.test", &internal).unwrap();
+        assert!(reopened.load("isyncyou-internal:store:a", "https://example.test").unwrap().unwrap().subject.is_none());
         let raw = std::fs::read_dir(dir.path().join("agent-credentials"))
             .unwrap()
             .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
@@ -204,7 +215,11 @@ mod tests {
         assert!(raw.iter().all(|bytes| !bytes
             .windows(b"refresh-sentinel".len())
             .any(|w| w == b"refresh-sentinel")));
+        assert!(raw.iter().all(|bytes| !bytes
+            .windows(b"subject-sentinel".len())
+            .any(|w| w == b"subject-sentinel")));
         reopened.delete("one", "https://example.test").unwrap();
+        reopened.delete("isyncyou-internal:store:a", "https://example.test").unwrap();
         assert!(reopened
             .load("one", "https://example.test")
             .unwrap()

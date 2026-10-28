@@ -16,10 +16,11 @@ internal object PushBroker {
         val bytes = Base64.decode(challenge.getString("payload"), Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
         require(bytes.size in 1..8192)
         val payload = JSONObject(String(bytes, Charsets.UTF_8))
+        val now = System.currentTimeMillis() / 1000
         require(payload.getInt("version") == 1 && payload.getString("challenge_id") == id &&
             payload.getString("action") == action && payload.getString("installation_id") == identity.installation &&
             payload.getString("endpoint") == endpoint && payload.getString("public_key") == identity.publicKey &&
-            payload.getLong("expires") >= System.currentTimeMillis() / 1000)
+            payload.getLong("expires") in now..(now + 180))
         val signature = PushInstallationKey.sign(context, account, bytes)
         bytes.fill(0)
         val body = JSONObject().put("challenge_id", id).put("signature", signature)

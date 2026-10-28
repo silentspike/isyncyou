@@ -1211,6 +1211,7 @@ fn cmd_init(
     archive_root: Option<PathBuf>,
     force: bool,
 ) -> Result<(), String> {
+    Config::with_config_lock(config, || {
     if config.exists() && !force {
         return Err(format!(
             "{} already exists (use --force to overwrite)",
@@ -1240,7 +1241,7 @@ fn cmd_init(
             );
         }
         _ => {
-            std::fs::write(config, CONFIG_TEMPLATE).map_err(|e| e.to_string())?;
+            isyncyou_core::recovery::atomic_write(config, CONFIG_TEMPLATE.as_bytes()).map_err(|e| e.to_string())?;
             println!(
                 "wrote a starter template to {} — edit it, then run `isyncyou check`",
                 config.display()
@@ -1248,6 +1249,7 @@ fn cmd_init(
         }
     }
     Ok(())
+    })
 }
 
 /// Resolve a setup field: the flag wins; in non-interactive mode a missing
@@ -1340,7 +1342,10 @@ fn cmd_setup(
     };
     cfg.validate()
         .map_err(|errs| format!("invalid config: {}", errs.join("; ")))?;
-    cfg.save(config)?;
+    Config::with_config_lock(config, || {
+        if config.exists() && !force { return Err(format!("{} already exists (use --force to overwrite)",config.display())); }
+        cfg.save(config)
+    })?;
     println!("wrote config for account '{id}' to {}", config.display());
 
     if no_connect {
@@ -2331,7 +2336,12 @@ fn cmd_export(config: &Path, account: &str, service: &str, out: &Path) -> Result
 /// Encrypt an account's plaintext store in place (atomic temp + rename). Refuses
 /// without a configured store key — there is no silent plaintext path (#328 AC-4).
 fn cmd_migrate_encrypt_store(config: &Path, account: &str) -> Result<(), String> {
-    let cfg = load_config(config)?;
+    let config = resolve_config_path(config);
+    Config::with_config_lock(&config, || {
+    let cfg = load_config(&config)?;
+    if cfg.provider_accounts.contains_key(account) {
+        return Err("self-hosted provider stores are managed separately and already require encryption".into());
+    }
     let path = store_path(&cfg, account)?;
     let secret = isyncyou_store::configured_store_key()
         .map_err(|e| e.to_string())?
@@ -2358,10 +2368,16 @@ fn cmd_migrate_encrypt_store(config: &Path, account: &str) -> Result<(), String>
         }
         Err(e) => Err(format!("encrypt store: {e}")),
     }
+    })
 }
 
 fn cmd_migrate(config: &Path, account: &str, new_root: &Path) -> Result<(), String> {
-    let mut cfg = load_config(config)?;
+    let config = resolve_config_path(config);
+    Config::with_config_lock(&config, || {
+    let mut cfg = load_config(&config)?;
+    if cfg.provider_accounts.contains_key(account) {
+        return Err("self-hosted account archive migration requires a provider key migration and is not supported yet".into());
+    }
     let old = cfg
         .accounts
         .iter()
@@ -2395,13 +2411,14 @@ fn cmd_migrate(config: &Path, account: &str, new_root: &Path) -> Result<(), Stri
             a.archive_root = new.clone();
         }
     }
-    cfg.save(config)?;
+    cfg.save(&config)?;
     println!(
         "migrated account '{account}' archive: {} -> {}",
         old.display(),
         new.display()
     );
     Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -3718,6 +3735,22 @@ mod tests {
         assert!(cmd_migrate(&p, "a", &other)
             .unwrap_err()
             .contains("not empty"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_preserves_self_hosted_archive_until_key_migration_supported() {
+        let dir = std::env::temp_dir().join(format!("isyncyou-cli-provider-migrate-{}",std::process::id()));
+        let old = dir.join("old"); let new = dir.join("new");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("keep"),b"data").unwrap();
+        let config = write_config(&dir,&old);
+        let mut cfg = Config::load(&config).unwrap();
+        cfg.provider_accounts.insert("a".into(),isyncyou_core::config::ProviderConfig::SelfHosted { origin:"https://example.test".into(),client_id:"client".into() });
+        cfg.save(&config).unwrap();
+        assert!(cmd_migrate(&config,"a",&new).unwrap_err().contains("provider key migration"));
+        assert_eq!(std::fs::read(old.join("keep")).unwrap(),b"data");
+        assert!(!new.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

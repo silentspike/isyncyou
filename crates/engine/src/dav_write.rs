@@ -23,6 +23,8 @@ pub struct ApprovedDavWrite {
     pub href: String,
     /// `None` means create-if-absent. Existing objects require a strong ETag.
     pub expected_etag: Option<String>,
+    /// Optional collection sync-token precondition for cross-resource effects.
+    pub expected_collection_token: Option<String>,
     /// `None` means delete; otherwise the complete intended ICS/VCF payload.
     pub raw: Option<Vec<u8>>,
 }
@@ -84,6 +86,7 @@ trait WriteTransport {
         href: &str,
         raw: Vec<u8>,
         etag: Option<&str>,
+        collection_token: Option<&str>,
     ) -> Result<Option<String>, DavError>;
     fn delete(&self, scope: &ProviderScope, href: &str, etag: &str) -> Result<(), DavError>;
 }
@@ -95,8 +98,9 @@ impl WriteTransport for DavClient {
         href: &str,
         raw: Vec<u8>,
         etag: Option<&str>,
+        collection_token: Option<&str>,
     ) -> Result<Option<String>, DavError> {
-        DavClient::put(self, scope, href, raw, etag)
+        DavClient::put_with_collection_precondition(self, scope, href, raw, etag, collection_token)
     }
     fn delete(&self, scope: &ProviderScope, href: &str, etag: &str) -> Result<(), DavError> {
         DavClient::delete(self, scope, href, etag)
@@ -149,32 +153,38 @@ fn dispatch<T: WriteTransport>(
             || !tag.ends_with('"')
             || tag.contains('\r')
             || tag.contains('\n')
+            || tag.len() < 2
+            || tag[1..tag.len()-1].bytes().any(|b| b < 0x21 || b > 0x7e || b == b'"')
         {
             return Err("A strong resource ETag is required".into());
         }
     } else if op.raw.is_none() {
         return Err("Delete requires a strong resource ETag".into());
     }
+    if let Some(token) = &op.expected_collection_token {
+        if token.len() > 4096 || reqwest::Url::parse(token).is_err() || token.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '<' | '>' | '(' | ')')) { return Err("Invalid collection precondition".into()); }
+    }
     let kind = if op.raw.is_some() {
         "dav-put"
     } else {
         "dav-delete"
     };
-    let intent = serde_json::to_string(&serde_json::json!({"kind":kind,"account":scope.account_id,"origin":scope.origin,"service":scope.service,"collection":scope.collection,"href":target,"etag":op.expected_etag,"raw_base64":op.raw.as_ref().map(|v| STANDARD.encode(v))})).map_err(|_| "Invalid DAV intent")?;
+    if op.raw.is_none() && op.expected_collection_token.is_some() { return Err("Collection precondition is unsupported for delete".into()); }
+    let intent = serde_json::to_string(&serde_json::json!({"kind":kind,"account":scope.account_id,"origin":scope.origin,"service":scope.service,"collection":scope.collection,"href":target,"etag":op.expected_etag,"collection_token":op.expected_collection_token,"raw_base64":op.raw.as_ref().map(|v| STANDARD.encode(v))})).map_err(|_| "Invalid DAV intent")?;
     let digest = format!("{:x}", Sha256::digest(intent.as_bytes()));
     if let Some(outcome) = recorded(store, scope, &op.operation_id, &digest)? {
         return Ok(outcome);
     }
     if !store
-        .claim_provider_mutation(scope, &op.operation_id, kind, &intent, &digest)
+        .claim_provider_target_mutation(scope, &op.operation_id, kind, target, &intent, &digest)
         .map_err(|e| e.to_string())?
     {
         return recorded(store, scope, &op.operation_id, &digest)?
-            .ok_or_else(|| "Mutation claim disappeared".into());
+            .ok_or_else(|| "Target has an unresolved mutation".into());
     }
     let result = match &op.raw {
         Some(raw) => transport
-            .put(scope, target, raw.clone(), op.expected_etag.as_deref())
+            .put(scope, target, raw.clone(), op.expected_etag.as_deref(), op.expected_collection_token.as_deref())
             .map(|_| ()),
         None => transport.delete(
             scope,
@@ -278,6 +288,35 @@ fn execute_inner(
     let target = client
         .validate_target(&scope, &op.href)
         .map_err(|e| e.to_string())?;
+    if scope.service == "calendar" {
+        if let Some(raw) = &op.raw {
+            use isyncyou_connectors::dav::edit::{resource_index, ResourceIndex};
+            let proposed = resource_index(raw)?;
+            if let ResourceIndex::Event { uid } = &proposed {
+                if op.expected_etag.is_some() {
+                    let previous = store.provider_object(&scope, &target).map_err(|e| e.to_string())?.ok_or("Cached event resource missing")?;
+                    if !matches!(resource_index(&previous.raw)?, ResourceIndex::Event {uid: old} if old == *uid) { return Err("Event UID or resource type changed".into()); }
+                }
+            }
+            if let ResourceIndex::Task(task) = proposed {
+                match &op.expected_etag {
+                    None if task.parent_uid.is_some() => return Err("Creating a task with parentage requires a validated graph operation".into()),
+                    Some(_) => {
+                        let previous = store.provider_object(&scope, &target).map_err(|e| e.to_string())?.ok_or("Cached task resource missing")?;
+                        let ResourceIndex::Task(old) = resource_index(&previous.raw)? else { return Err("Resource type changed".into()); };
+                        if old.uid != task.uid { return Err("Task UID cannot change during an edit".into()); }
+                        if old.parent_uid != task.parent_uid {
+                            let prepared = crate::dav_live::prepare_task_parent_in_store(&store, &scope, &target, &task.uid, task.parent_uid.as_deref())?;
+                            if prepared.raw != *raw || op.expected_collection_token != prepared.expected_collection_token || op.expected_etag.as_deref() != Some(prepared.expected_etag.as_str()) {
+                                return Err("Task parent effect no longer matches its validated graph".into());
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
     let (resource, privilege) = match (&op.raw, &op.expected_etag) {
         (Some(_), None) => (None, "bind"),
         (Some(_), Some(_)) => (Some(target.as_str()), "write-content"),
@@ -308,6 +347,7 @@ mod tests {
             _: &str,
             _: Vec<u8>,
             _: Option<&str>,
+            _: Option<&str>,
         ) -> Result<Option<String>, DavError> {
             self.calls.set(self.calls.get() + 1);
             if self.conflict {
@@ -335,6 +375,7 @@ mod tests {
             service: scope.service.clone(),
             href: "a.ics".into(),
             expected_etag: Some("\"v1\"".into()),
+            expected_collection_token: None,
             raw: Some(b"original bytes".to_vec()),
         };
         (scope, op)
@@ -357,6 +398,10 @@ mod tests {
             dispatch(&store, &fake, &scope, &op, target).unwrap(),
             WriteOutcome::Unknown
         );
+        assert_eq!(fake.calls.get(), 1);
+        let mut second = fixture().1;
+        second.operation_id = "op-2".into();
+        assert!(dispatch(&store, &fake, &scope, &second, target).is_err());
         assert_eq!(fake.calls.get(), 1);
         let (_, intent, _, state, _) = store
             .provider_mutation_intent(&scope, &op.operation_id)

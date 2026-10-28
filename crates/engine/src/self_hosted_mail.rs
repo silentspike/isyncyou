@@ -179,6 +179,19 @@ pub fn sending_identities(
         .ok_or_else(|| "Invalid sending identities".into())
 }
 
+/// Read the native seen flag without using a stale cache result.
+pub fn read_state(cfg: &Config, account: &str, provider: &SelfHostedClient, email_id: &str) -> Result<bool, String> {
+    scope(cfg,account,provider)?;
+    if email_id.is_empty() { return Err("Missing email identity".into()); }
+    let ids = vec![email_id.to_owned()];
+    let result = provider.client.get("Email",Some(&ids),None).map_err(|_| "JMAP email unavailable")?;
+    if !list(&result,"notFound")?.is_empty() { return Err("JMAP email unavailable".into()); }
+    let rows = result["list"].as_array().ok_or("Invalid JMAP email")?;
+    if rows.len() != 1 || rows[0]["id"].as_str() != Some(email_id) { return Err("Invalid JMAP email identity".into()); }
+    let keywords = rows[0]["keywords"].as_object().ok_or("Invalid JMAP keywords")?;
+    match keywords.get("$seen") { None => Ok(false), Some(Value::Bool(true)) => Ok(true), _ => Err("Invalid JMAP seen flag".into()) }
+}
+
 /// Initial enumeration is reconciled only when all pages share one query state.
 /// Subsequent changes are applied with their cursor in the same transaction.
 pub fn sync(
@@ -521,6 +534,107 @@ pub enum SendOutcome {
     Unknown,
 }
 
+fn draft_addresses(value: &Value, key: &str, required: bool) -> Result<Vec<String>, String> {
+    let Some(addresses) = value.get(key).filter(|v| !v.is_null()) else {
+        return if required { Err("Draft recipients required".into()) } else { Ok(Vec::new()) };
+    };
+    let addresses = addresses.as_array().ok_or("Invalid draft addresses")?;
+    if addresses.len() > 1000 || (required && addresses.is_empty()) {
+        return Err("Invalid draft addresses".into());
+    }
+    addresses.iter().map(|address| {
+        let fields = address.as_object().ok_or("Invalid draft address")?;
+        let email = fields.get("email").and_then(Value::as_str).ok_or("Invalid draft address")?;
+        if fields.len() != 1 || email.is_empty() || email.len() > 320 || email.chars().any(char::is_control) {
+            return Err("Invalid draft address".into());
+        }
+        Ok(email.to_owned())
+    }).collect()
+}
+
+fn native_recipients(email: &Value) -> Result<Vec<String>, String> {
+    let mut result = Vec::new();
+    for key in ["to", "cc", "bcc"] {
+        if let Some(addresses) = email.get(key).filter(|value| !value.is_null()) {
+            for address in addresses.as_array().ok_or("Invalid native recipients")? {
+                let value = address.get("email").and_then(Value::as_str).ok_or("Invalid native recipient")?;
+                if value.is_empty() || value.len() > 320 || value.chars().any(char::is_control) {
+                    return Err("Invalid native recipient".into());
+                }
+                result.push(value.to_owned());
+                if result.len() > 1000 { return Err("Too many native recipients".into()); }
+            }
+        }
+    }
+    result.sort();
+    result.dedup();
+    Ok(result)
+}
+
+#[cfg(test)]
+mod recipient_tests {
+    use super::{draft_addresses, native_recipients};
+    use serde_json::json;
+
+    #[test]
+    fn draft_addresses_reject_header_injection_and_unexpected_fields() {
+        assert!(draft_addresses(&json!({"to":[{"email":"a@example.org\r\nBcc: x"}]}), "to", true).is_err());
+        assert!(draft_addresses(&json!({"to":[{"email":"a@example.org", "name":"A"}]}), "to", true).is_err());
+        assert!(draft_addresses(&json!({"to":[]}), "to", true).is_err());
+        assert_eq!(draft_addresses(&json!({}), "cc", false).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn native_envelope_includes_cc_and_bcc_and_rejects_malformed_rows() {
+        let email = json!({"to":[{"email":"a@example.org","name":"A"}], "cc":[{"email":"b@example.org"}], "bcc":[{"email":"c@example.org"}]});
+        assert_eq!(native_recipients(&email).unwrap(), vec!["a@example.org", "b@example.org", "c@example.org"]);
+        assert!(native_recipients(&json!({"bcc":[{}]})).is_err());
+    }
+}
+
+/// Update the seen flag once using a native conditional state and durable intent.
+pub fn set_read(cfg:&Config,account:&str,store:&Store,provider:&SelfHostedClient,operation_id:&str,email_id:&str,is_read:bool) -> Result<SendOutcome,String> {
+    if operation_id.is_empty() || email_id.is_empty() { return Err("Invalid mail operation".into()); }
+    let scope=scope(cfg,account,provider)?;
+    let intent=serde_json::to_string(&serde_json::json!({"kind":"set_read","email_id":email_id,"is_read":is_read})).map_err(|_| "Invalid mail operation")?;
+    let digest=format!("{:x}",Sha256::digest(intent.as_bytes()));
+    if let Some((previous,state,result))=store.provider_mutation(&scope,operation_id).map_err(|e| e.to_string())? {
+        if previous!=digest { return Err("Mail operation differs from recorded intent".into()); }
+        return Ok(match state.as_str() { "confirmed"=>SendOutcome::Confirmed(result.ok_or("Missing native email identity")?), "rejected"=>SendOutcome::Rejected, _=>SendOutcome::Unknown });
+    }
+    let ids=vec![email_id.to_owned()];
+    let email=provider.client.get("Email",Some(&ids),None).map_err(|_| "Email unavailable")?;
+    if !list(&email,"notFound")?.is_empty() { return Err("Email unavailable".into()); }
+    let rows=email["list"].as_array().ok_or("Invalid email response")?;
+    if rows.len()!=1 || rows[0]["id"].as_str()!=Some(email_id) { return Err("Invalid email identity".into()); }
+    let memberships=rows[0]["mailboxIds"].as_object().ok_or("Email mailbox membership unavailable")?;
+    if memberships.iter().any(|(id,present)| id.is_empty() || present.as_bool()!=Some(true)) { return Err("Invalid email mailbox membership".into()); }
+    let mailbox_ids:Vec<String>=memberships.iter().filter(|(_,present)| present.as_bool()==Some(true)).map(|(id,_)|id.clone()).collect();
+    if mailbox_ids.is_empty() || mailbox_ids.len()>provider.client.max_objects_in_get() { return Err("Email mailbox rights unavailable".into()); }
+    let boxes=provider.client.get("Mailbox",Some(&mailbox_ids),None).map_err(|_| "Email mailbox rights unavailable")?;
+    if !list(&boxes,"notFound")?.is_empty() { return Err("Email mailbox rights unavailable".into()); }
+    let values=boxes["list"].as_array().ok_or("Email mailbox rights unavailable")?;
+    let expected:std::collections::HashSet<&str>=mailbox_ids.iter().map(String::as_str).collect();
+    let mut seen=std::collections::HashSet::new();
+    for value in values {
+        let id=value["id"].as_str().ok_or("Invalid mailbox identity")?;
+        if !expected.contains(id) || !seen.insert(id) || value.pointer("/myRights/maySetSeen").and_then(Value::as_bool)!=Some(true) { return Err("Email seen flag is not writable".into()); }
+    }
+    if seen.len()!=expected.len() { return Err("Email mailbox rights unavailable".into()); }
+    let state=field(&email,"state")?;
+    if !store.claim_provider_target_mutation(&scope,operation_id,"mail_set_read",email_id,&intent,&digest).map_err(|e| e.to_string())? { return Ok(SendOutcome::Unknown); }
+    let patch=serde_json::json!({"keywords/$seen":if is_read { Some(true) } else { None }});
+    match provider.client.update_email(email_id,state,&patch) {
+        Ok(EmailUpdateResult::Applied) => {
+            if store.finish_provider_mutation(&scope,operation_id,Some(email_id)).map_err(|e| e.to_string())? { Ok(SendOutcome::Confirmed(email_id.into())) } else { Ok(SendOutcome::Unknown) }
+        }
+        Ok(EmailUpdateResult::Rejected) => {
+            if store.finish_provider_mutation(&scope,operation_id,None).map_err(|e| e.to_string())? { Ok(SendOutcome::Rejected) } else { Ok(SendOutcome::Unknown) }
+        }
+        _ => Ok(SendOutcome::Unknown),
+    }
+}
+
 /// Create one draft with a durable intent; uncertain creation is never replayed.
 pub fn create_draft(
     cfg: &Config,
@@ -542,6 +656,10 @@ pub fn create_draft(
         "keywords",
         "subject",
         "to",
+        "cc",
+        "bcc",
+        "header:Importance:asText",
+        "header:Disposition-Notification-To:asAddresses",
         "bodyValues",
         "htmlBody",
     ];
@@ -552,22 +670,20 @@ pub fn create_draft(
         return Err("Unsupported draft fields".into());
     }
     let subject = email["subject"].as_str().ok_or("Draft subject required")?;
-    let recipients = email["to"].as_array().ok_or("Draft recipients required")?;
+    let to = draft_addresses(email,"to",true)?;
+    let cc = draft_addresses(email,"cc",false)?;
+    let bcc = draft_addresses(email,"bcc",false)?;
     if subject.contains('\r')
         || subject.contains('\n')
-        || recipients.len() > 1000
-        || recipients.iter().any(|recipient| {
-            recipient.as_object().is_none_or(|fields| fields.len() != 1)
-                || recipient["email"].as_str().is_none_or(|address| {
-                    address.is_empty()
-                        || address.len() > 320
-                        || address.contains('\r')
-                        || address.contains('\n')
-                })
-        })
+        || to.len()+cc.len()+bcc.len() > 1000
     {
         return Err("Invalid draft recipients or subject".into());
     }
+    if let Some(importance) = email.get("header:Importance:asText") {
+        if !matches!(importance.as_str(),Some("low"|"normal"|"high")) { return Err("Invalid draft importance".into()); }
+    }
+    let receipt = draft_addresses(email,"header:Disposition-Notification-To:asAddresses",false)?;
+    if receipt.len()>1 { return Err("Invalid read receipt address".into()); }
     let body_values = email["bodyValues"]
         .as_object()
         .ok_or("Draft body required")?;
@@ -640,6 +756,11 @@ pub fn create_draft(
             != Some(true)
     {
         return Err("Draft mailbox is not writable".into());
+    }
+    if let Some(address) = receipt.first() {
+        let identities = provider.client.get("Identity",None,None).map_err(|_| "Sending identities unavailable")?;
+        let identities = identities["list"].as_array().ok_or("Sending identities unavailable")?;
+        if !identities.iter().any(|identity| identity["email"].as_str()==Some(address.as_str())) { return Err("Read receipt address is not an authorized sending identity".into()); }
     }
     if !store
         .claim_provider_mutation(&scope, operation_id, "draft", &intent, &digest)
@@ -743,6 +864,12 @@ pub fn send_approved(
         || rows[0]["blobId"].as_str() != Some(approved.blob_id.as_str())
     {
         return Err("Approved email changed or is unavailable".into());
+    }
+    let mut approved_recipients = approved.recipients.clone();
+    approved_recipients.sort();
+    approved_recipients.dedup();
+    if native_recipients(&rows[0])? != approved_recipients {
+        return Err("Approved recipients do not match the native draft".into());
     }
     let identity_ids = vec![approved.identity_id.clone()];
     let identities = client

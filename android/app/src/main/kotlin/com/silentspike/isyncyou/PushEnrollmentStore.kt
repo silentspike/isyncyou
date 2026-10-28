@@ -58,6 +58,14 @@ internal object PushEnrollmentStore {
         return true
     }
 
+    @Synchronized
+    fun removeIf(context: Context, instance: String, predicate: (JSONObject) -> Boolean): Boolean {
+        val state = get(context, instance) ?: return false
+        if (!predicate(state)) return false
+        remove(context, instance)
+        return true
+    }
+
     private fun key(mustExist: Boolean): SecretKey {
         val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         (ks.getEntry(ALIAS, null) as? KeyStore.SecretKeyEntry)?.let { return it.secretKey }

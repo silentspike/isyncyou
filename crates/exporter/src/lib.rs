@@ -28,6 +28,9 @@ pub fn capture_page(
                 io::Error::new(io::ErrorKind::InvalidData, "outbox digest mismatch").into(),
             );
         }
+        let related_blobs = if capture.scope.service == "mail" {
+            mail_dependencies(&capture.object.raw)?
+        } else { Vec::new() };
         result.push((
             capture.sequence,
             Object {
@@ -39,6 +42,7 @@ pub fn capture_page(
                 version: capture.version_key,
                 digest: hash,
                 size: capture.object.raw.len() as u64,
+                related_blobs,
             },
         ));
     }
@@ -125,6 +129,34 @@ pub struct Collection {
     pub complete: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobRef {
+    pub digest: String,
+    pub size: u64,
+}
+
+/// Return the immutable original MIME reference for a metadata version. Legacy
+/// envelopes contain their own MIME and therefore have no related blob.
+pub fn mail_dependencies(raw: &[u8]) -> io::Result<Vec<BlobRef>> {
+    if raw.starts_with(b"ISYNC-MIME-1\n") {
+        original_mail(raw)?;
+        return Ok(Vec::new());
+    }
+    if raw.len() > 1024 * 1024 { return Err(io::Error::new(io::ErrorKind::InvalidData, "mail metadata too large")); }
+    let record: serde_json::Value = serde_json::from_slice(raw).map_err(io::Error::other)?;
+    if record.get("schema").and_then(serde_json::Value::as_str) != Some("isyncyou.mail-metadata.v1") ||
+       !record.get("native").is_some_and(serde_json::Value::is_object) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid mail metadata"));
+    }
+    let digest = record.get("mime_digest").and_then(serde_json::Value::as_str)
+        .filter(|x| x.len() == 64 && x.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid MIME digest"))?;
+    let size = record.get("mime_size").and_then(serde_json::Value::as_u64)
+        .filter(|x| *x <= 64 * 1024 * 1024)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid MIME size"))?;
+    Ok(vec![BlobRef { digest: digest.to_owned(), size }])
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Object {
     pub account: String,
@@ -135,6 +167,8 @@ pub struct Object {
     pub version: String,
     pub digest: String,
     pub size: u64,
+    #[serde(default)]
+    pub related_blobs: Vec<BlobRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,7 +194,13 @@ fn sync_dir(path: &Path) -> io::Result<()> {
 /// Store immutable bytes. Callers must enforce a configured space quota before
 /// supplying data; this function never removes older or unprotected objects.
 pub fn put(root: &Path, bytes: &[u8]) -> io::Result<String> {
+    if root.symlink_metadata().is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "archive path is a symlink"));
+    }
     let blobs = root.join("blobs");
+    if blobs.symlink_metadata().is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "blob directory is a symlink"));
+    }
     fs::create_dir_all(&blobs)?;
     fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
     fs::set_permissions(&blobs, fs::Permissions::from_mode(0o700))?;
@@ -174,7 +214,7 @@ pub fn put(root: &Path, bytes: &[u8]) -> io::Result<String> {
     let hash = digest(bytes);
     let path = blobs.join(&hash);
     if path.exists() {
-        if digest(&fs::read(&path)?) != hash {
+        if !fs::symlink_metadata(&path)?.is_file() || digest(&fs::read(&path)?) != hash {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "existing blob corrupt",
@@ -259,12 +299,26 @@ pub fn publish(root: &Path, manifest: &Manifest) -> io::Result<String> {
             ));
         }
         let old: Manifest = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-        previous.extend(old.objects.into_iter().map(|o| (o.digest, o.size)));
+        for o in old.objects {
+            previous.insert((o.digest, o.size));
+            previous.extend(o.related_blobs.into_iter().map(|b| (b.digest, b.size)));
+        }
     }
     for object in &manifest.objects {
-        if object.digest.len() != 64
-            || !object
-                .digest
+        if object.digest.len() != 64 || !object.digest.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid digest"));
+        }
+        if object.service == "mail" {
+            let bytes = fs::read(root.join("blobs").join(&object.digest))?;
+            if mail_dependencies(&bytes)? != object.related_blobs {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "mail dependency mismatch"));
+            }
+        }
+        if object.related_blobs.len() > 64 { return Err(io::Error::new(io::ErrorKind::InvalidInput, "too many related blobs")); }
+        let refs = std::iter::once((&object.digest, object.size)).chain(object.related_blobs.iter().map(|b| (&b.digest, b.size)));
+        for (hash, size) in refs {
+        if hash.len() != 64
+            || !hash
                 .bytes()
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
         {
@@ -273,14 +327,15 @@ pub fn publish(root: &Path, manifest: &Manifest) -> io::Result<String> {
                 "invalid digest",
             ));
         }
-        let path = root.join("blobs").join(&object.digest);
+        let path = root.join("blobs").join(hash);
         let metadata = fs::symlink_metadata(&path)?;
         if !metadata.is_file()
-            || metadata.len() != object.size
-            || (!previous.contains(&(object.digest.clone(), object.size))
-                && digest(&fs::read(path)?) != object.digest)
+            || metadata.len() != size
+            || (!previous.contains(&(hash.clone(), size))
+                && digest(&fs::read(path)?) != *hash)
         {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "blob mismatch"));
+        }
         }
     }
     let data = serde_json::to_vec(manifest).map_err(io::Error::other)?;
@@ -292,6 +347,9 @@ pub fn publish(root: &Path, manifest: &Manifest) -> io::Result<String> {
     }
     let generation = digest(&data);
     let manifests = root.join("manifests");
+    if manifests.symlink_metadata().is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "manifest directory is a symlink"));
+    }
     fs::create_dir_all(&manifests)?;
     fs::set_permissions(&manifests, fs::Permissions::from_mode(0o700))?;
     sync_dir(root)?;
@@ -402,7 +460,7 @@ mod tests {
             collections: vec![Collection {
                 account: "a".into(),
                 origin: "https://example.test".into(),
-                service: "mail".into(),
+                service: "calendar".into(),
                 collection: "inbox".into(),
                 cursor: "c1".into(),
                 observed_at: 100,
@@ -411,12 +469,13 @@ mod tests {
             objects: vec![Object {
                 account: "a".into(),
                 origin: "https://example.test".into(),
-                service: "mail".into(),
+                service: "calendar".into(),
                 collection: "inbox".into(),
                 id: "i".into(),
                 version: "v".into(),
                 digest: hash.clone(),
                 size: 8,
+                related_blobs: Vec::new(),
             }],
             events: vec![],
         };
@@ -447,5 +506,30 @@ mod tests {
         assert_eq!(native["id"], "one");
         assert_eq!(original, mime);
         assert!(original_mail(b"ISYNC-MIME-1\n\xff\xff\xff\xff").is_err());
+    }
+
+    #[test]
+    fn metadata_versions_share_one_immutable_original_and_missing_dependency_blocks_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mime = put(root, b"same original MIME").unwrap();
+        let a_data = serde_json::to_vec(&serde_json::json!({"schema":"isyncyou.mail-metadata.v1","native":{"flags":[]},"mime_digest":mime,"mime_size":18})).unwrap();
+        let b_data = serde_json::to_vec(&serde_json::json!({"schema":"isyncyou.mail-metadata.v1","native":{"flags":["seen"]},"mime_digest":mime,"mime_size":18})).unwrap();
+        let a = put(root, &a_data).unwrap();
+        let b = put(root, &b_data).unwrap();
+        let make = |digest: String, size: u64, version: &str| Object {
+            account: "a".into(), origin: "http://127.0.0.1/".into(), service: "mail".into(),
+            collection: "a".into(), id: "one".into(), version: version.into(), digest, size,
+            related_blobs: vec![BlobRef { digest: mime.clone(), size: 18 }],
+        };
+        let mut manifest = Manifest { schema: 1, capture_highwater: 1, event_highwater: 0,
+            collections: vec![Collection { account: "a".into(), origin: "http://127.0.0.1/".into(),
+                service: "mail".into(), collection: "a".into(), cursor: "state".into(),
+                observed_at: 100, complete: true }], objects: vec![make(a, a_data.len() as u64, "one")], events: vec![] };
+        publish(root, &manifest).unwrap();
+        manifest.objects.push(make(b, b_data.len() as u64, "two"));
+        publish(root, &manifest).unwrap();
+        manifest.objects[1].related_blobs[0].digest = "f".repeat(64);
+        assert!(publish(root, &manifest).is_err());
     }
 }

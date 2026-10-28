@@ -1316,7 +1316,7 @@ impl AgentControlStore {
         code: &str,
         now_ms: u64,
     ) -> Result<(), String> {
-        if !matches!(code, "completed" | "failed" | "outcome_unknown") {
+        if !matches!(code, "completed" | "failed" | "provider_rejected" | "outcome_unknown") {
             return Err("control_store_unavailable".into());
         }
         let connection = self
@@ -9114,6 +9114,25 @@ mod tests {
                 | PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Cancelled)
                 | PendingConfirmOutcome::Rejected(ClosedConfirmationCode::Replayed)
         ));
+        drop(registry);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_confirmation_persists_provider_rejection_distinct_from_unknown() {
+        let root = temp_root("confirm-provider-rejection");
+        let credentials = credential_store(&root);
+        let persistence = Arc::new(AgentControlStore::open(&root, &credentials, INSTALLATION_PRINCIPAL, 1).unwrap());
+        let registry = PendingRegistry::with_persistence(persistence.clone());
+        for (timestamp, code) in [(1_000, "provider_rejected"), (2_000, "outcome_unknown")] {
+            let (pending, token) = registry.register_bound(backup_action(), "backup", timestamp, 60_000, owner()).unwrap();
+            assert!(matches!(registry.confirm(&pending.id, &token, &pending.action_hash, &owner_proof(), timestamp + 1), PendingConfirmOutcome::Confirmed(_)));
+            persistence.finish_pending_confirmation(&pending.id, code, timestamp + 2).unwrap();
+        }
+        let projections = persistence.pending_confirm_projections(8).unwrap();
+        assert_eq!(projections.len(), 2);
+        assert_eq!(projections[0].code, "provider_rejected");
+        assert_eq!(projections[1].code, "outcome_unknown");
         drop(registry);
         std::fs::remove_dir_all(root).unwrap();
     }

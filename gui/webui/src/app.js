@@ -338,6 +338,8 @@ const MOBILE = !!BRIDGE;
 let _bridgeSeq = 0;
 const BRIDGE_TIMEOUT_MS = 15000;
 const NATIVE_TIMEOUT_MS = 5000;
+const PROVIDER_NATIVE_TIMEOUT_MS = 125000;
+const providerActionsUnknown = new Set();
 const BIO_TIMEOUT_MS = 120000;
 const MUTATION_COMMIT_TIMEOUT_MS = 125000;
 // Provider transport permits 60s to first response and 120s of SSE read idleness.
@@ -1991,7 +1993,7 @@ function openCompose(opts = {}) {
     bodyEl,
     el("div", { class: "cmp-footer" },
       el("label", { class: "cmp-opt", title: "Importance" }, icon("flag", "icon-sm"), impSel),
-      el("label", { class: "cmp-opt" }, rrChk, el("span", { text: "Read receipt" })),
+      el("label", { class: "cmp-opt" }, rrChk, el("span", { text: "Request read receipt (not guaranteed)" })),
       el("div", { class: "spacer", style: "flex:1" }),
       el("button", { class: "btn ghost", type: "button", onclick: (e) => composeSubmit(e.currentTarget, true) }, icon("archive", "icon-sm"), "Save draft"),
       el("button", { class: "btn primary", type: "button", onclick: (e) => composeSubmit(e.currentTarget, false) }, icon("send", "icon-sm"), "Send")));
@@ -2015,8 +2017,8 @@ async function composeSubmit(btn, asDraft) {
     if (asDraft) {
       const draft = await stageMutation("mail_body", {
         account: App.account, operation: "draft", target: "",
-        recipients: splitEmails(to), cc: [], bcc: [], subject,
-        importance: null, read_receipt: false, all: false,
+        recipients: splitEmails(to), cc: ownProvider ? splitEmails(cc) : [], bcc: ownProvider ? splitEmails(bcc) : [], subject,
+        importance: ownProvider && importance !== "normal" ? importance : null, read_receipt: ownProvider && rr, all: false,
       }, new TextEncoder().encode(body));
       toast(draft && draft.sync_state === "pending" ? "Draft created; local synchronization is pending." : "Draft saved");
     } else {
@@ -6663,7 +6665,9 @@ async function confirmAgentPending(pendingId) {
   try {
     await postJson("/api/v1/agent/confirm", CAP.agent, attempt.request);
     updateAgentPendingStatus(record, "confirmed");
-    record.result = "Completed successfully.";
+    record.result = typeof record.preview === "string" && record.preview.startsWith("isyncyou-mail-confirm-v1\n")
+      ? "Message submitted. Delivery has not yet been verified."
+      : "Completed successfully.";
     clearAgentPendingAuthority(record);
   } catch (e) {
     if (e && e.nativePromptDenied) {
@@ -6685,6 +6689,7 @@ async function confirmAgentPending(pendingId) {
       updateAgentPendingStatus(record, status);
       record.error = status === "expired" ? "Confirmation expired."
         : status === "cancelled" ? "Confirmation was cancelled."
+        : e.code === "provider_submission_rejected" ? "The provider rejected the submission. No message was submitted."
         : "The action was not confirmed.";
       clearAgentPendingAuthority(record);
     }
@@ -7589,7 +7594,7 @@ async function ensureAgentSession() {
   if (AssistantState.selectedSessionId && AssistantState.selectedSessionAccount === App.account) {
     return AssistantState.selectedSessionId;
   }
-  const page = await request("GET", "/api/v1/agent/session/list?limit=100", {
+  const page = await request("GET", "/api/v1/agent/session/list?" + qs({ limit: 100, account: App.account }), {
     capToken: CAP.agent,
   });
   const sessions = Array.isArray(page.sessions) ? page.sessions : [];
@@ -7599,6 +7604,7 @@ async function ensureAgentSession() {
     const created = await postJson("/api/v1/agent/session/create", CAP.agent, {
       request_id: crypto.randomUUID(),
       display_name: "Assistant",
+      account: App.account,
     });
     session = created && created.session;
   }
@@ -7626,6 +7632,7 @@ function sessionRecordsToTranscript(records) {
       completed: "Action completed.",
       cancelled: "Action cancelled. No changes were made.",
       failed: "Action did not complete.",
+      provider_rejected: "The provider rejected the submission. No message was submitted.",
       outcome_unknown: "The action outcome could not be verified.",
     };
     return copy[code] || "Action status updated.";
@@ -8417,21 +8424,47 @@ function renderAccountMenu(body) {
     if (CAP.account && a.provider === "self_hosted") {
       const connected = accountRoleStatus(a, "reader").state === "connected";
       const controls = el("div", { class: "acct-acts" });
-      controls.append(el("button", { class: "btn sm", onclick: () => providerAccountAction(a, body, connected) }, connected ? "Disconnect" : "Connect"));
+      controls.append(el("button", { class: "btn sm", disabled: providerActionsUnknown.has(a.id), onclick: () => providerAccountAction(a, body, connected) }, connected ? "Disconnect" : "Connect"));
       row.append(el("div", { class: "acct-role" },
         el("span", { class: "acct-role-copy" }, el("b", { text: "Self-hosted account" }),
           el("span", { class: "dim", text: connected ? "Local grant available" : "Not connected" })), controls));
+      {
+        const listQuarantine = BRIDGE
+          ? nativeCall("providerQuarantineList", { account: a.id }, NATIVE_TIMEOUT_MS)
+          : postJson("/api/v1/account/provider/quarantine/list", CAP.account, { request_id: crypto.randomUUID(), account: a.id });
+        void listQuarantine.then(result => {
+          if (!result || !Array.isArray(result.ids) || !result.ids.length) return;
+          const notice = el("div", { class: "acct-role" }, el("span", { class: "acct-role-copy", text: "A rejected sign-in has a grant whose revocation is pending." }));
+          result.ids.forEach(id => {
+            if (typeof id !== "string" || !/^[a-f0-9]{64}$/.test(id)) return;
+            notice.append(el("button", { class: "btn sm", text: "Retry revocation", onclick: async e => {
+              e.currentTarget.disabled = true;
+              try {
+                const outcome = BRIDGE
+                  ? await nativeCall("providerQuarantineRevoke", { account: a.id, recovery_id: id }, PROVIDER_NATIVE_TIMEOUT_MS)
+                  : await postJson("/api/v1/account/provider/quarantine/revoke", CAP.account, { request_id: crypto.randomUUID(), account: a.id, recovery_id: id });
+                if (!outcome || outcome.revoked !== true) throw new Error("revocation_unconfirmed");
+                toast("Grant revocation confirmed.");
+                renderAccountMenu(body);
+              } catch (_) { toast("Grant revocation is unconfirmed. Check status before taking further action.", "err"); }
+            } }));
+          });
+          row.append(notice);
+        }).catch(() => {});
+      }
       if (BRIDGE && connected) {
         const pushStatus = el("span", { class: "dim", text: "Checking push setup…" });
         const showPush = result => {
-          const labels = { not_registered: "Not configured", registering: "Registering", endpoint_received: "Endpoint received", credentials_ready: "Configure distributor", awaiting_proof: "Awaiting verification", verification_pending: "Verification pending", active: "Active", degraded: "Delayed", create_unknown: "Enrollment outcome unknown", delivery_unknown: "Verification outcome unknown", unavailable: "Unavailable" };
-          pushStatus.textContent = labels[result && result.status] || "Status unavailable";
+          const labels = { not_registered: "Not configured", configuration_required: "Configuration required", registering: "Registering", endpoint_received: "Endpoint received", credentials_ready: "Configure distributor", awaiting_proof: "Awaiting verification", verification_pending: "Verification pending", active: "Registered; delivery not yet observed", degraded: "Delayed", create_unknown: "Enrollment outcome unknown", delivery_unknown: "Verification outcome unknown", unavailable: "Unavailable" };
+          const status = labels[result && result.status] || "Status unavailable";
+          const lastSync = result && Number(result.last_sync_at) > 0 ? ` · Last account sync ${new Date(Number(result.last_sync_at) * 1000).toLocaleString()}` : " · No successful account sync observed";
+          pushStatus.textContent = status + (result && result.catch_up_pending ? " · Catch-up pending" : "") + lastSync;
         };
         void nativeCall("providerPushStatus", { account: a.id }, NATIVE_TIMEOUT_MS).then(showPush).catch(() => showPush(null));
         row.append(el("div", { class: "acct-role" }, el("span", { class: "acct-role-copy" }, el("b", { text: "Push updates" }), pushStatus),
-          el("button", { class: "btn sm", onclick: async () => {
-            try { showPush(await nativeCall("providerPushSetup", { account: a.id }, NATIVE_TIMEOUT_MS)); }
-            catch (_) { toast("Push setup is unavailable.", "err"); }
+          el("button", { class: "btn sm", onclick: async e => {
+            try { showPush(await nativeCall("providerPushSetup", { account: a.id }, PROVIDER_NATIVE_TIMEOUT_MS)); }
+            catch (error) { if (error.message === "Bridge timeout") e.currentTarget.disabled = true; toast(error.message === "Bridge timeout" ? "Push setup outcome is unknown. Check its status before taking further action." : "Push setup is unavailable.", "err"); }
           } }, "Set up")));
       }
     } else if (CAP.account) {
@@ -8454,9 +8487,42 @@ function renderAccountMenu(body) {
     }
     body.append(row);
   });
+  if (CAP.account) body.append(el("button", { class: "btn sm", type: "button", onclick: () => openProviderAccountSetup(body) }, icon("plus", "icon-sm"), "Add self-hosted account"));
   body.append(el("div", { class: "acct-note dim" }, CAP.account
     ? "Microsoft accounts connect Reader and Writer separately."
     : "Read-only server — account switching only."));
+}
+function openProviderAccountSetup(menuBody) {
+  const account = el("input", { class: "input", placeholder: "Account identifier" });
+  const username = el("input", { class: "input", placeholder: "Provider username or email" });
+  const origin = el("input", { class: "input", placeholder: "https://provider.example" });
+  const client = el("input", { class: "input", placeholder: "OAuth client ID" });
+  const form = el("div", { class: "compose" },
+    el("p", { class: "dim", text: "Enter the exact provider username or email, provider origin and registered public OAuth client ID. Linux requires an available, unlocked system keyring. No password is stored here." }),
+    account, username, origin, client,
+    el("button", { class: "btn primary", type: "button", onclick: async e => {
+      const button = e.currentTarget;
+      button.disabled = true;
+      const values = { account: account.value.trim(), username: username.value.trim(), origin: origin.value.trim(), client_id: client.value.trim() };
+      try {
+        const result = BRIDGE
+          ? await nativeCall("providerCreateAccount", values, PROVIDER_NATIVE_TIMEOUT_MS)
+          : await postJson("/api/v1/account/provider/create", CAP.account, { request_id: crypto.randomUUID(), ...values });
+        if (!result || result.created !== true) throw new Error("account_setup_failed");
+        await reloadAccounts();
+        closeSheet();
+        renderAccountMenu(menuBody);
+        toast("Account added. Connect it to sign in.");
+      } catch (error) {
+        if (error.message === "Bridge timeout") {
+          toast("Account creation outcome is unknown. Check the account list before taking further action.", "err");
+          return;
+        }
+        toast("Account could not be added. Check the details and try again.", "err");
+      }
+      button.disabled = false;
+    } }, "Add account"));
+  openSheet("Add self-hosted account", form);
 }
 async function providerAccountAction(a, body, connected) {
   if (!BRIDGE) {
@@ -8464,7 +8530,7 @@ async function providerAccountAction(a, body, connected) {
     return startAccountLogin(a, "reader", body);
   }
   try {
-    const result = await nativeCall(connected ? "providerSignOut" : "providerSignIn", { account: a.id }, NATIVE_TIMEOUT_MS);
+    const result = await nativeCall(connected ? "providerSignOut" : "providerSignIn", { account: a.id }, PROVIDER_NATIVE_TIMEOUT_MS);
     if (connected && result && result.connected === false) {
       await reloadAccounts();
       toast("Provider account disconnected");
@@ -8472,13 +8538,21 @@ async function providerAccountAction(a, body, connected) {
     } else if (!connected && result && result.opened) {
       toast("Complete sign-in in your browser.");
     } else throw new Error("provider_auth_unavailable");
-  } catch (_) { toast("Provider account action failed. Try again.", "err"); }
+  } catch (error) {
+    if (error.message === "Bridge timeout") {
+      providerActionsUnknown.add(a.id);
+      renderAccountMenu(body);
+      toast("The account action outcome is unknown. Check account status before taking further action.", "err");
+    } else toast("Provider account action failed.", "err");
+  }
 }
 if (typeof window !== "undefined") window.addEventListener("isy-provider-auth", async event => {
   if (event.detail === "connected") {
     try { await reloadAccounts(); } catch (_) {}
     toast("Provider account connected");
-  } else if (event.detail === "failed") toast("Provider sign-in failed.", "err");
+  } else if (event.detail === "revocation_pending") toast("Sign-in was rejected and grant revocation is pending. Open the account menu to review it.", "err");
+  else if (event.detail === "revocation_unrecoverable") toast("Sign-in was rejected; revocation is unconfirmed and local recovery is unavailable.", "err");
+  else if (event.detail === "failed") toast("Provider sign-in failed.", "err");
 });
 async function accountSignOut(a, role, body) {
   try {
@@ -8486,7 +8560,12 @@ async function accountSignOut(a, role, body) {
     await reloadAccounts();
     toast(d.message || `${ACCOUNT_ROLE_META[role].label} disconnected`);
   }
-  catch (_) { toast("Disconnect failed. Try again.", "err"); }
+  catch (_) {
+    if (a.provider === "self_hosted") {
+      providerActionsUnknown.add(a.id);
+      toast("Disconnect outcome is unknown. Check account status before taking further action.", "err");
+    } else toast("Disconnect failed. Try again.", "err");
+  }
   renderAccountMenu(body);
 }
 async function startAccountLogin(a, role, body) {
@@ -8587,11 +8666,16 @@ async function startAccountLogin(a, role, body) {
       pickerButton.disabled = true;
       await finishAccountLoginGuard(login.login_id);
       await reloadAccounts();
+      if (ownProvider && CAP.sync) {
+        await postJson("/api/v1/sync/now", CAP.sync, { request_id: crypto.randomUUID() }).catch(() => {});
+      }
       toast(`${roleMeta.label} connected`);
       renderAccountMenu(body);
     } else if (r.state === "error") {
       const message = r.code === "account_login_expired" ? "Sign-in expired."
         : r.code === "account_keyring_unavailable" ? "The system keyring is unavailable. Unlock or configure it, then try again."
+        : r.code === "account_revocation_pending" ? "Sign-in was rejected and grant revocation is still pending."
+        : r.code === "account_revocation_unrecoverable" ? "Sign-in was rejected; revocation is unconfirmed and local recovery is unavailable."
         : r.code === "account_identity_mismatch" ? "Reader and Writer must use the same Microsoft account."
           : r.code === "account_identity_unverified" ? "The Microsoft account could not be verified. Reconnect the other role first."
             : "Sign-in failed.";

@@ -421,7 +421,7 @@ pub fn registry_tool_names() -> Vec<&'static str> {
 pub fn tool_schema() -> serde_json::Value {
     let change_schema = serde_json::json!({
         "type": "object",
-        "description": "A live-write change. For self-hosted send_approved provide the observed origin, email_id, blob_id, identity_id, mail_from, recipients, draft_mailbox_id and sent_mailbox_id; the user must confirm the exact effect.",
+        "description": "A live-write change. For self-hosted set_read provide the observed origin. For self-hosted send_approved provide the observed origin, email_id, blob_id, identity_id, mail_from, recipients, draft_mailbox_id and sent_mailbox_id; the user must confirm the exact effect.",
         "properties": {
             "verb": { "type": "string", "enum": ["set_read", "set_flag", "set_categories", "move", "create_draft", "send_draft", "send_approved", "create", "update", "delete", "respond", "complete", "checklist_add", "checklist_toggle", "checklist_delete", "list_create", "list_delete", "append"] },
             "is_read": { "type": "boolean" }, "origin": { "type": "string" }, "email_id": { "type": "string" },
@@ -433,7 +433,7 @@ pub fn tool_schema() -> serde_json::Value {
     });
     serde_json::json!({
         "name": TOOL_NAME,
-        "description": "Operate on the user's own Microsoft 365 archive and account: \
+        "description": "Operate on the user's own selected iSyncYou account and archive: \
                         search, read, list, export, restore-local, backup, \
                         restore-cloud, live-write. This is the only tool; it cannot run \
                         shell commands, touch the filesystem, the OS, devices, or \

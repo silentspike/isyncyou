@@ -38,7 +38,16 @@ pub fn perform(
                 json!({"vapid":client.vapid_public_key(),"session_state":client.session_state()}),
             )
         }
-        "get" => return client.push_get(None).map_err(|_| "provider_unavailable"),
+        "get" => {
+            let id = request.get("id").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 512);
+            if request.get("id").is_some() && id.is_none() { return Err("invalid_request"); }
+            let ids = id.map(|value| vec![value.to_owned()]);
+            let result = client.push_get(ids.as_deref()).map_err(|_| "provider_unavailable")?;
+            if serde_json::to_vec(&result).map_err(|_| "provider_unavailable")?.len() > 65536 {
+                return Err("provider_unavailable");
+            }
+            return Ok(result);
+        }
         "create" => client.push_create(
             get("creation_id")?,
             get("device_client_id")?,

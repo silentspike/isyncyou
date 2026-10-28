@@ -2,7 +2,7 @@ use base64::Engine as _;
 use isyncyou_agent::{
     new_ulid, parse_action, payload_digest, request_object_digest, select_provider_context,
     tool_result_digest, AgentCredentialStore, AssistantBlock, IdempotencyTombstoneV1,
-    LocalEffectCheckpointV1, OneDriveSessionV2Transport, PairingPayload, PendingOwnerBinding,
+    LocalEffectCheckpointV1, PairingPayload, PendingOwnerBinding,
     PersistedLeaseBinding, PersistedNormalizedAssistantBlockV2, PersistedToolActionV2,
     ProviderAttemptBindingV1, ReadToolCheckpointV2, RequestJournalV2, RequestPhase,
     RequestRouteDomain, RequestStepOutcomeV2, RequestStepRef, RequestUuidBindingV1, SanitizedUsage,
@@ -18,6 +18,7 @@ use isyncyou_agent::{
     REQUEST_JOURNAL_VERSION,
 };
 use serde::{Deserialize, Serialize};
+use crate::provider_session::ProductSessionTransport;
 
 const SESSION_INDEX_ID: &str = "product-session-v2-index";
 const SESSION_SECRET_PREFIX: &str = "product-session-v2/";
@@ -52,6 +53,8 @@ struct ProductSessionStoredSummaryV1 {
     created_at_ms: u64,
     archived: bool,
     local_account: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_origin: Option<String>,
     // Missing means the record predates local-first creation. Those sessions were
     // created remotely before the local index was committed.
     #[serde(default)]
@@ -155,6 +158,7 @@ impl ProductSessionIndexV1 {
 
 pub struct ProductSessionRegistry<'a> {
     store: &'a AgentCredentialStore,
+    config: Option<isyncyou_core::Config>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,7 +180,7 @@ struct ProductSessionIndexGuard {
 }
 
 pub struct ProductTurnRuntime {
-    guard: SessionLeaseGuard<OneDriveSessionV2Transport>,
+    guard: SessionLeaseGuard<ProductSessionTransport>,
     session_id: String,
     request_id: String,
     request_binding: RequestUuidBindingV1,
@@ -1418,7 +1422,24 @@ impl TurnObserver for ProductTurnRuntime {
 
 impl<'a> ProductSessionRegistry<'a> {
     pub fn new(store: &'a AgentCredentialStore) -> Self {
-        Self { store }
+        Self { store, config: None }
+    }
+
+    pub fn with_config(mut self, config: &isyncyou_core::Config) -> Self {
+        self.config = Some(config.clone());
+        self
+    }
+
+    fn transport(&self, token: &str, session_id: &str) -> Result<ProductSessionTransport, String> {
+        let session = self.load_index()?.sessions.into_iter().find(|s| s.session_id == session_id)
+            .ok_or_else(|| "session_not_found".to_string())?;
+        let configured = self.config.as_ref().and_then(|cfg| cfg.provider_accounts.get(&session.local_account));
+        match (session.provider_origin.as_deref(), configured) {
+            (None, None) => {},
+            (Some(expected), Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. })) if expected == origin => {},
+            _ => return Err("session_account_mismatch".into()),
+        }
+        ProductSessionTransport::new(self.config.as_ref(), &session.local_account, token, session_id).map_err(map_session_error)
     }
 
     fn lock_index_rmw(&self) -> Result<ProductSessionIndexGuard, String> {
@@ -1446,8 +1467,12 @@ impl<'a> ProductSessionRegistry<'a> {
         let _index_guard = self.lock_index_rmw()?;
         let display_name = normalize_display_name(display_name)?;
         let mut index = self.load_index()?;
-        let digest =
-            payload_digest(&(local_account, display_name.as_deref())).map_err(map_session_error)?;
+        let provider_origin = self.config.as_ref().and_then(|cfg| cfg.provider_accounts.get(local_account)).map(|provider| match provider { isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. } => origin.clone() });
+        let digest = if let Some(origin) = &provider_origin {
+            payload_digest(&(local_account, display_name.as_deref(), origin)).map_err(map_session_error)?
+        } else {
+            payload_digest(&(local_account, display_name.as_deref())).map_err(map_session_error)?
+        };
         if let Some(receipt) = index
             .request_receipts
             .iter()
@@ -1496,6 +1521,7 @@ impl<'a> ProductSessionRegistry<'a> {
             created_at_ms,
             archived: false,
             local_account: local_account.to_owned(),
+            provider_origin,
             remote_initialized: Some(false),
         };
         index.sessions.push(summary.clone());
@@ -1529,10 +1555,11 @@ impl<'a> ProductSessionRegistry<'a> {
             .map(|cursor| self.decode_cursor(cursor, index.generation))
             .transpose()?
             .unwrap_or(0);
+        let provider_origin = self.config.as_ref().and_then(|cfg| cfg.provider_accounts.get(local_account)).map(|provider| match provider { isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. } => origin.as_str() });
         let mut sessions = index
             .sessions
             .iter()
-            .filter(|session| session.local_account == local_account)
+            .filter(|session| session.local_account == local_account && (self.config.is_none() || session.provider_origin.as_deref() == provider_origin))
             .cloned()
             .collect::<Vec<_>>();
         sessions
@@ -1742,6 +1769,7 @@ impl<'a> ProductSessionRegistry<'a> {
             created_at_ms,
             archived: false,
             local_account: local_account.to_owned(),
+            provider_origin: None,
             // Pairing reveal ensures the source manifest exists before exposing
             // the transfer code, so an imported session can read it immediately.
             remote_initialized: Some(true),
@@ -1775,26 +1803,25 @@ impl<'a> ProductSessionRegistry<'a> {
         &self,
         graph_token: &str,
         session_id: &str,
-    ) -> Result<SessionV2Store<OneDriveSessionV2Transport>, String> {
-        let transport =
-            OneDriveSessionV2Transport::new(graph_token, session_id).map_err(map_session_error)?;
+    ) -> Result<SessionV2Store<ProductSessionTransport>, String> {
+        let transport = self.transport(graph_token, session_id)?;
         self.open_with_transport(session_id, transport)
     }
 
     fn open_with_transport(
         &self,
         session_id: &str,
-        transport: OneDriveSessionV2Transport,
-    ) -> Result<SessionV2Store<OneDriveSessionV2Transport>, String> {
+        transport: ProductSessionTransport,
+    ) -> Result<SessionV2Store<ProductSessionTransport>, String> {
         self.open_known_with_transport(session_id, transport, false)
     }
 
     fn open_known_with_transport(
         &self,
         session_id: &str,
-        transport: OneDriveSessionV2Transport,
+        transport: ProductSessionTransport,
         allow_archived: bool,
-    ) -> Result<SessionV2Store<OneDriveSessionV2Transport>, String> {
+    ) -> Result<SessionV2Store<ProductSessionTransport>, String> {
         let index = self.load_index()?;
         if !index.sessions.iter().any(|session| {
             session.session_id == session_id && (allow_archived || !session.archived)
@@ -1842,8 +1869,7 @@ impl<'a> ProductSessionRegistry<'a> {
         target: &ProductSessionMaintenanceTarget,
         candidate_limit: usize,
     ) -> Result<usize, String> {
-        let transport = OneDriveSessionV2Transport::new(graph_token, &target.session_id)
-            .map_err(map_session_error)?;
+        let transport = self.transport(graph_token, &target.session_id)?;
         let session = self.open_known_with_transport(&target.session_id, transport, true)?;
         let (current, server_time) = session
             .current_manifest_with_server_time(&target.session_id)
@@ -1892,9 +1918,8 @@ impl<'a> ProductSessionRegistry<'a> {
         &self,
         graph_token: &str,
         session_id: &str,
-    ) -> Result<SessionV2Store<OneDriveSessionV2Transport>, String> {
-        let transport =
-            OneDriveSessionV2Transport::new(graph_token, session_id).map_err(map_session_error)?;
+    ) -> Result<SessionV2Store<ProductSessionTransport>, String> {
+        let transport = self.transport(graph_token, session_id)?;
         self.ensure_remote_session_with_transport(session_id, transport)
     }
 
@@ -1902,9 +1927,8 @@ impl<'a> ProductSessionRegistry<'a> {
         &self,
         graph_token: &str,
         session_id: &str,
-    ) -> Result<SessionV2Store<OneDriveSessionV2Transport>, String> {
-        let transport =
-            OneDriveSessionV2Transport::new(graph_token, session_id).map_err(map_session_error)?;
+    ) -> Result<SessionV2Store<ProductSessionTransport>, String> {
+        let transport = self.transport(graph_token, session_id)?;
         // The route has already reserved the deterministic turn ID and detached
         // this worker from the synchronous response path. Keep the normal bounded
         // Graph request timeouts, but do not apply one aggregate interactive
@@ -1918,8 +1942,8 @@ impl<'a> ProductSessionRegistry<'a> {
     fn ensure_remote_session_with_transport(
         &self,
         session_id: &str,
-        transport: OneDriveSessionV2Transport,
-    ) -> Result<SessionV2Store<OneDriveSessionV2Transport>, String> {
+        transport: ProductSessionTransport,
+    ) -> Result<SessionV2Store<ProductSessionTransport>, String> {
         let session = self.open_with_transport(session_id, transport.clone())?;
         if !self.remote_initialization_pending(session_id)? {
             return Ok(session);
@@ -1970,7 +1994,7 @@ impl<'a> ProductSessionRegistry<'a> {
         }
         if !matches!(
             code,
-            "cancelled" | "completed" | "failed" | "outcome_unknown"
+            "cancelled" | "completed" | "failed" | "provider_rejected" | "outcome_unknown"
         ) {
             return Err("session_state_invalid".into());
         }
@@ -2716,6 +2740,25 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn self_hosted_session_index_is_bound_to_account_and_origin() {
+        let root = temp_root("provider-origin");
+        let store = credential_store(&root);
+        let mut cfg = isyncyou_core::Config::default();
+        cfg.accounts.push(isyncyou_core::AccountConfig { id:"a".into(), username:"a".into(), sync_root:root.join("sync"), archive_root:root.join("archive"), cache_root:root.join("cache"), mount_point:None });
+        cfg.provider_accounts.insert("a".into(), isyncyou_core::config::ProviderConfig::SelfHosted { origin:"https://one.example.invalid".into(), client_id:"client".into() });
+        let registry = ProductSessionRegistry::new(&store).with_config(&cfg);
+        let session = registry.create("a", "123e4567-e89b-42d3-a456-426614174000", Some("Assistant"), 1).unwrap();
+        assert_eq!(registry.list_page("a", None, Some(10)).unwrap().sessions.len(), 1);
+        assert!(registry.list_page("other", None, Some(10)).unwrap().sessions.is_empty());
+        cfg.provider_accounts.insert("a".into(), isyncyou_core::config::ProviderConfig::SelfHosted { origin:"https://two.example.invalid".into(), client_id:"client".into() });
+        let changed = ProductSessionRegistry::new(&store).with_config(&cfg);
+        assert!(changed.list_page("a", None, Some(10)).unwrap().sessions.is_empty());
+        assert!(changed.transport("", &session.session_id).is_err());
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn insert_session(
         registry: &ProductSessionRegistry<'_>,
         session_id: &str,
@@ -2739,6 +2782,7 @@ mod tests {
             created_at_ms,
             archived: false,
             local_account: account.into(),
+            provider_origin: None,
             remote_initialized: None,
         });
         index.selected_session_id = Some(session_id.into());

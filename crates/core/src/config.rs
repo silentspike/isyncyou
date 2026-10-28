@@ -211,14 +211,23 @@ impl Config {
     /// write cannot protect against stale snapshots.
     pub fn update_atomically<T>(path: impl AsRef<Path>, mutate: impl FnOnce(&mut Config) -> Result<T,String>) -> Result<T,String> {
         let path = path.as_ref();
+        Self::with_config_lock(path, || {
+            let mut cfg = if path.exists() { Self::load(path)? } else { Self::default() };
+            let result = mutate(&mut cfg)?;
+            cfg.validate().map_err(|errors| errors.join("; "))?;
+            cfg.save(path)?;
+            Ok(result)
+        })
+    }
+
+    /// Serialize specialized configuration operations such as explicit replacement
+    /// or coordinated archive moves using the same cross-process gate.
+    pub fn with_config_lock<T>(path: impl AsRef<Path>, action: impl FnOnce() -> Result<T,String>) -> Result<T,String> {
+        let path = path.as_ref();
         let mut lock_path = path.as_os_str().to_os_string(); lock_path.push(".provider-setup.lock");
         let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(PathBuf::from(lock_path)).map_err(|_| "Configuration lock unavailable")?;
         lock.lock_exclusive().map_err(|_| "Configuration lock unavailable")?;
-        let mut cfg = if path.exists() { Self::load(path)? } else { Self::default() };
-        let result = mutate(&mut cfg)?;
-        cfg.validate().map_err(|errors| errors.join("; "))?;
-        cfg.save(path)?;
-        Ok(result)
+        action()
     }
     /// Parse a TOML string.
     pub fn from_toml(s: &str) -> Result<Config, String> {
@@ -309,9 +318,10 @@ impl Config {
                         url.scheme() == "https" && url.host_str().is_some()
                             && url.username().is_empty() && url.password().is_none()
                             && url.path() == "/" && url.query().is_none() && url.fragment().is_none()
+                            && url.origin().ascii_serialization() == origin.as_str()
                     });
                     if !valid || client_id.trim().is_empty() {
-                        errs.push(format!("provider_accounts[{account}]: HTTPS origin and client id required"));
+                        errs.push(format!("provider_accounts[{account}]: canonical HTTPS origin without trailing slash and client id required"));
                     }
                 }
             }

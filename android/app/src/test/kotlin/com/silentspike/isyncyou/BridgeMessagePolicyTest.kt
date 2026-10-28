@@ -9,13 +9,18 @@ import org.junit.Test
 class BridgeMessagePolicyTest {
     @Test
     fun providerOperationsAcceptOnlyAccountIdentifiers() {
-        for (op in listOf("providerSignIn", "providerStatus", "providerSignOut", "providerPushSetup", "providerPushStatus")) {
+        for (op in listOf("providerSignIn", "providerStatus", "providerSignOut", "providerPushSetup", "providerPushStatus", "providerQuarantineList")) {
             fun envelope(payload: JSONObject) = JSONObject().put("t", "native").put("id", "p1")
                 .put("op", op).put("payload", payload).toString()
             assertValid(BridgeMessagePolicy.validateEnvelope(envelope(JSONObject().put("account", "me"))), "native", "p1")
             assertInvalid(BridgeMessagePolicy.validateEnvelope(envelope(JSONObject().put("account", "../other"))), "invalid_account")
             assertInvalid(BridgeMessagePolicy.validateEnvelope(envelope(JSONObject().put("account", "me").put("url", "https://evil.test"))), "invalid_account")
         }
+        fun revoke(recovery: String) = JSONObject().put("t", "native").put("id", "r1")
+            .put("op", "providerQuarantineRevoke")
+            .put("payload", JSONObject().put("account", "me").put("recovery_id", recovery)).toString()
+        assertValid(BridgeMessagePolicy.validateEnvelope(revoke("a".repeat(64))), "native", "r1")
+        assertInvalid(BridgeMessagePolicy.validateEnvelope(revoke("bad")), "invalid_recovery")
     }
     @Test
     fun android_bridge_forwards_only_bounded_public_progress_projection() {

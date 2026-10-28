@@ -28,6 +28,71 @@ fn classify_confirmed_execution(
     }
 }
 
+fn submission_outcome(outcome: isyncyou_engine::self_hosted_mail::SendOutcome) -> ConfirmedExecutionOutcome {
+    match outcome {
+        isyncyou_engine::self_hosted_mail::SendOutcome::Submitted { sent_update, .. } => ConfirmedExecutionOutcome::Completed(
+            ConfirmedActionResult::new(format!("Message submitted; delivery not confirmed; Sent update {sent_update}")),
+        ),
+        isyncyou_engine::self_hosted_mail::SendOutcome::Rejected => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderRejected),
+        isyncyou_engine::self_hosted_mail::SendOutcome::Unknown | isyncyou_engine::self_hosted_mail::SendOutcome::Confirmed(_) => ConfirmedExecutionOutcome::OutcomeUnknown,
+    }
+}
+
+fn bound_submission_operation_id(pending_id: &str) -> Option<String> {
+    if pending_id.is_empty() || pending_id.len() > 128 || pending_id.chars().any(char::is_control) { None }
+    else { Some(format!("agent:{pending_id}")) }
+}
+
+fn execute_bound_provider_submission(cfg: &Config, action: &isyncyou_agent::ToolAction, pending_id: &str, gate: &Arc<Mutex<()>>) -> ConfirmedExecutionOutcome {
+    let Some(operation_id) = bound_submission_operation_id(pending_id) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
+    let intent = match validate_live_write_action(action) {
+        Ok(AgentLiveWriteIntent::Mail(MailLiveWrite::SendApproved { origin, email_id, blob_id, identity_id, mail_from, recipients, draft_mailbox_id, sent_mailbox_id })) =>
+            (origin, email_id, blob_id, identity_id, mail_from, recipients, draft_mailbox_id, sent_mailbox_id),
+        _ => return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected),
+    };
+    let account = action.account();
+    if !matches!(cfg.provider_accounts.get(account), Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) if origin == &intent.0) {
+        return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
+    }
+    let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+    let result = (|| {
+        let store = isyncyou_engine::provider_store::open(cfg, account)?;
+        let client = isyncyou_engine::self_hosted_mail::client(cfg, account)?;
+        let approved = isyncyou_engine::self_hosted_mail::ApprovedSubmission {
+            operation_id, email_id:intent.1, blob_id:intent.2, identity_id:intent.3,
+            mail_from:intent.4, recipients:intent.5, draft_mailbox_id:intent.6, sent_mailbox_id:intent.7,
+        };
+        isyncyou_engine::self_hosted_mail::send_approved(cfg, account, &store, &client, &approved)
+    })();
+    match result { Ok(outcome) => submission_outcome(outcome), Err(_) => ConfirmedExecutionOutcome::OutcomeUnknown }
+}
+
+fn execute_bound_provider_read_state(cfg: &Config, action: &isyncyou_agent::ToolAction, pending_id: &str, gate: &Arc<Mutex<()>>) -> ConfirmedExecutionOutcome {
+    let Some(operation_id) = bound_submission_operation_id(pending_id) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
+    let isyncyou_agent::ToolAction::LiveWrite { account, change, .. } = action else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
+    let Ok(AgentLiveWriteIntent::Mail(MailLiveWrite::SetRead { target, is_read })) = validate_live_write_action(action) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
+    if !matches!(cfg.provider_accounts.get(account), Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) if change.get("origin").and_then(serde_json::Value::as_str) == Some(origin.as_str())) {
+        return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
+    }
+    let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+    let result = (|| {
+        let store = isyncyou_engine::provider_store::open(cfg, account)?;
+        let client = isyncyou_engine::self_hosted_mail::client(cfg, account)?;
+        let outcome = isyncyou_engine::self_hosted_mail::set_read(cfg, account, &store, &client, &operation_id, &target, is_read)?;
+        let synced = if matches!(&outcome, isyncyou_engine::self_hosted_mail::SendOutcome::Confirmed(_)) { isyncyou_engine::self_hosted_mail::sync(cfg, account, &store, &client).is_ok() } else { false };
+        Ok::<_, String>((outcome, synced))
+    })();
+    match result {
+        Ok((isyncyou_engine::self_hosted_mail::SendOutcome::Confirmed(_), synced)) => ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new(if synced { "Email read state updated" } else { "Email read state updated; local synchronization pending" }.to_string())),
+        Ok((isyncyou_engine::self_hosted_mail::SendOutcome::Rejected, _)) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderRejected),
+        _ => ConfirmedExecutionOutcome::OutcomeUnknown,
+    }
+}
+
+fn is_provider_submission(action: &isyncyou_agent::ToolAction) -> bool {
+    matches!(validate_live_write_action(action), Ok(AgentLiveWriteIntent::Mail(MailLiveWrite::SendApproved { .. })))
+}
+
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
@@ -530,7 +595,7 @@ enum MailLiveWrite {
         target: String,
     },
     SendApproved {
-        operation_id: String, origin: String, email_id: String, blob_id: String,
+        origin: String, email_id: String, blob_id: String,
         identity_id: String, mail_from: String, recipients: Vec<String>,
         draft_mailbox_id: String, sent_mailbox_id: String,
     },
@@ -755,7 +820,7 @@ impl LiveWriteRuntime for LiveLiveWriteRuntime {
     ) -> Result<Option<String>, String> {
         match intent {
             AgentLiveWriteIntent::Mail(op) => {
-                let writer = crate::DaemonMailWrite { cfg: cfg.clone() };
+                let writer = crate::DaemonMailWrite { cfg: cfg.clone(), config_path: None };
                 match op {
                     MailLiveWrite::SetRead { target, is_read } => {
                         isyncyou_webui::MailWriteHandler::set_read(
@@ -807,22 +872,7 @@ impl LiveWriteRuntime for LiveLiveWriteRuntime {
                         isyncyou_webui::MailWriteHandler::send_draft(&writer, account, target)?;
                         Ok(None)
                     }
-                    MailLiveWrite::SendApproved { operation_id, origin, email_id, blob_id, identity_id, mail_from, recipients, draft_mailbox_id, sent_mailbox_id } => {
-                        match cfg.provider_accounts.get(account) {
-                            Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin: configured, .. }) if configured == origin => {},
-                            _ => return Err("provider_origin_mismatch".into()),
-                        }
-                        let store = isyncyou_engine::provider_store::open(cfg, account)?;
-                        let client = isyncyou_engine::self_hosted_mail::client(cfg, account)?;
-                        let approved = isyncyou_engine::self_hosted_mail::ApprovedSubmission {
-                            operation_id: operation_id.clone(), email_id: email_id.clone(), blob_id: blob_id.clone(), identity_id: identity_id.clone(),
-                            mail_from: mail_from.clone(), recipients: recipients.clone(), draft_mailbox_id: draft_mailbox_id.clone(), sent_mailbox_id: sent_mailbox_id.clone(),
-                        };
-                        match isyncyou_engine::self_hosted_mail::send_approved(cfg, account, &store, &client, &approved)? {
-                            isyncyou_engine::self_hosted_mail::SendOutcome::Submitted { id, .. } => Ok(Some(id)),
-                            _ => Err("submission_not_confirmed".into()),
-                        }
-                    }
+                    MailLiveWrite::SendApproved { .. } => Err("bound_confirmation_required".into()),
                 }
             }
             AgentLiveWriteIntent::Calendar(op) => {
@@ -1055,12 +1105,11 @@ fn validate_live_write_action(
             if recipients.is_empty() || recipients.len() > 20 || recipients.iter().map(String::len).sum::<usize>() > 2048 || recipients.iter().chain(std::iter::once(&mail_from)).any(|s| s.len() > 320 || s.chars().any(char::is_control)) {
                 return Err("invalid_live_write: invalid envelope".into());
             }
-            let operation_id = isyncyou_agent::confirm::action_hash(action, 0).map_err(|_| "invalid_live_write: action hash".to_string())?;
             let email_id = required_change_str(change, "email_id")?;
             let blob_id = required_change_str(change, "blob_id")?;
             if email_id.len() > 256 || blob_id.len() > 256 { return Err("invalid_live_write: native identity too long".into()); }
             Ok(AgentLiveWriteIntent::Mail(MailLiveWrite::SendApproved {
-                operation_id, origin: required_change_str(change, "origin")?, email_id,
+                origin: required_change_str(change, "origin")?, email_id,
                 blob_id, identity_id: required_change_str(change, "identity_id")?, mail_from, recipients,
                 draft_mailbox_id: required_change_str(change, "draft_mailbox_id")?, sent_mailbox_id: required_change_str(change, "sent_mailbox_id")?,
             }))
@@ -1166,6 +1215,7 @@ fn ensure_mobile_live_write_allowlisted(action: &isyncyou_agent::ToolAction) -> 
         AgentLiveWriteIntent::Mail(MailLiveWrite::SetRead { .. })
             | AgentLiveWriteIntent::Mail(MailLiveWrite::SetFlag { .. })
             | AgentLiveWriteIntent::Mail(MailLiveWrite::SetCategories { .. })
+            | AgentLiveWriteIntent::Mail(MailLiveWrite::SendApproved { .. })
             | AgentLiveWriteIntent::Todo(TodoLiveWrite::Complete { .. })
             | AgentLiveWriteIntent::Todo(TodoLiveWrite::ChecklistToggle { .. })
     );
@@ -1647,6 +1697,19 @@ pub(crate) fn preview_for_pending_action(
 /// Refuse previews that cannot show the complete effect to the approving user.
 pub(crate) fn preview_for_pending_action_with_config(cfg: &Config, action: &isyncyou_agent::ToolAction) -> Result<PendingOperationPreview, String> {
     let mut preview = preview_for_pending_action(action)?;
+    if let isyncyou_agent::ToolAction::LiveWrite { account, change, .. } = action {
+        if let (Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }), Ok(AgentLiveWriteIntent::Mail(MailLiveWrite::SetRead { target, is_read }))) = (cfg.provider_accounts.get(account), validate_live_write_action(action)) {
+            if change.get("origin").and_then(serde_json::Value::as_str) != Some(origin.as_str()) { return Err("provider_origin_mismatch".into()); }
+            let client = isyncyou_engine::self_hosted_mail::client(cfg, account)?;
+            let body = isyncyou_engine::self_hosted_mail::read_body(cfg, account, &client, &target, 4096)?;
+            let rows = body["list"].as_array().ok_or("provider_preview_unavailable")?;
+            if rows.len() != 1 || rows[0]["id"].as_str() != Some(target.as_str()) { return Err("provider_preview_unavailable".into()); }
+            let subject = rows[0]["subject"].as_str().ok_or("provider_preview_unavailable")?;
+            if subject.len() > 1024 || subject.chars().any(char::is_control) { return Err("provider_preview_unavailable".into()); }
+            preview.text = format!("Mark email ‘{subject}’ as {} in account {account} ({origin}). This identification was read from the provider.", if is_read { "read" } else { "unread" });
+            return Ok(preview);
+        }
+    }
     let AgentLiveWriteIntent::Mail(MailLiveWrite::SendApproved { origin, email_id, blob_id, .. }) = (match action {
         isyncyou_agent::ToolAction::LiveWrite { .. } => validate_live_write_action(action)?,
         _ => return Ok(preview),
@@ -1671,10 +1734,12 @@ fn append_verified_submission_preview(preview: &mut PendingOperationPreview, acc
     let subject = row["subject"].as_str().ok_or("provider_preview_unavailable")?;
     if subject.chars().any(char::is_control) { return Err("provider_preview_unavailable".into()); }
     let mut bodies = Vec::new();
+    let mut body_part_ids = Vec::new();
     for (field, kind) in [("textBody", "text"), ("htmlBody", "html")] {
         let parts = row[field].as_array().ok_or("provider_preview_unavailable")?;
         for part in parts {
             let part_id = part["partId"].as_str().ok_or("provider_preview_unavailable")?;
+            body_part_ids.push(part_id.to_string());
             let value = &row["bodyValues"][part_id];
             if value["isTruncated"].as_bool() != Some(false) { return Err("provider_preview_unavailable".into()); }
             let text = value["value"].as_str().ok_or("provider_preview_unavailable")?;
@@ -1693,11 +1758,12 @@ fn append_verified_submission_preview(preview: &mut PendingOperationPreview, acc
         if [blob,mime,name].iter().any(|s| s.chars().any(char::is_control)) { return Err("provider_preview_unavailable".into()); }
         manifest.push(serde_json::json!({"name":name,"type":mime,"size":size,"blob_id":blob}));
     }
-    fn collect_inline(part: &serde_json::Value, manifest: &mut Vec<serde_json::Value>) -> Result<(), String> {
+    fn collect_inline(part: &serde_json::Value, body_ids: &[String], manifest: &mut Vec<serde_json::Value>) -> Result<(), String> {
         if let Some(children) = part["subParts"].as_array() {
-            for child in children { collect_inline(child, manifest)?; }
+            for child in children { collect_inline(child, body_ids, manifest)?; }
         }
-        if part["disposition"].as_str() == Some("inline") {
+        let is_body = part["partId"].as_str().is_some_and(|id| body_ids.iter().any(|known| known == id));
+        if !is_body && part["blobId"].as_str().is_some() {
             let blob = part["blobId"].as_str().filter(|s| !s.is_empty()).ok_or("provider_preview_unavailable")?;
             let mime = part["type"].as_str().filter(|s| !s.is_empty()).ok_or("provider_preview_unavailable")?;
             let size = part["size"].as_u64().ok_or("provider_preview_unavailable")?;
@@ -1710,7 +1776,7 @@ fn append_verified_submission_preview(preview: &mut PendingOperationPreview, acc
         Ok(())
     }
     if !row["bodyStructure"].is_object() { return Err("provider_preview_unavailable".into()); }
-    collect_inline(&row["bodyStructure"], &mut manifest)?;
+    collect_inline(&row["bodyStructure"], &body_part_ids, &mut manifest)?;
     if row["hasAttachment"].as_bool().ok_or("provider_preview_unavailable")? && manifest.is_empty() { return Err("provider_preview_unavailable".into()); }
     let value = serde_json::json!({"summary":preview.text,"account":account,"subject":subject,"provenance":"live","email_id":email_id,"blob_id":blob_id,"bodies":bodies,"attachments":manifest});
     let encoded = serde_json::to_string(&value).map_err(|_| "provider_preview_unavailable")?;
@@ -2354,11 +2420,21 @@ fn write_owner_only_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 pub(crate) struct DesktopAgentOperations {
     cfg: Config,
     gate: Arc<Mutex<()>>,
+    config_path: Option<std::path::PathBuf>,
 }
 
 impl DesktopAgentOperations {
     pub(crate) fn new(cfg: Config, gate: Arc<Mutex<()>>) -> Self {
-        Self { cfg, gate }
+        Self { cfg, gate, config_path: None }
+    }
+    pub(crate) fn with_config_path(cfg: Config, gate: Arc<Mutex<()>>, config_path: std::path::PathBuf) -> Self {
+        Self { cfg, gate, config_path: Some(config_path) }
+    }
+    fn current_config(&self) -> Result<Config, String> {
+        match &self.config_path {
+            None => Ok(self.cfg.clone()),
+            Some(path) => { let cfg = Config::load(path)?; cfg.validate().map_err(|_| "account_config_unavailable".to_string())?; Ok(cfg) }
+        }
     }
 }
 
@@ -2367,9 +2443,10 @@ impl DesktopAgentOperations {
         &self,
         action: &isyncyou_agent::ToolAction,
     ) -> Result<ConfirmedActionResult, String> {
+        let cfg = self.current_config()?;
         match action {
             isyncyou_agent::ToolAction::Backup { account, services } => {
-                let run = run_backup_account(&self.cfg, account, &self.gate, services)?;
+                let run = run_backup_account(&cfg, account, &self.gate, services)?;
                 Ok(ConfirmedActionResult::new(
                     serde_json::json!({
                         "op": "backup",
@@ -2391,7 +2468,7 @@ impl DesktopAgentOperations {
                 service,
                 id,
             } => {
-                let run = run_restore_cloud(&self.cfg, account, service, id, &self.gate)?;
+                let run = run_restore_cloud(&cfg, account, service, id, &self.gate)?;
                 Ok(ConfirmedActionResult::new(
                     serde_json::json!({
                         "op": "restore-cloud",
@@ -2404,7 +2481,7 @@ impl DesktopAgentOperations {
                 ))
             }
             isyncyou_agent::ToolAction::LiveWrite { account, .. } => {
-                let run = run_live_write(&self.cfg, action, &self.gate)?;
+                let run = run_live_write(&cfg, action, &self.gate)?;
                 Ok(ConfirmedActionResult::new(
                     serde_json::json!({
                         "op": "live-write",
@@ -2419,7 +2496,7 @@ impl DesktopAgentOperations {
                 ))
             }
             isyncyou_agent::ToolAction::Share { account, .. } => {
-                let run = run_share(&self.cfg, action, &self.gate)?;
+                let run = run_share(&cfg, action, &self.gate)?;
                 Ok(ConfirmedActionResult::new(
                     serde_json::json!({
                         "op": "share",
@@ -2449,11 +2526,28 @@ impl AgentConfirmedActionExecutor for DesktopAgentOperations {
         &self,
         action: &isyncyou_agent::ToolAction,
     ) -> Result<String, ClosedExecutionCode> {
-        exact_account_key(&self.cfg, action)
+        let cfg = self.current_config().map_err(|_| ClosedExecutionCode::ExecutorRejected)?;
+        exact_account_key(&cfg, action)
     }
 
     fn execute_confirmed(&self, action: &isyncyou_agent::ToolAction) -> ConfirmedExecutionOutcome {
         classify_confirmed_execution(action, || self.execute_confirmed_inner(action))
+    }
+    fn execute_confirmed_bound(&self, action: &isyncyou_agent::ToolAction, pending_id: &str) -> ConfirmedExecutionOutcome {
+        if is_provider_submission(action) {
+            return match self.current_config() {
+                Ok(cfg) => execute_bound_provider_submission(&cfg, action, pending_id, &self.gate),
+                Err(_) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected),
+            };
+        }
+        if matches!(validate_live_write_action(action), Ok(AgentLiveWriteIntent::Mail(MailLiveWrite::SetRead { .. }))) {
+            if let Ok(cfg) = self.current_config() {
+                if cfg.provider_accounts.contains_key(action.account()) {
+                    return execute_bound_provider_read_state(&cfg, action, pending_id, &self.gate);
+                }
+            }
+        }
+        self.execute_confirmed(action)
     }
 }
 
@@ -2476,6 +2570,7 @@ impl AgentConfirmedActionExecutor for MobileDisabledAgentOperations {
 
 pub(crate) struct MobileFullNodeAgentOperations {
     cfg: Config,
+    config_path: Option<std::path::PathBuf>,
     gate: Arc<Mutex<()>>,
     mobile_jobs: Arc<MobileJobRuntime>,
 }
@@ -2488,8 +2583,18 @@ impl MobileFullNodeAgentOperations {
     ) -> Self {
         Self {
             cfg,
+            config_path: None,
             gate,
             mobile_jobs,
+        }
+    }
+    pub(crate) fn with_config_path(cfg: Config, gate: Arc<Mutex<()>>, mobile_jobs: Arc<MobileJobRuntime>, config_path: std::path::PathBuf) -> Self {
+        Self { cfg, gate, mobile_jobs, config_path: Some(config_path) }
+    }
+    fn current_config(&self) -> Result<Config, String> {
+        match &self.config_path {
+            None => Ok(self.cfg.clone()),
+            Some(path) => { let cfg = Config::load(path)?; cfg.validate().map_err(|_| "account_config_unavailable".to_string())?; Ok(cfg) }
         }
     }
 
@@ -2521,6 +2626,7 @@ impl MobileFullNodeAgentOperations {
         &self,
         action: &isyncyou_agent::ToolAction,
     ) -> Result<ConfirmedActionResult, String> {
+        let cfg = self.current_config()?;
         match action {
             isyncyou_agent::ToolAction::Backup { account, services } => {
                 let job = self.mobile_jobs.enqueue_backup(account, services)?;
@@ -2551,7 +2657,7 @@ impl MobileFullNodeAgentOperations {
             }
             isyncyou_agent::ToolAction::LiveWrite { account, .. } => {
                 ensure_mobile_live_write_allowlisted(action)?;
-                let run = run_live_write(&self.cfg, action, &self.gate)?;
+                let run = run_live_write(&cfg, action, &self.gate)?;
                 Ok(ConfirmedActionResult::new(
                     serde_json::json!({
                         "op": "live-write",
@@ -2566,7 +2672,7 @@ impl MobileFullNodeAgentOperations {
                 ))
             }
             isyncyou_agent::ToolAction::Share { account, .. } => {
-                let run = run_share(&self.cfg, action, &self.gate)?;
+                let run = run_share(&cfg, action, &self.gate)?;
                 Ok(ConfirmedActionResult::new(
                     serde_json::json!({
                         "op": "share",
@@ -2596,7 +2702,8 @@ impl AgentConfirmedActionExecutor for MobileFullNodeAgentOperations {
         &self,
         action: &isyncyou_agent::ToolAction,
     ) -> Result<String, ClosedExecutionCode> {
-        exact_account_key(&self.cfg, action)
+        let cfg = self.current_config().map_err(|_| ClosedExecutionCode::ExecutorRejected)?;
+        exact_account_key(&cfg, action)
     }
 
     fn execute_confirmed(&self, action: &isyncyou_agent::ToolAction) -> ConfirmedExecutionOutcome {
@@ -2606,6 +2713,22 @@ impl AgentConfirmedActionExecutor for MobileFullNodeAgentOperations {
             return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
         }
         classify_confirmed_execution(action, || self.execute_confirmed_inner(action))
+    }
+    fn execute_confirmed_bound(&self, action: &isyncyou_agent::ToolAction, pending_id: &str) -> ConfirmedExecutionOutcome {
+        if is_provider_submission(action) {
+            return match self.current_config() {
+                Ok(cfg) => execute_bound_provider_submission(&cfg, action, pending_id, &self.gate),
+                Err(_) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected),
+            };
+        }
+        if matches!(validate_live_write_action(action), Ok(AgentLiveWriteIntent::Mail(MailLiveWrite::SetRead { .. }))) {
+            if let Ok(cfg) = self.current_config() {
+                if cfg.provider_accounts.contains_key(action.account()) {
+                    return execute_bound_provider_read_state(&cfg, action, pending_id, &self.gate);
+                }
+            }
+        }
+        self.execute_confirmed(action)
     }
 }
 
@@ -2654,8 +2777,8 @@ mod tests {
         }});
         let action = isyncyou_agent::parse_action(&input).unwrap();
         let intent = validate_live_write_action(&action).unwrap();
-        let AgentLiveWriteIntent::Mail(MailLiveWrite::SendApproved { operation_id, recipients, email_id, blob_id, .. }) = intent else { panic!("wrong intent") };
-        assert_eq!(operation_id, isyncyou_agent::confirm::action_hash(&action, 0).unwrap());
+        let AgentLiveWriteIntent::Mail(MailLiveWrite::SendApproved { recipients, email_id, blob_id, .. }) = intent else { panic!("wrong intent") };
+        let effect_hash = isyncyou_agent::confirm::action_hash(&action, 0).unwrap();
         assert_eq!(recipients, vec!["to@example.invalid"]);
         assert_eq!(email_id, "email-1");
         assert_eq!(blob_id, "blob-1");
@@ -2666,11 +2789,36 @@ mod tests {
             let mut changed = input.clone();
             changed["change"][field] = json!("changed");
             let changed = isyncyou_agent::parse_action(&changed).unwrap();
-            assert_ne!(operation_id, isyncyou_agent::confirm::action_hash(&changed, 0).unwrap(), "{field}");
+            assert_ne!(effect_hash, isyncyou_agent::confirm::action_hash(&changed, 0).unwrap(), "{field}");
         }
         let mut changed = input.clone();
         changed["change"]["recipients"] = json!(["other@example.invalid"]);
-        assert_ne!(operation_id, isyncyou_agent::confirm::action_hash(&isyncyou_agent::parse_action(&changed).unwrap(), 0).unwrap());
+        assert_ne!(effect_hash, isyncyou_agent::confirm::action_hash(&isyncyou_agent::parse_action(&changed).unwrap(), 0).unwrap());
+    }
+
+    #[test]
+    fn provider_read_state_effect_binds_origin_target_and_value() {
+        let input = json!({"op":"live-write", "account":"a", "service":"mail", "target":"email-1", "change":{"verb":"set_read", "origin":"https://example.invalid", "is_read":true}});
+        let action = isyncyou_agent::parse_action(&input).unwrap();
+        let hash = isyncyou_agent::confirm::action_hash(&action, 0).unwrap();
+        for field in ["origin", "is_read"] {
+            let mut changed = input.clone();
+            changed["change"][field] = if field == "is_read" { json!(false) } else { json!("https://other.invalid") };
+            assert_ne!(hash, isyncyou_agent::confirm::action_hash(&isyncyou_agent::parse_action(&changed).unwrap(), 0).unwrap());
+        }
+        let mut changed = input;
+        changed["target"] = json!("email-2");
+        assert_ne!(hash, isyncyou_agent::confirm::action_hash(&isyncyou_agent::parse_action(&changed).unwrap(), 0).unwrap());
+    }
+
+    #[test]
+    fn submission_rejection_and_unknown_are_distinct_and_pending_ids_are_stable() {
+        use isyncyou_engine::self_hosted_mail::SendOutcome;
+        assert_eq!(submission_outcome(SendOutcome::Rejected), ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderRejected));
+        assert_eq!(submission_outcome(SendOutcome::Unknown), ConfirmedExecutionOutcome::OutcomeUnknown);
+        assert_eq!(bound_submission_operation_id("pending-one"), bound_submission_operation_id("pending-one"));
+        assert_ne!(bound_submission_operation_id("pending-one"), bound_submission_operation_id("pending-two"));
+        assert!(bound_submission_operation_id("bad\nidentity").is_none());
     }
 
     #[test]

@@ -62,6 +62,29 @@ pub enum PushOutcome {
     Rejected { kind: String },
 }
 
+pub enum MailboxCreateResult {
+    Created { id: String },
+    Rejected { kind: String },
+}
+
+/// Read-only API-key client for a local exporter. No writable client is exposed.
+pub struct LoopbackJmapReader(JmapClient);
+impl LoopbackJmapReader {
+    pub fn discover(origin: &str, api_key: String, trusted_public_origin: &str) -> Result<Self, JmapError> {
+        JmapClient::discover_inner(origin, api_key, Some(trusted_public_origin)).map(Self)
+    }
+    pub fn account_id(&self) -> &str { self.0.account_id() }
+    pub fn max_objects_in_get(&self) -> usize { self.0.max_objects_in_get() }
+    pub fn get(&self, kind: &str, ids: Option<&[String]>, properties: Option<&[String]>) -> Result<Value, JmapError> {
+        if !matches!(kind, "Email" | "Mailbox") { return Err(JmapError::Unsupported); }
+        self.0.get(kind, ids, properties)
+    }
+    pub fn query_emails(&self, position: usize, limit: usize, filter: Option<Value>) -> Result<Value, JmapError> { self.0.query_emails(position, limit, filter) }
+    pub fn query_mailboxes(&self, position: usize, limit: usize) -> Result<Value, JmapError> { self.0.query_mailboxes(position, limit) }
+    pub fn changes(&self, kind: &str, since: &str, max: usize) -> Result<Value, JmapError> { self.0.changes(kind, since, max) }
+    pub fn download(&self, blob_id: &str, name: &str, media_type: &str) -> Result<Vec<u8>, JmapError> { self.0.download(blob_id, name, media_type) }
+}
+
 struct Counts {
     requests: usize,
     attachments: usize,
@@ -148,8 +171,7 @@ fn body(response: Response, max: u64) -> Result<Vec<u8>, JmapError> {
 }
 fn endpoint(origin: &Url, value: &str) -> Result<Url, JmapError> {
     let url = origin.join(value).map_err(|_| JmapError::InvalidUrl)?;
-    if url.scheme() != "https"
-        || url.origin() != origin.origin()
+    if url.origin() != origin.origin()
         || !url.username().is_empty()
         || url.password().is_some()
         || url.fragment().is_some()
@@ -157,6 +179,25 @@ fn endpoint(origin: &Url, value: &str) -> Result<Url, JmapError> {
         return Err(JmapError::InvalidUrl);
     }
     Ok(url)
+}
+fn allowed_origin(origin: &Url, loopback: bool) -> bool {
+    if loopback {
+        origin.scheme() == "http" && (matches!(origin.host(), Some(url::Host::Ipv4(ip)) if ip == std::net::Ipv4Addr::LOCALHOST)
+            || matches!(origin.host(), Some(url::Host::Ipv6(ip)) if ip == std::net::Ipv6Addr::LOCALHOST))
+    } else { origin.scheme() == "https" }
+}
+fn rewrite_loopback_endpoint(local: &Url, public: &Url, value: &str) -> Result<String, JmapError> {
+    let vars = [("{accountId}", "JMAPVARACCOUNT"), ("{blobId}", "JMAPVARBLOB"), ("{name}", "JMAPVARNAME"), ("{type}", "JMAPVARTYPE")];
+    let mut encoded = value.to_owned();
+    for (var, marker) in vars { if encoded.contains(marker) { return Err(JmapError::InvalidUrl); } encoded = encoded.replace(var, marker); }
+    let url = local.join(&encoded).map_err(|_| JmapError::InvalidUrl)?;
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() || (url.origin() != local.origin() && url.origin() != public.origin()) { return Err(JmapError::InvalidUrl); }
+    let mut mapped = local.clone();
+    mapped.set_path(url.path());
+    mapped.set_query(url.query());
+    let mut result = mapped.to_string();
+    for (var, marker) in vars { result = result.replace(marker, var); }
+    Ok(result)
 }
 fn nonempty(value: Option<&Value>) -> Result<&str, JmapError> {
     value
@@ -185,8 +226,12 @@ pub struct JmapClient {
 
 impl JmapClient {
     pub fn discover(origin: &str, token: String) -> Result<Self, JmapError> {
+        Self::discover_inner(origin, token, None)
+    }
+    fn discover_inner(origin: &str, token: String, trusted_public_origin: Option<&str>) -> Result<Self, JmapError> {
+        let loopback = trusted_public_origin.is_some();
         let origin = Url::parse(origin).map_err(|_| JmapError::InvalidUrl)?;
-        if origin.scheme() != "https"
+        if !allowed_origin(&origin, loopback)
             || origin.host_str().is_none()
             || !origin.username().is_empty()
             || origin.password().is_some()
@@ -197,10 +242,16 @@ impl JmapClient {
         {
             return Err(JmapError::InvalidUrl);
         }
-        let http = Client::builder()
+        let public = if let Some(value) = trusted_public_origin {
+            let url = Url::parse(value).map_err(|_| JmapError::InvalidUrl)?;
+            if !allowed_origin(&url, false) || url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() || url.path() != "/" || url.query().is_some() || url.fragment().is_some() { return Err(JmapError::InvalidUrl); }
+            Some(url)
+        } else { None };
+        let mut builder = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(60))
-            .build()
+            .timeout(Duration::from_secs(60));
+        if loopback { builder = builder.no_proxy(); }
+        let http = builder.build()
             .map_err(|_| JmapError::Transport)?;
         let response = http
             .get(endpoint(&origin, "/.well-known/jmap")?)
@@ -252,9 +303,10 @@ impl JmapClient {
         }
         let submission =
             capabilities.contains_key(SUBMISSION) && account_caps.contains_key(SUBMISSION);
-        let api = endpoint(&origin, nonempty(session.get("apiUrl"))?)?;
-        let download = nonempty(session.get("downloadUrl"))?.to_owned();
-        let upload = nonempty(session.get("uploadUrl"))?.to_owned();
+        let map = |value: &str| -> Result<String, JmapError> { if let Some(public) = &public { rewrite_loopback_endpoint(&origin, public, value) } else { Ok(value.to_owned()) } };
+        let api = endpoint(&origin, &map(nonempty(session.get("apiUrl"))?)?)?;
+        let download = map(nonempty(session.get("downloadUrl"))?)?;
+        let upload = map(nonempty(session.get("uploadUrl"))?)?;
         // Validate templates before retaining them; substitute safe placeholders.
         endpoint(
             &origin,
@@ -509,6 +561,40 @@ impl JmapClient {
         }
         self.call("Email/import", json!({"accountId":self.account,"emails":{creation_id:{"blobId":blob_id,"mailboxIds":mailbox_ids}}}), true, false)
     }
+    /// The caller records the intent before dispatch and reconciles unknown outcomes.
+    pub fn create_mailbox(&self, creation_id: &str, name: &str, if_in_state: &str) -> Result<MailboxCreateResult, JmapError> {
+        if creation_id.is_empty() || name.is_empty() || if_in_state.is_empty() { return Err(JmapError::InvalidResponse); }
+        let response = self.call("Mailbox/set", json!({"accountId":self.account,"ifInState":if_in_state,"create":{creation_id:{"name":name}}}), true, false)?;
+        let created = response.get("created").and_then(|v| v.get(creation_id));
+        let rejected = response.get("notCreated").and_then(|v| v.get(creation_id));
+        match (created, rejected) {
+            (Some(value), None) => Ok(MailboxCreateResult::Created { id: nonempty(value.get("id")).map_err(|_| JmapError::OutcomeUnknown)?.to_owned() }),
+            (None, Some(value)) => {
+                let kind = nonempty(value.get("type")).map_err(|_| JmapError::OutcomeUnknown)?;
+                if kind.len() > 80 || !kind.bytes().all(|c| c.is_ascii_alphanumeric()) { return Err(JmapError::OutcomeUnknown); }
+                Ok(MailboxCreateResult::Rejected { kind: kind.to_owned() })
+            }
+            _ => Err(JmapError::OutcomeUnknown),
+        }
+    }
+    /// Change only mailbox memberships and keywords against an observed Email state.
+    /// The caller owns the durable intent, authorization and unknown reconciliation.
+    pub fn update_email(&self, email_id: &str, if_in_state: &str, patch: &Value) -> Result<EmailUpdateResult, JmapError> {
+        let entries = patch.as_object().filter(|v| !v.is_empty() && v.len() <= 128).ok_or(JmapError::InvalidResponse)?;
+        if email_id.is_empty() || if_in_state.is_empty() || entries.iter().any(|(key, value)| {
+            let part = key.strip_prefix("keywords/").or_else(|| key.strip_prefix("mailboxIds/"));
+            let valid_path = part.is_some_and(|s| !s.is_empty() && !s.contains('/') && valid_pointer_token(s));
+            !valid_path || !(value.is_null() || value.as_bool() == Some(true))
+        }) { return Err(JmapError::InvalidResponse); }
+        let result = self.call("Email/set", json!({"accountId":self.account,"ifInState":if_in_state,"update":{email_id:patch}}), true, false)?;
+        let updated = result.get("updated").and_then(|v| v.get(email_id));
+        let rejected = result.get("notUpdated").and_then(|v| v.get(email_id));
+        Ok(match (updated, rejected) {
+            (Some(value), None) if value.is_null() || value.is_object() => EmailUpdateResult::Applied,
+            (None, Some(value)) if value.is_object() => EmailUpdateResult::Rejected,
+            _ => EmailUpdateResult::Unknown,
+        })
+    }
     /// Caller must persist the exact approved intent before invoking this once.
     /// Unknown outcomes require native reconciliation, never automatic retry.
     pub fn submit(
@@ -716,6 +802,13 @@ fn encode(value: &str) -> String {
 fn pointer_escape(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
 }
+fn valid_pointer_token(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'~' && !matches!(bytes.next(), Some(b'0' | b'1')) { return false; }
+    }
+    true
+}
 fn parse_push_mutation(
     payload: &Value,
     success: &str,
@@ -892,6 +985,21 @@ mod tests {
         assert!(endpoint(&origin, "https://other.example/api").is_err());
         assert!(endpoint(&origin, "https://user@mail.example/api").is_err());
         assert!(endpoint(&origin, "/api").is_ok());
+        assert!(allowed_origin(&Url::parse("http://127.0.0.1:8080/").unwrap(), true));
+        assert!(allowed_origin(&Url::parse("http://[::1]:8080/").unwrap(), true));
+        assert!(!allowed_origin(&Url::parse("http://localhost:8080/").unwrap(), true));
+        assert!(!allowed_origin(&Url::parse("http://127.0.0.2:8080/").unwrap(), true));
+        assert!(!allowed_origin(&Url::parse("http://127.0.0.1:8080/").unwrap(), false));
+        assert!(endpoint(&Url::parse("http://127.0.0.1:8080/").unwrap(), "http://127.0.0.1:8081/api").is_err());
+        let local = Url::parse("http://127.0.0.1:8080/").unwrap();
+        let public = Url::parse("https://mail.example/").unwrap();
+        assert_eq!(rewrite_loopback_endpoint(&local, &public, "https://mail.example/download/{accountId}/{blobId}/{name}?accept={type}").unwrap(), "http://127.0.0.1:8080/download/{accountId}/{blobId}/{name}?accept={type}");
+        assert!(rewrite_loopback_endpoint(&local, &public, "https://other.example/api").is_err());
+        assert!(rewrite_loopback_endpoint(&local, &public, "https://mail.example:444/api").is_err());
+        assert!(rewrite_loopback_endpoint(&local, &public, "https://user@mail.example/api").is_err());
+        assert!(rewrite_loopback_endpoint(&local, &public, "http://127.0.0.1:8081/api").is_err());
+        assert!(valid_pointer_token("a~1b~0c"));
+        assert!(!valid_pointer_token("a~2b"));
     }
     #[test]
     fn account_gates_are_shared() {

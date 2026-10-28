@@ -2,7 +2,7 @@
 mod mail;
 
 use fs2::FileExt;
-use isyncyou_connectors::{dav::DavClient, jmap::JmapClient};
+use isyncyou_connectors::{dav::LoopbackDavReader, jmap::LoopbackJmapReader};
 use isyncyou_exporter::{Collection, Event, Manifest, Object};
 use isyncyou_store::{ProviderScope, Store};
 use serde::Deserialize;
@@ -18,6 +18,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 #[serde(deny_unknown_fields)]
 struct Config {
     origin: String,
+    trusted_public_origin: String,
     dav_entry: String,
     store: PathBuf,
     archive: PathBuf,
@@ -67,7 +68,7 @@ fn run(config: Config) -> Result<()> {
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
         _ => false,
     };
-    if origin.scheme() != "https"
+    if origin.scheme() != "http"
         || !loopback
         || origin.path() != "/"
         || origin.query().is_some()
@@ -78,6 +79,9 @@ fn run(config: Config) -> Result<()> {
         || config.minimum_free_bytes < 256 * 1024 * 1024
     {
         return Err("invalid private exporter configuration".into());
+    }
+    if config.archive.symlink_metadata().is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err("archive path is a symlink".into());
     }
     fs::create_dir_all(&config.archive)?;
     fs::set_permissions(&config.archive, fs::Permissions::from_mode(0o700))?;
@@ -105,7 +109,10 @@ fn run(config: Config) -> Result<()> {
     }
     let key = credential("store-key")?;
     let store = Store::open_encrypted(&config.store, &key)?;
-    let jmap = JmapClient::discover(&config.origin, token.clone())?;
+    // The dedicated collector lock excludes other writers. Preserve captured
+    // staged versions before releasing an interrupted source enumeration.
+    store.recover_abandoned_provider_staging()?;
+    let jmap = LoopbackJmapReader::discover(&config.origin, token.clone(), &config.trusted_public_origin)?;
     let account = jmap.account_id().to_owned();
     let mail_scope = ProviderScope {
         account_id: account.clone(),
@@ -124,13 +131,20 @@ fn run(config: Config) -> Result<()> {
     };
     mail::sync(&jmap, &store, &mail_scope, &mut budget)?;
     mail::sync_mailboxes(&jmap, &store, &mailbox_scope)?;
-    let dav = DavClient::new(&config.origin, token)?;
+    let dav = LoopbackDavReader::new(&config.origin, token)?;
     let collections = dav.discover(&config.dav_entry)?;
     if !collections.iter().any(|x| x.calendar) || !collections.iter().any(|x| x.addressbook) {
         return Err("required DAV collections unavailable".into());
     }
     let mut expected = vec![mail_scope, mailbox_scope];
     for collection in collections {
+        // Historical ownership follows native DAV owner/principal evidence,
+        // never mere read or shared-calendar access.
+        match collection.owned_by_current_principal {
+            Some(true) => {},
+            Some(false) => continue,
+            None => return Err("DAV collection ownership not verified".into()),
+        }
         for (matches, service) in [
             (collection.calendar, "calendar"),
             (collection.addressbook, "contacts"),
@@ -156,6 +170,10 @@ fn run(config: Config) -> Result<()> {
             dav.sync_collection(&store, &scope)?;
             expected.push(scope);
         }
+    }
+    if !expected.iter().any(|scope| scope.service == "calendar") ||
+       !expected.iter().any(|scope| scope.service == "contacts") {
+        return Err("required owned DAV collections unavailable".into());
     }
     let snapshot = store.provider_export_snapshot(&account, &config.origin)?;
     if snapshot.collections.len() != expected.len()
@@ -240,6 +258,9 @@ fn run(config: Config) -> Result<()> {
             if digest != item.digest {
                 return Err("source digest mismatch".into());
             }
+            let related_blobs = if item.scope.service == "mail" {
+                isyncyou_exporter::mail_dependencies(&item.object.raw)?
+            } else { Vec::new() };
             capture = item.sequence;
             objects.push(Object {
                 account: item.scope.account_id,
@@ -250,6 +271,7 @@ fn run(config: Config) -> Result<()> {
                 version: item.version_key,
                 digest,
                 size: item.object.raw.len() as u64,
+                related_blobs,
             });
             if objects.len() > 200_000 {
                 return Err("export manifest limit reached".into());

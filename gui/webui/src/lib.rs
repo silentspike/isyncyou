@@ -389,6 +389,9 @@ product_post_routes! {
     OnedriveConflictResolve => ("/api/v1/onedrive/conflict/resolve", 8 * 1024, OnedriveManage),
     OnedriveCleanup => ("/api/v1/onedrive/cleanup", 8 * 1024, OnedriveManage),
     AccountLoginStart => ("/api/v1/account/login/start", 8 * 1024, Account),
+    AccountCreateProvider => ("/api/v1/account/provider/create", 8 * 1024, Account),
+    AccountQuarantineList => ("/api/v1/account/provider/quarantine/list", 8 * 1024, Account),
+    AccountQuarantineRevoke => ("/api/v1/account/provider/quarantine/revoke", 8 * 1024, Account),
     AccountLoginPoll => ("/api/v1/account/login/poll", 8 * 1024, Account),
     AccountLoginCancel => ("/api/v1/account/login/cancel", 8 * 1024, Account),
     AccountSignout => ("/api/v1/account/signout", 8 * 1024, Account),
@@ -430,7 +433,7 @@ impl ProductPostRoute {
         use ProductPostRoute::*;
         match self {
             AgentTurn => ProductReplayPolicy::AtomicTurnAdmission,
-            AccountLoginStart | AgentUserPresenceStart => ProductReplayPolicy::EphemeralResponse,
+            AccountLoginStart | AccountQuarantineList | AgentUserPresenceStart => ProductReplayPolicy::EphemeralResponse,
             AccountLoginPoll
             | AccountLoginCancel
             | MutationIntentCreate
@@ -497,6 +500,8 @@ impl ProductPostRoute {
             | OnedriveConflictResolve
             | OnedriveCleanup
             | AccountSignout
+            | AccountCreateProvider
+            | AccountQuarantineRevoke
             | PushRegister
             | PushTest
             | AgentUserPresenceConfirm
@@ -1287,6 +1292,9 @@ fn scalar_product_fields(route: ProductPostRoute) -> Option<&'static [&'static s
         OnedriveConflictResolve => Some(&["account", "id", "resolution"]),
         OnedriveCleanup => Some(&["account"]),
         AccountLoginStart | AccountSignout => Some(&["account", "role"]),
+        AccountCreateProvider => Some(&["account", "username", "origin", "client_id"]),
+        AccountQuarantineList => Some(&["account"]),
+        AccountQuarantineRevoke => Some(&["account", "recovery_id"]),
         AccountLoginPoll | AccountLoginCancel => Some(&["id"]),
         MailSend
         | MailReply
@@ -1702,6 +1710,9 @@ fn canonicalize_scalar_product_payload(
                 return Err(no_store_json_error(400, "invalid account role"));
             }
         }
+        AccountCreateProvider => require_non_empty_scalar_fields(object, &["account", "username", "origin", "client_id"])?,
+        AccountQuarantineList => require_non_empty_scalar_fields(object, &["account"])?,
+        AccountQuarantineRevoke => require_non_empty_scalar_fields(object, &["account", "recovery_id"])?,
         MailSend
         | MailReply
         | MailForward
@@ -2465,6 +2476,7 @@ pub enum ClosedConfirmationFailure {
     AuditStartFailed,
     ExecutorRejected,
     ExecutorFailed,
+    ProviderRejected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2510,6 +2522,8 @@ pub struct AgentCredentialRefreshRequest {
 #[serde(deny_unknown_fields)]
 pub struct AgentSessionCreateRequest {
     pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     #[serde(default)]
     pub display_name: Option<String>,
 }
@@ -2770,6 +2784,9 @@ pub trait AgentHandler: Send + Sync {
     ) -> Result<serde_json::Value, String> {
         Err("product sessions are not enabled on this server".into())
     }
+    fn session_create_for_account(&self, request_id: &str, _account: Option<&str>, display_name: Option<&str>) -> Result<serde_json::Value, String> {
+        self.session_create(request_id, display_name)
+    }
 
     fn session_list(
         &self,
@@ -2777,6 +2794,9 @@ pub trait AgentHandler: Send + Sync {
         _limit: Option<usize>,
     ) -> Result<serde_json::Value, String> {
         Err("product sessions are not enabled on this server".into())
+    }
+    fn session_list_for_account(&self, _account: Option<&str>, cursor: Option<&str>, limit: Option<usize>) -> Result<serde_json::Value, String> {
+        self.session_list(cursor, limit)
     }
 
     fn session_select(
@@ -3152,7 +3172,7 @@ pub trait MailWriteHandler: Send + Sync {
     fn provider_store(&self, _account: &str) -> Result<Store, String> {
         Err("provider_store_unavailable".into())
     }
-    fn provider_create_draft(&self, _account: &str, _request_id: &str, _subject: &str, _body: &str, _to: &[String]) -> Result<Value, String> {
+    fn provider_create_draft(&self, _account: &str, _request_id: &str, _subject: &str, _body: &str, _to: &[String], _cc: &[String], _bcc: &[String], _importance: Option<&str>, _read_receipt: bool) -> Result<Value, String> {
         Err("provider_draft_unavailable".into())
     }
     /// Fetch a bounded, plain-text provider body. This does not imply archival capture.
@@ -3675,6 +3695,10 @@ pub struct AccountAuthStatus {
 /// Live account-auth handler (#68): the daemon's Microsoft sign-in + sign-out.
 /// `None` => the account menu offers only switching (the read-only CLI `serve`).
 pub trait AccountAuthHandler: Send + Sync {
+    fn current_config(&self) -> Option<Config> { None }
+    fn quarantine_list(&self, _account: &str) -> Result<Vec<String>, String> { Err("account_recovery_unavailable".into()) }
+    fn quarantine_revoke(&self, _account: &str, _id: &str) -> Result<(), String> { Err("account_recovery_unavailable".into()) }
+    fn create_provider_account(&self, _account: &str, _username: &str, _origin: &str, _client_id: &str) -> Result<(), String> { Err("account_setup_unavailable".into()) }
     /// Begin Authorization Code + PKCE for a configured account. Returns only an opaque login ID
     /// and a reviewed authorization URI. The expected state, verifier, callback code, and tokens
     /// stay in Rust; the authorization URI necessarily contains the public state challenge.
@@ -4811,6 +4835,9 @@ impl Router {
                 ProductPostRoute::OnedriveConflictResolve => self.onedrive_conflict_resolve(req),
                 ProductPostRoute::OnedriveCleanup => self.onedrive_cleanup(req),
                 ProductPostRoute::AccountLoginStart => self.account_login_start(req),
+                ProductPostRoute::AccountCreateProvider => self.account_create_provider(req),
+                ProductPostRoute::AccountQuarantineList => self.account_quarantine(req, false),
+                ProductPostRoute::AccountQuarantineRevoke => self.account_quarantine(req, true),
                 ProductPostRoute::AccountLoginPoll => self.account_login_poll(req),
                 ProductPostRoute::AccountLoginCancel => self.account_login_cancel(req),
                 ProductPostRoute::AccountSignout => self.account_signout(req),
@@ -6826,9 +6853,9 @@ impl Router {
         if !valid_client_request_id(&request.request_id) || request.account.is_empty() {
             return ApiResponse::error(400, "invalid mail draft request");
         }
-        if self.config.provider_accounts.contains_key(&request.account) {
+        if self.provider_origin(&request.account).is_some() {
             if request.id.is_some() { return ApiResponse::error(409, "provider_send_requires_confirmation"); }
-            return match h.provider_create_draft(&request.account, &request.request_id, &request.subject, &request.body, &request.to) {
+            return match h.provider_create_draft(&request.account, &request.request_id, &request.subject, &request.body, &request.to, &[], &[], None, false) {
                 Ok(value) => ApiResponse::ok_json(&value),
                 Err(_) => ApiResponse::error(409, "provider_draft_outcome_unknown"),
             };
@@ -7702,8 +7729,8 @@ impl Router {
     }
 
     fn accounts(&self) -> ApiResponse {
-        let accounts: Vec<Value> = self
-            .config
+        let cfg = self.account_auth.as_ref().and_then(|h| h.current_config()).unwrap_or_else(|| self.config.clone());
+        let accounts: Vec<Value> = cfg
             .accounts
             .iter()
             .map(|a| {
@@ -7711,7 +7738,7 @@ impl Router {
                     .account_auth
                     .as_ref()
                     .map(|handler| handler.status(&a.id));
-                let provider = if self.config.provider_accounts.contains_key(&a.id) {
+                let provider = if cfg.provider_accounts.contains_key(&a.id) {
                     "self_hosted"
                 } else {
                     "microsoft"
@@ -7720,6 +7747,43 @@ impl Router {
             })
             .collect();
         ApiResponse::ok_json(&json!({ "accounts": accounts }))
+    }
+
+    fn provider_origin(&self, account: &str) -> Option<String> {
+        let cfg = self.account_auth.as_ref().and_then(|h| h.current_config()).unwrap_or_else(|| self.config.clone());
+        match cfg.provider_accounts.get(account) {
+            Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) => Some(origin.clone()),
+            None => None,
+        }
+    }
+
+    fn account_quarantine(&self, req: &ApiRequest, revoke: bool) -> ApiResponse {
+        let h = match self.account_gate(req) { Ok(h) => h, Err(e) => return e };
+        let fields: &[&str] = if revoke { &["account", "recovery_id"] } else { &["account"] };
+        let parsed = match parse_strict_scalar_mutation(req, "account recovery", fields) { Ok(value) => value, Err(error) => return error };
+        let Some(account) = parsed.q("account") else { return ApiResponse::error(400, "invalid_account_recovery"); };
+        if revoke {
+            let Some(id) = parsed.q("recovery_id") else { return ApiResponse::error(400, "invalid_account_recovery"); };
+            match h.quarantine_revoke(account, id) {
+                Ok(()) => ApiResponse::ok_json(&json!({"revoked":true})),
+                Err(_) => ApiResponse::error(409, "grant_revocation_unconfirmed"),
+            }
+        } else {
+            match h.quarantine_list(account) {
+                Ok(ids) => ApiResponse::ok_json(&json!({"ids":ids})),
+                Err(_) => ApiResponse::error(409, "account_recovery_unavailable"),
+            }
+        }
+    }
+
+    fn account_create_provider(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.account_gate(req) { Ok(h) => h, Err(e) => return e };
+        let parsed = match parse_strict_scalar_mutation(req, "provider account", &["account", "username", "origin", "client_id"]) { Ok(req) => req, Err(e) => return e };
+        let (Some(account), Some(username), Some(origin), Some(client_id)) = (parsed.q("account"), parsed.q("username"), parsed.q("origin"), parsed.q("client_id")) else { return ApiResponse::error(400, "invalid_account_setup"); };
+        match h.create_provider_account(account, username, origin, client_id) {
+            Ok(()) => ApiResponse::ok_json(&json!({"created":true})),
+            Err(_) => ApiResponse::error(409, "account_setup_failed"),
+        }
     }
 
     /// Account-auth cap check (#68): 404 if sign-in isn't enabled (read-only serve),
@@ -7908,7 +7972,7 @@ impl Router {
         {
             return no_store_json_error(400, "invalid session create request");
         }
-        match handler.session_create(&request.request_id, request.display_name.as_deref()) {
+        match handler.session_create_for_account(&request.request_id, request.account.as_deref(), request.display_name.as_deref()) {
             Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
             Err(error) => agent_session_error_response(&error),
         }
@@ -7948,7 +8012,7 @@ impl Router {
             Ok(limit) => limit,
             Err(error) => return error,
         };
-        match handler.session_list(cursor, limit) {
+        match handler.session_list_for_account(req.q("account"), cursor, limit) {
             Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
             Err(error) => agent_session_error_response(&error),
         }
@@ -8316,6 +8380,7 @@ impl Router {
                 "confirmed": request.pending,
                 "result": "Completed successfully."
             })),
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::ProviderRejected) => no_store_json_error(409, "provider_submission_rejected"),
             AgentConfirmOutcome::Failed(_) => no_store_json_error(409, "confirmation_failed"),
             AgentConfirmOutcome::Rejected(code) => agent_closed_confirmation_response(code),
             AgentConfirmOutcome::Retryable => no_store_json_error(503, "confirmation_retryable"),
@@ -8901,12 +8966,12 @@ impl Router {
         };
         if service == "mail" {
             if let Some(account) = req.q("account") {
-                if let Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) = self.config.provider_accounts.get(account) {
+                if let Some(origin) = self.provider_origin(account) {
                     let store = match self.mail_write.as_ref().and_then(|h| h.provider_store(account).ok()) {
                         Some(store) => store,
                         None => return ApiResponse::error(503, "provider_store_unavailable"),
                     };
-                    return self.provider_mail_items(&store, account, origin, req);
+                    return self.provider_mail_items(&store, account, &origin, req);
                 }
             }
         }
@@ -9307,7 +9372,7 @@ impl Router {
             (Some(a), Some(s), Some(i)) => (a, s, i),
             _ => return ApiResponse::error(400, "missing 'account', 'service' or 'id'"),
         };
-        if service == "mail" && self.config.provider_accounts.contains_key(account) {
+        if service == "mail" && self.provider_origin(account).is_some() {
             return match self.mail_write.as_ref().and_then(|h| h.provider_read_body(account, id).ok()) {
                 Some(text) => ApiResponse { status: 200, content_type: "text/plain; charset=utf-8".into(), body: text.into_bytes(), headers: Vec::new() },
                 None => ApiResponse::error(503, "provider_body_unavailable"),
@@ -9456,7 +9521,7 @@ impl Router {
             (Some(a), Some(s), Some(i)) => (a, s, i),
             _ => return ApiResponse::error(400, "missing 'account', 'service' or 'id'"),
         };
-        if service == "mail" && self.config.provider_accounts.contains_key(account) {
+        if service == "mail" && self.provider_origin(account).is_some() {
             return match self.mail_write.as_ref().and_then(|h| h.provider_read_body(account, id).ok()) {
                 Some(text) => ApiResponse::html_with_csp(&view::page("Message", &format!("<pre>{}</pre>", view::escape(&text))), view::VIEWER_CSP),
                 None => ApiResponse::error(503, "provider_body_unavailable"),

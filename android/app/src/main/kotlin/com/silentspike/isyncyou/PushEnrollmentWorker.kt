@@ -21,6 +21,52 @@ class PushEnrollmentWorker(context: Context, params: WorkerParameters) : Corouti
         }
         try {
             when (state.optString("stage")) {
+                "destroy_unknown", "replacement_destroy_unknown" -> {
+                    val previousStage = state.getString("stage")
+                    val id = state.getString("subscription_id")
+                    if (PushJmap.lookup(applicationContext, account, instance, id) == PushJmap.Lookup.Absent) {
+                        PushEnrollmentStore.update(applicationContext, instance) {
+                            if (it.optString("stage") != previousStage || it.optString("subscription_id") != id) return@update false
+                            it.remove("subscription_id")
+                            if (previousStage == "destroy_unknown") it.put("stage", "broker_bound_logout")
+                            else it.put("replacement_from", "broker_bound").put("stage", "endpoint_changed")
+                            true
+                        }
+                        if (previousStage == "replacement_destroy_unknown") PushScheduler.enqueue(applicationContext, instance)
+                    }
+                }
+                "endpoint_changed" -> {
+                    // Preserve both endpoints until old subscription and broker binding
+                    // are confirmed removed. Unknown outcomes remain explicit.
+                    check(state.optString("replacement_from") in setOf("active", "verification_pending", "broker_bound"))
+                    val oldSubscription = state.optString("subscription_id", "")
+                    if (oldSubscription.isNotEmpty()) {
+                        if (!PushEnrollmentStore.update(applicationContext, instance) {
+                                if (it.optString("stage") != "endpoint_changed") return@update false
+                                it.put("stage", "replacement_destroy_unknown"); true
+                            }) return@withContext Result.success()
+                        val destroyed = PushJmap.call(applicationContext, account, "destroy", org.json.JSONObject().put("id", oldSubscription))
+                        check(destroyed.optString("status") == "applied")
+                    }
+                    val expected = if (oldSubscription.isEmpty()) "endpoint_changed" else "replacement_destroy_unknown"
+                    if (!PushEnrollmentStore.update(applicationContext, instance) {
+                            if (it.optString("stage") != expected) return@update false
+                            it.put("stage", "replacement_revoke_unknown"); true
+                        }) return@withContext Result.success()
+                    val revoked = PushBroker.operation(applicationContext, account, endpoint, "revoke")
+                    check(revoked.optString("status") == "revoked")
+                    PushEnrollmentStore.update(applicationContext, instance) {
+                        if (it.optString("stage") != "replacement_revoke_unknown") return@update false
+                        val replacement = it.getJSONObject("replacement")
+                        it.put("endpoint", replacement.getString("endpoint"))
+                            .put("public_key", replacement.getString("public_key"))
+                            .put("auth", replacement.getString("auth"))
+                            .put("stage", "endpoint_received")
+                        listOf("replacement", "replacement_from", "subscription_id", "expires", "verify_id", "verify_code").forEach { key -> it.remove(key) }
+                        true
+                    }
+                    PushScheduler.enqueue(applicationContext, instance)
+                }
                 "endpoint_received" -> {
                     // Record intent before the remote mutation. A lost reply is never resent blindly.
                     if (!PushEnrollmentStore.update(applicationContext, instance) {
@@ -67,8 +113,7 @@ class PushEnrollmentWorker(context: Context, params: WorkerParameters) : Corouti
                 check(outcome.optString("status") == "applied")
                 val id = outcome.getString("id")
                 val expiry = outcome.optString("expires", "").takeIf { PushJmap.expiryMillis(it) != null }
-                    ?: PushJmap.find(applicationContext, account, instance, endpoint,
-                        current.getString("public_key"), current.getString("auth"))?.optString("expires", "")
+                    ?: PushJmap.findKnown(applicationContext, account, instance, id)?.optString("expires", "")
                 require(expiry != null && PushJmap.expiryMillis(expiry) != null)
                 PushEnrollmentStore.update(applicationContext, instance) {
                     if (it.optString("stage") != "create_unknown") return@update false
@@ -86,8 +131,10 @@ class PushEnrollmentWorker(context: Context, params: WorkerParameters) : Corouti
                     PushEnrollmentStore.update(applicationContext, instance) { it.put("stage", "vapid_changed"); true }
                     return@withContext Result.failure()
                 }
-                val existing = PushJmap.find(applicationContext, account, instance, endpoint,
-                    afterCreate.getString("public_key"), afterCreate.getString("auth"))
+                val verifiedId = afterCreate.optString("verify_id", "")
+                val existing = if (verifiedId.isNotEmpty() && afterCreate.optString("verify_code", "").isNotEmpty()) {
+                    PushJmap.findKnown(applicationContext, account, instance, verifiedId)
+                } else null
                 if (existing != null && existing.optString("id").isNotEmpty() &&
                     PushJmap.expiryMillis(existing.optString("expires", "")) != null) {
                     PushEnrollmentStore.update(applicationContext, instance) {
@@ -121,6 +168,23 @@ class PushEnrollmentWorker(context: Context, params: WorkerParameters) : Corouti
             val active = PushEnrollmentStore.get(applicationContext, instance) ?: return@withContext Result.failure()
             val expires = active.optString("expires", "")
             val expiry = PushJmap.expiryMillis(expires)
+            if (active.optString("stage") == "renew_unknown" && expiry != null) {
+                val id = active.getString("subscription_id")
+                val observed = PushJmap.findKnown(applicationContext, account, instance, id)
+                val observedExpiry = observed?.optString("expires", "") ?: ""
+                val observedMillis = PushJmap.expiryMillis(observedExpiry)
+                if (observedMillis != null && observedMillis > expiry) {
+                    PushEnrollmentStore.update(applicationContext, instance) {
+                        if (it.optString("stage") != "renew_unknown") return@update false
+                        it.put("expires", observedExpiry).put("stage", "active"); true
+                    }
+                    PushJmap.scheduleRenewal(applicationContext, instance, observedExpiry)
+                }
+            }
+            if (active.optString("stage") == "active" && expiry != null &&
+                System.currentTimeMillis() < expiry - java.util.concurrent.TimeUnit.DAYS.toMillis(1)) {
+                PushJmap.scheduleRenewal(applicationContext, instance, expires)
+            }
             if (active.optString("stage") == "active" && expiry != null &&
                 System.currentTimeMillis() >= expiry - java.util.concurrent.TimeUnit.DAYS.toMillis(1)) {
                 val id = active.getString("subscription_id")
@@ -131,8 +195,7 @@ class PushEnrollmentWorker(context: Context, params: WorkerParameters) : Corouti
                 val renewed = PushJmap.call(applicationContext, account, "renew", org.json.JSONObject()
                     .put("id", id).put("expires", PushJmap.requestedExpiry()))
                 check(renewed.optString("status") == "applied")
-                val currentSubscription = requireNotNull(PushJmap.find(applicationContext, account, instance, endpoint,
-                    active.getString("public_key"), active.getString("auth")))
+                val currentSubscription = requireNotNull(PushJmap.findKnown(applicationContext, account, instance, id))
                 check(currentSubscription.optString("id") == id)
                 val actualExpiry = currentSubscription.getString("expires")
                 requireNotNull(PushJmap.expiryMillis(actualExpiry))
@@ -143,9 +206,10 @@ class PushEnrollmentWorker(context: Context, params: WorkerParameters) : Corouti
                 PushJmap.scheduleRenewal(applicationContext, instance, actualExpiry)
             }
             val before = PushEnrollmentStore.get(applicationContext, instance)?.optLong("hint_generation", 0) ?: 0
-            if (NativeEngine.nativeWaitProviderRefresh() != 1) return@withContext Result.retry()
+            if (NativeEngine.nativeWaitProviderRefresh(account) != 1) return@withContext Result.retry()
             PushEnrollmentStore.update(applicationContext, instance) {
                 if (it.optLong("hint_generation", 0) == before) it.put("hint_pending", false)
+                it.put("last_sync_at", System.currentTimeMillis() / 1000)
                 true
             }
             if (PushEnrollmentStore.get(applicationContext, instance)?.optBoolean("hint_pending", false) == true) {

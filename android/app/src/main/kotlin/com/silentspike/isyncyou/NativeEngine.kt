@@ -78,14 +78,19 @@ object NativeEngine {
     external fun nativeSetAgentCredentialKey(key: ByteArray): Int
 
     /** Native-owned PKCE attempt; the returned URL must only be opened by Android. */
+    external fun nativeProviderCreateAccount(filesDir: String, request: String): Int
+    external fun nativeProviderBrokerConfigured(filesDir: String, account: String): Int
+    external fun nativeProviderSetBroker(filesDir: String, account: String, broker: String): Int
     external fun nativeProviderBegin(filesDir: String, account: String, redirect: String): String
     external fun nativeProviderFinish(filesDir: String, callback: String): Int
+    external fun nativeProviderQuarantineList(filesDir: String, account: String): String
+    external fun nativeProviderQuarantineRevoke(filesDir: String, account: String, id: String): Int
     external fun nativeProviderStatus(filesDir: String, account: String): Int
     external fun nativeProviderLogout(filesDir: String, account: String): Int
     external fun nativeProviderCancel()
     external fun nativeWakeProviderRefresh()
     /** Wait for a completed provider pass; partial errors and timeout return zero. */
-    external fun nativeWaitProviderRefresh(): Int
+    external fun nativeWaitProviderRefresh(account: String): Int
 
     /** Native-only push broker response may contain short-lived distributor credentials. */
     external fun nativeProviderBroker(filesDir: String, account: String, operation: String, request: String): String

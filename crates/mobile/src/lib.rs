@@ -941,16 +941,15 @@ fn run_onedrive_scoped_pass(
 
 /// Run the shared JMAP delta against the same encrypted store used by the UI.
 /// A plain or unavailable store fails closed before any provider object is written.
-fn refresh_self_hosted_data(cfg: &Config, base: &Path) -> (bool, bool) {
+fn refresh_self_hosted_data(cfg: &Config, base: &Path) -> (bool, HashMap<String, bool>) {
     let mut changed = false;
-    let mut successful = true;
-    let mut seen = false;
+    let mut outcomes = HashMap::new();
     for account in &cfg.accounts {
         if !cfg.provider_accounts.contains_key(&account.id) { continue; }
-        seen = true;
+        let mut successful = true;
         let protected = isyncyou_engine::provider_store::open(cfg, &account.id)
             .map(|store| store.protected_provider_storage()).unwrap_or(false);
-        if !protected { successful = false; continue; }
+        if !protected { outcomes.insert(account.id.clone(), false); continue; }
         let result = (|| -> Result<usize, String> {
             let store = isyncyou_engine::provider_store::open(cfg, &account.id)
                 .map_err(|_| "Protected provider store unavailable")?;
@@ -972,8 +971,9 @@ fn refresh_self_hosted_data(cfg: &Config, base: &Path) -> (bool, bool) {
                 Err(_) => successful = false,
             }
         } else { successful = false; }
+        outcomes.insert(account.id.clone(), successful);
     }
-    (changed, seen && successful)
+    (changed, outcomes)
 }
 
 fn refresh_loop(
@@ -1020,13 +1020,13 @@ fn refresh_loop(
                 events.notify(); // wake SSE subscribers so the UI refetches
             }
             provider_successful
-        })).unwrap_or(false);
+        })).unwrap_or_default();
         finish_provider_refresh(generation, successful);
     }
 }
 
 #[derive(Default)]
-struct RefreshSignal { requested: u64, completed: u64, successful: bool }
+struct RefreshSignal { requested: u64, completed: u64, outcomes: HashMap<String, bool> }
 
 fn provider_refresh_wakeup() -> &'static (Mutex<RefreshSignal>, std::sync::Condvar) {
     static WAKE: OnceLock<(Mutex<RefreshSignal>, std::sync::Condvar)> = OnceLock::new();
@@ -1051,20 +1051,20 @@ fn wake_provider_refresh() -> u64 {
     generation
 }
 
-fn finish_provider_refresh(generation: u64, successful: bool) {
+fn finish_provider_refresh(generation: u64, outcomes: HashMap<String, bool>) {
     let (flag, wake) = provider_refresh_wakeup();
     let mut state = flag.lock().unwrap_or_else(|e| e.into_inner());
     state.completed = state.completed.max(generation);
-    state.successful = successful;
+    state.outcomes = outcomes;
     wake.notify_all();
 }
 
-fn wait_for_completed_refresh(generation: u64, timeout: Duration) -> bool {
+fn wait_for_completed_refresh(generation: u64, account: &str, timeout: Duration) -> bool {
     let (flag, wake) = provider_refresh_wakeup();
     let guard = flag.lock().unwrap_or_else(|e| e.into_inner());
     let (guard, _) = wake.wait_timeout_while(guard, timeout, |state| state.completed < generation)
         .unwrap_or_else(|e| e.into_inner());
-    guard.completed >= generation && guard.successful
+    guard.completed >= generation && guard.outcomes.get(account).copied().unwrap_or(false)
 }
 
 #[no_mangle]
@@ -1077,10 +1077,11 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeWakeProv
 /// Wait for a successful provider pass; timeout, partial errors and panic fail closed.
 #[no_mangle]
 pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeWaitProviderRefresh<'a>(
-    _env: jni::EnvUnowned<'a>, _class: jni::objects::JClass<'a>,
+    mut env: jni::EnvUnowned<'a>, _class: jni::objects::JClass<'a>, account: jni::objects::JString<'a>,
 ) -> jni::sys::jint {
+    let Some(account) = jni_get_string(&mut env, &account) else { return 0 };
     let generation = wake_provider_refresh();
-    i32::from(wait_for_completed_refresh(generation, Duration::from_secs(120)))
+    i32::from(wait_for_completed_refresh(generation, &account, Duration::from_secs(120)))
 }
 
 // ----------------------------------------------------------------- JNI surface

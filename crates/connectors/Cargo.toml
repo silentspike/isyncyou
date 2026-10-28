@@ -15,6 +15,7 @@ isyncyou-pathmap = { path = "../pathmap" }
 serde_json = { workspace = true }
 ring = "0.17"
 icalendar = { version = "=0.17.13", features = ["parser", "recurrence"] }
+ical-rs = { version = "=0.5.1", features = ["parser", "jcal"] }
 vcard-rs = { version = "=0.4.0", features = ["parser", "jcard", "encoding", "base64"] }
 thiserror = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"], optional = true }

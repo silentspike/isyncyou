@@ -34,7 +34,11 @@ class UnifiedPushReceiver : MessagingReceiver() {
         val changed = PushEnrollmentStore.update(context, instance) { state ->
             val old = state.optString("endpoint", "")
             if (old.isNotEmpty() && old != endpoint.url) {
-                state.put("stage", "endpoint_changed")
+                if (state.optString("stage") == "endpoint_changed") return@update false
+                state.put("replacement_from", state.optString("stage"))
+                    .put("replacement", JSONObject().put("endpoint", endpoint.url)
+                        .put("public_key", keys.pubKey).put("auth", keys.auth))
+                    .put("stage", "endpoint_changed")
             } else if (old.isEmpty()) {
                 state.put("endpoint", endpoint.url).put("public_key", keys.pubKey).put("auth", keys.auth)
                     .put("stage", "endpoint_received")
@@ -51,14 +55,22 @@ class UnifiedPushReceiver : MessagingReceiver() {
             val changed = PushEnrollmentStore.update(context, instance) { state ->
                 when (payload.optString("@type")) {
                     "StateChange" -> {
+                        // A genuine encrypted state change on this subscription proves
+                        // that the server accepted an otherwise unknown verification.
+                        if (state.optString("stage") == "verify_unknown") {
+                            state.put("stage", "active"); state.remove("verify_id"); state.remove("verify_code")
+                        }
                         state.put("degraded", false).put("hint_pending", true)
                             .put("hint_generation", state.optLong("hint_generation", 0) + 1)
+                            .put("last_hint_at", System.currentTimeMillis() / 1000)
                         true
                     }
                     "PushVerification" -> {
                         val subscription = payload.optString("pushSubscriptionId", "")
                         val code = payload.optString("verificationCode", "")
                         if (subscription.length !in 1..512 || code.length !in 1..512) return@update false
+                        if (state.optString("stage") == "active" ||
+                            (state.optString("verify_id") == subscription && state.optString("verify_code") == code)) return@update false
                         // This may arrive before PushSubscription/set returns; retain it securely.
                         state.put("verify_id", subscription).put("verify_code", code)
                         true

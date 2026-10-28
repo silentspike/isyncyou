@@ -36,6 +36,7 @@ pub mod provider_push;
 pub mod provider_store;
 pub mod provider_setup;
 pub mod self_hosted_mail;
+pub mod self_hosted_mail_restore;
 mod restore_calendar;
 mod restore_contacts;
 mod restore_key;

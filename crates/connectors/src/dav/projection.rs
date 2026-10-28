@@ -30,6 +30,9 @@ fn component<T: Component>(item: &T, depth: usize) -> Result<Value, String> {
 /// This view is intentionally not a recurrence expansion or a source serializer.
 pub fn calendar(raw: &[u8]) -> Result<Value, String> {
     if raw.len() > 16 * 1024 * 1024 { return Err("Calendar resource is too large".into()); }
+    let tree = ical::tree::cst::IcalCst::parse(raw).map_err(|_| "Invalid calendar resource")?;
+    if tree.to_bytes() != raw { return Err("Calendar must be a single complete resource".into()); }
+    let jcal = tree.decode().to_jcal();
     let text = std::str::from_utf8(raw).map_err(|_| "Calendar resource is not UTF-8")?;
     let calendar: Calendar = text.parse().map_err(|_| "Invalid calendar resource")?;
     let mut components = Vec::new();
@@ -40,15 +43,15 @@ pub fn calendar(raw: &[u8]) -> Result<Value, String> {
             _ => {}
         }
     }
-    Ok(json!({"components":components}))
+    Ok(json!({"components":components,"jcal":jcal}))
 }
 
 /// Project a complete contact into RFC 7095 jCard while retaining original VCF
 /// separately in the provider store, including any unrecognized bytes/fields.
 pub fn contact(raw: &[u8]) -> Result<Value, String> {
     if raw.len() > 16 * 1024 * 1024 { return Err("Contact resource is too large".into()); }
-    let text = std::str::from_utf8(raw).map_err(|_| "Contact resource uses an unsupported encoding")?;
-    let parsed = vcard::tree::cst::VcardCst::parse(text).map_err(|_| "Invalid contact resource")?;
+    let parsed = vcard::tree::cst::VcardCst::parse(raw).map_err(|_| "Invalid contact resource")?;
+    if parsed.to_bytes() != raw { return Err("Contact resource is not a single complete vCard".into()); }
     Ok(parsed.decode().to_jcard())
 }
 
@@ -63,6 +66,7 @@ mod tests {
         assert_eq!(view["components"][0]["kind"], "VTODO");
         assert_eq!(view["components"][0]["properties"]["RELATED-TO"][0]["value"], "parent");
         assert_eq!(view["components"][0]["properties"]["RRULE"][0]["value"], "FREQ=WEEKLY");
+        assert_eq!(view["jcal"][0], "vcalendar");
         assert!(!view.to_string().contains("checklist"));
     }
 

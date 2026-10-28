@@ -377,11 +377,28 @@ object BridgeMessagePolicy {
             }
         }
         when (op) {
-            "providerSignIn", "providerSignOut", "providerStatus", "providerPushSetup", "providerPushStatus" -> {
+            "providerCreateAccount" -> {
+                if (!hasExactKeys(payload, setOf("account", "username", "origin", "client_id")) ||
+                    exactString(payload, "account")?.matches(Regex("[A-Za-z0-9_-]{1,64}")) != true ||
+                    listOf("username", "origin", "client_id").any {
+                        val value = exactString(payload, it)
+                        value.isNullOrBlank() || value.length > 2048 || value.any(Char::isISOControl)
+                    }) return BridgeValidation(false, type, id, "invalid_account_setup")
+            }
+            "providerSignIn", "providerSignOut", "providerStatus", "providerPushSetup", "providerPushStatus", "providerQuarantineList" -> {
                 val account = exactString(payload, "account")
                 if (!hasOnlyKeys(payload, setOf("account")) || account == null ||
                     !account.matches(Regex("[A-Za-z0-9._-]{1,128}"))) {
                     return BridgeValidation(false, type, id, "invalid_account")
+                }
+            }
+            "providerQuarantineRevoke" -> {
+                val account = exactString(payload, "account")
+                val recovery = exactString(payload, "recovery_id")
+                if (!hasOnlyKeys(payload, setOf("account", "recovery_id")) || account == null ||
+                    !account.matches(Regex("[A-Za-z0-9._-]{1,128}")) ||
+                    recovery?.matches(Regex("[0-9a-f]{64}")) != true) {
+                    return BridgeValidation(false, type, id, "invalid_recovery")
                 }
             }
             "beginNetworkGuard" -> {

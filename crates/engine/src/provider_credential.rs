@@ -6,6 +6,8 @@ pub struct ProviderCredential {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_at: u64,
+    /// Stable OAuth account subject; absent only for internal non-OAuth secrets.
+    pub subject: Option<String>,
 }
 
 /// Implementations must use secure platform storage and atomically replace the

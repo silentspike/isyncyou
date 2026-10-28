@@ -108,6 +108,16 @@ for abi in "${canonical_abis[@]}"; do
   mkdir -p "$stage/$abi"
 
   case $BUILDER in
+    remote-v2-api24)
+      mkdir -p "$ROOT/target/$target/release"
+      # The audited V2 profile sets NDK API-24 compiler and linker variables.
+      # V2 owns RUSTUP_TOOLCHAIN; only the non-secret page-alignment flags pass in.
+      target_env=$(printf 'RUSTFLAGS=%q' "$ANDROID_PAGE_RUSTFLAGS")
+      cargo remote --init --profile android-r27d-api24 --no-copy-lock -d "$RUST_TOOLCHAIN" \
+        -b "$target_env" -c "$target/release/libisyncyou_mobile.so" -- \
+        build --locked --release -p isyncyou-mobile --target "$target" "${feature_args[@]}"
+      source_library="$ROOT/target/$target/release/libisyncyou_mobile.so"
+      ;;
     remote)
       remote_bin="$REMOTE_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
       mkdir -p "$ROOT/target/$target/release"

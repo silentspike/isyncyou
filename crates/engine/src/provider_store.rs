@@ -11,13 +11,25 @@ use sha2::{Digest, Sha256};
 /// when its platform-protected key is unavailable.
 #[cfg(feature = "encrypted-store")]
 pub fn open(cfg: &Config, account: &str) -> Result<Store, String> {
+    open_inner(cfg,account,true)
+}
+
+/// Open an encrypted provider writer for local session state without running
+/// sync-staging recovery on every immutable object operation.
+#[cfg(feature = "encrypted-store")]
+pub fn open_for_session(cfg: &Config, account: &str) -> Result<Store, String> {
+    open_inner(cfg,account,false)
+}
+
+#[cfg(feature = "encrypted-store")]
+fn open_inner(cfg: &Config, account: &str, recover_staging: bool) -> Result<Store, String> {
     let path = location(cfg,account)?;
     let mut wal = path.as_os_str().to_os_string(); wal.push("-wal");
     let mut shm = path.as_os_str().to_os_string(); shm.push("-shm");
     let existing = path.exists() || std::path::Path::new(&wal).exists() || std::path::Path::new(&shm).exists();
     let key = crate::provider_auth::provider_database_key(cfg,account,existing)?;
     let store = Store::open_encrypted(path,&key).map_err(|e| e.to_string())?;
-    store.recover_abandoned_provider_staging().map_err(|e| e.to_string())?;
+    if recover_staging { store.recover_abandoned_provider_staging().map_err(|e| e.to_string())?; }
     Ok(store)
 }
 
@@ -41,8 +53,25 @@ pub fn open_readonly(cfg: &Config, account: &str) -> Result<Store, String> {
     Store::open_readonly_encrypted(path,&key).map_err(|e| e.to_string())
 }
 
+#[cfg(feature = "encrypted-store")]
+pub(crate) fn has_cached_data(cfg: &Config, account: &str) -> Result<bool, String> {
+    let path = location(cfg,account)?;
+    if !path.exists() { return Ok(false); }
+    open_readonly(cfg,account)?.provider_contains_data().map_err(|_| "Provider cache identity check failed".into())
+}
+
+#[cfg(not(feature = "encrypted-store"))]
+pub(crate) fn has_cached_data(_cfg: &Config, _account: &str) -> Result<bool, String> {
+    Err("Encrypted provider storage is unavailable".into())
+}
+
 #[cfg(not(feature = "encrypted-store"))]
 pub fn open(_cfg: &Config, _account: &str) -> Result<Store, String> {
+    Err("Encrypted provider storage is unavailable".into())
+}
+
+#[cfg(not(feature = "encrypted-store"))]
+pub fn open_for_session(_cfg: &Config, _account: &str) -> Result<Store, String> {
     Err("Encrypted provider storage is unavailable".into())
 }
 
