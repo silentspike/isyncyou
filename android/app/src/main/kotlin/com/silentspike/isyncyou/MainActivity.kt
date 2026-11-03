@@ -599,6 +599,11 @@ class MainActivity : FragmentActivity() {
             }
             "providerSignIn" -> providerSignIn(payload.optString("account"), id, reply)
             "providerAuthResolve" -> resolveUnknownProviderAuth(payload.optString("account"), id, reply)
+            "providerAuthCancelPending" -> dispatchBridge {
+                val cancelled = NativeEngine.nativeProviderCancelPending(filesDir.absolutePath, payload.getString("account")) == 1
+                if (cancelled) postBridgeResponse(reply, id, 200, JSONObject().put("cancelled", true))
+                else postBridgeError(reply, id, 409, "unavailable", "provider_pending_changed")
+            }
             "providerPushSetup" -> providerPushSetup(payload.optString("account"), id, reply)
             "providerPushStatus" -> dispatchBridge {
                 val account = payload.optString("account")

@@ -47,6 +47,21 @@ mod recovery_tests {
         assert!(!same_credential(&Some(credential()), &Some(changed)));
         assert!(!same_credential(&Some(credential()), &None));
     }
+    #[test]
+    fn pending_cancel_is_account_and_stage_bound_and_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AndroidProviderCredentialStore::for_test(dir.path());
+        let pending = br#"{"stage":"pending","account":"one"}"#;
+        store.write_auth_journal(pending).unwrap();
+        assert!(cancel_pending_in_store(&store, "other").is_err());
+        assert_eq!(store.read_auth_journal().unwrap().as_deref(), Some(pending.as_slice()));
+        store.write_auth_journal(br#"{"stage":"exchange_started","account":"one"}"#).unwrap();
+        assert!(cancel_pending_in_store(&store, "one").is_err());
+        assert!(store.read_auth_journal().unwrap().is_some());
+        store.write_auth_journal(pending).unwrap();
+        cancel_pending_in_store(&store, "one").unwrap();
+        assert!(AndroidProviderCredentialStore::for_test(dir.path()).read_auth_journal().unwrap().is_none());
+    }
 }
 
 fn prepare_unknown_recovery(base: &Path, account: &str) -> Result<bool, String> {
@@ -208,7 +223,7 @@ fn begin(base: &Path, account: &str, redirect: &str) -> Result<String, String> {
     let store = AndroidProviderCredentialStore::new(base)?;
     if let Some(raw) = store.read_auth_journal()? {
         let prior: serde_json::Value = serde_json::from_slice(&raw).map_err(|_| "Authorization recovery unavailable")?;
-        if prior["stage"] != "pending" { return Err("Authorization outcome unknown".into()); }
+        return Err(if prior["stage"] == "pending" { "Authorization already pending" } else { "Authorization outcome unknown" }.into());
     }
     let attempt = provider_auth::start_self_hosted_auth(&cfg, account, redirect)?;
     let serialized = provider_auth::export_android_auth_attempt(&attempt)?;
@@ -218,6 +233,38 @@ fn begin(base: &Path, account: &str, redirect: &str) -> Result<String, String> {
     let uri = attempt.authorization_uri.clone();
     *guard = Some(attempt);
     Ok(uri)
+}
+
+// Cancel only the named account's unexchanged attempt. The same mutex also
+// serializes begin and callback dispatch, so an exchange cannot race this
+// durable deletion. An exchange_started outcome must use the recovery flow.
+fn cancel_pending(base: &Path, account: &str) -> Result<(), String> {
+    let mut guard = attempts().lock().map_err(|_| "Authorization unavailable")?;
+    let store = AndroidProviderCredentialStore::new(base)?;
+    cancel_pending_in_store(&store, account)?;
+    *guard = None;
+    Ok(())
+}
+
+fn cancel_pending_in_store(store: &AndroidProviderCredentialStore, account: &str) -> Result<(), String> {
+    let raw = store.read_auth_journal()?.ok_or("No pending authorization")?;
+    let journal: serde_json::Value = serde_json::from_slice(&raw).map_err(|_| "Invalid authorization journal")?;
+    if journal["stage"].as_str() != Some("pending") || journal["account"].as_str() != Some(account) {
+        return Err("Authorization state changed".into());
+    }
+    store.delete_auth_journal()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeProviderCancelPending<'a>(
+    mut env: jni::EnvUnowned<'a>, _class: jni::objects::JClass<'a>,
+    base: jni::objects::JString<'a>, account: jni::objects::JString<'a>,
+) -> jni::sys::jint {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(base) = jni_get_string(&mut env, &base) else { return 0 };
+        let Some(account) = jni_get_string(&mut env, &account) else { return 0 };
+        i32::from(cancel_pending(Path::new(&base), &account).is_ok())
+    })).unwrap_or(0)
 }
 
 fn finish(base: &Path, callback: &str) -> Result<(), provider_auth::AuthFinishError> {

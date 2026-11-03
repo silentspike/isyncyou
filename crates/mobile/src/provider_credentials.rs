@@ -15,6 +15,13 @@ pub(crate) struct AndroidProviderCredentialStore {
 
 impl AndroidProviderCredentialStore {
     const AUTH_JOURNAL_ID: &'static str = "mobile-self-hosted-pkce-v1";
+    #[cfg(test)]
+    pub(crate) fn for_test(base: &Path) -> Self {
+        Self {
+            resolver: CredentialStoreResolver::new(CredentialStoreConfig::new(base)).with_provided_key([23; 32]),
+            allow_test_key: true,
+        }
+    }
     pub(crate) fn new(base: &Path) -> Result<Self, String> {
         let resolver = CredentialStoreResolver::new(CredentialStoreConfig::with_paths(
             base.join("provider-credentials"),

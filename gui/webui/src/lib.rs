@@ -799,6 +799,13 @@ fn parse_strict_scalar_mutation(
     Ok(parsed)
 }
 
+fn safe_recovery_result_diagnostic(error: &str) -> bool {
+    if matches!(error,"recovery_result_store_unavailable" | "recovery_result_binding_unavailable" | "recovery_result_auth_unavailable" | "recovery_result_status_invalid" | "recovery_result_not_available" | "recovery_result_integrity_size_true_hash_false" | "recovery_result_integrity_size_false_hash_true" | "recovery_result_integrity_size_false_hash_false") { return true; }
+    let Some(detail)=error.strip_prefix("recovery_result_status:").or_else(||error.strip_prefix("recovery_result_body:")) else { return false; };
+    if matches!(detail,"recovery_challenge_unavailable" | "recovery_read_transport_unavailable" | "recovery_read_content_type_invalid" | "recovery_read_length_exceeded" | "recovery_read_body_unavailable") { return true; }
+    detail.strip_prefix("recovery_challenge_http_").or_else(||detail.strip_prefix("recovery_read_http_")).is_some_and(|code|code.len()==3 && code.bytes().all(|b|b.is_ascii_digit()))
+}
+
 fn valid_recovery_catalog_service(value: &str) -> bool {
     matches!(value, "calendar" | "todo" | "mail" | "contacts")
 }
@@ -8377,6 +8384,7 @@ impl Router {
                     "recovery_prepare_staging_unavailable"=>"recovery_prepare_staging_unavailable",
                     "recovery_prepare_result_unavailable"=>"recovery_prepare_result_unavailable",
                     "recovery_prepare_projection_unavailable"=>"recovery_prepare_projection_unavailable",
+                    _ if safe_recovery_result_diagnostic(&error)=>error.as_str(),
                     _=>"recovery_import_prepare_unavailable",
                 };
                 no_store_json_error(409,code)
@@ -10770,6 +10778,14 @@ fn mail_preview_enrichment(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovery_result_diagnostics_are_bounded_and_do_not_echo_arbitrary_errors() {
+        assert!(super::safe_recovery_result_diagnostic("recovery_result_body:recovery_read_http_404"));
+        assert!(super::safe_recovery_result_diagnostic("recovery_result_integrity_size_true_hash_false"));
+        assert!(!super::safe_recovery_result_diagnostic("recovery_result_body:secret"));
+        assert!(!super::safe_recovery_result_diagnostic("recovery_result_body:recovery_read_http_404secret"));
+    }
+
     #[test]
     fn recovery_catalog_accepts_four_domains_only() {
         for service in ["calendar", "todo", "mail", "contacts"] {

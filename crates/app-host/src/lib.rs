@@ -377,6 +377,14 @@ fn execute_staged_recovery_batch(cfg:&Config,account:&str,origin:&str,manifest:a
     Ok(CalendarBatchOutcome::Confirmed(completed))
 }
 
+#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+fn safe_recovery_result_diagnostic(error:&str) -> bool {
+    if matches!(error,"recovery_result_store_unavailable" | "recovery_result_binding_unavailable" | "recovery_result_auth_unavailable" | "recovery_result_status_invalid" | "recovery_result_not_available" | "recovery_result_integrity_size_true_hash_false" | "recovery_result_integrity_size_false_hash_true" | "recovery_result_integrity_size_false_hash_false") { return true; }
+    let Some(detail)=error.strip_prefix("recovery_result_status:").or_else(||error.strip_prefix("recovery_result_body:")) else { return false; };
+    if matches!(detail,"recovery_challenge_unavailable" | "recovery_read_transport_unavailable" | "recovery_read_content_type_invalid" | "recovery_read_length_exceeded" | "recovery_read_body_unavailable") { return true; }
+    detail.strip_prefix("recovery_challenge_http_").or_else(||detail.strip_prefix("recovery_read_http_")).is_some_and(|code|code.len()==3 && code.bytes().all(|b|b.is_ascii_digit()))
+}
+
 fn calendar_month_bounds(year:u32, month:u32) -> Option<(String,String)> {
     if !(1900..=9998).contains(&year) || !(1..=12).contains(&month) { return None; }
     let (next_year,next_month) = if month == 12 { (year+1,1) } else { (year,month+1) };
@@ -11448,7 +11456,7 @@ fn prepare_recovery_import_action(cfg:&Config,control:&agent_control_store::Agen
                 let expires=unix_now_ms().checked_add(24*60*60*1000).ok_or("recovery_batch_invalid")?;
                 isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.reserve_recovery_batch(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,&manifest,expires,unix_now_ms()).map(|_| ())).map_err(|_| "recovery_prepare_staging_unavailable")?;
                 for (index,selection) in selections.iter().enumerate() {
-                    let payload=isyncyou_engine::provider_auth::with_platform_credential_store(cfg,&request.account,|credentials| read_bound_recovery_result(cfg,selection,signer.as_ref(),credentials)).map_err(|_| "recovery_prepare_result_unavailable")?;
+                    let payload=isyncyou_engine::provider_auth::with_platform_credential_store(cfg,&request.account,|credentials| read_bound_recovery_result(cfg,selection,signer.as_ref(),credentials)).map_err(|error| if safe_recovery_result_diagnostic(&error) { error } else { "recovery_prepare_result_unavailable".into() })?;
                     if payload.sha256!=statuses[index].sha256 || payload.bytes.len() as u64!=statuses[index].size || payload.kind!=statuses[index].kind || payload.encoding!=statuses[index].encoding { return Err("recovery_result_changed".into()); }
                     for (chunk,bytes) in payload.bytes.chunks(agent_control_store::RECOVERY_CHUNK_BYTES).enumerate() {
                         isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.put_recovery_batch_chunk(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,index,u32::try_from(chunk).map_err(|_| "recovery_batch_invalid")?,bytes,unix_now_ms()))?;

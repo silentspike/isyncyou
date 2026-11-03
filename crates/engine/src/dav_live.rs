@@ -5,11 +5,15 @@ use isyncyou_core::{config::ProviderConfig, Config};
 use isyncyou_store::{ProviderObject, ProviderScope, Store};
 use crate::provider_credential::ProviderCredentialStore;
 
+fn configured_origin(cfg: &Config, account: &str) -> Result<String, String> {
+    match cfg.provider_accounts.get(account) {
+        Some(ProviderConfig::SelfHosted { origin, .. }) => Ok(origin.clone()),
+        None => Err("Not a self-hosted account".into()),
+    }
+}
+
 fn configured(cfg: &Config, account: &str) -> Result<(String, Store), String> {
-    let origin = match cfg.provider_accounts.get(account) {
-        Some(ProviderConfig::SelfHosted { origin, .. }) => origin.clone(),
-        None => return Err("Not a self-hosted account".into()),
-    };
+    let origin = configured_origin(cfg,account)?;
     let store = crate::provider_store::open(cfg, account)?;
     Ok((origin, store))
 }
@@ -26,13 +30,13 @@ fn client_with_store(cfg: &Config, account: &str, origin: &str, credentials: &dy
 
 /// Resolve server-advertised collections for the configured account.
 pub fn discover(cfg: &Config, account: &str, entry: &str) -> Result<Vec<Collection>, String> {
-    let (origin, _) = configured(cfg, account)?;
+    let origin = configured_origin(cfg, account)?;
     client(cfg, account, &origin)?.discover(entry).map_err(|e| e.to_string())
 }
 
 /// Platform credential variant for the same discovery path.
 pub fn discover_with_store(cfg: &Config, account: &str, entry: &str, credentials: &dyn ProviderCredentialStore) -> Result<Vec<Collection>, String> {
-    let (origin, _) = configured(cfg, account)?;
+    let origin = configured_origin(cfg, account)?;
     client_with_store(cfg, account, &origin, credentials)?.discover(entry).map_err(|e| e.to_string())
 }
 
@@ -67,8 +71,56 @@ pub fn sync_all(cfg: &Config, account: &str, entry: &str) -> Result<SyncPass, St
     sync_all_inner(cfg, account, entry, None)
 }
 
+/// One cross-process lease per account/origin/collection keeps two detached
+/// network observations from racing; it is independent of the provider writer.
+fn collection_sync_lease(cfg: &Config, scope: &ProviderScope) -> Result<std::fs::File, String> {
+    use fs2::FileExt;
+    use sha2::{Digest,Sha256};
+    let account = cfg.accounts.iter().find(|a| a.id == scope.account_id).ok_or("Account missing")?;
+    std::fs::create_dir_all(&account.archive_root).map_err(|_| "DAV archive directory unavailable")?;
+    let mut h=Sha256::new();
+    for value in [&scope.account_id,&scope.origin,&scope.service,&scope.collection] { h.update((value.len() as u64).to_be_bytes()); h.update(value.as_bytes()); }
+    let path=account.archive_root.join(format!(".isyncyou-dav-sync-{:x}.lock",h.finalize()));
+    let file=std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path).map_err(|_| "DAV sync lease unavailable")?;
+    file.try_lock_exclusive().map_err(|_| "DAV collection sync already active")?;
+    Ok(file)
+}
+
+fn sync_detached(cfg: &Config, client: &DavClient, scope: &ProviderScope) -> Result<usize,String> {
+    let _lease=collection_sync_lease(cfg,scope)?;
+    let snapshot = match crate::provider_store::open_readonly(cfg,&scope.account_id) {
+        Ok(store) => store,
+        Err(error) if error == "Provider cache is not initialized" => {
+            drop(crate::provider_store::open_for_session(cfg,&scope.account_id)?);
+            crate::provider_store::open_readonly(cfg,&scope.account_id)?
+        }
+        Err(error) => return Err(error),
+    };
+    let cursor=snapshot.provider_cursor(scope).map_err(|e| e.to_string())?;
+    let accessible=snapshot.provider_accessible(scope).map_err(|e| e.to_string())?;
+    let full = scope.service == "calendar" && (snapshot.provider_dav_unindexed_count(scope).map_err(|e| e.to_string())? > 0 || snapshot.provider_alarm_unindexed_count(scope).map_err(|e| e.to_string())? > 0);
+    drop(snapshot);
+    let batch=match client.fetch_sync_batch(scope,cursor.clone(),accessible,full) {
+        Ok(batch) => batch,
+        Err(DavError::Http(403)) => {
+            // A denial must not overwrite an access/cursor change observed by
+            // another writer while this network request was in flight.
+            let store=crate::provider_store::open_for_session(cfg,&scope.account_id)?;
+            if store.provider_cursor(scope).map_err(|e| e.to_string())? == cursor && store.provider_accessible(scope).map_err(|e| e.to_string())? == accessible {
+                store.set_provider_accessible(scope,false).map_err(|e| e.to_string())?;
+            }
+            return Err("DAV collection access denied".into());
+        },
+        Err(error) => return Err(error.to_string()),
+    };
+    let store=crate::provider_store::open_for_session(cfg,&scope.account_id)?;
+    let count=DavClient::commit_sync_batch(&store,scope,batch).map_err(|e| e.to_string())?;
+    store.backfill_provider_dav_search(scope,100).map_err(|e| e.to_string())?;
+    Ok(count)
+}
+
 fn sync_all_inner(cfg: &Config, account: &str, entry: &str, credentials: Option<&dyn ProviderCredentialStore>) -> Result<SyncPass, String> {
-    let (origin, store) = configured(cfg, account)?;
+    let origin = configured_origin(cfg, account)?;
     let client = match credentials {
         Some(credentials) => client_with_store(cfg, account, &origin, credentials)?,
         None => client(cfg, account, &origin)?,
@@ -82,15 +134,13 @@ fn sync_all_inner(cfg: &Config, account: &str, entry: &str, credentials: Option<
             report.collections += 1;
             present.insert((service.to_owned(), collection.url.clone()));
             let scope = ProviderScope { account_id: account.into(), origin: origin.clone(), service: service.into(), collection: collection.url.clone() };
-            match client.sync_collection(&store, &scope) {
-                Ok(changes) => {
-                    report.changes += changes;
-                    if store.backfill_provider_dav_search(&scope, 100).is_err() { report.failed += 1; }
-                },
+            match sync_detached(cfg,&client,&scope) {
+                Ok(changes) => { report.changes += changes; },
                 Err(_) => report.failed += 1,
             }
         }
     }
+    let store = crate::provider_store::open_for_session(cfg,account)?;
     for service in ["calendar", "contacts"] {
         for scope in store.provider_scopes(account, &origin, service).map_err(|e| e.to_string())? {
             if !present.contains(&(service.to_owned(), scope.collection.clone())) {
@@ -103,7 +153,7 @@ fn sync_all_inner(cfg: &Config, account: &str, entry: &str, credentials: Option<
 
 fn sync_collection_inner(cfg: &Config, account: &str, entry: &str, collection: &str, service: &str, credentials: Option<&dyn ProviderCredentialStore>) -> Result<usize, String> {
     if !matches!(service, "calendar" | "contacts") { return Err("Unsupported DAV service".into()); }
-    let (origin, store) = configured(cfg, account)?;
+    let origin = configured_origin(cfg, account)?;
     let client = match credentials {
         Some(credentials) => client_with_store(cfg, account, &origin, credentials)?,
         None => client(cfg, account, &origin)?,
@@ -112,18 +162,18 @@ fn sync_collection_inner(cfg: &Config, account: &str, entry: &str, collection: &
     let collections = match client.discover(entry) {
         Ok(collections) => collections,
         Err(DavError::Http(403)) => {
+            let store = crate::provider_store::open_for_session(cfg,account)?;
             store.set_provider_accessible(&scope, false).map_err(|e| e.to_string())?;
             return Err("Collection is not currently accessible".into());
         }
         Err(error) => return Err(error.to_string()),
     };
     if !collections.iter().any(|c| c.url == collection && if service == "calendar" { c.calendar } else { c.addressbook }) {
+        let store = crate::provider_store::open_for_session(cfg,account)?;
         store.set_provider_accessible(&scope, false).map_err(|e| e.to_string())?;
         return Err("Collection is not currently accessible".into());
     }
-    let changes = client.sync_collection(&store, &scope).map_err(|e| e.to_string())?;
-    store.backfill_provider_dav_search(&scope, 100).map_err(|e| e.to_string())?;
-    Ok(changes)
+    sync_detached(cfg,&client,&scope)
 }
 
 /// Query one currently discoverable calendar's free/busy, not an aggregate
@@ -244,14 +294,17 @@ impl ReminderPlan {
 /// occurrences outside that window cannot fire inside the trigger window.
 pub fn plan_account_reminders_with_store(cfg: &Config, account: &str, entry: &str, occurrence_start: &str, occurrence_end: &str, window_start: i64, window_end: i64, floating_tzid: Option<&str>, credentials: &dyn ProviderCredentialStore) -> Result<Vec<serde_json::Value>, String> {
     if window_end <= window_start || window_end.saturating_sub(window_start) > 31 * 86400 || occurrence_start >= occurrence_end { return Err("Invalid reminder planning window".into()); }
-    let (origin, store) = configured(cfg, account)?;
+    let origin = configured_origin(cfg, account)?;
     let client = client_with_store(cfg, account, &origin, credentials)?;
     let collections = client.discover(entry).map_err(|e| e.to_string())?;
     let mut records = Vec::new();
     let mut objects_seen = 0usize;
     for collection in collections.into_iter().filter(|c| c.calendar) {
         let scope = ProviderScope { account_id:account.into(), origin:origin.clone(), service:"calendar".into(), collection:collection.url };
-        client.sync_collection(&store, &scope).map_err(|e| e.to_string())?;
+        sync_detached(cfg,&client,&scope)?;
+        let store = crate::provider_store::open_readonly(cfg,account)?;
+        let initial_cursor = store.provider_cursor(&scope).map_err(|e| e.to_string())?;
+        let initial_access = store.provider_accessible(&scope).map_err(|e| e.to_string())?;
         let mut expanded = client.expanded_events(&scope, occurrence_start, occurrence_end).map_err(|e| e.to_string())?;
         expanded.extend(client.expanded_tasks(&scope, occurrence_start, occurrence_end).map_err(|e| e.to_string())?);
         let mut by_href = std::collections::HashMap::new();
@@ -281,6 +334,7 @@ pub fn plan_account_reminders_with_store(cfg: &Config, account: &str, entry: &st
             after = page.last().ok_or("Reminder pagination failed")?.remote_id.clone();
         }
         if !by_href.is_empty() { return Err("Calendar changed during reminder enumeration".into()); }
+        if store.provider_cursor(&scope).map_err(|e| e.to_string())? != initial_cursor || store.provider_accessible(&scope).map_err(|e| e.to_string())? != initial_access { return Err("Calendar changed during reminder enumeration".into()); }
     }
     Ok(records)
 }

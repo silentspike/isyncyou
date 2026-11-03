@@ -9373,9 +9373,19 @@ function renderAccountMenu(body) {
         } catch (_) { toast("The sign-in state could not be resolved. No server grant status was established.", "err"); }
         } }, "Resolve sign-in");
         controls.append(resolveButton);
+        const cancelPendingButton = el("button", { class:"btn sm", type:"button", style:"display:none", onclick:async event => {
+          const button=event.currentTarget; button.disabled=true;
+          try {
+            const result=await nativeCall("providerAuthCancelPending",{account:a.id},PROVIDER_NATIVE_TIMEOUT_MS);
+            if (result && result.cancelled === true) { await reloadAccounts(); renderAccountMenu(body); toast("Pending browser sign-in cancelled."); }
+            else { toast("The pending sign-in was not cancelled.","err"); button.disabled=false; }
+          } catch (_) { toast("The sign-in state changed or could not be cancelled.","err"); button.disabled=false; }
+        } }, "Cancel pending sign-in");
+        controls.append(cancelPendingButton);
         void nativeCall("providerStatus", { account:a.id }, NATIVE_TIMEOUT_MS).then(status => {
           if (!controls.isConnected) return;
           if (status && status.auth_state === "outcome_unknown") { providerActionsUnknown.add(a.id); connectButton.disabled = true; resolveButton.style.display = ""; }
+          else if (status && status.auth_state === "pending" && !providerActionsUnknown.has(a.id)) { connectButton.disabled=true; cancelPendingButton.style.display=""; }
         }).catch(() => {});
       }
       row.append(el("div", { class: "acct-role" },

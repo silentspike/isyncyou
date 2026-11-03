@@ -175,7 +175,7 @@ fn linux_signer_from_record(scope: &ProviderScope, slot: &str, store: &Store) ->
 #[cfg(all(target_os = "linux", feature = "desktop-keyring"))]
 pub fn load_linux_recovery_signer(cfg: &Config, account: &str) -> Result<LinuxRecoverySigner, String> {
     let (scope, slot) = linux_identity_scope(cfg, account)?;
-    let store = crate::provider_store::open(cfg, account)?;
+    let store = crate::provider_store::open_readonly(cfg, account)?;
     linux_signer_from_record(&scope, &slot, &store)
 }
 
@@ -351,6 +351,7 @@ impl RecoveryBroker {
         let challenge = self.http.post(self.origin.join("/recovery/challenge").map_err(|_| "Invalid recovery route")?)
             .bearer_auth(&self.token).json(&json!({"device":device,"action":action,"effect":effect})).send()
             .map_err(|_| "Recovery challenge unavailable")?;
+        if !challenge.status().is_success() { return Err(format!("recovery_challenge_http_{}", challenge.status().as_u16())); }
         let response: Value = serde_json::from_slice(&Self::bounded(challenge, 16384)?).map_err(|_| "Invalid recovery challenge")?;
         let id = response.get("challenge_id").and_then(Value::as_str).filter(|v| !v.is_empty() && v.len() <= 128).ok_or("Invalid recovery challenge")?;
         let encoded = response.get("payload").and_then(Value::as_str).ok_or("Invalid recovery challenge")?;
@@ -407,12 +408,21 @@ impl RecoveryBroker {
         if id.len() != 36 || id.bytes().enumerate().any(|(i,b)| {
             if [8,13,18,23].contains(&i) { b != b'-' } else { !(b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) }
         }) { return Err("Invalid recovery job".into()); }
-        let (challenge, signature) = self.signed(signer, "read", &json!({"id":id}))?;
+        let (challenge, signature) = self.signed(signer, "read", &json!({"id":id})).map_err(|e| {
+            if e.strip_prefix("recovery_challenge_http_").is_some_and(|v| v.len()==3 && v.bytes().all(|b| b.is_ascii_digit())) { e }
+            else { "recovery_challenge_unavailable".into() }
+        })?;
         let suffix = if result { "/result" } else { "" };
         let url = self.origin.join(&format!("/recovery/jobs/{id}{suffix}")).map_err(|_| "Invalid recovery route")?;
         let response = self.http.get(url).bearer_auth(&self.token).header("X-Recovery-Device", signer.device_id())
-            .header("X-Recovery-Challenge", challenge).header("X-Recovery-Signature", signature).send().map_err(|_| "Recovery result unavailable")?;
-        Self::bounded(response, if result { 100 * 1024 * 1024 } else { 16384 })
+            .header("X-Recovery-Challenge", challenge).header("X-Recovery-Signature", signature).send().map_err(|_| "recovery_read_transport_unavailable")?;
+        if !response.status().is_success() { return Err(format!("recovery_read_http_{}", response.status().as_u16())); }
+        let expected = if result { "application/octet-stream" } else { "application/json" };
+        if response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(';').next()).map(str::trim) != Some(expected) { return Err("recovery_read_content_type_invalid".into()); }
+        let limit = if result { 100 * 1024 * 1024 } else { 16384 };
+        if response.content_length().is_some_and(|n| n > limit) { return Err("recovery_read_length_exceeded".into()); }
+        Self::bounded(response, limit).map_err(|_| "recovery_read_body_unavailable".into())
     }
 
     pub fn job_status(&self, signer: &dyn RecoveryDeviceSigner, id: &str) -> Result<Value, String> {
@@ -423,11 +433,13 @@ impl RecoveryBroker {
 
     /// Accept only bytes matching the immediately authenticated job status.
     fn result(&self, signer: &dyn RecoveryDeviceSigner, id: &str) -> Result<RecoveredPayload, String> {
-        let status = self.job_status(signer, id)?;
-        let status = parse_bound_status(&status, String::new())?;
-        if status.state != "available" { return Err("Recovery result unavailable".into()); }
-        let bytes = self.job_read(signer, id, true)?;
-        if bytes.len() as u64 != status.size || format!("{:x}", Sha256::digest(&bytes)) != status.sha256 { return Err("Recovery result integrity failure".into()); }
+        let status = self.job_status(signer, id).map_err(|e| format!("recovery_result_status:{e}"))?;
+        let status = parse_bound_status(&status, String::new()).map_err(|_| "recovery_result_status_invalid")?;
+        if status.state != "available" { return Err("recovery_result_not_available".into()); }
+        let bytes = self.job_read(signer, id, true).map_err(|e| format!("recovery_result_body:{e}"))?;
+        let size_match = bytes.len() as u64 == status.size;
+        let hash_match = format!("{:x}", Sha256::digest(&bytes)) == status.sha256;
+        if !size_match || !hash_match { return Err(format!("recovery_result_integrity_size_{size_match}_hash_{hash_match}")); }
         Ok(RecoveredPayload { bytes, kind:status.kind, encoding:status.encoding, sha256:status.sha256 })
     }
 }
@@ -633,7 +645,7 @@ fn bound_recovery_job_with_token(cfg: &Config, selection: &RecoverySelection, si
 /// downloading bytes. The host must still hash every downloaded payload.
 pub fn bound_recovery_status(cfg: &Config, selection: &RecoverySelection, signer: &dyn RecoveryDeviceSigner,
                              credentials: &dyn ProviderCredentialStore) -> Result<BoundRecoveryStatus, String> {
-    let store = crate::provider_store::open(cfg, &selection.account_id)?;
+    let store = crate::provider_store::open_readonly(cfg, &selection.account_id)?;
     crate::provider_auth::with_locked_provider_access_token(cfg, &selection.account_id, credentials, |token| {
         let (broker, id) = bound_recovery_job_with_token(cfg, selection, signer, &store, token)?;
         parse_bound_status(&broker.job_status(signer, &id)?, recovery_selection_digest(selection, signer.device_id()))
@@ -646,11 +658,15 @@ fn recovery_selection_digest(selection: &RecoverySelection, device: &str) -> Str
 
 pub fn read_bound_recovery_result(cfg: &Config, selection: &RecoverySelection, signer: &dyn RecoveryDeviceSigner,
                                   credentials: &dyn ProviderCredentialStore) -> Result<RecoveredPayload, String> {
-    let store = crate::provider_store::open(cfg, &selection.account_id)?;
-    crate::provider_auth::with_locked_provider_access_token(cfg, &selection.account_id, credentials, |token| {
-        let (broker, id) = bound_recovery_job_with_token(cfg, selection, signer, &store, token)?;
+    let store = crate::provider_store::open_readonly(cfg, &selection.account_id).map_err(|_| "recovery_result_store_unavailable")?;
+    let mut entered = false;
+    let result = crate::provider_auth::with_locked_provider_access_token(cfg, &selection.account_id, credentials, |token| {
+        entered = true;
+        let (broker, id) = bound_recovery_job_with_token(cfg, selection, signer, &store, token).map_err(|_| "recovery_result_binding_unavailable")?;
         broker.result(signer, &id)
-    })
+    });
+    if !entered { return Err("recovery_result_auth_unavailable".into()); }
+    result
 }
 
 /// Fetch a durably bound result and build the exact calendar import intent.

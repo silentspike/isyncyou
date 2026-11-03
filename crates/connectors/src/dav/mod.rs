@@ -332,6 +332,16 @@ pub struct ExpandedCalendar {
     pub calendar_data: String,
 }
 
+/// Complete bounded network observation; no provider writer is held while it
+/// is built. It must be committed against the unchanged starting cursor.
+pub struct DavNetworkBatch {
+    pub expected_cursor: Option<String>,
+    pub expected_accessible: Option<bool>,
+    pub cursor: String,
+    pub full: bool,
+    changes: Vec<ProviderChange>,
+}
+
 /// One server-reported access control entry. Protected/inherited entries are
 /// presented as such and must not be rewritten by a client-side share editor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -832,6 +842,98 @@ impl DavClient {
 
     /// Advance each completed page transactionally. A denied collection or
     /// resource preserves existing objects and its previous checkpoint.
+    pub fn fetch_sync_batch(&self, scope: &ProviderScope, expected_cursor: Option<String>, expected_accessible: Option<bool>, force_full: bool) -> Result<DavNetworkBatch, DavError> {
+        let collection = self.collection(scope)?;
+        let mut full = force_full || expected_accessible != Some(true) || expected_cursor.as_deref().is_none_or(str::is_empty);
+        let mut cursor = if full { String::new() } else { expected_cursor.clone().unwrap_or_default() };
+        let mut seen_tokens = HashSet::new();
+        let mut changes = Vec::new();
+        let mut bytes_total = 0usize;
+        loop {
+            if !seen_tokens.insert(cursor.clone()) { return Err(DavError::InvalidResponse); }
+            let body = format!("<?xml version=\"1.0\"?><d:sync-collection xmlns:d=\"DAV:\"><d:sync-token>{}</d:sync-token><d:sync-level>1</d:sync-level><d:prop><d:getetag/></d:prop></d:sync-collection>",escape_xml(&cursor));
+            let response = self.http.request(reqwest::Method::from_bytes(b"REPORT").map_err(|_| DavError::InvalidResponse)?,collection.clone())
+                .bearer_auth(&self.token).header("Depth","0").header(CONTENT_TYPE,"application/xml; charset=utf-8").body(body).send()
+                .map_err(|_| DavError::Transport("DAV report failed".into()))?;
+            let code = response.status().as_u16();
+            if code == 403 {
+                let error = bounded_body(response)?;
+                if invalid_sync_token(&error)? {
+                    if full { return Err(DavError::InvalidSyncToken); }
+                    cursor.clear(); full=true; changes.clear(); bytes_total=0; seen_tokens.clear(); continue;
+                }
+                return Err(DavError::Http(code));
+            }
+            if code != 207 { return Err(DavError::Http(code)); }
+            let page = parse_page(&bounded_body(response)?)?;
+            let mut more = false; let mut seen_collection_self = false;
+            for entry in page.entries {
+                let candidate = self.checked_from(&collection,&entry.href)?;
+                if candidate == collection && entry.status == Some(507) { more=true; continue; }
+                if candidate == collection { accept_collection_self(&entry,&mut seen_collection_self)?; continue; }
+                let url = self.resource(&collection,&entry.href)?;
+                let id = url.to_string();
+                match entry.status {
+                    Some(404) => changes.push(ProviderChange::Destroyed(id)),
+                    Some(code) if code != 200 => return Err(DavError::Http(code)),
+                    _ => {
+                        if entry.propstats != 1 || entry.prop_status != Some(200) || entry.etag.as_deref().is_none_or(str::is_empty) { return Err(DavError::InvalidResponse); }
+                        let response = self.http.get(url).bearer_auth(&self.token).send().map_err(|_| DavError::Transport("DAV object fetch failed".into()))?;
+                        let code = response.status().as_u16();
+                        if code != 200 { return Err(DavError::Http(code)); }
+                        let etag = response.headers().get(ETAG).and_then(|v| v.to_str().ok()).filter(|v| !v.is_empty()).map(str::to_owned).ok_or(DavError::InvalidResponse)?;
+                        let raw = bounded_body(response)?;
+                        bytes_total = bytes_total.checked_add(raw.len()).ok_or(DavError::InvalidResponse)?;
+                        if bytes_total > 64 * 1024 * 1024 { return Err(DavError::InvalidResponse); }
+                        changes.push(ProviderChange::Upsert(ProviderObject {remote_id:id,etag:Some(etag),raw}));
+                    }
+                }
+                if changes.len() > 100_000 { return Err(DavError::InvalidResponse); }
+            }
+            cursor = page.token;
+            if !more { return Ok(DavNetworkBatch {expected_cursor,expected_accessible,cursor,full,changes}); }
+        }
+    }
+
+    /// Apply an already fetched batch without any network activity. The caller
+    /// holds the collection lease and the short-lived provider writer.
+    pub fn commit_sync_batch(store: &Store, scope: &ProviderScope, batch: DavNetworkBatch) -> Result<usize, DavError> {
+        let current = store.provider_cursor(scope).map_err(|e| DavError::Store(e.to_string()))?;
+        let accessible = store.provider_accessible(scope).map_err(|e| DavError::Store(e.to_string()))?;
+        if current != batch.expected_cursor || accessible != batch.expected_accessible { return Err(DavError::Conflict); }
+        if batch.full {
+            let mut staging = Staging::begin(store,scope)?;
+            let mut count = 0usize;
+            for change in &batch.changes {
+                match change { ProviderChange::Upsert(object) => { staging.put(object)?; count += 1; }, ProviderChange::Destroyed(id) => staging.remove(id)? }
+            }
+            staging.finish(&batch.cursor)?;
+            Ok(count)
+        } else {
+            let expected = batch.expected_cursor.as_deref().filter(|x| !x.is_empty()).ok_or(DavError::InvalidResponse)?;
+            let mut changes = Vec::new();
+            for change in batch.changes {
+                if let ProviderChange::Upsert(object) = &change {
+                    let existing = store.provider_object(scope,&object.remote_id).map_err(|e| DavError::Store(e.to_string()))?;
+                    if existing.as_ref().and_then(|o| o.etag.as_deref()) == object.etag.as_deref() { continue; }
+                }
+                changes.push(change);
+            }
+            let count = changes.len();
+            let applied = if scope.service == "calendar" {
+                let indexed: Vec<_> = changes.into_iter().map(|change| {
+                    let (index,alarm) = match &change { ProviderChange::Upsert(object) => (Some(dav_index(&object.raw)),Some(alarm_index(&object.raw))), ProviderChange::Destroyed(_) => (None,None) };
+                    (change,index,alarm)
+                }).collect();
+                store.apply_provider_dav_page_indexed_if_cursor(scope,expected,&indexed,&batch.cursor)
+            } else {
+                store.apply_provider_page_if_accessible_cursor(scope,expected,&changes,&batch.cursor)
+            }.map_err(|e| DavError::Store(e.to_string()))?;
+            if !applied { return Err(DavError::Conflict); }
+            Ok(count)
+        }
+    }
+
     pub fn sync_collection(&self, store: &Store, scope: &ProviderScope) -> Result<usize, DavError> {
         let collection = self.collection(scope)?;
         let mut cursor = store.provider_cursor(scope).map_err(|e| DavError::Store(e.to_string()))?.unwrap_or_default();
@@ -1000,6 +1102,43 @@ impl DavClient {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature="encrypted-store")]
+    #[test]
+    fn detached_sync_allows_writer_during_network_and_rejects_stale_cursor() {
+        use std::io::{Read,Write};
+        let temp=tempfile::tempdir().unwrap(); let db=temp.path().join("provider.db");
+        let store=isyncyou_store::Store::open_encrypted(&db,b"test-key").unwrap(); drop(store);
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin=format!("http://{}/",listener.local_addr().unwrap());
+        let (entered_tx,entered_rx)=std::sync::mpsc::channel(); let (resume_tx,resume_rx)=std::sync::mpsc::channel();
+        let server=std::thread::spawn(move || {
+            let (mut socket,_)=listener.accept().unwrap(); let mut request=Vec::new(); let mut buf=[0u8;4096];
+            loop { let n=socket.read(&mut buf).unwrap(); assert_ne!(n,0); request.extend_from_slice(&buf[..n]);
+                if let Some(end)=request.windows(4).position(|w| w==b"\r\n\r\n") {
+                    let headers=String::from_utf8_lossy(&request[..end]); let length=headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok())).unwrap_or(0);
+                    if request.len()>=end+4+length { break; }
+                }
+            }
+            entered_tx.send(()).unwrap(); resume_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            let body=r#"<d:multistatus xmlns:d="DAV:"><d:sync-token>remote-next</d:sync-token></d:multistatus>"#;
+            write!(socket,"HTTP/1.1 207 Multi-Status\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+        });
+        let scope=isyncyou_store::ProviderScope {account_id:"fixture".into(),origin:origin.clone(),service:"contacts".into(),collection:format!("{origin}book/")};
+        let worker_scope=scope.clone(); let worker_origin=origin.clone();
+        let worker=std::thread::spawn(move || {
+            let client=super::DavClient {http:reqwest::blocking::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(10)).build().unwrap(),origin:url::Url::parse(&worker_origin).unwrap(),token:"fixture".into(),trusted_public_origin:None};
+            client.fetch_sync_batch(&worker_scope,None,None,true).unwrap()
+        });
+        entered_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        // A real encrypted provider writer can be opened and committed while
+        // the REPORT is stalled; the returned observation then becomes stale.
+        let writer=isyncyou_store::Store::open_encrypted(&db,b"test-key").unwrap();
+        writer.apply_provider_page(&scope,&[],"newer").unwrap(); drop(writer);
+        resume_tx.send(()).unwrap(); let batch=worker.join().unwrap(); server.join().unwrap();
+        let writer=isyncyou_store::Store::open_encrypted(&db,b"test-key").unwrap();
+        assert!(matches!(super::DavClient::commit_sync_batch(&writer,&scope,batch),Err(super::DavError::Conflict)));
+        assert_eq!(writer.provider_cursor(&scope).unwrap().as_deref(),Some("newer"));
+    }
     #[test]
     fn personal_home_accepts_only_collection_slash_and_rebases_relative_principal() {
         use std::io::{Read, Write};

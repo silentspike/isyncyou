@@ -399,6 +399,29 @@ impl Store {
         tx.commit()?; Ok(())
     }
 
+    /// Atomically apply DAV objects and their indexes only while the fetched
+    /// checkpoint is still current and the collection remains accessible.
+    pub fn apply_provider_dav_page_indexed_if_cursor(&self, scope:&ProviderScope, expected:&str, changes:&[(ProviderChange,Option<ProviderDavIndex>,Option<ProviderAlarmIndex>)], cursor:&str) -> Result<bool> {
+        if !self.protected_provider_storage() { return Err(StoreError::MissingStoreKey); }
+        if scope.service != "calendar" { return Err(StoreError::InvalidProgressiveSearch("DAV index requires calendar scope".into())); }
+        let tx = self.conn.unchecked_transaction()?;
+        let current:Option<(Option<String>,bool)> = tx.query_row("SELECT cursor,accessible FROM provider_collections WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4",params![scope.account_id,scope.origin,scope.service,scope.collection],|row| Ok((row.get(0)?,row.get(1)?))).optional()?;
+        if !matches!(current,Some((Some(ref value),true)) if value == expected) { return Ok(false); }
+        for (change,identity,alarm) in changes {
+            match (change,identity,alarm) {
+                (ProviderChange::Upsert(object),Some(identity),Some(alarm)) => {
+                    apply_changes(&tx,scope,std::slice::from_ref(change),cursor)?;
+                    write_dav_index(&tx,scope,&object.remote_id,identity)?;
+                    write_alarm_index(&tx,scope,&object.remote_id,alarm)?;
+                }
+                (ProviderChange::Destroyed(_),None,None) => apply_changes(&tx,scope,std::slice::from_ref(change),cursor)?,
+                _ => return Err(StoreError::InvalidProgressiveSearch("DAV resource/index mismatch".into())),
+            }
+        }
+        apply_changes(&tx,scope,&[],cursor)?;
+        tx.commit()?; Ok(true)
+    }
+
     pub fn stage_provider_alarm_index(&self, scope:&ProviderScope, generation:&str, remote_id:&str, index:&ProviderAlarmIndex) -> Result<()> {
         if !self.protected_provider_storage() { return Err(StoreError::MissingStoreKey); }
         if scope.service != "calendar" { return Err(StoreError::InvalidProgressiveSearch("alarm index requires calendar scope".into())); }
@@ -835,6 +858,16 @@ impl Store {
         Ok(true)
     }
 
+    /// DAV variant: a revoked collection cannot be made accessible again by a stale page.
+    pub fn apply_provider_page_if_accessible_cursor(&self, scope:&ProviderScope, expected:&str, changes:&[ProviderChange], cursor:&str) -> Result<bool> {
+        if !self.protected_provider_storage() { return Err(StoreError::MissingStoreKey); }
+        let tx = self.conn.unchecked_transaction()?;
+        let current:Option<(Option<String>,bool)> = tx.query_row("SELECT cursor,accessible FROM provider_collections WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4",params![scope.account_id,scope.origin,scope.service,scope.collection],|row| Ok((row.get(0)?,row.get(1)?))).optional()?;
+        if !matches!(current,Some((Some(ref value),true)) if value == expected) { return Ok(false); }
+        apply_changes(&tx,scope,changes,cursor)?;
+        tx.commit()?; Ok(true)
+    }
+
     /// Replace only this collection after a complete, successful enumeration.
     pub fn reconcile_provider_snapshot(&self, scope: &ProviderScope, objects: &[ProviderObject], cursor: &str) -> Result<()> {
         if !self.protected_provider_storage() { return Err(StoreError::MissingStoreKey); }
@@ -1063,6 +1096,45 @@ fn capture_observation(tx: &rusqlite::Transaction<'_>, scope: &ProviderScope, ob
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "encrypted-store")]
+    fn encrypted_readonly_observes_committed_mutation_while_writer_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider.db");
+        let writer = Store::open_encrypted(&path,b"test-store-key").unwrap();
+        let scope = ProviderScope {account_id:"a".into(),origin:"https://example.test".into(),service:"recovery-device".into(),collection:"installation".into()};
+        assert!(writer.claim_provider_mutation(&scope,"installation","signer","{}","digest").unwrap());
+        let reader = Store::open_readonly_encrypted(&path,b"test-store-key").unwrap();
+        let (kind,_,digest,state,_) = reader.provider_mutation_intent(&scope,"installation").unwrap().unwrap();
+        assert_eq!((kind.as_str(),digest.as_str(),state.as_str()),("signer","digest","unknown"));
+        assert!(Store::open_readonly_encrypted(&path,b"wrong-key").is_err());
+        drop(reader); drop(writer);
+    }
+
+    #[test]
+    fn dav_page_cas_preserves_cursor_indexes_and_revoked_access() {
+        let store = Store::open_in_memory().unwrap();
+        let calendar = ProviderScope {account_id:"a".into(),origin:"https://example.test".into(),service:"calendar".into(),collection:"/cal/".into()};
+        let item = ProviderObject {remote_id:"/cal/one.ics".into(),etag:Some("v1".into()),raw:b"BEGIN:VCALENDAR".to_vec()};
+        let index = ProviderDavIndex::Valid {uid:"task1".into(),kind:"task".into(),parent_uid:None};
+        let alarm = ProviderAlarmIndex::Valid {has_alarm:false};
+        store.apply_provider_dav_page_indexed(&calendar,&[(ProviderChange::Upsert(item.clone()),Some(index.clone()),Some(alarm.clone()))],"one").unwrap();
+        assert!(!store.apply_provider_dav_page_indexed_if_cursor(&calendar,"stale",&[(ProviderChange::Destroyed(item.remote_id.clone()),None,None)],"two").unwrap());
+        assert_eq!(store.provider_dav_uid_lookup(&calendar,"task1").unwrap().len(),1);
+        store.set_provider_accessible(&calendar,false).unwrap();
+        assert!(!store.apply_provider_dav_page_indexed_if_cursor(&calendar,"one",&[(ProviderChange::Destroyed(item.remote_id.clone()),None,None)],"two").unwrap());
+        assert_eq!(store.provider_cursor(&calendar).unwrap().as_deref(),Some("one"));
+        assert_eq!(store.provider_accessible(&calendar).unwrap(),Some(false));
+        store.set_provider_accessible(&calendar,true).unwrap();
+        assert!(store.apply_provider_dav_page_indexed_if_cursor(&calendar,"one",&[(ProviderChange::Destroyed(item.remote_id),None,None)],"two").unwrap());
+        assert_eq!(store.provider_dav_uid_lookup(&calendar,"task1").unwrap().len(),0);
+        let contacts = ProviderScope {service:"contacts".into(),collection:"/card/".into(),..calendar};
+        store.apply_provider_page(&contacts,&[],"one").unwrap();
+        store.set_provider_accessible(&contacts,false).unwrap();
+        assert!(!store.apply_provider_page_if_accessible_cursor(&contacts,"one",&[],"two").unwrap());
+        assert_eq!(store.provider_cursor(&contacts).unwrap().as_deref(),Some("one"));
+    }
 
     #[test]
     fn offline_draft_result_is_scoped_and_rejects_ambiguous_native_accounts() {

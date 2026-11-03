@@ -22,7 +22,7 @@ class BridgeMessagePolicyTest {
     }
     @Test
     fun providerOperationsAcceptOnlyAccountIdentifiers() {
-        for (op in listOf("providerSignIn", "providerStatus", "providerSignOut", "providerPushSetup", "providerPushStatus", "providerQuarantineList", "providerAuthResolve")) {
+        for (op in listOf("providerSignIn", "providerStatus", "providerSignOut", "providerPushSetup", "providerPushStatus", "providerQuarantineList", "providerAuthResolve", "providerAuthCancelPending")) {
             fun envelope(payload: JSONObject) = JSONObject().put("t", "native").put("id", "p1")
                 .put("op", op).put("payload", payload).toString()
             assertValid(BridgeMessagePolicy.validateEnvelope(envelope(JSONObject().put("account", "me"))), "native", "p1")

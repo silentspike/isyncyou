@@ -90,6 +90,7 @@ object NativeEngine {
     external fun nativeProviderStatus(filesDir: String, account: String): Int
     external fun nativeProviderLogout(filesDir: String, account: String): Int
     external fun nativeProviderCancel()
+    external fun nativeProviderCancelPending(base: String, account: String): Int
     external fun nativeWakeProviderRefresh()
     /** Wait for a completed provider pass; partial errors and timeout return zero. */
     external fun nativeWaitProviderRefresh(account: String): Int
