@@ -5018,6 +5018,10 @@ impl Router {
             "/api/v1/agent/turn",
             "/api/v1/agent/turn/cancel",
             "/api/v1/agent/pending/cancel",
+            // Confirmation consumes its persistent authority first; the selected
+            // executor acquires this same archive gate around its own store work.
+            // Holding it here would deadlock a non-reentrant mutex.
+            "/api/v1/agent/confirm",
         ];
         let static_get = req.method == "GET"
             && (matches!(
@@ -11368,6 +11372,26 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 "Agent hot read must be served without the archive gate: {path}"
             );
         }
+    }
+
+    #[test]
+    fn agent_confirmation_executor_can_acquire_shared_nonrecursive_gate() {
+        struct GateAgent(std::sync::Arc<std::sync::Mutex<()>>);
+        impl AgentHandler for GateAgent {
+            fn start_turn(&self, _account:&str, _prompt:&str)->Result<String,String> { Err("unused".into()) }
+            fn confirm(&self, _command:&AgentConfirmCommand)->AgentConfirmOutcome {
+                let _held=self.0.try_lock().expect("router must not hold the executor gate");
+                AgentConfirmOutcome::Completed
+            }
+            fn cancel(&self, _turn:&str) {}
+            fn open_stream(&self, _turn:&str)->Option<std::sync::mpsc::Receiver<String>> { None }
+        }
+        let gate=std::sync::Arc::new(std::sync::Mutex::new(()));
+        let router=Router::with_gate(Config::default(),gate.clone())
+            .with_agent(std::sync::Arc::new(GateAgent(gate)),"agentsecret".into())
+            .with_session_token("sess".into());
+        let response=router.route(&agent_confirm_request(TEST_CONFIRM_ACTION_HASH));
+        assert_eq!(response.status,200);
     }
 
     #[test]
