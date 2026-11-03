@@ -166,7 +166,9 @@ class MainActivity : FragmentActivity() {
                 maxOf(bars.bottom, insets.getInsets(WindowInsetsCompat.Type.ime()).bottom)
             } else bars.bottom
             view.setPadding(bars.left, bars.top, bars.right, bottom)
-            insets
+            // The WebView is already inside the safe area; do not propagate the
+            // same system/IME insets to its viewport a second time.
+            WindowInsetsCompat.CONSUMED
         }
         web.settings.apply {
             javaScriptEnabled = true

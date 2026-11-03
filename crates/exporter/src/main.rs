@@ -9,7 +9,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fs::{self, OpenOptions};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use url::Url;
 
@@ -331,8 +331,15 @@ fn main() {
             return Err("expected one private config path".into());
         }
         let path = PathBuf::from(&args[1]);
-        let metadata = fs::metadata(&path)?;
-        if !path.is_absolute() || metadata.permissions().mode() & 0o077 != 0 {
+        let metadata = fs::symlink_metadata(&path)?;
+        let mode = metadata.permissions().mode() & 0o777;
+        let systemd_credential = std::env::var_os("CREDENTIALS_DIRECTORY")
+            .map(PathBuf::from)
+            .filter(|directory| directory.is_absolute())
+            .is_some_and(|directory| path == directory.join("exporter-config"));
+        let private_file = mode & 0o077 == 0;
+        let systemd_file = systemd_credential && metadata.uid() == 0 && mode == 0o440;
+        if !path.is_absolute() || !metadata.file_type().is_file() || !(private_file || systemd_file) {
             return Err("private config required".into());
         }
         run(serde_json::from_slice(&fs::read(path)?)?)
