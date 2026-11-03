@@ -131,7 +131,7 @@ fn run(config: Config) -> Result<()> {
     };
     mail::sync(&jmap, &store, &mail_scope, &mut budget)?;
     mail::sync_mailboxes(&jmap, &store, &mailbox_scope)?;
-    let dav = LoopbackDavReader::new(&config.origin, token)?;
+    let dav = LoopbackDavReader::new_with_public_origin(&config.origin, token, &config.trusted_public_origin)?;
     let collections = dav.discover(&config.dav_entry)?;
     if !collections.iter().any(|x| x.calendar) || !collections.iter().any(|x| x.addressbook) {
         return Err("required DAV collections unavailable".into());

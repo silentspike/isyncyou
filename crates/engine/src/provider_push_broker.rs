@@ -14,6 +14,16 @@ pub fn post(
     operation: &str,
     request: &Value,
 ) -> Result<Value, &'static str> {
+    post_inner(cfg, account, operation, request, None)
+}
+
+/// Engine-internal transport for a token already protected by the account lock.
+pub(crate) fn post_with_token(cfg: &Config, account: &str, operation: &str, request: &Value, token: &str) -> Result<Value, &'static str> {
+    if token.is_empty() || token.chars().any(char::is_control) { return Err("auth_unavailable"); }
+    post_inner(cfg, account, operation, request, Some(token))
+}
+
+fn post_inner(cfg: &Config, account: &str, operation: &str, request: &Value, supplied_token: Option<&str>) -> Result<Value, &'static str> {
     if !matches!(
         operation,
         "challenge" | "prepare" | "deliver" | "confirm" | "revoke"
@@ -47,8 +57,14 @@ pub fn post(
     if body.len() > 8192 {
         return Err("invalid_request");
     }
-    let token = crate::provider_auth::self_hosted_access_token(cfg, account)
-        .map_err(|_| "auth_unavailable")?;
+    let owned_token;
+    let token = match supplied_token {
+        Some(token) => token,
+        None => {
+            owned_token = crate::provider_auth::self_hosted_access_token(cfg, account).map_err(|_| "auth_unavailable")?;
+            &owned_token
+        }
+    };
     let client = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(20))

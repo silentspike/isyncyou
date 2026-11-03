@@ -94,9 +94,35 @@ cd "$ROOT"
 native_status=$(git status --porcelain --untracked-files=all -- Cargo.toml Cargo.lock crates gui/webui)
 [[ -z $native_status ]] || die "Rust/WebUI inputs are dirty; commit them before producing a bound APK artifact"
 source_commit=$(git rev-parse HEAD)
+snapshot=''
 
 stage=$(mktemp -d "$ROOT/android/app/src/main/.jniLibs-stage.XXXXXX")
-trap 'rm -rf -- "$stage"' EXIT INT TERM
+cleanup() {
+  rm -rf -- "$stage"
+  [[ -z $snapshot ]] || rm -rf -- "$snapshot"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [[ $BUILDER == remote-v2-api24 ]]; then
+  native_status=$(git status --porcelain --untracked-files=all -- Cargo.toml Cargo.lock rust-toolchain.toml crates bin gui)
+  [[ -z $native_status ]] || die "archived native inputs are dirty; commit them before building"
+  [[ $(git rev-parse HEAD) == "$source_commit" ]] || die "HEAD changed before the native snapshot"
+  [[ $ABIS == arm64-v8a ]] || die "the audited V2 API-24 profile supports arm64-v8a only"
+  [[ $NDK_VERSION == 27.3.13750724 ]] || die "the audited V2 API-24 profile requires NDK 27.3.13750724"
+  [[ $RUST_TOOLCHAIN =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "an exact Rust toolchain version is required"
+  snapshot=$(mktemp -d "${TMPDIR:-/tmp}/isyncyou-android-source.XXXXXXXX")
+  # Export tracked native inputs from the same commit that will bind the receipt.
+  # This is an isolated build input, not a worktree or a project migration.
+  git archive "$source_commit" -- Cargo.toml Cargo.lock rust-toolchain.toml crates bin gui | \
+    tar -xf - -C "$snapshot"
+  find "$snapshot" -type d -name TESTING-PRIVATE -prune -exec rm -rf -- {} +
+  find "$snapshot" -type f \( -name AGENTS.md -o -name TESTING-PRIVATE \) -delete
+  project_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
+  printf '[cargo_remote]\nschema = 1\nproject_id = "%s"\nprofile = "android-r27d-api24"\ntoolchain = "%s"\ntargets = []\nresources = "normal"\n' \
+    "$project_id" "$RUST_TOOLCHAIN" > "$snapshot/.cargo-remote.toml"
+fi
 
 feature_args=()
 if (( ${#canonical_features[@]} > 0 )); then
@@ -109,14 +135,13 @@ for abi in "${canonical_abis[@]}"; do
 
   case $BUILDER in
     remote-v2-api24)
-      mkdir -p "$ROOT/target/$target/release"
       # The audited V2 profile sets NDK API-24 compiler and linker variables.
       # V2 owns RUSTUP_TOOLCHAIN; only the non-secret page-alignment flags pass in.
       target_env=$(printf 'RUSTFLAGS=%q' "$ANDROID_PAGE_RUSTFLAGS")
-      cargo remote --init --profile android-r27d-api24 --no-copy-lock -d "$RUST_TOOLCHAIN" \
+      (cd "$snapshot" && cargo remote --init --profile android-r27d-api24 --no-copy-lock -d "$RUST_TOOLCHAIN" \
         -b "$target_env" -c "$target/release/libisyncyou_mobile.so" -- \
-        build --locked --release -p isyncyou-mobile --target "$target" "${feature_args[@]}"
-      source_library="$ROOT/target/$target/release/libisyncyou_mobile.so"
+        build --locked --release -p isyncyou-mobile --target "$target" "${feature_args[@]}")
+      source_library="$snapshot/target/$target/release/libisyncyou_mobile.so"
       ;;
     remote)
       remote_bin="$REMOTE_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
@@ -167,8 +192,16 @@ done
   done
 } >"$stage/isyncyou-native.properties"
 
+if [[ $BUILDER == remote-v2-api24 ]]; then
+  [[ $(git rev-parse HEAD) == "$source_commit" ]] || die "HEAD changed during the native build"
+  native_status=$(git status --porcelain --untracked-files=all -- Cargo.toml Cargo.lock rust-toolchain.toml crates bin gui)
+  [[ -z $native_status ]] || die "archived native inputs changed during the native build"
+fi
+
 rm -rf -- "$JNI_DIR"
 mv -- "$stage" "$JNI_DIR"
+[[ -z $snapshot ]] || rm -rf -- "$snapshot"
+snapshot=''
 trap - EXIT INT TERM
 printf 'android native artifact: PASS (%s; %s)\n' \
   "$(IFS=,; printf '%s' "${canonical_abis[*]}")" "$BUILDER"

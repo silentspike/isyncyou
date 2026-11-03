@@ -5,9 +5,6 @@ import android.content.Intent
 import androidx.work.ExistingWorkPolicy
 import androidx.work.Constraints
 import androidx.work.NetworkType
-import androidx.work.ExistingPeriodicWorkPolicy
-import androidx.work.PeriodicWorkRequestBuilder
-import java.util.concurrent.TimeUnit
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.workDataOf
@@ -42,6 +39,10 @@ class UnifiedPushReceiver : MessagingReceiver() {
             } else if (old.isEmpty()) {
                 state.put("endpoint", endpoint.url).put("public_key", keys.pubKey).put("auth", keys.auth)
                     .put("stage", "endpoint_received")
+            } else if (state.optBoolean("degraded", false)) {
+                // NEW_ENDPOINT also signals that a temporarily unavailable
+                // distributor is reachable again, even if its URL is unchanged.
+                state.put("degraded", false)
             } else return@update false
             true
         }
@@ -104,16 +105,15 @@ class UnifiedPushReceiver : MessagingReceiver() {
 
 internal object PushScheduler {
     fun scheduleCatchUp(context: Context, instance: String) {
-        val request = PeriodicWorkRequestBuilder<PushEnrollmentWorker>(15, TimeUnit.MINUTES)
-            .setInputData(workDataOf("instance" to instance))
-            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-            .build()
-        WorkManager.getInstance(context).enqueueUniquePeriodicWork("provider-push-catch-up:$instance", ExistingPeriodicWorkPolicy.KEEP, request)
+        // Migrate previously scheduled per-installation polling to one account pass.
+        WorkManager.getInstance(context).cancelUniqueWork("provider-push-catch-up:$instance")
+        ProviderCatchUpWorker.schedule(context)
     }
 
     fun cancel(context: Context, instance: String) {
         WorkManager.getInstance(context).cancelUniqueWork("provider-push-catch-up:$instance")
         WorkManager.getInstance(context).cancelUniqueWork("provider-push:$instance")
+        WorkManager.getInstance(context).cancelAllWorkByTag(PushJmap.renewalTag(instance))
     }
     fun enqueue(context: Context, instance: String, queueAfter: Boolean = true) {
         val request = OneTimeWorkRequestBuilder<PushEnrollmentWorker>()

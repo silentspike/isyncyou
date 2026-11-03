@@ -24,6 +24,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.Lifecycle
@@ -51,6 +52,8 @@ class MainActivity : FragmentActivity() {
         const val TAG = "iSyncYou"
         const val BIO_TIMEOUT_MS = 120_000L
         const val DEVICE_CREDENTIAL_REQUEST_CODE = 640
+        val attachmentBusy = java.util.concurrent.atomic.AtomicBoolean(false)
+        val providerScheduleLock = Any()
 
         /** The stable app origin the WebView loads from (#0A) — WebView's reserved
          *  virtual host. GET assets/subresources are served in-process via
@@ -60,6 +63,33 @@ class MainActivity : FragmentActivity() {
     }
 
     private lateinit var web: WebView
+
+    private var pendingAttachmentPath: String? = null
+    private val attachmentDocument = registerForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+        val path = pendingAttachmentPath
+        pendingAttachmentPath = null
+        if (uri != null && path != null) {
+            val accepted = dispatchBridge {
+                val success = runCatching {
+                    val response = NativeEngine.nativeAssetRequestWithSession(path, sessionToken)
+                    val bytes = AttachmentDownloadPolicy.body(response) ?: error("Invalid attachment response")
+                    val output = requireNotNull(contentResolver.openOutputStream(uri, "w"))
+                    output.use { it.write(bytes); it.flush() }
+                }.isSuccess
+                attachmentBusy.set(false)
+                runOnUiThread {
+                    android.widget.Toast.makeText(this,
+                        if (success) "Attachment saved." else "Attachment could not be saved; the selected file may be incomplete.",
+                        android.widget.Toast.LENGTH_LONG).show()
+                }
+            }
+            if (!accepted) attachmentBusy.set(false)
+        } else if (uri != null) {
+            attachmentBusy.set(false)
+            android.widget.Toast.makeText(this, "Download session expired; the selected file may be empty.",
+                android.widget.Toast.LENGTH_LONG).show()
+        } else attachmentBusy.set(false)
+    }
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -242,6 +272,7 @@ class MainActivity : FragmentActivity() {
         }
         sessionToken = token
         NativeEngine.nativeWakeProviderRefresh()
+        dispatchBridge { reconcileProviderCatchUp() }
         // The WebView loads from the stable app origin. GET assets/subresources are served
         // in-process with the trusted Activity session, and API/stream/native-control
         // traffic rides the preflighted origin-bound WebMessage bridge.
@@ -497,6 +528,28 @@ class MainActivity : FragmentActivity() {
         val op = obj.optString("op")
         val payload = obj.optJSONObject("payload") ?: JSONObject()
         when (op) {
+            "downloadProviderAttachment" -> {
+                if (sessionToken.isBlank()) {
+                    postBridgeError(reply, id, 503, "unavailable", "session_not_ready")
+                } else runOnUiThread {
+                    if (!attachmentBusy.compareAndSet(false, true)) {
+                        postBridgeError(reply, id, 409, "unavailable", "download_pending")
+                    } else {
+                        val query = android.net.Uri.Builder().appendQueryParameter("account", payload.getString("account"))
+                            .appendQueryParameter("service", "mail").appendQueryParameter("id", payload.getString("id"))
+                            .appendQueryParameter("blob_id", payload.getString("blob_id")).build().encodedQuery
+                        pendingAttachmentPath = "/api/v1/attachment?$query"
+                        try {
+                            attachmentDocument.launch(AttachmentDownloadPolicy.filename(payload.getString("filename")))
+                            postBridgeResponse(reply, id, 200, JSONObject().put("opened", true))
+                        } catch (_: Exception) {
+                            pendingAttachmentPath = null
+                            attachmentBusy.set(false)
+                            postBridgeError(reply, id, 503, "unavailable", "document_picker_unavailable")
+                        }
+                    }
+                }
+            }
             "providerCreateAccount" -> dispatchBridge {
                 val success = NativeEngine.nativeProviderCreateAccount(filesDir.absolutePath, payload.toString()) == 1
                 if (success) postBridgeResponse(reply, id, 200, JSONObject().put("created", true))
@@ -514,6 +567,7 @@ class MainActivity : FragmentActivity() {
                 else postBridgeError(reply, id, 503, "unavailable", "grant_revocation_unconfirmed")
             }
             "providerSignIn" -> providerSignIn(payload.optString("account"), id, reply)
+            "providerAuthResolve" -> resolveUnknownProviderAuth(payload.optString("account"), id, reply)
             "providerPushSetup" -> providerPushSetup(payload.optString("account"), id, reply)
             "providerPushStatus" -> dispatchBridge {
                 val account = payload.optString("account")
@@ -522,7 +576,9 @@ class MainActivity : FragmentActivity() {
                     val state = PushEnrollmentStore.get(this, identity.installation)
                     val stage = state?.optString("stage", "not_registered") ?: "not_registered"
                     val expiry = state?.optString("expires", "")?.let(PushJmap::expiryMillis)
+                    val origin = NativeEngine.nativeProviderOrigin(filesDir.absolutePath, account)
                     val status = when {
+                        state != null && (origin.isEmpty() || state.optString("origin") != origin) -> "account_changed"
                         state?.optBoolean("degraded", false) == true -> "degraded"
                         stage == "active" && expiry == null -> "expiry_unknown"
                         stage == "active" && expiry != null && expiry <= System.currentTimeMillis() -> "expired"
@@ -539,12 +595,28 @@ class MainActivity : FragmentActivity() {
                 val result = if (op == "providerStatus") {
                     NativeEngine.nativeProviderStatus(filesDir.absolutePath, account)
                 } else {
-                    if (revokePushBeforeLogout(account)) NativeEngine.nativeProviderLogout(filesDir.absolutePath, account) else 0
+                    synchronized(providerScheduleLock) {
+                        val journalStatus = NativeEngine.nativeProviderAuthJournalStatus(filesDir.absolutePath)
+                        val signedOut = if (journalStatus in 0..1 && revokePushBeforeLogout(account))
+                            NativeEngine.nativeProviderLogout(filesDir.absolutePath, account) else 0
+                        if (signedOut == 1) reconcileProviderCatchUp()
+                        signedOut
+                    }
                 }
                 if (result < 0 || (op == "providerSignOut" && result != 1)) {
                     postBridgeError(reply, id, 503, "unavailable", "provider_operation_failed")
                 } else {
-                    postBridgeResponse(reply, id, 200, JSONObject().put("connected", op == "providerStatus" && result == 1))
+                    val body = JSONObject().put("connected", op == "providerStatus" && result == 1)
+                    if (op == "providerStatus") {
+                        val authState = when (NativeEngine.nativeProviderAuthJournalAccountStatus(filesDir.absolutePath, account)) {
+                            0 -> "idle"
+                            1 -> "pending"
+                            2 -> "outcome_unknown"
+                            else -> "unavailable"
+                        }
+                        body.put("auth_state", authState)
+                    }
+                    postBridgeResponse(reply, id, 200, body)
                 }
             }
             "pushToken" -> postBridgeResponse(
@@ -654,8 +726,58 @@ class MainActivity : FragmentActivity() {
         }
     }
 
+    private fun reconcileProviderCatchUp() = synchronized(providerScheduleLock) {
+        val response = runCatching {
+            JSONObject(NativeEngine.nativeConnectedProviderAccounts(filesDir.absolutePath))
+        }.getOrNull()
+        if (response?.optBoolean("ok") != true) {
+            // Preserve a retry when encrypted account state is temporarily unavailable.
+            ProviderCatchUpWorker.schedule(this)
+            return@synchronized
+        }
+        if (response.optJSONArray("accounts")?.length() == 0) ProviderCatchUpWorker.cancel(this)
+        else ProviderCatchUpWorker.schedule(this)
+    }
+
+    private fun resolveUnknownProviderAuth(account: String, id: String, reply: JavaScriptReplyProxy) {
+        dispatchBridge {
+            val connected = NativeEngine.nativeProviderAuthRecoveryPrepare(filesDir.absolutePath, account)
+            if (connected < 0) {
+                postBridgeError(reply, id, 409, "unavailable", "provider_auth_recovery_changed")
+                return@dispatchBridge
+            }
+            runOnUiThread {
+                val local = if (connected == 1) "A locally stored sign-in is still present; its server validity has not been checked." else "No confirmed local sign-in is available, or revocation is pending."
+                android.app.AlertDialog.Builder(this)
+                    .setTitle("Uncertain sign-in")
+                    .setMessage("Account: $account\n\nThe server may have issued an authorization even though the result was lost. $local Clearing this local waiting state will not revoke an unknown server grant. Check and revoke any unexpected grant in the provider's account settings. Continue only if you accept that limitation.")
+                    .setNegativeButton("Keep waiting") { _, _ ->
+                        NativeEngine.nativeProviderAuthRecoveryCancel()
+                        postBridgeResponse(reply, id, 200, JSONObject().put("status", "unchanged"))
+                    }
+                    .setOnCancelListener {
+                        NativeEngine.nativeProviderAuthRecoveryCancel()
+                        postBridgeResponse(reply, id, 200, JSONObject().put("status", "unchanged"))
+                    }
+                    .setPositiveButton("Clear waiting state") { _, _ ->
+                        dispatchBridge {
+                            val cleared = synchronized(providerScheduleLock) {
+                                NativeEngine.nativeProviderAuthRecoveryAbort(filesDir.absolutePath, account) == 1
+                            }
+                            if (cleared) postBridgeResponse(reply, id, 200, JSONObject().put("status", "cleared"))
+                            else postBridgeError(reply, id, 409, "unavailable", "provider_auth_recovery_changed")
+                        }
+                    }.show()
+            }
+        }
+    }
+
     private fun providerSignIn(account: String, id: String, reply: JavaScriptReplyProxy) {
         dispatchBridge {
+            if (NativeEngine.nativeProviderAuthJournalStatus(filesDir.absolutePath) == 2) {
+                postBridgeError(reply, id, 409, "unavailable", "provider_auth_outcome_unknown")
+                return@dispatchBridge
+            }
             val redirect = "${packageName}:/oauth/callback"
             val url = NativeEngine.nativeProviderBegin(filesDir.absolutePath, account, redirect)
             if (url.isEmpty()) {
@@ -718,6 +840,11 @@ class MainActivity : FragmentActivity() {
                 return@dispatchBridge
             }
             val state = runCatching { PushEnrollmentStore.get(this, identity.installation) }.getOrNull()
+            val origin = NativeEngine.nativeProviderOrigin(filesDir.absolutePath, account)
+            if (origin.isEmpty() || (state != null && state.optString("origin") != origin)) {
+                postBridgeError(reply, id, 409, "unavailable", "provider_account_changed")
+                return@dispatchBridge
+            }
             if (state?.optString("stage") == "credentials_ready") {
                 if (state.optLong("expires", 0) <= System.currentTimeMillis() / 1000) {
                     postBridgeError(reply, id, 503, "unavailable", "push_enrollment_expired")
@@ -784,7 +911,7 @@ class MainActivity : FragmentActivity() {
                     } else {
                         try {
                             PushEnrollmentStore.put(this, identity.installation,
-                                JSONObject().put("account", account).put("stage", "registering")
+                                JSONObject().put("account", account).put("origin", origin).put("stage", "registering")
                                     .put("vapid", vapid ?: JSONObject.NULL).put("session_state", metadata.getString("session_state")))
                             org.unifiedpush.android.connector.UnifiedPush.register(this, identity.installation,
                                 "iSyncYou", vapid, WebPushKeyManager(this))
@@ -803,6 +930,8 @@ class MainActivity : FragmentActivity() {
         val identity = PushInstallationKey.existing(this, account) ?: return true
         val state = PushEnrollmentStore.get(this, identity.installation)
         if (state != null) {
+            val origin = NativeEngine.nativeProviderOrigin(filesDir.absolutePath, account)
+            check(origin.isNotEmpty() && state.optString("origin") == origin)
             val initialStage = state.optString("stage")
             if (initialStage in setOf("active", "verification_pending")) {
                 val id = state.getString("subscription_id")
@@ -853,15 +982,22 @@ class MainActivity : FragmentActivity() {
         intent.data = null
         dispatchBridge {
             val started = runCatching { EngineBootstrap.ensureStarted(filesDir).isNotEmpty() }.getOrDefault(false)
-            val outcome = if (started) NativeEngine.nativeProviderFinish(filesDir.absolutePath, uri.toString()) else 0
-            if (outcome == 1) NativeEngine.nativeWakeProviderRefresh()
+            val outcome = synchronized(providerScheduleLock) {
+                val result = if (started) NativeEngine.nativeProviderFinish(filesDir.absolutePath, uri.toString()) else 0
+                if (result == 1) {
+                    NativeEngine.nativeWakeProviderRefresh()
+                    ProviderCatchUpWorker.schedule(this)
+                }
+                result
+            }
+            val journalUnknown = outcome == 0 && NativeEngine.nativeProviderAuthJournalStatus(filesDir.absolutePath) == 2
             runOnUiThread {
                 if (::web.isInitialized) {
                     val result = when (outcome) {
                         1 -> "connected"
                         2 -> "revocation_pending"
                         3 -> "revocation_unrecoverable"
-                        else -> "failed"
+                        else -> if (journalUnknown) "outcome_unknown" else "failed"
                     }
                     web.evaluateJavascript("window.dispatchEvent(new CustomEvent('isy-provider-auth', {detail:'$result'}))", null)
                 }

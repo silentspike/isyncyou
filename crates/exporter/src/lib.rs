@@ -118,6 +118,34 @@ pub fn original_mail(envelope: &[u8]) -> io::Result<(serde_json::Value, &[u8])> 
     Ok((metadata, &envelope[end..]))
 }
 
+/// Decode only the explicitly broker-declared representation after checking
+/// the exact protected payload. A raw MIME message may itself start with the
+/// legacy magic, so its bytes must never be used to infer the representation.
+pub fn verified_recovery_mail<'a>(
+    payload: &'a [u8],
+    expected_size: u64,
+    expected_sha256: &str,
+    encoding: &str,
+) -> io::Result<&'a [u8]> {
+    if expected_size != payload.len() as u64
+        || expected_size > 100 * 1024 * 1024
+        || expected_sha256.len() != 64
+        || !expected_sha256.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        || digest(payload) != expected_sha256
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "recovery payload integrity failure"));
+    }
+    let mime = match encoding {
+        "mime" => payload,
+        "isync-mime-1" => original_mail(payload)?.1,
+        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown recovery encoding")),
+    };
+    if mime.len() > 64 * 1024 * 1024 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "recovered MIME too large"));
+    }
+    Ok(mime)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Collection {
     pub account: String,
@@ -506,6 +534,21 @@ mod tests {
         assert_eq!(native["id"], "one");
         assert_eq!(original, mime);
         assert!(original_mail(b"ISYNC-MIME-1\n\xff\xff\xff\xff").is_err());
+    }
+
+    #[test]
+    fn recovery_mail_requires_integrity_and_explicit_encoding() {
+        let mime = b"ISYNC-MIME-1\nthis is ordinary MIME data";
+        let hash = digest(mime);
+        assert_eq!(verified_recovery_mail(mime, mime.len() as u64, &hash, "mime").unwrap(), mime);
+        assert!(verified_recovery_mail(mime, mime.len() as u64, &hash, "isync-mime-1").is_err());
+        assert!(verified_recovery_mail(mime, mime.len() as u64, &hash, "unknown").is_err());
+        assert!(verified_recovery_mail(mime, mime.len() as u64, &"f".repeat(64), "mime").is_err());
+        let mut envelope = b"ISYNC-MIME-1\n".to_vec();
+        envelope.extend_from_slice(&2u32.to_be_bytes());
+        envelope.extend_from_slice(b"{}");
+        envelope.extend_from_slice(mime);
+        assert_eq!(verified_recovery_mail(&envelope, envelope.len() as u64, &digest(&envelope), "isync-mime-1").unwrap(), mime);
     }
 
     #[test]

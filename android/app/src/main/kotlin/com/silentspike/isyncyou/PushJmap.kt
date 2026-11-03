@@ -38,9 +38,11 @@ internal object PushJmap {
         val request = OneTimeWorkRequestBuilder<PushEnrollmentWorker>()
             .setInputData(workDataOf("instance" to instance))
             .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+            .addTag(renewalTag(instance))
             .setInitialDelay(delay, TimeUnit.MILLISECONDS).build()
         WorkManager.getInstance(context).enqueueUniqueWork("provider-push-renew:$instance:$expires", ExistingWorkPolicy.KEEP, request)
     }
+    fun renewalTag(instance: String) = "provider-push-renew:$instance"
     fun call(context: Context, account: String, operation: String, body: JSONObject = JSONObject()): JSONObject {
         val response = JSONObject(NativeEngine.nativeProviderPush(context.filesDir.absolutePath, account, operation, body.toString()))
         check(response.optBoolean("ok")) { "Push operation unavailable" }

@@ -17,6 +17,7 @@ object NativeEngine {
      * store live under it.
      */
     external fun nativeStart(filesDir: String): Int
+    external fun nativeInstallRecoverySigner(bridge: RecoveryKeyBridge): Int
 
     /** Return the bounded recoverable mobile-job plan for WorkManager. */
     external fun nativeMobileJobPlan(): String
@@ -79,6 +80,7 @@ object NativeEngine {
 
     /** Native-owned PKCE attempt; the returned URL must only be opened by Android. */
     external fun nativeProviderCreateAccount(filesDir: String, request: String): Int
+    external fun nativeProviderOrigin(filesDir: String, account: String): String
     external fun nativeProviderBrokerConfigured(filesDir: String, account: String): Int
     external fun nativeProviderSetBroker(filesDir: String, account: String, broker: String): Int
     external fun nativeProviderBegin(filesDir: String, account: String, redirect: String): String
@@ -91,10 +93,21 @@ object NativeEngine {
     external fun nativeWakeProviderRefresh()
     /** Wait for a completed provider pass; partial errors and timeout return zero. */
     external fun nativeWaitProviderRefresh(account: String): Int
+    external fun nativeConnectedProviderAccounts(base: String): String
+    external fun nativeProviderAuthJournalStatus(base: String): Int
+    external fun nativeProviderAuthJournalAccountStatus(base: String, account: String): Int
+    external fun nativeProviderAuthRecoveryPrepare(base: String, account: String): Int
+    external fun nativeProviderAuthRecoveryAbort(base: String, account: String): Int
+    external fun nativeProviderAuthRecoveryCancel()
+    external fun nativeWaitProviderRefreshResults(): String
 
     /** Native-only push broker response may contain short-lived distributor credentials. */
     external fun nativeProviderBroker(filesDir: String, account: String, operation: String, request: String): String
     external fun nativeProviderPush(filesDir: String, account: String, operation: String, request: String): String
+
+    /** Native-only reminder claims; no Android worker is scheduled until coverage is qualified. */
+    external fun nativeReminderClaim(filesDir: String, record: String): String
+    external fun nativeReminderAcknowledge(filesDir: String, record: String, tag: String): Int
 
     /**
      * #619 evidence hook: available only when the Rust library is built with

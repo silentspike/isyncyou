@@ -181,7 +181,7 @@ mod tests {
         first.bind_manifest_crypto(crypto.clone()).unwrap();
         first.create_session().unwrap();
         let session = isyncyou_agent::SessionV2Store::new(first.clone(), &[9; 32], crypto.clone());
-        let lease = session.acquire_lease(id, "lease-a", "holder-a").unwrap();
+        let mut lease = session.acquire_lease(id, "lease-a", "holder-a").unwrap();
         assert!(!lease.is_lost());
         lease.release().unwrap();
         drop(session);

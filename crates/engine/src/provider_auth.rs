@@ -39,6 +39,67 @@ pub struct AuthAttempt {
     started_at: u64,
 }
 
+// Secret material: this representation is only for an authenticated,
+// encrypted platform store. It must never be exposed to a WebView or logged.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AndroidAuthAttempt {
+    version: u8,
+    origin: String,
+    client_id: String,
+    token_endpoint: String,
+    revocation_endpoint: String,
+    redirect_uri: String,
+    verifier: String,
+    state: String,
+    account_id: String,
+    expected_username: String,
+    started_at: u64,
+}
+
+/// Export only to an authenticated, encrypted Android-owned pending-attempt store.
+pub fn export_android_auth_attempt(attempt: &AuthAttempt) -> Result<Vec<u8>, String> {
+    let current = now();
+    if !android_redirect(&attempt.redirect_uri) || current < attempt.started_at || current - attempt.started_at > 600 {
+        return Err("Invalid or expired Android OAuth attempt".into());
+    }
+    serde_json::to_vec(&AndroidAuthAttempt {
+        version: 1, origin: attempt.origin.clone(), client_id: attempt.client_id.clone(),
+        token_endpoint: attempt.token_endpoint.clone(), revocation_endpoint: attempt.revocation_endpoint.clone(),
+        redirect_uri: attempt.redirect_uri.clone(), verifier: attempt.verifier.clone(), state: attempt.state.clone(),
+        account_id: attempt.account_id.clone(), expected_username: attempt.expected_username.clone(), started_at: attempt.started_at,
+    }).map_err(|_| "Invalid Android OAuth attempt".into())
+}
+
+fn android_redirect(uri: &str) -> bool {
+    matches!(uri, "com.silentspike.isyncyou:/oauth/callback" | "com.silentspike.isyncyou.debug:/oauth/callback")
+}
+
+/// Restore a pending attempt after the platform has authenticated its encrypted
+/// record. The platform must atomically claim it before any token exchange and
+/// must never replay an attempt whose exchange has started.
+pub fn import_android_auth_attempt(cfg: &Config, id: &str, redirect_uri: &str, bytes: &[u8]) -> Result<AuthAttempt, String> {
+    if bytes.len() > 16 * 1024 || !android_redirect(redirect_uri) { return Err("Invalid Android OAuth attempt".into()); }
+    let saved: AndroidAuthAttempt = serde_json::from_slice(bytes).map_err(|_| "Invalid Android OAuth attempt")?;
+    let (origin, client_id, cache_path) = account(cfg, id)?;
+    let username = &cfg.accounts.iter().find(|a| a.id == id).ok_or("Account missing")?.username;
+    let valid_secret = |s: &str| s.len() == 43 && URL_SAFE_NO_PAD.decode(s).is_ok_and(|v| v.len() == 32);
+    let current = now();
+    if saved.version != 1 || saved.account_id != id || saved.origin != origin || saved.client_id != client_id
+        || saved.expected_username != *username || saved.redirect_uri != redirect_uri
+        || saved.started_at > current || current - saved.started_at > 600
+        || !valid_secret(&saved.verifier) || !valid_secret(&saved.state) {
+        return Err("Invalid or expired Android OAuth attempt".into());
+    }
+    let base = reqwest::Url::parse(&origin).map_err(|_| "Invalid provider origin")?;
+    same_origin(&base, &saved.token_endpoint)?;
+    same_origin(&base, &saved.revocation_endpoint)?;
+    Ok(AuthAttempt { authorization_uri: String::new(), origin, client_id, cache_path,
+        token_endpoint: saved.token_endpoint, revocation_endpoint: saved.revocation_endpoint,
+        redirect_uri: saved.redirect_uri, verifier: saved.verifier, state: saved.state,
+        account_id: id.into(), expected_username: username.clone(), account_config: cfg.clone(), started_at: saved.started_at })
+}
+
 /// Typed completion state. No variant contains credentials or provider payloads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthFinishError {
@@ -300,7 +361,11 @@ pub fn finish_self_hosted_auth_detailed_with_store(
         },
     );
     match saved {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            let marker = revocation_pending_key(&attempt.account_id);
+            if store.load(&marker, &attempt.origin)?.is_some() { store.delete(&marker, &attempt.origin)?; }
+            Ok(())
+        },
         Err(error) => match revoke_unaccepted_grant(&attempt,store,&token) {
             Ok(()) => Err(AuthFinishError::Failed(error)),
             Err(recovery) => Err(recovery),
@@ -309,6 +374,7 @@ pub fn finish_self_hosted_auth_detailed_with_store(
 }
 
 fn quarantine_key(account:&str) -> String { format!("isyncyou-internal:quarantine-index:{:x}",Sha256::digest(account.as_bytes())) }
+fn revocation_pending_key(account:&str) -> String { format!("isyncyou-internal:revocation-pending:{:x}",Sha256::digest(account.as_bytes())) }
 
 fn load_quarantine(store:&dyn ProviderCredentialStore,account:&str,origin:&str) -> Result<std::collections::BTreeMap<String,String>,String> {
     let Some(record) = store.load(&quarantine_key(account),origin)? else { return Ok(Default::default()); };
@@ -420,6 +486,14 @@ pub fn validate_callback(attempt: &AuthAttempt, callback: &str) -> Result<(), St
     callback_code(attempt, callback).map(|_| ())
 }
 
+/// Classify an authenticated callback without exposing its authorization code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthCallbackKind { Code, Rejected }
+
+pub fn classify_callback(attempt: &AuthAttempt, callback: &str) -> Result<AuthCallbackKind, String> {
+    Ok(if callback_code(attempt, callback)?.is_some() { AuthCallbackKind::Code } else { AuthCallbackKind::Rejected })
+}
+
 fn callback_code(attempt: &AuthAttempt, callback: &str) -> Result<Option<String>, String> {
     if now().saturating_sub(attempt.started_at) > 600 {
         return Err("OAuth attempt expired".into());
@@ -475,6 +549,14 @@ fn lock(path: &std::path::Path) -> Result<std::fs::File, String> {
     Ok(lock)
 }
 
+/// Cross-process lease for the one event stream of a configured account.
+pub(crate) fn try_event_stream_lease(cfg: &Config, id: &str) -> Result<std::fs::File, String> {
+    let (_, _, path) = account(cfg,id)?;
+    let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path.with_extension("event.lock")).map_err(|_| "Event stream lease unavailable")?;
+    file.try_lock_exclusive().map_err(|_| "Event stream already active")?;
+    Ok(file)
+}
+
 pub fn self_hosted_access_token(cfg: &Config, id: &str) -> Result<String, String> {
     #[cfg(target_os = "android")]
     return self_hosted_access_token_with_store(
@@ -501,6 +583,11 @@ pub fn self_hosted_access_token_with_store(
 ) -> Result<String, String> {
     let (origin, client_id, path) = account(cfg, id)?;
     let _lock = lock(&path)?;
+    access_token_locked(id, &origin, &client_id, store)
+}
+
+fn access_token_locked(id: &str, origin: &str, client_id: &str, store: &dyn ProviderCredentialStore) -> Result<String, String> {
+    if store.load(&revocation_pending_key(id), &origin)?.is_some() { return Err("Provider revocation pending; sign in again after recovery".into()); }
     let mut cached = store.load(id, &origin)?.ok_or("Provider login required")?;
     if cached.subject.as_deref().is_none_or(str::is_empty) { return Err("Provider account identity must be verified by signing in again".into()); }
     let binding_id = format!("isyncyou-internal:subject:{:x}",Sha256::digest(id.as_bytes()));
@@ -540,6 +627,15 @@ pub fn self_hosted_access_token_with_store(
     Ok(cached.access_token)
 }
 
+/// Internal engine-only seam for a bounded native dispatch that must be
+/// serialized with logout. The callback must not reacquire the account lock.
+pub(crate) fn with_locked_provider_access_token<T>(cfg: &Config, id: &str, store: &dyn ProviderCredentialStore, action: impl FnOnce(&str) -> Result<T, String>) -> Result<T, String> {
+    let (origin, client_id, path) = account(cfg,id)?;
+    let _lock = lock(&path)?;
+    let token = access_token_locked(id,&origin,&client_id,store)?;
+    action(&token)
+}
+
 #[cfg(not(target_os = "android"))]
 fn load_keyring(path: &std::path::Path) -> Result<TokenCache, String> {
     let marker: Value =
@@ -560,6 +656,29 @@ struct DesktopCredentialStore {
     account: String,
     origin: String,
 }
+
+/// Supply the existing account/origin-bound keyring adapter to native recovery
+/// code. The callback must use the receiving operation's own account lock and
+/// must never expose credential contents to the UI or logs.
+#[cfg(not(target_os = "android"))]
+pub fn with_desktop_credential_store<T>(cfg: &Config, id: &str, action: impl FnOnce(&dyn ProviderCredentialStore) -> Result<T, String>) -> Result<T, String> {
+    let (origin, _, path) = account(cfg, id)?;
+    let store = DesktopCredentialStore {path,account:id.into(),origin};
+    action(&store)
+}
+
+/// Supply the native credential adapter to account-scoped engine operations.
+/// Operations remain responsible for their account lock and must not expose
+/// credentials to the UI, logs, or an unrestricted signing interface.
+pub fn with_platform_credential_store<T>(cfg: &Config, id: &str, action: impl FnOnce(&dyn ProviderCredentialStore) -> Result<T, String>) -> Result<T, String> {
+    #[cfg(target_os = "android")]
+    {
+        account(cfg,id)?;
+        action(crate::provider_credential::platform_store()?)
+    }
+    #[cfg(not(target_os = "android"))]
+    { with_desktop_credential_store(cfg,id,action) }
+}
 #[cfg(not(target_os = "android"))]
 impl DesktopCredentialStore {
     fn path_for(&self, account:&str, origin:&str) -> Result<PathBuf,String> {
@@ -569,6 +688,7 @@ impl DesktopCredentialStore {
         let binding = format!("isyncyou-internal:subject:{:x}",Sha256::digest(self.account.as_bytes()));
         if account == binding { return Ok(self.path.with_extension("subject.json")); }
         if account == quarantine_key(&self.account) { return Ok(self.path.with_extension("quarantine.json")); }
+        if account == revocation_pending_key(&self.account) { return Ok(self.path.with_extension("revocation-pending.json")); }
         Err("Credential account mismatch".into())
     }
 }
@@ -601,11 +721,22 @@ impl ProviderCredentialStore for DesktopCredentialStore {
             account_subject: credential.subject.clone(),
         }
         .save_to_keyring(&path)
-        .map_err(|_| "System keyring unavailable".into())
+        .map_err(|_| "System keyring unavailable".to_string())?;
+        if account == revocation_pending_key(&self.account) {
+            std::fs::File::open(&path).and_then(|file| file.sync_all()).map_err(|_| "Revocation marker durability unavailable")?;
+            let parent = path.parent().ok_or("Revocation marker directory unavailable")?;
+            std::fs::File::open(parent).and_then(|file| file.sync_all()).map_err(|_| "Revocation marker durability unavailable")?;
+        }
+        Ok(())
     }
     fn delete(&self, account: &str, origin: &str) -> Result<(), String> {
         let path = self.path_for(account,origin)?;
-        delete_desktop_credential(&path)
+        delete_desktop_credential(&path)?;
+        if account == revocation_pending_key(&self.account) {
+            let parent = path.parent().ok_or("Revocation marker directory unavailable")?;
+            std::fs::File::open(parent).and_then(|file| file.sync_all()).map_err(|_| "Revocation marker durability unavailable")?;
+        }
+        Ok(())
     }
 }
 
@@ -654,15 +785,57 @@ pub fn self_hosted_auth_status_with_store(
 ) -> Result<bool, String> {
     let (origin, _, path) = account(cfg, id)?;
     let _lock = lock(&path)?;
-    let Some(token) = store.load(id, &origin)? else {
-        return Ok(false);
-    };
-    let binding_id = format!("isyncyou-internal:subject:{:x}",Sha256::digest(id.as_bytes()));
-    let binding = store.load(&binding_id,&origin)?;
-    Ok(token
-        .refresh_token
-        .as_deref()
-        .is_some_and(|value| !value.is_empty()) && token.subject.as_deref().is_some_and(|value| !value.is_empty()) && binding.is_some_and(|value| value.subject == token.subject))
+    Ok(verified_subject_locked(store,id,&origin)?.is_some())
+}
+
+/// Return only the locally bound provider subject when the current installation
+/// still holds a matching refresh grant. This performs no token refresh or I/O
+/// to the provider; the subject is sensitive account metadata, never a token.
+pub fn verified_local_provider_subject(cfg: &Config, id: &str) -> Result<Option<String>, String> {
+    #[cfg(target_os = "android")]
+    return verified_local_provider_subject_with_store(cfg, id, crate::provider_credential::platform_store()?);
+    #[cfg(not(target_os = "android"))]
+    {
+        let (origin, _, path) = account(cfg, id)?;
+        let store = DesktopCredentialStore { path, account:id.into(), origin };
+        verified_local_provider_subject_with_store(cfg, id, &store)
+    }
+}
+
+pub fn verified_local_provider_subject_with_store(cfg: &Config, id: &str, store: &dyn ProviderCredentialStore) -> Result<Option<String>, String> {
+    let (origin, _, path) = account(cfg, id)?;
+    let _lock = lock(&path)?;
+    verified_subject_locked(store,id,&origin)
+}
+
+fn verified_subject_locked(store: &dyn ProviderCredentialStore, id: &str, origin: &str) -> Result<Option<String>, String> {
+    if store.load(&revocation_pending_key(id), origin)?.is_some() { return Ok(None); }
+    let Some(credential) = store.load(id, &origin)? else { return Ok(None); };
+    if credential.refresh_token.as_deref().is_none_or(str::is_empty) { return Ok(None); }
+    let Some(subject) = credential.subject.filter(|s| !s.is_empty() && s.len() <= 4096) else { return Ok(None); };
+    let binding_id = format!("isyncyou-internal:subject:{:x}", Sha256::digest(id.as_bytes()));
+    let binding = store.load(&binding_id, &origin)?;
+    Ok(if binding.and_then(|value| value.subject).as_deref() == Some(subject.as_str()) { Some(subject) } else { None })
+}
+
+/// Execute a local journal operation under the same account lock as refresh and
+/// logout. The callback must not call another function that acquires this lock.
+pub fn with_locked_provider_subject<T>(cfg: &Config, id: &str, action: impl FnOnce(Option<&str>) -> Result<T, String>) -> Result<T, String> {
+    #[cfg(target_os = "android")]
+    return with_locked_provider_subject_with_store(cfg, id, crate::provider_credential::platform_store()?, action);
+    #[cfg(not(target_os = "android"))]
+    {
+        let (origin, _, path) = account(cfg, id)?;
+        let desktop = DesktopCredentialStore { path, account:id.into(), origin };
+        with_locked_provider_subject_with_store(cfg,id,&desktop,action)
+    }
+}
+
+pub fn with_locked_provider_subject_with_store<T>(cfg: &Config, id: &str, store: &dyn ProviderCredentialStore, action: impl FnOnce(Option<&str>) -> Result<T, String>) -> Result<T, String> {
+    let (origin, _, path) = account(cfg, id)?;
+    let _lock = lock(&path)?;
+    let subject = verified_subject_locked(store,id,&origin)?;
+    action(subject.as_deref())
 }
 
 /// Revoke the installation grant first, then remove its local keyring entry.
@@ -689,11 +862,15 @@ pub fn logout_self_hosted_with_store(
 ) -> Result<(), String> {
     let (origin, client_id, path) = account(cfg, id)?;
     let _lock = lock(&path)?;
+    if let Some(marker) = store.load(&revocation_pending_key(id), &origin)? {
+        return Err(match marker.access_token.as_str() { "revoked" => "Grant already revoked; local cleanup may be required", "rejected" => "Provider rejected revocation; recovery required", _ => "Revocation outcome unknown; recovery required" }.into());
+    }
     let cache = store.load(id, &origin)?.ok_or("Provider login required")?;
     let refresh = cache
         .refresh_token
         .as_deref()
         .ok_or("Provider login required")?;
+    store.replace(&revocation_pending_key(id), &origin, &ProviderCredential { access_token:"pending".into(), refresh_token:None, expires_at:0, subject:None })?;
     let (_, _, endpoint) = metadata(&origin)?;
     let response = client()?
         .post(endpoint)
@@ -705,8 +882,13 @@ pub fn logout_self_hosted_with_store(
         .send()
         .map_err(|_| "Revocation outcome unknown")?;
     if !response.status().is_success() {
-        return Err("Provider rejected revocation".into());
+        if response.status().is_client_error() {
+            store.replace(&revocation_pending_key(id), &origin, &ProviderCredential { access_token:"rejected".into(), refresh_token:None, expires_at:0, subject:None })?;
+            return Err("Provider rejected revocation".into());
+        }
+        return Err("Revocation outcome unknown".into());
     }
+    store.replace(&revocation_pending_key(id), &origin, &ProviderCredential { access_token:"revoked".into(), refresh_token:None, expires_at:0, subject:None })?;
     store.delete(id, &origin)
 }
 
@@ -797,6 +979,109 @@ mod tests {
     use super::*;
 
     #[test]
+    fn event_stream_lease_is_exclusive_and_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.accounts.push(isyncyou_core::AccountConfig {id:"a".into(),username:"user".into(),sync_root:PathBuf::new(),archive_root:dir.path().into(),cache_root:PathBuf::new(),mount_point:None});
+        cfg.provider_accounts.insert("a".into(),ProviderConfig::SelfHosted {origin:"https://example.test".into(),client_id:"client".into()});
+        let first = try_event_stream_lease(&cfg,"a").unwrap();
+        assert!(try_event_stream_lease(&cfg,"a").is_err());
+        drop(first);
+        assert!(try_event_stream_lease(&cfg,"a").is_ok());
+    }
+
+    #[test]
+    fn pending_revocation_disables_local_subject_and_access_under_account_lock() {
+        struct Keys(std::sync::Mutex<std::collections::HashMap<(String,String),ProviderCredential>>);
+        impl ProviderCredentialStore for Keys {
+            fn load(&self,a:&str,o:&str)->Result<Option<ProviderCredential>,String>{Ok(self.0.lock().unwrap().get(&(a.into(),o.into())).cloned())}
+            fn replace(&self,a:&str,o:&str,c:&ProviderCredential)->Result<(),String>{self.0.lock().unwrap().insert((a.into(),o.into()),c.clone());Ok(())}
+            fn delete(&self,a:&str,o:&str)->Result<(),String>{self.0.lock().unwrap().remove(&(a.into(),o.into()));Ok(())}
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.accounts.push(isyncyou_core::AccountConfig {id:"a".into(),username:"user".into(),sync_root:PathBuf::new(),archive_root:dir.path().into(),cache_root:PathBuf::new(),mount_point:None});
+        cfg.provider_accounts.insert("a".into(),ProviderConfig::SelfHosted {origin:"https://example.test".into(),client_id:"client".into()});
+        let keys=Keys(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let credential=ProviderCredential {access_token:"secret".into(),refresh_token:Some("refresh".into()),expires_at:now()+600,subject:Some("subject".into())};
+        keys.replace("a","https://example.test",&credential).unwrap();
+        let binding=format!("isyncyou-internal:subject:{:x}",Sha256::digest(b"a"));
+        keys.replace(&binding,"https://example.test",&credential).unwrap();
+        assert_eq!(with_locked_provider_subject_with_store(&cfg,"a",&keys,|subject| Ok(subject.map(str::to_owned))).unwrap().as_deref(),Some("subject"));
+        keys.replace(&revocation_pending_key("a"),"https://example.test",&credential).unwrap();
+        assert_eq!(with_locked_provider_subject_with_store(&cfg,"a",&keys,|subject| Ok(subject.map(str::to_owned))).unwrap(),None);
+        assert!(self_hosted_access_token_with_store(&cfg,"a",&keys).is_err());
+        assert!(!self_hosted_auth_status_with_store(&cfg,"a",&keys).unwrap());
+        assert!(logout_self_hosted_with_store(&cfg,"a",&keys).unwrap_err().contains("outcome unknown"));
+    }
+
+    #[test]
+    fn locked_dispatch_serializes_revocation_and_prevents_reuse() {
+        struct Keys(std::sync::Mutex<std::collections::HashMap<(String,String),ProviderCredential>>);
+        impl ProviderCredentialStore for Keys {
+            fn load(&self,a:&str,o:&str)->Result<Option<ProviderCredential>,String>{Ok(self.0.lock().unwrap().get(&(a.into(),o.into())).cloned())}
+            fn replace(&self,a:&str,o:&str,c:&ProviderCredential)->Result<(),String>{self.0.lock().unwrap().insert((a.into(),o.into()),c.clone());Ok(())}
+            fn delete(&self,a:&str,o:&str)->Result<(),String>{self.0.lock().unwrap().remove(&(a.into(),o.into()));Ok(())}
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.accounts.push(isyncyou_core::AccountConfig {id:"a".into(),username:"user".into(),sync_root:PathBuf::new(),archive_root:dir.path().into(),cache_root:PathBuf::new(),mount_point:None});
+        cfg.provider_accounts.insert("a".into(),ProviderConfig::SelfHosted {origin:"https://example.test".into(),client_id:"client".into()});
+        let keys=Keys(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let credential=ProviderCredential {access_token:"secret".into(),refresh_token:Some("refresh".into()),expires_at:now()+600,subject:Some("subject".into())};
+        keys.replace("a","https://example.test",&credential).unwrap();
+        keys.replace(&format!("isyncyou-internal:subject:{:x}",Sha256::digest(b"a")),"https://example.test",&credential).unwrap();
+        let (entered_tx,entered_rx)=std::sync::mpsc::channel();
+        let (release_tx,release_rx)=std::sync::mpsc::channel();
+        let (attempt_tx,attempt_rx)=std::sync::mpsc::channel();
+        let (done_tx,done_rx)=std::sync::mpsc::channel();
+        std::thread::scope(|threads| {
+            let cfg_ref = &cfg; let keys_ref = &keys; let credential_ref = &credential;
+            threads.spawn(move || with_locked_provider_access_token(cfg_ref,"a",keys_ref,|_| {
+                entered_tx.send(()).unwrap(); release_rx.recv().unwrap(); Ok(())
+            }).unwrap());
+            entered_rx.recv().unwrap();
+            threads.spawn(move || {
+                attempt_tx.send(()).unwrap();
+                with_locked_provider_subject_with_store(cfg_ref,"a",keys_ref,|subject| {
+                    assert_eq!(subject,Some("subject"));
+                    keys_ref.replace(&revocation_pending_key("a"),"https://example.test",credential_ref)
+                }).unwrap();
+                done_tx.send(()).unwrap();
+            });
+            attempt_rx.recv().unwrap();
+            let blocked = done_rx.recv_timeout(Duration::from_millis(100)).is_err();
+            release_tx.send(()).unwrap();
+            if blocked { done_rx.recv_timeout(Duration::from_secs(5)).unwrap(); }
+            assert!(blocked);
+        });
+        assert!(with_locked_provider_access_token(&cfg,"a",&keys,|_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn android_attempt_roundtrip_is_scoped_and_expires() {
+        let mut cfg = Config::default();
+        cfg.accounts.push(isyncyou_core::AccountConfig { id:"a".into(), username:"user".into(), sync_root:PathBuf::new(), archive_root:PathBuf::new(), cache_root:PathBuf::new(), mount_point:None });
+        cfg.provider_accounts.insert("a".into(), ProviderConfig::SelfHosted { origin:"https://example.test".into(), client_id:"client".into() });
+        let redirect = "com.silentspike.isyncyou:/oauth/callback";
+        let attempt = AuthAttempt { authorization_uri:String::new(), origin:"https://example.test".into(), client_id:"client".into(), token_endpoint:"https://example.test/token".into(), revocation_endpoint:"https://example.test/revoke".into(), redirect_uri:redirect.into(), verifier:random().unwrap(), state:random().unwrap(), cache_path:PathBuf::new(), account_id:"a".into(), expected_username:"user".into(), account_config:cfg.clone(), started_at:now() };
+        let bytes = export_android_auth_attempt(&attempt).unwrap();
+        let restored = import_android_auth_attempt(&cfg,"a",redirect,&bytes).unwrap();
+        assert_eq!(restored.state, attempt.state);
+        assert_eq!(restored.verifier, attempt.verifier);
+        assert!(import_android_auth_attempt(&cfg,"a","com.silentspike.isyncyou.debug:/oauth/callback",&bytes).is_err());
+        let mut changed = cfg.clone();
+        changed.accounts[0].username = "other".into();
+        assert!(import_android_auth_attempt(&changed,"a",redirect,&bytes).is_err());
+        let mut saved: AndroidAuthAttempt = serde_json::from_slice(&bytes).unwrap();
+        saved.started_at = now().saturating_sub(601);
+        assert!(import_android_auth_attempt(&cfg,"a",redirect,&serde_json::to_vec(&saved).unwrap()).is_err());
+        saved.started_at = now();
+        saved.token_endpoint = "https://evil.test/token".into();
+        assert!(import_android_auth_attempt(&cfg,"a",redirect,&serde_json::to_vec(&saved).unwrap()).is_err());
+    }
+
+    #[test]
     fn userinfo_requires_exact_configured_identity_and_stable_subject() {
         let identity = serde_json::json!({"sub":"subject-1","preferred_username":"user@example.test"});
         assert_eq!(validate_userinfo(&identity,"user@example.test").unwrap(),"subject-1");
@@ -848,6 +1133,7 @@ mod tests {
     struct FakeStore(std::sync::Mutex<Option<ProviderCredential>>);
     impl ProviderCredentialStore for FakeStore {
         fn load(&self, account: &str, origin: &str) -> Result<Option<ProviderCredential>, String> {
+            if account == revocation_pending_key("a") && origin == "https://example.test" { return Ok(None); }
             if (account != "a" && account != format!("isyncyou-internal:subject:{:x}",Sha256::digest(b"a"))) || origin != "https://example.test" {
                 return Err("wrong scope".into());
             }
@@ -900,11 +1186,14 @@ mod tests {
             subject: Some("stable-subject".into()),
         })));
         assert!(self_hosted_auth_status_with_store(&cfg, "a", &store).unwrap());
+        assert_eq!(verified_local_provider_subject_with_store(&cfg, "a", &store).unwrap().as_deref(), Some("stable-subject"));
+        with_locked_provider_access_token(&cfg,"a",&store,|token| { assert_eq!(token,"secret"); Ok(()) }).unwrap();
         assert_eq!(
             self_hosted_access_token_with_store(&cfg, "a", &store).unwrap(),
             "secret"
         );
         store.0.lock().unwrap().as_mut().unwrap().subject = None;
+        assert_eq!(verified_local_provider_subject_with_store(&cfg, "a", &store).unwrap(), None);
         assert!(!self_hosted_auth_status_with_store(&cfg,"a",&store).unwrap());
         assert!(self_hosted_access_token_with_store(&cfg,"a",&store).is_err());
         cfg.provider_accounts.insert(
@@ -995,6 +1284,8 @@ mod tests {
         assert!(validate_callback(&attempt, "http://127.0.0.1:53682/oauth/callback?code=a&state=expected&iss=https%3A%2F%2Fevil.test").is_err());
         assert!(validate_callback(&attempt, "http://127.0.0.1:53682/oauth/callback?code=a&state=expected&iss=https%3A%2F%2Fexample.test").is_ok());
         assert!(validate_callback(&attempt, "http://127.0.0.1:53682/oauth/callback?error=access_denied&state=expected&iss=https%3A%2F%2Fexample.test").is_ok());
+        assert_eq!(classify_callback(&attempt, "http://127.0.0.1:53682/oauth/callback?code=a&state=expected&iss=https%3A%2F%2Fexample.test").unwrap(), AuthCallbackKind::Code);
+        assert_eq!(classify_callback(&attempt, "http://127.0.0.1:53682/oauth/callback?error=access_denied&state=expected&iss=https%3A%2F%2Fexample.test").unwrap(), AuthCallbackKind::Rejected);
         assert!(validate_callback(&attempt, "http://127.0.0.1:53682/oauth/callback?error=access_denied&state=wrong&iss=https%3A%2F%2Fexample.test").is_err());
     }
 }

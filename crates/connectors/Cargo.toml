@@ -14,6 +14,9 @@ isyncyou-store = { path = "../store", default-features = false }
 isyncyou-pathmap = { path = "../pathmap" }
 serde_json = { workspace = true }
 ring = "0.17"
+chrono = "0.4"
+chrono-tz = "0.10"
+iso8601 = "0.6"
 icalendar = { version = "=0.17.13", features = ["parser", "recurrence"] }
 ical-rs = { version = "=0.5.1", features = ["parser", "jcal"] }
 vcard-rs = { version = "=0.4.0", features = ["parser", "jcard", "encoding", "base64"] }

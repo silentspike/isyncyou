@@ -1819,6 +1819,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "zeroize",
 ]
 
@@ -1855,8 +1856,11 @@ dependencies = [
 name = "isyncyou-connectors"
 version = "1.0.0"
 dependencies = [
+ "chrono",
+ "chrono-tz",
  "ical-rs",
  "icalendar",
+ "iso8601",
  "isyncyou-core",
  "isyncyou-graph",
  "isyncyou-pathmap",
@@ -1945,6 +1949,7 @@ dependencies = [
  "keyring-core",
  "reqwest",
  "ring",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",

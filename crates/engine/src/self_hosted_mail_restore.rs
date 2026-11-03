@@ -9,6 +9,1084 @@ use isyncyou_store::{ProviderScope, Store};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use crate::provider_credential::ProviderCredentialStore;
+use std::collections::HashMap;
+use std::io::Read;
+
+/// Platform implementation must sign with the already enrolled installation
+/// key, never a newly generated replacement for an existing enrollment.
+pub trait RecoveryDeviceSigner: Send + Sync {
+    fn device_id(&self) -> &str;
+    fn sign(&self, challenge: &[u8]) -> Result<String, String>;
+}
+
+/// Platform-owned installation key lookup; implementations must bind the
+/// configured account and origin and must not create a replacement key.
+pub trait RecoverySignerFactory: Send + Sync {
+    fn load(&self, cfg: &Config, account: &str) -> Result<Box<dyn RecoveryDeviceSigner>, String>;
+}
+
+static RECOVERY_SIGNER_FACTORY: std::sync::OnceLock<std::sync::Arc<dyn RecoverySignerFactory>> = std::sync::OnceLock::new();
+
+pub fn install_recovery_signer_factory(factory: std::sync::Arc<dyn RecoverySignerFactory>) -> Result<(), String> {
+    RECOVERY_SIGNER_FACTORY.set(factory).map_err(|_| "Recovery signer factory already installed".into())
+}
+
+/// Host-only factory access. A signer is never exported to UI or model code.
+pub fn load_registered_recovery_signer(cfg: &Config, account: &str) -> Result<Box<dyn RecoveryDeviceSigner>, String> {
+    if let Some(factory) = RECOVERY_SIGNER_FACTORY.get() { return factory.load(cfg, account); }
+    #[cfg(all(target_os = "linux", feature = "desktop-keyring"))]
+    return Ok(Box::new(load_linux_recovery_signer(cfg, account)?));
+    #[cfg(not(all(target_os = "linux", feature = "desktop-keyring")))]
+    Err("Recovery signer factory unavailable".into())
+}
+
+/// Linux installation identity. The private key is in the system keyring; the
+/// protected provider ledger records the account/origin-bound public identity.
+#[cfg(all(target_os = "linux", feature = "desktop-keyring"))]
+pub struct LinuxRecoverySigner {
+    installation: String,
+    public_key: String,
+    key: ring::signature::EcdsaKeyPair,
+}
+
+#[cfg(all(target_os = "linux", feature = "desktop-keyring"))]
+impl RecoveryDeviceSigner for LinuxRecoverySigner {
+    fn device_id(&self) -> &str { &self.installation }
+    fn sign(&self, challenge: &[u8]) -> Result<String, String> {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        if challenge.is_empty() || challenge.len() > 8192 { return Err("Invalid device challenge".into()); }
+        let signature = self.key.sign(&ring::rand::SystemRandom::new(), challenge).map_err(|_| "Device signing unavailable")?;
+        Ok(URL_SAFE_NO_PAD.encode(signature.as_ref()))
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "desktop-keyring"))]
+impl LinuxRecoverySigner {
+    pub fn public_key_der(&self) -> &str { &self.public_key }
+}
+
+/// Prove an existing Linux key to the recovery broker. The result is only a
+/// pending candidate: an independently authorized management binding is still
+/// required. Unknown outcomes are never submitted a second time automatically.
+#[cfg(all(target_os = "linux", feature = "desktop-keyring"))]
+pub fn prove_linux_recovery_device(cfg: &Config, account: &str, signer: &LinuxRecoverySigner,
+                                   operation: &str) -> Result<LinuxRegistrationOutcome, String> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    if operation.is_empty() || operation.len() > 128 || !operation.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err("Invalid device registration intent".into());
+    }
+    let (scope, slot) = linux_identity_scope(cfg, account)?;
+    let store = crate::provider_store::open(cfg, account)?;
+    let bound = linux_signer_from_record(&scope, &slot, &store)?;
+    if bound.installation != signer.installation || bound.public_key != signer.public_key { return Err("Recovery device changed".into()); }
+    crate::provider_auth::with_platform_credential_store(cfg, account, |credentials| {
+    crate::provider_auth::with_locked_provider_access_token(cfg, account, credentials, |token| {
+    let native = JmapClient::discover(&scope.origin, token.to_owned()).map_err(|_| "Recovery identity unavailable")?;
+    let origin = reqwest::Url::parse(&scope.origin).map_err(|_| "Invalid recovery origin")?;
+    if origin.scheme() != "https" || origin.host_str().is_none() || origin.path() != "/" || !origin.username().is_empty() ||
+        origin.password().is_some() || origin.query().is_some() || origin.fragment().is_some() { return Err("Invalid recovery origin".into()); }
+    let der = URL_SAFE_NO_PAD.decode(&signer.public_key).map_err(|_| "Invalid device key")?;
+    let fingerprint = format!("{:x}", Sha256::digest(der));
+    let intent = json!({"action":"prove-recovery-device","native_account":native.account_id(),"device":signer.installation,
+        "public_key":signer.public_key,"fingerprint":fingerprint}).to_string();
+    let digest = format!("{:x}", Sha256::digest(intent.as_bytes()));
+    if let Some((previous,state,result)) = store.provider_mutation(&scope, operation).map_err(|e| e.to_string())? {
+        if previous != digest { return Err("Device registration intent changed".into()); }
+        return if state == "confirmed" {
+            let saved = result.ok_or("Registration result missing")?;
+            Ok(LinuxRegistrationOutcome::AlreadyCompleted(serde_json::from_str(&saved).map_err(|_| "Invalid registration result")?))
+        } else { Ok(LinuxRegistrationOutcome::Unknown) };
+    }
+    if !store.claim_provider_mutation(&scope,operation,"recovery-device-proof",&intent,&digest).map_err(|e| e.to_string())? {
+        return Ok(LinuxRegistrationOutcome::Unknown);
+    }
+    let http = reqwest::blocking::Client::builder().redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30)).build().map_err(|_| "Recovery transport unavailable")?;
+    let response = match http.post(origin.join("/recovery/enrollment/challenge").map_err(|_| "Invalid recovery route")?)
+        .bearer_auth(&token).json(&json!({"device":signer.installation,"public_key":signer.public_key})).send() {
+        Ok(value) => value, Err(_) => return Ok(LinuxRegistrationOutcome::Unknown),
+    };
+    let response: Value = match RecoveryBroker::bounded(response,16384).and_then(|b| serde_json::from_slice(&b).map_err(|_| "Invalid device challenge".into())) {
+        Ok(value) => value, Err(_) => return Ok(LinuxRegistrationOutcome::Unknown),
+    };
+    let Some(id) = response.get("challenge_id").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 128) else { return Ok(LinuxRegistrationOutcome::Unknown); };
+    let Some(bytes) = response.get("payload").and_then(Value::as_str).and_then(|s| URL_SAFE_NO_PAD.decode(s).ok()).filter(|b| b.len() <= 8192) else { return Ok(LinuxRegistrationOutcome::Unknown); };
+    let Ok(payload) = serde_json::from_slice::<Value>(&bytes) else { return Ok(LinuxRegistrationOutcome::Unknown); };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|_| "Clock unavailable")?.as_secs();
+    let expiry = payload.get("expires").and_then(Value::as_u64).unwrap_or(0);
+    if payload.get("schema").and_then(Value::as_u64) != Some(1) || payload.get("action").and_then(Value::as_str) != Some("enroll-recovery-device") ||
+        payload.get("challenge_id").and_then(Value::as_str) != Some(id) || payload.get("account").and_then(Value::as_str) != Some(native.account_id()) ||
+        payload.get("subject").and_then(Value::as_str).is_none_or(str::is_empty) || payload.get("device").and_then(Value::as_str) != Some(signer.device_id()) ||
+        payload.get("public_key").and_then(Value::as_str) != Some(signer.public_key_der()) || payload.get("fingerprint").and_then(Value::as_str) != Some(fingerprint.as_str()) ||
+        response.get("fingerprint").and_then(Value::as_str) != Some(fingerprint.as_str()) || response.get("expires").and_then(Value::as_u64) != Some(expiry) || expiry < now || expiry > now + 900 {
+        return Ok(LinuxRegistrationOutcome::Unknown);
+    }
+    let response = match http.post(origin.join("/recovery/enrollment/prove").map_err(|_| "Invalid recovery route")?)
+        .bearer_auth(&token).json(&json!({"challenge_id":id,"signature":signer.sign(&bytes)?})).send() {
+        Ok(value) => value, Err(_) => return Ok(LinuxRegistrationOutcome::Unknown),
+    };
+    let result: Value = match RecoveryBroker::bounded(response,16384).and_then(|b| serde_json::from_slice(&b).map_err(|_| "Invalid device proof response".into())) {
+        Ok(value) => value, Err(_) => return Ok(LinuxRegistrationOutcome::Unknown),
+    };
+    if result.get("state").and_then(Value::as_str) != Some("awaiting_management") || result.get("device").and_then(Value::as_str) != Some(signer.device_id()) ||
+        result.get("fingerprint").and_then(Value::as_str) != Some(fingerprint.as_str()) { return Ok(LinuxRegistrationOutcome::Unknown); }
+    let receipt = json!({"challenge_id":id,"account":native.account_id(),"device":signer.installation,
+        "fingerprint":fingerprint,"state":"awaiting_management"});
+    if !store.finish_provider_mutation(&scope,operation,Some(&receipt.to_string())).map_err(|e| e.to_string())? { return Ok(LinuxRegistrationOutcome::Unknown); }
+    Ok(LinuxRegistrationOutcome::Applied(receipt))
+    })
+    })
+}
+
+#[cfg(all(target_os = "linux", feature = "desktop-keyring"))]
+fn linux_identity_scope(cfg: &Config, account: &str) -> Result<(ProviderScope, String), String> {
+    let origin = match cfg.provider_accounts.get(account) {
+        Some(ProviderConfig::SelfHosted { origin, .. }) => origin.clone(),
+        _ => return Err("Recovery account unavailable".into()),
+    };
+    // This initializes the existing desktop Secret Service store and ensures a
+    // real account credential exists; no keyring or plaintext fallback.
+    crate::provider_auth::self_hosted_access_token(cfg, account)?;
+    let slot = format!("{:x}", Sha256::digest(format!("{account}\0{origin}").as_bytes()));
+    Ok((ProviderScope { account_id:account.into(), origin, service:"recovery-device".into(), collection:"installation".into() }, slot))
+}
+
+#[cfg(all(target_os = "linux", feature = "desktop-keyring"))]
+fn linux_signer_from_record(scope: &ProviderScope, slot: &str, store: &Store) -> Result<LinuxRecoverySigner, String> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use ring::signature::KeyPair;
+    let (_, intent, _, _, _) = store.provider_mutation_intent(scope, "linux-installation-v1").map_err(|e| e.to_string())?
+        .ok_or("Recovery installation is not initialized")?;
+    let record: Value = serde_json::from_str(&intent).map_err(|_| "Invalid recovery installation")?;
+    let installation = record.get("installation").and_then(Value::as_str).filter(|s| s.len() >= 16 && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')).ok_or("Invalid recovery installation")?;
+    let public = record.get("public_key").and_then(Value::as_str).ok_or("Invalid recovery installation")?;
+    let entry = keyring_core::Entry::new("org.silentspike.isyncyou.recovery-device", slot).map_err(|_| "System keyring unavailable")?;
+    let encoded = entry.get_password().map_err(|_| "Recovery installation key unavailable")?;
+    let private = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| "Invalid recovery installation key")?;
+    let key = ring::signature::EcdsaKeyPair::from_pkcs8(&ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING, &private, &ring::rand::SystemRandom::new())
+        .map_err(|_| "Invalid recovery installation key")?;
+    let mut der = vec![0x30,0x59,0x30,0x13,0x06,0x07,0x2a,0x86,0x48,0xce,0x3d,0x02,0x01,0x06,0x08,0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,0x07,0x03,0x42,0x00];
+    der.extend_from_slice(key.public_key().as_ref());
+    if URL_SAFE_NO_PAD.encode(&der) != public { return Err("Recovery installation key mismatch".into()); }
+    Ok(LinuxRecoverySigner { installation:installation.into(), public_key:public.into(), key })
+}
+
+/// Load only an existing key; absence is an error and never creates a replacement.
+#[cfg(all(target_os = "linux", feature = "desktop-keyring"))]
+pub fn load_linux_recovery_signer(cfg: &Config, account: &str) -> Result<LinuxRecoverySigner, String> {
+    let (scope, slot) = linux_identity_scope(cfg, account)?;
+    let store = crate::provider_store::open(cfg, account)?;
+    linux_signer_from_record(&scope, &slot, &store)
+}
+
+/// Explicit one-time local initialization. A ledger claim precedes keyring
+/// write, so a crash or concurrent initializer fails closed without replacing
+/// an existing key. This does not claim that the server registration is active.
+#[cfg(all(target_os = "linux", feature = "desktop-keyring"))]
+pub fn initialize_linux_recovery_signer(cfg: &Config, account: &str) -> Result<LinuxRecoverySigner, String> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use ring::{rand::SecureRandom, signature::KeyPair};
+    let (scope, slot) = linux_identity_scope(cfg, account)?;
+    let store = crate::provider_store::open(cfg, account)?;
+    if store.provider_mutation(&scope, "linux-installation-v1").map_err(|e| e.to_string())?.is_some() {
+        return linux_signer_from_record(&scope, &slot, &store);
+    }
+    let entry = keyring_core::Entry::new("org.silentspike.isyncyou.recovery-device", &slot).map_err(|_| "System keyring unavailable")?;
+    match entry.get_password() { Err(keyring_core::Error::NoEntry) => {}, Ok(_) => return Err("Unbound recovery key already exists".into()), Err(_) => return Err("System keyring unavailable".into()) }
+    let rng = ring::rand::SystemRandom::new();
+    let private = ring::signature::EcdsaKeyPair::generate_pkcs8(&ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING, &rng).map_err(|_| "Device key generation unavailable")?;
+    let key = ring::signature::EcdsaKeyPair::from_pkcs8(&ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING, private.as_ref(), &rng).map_err(|_| "Device key generation unavailable")?;
+    let mut id = [0u8;24]; rng.fill(&mut id).map_err(|_| "Device identity unavailable")?;
+    let installation = URL_SAFE_NO_PAD.encode(id);
+    let mut der = vec![0x30,0x59,0x30,0x13,0x06,0x07,0x2a,0x86,0x48,0xce,0x3d,0x02,0x01,0x06,0x08,0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,0x07,0x03,0x42,0x00];
+    der.extend_from_slice(key.public_key().as_ref());
+    let intent = json!({"installation":installation,"public_key":URL_SAFE_NO_PAD.encode(&der)}).to_string();
+    let digest = format!("{:x}", Sha256::digest(intent.as_bytes()));
+    if !store.claim_provider_mutation(&scope, "linux-installation-v1", "recovery-device", &intent, &digest).map_err(|e| e.to_string())? {
+        return Err("Recovery installation initialization requires reconciliation".into());
+    }
+    entry.set_password(&URL_SAFE_NO_PAD.encode(private.as_ref())).map_err(|_| "Recovery installation key unavailable")?;
+    linux_signer_from_record(&scope, &slot, &store)
+}
+
+#[cfg(all(target_os = "linux", feature = "desktop-keyring"))]
+pub enum LinuxRegistrationOutcome {
+    /// May contain provisional subscription credentials: retain only in native protected state.
+    Applied(Value),
+    AlreadyCompleted(Value),
+    Unknown,
+}
+
+/// Execute one existing push-broker enrollment step. The host must actually
+/// subscribe using the provisional credentials and present the received nonce
+/// to `confirm`; a prepared identity alone is not an active registration.
+/// `operation` must be durable and distinct for each effect. Unknown outcomes
+/// stay in the ledger and are never replayed automatically.
+#[cfg(all(target_os = "linux", feature = "desktop-keyring"))]
+pub fn linux_recovery_registration_step(cfg: &Config, account: &str, signer: &LinuxRecoverySigner,
+    endpoint: &str, action: &str, operation: &str, received_nonce: Option<&str>) -> Result<LinuxRegistrationOutcome, String> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    if !matches!(action,"prepare" | "deliver" | "confirm") || operation.is_empty() || operation.len() > 128 ||
+        !operation.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') ||
+        endpoint.is_empty() || endpoint.len() > 2048 || endpoint.chars().any(char::is_control) ||
+        (action == "confirm") != received_nonce.is_some() ||
+        received_nonce.is_some_and(|s| s.is_empty() || s.len() > 512 || s.chars().any(char::is_control)) {
+        return Err("Invalid device registration intent".into());
+    }
+    let (scope, slot) = linux_identity_scope(cfg, account)?;
+    let store = crate::provider_store::open(cfg, account)?;
+    let bound = linux_signer_from_record(&scope, &slot, &store)?;
+    if bound.installation != signer.installation || bound.public_key != signer.public_key { return Err("Recovery device changed".into()); }
+    crate::provider_auth::with_platform_credential_store(cfg, account, |credentials| {
+    crate::provider_auth::with_locked_provider_access_token(cfg, account, credentials, |token| {
+    let native = JmapClient::discover(&scope.origin, token.to_owned()).map_err(|_| "Recovery identity unavailable")?;
+    let intent = json!({"action":action,"endpoint":endpoint,"device":signer.installation,"public_key":signer.public_key,
+        "native_account":native.account_id(),"received_nonce":received_nonce}).to_string();
+    let digest = format!("{:x}", Sha256::digest(intent.as_bytes()));
+    if let Some((previous, state, result)) = store.provider_mutation(&scope, operation).map_err(|e| e.to_string())? {
+        if previous != digest { return Err("Device registration intent changed".into()); }
+        return if state == "confirmed" {
+            let saved = result.ok_or("Registration result missing")?;
+            Ok(LinuxRegistrationOutcome::AlreadyCompleted(serde_json::from_str(&saved).map_err(|_| "Invalid registration result")?))
+        } else { Ok(LinuxRegistrationOutcome::Unknown) };
+    }
+    if !store.claim_provider_mutation(&scope, operation, "recovery-device-registration", &intent, &digest).map_err(|e| e.to_string())? {
+        return Ok(LinuxRegistrationOutcome::Unknown);
+    }
+    let challenge_request = json!({"action":action,"installation_id":signer.installation,"endpoint":endpoint,"public_key":signer.public_key});
+    let challenge = match crate::provider_push_broker::post_with_token(cfg,account,"challenge",&challenge_request,token) { Ok(value) => value, Err(_) => return Ok(LinuxRegistrationOutcome::Unknown) };
+    let Some(id) = challenge.get("challenge_id").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 128) else { return Ok(LinuxRegistrationOutcome::Unknown); };
+    let Some(bytes) = challenge.get("payload").and_then(Value::as_str).and_then(|s| URL_SAFE_NO_PAD.decode(s).ok()).filter(|b| b.len() <= 8192) else { return Ok(LinuxRegistrationOutcome::Unknown); };
+    let Ok(payload) = serde_json::from_slice::<Value>(&bytes) else { return Ok(LinuxRegistrationOutcome::Unknown); };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|_| "Clock unavailable")?.as_secs();
+    let expires = payload.get("expires").and_then(Value::as_u64).unwrap_or(0);
+    if payload.get("version").and_then(Value::as_u64) != Some(1) || payload.get("challenge_id").and_then(Value::as_str) != Some(id) ||
+        payload.get("account").and_then(Value::as_str) != Some(native.account_id()) || payload.get("action").and_then(Value::as_str) != Some(action) ||
+        payload.get("installation_id").and_then(Value::as_str) != Some(signer.device_id()) || payload.get("endpoint").and_then(Value::as_str) != Some(endpoint) ||
+        payload.get("public_key").and_then(Value::as_str) != Some(signer.public_key_der()) || expires < now || expires > now + 180 ||
+        challenge.get("expires").and_then(Value::as_u64) != Some(expires) { return Ok(LinuxRegistrationOutcome::Unknown); }
+    let mut request = json!({"challenge_id":id,"signature":signer.sign(&bytes)?});
+    if let Some(nonce) = received_nonce { request["received_nonce"] = json!(nonce); }
+    let response = match crate::provider_push_broker::post_with_token(cfg,account,action,&request,token) { Ok(value) => value, Err(_) => return Ok(LinuxRegistrationOutcome::Unknown) };
+    let valid = match action {
+        "prepare" => response.get("username").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) && response.get("password").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) && response.get("expires").and_then(Value::as_u64).is_some_and(|x| x > now),
+        "deliver" => response.get("status").and_then(Value::as_str) == Some("sent"),
+        "confirm" => response.get("status").and_then(Value::as_str) == Some("active"),
+        _ => false,
+    };
+    if !valid || !store.finish_provider_mutation(&scope,operation,Some(&response.to_string())).map_err(|e| e.to_string())? { return Ok(LinuxRegistrationOutcome::Unknown); }
+    Ok(LinuxRegistrationOutcome::Applied(response))
+    })
+    })
+}
+
+/// Native-only broker transport. The host retains its job-to-source binding in
+/// protected storage; neither tokens nor returned object bytes go to the UI.
+pub struct RecoveryBroker {
+    http: reqwest::blocking::Client,
+    origin: reqwest::Url,
+    token: String,
+    native_account: String,
+}
+
+pub struct RecoveredPayload {
+    pub bytes: Vec<u8>,
+    pub kind: String,
+    pub encoding: String,
+    pub sha256: String,
+}
+
+/// Metadata is authenticated by the broker and tied to a durably recorded
+/// account/device/source job. Size and digest refer to returned encoded bytes.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct BoundRecoveryStatus {
+    pub state: String,
+    pub kind: String,
+    pub encoding: String,
+    pub size: u64,
+    pub sha256: String,
+    pub selection_sha256: String,
+}
+
+fn parse_bound_status(value: &Value, selection_sha256: String) -> Result<BoundRecoveryStatus, String> {
+    let state = value.get("state").and_then(Value::as_str).filter(|s| matches!(*s,"queued" | "extracting" | "available" | "expired")).ok_or("Invalid recovery state")?;
+    let size = value.get("size").and_then(Value::as_u64).filter(|n| *n <= 100 * 1024 * 1024).ok_or("Invalid recovery size")?;
+    let digest = value.get("digest").and_then(Value::as_str).filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))).ok_or("Invalid recovery digest")?;
+    let kind = value.get("kind").and_then(Value::as_str).filter(|s| matches!(*s,"event" | "task" | "contact" | "mail")).ok_or("Invalid recovery kind")?;
+    let encoding = value.get("encoding").and_then(Value::as_str).filter(|s| matches!(*s,"raw" | "mime" | "isync-mime-1")).ok_or("Invalid recovery encoding")?;
+    if (kind == "mail") != (encoding != "raw") { return Err("Recovery encoding mismatch".into()); }
+    Ok(BoundRecoveryStatus { state:state.into(), kind:kind.into(), encoding:encoding.into(), size, sha256:digest.into(), selection_sha256 })
+}
+
+impl RecoveryBroker {
+    fn connect_with_token(cfg: &Config, account: &str, token: &str) -> Result<Self, String> {
+        let origin = match cfg.provider_accounts.get(account) {
+            Some(ProviderConfig::SelfHosted { origin, .. }) => origin,
+            _ => return Err("Recovery account unavailable".into()),
+        };
+        let parsed = reqwest::Url::parse(origin).map_err(|_| "Invalid recovery origin")?;
+        if parsed.scheme() != "https" || parsed.host_str().is_none() || parsed.path() != "/" ||
+            !parsed.username().is_empty() || parsed.password().is_some() || parsed.query().is_some() || parsed.fragment().is_some() {
+            return Err("Invalid recovery origin".into());
+        }
+        let native = JmapClient::discover(origin, token.to_owned()).map_err(|_| "Recovery identity unavailable")?;
+        let http = reqwest::blocking::Client::builder().redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30)).build().map_err(|_| "Recovery transport unavailable")?;
+        Ok(Self { http, origin: parsed, token:token.into(), native_account: native.account_id().to_owned() })
+    }
+
+    fn bounded(response: reqwest::blocking::Response, limit: u64) -> Result<Vec<u8>, String> {
+        if !response.status().is_success() { return Err("Recovery request unavailable".into()); }
+        let mut bytes = Vec::new();
+        response.take(limit + 1).read_to_end(&mut bytes).map_err(|_| "Recovery response unavailable")?;
+        if bytes.len() as u64 > limit { return Err("Recovery response too large".into()); }
+        Ok(bytes)
+    }
+
+    fn signed(&self, signer: &dyn RecoveryDeviceSigner, action: &str, effect: &Value)
+        -> Result<(String, String), String> {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let device = signer.device_id();
+        if device.is_empty() || device.len() > 256 || device.chars().any(char::is_control) { return Err("Invalid recovery device".into()); }
+        let challenge = self.http.post(self.origin.join("/recovery/challenge").map_err(|_| "Invalid recovery route")?)
+            .bearer_auth(&self.token).json(&json!({"device":device,"action":action,"effect":effect})).send()
+            .map_err(|_| "Recovery challenge unavailable")?;
+        let response: Value = serde_json::from_slice(&Self::bounded(challenge, 16384)?).map_err(|_| "Invalid recovery challenge")?;
+        let id = response.get("challenge_id").and_then(Value::as_str).filter(|v| !v.is_empty() && v.len() <= 128).ok_or("Invalid recovery challenge")?;
+        let encoded = response.get("payload").and_then(Value::as_str).ok_or("Invalid recovery challenge")?;
+        let bytes = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| "Invalid recovery challenge")?;
+        if bytes.len() > 8192 { return Err("Invalid recovery challenge".into()); }
+        let payload: Value = serde_json::from_slice(&bytes).map_err(|_| "Invalid recovery challenge")?;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|_| "Clock unavailable")?.as_secs();
+        let expiry = payload.get("expires").and_then(Value::as_u64).ok_or("Invalid recovery challenge")?;
+        if payload.get("schema").and_then(Value::as_u64) != Some(1) || payload.get("challenge_id").and_then(Value::as_str) != Some(id) ||
+            payload.get("native_account").and_then(Value::as_str) != Some(self.native_account.as_str()) ||
+            payload.get("subject").and_then(Value::as_str).is_none_or(str::is_empty) ||
+            payload.get("device").and_then(Value::as_str) != Some(device) || payload.get("action").and_then(Value::as_str) != Some(action) ||
+            payload.get("effect") != Some(effect) || expiry < now || expiry > now + 180 ||
+            response.get("expires").and_then(Value::as_u64) != Some(expiry) { return Err("Recovery challenge mismatch".into()); }
+        let signature = signer.sign(&bytes)?;
+        if signature.is_empty() || signature.len() > 1024 || !signature.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') { return Err("Invalid recovery signature".into()); }
+        Ok((id.to_owned(), signature))
+    }
+
+    /// Read one bounded catalog page for the account authenticated by JMAP.
+    pub fn catalog(&self, signer: &dyn RecoveryDeviceSigner, after: u64) -> Result<Value, String> {
+        if after > i64::MAX as u64 { return Err("Invalid catalog cursor".into()); }
+        let effect = json!({"catalog_after":after});
+        let (challenge, signature) = self.signed(signer, "read", &effect)?;
+        let url = self.origin.join(&format!("/recovery/catalog/{after}")).map_err(|_| "Invalid recovery route")?;
+        let response = self.http.get(url).bearer_auth(&self.token).header("X-Recovery-Device", signer.device_id())
+            .header("X-Recovery-Challenge", challenge).header("X-Recovery-Signature", signature).send().map_err(|_| "Recovery catalog unavailable")?;
+        serde_json::from_slice(&Self::bounded(response, 256 * 1024)?).map_err(|_| "Invalid recovery catalog".into())
+    }
+
+    /// Challenge issuance does not create a recovery job and may fail before
+    /// the local job claim. The create request follows the durable claim.
+    fn prepare_job(&self, signer: &dyn RecoveryDeviceSigner, generation: &str, object: &str,
+                   version: &str, confirmation: &str) -> Result<(Value, String, String), String> {
+        if [generation, object, version, confirmation].iter().any(|v| v.is_empty() || v.len() > 512 || v.chars().any(char::is_control)) {
+            return Err("Invalid recovery selection".into());
+        }
+        let effect = json!({"generation":generation,"object":object,"version":version,"destination":"recovered","confirmation":confirmation});
+        let (challenge, signature) = self.signed(signer, "create", &effect)?;
+        Ok((effect, challenge, signature))
+    }
+
+    fn create_job(&self, signer: &dyn RecoveryDeviceSigner, effect: &Value, challenge: String, signature: String) -> Result<Value, String> {
+        let response = self.http.post(self.origin.join("/recovery/jobs").map_err(|_| "Invalid recovery route")?)
+            .bearer_auth(&self.token).header("X-Recovery-Device", signer.device_id())
+            .header("X-Recovery-Challenge", challenge).header("X-Recovery-Signature", signature).json(effect).send()
+            .map_err(|_| "Recovery job outcome unknown")?;
+        let data = Self::bounded(response, 16384).map_err(|_| "Recovery job outcome unknown")?;
+        serde_json::from_slice(&data).map_err(|_| "Recovery job outcome unknown".into())
+    }
+
+    fn job_read(&self, signer: &dyn RecoveryDeviceSigner, id: &str, result: bool) -> Result<Vec<u8>, String> {
+        // Canonical UUID spelling prevents path changes and binds the challenge.
+        if id.len() != 36 || id.bytes().enumerate().any(|(i,b)| {
+            if [8,13,18,23].contains(&i) { b != b'-' } else { !(b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) }
+        }) { return Err("Invalid recovery job".into()); }
+        let (challenge, signature) = self.signed(signer, "read", &json!({"id":id}))?;
+        let suffix = if result { "/result" } else { "" };
+        let url = self.origin.join(&format!("/recovery/jobs/{id}{suffix}")).map_err(|_| "Invalid recovery route")?;
+        let response = self.http.get(url).bearer_auth(&self.token).header("X-Recovery-Device", signer.device_id())
+            .header("X-Recovery-Challenge", challenge).header("X-Recovery-Signature", signature).send().map_err(|_| "Recovery result unavailable")?;
+        Self::bounded(response, if result { 100 * 1024 * 1024 } else { 16384 })
+    }
+
+    pub fn job_status(&self, signer: &dyn RecoveryDeviceSigner, id: &str) -> Result<Value, String> {
+        let value: Value = serde_json::from_slice(&self.job_read(signer, id, false)?).map_err(|_| "Invalid recovery status")?;
+        if value.get("id").and_then(Value::as_str) != Some(id) { return Err("Recovery job mismatch".into()); }
+        Ok(value)
+    }
+
+    /// Accept only bytes matching the immediately authenticated job status.
+    fn result(&self, signer: &dyn RecoveryDeviceSigner, id: &str) -> Result<RecoveredPayload, String> {
+        let status = self.job_status(signer, id)?;
+        let status = parse_bound_status(&status, String::new())?;
+        if status.state != "available" { return Err("Recovery result unavailable".into()); }
+        let bytes = self.job_read(signer, id, true)?;
+        if bytes.len() as u64 != status.size || format!("{:x}", Sha256::digest(&bytes)) != status.sha256 { return Err("Recovery result integrity failure".into()); }
+        Ok(RecoveredPayload { bytes, kind:status.kind, encoding:status.encoding, sha256:status.sha256 })
+    }
+}
+
+/// Read the account's catalog while serialized with refresh and logout.
+pub fn recovery_catalog_with_store(cfg: &Config, account: &str, signer: &dyn RecoveryDeviceSigner,
+                                   credentials: &dyn ProviderCredentialStore, after: u64) -> Result<Value, String> {
+    crate::provider_auth::with_locked_provider_access_token(cfg, account, credentials, |token| {
+        RecoveryBroker::connect_with_token(cfg, account, token)?.catalog(signer, after)
+    })
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct RecoverySelection {
+    pub operation_id: String,
+    pub account_id: String,
+    pub origin: String,
+    pub generation: String,
+    pub object: String,
+    pub version: String,
+    pub confirmation: String,
+}
+
+pub enum RecoveryJobOutcome { Created(String), Unknown }
+
+/// Journal the account, registered device and exact protected selection before
+/// sending a create request. Re-entry only returns the recorded native ID; an
+/// ambiguous dispatch with no ID remains unknown and is never submitted again.
+pub fn create_bound_recovery_job(cfg: &Config, selection: &RecoverySelection, signer: &dyn RecoveryDeviceSigner,
+                                 credentials: &dyn ProviderCredentialStore) -> Result<RecoveryJobOutcome, String> {
+    if selection.operation_id.is_empty() || selection.operation_id.len() > 128 ||
+        !selection.operation_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') ||
+        [&selection.generation, &selection.object, &selection.version].iter().any(|s| s.len() != 64 ||
+            !s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) ||
+        selection.confirmation.is_empty() || selection.confirmation.len() > 512 || selection.confirmation.chars().any(char::is_control) ||
+        signer.device_id().is_empty() || signer.device_id().len() > 256 || signer.device_id().chars().any(char::is_control) {
+        return Err("Invalid recovery operation".into());
+    }
+    match cfg.provider_accounts.get(&selection.account_id) {
+        Some(ProviderConfig::SelfHosted { origin, .. }) if origin == &selection.origin => {},
+        _ => return Err("Recovery account or origin changed".into()),
+    }
+    let store = crate::provider_store::open(cfg, &selection.account_id)?;
+    crate::provider_auth::with_locked_provider_access_token(cfg, &selection.account_id, credentials, |token| {
+        create_bound_recovery_job_with_token(cfg, selection, signer, &store, token)
+    })
+}
+
+fn create_bound_recovery_job_with_token(cfg: &Config, selection: &RecoverySelection, signer: &dyn RecoveryDeviceSigner,
+                                        store: &Store, token: &str) -> Result<RecoveryJobOutcome, String> {
+    let broker = RecoveryBroker::connect_with_token(cfg, &selection.account_id, token)?;
+    let scope = ProviderScope { account_id:selection.account_id.clone(), origin:selection.origin.clone(),
+        service:"recovery".into(), collection:broker.native_account.clone() };
+    let intent = json!({"selection":selection,"device":signer.device_id(),"native_account":broker.native_account}).to_string();
+    let digest = format!("{:x}", Sha256::digest(intent.as_bytes()));
+    if let Some((previous, _, id)) = store.provider_mutation(&scope, &selection.operation_id).map_err(|e| e.to_string())? {
+        if previous != digest { return Err("Recovery selection differs from recorded intent".into()); }
+        return Ok(match id { Some(id) => RecoveryJobOutcome::Created(id), None => RecoveryJobOutcome::Unknown });
+    }
+    let (effect, challenge, signature) = broker.prepare_job(signer, &selection.generation, &selection.object, &selection.version, &selection.confirmation)?;
+    if !store.claim_provider_mutation(&scope, &selection.operation_id, "recovery-job", &intent, &digest).map_err(|e| e.to_string())? {
+        return Ok(RecoveryJobOutcome::Unknown);
+    }
+    let response = match broker.create_job(signer, &effect, challenge, signature) {
+        Ok(value) => value, Err(_) => return Ok(RecoveryJobOutcome::Unknown),
+    };
+    let Some(id) = response.get("id").and_then(Value::as_str) else { return Ok(RecoveryJobOutcome::Unknown); };
+    if id.len() != 36 || id.bytes().enumerate().any(|(i,b)| if [8,13,18,23].contains(&i) { b != b'-' } else { !(b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) }) {
+        return Ok(RecoveryJobOutcome::Unknown);
+    }
+    if !store.checkpoint_provider_mutation(&scope, &selection.operation_id, &digest, id).map_err(|e| e.to_string())? {
+        return Ok(RecoveryJobOutcome::Unknown);
+    }
+    Ok(RecoveryJobOutcome::Created(id.into()))
+}
+
+/// Read only the job that was durably tied to this exact account, device and
+/// source selection. The returned payload still stays inside the native host.
+fn bound_recovery_job_with_token(cfg: &Config, selection: &RecoverySelection, signer: &dyn RecoveryDeviceSigner,
+                                 store: &Store, token: &str) -> Result<(RecoveryBroker, String), String> {
+    match cfg.provider_accounts.get(&selection.account_id) {
+        Some(ProviderConfig::SelfHosted { origin, .. }) if origin == &selection.origin => {},
+        _ => return Err("Recovery account or origin changed".into()),
+    }
+    let broker = RecoveryBroker::connect_with_token(cfg, &selection.account_id, token)?;
+    let scope = ProviderScope { account_id:selection.account_id.clone(), origin:selection.origin.clone(),
+        service:"recovery".into(), collection:broker.native_account.clone() };
+    let intent = json!({"selection":selection,"device":signer.device_id(),"native_account":broker.native_account}).to_string();
+    let digest = format!("{:x}", Sha256::digest(intent.as_bytes()));
+    let (recorded, _, id) = store.provider_mutation(&scope, &selection.operation_id).map_err(|e| e.to_string())?
+        .ok_or("Recovery job not recorded")?;
+    if recorded != digest { return Err("Recovery selection differs from recorded intent".into()); }
+    Ok((broker, id.ok_or("Recovery job outcome unknown")?))
+}
+
+/// Obtain trustworthy kind, encoding, length and digest before reserving or
+/// downloading bytes. The host must still hash every downloaded payload.
+pub fn bound_recovery_status(cfg: &Config, selection: &RecoverySelection, signer: &dyn RecoveryDeviceSigner,
+                             credentials: &dyn ProviderCredentialStore) -> Result<BoundRecoveryStatus, String> {
+    let store = crate::provider_store::open(cfg, &selection.account_id)?;
+    crate::provider_auth::with_locked_provider_access_token(cfg, &selection.account_id, credentials, |token| {
+        let (broker, id) = bound_recovery_job_with_token(cfg, selection, signer, &store, token)?;
+        parse_bound_status(&broker.job_status(signer, &id)?, recovery_selection_digest(selection, signer.device_id()))
+    })
+}
+
+fn recovery_selection_digest(selection: &RecoverySelection, device: &str) -> String {
+    format!("{:x}", Sha256::digest(json!({"schema":"recovery-selection-v1","selection":selection,"device":device}).to_string().as_bytes()))
+}
+
+pub fn read_bound_recovery_result(cfg: &Config, selection: &RecoverySelection, signer: &dyn RecoveryDeviceSigner,
+                                  credentials: &dyn ProviderCredentialStore) -> Result<RecoveredPayload, String> {
+    let store = crate::provider_store::open(cfg, &selection.account_id)?;
+    crate::provider_auth::with_locked_provider_access_token(cfg, &selection.account_id, credentials, |token| {
+        let (broker, id) = bound_recovery_job_with_token(cfg, selection, signer, &store, token)?;
+        broker.result(signer, &id)
+    })
+}
+
+/// Fetch a durably bound result and build the exact calendar import intent.
+/// Caller supplies a persisted UID mapping and must confirm the returned hash.
+pub fn prepare_bound_calendar_restore(cfg: &Config, selection: &RecoverySelection, signer: &dyn RecoveryDeviceSigner,
+                                      credentials: &dyn ProviderCredentialStore, entry: &str, collection: &str,
+                                      uid_map: HashMap<String, String>) -> Result<(ApprovedCalendarRestore, CalendarRestoreSummary), String> {
+    let payload = read_bound_recovery_result(cfg, selection, signer, credentials)?;
+    calendar_restore_from_payload(selection, payload, entry, collection, uid_map)
+}
+
+fn calendar_restore_from_payload(selection: &RecoverySelection, payload: RecoveredPayload, entry: &str, collection: &str,
+                                 uid_map: HashMap<String, String>) -> Result<(ApprovedCalendarRestore, CalendarRestoreSummary), String> {
+    let kind = match (payload.kind.as_str(), payload.encoding.as_str()) {
+        ("event", "raw") => CalendarRestoreKind::Event,
+        ("task", "raw") => CalendarRestoreKind::Task,
+        _ => return Err("Recovery result is not a calendar object".into()),
+    };
+    let op = ApprovedCalendarRestore { operation_id:selection.operation_id.clone(), account_id:selection.account_id.clone(),
+        origin:selection.origin.clone(), entry:entry.into(), collection:collection.into(), source_generation:selection.generation.clone(),
+        source_object:selection.object.clone(), source_version:selection.version.clone(), original_sha256:payload.sha256,
+        original:payload.bytes, uid_map, kind };
+    let summary = prepare_calendar_restore(&op)?;
+    Ok((op, summary))
+}
+
+/// Prepare a single independent object with a fresh UID. Relations to objects
+/// outside this payload fail closed; use an explicitly persisted batch mapping
+/// when related objects are being restored together. Persist the returned intent
+/// before confirmation: preparing again generates a different UID.
+pub fn prepare_bound_calendar_restore_auto_uid(cfg: &Config, selection: &RecoverySelection, signer: &dyn RecoveryDeviceSigner,
+    credentials: &dyn ProviderCredentialStore, entry: &str, collection: &str)
+    -> Result<(ApprovedCalendarRestore, CalendarRestoreSummary), String> {
+    use isyncyou_connectors::dav::edit::{resource_index, ResourceIndex};
+    use ring::rand::SecureRandom;
+    let payload = read_bound_recovery_result(cfg, selection, signer, credentials)?;
+    let uid = match resource_index(&payload.bytes)? {
+        ResourceIndex::Event { uid } => uid,
+        ResourceIndex::Task(task) => {
+            if task.parent_uid.is_some() { return Err("Related task needs a persisted recovery mapping".into()); }
+            task.uid
+        },
+    };
+    let mut random = [0u8; 16];
+    ring::rand::SystemRandom::new().fill(&mut random).map_err(|_| "Recovery identity unavailable")?;
+    let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    let uid_map = HashMap::from([(uid, format!("{suffix}@recovered.invalid"))]);
+    calendar_restore_from_payload(selection, payload, entry, collection, uid_map)
+}
+
+/// Prepare a related set atomically in local memory before any remote write.
+/// The host must persist *all* returned intents and obtain one confirmation for
+/// the complete set before dispatching; each write retains its own journal.
+pub fn prepare_bound_calendar_restore_batch(cfg: &Config, selections: &[RecoverySelection], signer: &dyn RecoveryDeviceSigner,
+    credentials: &dyn ProviderCredentialStore, entry: &str, collection: &str)
+    -> Result<(ApprovedCalendarBatch, Vec<CalendarRestoreSummary>), String> {
+    validate_recovery_selection_set(selections)?;
+    let mut statuses = Vec::with_capacity(selections.len());
+    let mut total = 0usize;
+    for selection in selections {
+        let status = bound_recovery_status(cfg, selection, signer, credentials)?;
+        if status.state != "available" || !matches!(status.kind.as_str(), "event" | "task") || status.encoding != "raw" || status.size > 16 * 1024 * 1024 {
+            return Err("Recovery calendar object unavailable or exceeds capacity".into());
+        }
+        total = total.checked_add(status.size as usize).ok_or("Recovery batch exceeds capacity")?;
+        if total > 256 * 1024 * 1024 { return Err("Recovery batch exceeds protected staging capacity".into()); }
+        statuses.push(status);
+    }
+    let mut originals = Vec::with_capacity(selections.len());
+    for (selection, status) in selections.iter().zip(statuses) {
+        let payload = read_bound_recovery_result(cfg, selection, signer, credentials)?;
+        if payload.bytes.len() as u64 != status.size || payload.sha256 != status.sha256 || payload.kind != status.kind || payload.encoding != status.encoding {
+            return Err("Recovery result changed during preparation".into());
+        }
+        originals.push((selection, payload));
+    }
+    seal_calendar_batch(calendar_batch_from_payloads(originals, entry, collection)?)
+}
+
+fn validate_recovery_selection_set(selections: &[RecoverySelection]) -> Result<(), String> {
+    if selections.is_empty() || selections.len() > 32 { return Err("Invalid recovery batch size".into()); }
+    let first = &selections[0];
+    let mut operations = std::collections::HashSet::new();
+    if selections.iter().any(|s| s.account_id != first.account_id || s.origin != first.origin || !operations.insert(&s.operation_id)) {
+        return Err("Recovery batch identity mismatch".into());
+    }
+    Ok(())
+}
+
+fn seal_calendar_batch(prepared: Vec<(ApprovedCalendarRestore, CalendarRestoreSummary)>)
+    -> Result<(ApprovedCalendarBatch, Vec<CalendarRestoreSummary>), String> {
+    let (items, summaries): (Vec<_>, Vec<_>) = prepared.into_iter().unzip();
+    let approval_sha256 = calendar_batch_approval(&items)?;
+    Ok((ApprovedCalendarBatch { items, approval_sha256 }, summaries))
+}
+
+/// Rebuild from protected native chunks after the host authenticated and
+/// durably bound every status to its selection. No arbitrary UI bytes belong
+/// on this seam. Check the original size/hash again on every reconstruction.
+pub fn prepare_staged_calendar_batch(selections: &[RecoverySelection], statuses: &[BoundRecoveryStatus], signer: &dyn RecoveryDeviceSigner,
+    payloads: Vec<Vec<u8>>, entry: &str, collection: &str)
+    -> Result<(ApprovedCalendarBatch, Vec<CalendarRestoreSummary>), String> {
+    validate_recovery_selection_set(selections)?;
+    if statuses.len() != selections.len() || payloads.len() != selections.len() { return Err("Recovery staging identity mismatch".into()); }
+    let mut originals = Vec::with_capacity(selections.len());
+    let mut total = 0usize;
+    for ((selection, status), bytes) in selections.iter().zip(statuses).zip(payloads) {
+        if status.selection_sha256 != recovery_selection_digest(selection, signer.device_id()) || status.state != "available" || !matches!(status.kind.as_str(), "event" | "task") || status.encoding != "raw" ||
+            bytes.len() > 16 * 1024 * 1024 || bytes.len() as u64 != status.size || format!("{:x}",Sha256::digest(&bytes)) != status.sha256 {
+            return Err("Recovery staged payload mismatch".into());
+        }
+        total = total.checked_add(bytes.len()).ok_or("Recovery batch exceeds capacity")?;
+        if total > 256 * 1024 * 1024 { return Err("Recovery batch exceeds protected staging capacity".into()); }
+        originals.push((selection, RecoveredPayload {bytes, kind:status.kind.clone(), encoding:status.encoding.clone(), sha256:status.sha256.clone()}));
+    }
+    seal_calendar_batch(calendar_batch_from_payloads(originals, entry, collection)?)
+}
+
+fn calendar_batch_from_payloads(originals: Vec<(&RecoverySelection, RecoveredPayload)>, entry: &str, collection: &str)
+    -> Result<Vec<(ApprovedCalendarRestore, CalendarRestoreSummary)>, String> {
+    use isyncyou_connectors::dav::edit::{resource_index, ResourceIndex};
+    use ring::rand::SecureRandom;
+    let mut mapping = HashMap::new();
+    let mut pending = Vec::with_capacity(originals.len());
+    for (selection, payload) in originals {
+        let (uid, parent) = match resource_index(&payload.bytes)? {
+            ResourceIndex::Event { uid } => (uid, None),
+            ResourceIndex::Task(task) => (task.uid, task.parent_uid),
+        };
+        if uid.is_empty() || uid.len() > 4096 || uid.chars().any(char::is_control) ||
+            parent.as_ref().is_some_and(|value| value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control)) {
+            return Err("Invalid recovery relationship identity".into());
+        }
+        let mut random = [0u8; 16];
+        ring::rand::SystemRandom::new().fill(&mut random).map_err(|_| "Recovery identity unavailable")?;
+        let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
+        if mapping.insert(uid.clone(), format!("{suffix}@recovered.invalid")).is_some() {
+            return Err("Recovery batch contains duplicate source identity".into());
+        }
+        pending.push((selection, payload, uid, parent));
+    }
+    if pending.iter().any(|(_,_,_,parent)| parent.as_ref().is_some_and(|id| !mapping.contains_key(id))) {
+        return Err("Recovery batch is missing a related parent".into());
+    }
+    let mut ordered = Vec::with_capacity(pending.len());
+    let mut completed = std::collections::HashSet::new();
+    while !pending.is_empty() {
+        let index = pending.iter().position(|(_,_,_,parent)| parent.as_ref().is_none_or(|id| completed.contains(id)))
+            .ok_or("Recovery batch contains a relationship cycle")?;
+        let (selection,payload,uid,_) = pending.remove(index);
+        completed.insert(uid);
+        ordered.push(calendar_restore_from_payload(selection, payload, entry, collection, mapping.clone())?);
+    }
+    Ok(ordered)
+}
+
+/// Persist the whole structure in the protected confirmation ledger before
+/// any native writes. The hash binds the order and every per-object effect.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct ApprovedCalendarBatch {
+    pub items: Vec<ApprovedCalendarRestore>,
+    pub approval_sha256: String,
+}
+
+fn calendar_batch_approval(items: &[ApprovedCalendarRestore]) -> Result<String, String> {
+    if items.is_empty() || items.len() > 32 { return Err("Invalid recovery batch size".into()); }
+    let first = &items[0];
+    let mut operations = std::collections::HashSet::new();
+    let mut hashes = Vec::with_capacity(items.len());
+    let mut total = 0usize;
+    for item in items {
+        total = total.checked_add(item.original.len()).ok_or("Recovery batch exceeds capacity")?;
+        if total > 256 * 1024 * 1024 { return Err("Recovery batch exceeds protected staging capacity".into()); }
+        if item.account_id != first.account_id || item.origin != first.origin || item.collection != first.collection ||
+           item.uid_map != first.uid_map || !operations.insert(&item.operation_id) {
+            return Err("Recovery batch intent mismatch".into());
+        }
+        hashes.push(prepare_calendar_restore(item)?.approval_sha256);
+    }
+    Ok(format!("{:x}", Sha256::digest(json!({"schema":"calendar-recovery-batch-v1","items":hashes}).to_string().as_bytes())))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CalendarBatchOutcome {
+    Confirmed(Vec<String>),
+    Stopped { completed: Vec<String>, next_index: usize, reason: &'static str },
+}
+
+/// Stops at the first uncertain, conflicting or rejected item. A repeated call
+/// reconciles already journaled writes and never blindly reissues them.
+pub fn execute_calendar_restore_batch_with_store(cfg: &Config, batch: &ApprovedCalendarBatch, approved_sha256: &str,
+    credentials: &dyn ProviderCredentialStore) -> Result<CalendarBatchOutcome, String> {
+    if calendar_batch_approval(&batch.items)? != approved_sha256 || batch.approval_sha256 != approved_sha256 {
+        return Err("Calendar batch approval does not match intent".into());
+    }
+    let first = batch.items.first().ok_or("Invalid recovery batch size")?;
+    match cfg.provider_accounts.get(&first.account_id) {
+        Some(ProviderConfig::SelfHosted { origin, .. }) if origin == &first.origin => {},
+        _ => return Err("Account or origin changed after approval".into()),
+    }
+    let store = crate::provider_store::open(cfg, &first.account_id)?;
+    crate::provider_auth::with_locked_provider_access_token(cfg, &first.account_id, credentials, |token| {
+        execute_calendar_batch(batch, approved_sha256, |item, hash| execute_calendar_restore_with_token(cfg, item, hash, &store, token))
+    })
+}
+
+fn execute_calendar_batch<F>(batch: &ApprovedCalendarBatch, approved_sha256: &str, mut dispatch: F) -> Result<CalendarBatchOutcome, String>
+where F: FnMut(&ApprovedCalendarRestore, &str) -> Result<crate::dav_live::RecoveryImportOutcome, String> {
+    let digest = calendar_batch_approval(&batch.items)?;
+    if digest != batch.approval_sha256 || digest != approved_sha256 { return Err("Calendar batch approval does not match intent".into()); }
+    let mut completed = Vec::new();
+    for (index,item) in batch.items.iter().enumerate() {
+        let item_hash = prepare_calendar_restore(item)?.approval_sha256;
+        let outcome = dispatch(item, &item_hash);
+        match outcome {
+            Ok(crate::dav_live::RecoveryImportOutcome::Confirmed { href }) => completed.push(href),
+            Ok(crate::dav_live::RecoveryImportOutcome::Conflict) => return Ok(CalendarBatchOutcome::Stopped {completed,next_index:index,reason:"conflict"}),
+            Ok(crate::dav_live::RecoveryImportOutcome::Rejected) => return Ok(CalendarBatchOutcome::Stopped {completed,next_index:index,reason:"rejected"}),
+            Ok(crate::dav_live::RecoveryImportOutcome::Unknown) | Err(_) => return Ok(CalendarBatchOutcome::Stopped {completed,next_index:index,reason:"unknown"}),
+        }
+    }
+    Ok(CalendarBatchOutcome::Confirmed(completed))
+}
+
+/// A protected original and its complete, stable import intent. Store this
+/// only in the host's protected confirmation ledger; never expose its bytes to
+/// the model or browser. The host must authenticate the catalog/result first.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct ApprovedCalendarRestore {
+    pub operation_id: String,
+    pub account_id: String,
+    pub origin: String,
+    pub entry: String,
+    pub collection: String,
+    pub source_generation: String,
+    pub source_object: String,
+    pub source_version: String,
+    pub original_sha256: String,
+    #[serde(with = "recovery_payload_base64")]
+    pub original: Vec<u8>,
+    /// Persist before approval; use new UIDs and map any recovered relations.
+    pub uid_map: HashMap<String, String>,
+    pub kind: CalendarRestoreKind,
+}
+
+mod recovery_payload_base64 {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(value: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(value))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        if encoded.len() > 24 * 1024 * 1024 { return Err(serde::de::Error::custom("Recovery payload exceeds limit")); }
+        let bytes = STANDARD.decode(encoded).map_err(serde::de::Error::custom)?;
+        if bytes.len() > 16 * 1024 * 1024 { return Err(serde::de::Error::custom("Recovery payload exceeds limit")); }
+        Ok(bytes)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CalendarRestoreKind { Event, Task }
+
+/// A bounded effect description for human approval, containing no raw data.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub struct CalendarRestoreSummary {
+    pub kind: CalendarRestoreKind,
+    pub original_sha256: String,
+    pub projected_sha256: String,
+    /// Bind human confirmation to this exact effect and source/destination.
+    pub approval_sha256: String,
+    pub effects: &'static str,
+    pub components: Vec<CalendarRestorePreview>,
+    pub removed_scheduling_method: bool,
+    pub removed_scheduling_participants: bool,
+    pub removed_alarms: bool,
+    pub retained_timezone_definitions: bool,
+    /// Untrusted, bounded jCal text; not an independently validated time-zone rule.
+    pub timezone_definitions: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub struct CalendarRestorePreview {
+    pub kind: String,
+    pub title: Option<String>,
+    pub uid: String,
+    pub start: Option<CalendarPreviewDate>,
+    pub end: Option<CalendarPreviewDate>,
+    pub due: Option<CalendarPreviewDate>,
+    pub recurrence_id: Option<CalendarPreviewDate>,
+    pub recurrence_rule: Option<String>,
+    pub additional_dates: Vec<CalendarPreviewDate>,
+    pub excluded_dates: Vec<CalendarPreviewDate>,
+    pub relations: Vec<CalendarPreviewRelation>,
+    pub has_attachments: bool,
+    pub other_properties: Vec<CalendarPreviewProperty>,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub struct CalendarPreviewProperty {
+    pub name: String,
+    pub value: String,
+    pub parameters: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub struct CalendarPreviewRelation {
+    pub uid: String,
+    pub relation_type: String,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub struct CalendarPreviewDate {
+    pub value: String,
+    pub tzid: Option<String>,
+    pub value_type: Option<String>,
+}
+
+fn recovery_preview_multiline(value: &Value, max: usize) -> Result<String, String> {
+    let value = value.as_str().ok_or("Invalid recovery preview")?;
+    if value.len() > max || value.chars().any(|c| c.is_control() && c != '\r' && c != '\n') {
+        return Err("Recovery preview cannot be displayed safely".into());
+    }
+    Ok(value.replace("\r\n", "\n").replace('\r', "\n"))
+}
+
+fn calendar_preview(original: &[u8], projected: &[u8]) -> Result<(Vec<CalendarRestorePreview>, bool, bool, bool, Vec<String>), String> {
+    fn text(value: &Value, max: usize) -> Result<String, String> {
+        let value = value.as_str().ok_or("Invalid recovery preview")?;
+        if value.len() > max || value.chars().any(char::is_control) { return Err("Recovery preview cannot be displayed safely".into()); }
+        Ok(value.into())
+    }
+    fn values<'a>(object: &'a Value, key: &str) -> Result<&'a [Value], String> {
+        match object.get("properties").and_then(|v| v.get(key)) {
+            None => Ok(&[]),
+            Some(value) => value.as_array().map(Vec::as_slice).ok_or_else(|| "Invalid recovery preview".into()),
+        }
+    }
+    fn single(object: &Value, key: &str, max: usize) -> Result<Option<String>, String> {
+        let items = values(object,key)?;
+        if items.len() > 1 { return Err("Ambiguous recovery preview property".into()); }
+        items.first().map(|item| text(&item["value"],max)).transpose()
+    }
+    fn date_entry(item: &Value) -> Result<CalendarPreviewDate, String> {
+        Ok(CalendarPreviewDate {
+            value:text(&item["value"],4096)?,
+            tzid:item.pointer("/parameters/TZID").map(|v| text(v,256)).transpose()?,
+            value_type:item.pointer("/parameters/VALUE").map(|v| text(v,128)).transpose()?,
+        })
+    }
+    fn date(object: &Value, key: &str) -> Result<Option<CalendarPreviewDate>, String> {
+        let items = values(object,key)?;
+        if items.len() > 1 { return Err("Ambiguous recovery preview date".into()); }
+        items.first().map(date_entry).transpose()
+    }
+    fn dates(object: &Value, key: &str) -> Result<Vec<CalendarPreviewDate>, String> {
+        let items = values(object,key)?;
+        if items.len() > 32 { return Err("Recovery preview exceeds recurrence limit".into()); }
+        items.iter().map(date_entry).collect()
+    }
+    fn safe_timezone(value: &Value, depth: usize, count: &mut usize) -> Result<(), String> {
+        *count += 1;
+        if depth > 16 || *count > 4096 { return Err("Recovery time-zone preview exceeds limit".into()); }
+        match value {
+            Value::String(item) => {
+                if item.len() > 4096 || item.chars().any(char::is_control) || item.to_ascii_lowercase().starts_with("data:") {
+                    return Err("Recovery time-zone value cannot be displayed safely".into());
+                }
+            },
+            Value::Array(items) => {
+                if items.first().and_then(Value::as_str).is_some_and(|name| name.eq_ignore_ascii_case("attach")) {
+                    return Err("Recovery time zone contains an undisplayed attachment".into());
+                }
+                if items.get(2).and_then(Value::as_str).is_some_and(|kind| kind.eq_ignore_ascii_case("binary")) {
+                    return Err("Recovery time zone contains undisplayed binary data".into());
+                }
+                for item in items { safe_timezone(item,depth + 1,count)?; }
+            },
+            Value::Object(items) => {
+                for (key,item) in items {
+                    if key.len() > 128 || key.chars().any(char::is_control) { return Err("Invalid recovery time-zone parameter".into()); }
+                    if (key.eq_ignore_ascii_case("encoding") && item.as_str().is_some_and(|v| v.eq_ignore_ascii_case("base64") || v.eq_ignore_ascii_case("b"))) ||
+                       (key.eq_ignore_ascii_case("value") && item.as_str().is_some_and(|v| v.eq_ignore_ascii_case("binary"))) {
+                        return Err("Recovery time zone contains undisplayed binary data".into());
+                    }
+                    safe_timezone(item,depth + 1,count)?;
+                }
+            },
+            Value::Null | Value::Bool(_) | Value::Number(_) => {},
+        }
+        Ok(())
+    }
+    let output = isyncyou_connectors::dav::projection::calendar(projected)?;
+    let source = isyncyou_connectors::dav::projection::calendar(original)?;
+    let top = output.pointer("/jcal/1").and_then(Value::as_array).ok_or("Invalid recovery preview")?;
+    if top.iter().any(|property| property.get(0).and_then(Value::as_str).is_none_or(|name| {
+        !["version", "prodid", "calscale"].iter().any(|allowed| name.eq_ignore_ascii_case(allowed))
+    })) { return Err("Recovery calendar contains undisplayed calendar-level properties".into()); }
+    let mut timezones = Vec::new();
+    for component in output.pointer("/jcal/2").and_then(Value::as_array).ok_or("Invalid recovery preview")? {
+        if component.get(0).and_then(Value::as_str).is_some_and(|name| name.eq_ignore_ascii_case("vtimezone")) {
+            if timezones.len() >= 32 { return Err("Recovery preview exceeds time-zone limit".into()); }
+            let mut count = 0;
+            safe_timezone(component,0,&mut count)?;
+            timezones.push(serde_json::to_string(component).map_err(|_| "Invalid recovery time-zone preview")?);
+        }
+    }
+    let components = output.get("components").and_then(Value::as_array).ok_or("Invalid recovery preview")?;
+    let source_components = source.get("components").and_then(Value::as_array).ok_or("Invalid recovery preview")?;
+    if components.is_empty() || components.len() > 64 { return Err("Recovery preview exceeds component limit".into()); }
+    let mut previews = Vec::with_capacity(components.len());
+    for component in components {
+        let related = values(component,"RELATED-TO")?;
+        if related.len() > 32 { return Err("Recovery preview exceeds relation limit".into()); }
+        let properties = component.get("properties").and_then(Value::as_object).ok_or("Invalid recovery preview")?;
+        let mut other_properties = Vec::new();
+        for (name, property_values) in properties {
+            if ["UID","SUMMARY","DTSTART","DTEND","DUE","RECURRENCE-ID","RRULE","RDATE","EXDATE","RELATED-TO"]
+                .iter().any(|known| name.eq_ignore_ascii_case(known)) { continue; }
+            if name.is_empty() || name.len() > 128 || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+                return Err("Recovery property cannot be displayed safely".into());
+            }
+            let items = property_values.as_array().ok_or("Invalid recovery preview")?;
+            if items.len() > 32 || other_properties.len() + items.len() > 128 { return Err("Recovery preview exceeds property limit".into()); }
+            for item in items {
+                let params = item.get("parameters").and_then(Value::as_object).ok_or("Invalid recovery preview")?;
+                if params.len() > 32 { return Err("Recovery preview exceeds parameter limit".into()); }
+                let mut parameters = std::collections::BTreeMap::new();
+                for (key, value) in params {
+                    if key.is_empty() || key.len() > 128 || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+                        return Err("Recovery parameter cannot be displayed safely".into());
+                    }
+                    let value = text(value,1024)?;
+                    if (key.eq_ignore_ascii_case("VALUE") && value.eq_ignore_ascii_case("BINARY")) ||
+                        (key.eq_ignore_ascii_case("ENCODING") && (value.eq_ignore_ascii_case("BASE64") || value.eq_ignore_ascii_case("B"))) {
+                        return Err("Recovery property contains undisplayed binary data".into());
+                    }
+                    parameters.insert(key.clone(),value);
+                }
+                let value = if name.eq_ignore_ascii_case("DESCRIPTION") || name.eq_ignore_ascii_case("LOCATION") {
+                    recovery_preview_multiline(&item["value"],4096)?
+                } else { text(&item["value"],4096)? };
+                if name.eq_ignore_ascii_case("ATTACH") && value.trim_start().to_ascii_lowercase().starts_with("data:") {
+                    return Err("Recovery attachment contains undisplayed embedded data".into());
+                }
+                other_properties.push(CalendarPreviewProperty {name:name.clone(),value,parameters});
+            }
+        }
+        previews.push(CalendarRestorePreview {
+            kind:text(&component["kind"],32)?, title:single(component,"SUMMARY",1024)?,
+            uid:text(&component["uid"],1024)?, start:date(component,"DTSTART")?, end:date(component,"DTEND")?,
+            due:date(component,"DUE")?, recurrence_id:date(component,"RECURRENCE-ID")?,
+            recurrence_rule:single(component,"RRULE",1024)?,
+            additional_dates:dates(component,"RDATE")?,
+            excluded_dates:dates(component,"EXDATE")?,
+            has_attachments:!values(component,"ATTACH")?.is_empty(),
+            other_properties,
+            relations:related.iter().map(|item| Ok(CalendarPreviewRelation {
+                uid:text(&item["value"],1024)?,
+                relation_type:item.pointer("/parameters/RELTYPE").map(|v| text(v,128)).transpose()?.unwrap_or_else(|| "PARENT".into()),
+            })).collect::<Result<_,String>>()?,
+        });
+    }
+    if serde_json::to_vec(&(&previews,&timezones)).map_err(|_| "Invalid recovery preview")?.len() > 65536 {
+        return Err("Recovery preview exceeds display capacity".into());
+    }
+    let participants = source_components.iter().any(|c| {
+        c.get("properties").is_some_and(|p| p.get("ORGANIZER").is_some() || p.get("ATTENDEE").is_some())
+    });
+    let method = source.pointer("/jcal/1").and_then(Value::as_array).ok_or("Invalid recovery preview")?.iter().any(|property| {
+        property.get(0).and_then(Value::as_str).is_some_and(|name| name.eq_ignore_ascii_case("method"))
+    });
+    let alarms = isyncyou_connectors::dav::edit::resource_has_alarms(original)?;
+    Ok((previews, method, participants, alarms, timezones))
+}
+
+/// Validate the exact source and calculate the effect the user must approve.
+/// The caller authenticates the catalog binding and keeps the returned intent
+/// and mapping unchanged through confirmation and any later reconciliation.
+pub fn prepare_calendar_restore(op: &ApprovedCalendarRestore) -> Result<CalendarRestoreSummary, String> {
+    use isyncyou_connectors::dav::edit::{resource_index, ResourceIndex};
+    let hash = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if op.operation_id.is_empty() || op.operation_id.len() > 128 ||
+        !op.operation_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') ||
+        [&op.account_id, &op.origin, &op.entry, &op.collection].iter().any(|s| s.is_empty() || s.len() > 4096 || s.chars().any(char::is_control)) ||
+        [&op.source_generation, &op.source_object, &op.source_version, &op.original_sha256].iter().any(|s| !hash(s)) ||
+        op.original.len() > 16 * 1024 * 1024 || format!("{:x}", Sha256::digest(&op.original)) != op.original_sha256 {
+        return Err("Invalid calendar recovery intent".into());
+    }
+    let actual = match resource_index(&op.original)? {
+        ResourceIndex::Event { .. } => CalendarRestoreKind::Event,
+        ResourceIndex::Task(_) => CalendarRestoreKind::Task,
+    };
+    if actual != op.kind { return Err("Recovery object type mismatch".into()); }
+    let projected = crate::dav_live::prepare_recovered_calendar(&op.original, &op.uid_map)?;
+    let (components, removed_scheduling_method, removed_scheduling_participants, removed_alarms, timezone_definitions) = calendar_preview(&op.original, &projected)?;
+    let retained_timezone_definitions = !timezone_definitions.is_empty();
+    let projected_sha256 = format!("{:x}", Sha256::digest(&projected));
+    let ordered_map: std::collections::BTreeMap<_, _> = op.uid_map.iter().collect();
+    let approval = json!({"schema":"calendar-recovery-approval-v1", "operation_id":op.operation_id,
+        "account_id":op.account_id, "origin":op.origin, "entry":op.entry, "collection":op.collection,
+        "generation":op.source_generation, "object":op.source_object, "version":op.source_version,
+        "original_sha256":op.original_sha256, "projected_sha256":projected_sha256,
+        "uid_map":ordered_map, "kind":op.kind});
+    let approval_sha256 = format!("{:x}", Sha256::digest(approval.to_string().as_bytes()));
+    Ok(CalendarRestoreSummary { kind: actual, original_sha256: op.original_sha256.clone(),
+        projected_sha256, approval_sha256,
+        effects: "Create a personal recovered copy with new identity; scheduling participants and alarms are removed.",
+        components, removed_scheduling_method, removed_scheduling_participants, removed_alarms, retained_timezone_definitions, timezone_definitions })
+}
+
+/// Execute only after confirmation of the exact prepared intent. Account and
+/// origin are rechecked; the lower layer journals before PUT and reconciles an
+/// unknown outcome by readback without issuing a second PUT.
+pub fn execute_calendar_restore_with_store(cfg: &Config, op: &ApprovedCalendarRestore, approved_sha256: &str, credentials: &dyn ProviderCredentialStore)
+    -> Result<crate::dav_live::RecoveryImportOutcome, String> {
+    if prepare_calendar_restore(op)?.approval_sha256 != approved_sha256 {
+        return Err("Calendar recovery approval does not match intent".into());
+    }
+    match cfg.provider_accounts.get(&op.account_id) {
+        Some(ProviderConfig::SelfHosted { origin, .. }) if origin == &op.origin => {},
+        _ => return Err("Account or origin changed after approval".into()),
+    }
+    let store = crate::provider_store::open(cfg, &op.account_id)?;
+    crate::provider_auth::with_locked_provider_access_token(cfg, &op.account_id, credentials, |token| {
+        execute_calendar_restore_with_token(cfg, op, approved_sha256, &store, token)
+    })
+}
+
+fn execute_calendar_restore_with_token(cfg: &Config, op: &ApprovedCalendarRestore, approved_sha256: &str, store: &Store, token: &str)
+    -> Result<crate::dav_live::RecoveryImportOutcome, String> {
+    if prepare_calendar_restore(op)?.approval_sha256 != approved_sha256 {
+        return Err("Calendar recovery approval does not match intent".into());
+    }
+    match cfg.provider_accounts.get(&op.account_id) {
+        Some(ProviderConfig::SelfHosted { origin, .. }) if origin == &op.origin => {},
+        _ => return Err("Account or origin changed after approval".into()),
+    }
+    crate::dav_live::import_recovered_with_token(cfg, &op.account_id, &op.origin, store, &op.entry, &op.collection, "calendar",
+        &op.operation_id, &op.source_generation, &op.source_object, &op.source_version,
+        &op.original, &op.original_sha256, &op.uid_map, None, token)
+}
 
 pub struct ApprovedMailRestore {
     pub operation_id: String,
@@ -42,6 +1120,14 @@ trait Transport {
     fn upload(&self, mime: &[u8]) -> Result<String, JmapError>;
     fn import(&self, operation: &str, blob: &str, folder: &str) -> Result<Option<String>, JmapError>;
     fn readback(&self, id: &str, folder: &str, expected_sha: &str) -> Result<bool, JmapError>;
+}
+
+// An explicitly null ACL is the native representation of an unshared
+// mailbox; an omitted property is not evidence that it is private.
+fn is_unshared(value: &Value) -> bool {
+    value.get("shareWith").is_some_and(|acl| {
+        acl.is_null() || acl.as_object().is_some_and(|entries| entries.is_empty())
+    })
 }
 
 impl Transport for JmapClient {
@@ -81,7 +1167,7 @@ impl Transport for JmapClient {
                 if item.get("name").and_then(Value::as_str) == Some("Recovered") {
                     if !item.get("role").is_some_and(Value::is_null) ||
                        item.pointer("/myRights/mayAddItems").and_then(Value::as_bool) != Some(true) ||
-                       !item.get("shareWith").and_then(Value::as_object).is_some_and(|acl| acl.is_empty()) {
+                       !is_unshared(item) {
                         return Err(JmapError::InvalidResponse);
                     }
                     found.push(id.to_owned());
@@ -109,7 +1195,7 @@ impl Transport for JmapClient {
             && item.get("name").and_then(Value::as_str) == Some("Recovered")
             && item.get("role").is_some_and(Value::is_null)
             && item.pointer("/myRights/mayAddItems").and_then(Value::as_bool) == Some(true)
-            && item.get("shareWith").and_then(Value::as_object).is_some_and(|acl| acl.is_empty()))
+            && is_unshared(item))
     }
     fn upload(&self, mime: &[u8]) -> Result<String, JmapError> {
         self.upload(mime.to_vec(), "message/rfc822")?.get("blobId").and_then(Value::as_str)
@@ -264,15 +1350,19 @@ fn ensure_folder_inner(cfg: &Config, account: &str, origin: &str, operation: &st
         Some(ProviderConfig::SelfHosted { origin: current, .. }) if current == origin => {},
         _ => return Err("Account or origin changed after approval".into()),
     }
-    let token = match credentials {
-        Some(store) => crate::provider_auth::self_hosted_access_token_with_store(cfg, account, store)?,
-        None => crate::provider_auth::self_hosted_access_token(cfg, account)?,
-    };
-    let client = JmapClient::discover(origin, token).map_err(|_| "Mail service unavailable")?;
-    let scope = ProviderScope { account_id: account.into(), origin: origin.into(), service: "mail".into(),
-                                collection: client.account_id().to_owned() };
     let store = crate::provider_store::open(cfg, account)?;
-    ensure_folder(&store, &client, &scope, operation)
+    let run_locked = |credentials: &dyn ProviderCredentialStore| {
+        crate::provider_auth::with_locked_provider_access_token(cfg, account, credentials, |token| {
+            let client = JmapClient::discover(origin, token.to_owned()).map_err(|_| "Mail service unavailable")?;
+            let scope = ProviderScope { account_id: account.into(), origin: origin.into(), service: "mail".into(),
+                                        collection: client.account_id().to_owned() };
+            ensure_folder(&store, &client, &scope, operation)
+        })
+    };
+    match credentials {
+        Some(credentials) => run_locked(credentials),
+        None => crate::provider_auth::with_platform_credential_store(cfg, account, run_locked),
+    }
 }
 
 /// Caller must supply an approval bound to every field and exact original bytes.
@@ -289,21 +1379,224 @@ fn execute_inner(cfg: &Config, op: &ApprovedMailRestore, credentials: Option<&dy
         Some(ProviderConfig::SelfHosted { origin, .. }) if origin == &op.origin => {},
         _ => return Err("Account or origin changed after approval".into()),
     }
-    let token = match credentials {
-        Some(store) => crate::provider_auth::self_hosted_access_token_with_store(cfg, &op.account_id, store)?,
-        None => crate::provider_auth::self_hosted_access_token(cfg, &op.account_id)?,
-    };
-    let client = JmapClient::discover(&op.origin, token).map_err(|_| "Mail service unavailable")?;
-    let scope = ProviderScope { account_id: op.account_id.clone(), origin: op.origin.clone(),
-        service: "mail".into(), collection: client.account_id().to_owned() };
     let store = crate::provider_store::open(cfg, &op.account_id)?;
-    run(&store, &client, &scope, op)
+    let run_locked = |credentials: &dyn ProviderCredentialStore| {
+        crate::provider_auth::with_locked_provider_access_token(cfg, &op.account_id, credentials, |token| {
+            let client = JmapClient::discover(&op.origin, token.to_owned()).map_err(|_| "Mail service unavailable")?;
+            let scope = ProviderScope { account_id: op.account_id.clone(), origin: op.origin.clone(),
+                service: "mail".into(), collection: client.account_id().to_owned() };
+            run(&store, &client, &scope, op)
+        })
+    };
+    match credentials {
+        Some(credentials) => run_locked(credentials),
+        None => crate::provider_auth::with_platform_credential_store(cfg, &op.account_id, run_locked),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
+    #[cfg(all(target_os = "linux", feature = "desktop-keyring"))]
+    #[test]
+    fn linux_signer_uses_verifiable_p256_asn1_and_rejects_empty_challenge() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use ring::signature::KeyPair;
+        let rng = ring::rand::SystemRandom::new();
+        let private = ring::signature::EcdsaKeyPair::generate_pkcs8(&ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let key = ring::signature::EcdsaKeyPair::from_pkcs8(&ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING, private.as_ref(), &rng).unwrap();
+        let public = key.public_key().as_ref().to_vec();
+        let signer = LinuxRecoverySigner { installation:"installation-123456".into(), public_key:"public".into(), key };
+        let challenge = b"bound account and effect";
+        let signature = URL_SAFE_NO_PAD.decode(signer.sign(challenge).unwrap()).unwrap();
+        ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_ASN1, public)
+            .verify(challenge,&signature).unwrap();
+        assert!(signer.sign(b"").is_err());
+    }
+    #[test]
+    fn broker_checks_account_and_effect_before_device_signing() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        struct Signer(std::sync::atomic::AtomicUsize);
+        impl RecoveryDeviceSigner for Signer {
+            fn device_id(&self) -> &str { "device" }
+            fn sign(&self, _: &[u8]) -> Result<String, String> { self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst); Ok("signature".into()) }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for account in ["wrong-account", "native-account"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0; 1024];
+                loop {
+                    let count = stream.read(&mut buf).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buf[..count]);
+                    if let Some(pos) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..pos]);
+                        let length = headers.lines().find_map(|line| line.split_once(':').and_then(|(k,v)|
+                            if k.eq_ignore_ascii_case("content-length") { v.trim().parse::<usize>().ok() } else { None })).unwrap();
+                        if request.len() >= pos + 4 + length { break; }
+                    }
+                }
+                let expires = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 60;
+                let payload = json!({"schema":1,"challenge_id":"challenge","native_account":account,"subject":"person",
+                    "device":"device","action":"read","effect":{"catalog_after":0},"expires":expires}).to_string();
+                let response = json!({"challenge_id":"challenge","payload":URL_SAFE_NO_PAD.encode(payload.as_bytes()),"expires":expires}).to_string();
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",response.len(),response).unwrap();
+            }
+        });
+        let broker = RecoveryBroker { http:reqwest::blocking::Client::builder().no_proxy().build().unwrap(), origin:reqwest::Url::parse(&format!("http://{addr}/")).unwrap(), token:"test".into(), native_account:"native-account".into() };
+        let signer = Signer(std::sync::atomic::AtomicUsize::new(0));
+        let effect = json!({"catalog_after":0});
+        assert!(broker.signed(&signer,"read",&effect).is_err());
+        assert_eq!(signer.0.load(std::sync::atomic::Ordering::SeqCst),0);
+        assert!(broker.signed(&signer,"read",&effect).is_ok());
+        assert_eq!(signer.0.load(std::sync::atomic::Ordering::SeqCst),1);
+        server.join().unwrap();
+    }
+    #[test]
+    fn calendar_restore_prepares_bound_personal_effect_and_rejects_changed_source() {
+        assert_eq!(recovery_preview_multiline(&json!("first\r\nsecond\rthird"),4096).unwrap(), "first\nsecond\nthird");
+        assert!(recovery_preview_multiline(&json!("first\u{0007}second"),4096).is_err());
+        let original = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:old\r\nSUMMARY:Planning\r\nDESCRIPTION:Discuss plan\r\nLOCATION:Office\r\nX-KEEP:custom\r\nATTACH;FMTTYPE=application/pdf:https://example.test/document\r\nDTSTART:20261103T120000Z\r\nORGANIZER:mailto:a@example.test\r\nATTENDEE:mailto:b@example.test\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT5M\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n".to_vec();
+        let mut op = ApprovedCalendarRestore { operation_id:"op-1".into(), account_id:"a".into(), origin:"https://example.test/".into(),
+            entry:"/dav/".into(), collection:"https://example.test/dav/recovered/".into(), source_generation:"a".repeat(64),
+            source_object:"b".repeat(64), source_version:"c".repeat(64), original_sha256:format!("{:x}",Sha256::digest(&original)),
+            original, uid_map:HashMap::from([("old".into(),"new".into())]), kind:CalendarRestoreKind::Event };
+        let summary = prepare_calendar_restore(&op).unwrap();
+        assert_eq!(summary.components[0].title.as_deref(), Some("Planning"));
+        assert_eq!(summary.components[0].uid, "new");
+        assert!(summary.components[0].other_properties.iter().any(|p| p.name == "DESCRIPTION" && p.value == "Discuss plan"));
+        assert!(summary.components[0].other_properties.iter().any(|p| p.name == "LOCATION" && p.value == "Office"));
+        assert!(summary.components[0].other_properties.iter().any(|p| p.name == "X-KEEP" && p.value == "custom"));
+        assert!(summary.components[0].has_attachments);
+        assert!(summary.components[0].other_properties.iter().any(|p| p.name == "ATTACH" &&
+            p.value == "https://example.test/document" && p.parameters.get("FMTTYPE").map(String::as_str) == Some("application/pdf")));
+        assert_eq!(summary.components[0].start.as_ref().map(|x| x.value.as_str()), Some("20261103T120000Z"));
+        assert!(summary.removed_scheduling_participants);
+        assert!(summary.removed_scheduling_method);
+        assert!(summary.removed_alarms);
+        let projected = crate::dav_live::prepare_recovered_calendar(&op.original, &op.uid_map).unwrap();
+        let text = String::from_utf8(projected.clone()).unwrap();
+        assert!(text.contains("UID:new\r\n"));
+        for removed in ["METHOD:","ORGANIZER:","ATTENDEE:","VALARM"] { assert!(!text.contains(removed)); }
+        assert_eq!(summary.projected_sha256, format!("{:x}",Sha256::digest(&projected)));
+        let embedded = std::str::from_utf8(&op.original).unwrap().replace("https://example.test/document", "data:application/pdf;base64,AA==");
+        let mut embedded_op = op.clone();
+        embedded_op.original = embedded.into_bytes();
+        embedded_op.original_sha256 = format!("{:x}",Sha256::digest(&embedded_op.original));
+        assert!(prepare_calendar_restore(&embedded_op).is_err());
+        op.account_id = "other".into();
+        assert_ne!(prepare_calendar_restore(&op).unwrap().approval_sha256, summary.approval_sha256);
+        op.account_id = "a".into();
+        op.collection = "https://example.test/dav/other/".into();
+        assert_ne!(prepare_calendar_restore(&op).unwrap().approval_sha256, summary.approval_sha256);
+        op.kind = CalendarRestoreKind::Task;
+        assert!(prepare_calendar_restore(&op).is_err());
+        op.kind = CalendarRestoreKind::Event;
+        op.original.push(b'!');
+        assert!(prepare_calendar_restore(&op).is_err());
+    }
+    #[test]
+    fn task_restore_requires_mapped_parent_and_removes_scheduling() {
+        let original = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:child\r\nRELATED-TO;RELTYPE=PARENT:parent\r\nATTENDEE:mailto:b@example.test\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT5M\r\nEND:VALARM\r\nEND:VTODO\r\nEND:VCALENDAR\r\n".to_vec();
+        let mut op = ApprovedCalendarRestore { operation_id:"task-1".into(), account_id:"a".into(), origin:"https://example.test/".into(),
+            entry:"/dav/".into(), collection:"https://example.test/dav/recovered/".into(), source_generation:"a".repeat(64),
+            source_object:"b".repeat(64), source_version:"c".repeat(64), original_sha256:format!("{:x}",Sha256::digest(&original)),
+            original, uid_map:HashMap::from([("child".into(),"new-child".into())]), kind:CalendarRestoreKind::Task };
+        assert!(prepare_calendar_restore(&op).is_err());
+        op.uid_map.insert("parent".into(),"new-parent".into());
+        let summary = prepare_calendar_restore(&op).unwrap();
+        assert_eq!(summary.kind, CalendarRestoreKind::Task);
+        let projected = String::from_utf8(crate::dav_live::prepare_recovered_calendar(&op.original, &op.uid_map).unwrap()).unwrap();
+        assert!(projected.contains("RELATED-TO;RELTYPE=PARENT:new-parent\r\n"));
+        assert!(!projected.contains("ATTENDEE:"));
+        assert!(!projected.contains("VALARM"));
+    }
+    #[test]
+    fn recovery_preview_discloses_retained_timezone_rules_without_attachments() {
+        let original = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:Example/Zone\r\nBEGIN:STANDARD\r\nDTSTART:20261025T030000\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:old\r\nSUMMARY:Planning\r\nDTSTART;TZID=Example/Zone:20261103T120000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let projected = crate::dav_live::prepare_recovered_calendar(original,&HashMap::from([("old".into(),"new".into())])).unwrap();
+        let (_,_,_,_,timezones) = calendar_preview(original,&projected).unwrap();
+        assert_eq!(timezones.len(),1);
+        assert!(timezones[0].to_ascii_lowercase().contains("standard"));
+        assert!(timezones[0].to_ascii_lowercase().contains("tzoffsetto"));
+        let unsafe_zone = std::str::from_utf8(original).unwrap().replace("TZID:Example/Zone\r\n", "TZID:Example/Zone\r\nATTACH:data:application/octet-stream;base64,AA==\r\n");
+        let projected = crate::dav_live::prepare_recovered_calendar(unsafe_zone.as_bytes(),&HashMap::from([("old".into(),"new".into())])).unwrap();
+        assert!(calendar_preview(unsafe_zone.as_bytes(),&projected).is_err());
+    }
+    #[test]
+    fn recovery_batch_prepares_consistent_parent_mapping_before_dispatch() {
+        fn selection(operation: &str) -> RecoverySelection {
+            RecoverySelection { operation_id:operation.into(), account_id:"a".into(), origin:"https://example.test/".into(),
+                generation:"a".repeat(64), object:"b".repeat(64), version:"c".repeat(64), confirmation:"ok".into() }
+        }
+        fn payload(raw: &[u8]) -> RecoveredPayload {
+            RecoveredPayload { bytes:raw.to_vec(), kind:"task".into(), encoding:"raw".into(), sha256:format!("{:x}",Sha256::digest(raw)) }
+        }
+        let parent = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:parent\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let child = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:child\r\nRELATED-TO;RELTYPE=PARENT:parent\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let (a,b) = (selection("a"), selection("b"));
+        assert!(calendar_batch_from_payloads(vec![(&b,payload(child))],"/dav/","https://example.test/recovered/").is_err());
+        let result = calendar_batch_from_payloads(vec![(&b,payload(child)),(&a,payload(parent))],"/dav/","https://example.test/recovered/").unwrap();
+        assert_eq!(result[0].0.operation_id, "a");
+        assert_eq!(result[1].0.operation_id, "b");
+        let parent_uid = result[0].0.uid_map.get("parent").unwrap();
+        let projected = crate::dav_live::prepare_recovered_calendar(&result[1].0.original, &result[1].0.uid_map).unwrap();
+        assert!(String::from_utf8(projected).unwrap().contains(&format!("RELATED-TO;RELTYPE=PARENT:{parent_uid}")));
+        assert_eq!(result[0].0.uid_map, result[1].0.uid_map);
+        let items: Vec<_> = result.into_iter().map(|(item,_)| item).collect();
+        let hash = calendar_batch_approval(&items).unwrap();
+        let batch = ApprovedCalendarBatch { items, approval_sha256:hash.clone() };
+        let mut calls = Vec::new();
+        let stopped = execute_calendar_batch(&batch, &hash, |op,_| {
+            calls.push(op.operation_id.clone());
+            Ok(if op.operation_id == "a" { crate::dav_live::RecoveryImportOutcome::Confirmed { href:"parent".into() } }
+               else { crate::dav_live::RecoveryImportOutcome::Unknown })
+        }).unwrap();
+        assert_eq!(stopped,CalendarBatchOutcome::Stopped {completed:vec!["parent".into()],next_index:1,reason:"unknown"});
+        assert_eq!(calls,vec!["a","b"]);
+        let resumed = execute_calendar_batch(&batch, &hash, |op,_| {
+            calls.push(op.operation_id.clone());
+            Ok(crate::dav_live::RecoveryImportOutcome::Confirmed {href:op.operation_id.clone()})
+        }).unwrap();
+        assert_eq!(resumed, CalendarBatchOutcome::Confirmed(vec!["a".into(),"b".into()]));
+        assert_eq!(calls,vec!["a","b","a","b"]);
+        let mut altered = batch.clone();
+        altered.items.swap(0,1);
+        assert!(execute_calendar_batch(&altered,&hash,|_,_| panic!("unapproved order must not dispatch")).is_err());
+        let encoded = serde_json::to_vec(&batch).unwrap();
+        let decoded: ApprovedCalendarBatch = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(calendar_batch_approval(&decoded.items).unwrap(),hash);
+        let cyclic_parent = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:parent\r\nRELATED-TO:child\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        assert!(calendar_batch_from_payloads(vec![(&a,payload(cyclic_parent)),(&b,payload(child))],"/dav/","https://example.test/recovered/").is_err());
+        struct TestDevice;
+        impl RecoveryDeviceSigner for TestDevice {
+            fn device_id(&self) -> &str { "test-device" }
+            fn sign(&self, _: &[u8]) -> Result<String, String> { Err("not used".into()) }
+        }
+        let device = TestDevice;
+        let status = |selection: &RecoverySelection, bytes: &[u8]| BoundRecoveryStatus {state:"available".into(),kind:"task".into(),encoding:"raw".into(),
+            size:bytes.len() as u64,sha256:format!("{:x}",Sha256::digest(bytes)),selection_sha256:recovery_selection_digest(selection,device.device_id())};
+        let selections = vec![a.clone(),b.clone()];
+        let statuses = vec![status(&a,parent),status(&b,child)];
+        assert!(prepare_staged_calendar_batch(&selections,&statuses,&device,vec![parent.to_vec(),child.to_vec()],"/dav/","https://example.test/recovered/").is_ok());
+        assert!(prepare_staged_calendar_batch(&selections,&statuses,&device,vec![parent.to_vec(),b"changed".to_vec()],"/dav/","https://example.test/recovered/").is_err());
+        let mut swapped = statuses.clone();
+        swapped.swap(0,1);
+        assert!(prepare_staged_calendar_batch(&selections,&swapped,&device,vec![parent.to_vec(),child.to_vec()],"/dav/","https://example.test/recovered/").is_err());
+    }
+    #[test]
+    fn recovered_folder_requires_explicit_unshared_acl() {
+        assert!(is_unshared(&json!({"shareWith": null})));
+        assert!(is_unshared(&json!({"shareWith": {}})));
+        assert!(!is_unshared(&json!({})));
+        assert!(!is_unshared(&json!({"shareWith": {"other": {"mayReadItems": true}}})));
+    }
     struct Fake { folder: Cell<bool>, folder_count: Cell<u32>, upload_count: Cell<u32>, import_count: Cell<u32>,
                   lost_import: bool, readable: Cell<bool> }
     impl Transport for Fake {

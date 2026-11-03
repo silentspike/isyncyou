@@ -8,9 +8,13 @@
 //! minted here, used only by trusted native request paths, and required on every
 //! `/api/v1/*` route. Tokens are NEVER logged or exposed to WebView JavaScript.
 
-use isyncyou_core::{AccountConfig, Config, OneDriveMode};
+use isyncyou_core::{Config, OneDriveMode};
+#[cfg(test)]
+use isyncyou_core::AccountConfig;
 mod provider_credentials;
+mod reminder_mobile;
 mod provider_auth_mobile;
+mod recovery_signer;
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -266,23 +270,7 @@ fn cleanup_legacy_plaintext_mobile_state(base: &Path) -> Result<(), String> {
 }
 
 fn prepare_mobile_config_for_files_dir(cfg: &mut Config, base: &Path) -> Result<(), String> {
-    let (archive_root, sync_root, cache_root) = mobile_roots(base);
-    if let Some(acc) = cfg.accounts.iter_mut().find(|a| a.id == ACCOUNT) {
-        acc.sync_root = sync_root;
-        acc.archive_root = archive_root;
-        acc.cache_root = cache_root;
-        acc.mount_point = None;
-    } else {
-        cfg.accounts.push(AccountConfig {
-            id: ACCOUNT.into(),
-            username: ACCOUNT.into(),
-            sync_root,
-            archive_root,
-            cache_root,
-            mount_point: None,
-        });
-    }
-    cfg.validate().map_err(|errs| errs.join("; "))
+    cfg.prepare_mobile_for_files_dir(base)
 }
 
 #[cfg(feature = "agent-session-kdf-bench")]
@@ -1082,6 +1070,24 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeWaitProv
     let Some(account) = jni_get_string(&mut env, &account) else { return 0 };
     let generation = wake_provider_refresh();
     i32::from(wait_for_completed_refresh(generation, &account, Duration::from_secs(120)))
+}
+
+/// One pass can cover all accounts; callers must check each requested outcome.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeWaitProviderRefreshResults<'a>(
+    mut env: jni::EnvUnowned<'a>, _class: jni::objects::JClass<'a>,
+) -> jni::sys::jstring {
+    let generation = wake_provider_refresh();
+    let (flag, wake) = provider_refresh_wakeup();
+    let guard = flag.lock().unwrap_or_else(|e| e.into_inner());
+    let (guard, _) = wake.wait_timeout_while(guard, Duration::from_secs(120), |state| state.completed < generation)
+        .unwrap_or_else(|e| e.into_inner());
+    let value = if guard.completed >= generation {
+        serde_json::json!({"ok":true,"accounts":guard.outcomes})
+    } else {
+        serde_json::json!({"ok":false})
+    };
+    jni_new_string(&mut env, value.to_string())
 }
 
 // ----------------------------------------------------------------- JNI surface

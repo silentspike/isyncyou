@@ -105,6 +105,27 @@ pub fn client(cfg: &Config, account: &str) -> Result<SelfHostedClient, String> {
     })
 }
 
+/// Open one account-bound JMAP event stream. Each connection calls `on_change`
+/// before reading hints so callers reconcile persisted cursors after reconnect.
+pub fn watch_mail_events(cfg: &Config, account: &str, stop: &std::sync::atomic::AtomicBool, mut on_change: impl FnMut(isyncyou_connectors::jmap::EventDomains) -> Result<(), ()>) -> Result<(), String> {
+    let _lease = crate::provider_auth::try_event_stream_lease(cfg,account)?;
+    let origin = match cfg.provider_accounts.get(account) { Some(ProviderConfig::SelfHosted {origin,..}) => origin, None => return Err("Not a self-hosted account".into()) };
+    let token = crate::provider_auth::self_hosted_access_token(cfg, account)?;
+    let native = JmapClient::discover(origin, token.clone()).map_err(|_| "JMAP discovery failed")?;
+    let provider = SelfHostedClient {client:native,account:account.into(),origin:origin.clone()};
+    scope(cfg, account, &provider)?;
+    let mut last_auth_check: Option<std::time::Instant> = None;
+    provider.client.watch_mail_events(stop, |domains| {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) { return Err(()); }
+        if last_auth_check.is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(1)) {
+            let current = crate::provider_auth::self_hosted_access_token(cfg,account).map_err(|_| ())?;
+            if current != token { return Err(()); }
+            last_auth_check = Some(std::time::Instant::now());
+        }
+        on_change(domains)
+    }).map_err(|_| "JMAP event stream unavailable".into())
+}
+
 pub fn client_with_store(
     cfg: &Config,
     account: &str,
@@ -162,6 +183,224 @@ pub fn read_body(
         .map_err(|_| "JMAP body unavailable".into())
 }
 
+pub struct DownloadedAttachment {
+    pub filename: String,
+    pub content_type: String,
+    pub blob_id: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachmentInfo {
+    pub blob_id: String,
+    pub filename: String,
+    pub content_type: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelatedDraftKind { Reply, Forward }
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RelatedDraftPreview {
+    pub account: String,
+    pub origin: String,
+    pub remote_account: String,
+    pub source_email_id: String,
+    pub source_blob_id: String,
+    pub kind: RelatedDraftKind,
+    pub source: Value,
+    pub attachments: Vec<AttachmentInfo>,
+}
+
+/// Bind a reply/forward preview to an immutable native email and selected MIME
+/// blobs. The caller must show the source and selected attachments to the user.
+pub fn prepare_related_draft(cfg: &Config, account: &str, provider: &SelfHostedClient, source_email_id: &str, kind: RelatedDraftKind, selected_blob_ids: &[String]) -> Result<RelatedDraftPreview, String> {
+    let scope = scope(cfg, account, provider)?;
+    if source_email_id.is_empty() || selected_blob_ids.len() > 32 { return Err("Invalid source email or attachments".into()); }
+    let response = provider.client.get_email_bodies(&[source_email_id.into()], 1024 * 1024).map_err(|_| "Source email unavailable")?;
+    if !list(&response, "notFound")?.is_empty() { return Err("Source email unavailable".into()); }
+    let rows = response["list"].as_array().ok_or("Invalid source email")?;
+    if rows.len() != 1 || rows[0]["id"].as_str() != Some(source_email_id) { return Err("Invalid source email".into()); }
+    let source = &rows[0];
+    validate_complete_body(source).map_err(|_| "Source email body incomplete")?;
+    let blob_id = field(source, "blobId")?;
+    if kind == RelatedDraftKind::Reply && source["messageId"].as_array().is_none_or(|ids| ids.len() != 1 || ids[0].as_str().is_none_or(str::is_empty)) { return Err("Reply requires one source Message-ID".into()); }
+    let available = list_attachments(cfg, account, provider, source_email_id)?;
+    let mut unique = std::collections::HashSet::new();
+    let mut attachments = Vec::new();
+    for id in selected_blob_ids {
+        if !unique.insert(id) { return Err("Duplicate attachment".into()); }
+        let mut found = available.iter().filter(|item| &item.blob_id == id);
+        let part = found.next().ok_or("Source attachment unavailable")?;
+        if found.next().is_some() { return Err("Source attachment ambiguous".into()); }
+        attachments.push(part.clone());
+    }
+    Ok(RelatedDraftPreview { account:account.into(), origin:scope.origin, remote_account:scope.collection,
+        source_email_id:source_email_id.into(), source_blob_id:blob_id.into(), kind, source:source.clone(), attachments })
+}
+
+/// Create a reply/forward only after revalidating the exact approved source.
+pub fn create_related_draft(cfg: &Config, account: &str, store: &Store, provider: &SelfHostedClient, operation_id: &str, approved: &RelatedDraftPreview, email: &Value) -> Result<SendOutcome, String> {
+    let selected: Vec<String> = approved.attachments.iter().map(|a| a.blob_id.clone()).collect();
+    let current = prepare_related_draft(cfg, account, provider, &approved.source_email_id, approved.kind.clone(), &selected)?;
+    if &current != approved { return Err("Source email changed; new approval required".into()); }
+    if approved.kind == RelatedDraftKind::Reply {
+        if email.get("inReplyTo") != approved.source.get("messageId") { return Err("Reply references do not match source".into()); }
+        if let Some(references) = email.get("references") {
+            let mut expected = approved.source["references"].as_array().cloned().unwrap_or_default();
+            expected.extend(approved.source["messageId"].as_array().ok_or("Source Message-ID unavailable")?.iter().cloned());
+            if references != &Value::Array(expected) { return Err("Reply references do not match source".into()); }
+        }
+    } else if email.get("inReplyTo").is_some() || email.get("references").is_some() { return Err("Forward must not use reply references".into()); }
+    let requested = email.get("attachments").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+    if requested.len() != approved.attachments.len() { return Err("Attachments do not match approved source".into()); }
+    for (item, approved_part) in requested.iter().zip(&approved.attachments) {
+        if item["blobId"].as_str() != Some(approved_part.blob_id.as_str()) || item["name"].as_str() != Some(approved_part.filename.as_str()) || item["type"].as_str() != Some(approved_part.content_type.as_str()) { return Err("Attachments do not match approved source".into()); }
+    }
+    create_draft(cfg, account, store, provider, operation_id, email)
+}
+
+/// Upload one bounded attachment. A transport failure has an unknown outcome;
+/// callers must not assume a blob identity was created or attach a guessed one.
+fn upload_draft_attachment(cfg: &Config, account: &str, provider: &SelfHostedClient, bytes: Vec<u8>, content_type: &str) -> Result<String, String> {
+    let scope = scope(cfg, account, provider)?;
+    if bytes.len() > 64 * 1024 * 1024 || content_type.is_empty() || content_type.len() > 255 || !content_type.is_ascii() || content_type.chars().any(|c| c.is_control() || c.is_whitespace()) { return Err("Invalid attachment".into()); }
+    let size = bytes.len() as u64;
+    let response = provider.client.upload(bytes, content_type).map_err(|_| "Attachment upload outcome unknown")?;
+    if response["accountId"].as_str() != Some(scope.collection.as_str()) || response["size"].as_u64() != Some(size) { return Err("Invalid attachment upload response".into()); }
+    let blob = field(&response, "blobId")?;
+    if blob.len() > 1024 || blob.chars().any(char::is_control) { return Err("Invalid attachment identity".into()); }
+    Ok(blob.into())
+}
+
+/// Persist the exact upload intent before dispatch. A lost response is never
+/// replayed automatically because JMAP blob upload has no client operation ID.
+pub fn upload_draft_attachment_once(cfg: &Config, account: &str, store: &Store, provider: &SelfHostedClient, operation_id: &str, filename: &str, content_type: &str, bytes: Vec<u8>) -> Result<SendOutcome, String> {
+    let scope = scope(cfg, account, provider)?;
+    if operation_id.is_empty() || operation_id.len() > 1024 || filename.is_empty() || filename.len() > 255 || filename.chars().any(char::is_control)
+        || bytes.len() > 64 * 1024 * 1024 || content_type.is_empty() || content_type.len() > 255
+        || !content_type.is_ascii() || content_type.chars().any(|c| c.is_control() || c.is_whitespace()) { return Err("Invalid attachment upload".into()); }
+    let intent = serde_json::json!({"filename":filename,"content_type":content_type,"size":bytes.len(),"sha256":format!("{:x}",Sha256::digest(&bytes))}).to_string();
+    let digest = format!("{:x}", Sha256::digest(intent.as_bytes()));
+    if let Some((previous, state, result)) = store.provider_mutation(&scope, operation_id).map_err(|e| e.to_string())? {
+        if previous != digest { return Err("Upload differs from recorded intent".into()); }
+        return Ok(match state.as_str() { "confirmed" => SendOutcome::Confirmed(result.ok_or("Missing native blob identity")?), "rejected" => SendOutcome::Rejected, _ => SendOutcome::Unknown });
+    }
+    if !store.claim_provider_mutation(&scope, operation_id, "mail_attachment_upload", &intent, &digest).map_err(|e| e.to_string())? { return Ok(SendOutcome::Unknown); }
+    match upload_draft_attachment(cfg, account, provider, bytes, content_type) {
+        Ok(blob) if store.finish_provider_mutation(&scope, operation_id, Some(&blob)).map_err(|e| e.to_string())? => Ok(SendOutcome::Confirmed(blob)),
+        _ => Ok(SendOutcome::Unknown),
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AttachmentUploadStatus {
+    pub remote_account: String,
+    pub filename: String,
+    pub content_type: String,
+    pub size: u64,
+    pub sha256: String,
+    pub state: String,
+    pub blob_id: Option<String>,
+}
+
+/// Read the scoped durable upload result without contacting the provider.
+pub fn draft_attachment_upload_status(cfg: &Config, account: &str, store: &Store, operation_id: &str) -> Result<Option<AttachmentUploadStatus>, String> {
+    if operation_id.is_empty() || operation_id.len() > 1024 { return Err("Invalid operation identity".into()); }
+    let origin = match cfg.provider_accounts.get(account) { Some(ProviderConfig::SelfHosted { origin, .. }) => origin, None => return Err("Not a self-hosted account".into()) };
+    let Some((scope, intent, state, result)) = store.provider_mail_upload_intent(account, origin, operation_id).map_err(|e| e.to_string())? else { return Ok(None); };
+    let value: Value = serde_json::from_str(&intent).map_err(|_| "Invalid recorded upload")?;
+    let filename = field(&value, "filename")?.to_owned();
+    let content_type = field(&value, "content_type")?.to_owned();
+    let sha256 = field(&value, "sha256")?.to_owned();
+    let size = value["size"].as_u64().ok_or("Invalid recorded upload")?;
+    let blob_id = match state.as_str() {
+        "confirmed" => Some(result.filter(|id| !id.is_empty()).ok_or("Missing native blob identity")?),
+        "unknown" | "rejected" | "conflict" => None,
+        _ => return Err("Invalid upload state".into()),
+    };
+    Ok(Some(AttachmentUploadStatus { remote_account:scope.collection, filename, content_type, size, sha256, state, blob_id }))
+}
+
+/// Resolve only durable, confirmed uploads in the same provider account for a
+/// draft approval. Unknown and duplicate operations never produce attachments.
+pub fn resolve_uploaded_attachments(cfg: &Config, account: &str, store: &Store, operation_ids: &[String]) -> Result<Vec<AttachmentUploadStatus>, String> {
+    if operation_ids.len() > 32 { return Err("Too many attachments".into()); }
+    let mut seen = std::collections::HashSet::new();
+    let mut blobs = std::collections::HashSet::new();
+    let mut output = Vec::with_capacity(operation_ids.len());
+    let mut remote_account: Option<String> = None;
+    for operation in operation_ids {
+        if !seen.insert(operation) { return Err("Duplicate attachment operation".into()); }
+        let status = draft_attachment_upload_status(cfg, account, store, operation)?.ok_or("Attachment upload unavailable")?;
+        if remote_account.as_ref().is_some_and(|id| id != &status.remote_account) { return Err("Attachments belong to different native accounts".into()); }
+        remote_account.get_or_insert_with(|| status.remote_account.clone());
+        let blob = status.blob_id.as_ref().filter(|_| status.state == "confirmed").ok_or("Attachment upload not confirmed")?;
+        if !blobs.insert(blob.clone()) { return Err("Duplicate attachment blob".into()); }
+        output.push(status);
+    }
+    Ok(output)
+}
+
+/// Fetch only a blob referenced by the live MIME tree of this exact email.
+/// The transport limits the response to 64 MiB; metadata never supplies a URL.
+pub fn list_attachments(cfg:&Config, account:&str, provider:&SelfHostedClient, email_id:&str) -> Result<Vec<AttachmentInfo>,String> {
+    scope(cfg,account,provider)?;
+    if email_id.is_empty() { return Err("Invalid email identity".into()); }
+    let result=provider.client.get("Email",Some(&[email_id.to_owned()]),Some(&["id".into(),"bodyStructure".into(),"textBody".into(),"htmlBody".into()])).map_err(|_| "Email unavailable")?;
+    if !list(&result,"notFound")?.is_empty() { return Err("Email unavailable".into()); }
+    let rows=result["list"].as_array().ok_or("Invalid email")?;
+    if rows.len()!=1 || rows[0]["id"].as_str()!=Some(email_id) { return Err("Invalid email identity".into()); }
+    mime_attachments(&rows[0])
+}
+
+fn mime_attachments(email:&Value) -> Result<Vec<AttachmentInfo>,String> {
+    let mut body_ids=std::collections::HashSet::new();
+    for key in ["textBody","htmlBody"] {
+        for part in email[key].as_array().ok_or("MIME body parts unavailable")? {
+            if let Some(id) = part["partId"].as_str().filter(|id| !id.is_empty()) {
+                body_ids.insert(id.to_owned());
+            } else if part["type"].as_str().is_none_or(|kind| kind.starts_with("text/")) {
+                return Err("MIME body identity unavailable".into());
+            }
+        }
+    }
+    let root=email.get("bodyStructure").filter(|v| v.is_object()).ok_or("MIME structure unavailable")?;
+    let mut pending=vec![(root,0usize)]; let mut found=Vec::new(); let mut visited=0usize;
+    while let Some((part,depth))=pending.pop() {
+        visited+=1;
+        if depth>32 || visited>10000 { return Err("MIME structure exceeds limit".into()); }
+        if let Some(blob_id)=part.get("blobId").filter(|v| !v.is_null() && !part["partId"].as_str().is_some_and(|id| body_ids.contains(id))) {
+            let blob_id=blob_id.as_str().filter(|v| !v.is_empty() && v.len()<=1024 && !v.chars().any(char::is_control)).ok_or("Invalid attachment identity")?;
+            let size=part["size"].as_u64().ok_or("Attachment size unavailable")?;
+            let original=part["name"].as_str().unwrap_or("attachment");
+            let filename:String=original.chars().take(200).map(|c| if c.is_control() || matches!(c,'/'|'\\'|'"') { '_' } else { c }).collect();
+            let filename=if filename.is_empty() || filename=="." || filename==".." { "attachment".into() } else { filename };
+            let content_type=part["type"].as_str().filter(|s| s.len()<=255 && s.is_ascii() && !s.chars().any(|c| c.is_control() || c.is_whitespace())).unwrap_or("application/octet-stream").to_owned();
+            found.push(AttachmentInfo {blob_id:blob_id.into(),filename,content_type,size});
+        }
+        if let Some(children)=part.get("subParts").filter(|v| !v.is_null()) {
+            for child in children.as_array().ok_or("Invalid MIME structure")? {
+                if !child.is_object() { return Err("Invalid MIME structure".into()); }
+                pending.push((child,depth+1));
+            }
+        }
+    }
+    Ok(found)
+}
+
+pub fn download_attachment(cfg:&Config, account:&str, provider:&SelfHostedClient, email_id:&str, blob_id:&str) -> Result<DownloadedAttachment,String> {
+    if blob_id.is_empty() || blob_id.len()>1024 { return Err("Invalid attachment identity".into()); }
+    let matches:Vec<_>=list_attachments(cfg,account,provider,email_id)?.into_iter().filter(|part| part.blob_id==blob_id).collect();
+    if matches.len()!=1 { return Err("Attachment unavailable or ambiguous".into()); }
+    let part=matches.into_iter().next().ok_or("Attachment unavailable")?;
+    if part.size>64*1024*1024 { return Err("Attachment exceeds download limit".into()); }
+    let bytes=provider.client.download(blob_id,&part.filename,&part.content_type).map_err(|_| "Attachment download failed")?;
+    Ok(DownloadedAttachment {filename:part.filename,content_type:part.content_type,blob_id:part.blob_id,bytes})
+}
+
 /// Fetch native sending identities after account/origin validation.
 pub fn sending_identities(
     cfg: &Config,
@@ -179,6 +418,35 @@ pub fn sending_identities(
         .ok_or_else(|| "Invalid sending identities".into())
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SendingIdentity {
+    pub id: String,
+    pub name: String,
+    pub email: String,
+}
+
+/// Return only the fields needed to explicitly choose a native identity.
+pub fn selectable_sending_identities(cfg:&Config, account:&str, provider:&SelfHostedClient) -> Result<Vec<SendingIdentity>,String> {
+    let values = sending_identities(cfg,account,provider)?;
+    if values.len()>1000 { return Err("Too many sending identities".into()); }
+    let mut identities=Vec::with_capacity(values.len());
+    let mut ids=std::collections::HashSet::new();
+    for value in values {
+        let id=value["id"].as_str().filter(|v| !v.is_empty() && v.len()<=1024 && !v.chars().any(char::is_control)).ok_or("Invalid sending identity")?;
+        let name=value["name"].as_str().filter(|v| v.len()<=1024 && !v.chars().any(char::is_control)).ok_or("Invalid sending identity")?;
+        let email=value["email"].as_str().filter(|v| !v.is_empty() && v.len()<=320 && !v.chars().any(char::is_control)).ok_or("Invalid sending identity")?;
+        if !ids.insert(id.to_owned()) { return Err("Duplicate sending identity".into()); }
+        identities.push(SendingIdentity {id:id.into(),name:name.into(),email:email.into()});
+    }
+    Ok(identities)
+}
+
+/// Re-resolve an explicitly selected identity at the time of use.
+pub fn selected_sending_identity(cfg:&Config, account:&str, provider:&SelfHostedClient, identity_id:&str) -> Result<SendingIdentity,String> {
+    let mut matches=selectable_sending_identities(cfg,account,provider)?.into_iter().filter(|identity| identity.id==identity_id);
+    matches.next().ok_or_else(|| "Sending identity unavailable".into())
+}
+
 /// Read the native seen flag without using a stale cache result.
 pub fn read_state(cfg: &Config, account: &str, provider: &SelfHostedClient, email_id: &str) -> Result<bool, String> {
     scope(cfg,account,provider)?;
@@ -190,6 +458,132 @@ pub fn read_state(cfg: &Config, account: &str, provider: &SelfHostedClient, emai
     if rows.len() != 1 || rows[0]["id"].as_str() != Some(email_id) { return Err("Invalid JMAP email identity".into()); }
     let keywords = rows[0]["keywords"].as_object().ok_or("Invalid JMAP keywords")?;
     match keywords.get("$seen") { None => Ok(false), Some(Value::Bool(true)) => Ok(true), _ => Err("Invalid JMAP seen flag".into()) }
+}
+
+/// Actions with an explicit, reviewable native mailbox effect. Trash is a move,
+/// never permanent destruction.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MailAction {
+    SetFlag { flagged: bool },
+    SetRead { is_read: bool },
+    Move { source_mailbox_id: String, destination_mailbox_id: String },
+    Trash,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MailActionPreview {
+    pub account: String,
+    pub origin: String,
+    pub remote_account: String,
+    pub email_id: String,
+    pub blob_id: String,
+    pub email_state: String,
+    pub subject: Value,
+    pub from: Value,
+    pub mailbox_ids: Value,
+    pub mailboxes: Value,
+    pub keywords: Value,
+    pub action: MailAction,
+    pub patch: Value,
+}
+
+fn pointer_token(value: &str) -> String { value.replace('~', "~0").replace('/', "~1") }
+
+/// Resolve the native object and current mailbox rights for a consent preview.
+pub fn preview_mail_action(cfg: &Config, account: &str, provider: &SelfHostedClient, email_id: &str, action: MailAction) -> Result<MailActionPreview, String> {
+    let scope = scope(cfg, account, provider)?;
+    if email_id.is_empty() || email_id.len() > 1024 { return Err("Invalid email identity".into()); }
+    let response = provider.client.get("Email", Some(&[email_id.into()]), None).map_err(|_| "Email unavailable")?;
+    if !list(&response, "notFound")?.is_empty() { return Err("Email unavailable".into()); }
+    let rows = response["list"].as_array().ok_or("Invalid email")?;
+    if rows.len() != 1 || rows[0]["id"].as_str() != Some(email_id) { return Err("Invalid email identity".into()); }
+    let email = &rows[0];
+    let memberships = email["mailboxIds"].as_object().ok_or("Email memberships unavailable")?;
+    if memberships.is_empty() || memberships.len() > 1000 || memberships.iter().any(|(id, present)| id.is_empty() || id.len() > 1024 || id.chars().any(char::is_control) || present.as_bool() != Some(true)) { return Err("Invalid email memberships".into()); }
+    let keywords = email["keywords"].as_object().ok_or("Email keywords unavailable")?;
+    if keywords.values().any(|v| v.as_bool() != Some(true)) { return Err("Invalid email keywords".into()); }
+    let boxes = provider.client.get("Mailbox", None, None).map_err(|_| "Mailboxes unavailable")?;
+    let boxes = boxes["list"].as_array().ok_or("Invalid mailboxes")?;
+    if boxes.len() > 10000 { return Err("Too many mailboxes".into()); }
+    let find = |id: &str| -> Result<&Value, String> {
+        let mut matches = boxes.iter().filter(|b| b["id"].as_str() == Some(id));
+        let value = matches.next().ok_or("Mailbox unavailable")?;
+        if matches.next().is_some() { return Err("Ambiguous mailbox".into()); }
+        Ok(value)
+    };
+    let mut patch = serde_json::Map::new();
+    match &action {
+        MailAction::SetRead { is_read } => {
+            for id in memberships.keys() {
+                if find(id)?.pointer("/myRights/maySetSeen").and_then(Value::as_bool) != Some(true) { return Err("Read state is not writable".into()); }
+            }
+            if keywords.contains_key("$seen") == *is_read { return Err("Read state already has requested value".into()); }
+            patch.insert("keywords/$seen".into(), if *is_read { Value::Bool(true) } else { Value::Null });
+        }
+        MailAction::SetFlag { flagged } => {
+            for id in memberships.keys() {
+                if find(id)?.pointer("/myRights/maySetKeywords").and_then(Value::as_bool) != Some(true) { return Err("Flag is not writable".into()); }
+            }
+            if keywords.contains_key("$flagged") == *flagged { return Err("Flag already has requested value".into()); }
+            patch.insert("keywords/$flagged".into(), if *flagged { Value::Bool(true) } else { Value::Null });
+        }
+        MailAction::Move { source_mailbox_id, destination_mailbox_id } => {
+            if destination_mailbox_id.is_empty() || destination_mailbox_id.len() > 1024 || destination_mailbox_id.chars().any(char::is_control) || source_mailbox_id == destination_mailbox_id || !memberships.contains_key(source_mailbox_id) || memberships.contains_key(destination_mailbox_id) { return Err("Invalid mailbox move".into()); }
+            if find(source_mailbox_id)?.pointer("/myRights/mayRemoveItems").and_then(Value::as_bool) != Some(true) || find(destination_mailbox_id)?.pointer("/myRights/mayAddItems").and_then(Value::as_bool) != Some(true) { return Err("Mailbox move is not permitted".into()); }
+            patch.insert(format!("mailboxIds/{}", pointer_token(source_mailbox_id)), Value::Null);
+            patch.insert(format!("mailboxIds/{}", pointer_token(destination_mailbox_id)), Value::Bool(true));
+        }
+        MailAction::Trash => {
+            if memberships.len() >= 128 { return Err("Too many mailbox memberships for one operation".into()); }
+            let trash: Vec<_> = boxes.iter().filter(|b| b["role"].as_str() == Some("trash")).collect();
+            if trash.len() != 1 { return Err("Trash mailbox unavailable or ambiguous".into()); }
+            let trash_id = field(trash[0], "id")?;
+            if trash_id.len() > 1024 || trash_id.chars().any(char::is_control) || memberships.contains_key(trash_id) || trash[0].pointer("/myRights/mayAddItems").and_then(Value::as_bool) != Some(true) { return Err("Trash mailbox is not writable or email is already in trash".into()); }
+            for id in memberships.keys() {
+                if find(id)?.pointer("/myRights/mayRemoveItems").and_then(Value::as_bool) != Some(true) { return Err("Email cannot be removed from a mailbox".into()); }
+                patch.insert(format!("mailboxIds/{}", pointer_token(id)), Value::Null);
+            }
+            patch.insert(format!("mailboxIds/{}", pointer_token(trash_id)), Value::Bool(true));
+        }
+    }
+    let mut mailbox_descriptions: Vec<Value> = boxes.iter().filter(|b| {
+        let id = b["id"].as_str().unwrap_or("");
+        memberships.contains_key(id) || match &action {
+            MailAction::Move { destination_mailbox_id, .. } => id == destination_mailbox_id.as_str(),
+            MailAction::Trash => b["role"].as_str() == Some("trash"),
+            _ => false,
+        }
+    }).map(|b| serde_json::json!({"id": b["id"], "name": b["name"], "role": b["role"]})).collect();
+    mailbox_descriptions.sort_by(|a,b| a["id"].as_str().cmp(&b["id"].as_str()));
+    Ok(MailActionPreview { account:account.into(), origin:scope.origin, remote_account:scope.collection,
+        email_id:email_id.into(), blob_id:field(email,"blobId")?.into(), email_state:field(&response,"state")?.into(),
+        subject:email["subject"].clone(), from:email["from"].clone(), mailbox_ids:email["mailboxIds"].clone(),
+        mailboxes:Value::Array(mailbox_descriptions), keywords:email["keywords"].clone(), action, patch:Value::Object(patch) })
+}
+
+/// Dispatch an approved native action at most once. A lost response stays
+/// unknown; observing the desired state alone cannot prove which actor set it.
+pub fn apply_mail_action(cfg: &Config, account: &str, store: &Store, provider: &SelfHostedClient, operation_id: &str, approved: &MailActionPreview) -> Result<SendOutcome, String> {
+    if operation_id.is_empty() || operation_id.len() > 1024 { return Err("Invalid operation identity".into()); }
+    let scope = scope(cfg, account, provider)?;
+    let intent = serde_json::to_string(approved).map_err(|_| "Invalid mail action")?;
+    let digest = format!("{:x}", Sha256::digest(intent.as_bytes()));
+    if let Some((previous, state, result)) = store.provider_mutation(&scope, operation_id).map_err(|e| e.to_string())? {
+        if previous != digest { return Err("Mail action differs from recorded intent".into()); }
+        return Ok(match state.as_str() { "confirmed" => SendOutcome::Confirmed(result.ok_or("Missing native email identity")?), "rejected" => SendOutcome::Rejected, _ => SendOutcome::Unknown });
+    }
+    let current = preview_mail_action(cfg, account, provider, &approved.email_id, approved.action.clone())?;
+    if &current != approved { return Err("Mail action changed; new approval required".into()); }
+    if !store.claim_provider_target_mutation(&scope, operation_id, "mail_action", &approved.email_id, &intent, &digest).map_err(|e| e.to_string())? { return Ok(SendOutcome::Unknown); }
+    match provider.client.update_email(&approved.email_id, &approved.email_state, &approved.patch) {
+        Ok(EmailUpdateResult::Applied) if store.finish_provider_mutation(&scope, operation_id, Some(&approved.email_id)).map_err(|e| e.to_string())? => Ok(SendOutcome::Confirmed(approved.email_id.clone())),
+        Ok(EmailUpdateResult::Rejected) if store.finish_provider_mutation(&scope, operation_id, None).map_err(|e| e.to_string())? => Ok(SendOutcome::Rejected),
+        Err(JmapError::Method(kind)) if kind == "stateMismatch" => {
+            if store.finish_provider_mutation(&scope, operation_id, None).map_err(|e| e.to_string())? { Ok(SendOutcome::Rejected) } else { Ok(SendOutcome::Unknown) }
+        }
+        _ => Ok(SendOutcome::Unknown),
+    }
 }
 
 /// Initial enumeration is reconciled only when all pages share one query state.
@@ -351,15 +745,16 @@ fn sync_mailboxes_inner(
                 .map(ProviderChange::Destroyed),
         );
         count += changes.len();
-        store
-            .apply_provider_page(&scope, &changes, &next)
-            .map_err(|e| e.to_string())?;
-        cursor = next;
-        match page["hasMoreChanges"].as_bool() {
-            Some(false) => break,
-            Some(true) => {}
-            None => return Err("Invalid JMAP mailbox pagination".into()),
+        let more = page["hasMoreChanges"].as_bool().ok_or("Invalid JMAP mailbox pagination")?;
+        if more && next == cursor {
+            return Err("JMAP mailbox pagination did not advance".into());
         }
+        if !store.apply_provider_page_if_cursor(&scope, &cursor, &changes, &next)
+            .map_err(|e| e.to_string())? {
+            return Err("JMAP mailbox checkpoint changed; retry required".into());
+        }
+        cursor = next;
+        if !more { break; }
     }
     Ok(count)
 }
@@ -500,15 +895,16 @@ fn sync_inner(
                 .map(ProviderChange::Destroyed),
         );
         count += changes.len();
-        store
-            .apply_provider_page(&scope, &changes, &next)
-            .map_err(|e| e.to_string())?;
-        cursor = next;
-        match page["hasMoreChanges"].as_bool() {
-            Some(false) => break,
-            Some(true) => {}
-            None => return Err("Invalid JMAP pagination".into()),
+        let more = page["hasMoreChanges"].as_bool().ok_or("Invalid JMAP pagination")?;
+        if more && next == cursor {
+            return Err("JMAP pagination did not advance".into());
         }
+        if !store.apply_provider_page_if_cursor(&scope, &cursor, &changes, &next)
+            .map_err(|e| e.to_string())? {
+            return Err("JMAP checkpoint changed; retry required".into());
+        }
+        cursor = next;
+        if !more { break; }
     }
     Ok(count)
 }
@@ -524,6 +920,74 @@ pub struct ApprovedSubmission {
     pub recipients: Vec<String>,
     pub draft_mailbox_id: String,
     pub sent_mailbox_id: String,
+}
+
+/// Live, account-bound material for an explicit send confirmation. The host
+/// must bind every field of the resulting submission to its approval ledger.
+#[derive(serde::Serialize)]
+pub struct PreparedSubmission {
+    pub account: String,
+    pub origin: String,
+    pub remote_account: String,
+    pub email_id: String,
+    pub blob_id: String,
+    pub identity_id: String,
+    pub mail_from: String,
+    pub recipients: Vec<String>,
+    pub draft_mailbox_id: String,
+    pub sent_mailbox_id: String,
+    pub email: Value,
+}
+
+/// Read the current native draft and associated send identities for preview.
+/// A truncated body is never presented as a complete approval snapshot.
+pub fn prepare_submission(cfg: &Config, account: &str, provider: &SelfHostedClient, email_id: &str, identity_id: &str) -> Result<PreparedSubmission, String> {
+    let scope = scope(cfg, account, provider)?;
+    if email_id.is_empty() || identity_id.is_empty() { return Err("Missing draft or identity".into()); }
+    let ids = vec![email_id.to_owned()];
+    let result = provider.client.get_email_bodies(&ids, 16 * 1024 * 1024).map_err(|_| "Draft unavailable")?;
+    if !list(&result, "notFound")?.is_empty() { return Err("Draft unavailable".into()); }
+    let rows = result["list"].as_array().ok_or("Invalid draft")?;
+    if rows.len()!=1 || rows[0]["id"].as_str()!=Some(email_id) { return Err("Invalid draft identity".into()); }
+    let email = &rows[0];
+    let blob_id = email["blobId"].as_str().filter(|v| !v.is_empty()).ok_or("Missing draft blob")?;
+    validate_complete_body(email)?;
+    if serde_json::to_vec(email).map_err(|_| "Invalid draft")?.len()>16*1024*1024 { return Err("Draft preview exceeds limit".into()); }
+    let recipients = native_recipients(email)?;
+    if recipients.is_empty() { return Err("Draft recipients required".into()); }
+    let identities = provider.client.get("Identity",Some(&[identity_id.to_owned()]),None).map_err(|_| "Sending identity unavailable")?;
+    let identities = identities["list"].as_array().ok_or("Sending identity unavailable")?;
+    if identities.len()!=1 || identities[0]["id"].as_str()!=Some(identity_id) { return Err("Sending identity unavailable".into()); }
+    let mail_from=identities[0]["email"].as_str().filter(|s| !s.is_empty() && s.len()<=320 && !s.chars().any(char::is_control)).ok_or("Invalid sending identity")?;
+    let boxes=provider.client.get("Mailbox",None,None).map_err(|_| "Mailboxes unavailable")?;
+    let boxes=boxes["list"].as_array().ok_or("Mailboxes unavailable")?;
+    let drafts:Vec<_>=boxes.iter().filter(|b| b["role"].as_str()==Some("drafts") && email["mailboxIds"].get(b["id"].as_str().unwrap_or("")).and_then(Value::as_bool)==Some(true) && b.pointer("/myRights/mayRemoveItems").and_then(Value::as_bool)==Some(true)).collect();
+    let sent:Vec<_>=boxes.iter().filter(|b| b["role"].as_str()==Some("sent") && b.pointer("/myRights/mayAddItems").and_then(Value::as_bool)==Some(true)).collect();
+    if drafts.len()!=1 || sent.len()!=1 { return Err("Drafts or Sent mailbox is unavailable or ambiguous".into()); }
+    let draft_mailbox_id=field(drafts[0],"id")?.to_owned();
+    let sent_mailbox_id=field(sent[0],"id")?.to_owned();
+    if draft_mailbox_id==sent_mailbox_id { return Err("Invalid submission mailboxes".into()); }
+    Ok(PreparedSubmission { account:account.into(),origin:scope.origin,remote_account:scope.collection,email_id:email_id.into(),blob_id:blob_id.into(),identity_id:identity_id.into(),mail_from:mail_from.into(),recipients,draft_mailbox_id,sent_mailbox_id,email:email.clone() })
+}
+
+fn validate_complete_body(email: &Value) -> Result<(), String> {
+    let values = email["bodyValues"].as_object().ok_or("Draft body unavailable")?;
+    if values.values().any(|v| !complete_body_value(v)) { return Err("Draft body is incomplete".into()); }
+    for key in ["textBody", "htmlBody"] {
+        let parts = email[key].as_array().ok_or("Draft body structure unavailable")?;
+        for part in parts {
+            let media_type = part["type"].as_str().ok_or("Draft body type unavailable")?;
+            if !media_type.starts_with("text/") { continue; }
+            let id = part["partId"].as_str().filter(|s| !s.is_empty()).ok_or("Draft body part unavailable")?;
+            if !values.contains_key(id) { return Err("Draft body is incomplete".into()); }
+        }
+    }
+    Ok(())
+}
+
+fn complete_body_value(value: &Value) -> bool {
+    let clear = |name: &str| matches!(value.get(name), None | Some(Value::Bool(false)));
+    value["value"].as_str().is_some() && clear("isTruncated") && clear("isEncodingProblem")
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -573,8 +1037,42 @@ fn native_recipients(email: &Value) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod recipient_tests {
-    use super::{draft_addresses, native_recipients};
+    use super::{complete_body_value, draft_addresses, mime_attachments, native_recipients, pointer_token, validate_complete_body};
     use serde_json::json;
+
+    #[test]
+    fn offline_upload_resolution_requires_confirmed_scoped_unique_operations() {
+        use super::{draft_attachment_upload_status, resolve_uploaded_attachments};
+        use isyncyou_core::{config::ProviderConfig, Config};
+        use isyncyou_store::{ProviderScope, Store};
+        let store = Store::open_in_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.provider_accounts.insert("a".into(), ProviderConfig::SelfHosted {origin:"https://example.test".into(),client_id:"client".into()});
+        let scope = ProviderScope {account_id:"a".into(),origin:"https://example.test".into(),service:"mail".into(),collection:"native".into()};
+        let intent = json!({"filename":"file.txt","content_type":"text/plain","size":4,"sha256":"hash"}).to_string();
+        assert!(store.claim_provider_mutation(&scope,"op","mail_attachment_upload",&intent,"digest").unwrap());
+        assert!(resolve_uploaded_attachments(&cfg,"a",&store,&["op".into()]).is_err());
+        assert!(draft_attachment_upload_status(&cfg,"a",&store,"op").unwrap().unwrap().blob_id.is_none());
+        assert!(store.finish_provider_mutation(&scope,"op",Some("blob")).unwrap());
+        let result = resolve_uploaded_attachments(&cfg,"a",&store,&["op".into()]).unwrap();
+        assert_eq!(result[0].blob_id.as_deref(),Some("blob"));
+        assert_eq!(result[0].remote_account,"native");
+        assert!(resolve_uploaded_attachments(&cfg,"a",&store,&["op".into(),"op".into()]).is_err());
+        assert!(resolve_uploaded_attachments(&cfg,"a",&store,&["missing".into()]).is_err());
+    }
+
+    #[test]
+    fn body_values_accept_default_false_but_reject_incomplete_or_invalid() {
+        assert!(complete_body_value(&json!({"value":"complete"})));
+        assert!(complete_body_value(&json!({"value":"complete","isTruncated":false,"isEncodingProblem":false})));
+        assert!(!complete_body_value(&json!({"value":"partial","isTruncated":true})));
+        assert!(!complete_body_value(&json!({"value":"bad","isEncodingProblem":null})));
+        let mut email = json!({"bodyValues":{"text":{"value":"complete"}},"textBody":[{"partId":"text","type":"text/plain"}],"htmlBody":[{"partId":null,"type":"image/png"}]});
+        assert!(validate_complete_body(&email).is_ok());
+        email["bodyValues"]["text"]["isTruncated"] = json!(true);
+        assert!(validate_complete_body(&email).is_err());
+        assert_eq!(pointer_token("folder/~id"), "folder~1~0id");
+    }
 
     #[test]
     fn draft_addresses_reject_header_injection_and_unexpected_fields() {
@@ -589,6 +1087,20 @@ mod recipient_tests {
         let email = json!({"to":[{"email":"a@example.org","name":"A"}], "cc":[{"email":"b@example.org"}], "bcc":[{"email":"c@example.org"}]});
         assert_eq!(native_recipients(&email).unwrap(), vec!["a@example.org", "b@example.org", "c@example.org"]);
         assert!(native_recipients(&json!({"bcc":[{}]})).is_err());
+    }
+
+    #[test]
+    fn mime_list_excludes_body_but_keeps_inline_and_attachment() {
+        let email=json!({"textBody":[{"partId":"text"}],"htmlBody":[{"partId":"html"}],"bodyStructure":{"subParts":[
+            {"partId":"text","blobId":"text-blob","type":"text/plain","size":4},
+            {"partId":"html","blobId":"html-blob","type":"text/html","size":4},
+            {"partId":"inline","blobId":"inline-blob","type":"image/png","size":8},
+            {"partId":"attachment","blobId":"file-blob","type":"application/pdf","name":"a.pdf","size":9}
+        ]}});
+        let mut ids:Vec<_>=mime_attachments(&email).unwrap().into_iter().map(|item| item.blob_id).collect();
+        ids.sort();
+        assert_eq!(ids,vec!["file-blob","inline-blob"]);
+        assert!(mime_attachments(&json!({"bodyStructure":{}})).is_err());
     }
 }
 
@@ -662,12 +1174,33 @@ pub fn create_draft(
         "header:Disposition-Notification-To:asAddresses",
         "bodyValues",
         "htmlBody",
+        "inReplyTo",
+        "references",
+        "attachments",
     ];
     if email
         .as_object()
         .is_none_or(|fields| fields.keys().any(|key| !allowed.contains(&key.as_str())))
     {
         return Err("Unsupported draft fields".into());
+    }
+    for key in ["inReplyTo", "references"] {
+        if let Some(value) = email.get(key) {
+            let ids = value.as_array().ok_or("Invalid message references")?;
+            if ids.is_empty() || ids.len() > 100 || ids.iter().any(|v| v.as_str().is_none_or(|s| s.is_empty() || s.len() > 998 || s.chars().any(char::is_control))) { return Err("Invalid message references".into()); }
+        }
+    }
+    if let Some(value) = email.get("attachments") {
+        let attachments = value.as_array().ok_or("Invalid attachments")?;
+        if attachments.len() > 32 { return Err("Too many attachments".into()); }
+        for part in attachments {
+            let fields = part.as_object().ok_or("Invalid attachment")?;
+            if fields.keys().any(|key| !matches!(key.as_str(), "blobId" | "type" | "name" | "disposition"))
+                || part["blobId"].as_str().is_none_or(|s| s.is_empty() || s.len() > 1024 || s.chars().any(char::is_control))
+                || part["name"].as_str().is_none_or(|s| s.is_empty() || s.len() > 255 || s.chars().any(char::is_control))
+                || part["type"].as_str().is_none_or(|s| s.is_empty() || s.len() > 255 || !s.is_ascii() || s.chars().any(|c| c.is_control() || c.is_whitespace()))
+                || part["disposition"].as_str() != Some("attachment") { return Err("Invalid attachment".into()); }
+        }
     }
     let subject = email["subject"].as_str().ok_or("Draft subject required")?;
     let to = draft_addresses(email,"to",true)?;
@@ -804,6 +1337,67 @@ pub fn create_draft(
     }
 }
 
+// Inspect native creations after a lost response; without a native correlation
+// key even a matching creation cannot prove which client submitted it.
+fn reconcile_submission(
+    _store: &Store,
+    _scope: &ProviderScope,
+    client: &JmapClient,
+    op: &ProviderSubmission,
+) -> Result<SendOutcome, String> {
+    let intent: Value = serde_json::from_str(&op.intent_json).map_err(|_| "Invalid recorded submission")?;
+    let Some(mut state) = intent.get("submission_state").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned) else {
+        return Ok(SendOutcome::Unknown);
+    };
+    let mut created = Vec::new();
+    for page in 0..100 {
+        let Ok(changes) = client.changes("EmailSubmission", &state, 100) else { return Ok(SendOutcome::Unknown) };
+        if changes["oldState"].as_str() != Some(state.as_str()) { return Ok(SendOutcome::Unknown); }
+        let Some(next) = changes["newState"].as_str().filter(|s| !s.is_empty()) else { return Ok(SendOutcome::Unknown) };
+        let Ok(ids) = list(&changes, "created") else { return Ok(SendOutcome::Unknown) };
+        // A destroyed submission may have been ours, so another matching
+        // creation cannot establish an unambiguous result in that interval.
+        match list(&changes, "destroyed") {
+            Ok(ids) if ids.is_empty() => {}
+            _ => return Ok(SendOutcome::Unknown),
+        }
+        created.extend(ids);
+        if created.len() > 10_000 { return Ok(SendOutcome::Unknown); }
+        match changes["hasMoreChanges"].as_bool() {
+            Some(false) => break,
+            Some(true) if next != state => state = next.to_owned(),
+            _ => return Ok(SendOutcome::Unknown),
+        }
+        if page == 99 { return Ok(SendOutcome::Unknown); }
+    }
+    let mut matches = Vec::new();
+    for ids in created.chunks(client.max_objects_in_get().max(1)) {
+        let Ok(response) = client.get_submissions(Some(ids)) else { return Ok(SendOutcome::Unknown) };
+        let Some(rows) = response["list"].as_array() else { return Ok(SendOutcome::Unknown) };
+        if rows.len() != ids.len() { return Ok(SendOutcome::Unknown); }
+        for row in rows {
+            let Some(id) = row["id"].as_str().filter(|id| ids.iter().any(|v| v == *id)) else { return Ok(SendOutcome::Unknown) };
+            let Some(recipients) = row.pointer("/envelope/rcptTo").and_then(Value::as_array) else { return Ok(SendOutcome::Unknown) };
+            let mut addresses: Vec<&str> = recipients.iter().filter_map(|r| r["email"].as_str()).collect();
+            let Some(expected) = intent["recipients"].as_array() else { return Ok(SendOutcome::Unknown) };
+            let mut expected_addresses: Vec<&str> = expected.iter().filter_map(Value::as_str).collect();
+            if addresses.len() != recipients.len() || expected_addresses.len() != expected.len() { return Ok(SendOutcome::Unknown); }
+            addresses.sort_unstable(); expected_addresses.sort_unstable();
+            if row["emailId"].as_str() == Some(op.draft_id.as_str())
+                && row["identityId"].as_str() == Some(op.identity_id.as_str())
+                && row.pointer("/envelope/mailFrom/email") == intent.get("mail_from")
+                && addresses == expected_addresses {
+                matches.push(id.to_owned());
+            }
+        }
+    }
+    // Another client can submit the same immutable email and envelope in the
+    // observed interval. Even one matching creation does not prove ownership.
+    // Do not attribute this observation to us.
+    let _ = matches;
+    Ok(SendOutcome::Unknown)
+}
+
 /// Submit once. An existing or uncertain operation is observed, never resent.
 pub fn send_approved(
     cfg: &Config,
@@ -851,7 +1445,7 @@ pub fn send_approved(
                 sent_update: existing.sent_update.unwrap_or_else(|| "unknown".into()),
             },
             "rejected" => SendOutcome::Rejected,
-            _ => SendOutcome::Unknown,
+            _ => return reconcile_submission(store, &scope, client, &existing),
         });
     }
     let ids = vec![approved.email_id.clone()];
@@ -923,6 +1517,8 @@ pub fn send_approved(
         .map_err(|_| "Submission state unavailable")?;
     let submission_state = field(&submission, "state")?.to_string();
     let creation_id = format!("op_{:x}", Sha256::digest(approved.operation_id.as_bytes()));
+    let mut recorded_intent: Value = serde_json::from_str(&intent).map_err(|_| "Invalid submission")?;
+    recorded_intent["submission_state"] = Value::String(submission_state.clone());
     let op = ProviderSubmission {
         scope: scope.clone(),
         operation_id: approved.operation_id.clone(),
@@ -931,7 +1527,7 @@ pub fn send_approved(
         email_state: field(&email, "state")?.into(),
         snapshot_digest: digest,
         creation_id: creation_id.clone(),
-        intent_json: intent,
+        intent_json: serde_json::to_string(&recorded_intent).map_err(|_| "Invalid submission")?,
         state: "unknown".into(),
         submission_id: None,
         sent_update: None,

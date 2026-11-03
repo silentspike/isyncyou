@@ -57,6 +57,26 @@ internal object PushInstallationKey {
     fun sign(context: Context, account: String, challenge: ByteArray): String {
         require(challenge.size in 1..8192)
         val identity = getOrCreate(context, account)
+        return signIdentity(identity, challenge)
+    }
+
+    /** Recovery must never create a replacement for an already enrolled device. */
+    @Synchronized
+    fun signExisting(context: Context, account: String, challenge: ByteArray): String {
+        require(challenge.size in 1..8192)
+        val identity = requireNotNull(existing(context, account)) { "Installation key unavailable" }
+        return signIdentity(identity, challenge)
+    }
+
+    @Synchronized
+    fun signExistingForInstallation(context: Context, account: String, installation: String, challenge: ByteArray): String {
+        require(challenge.size in 1..8192)
+        val identity = requireNotNull(existing(context, account)) { "Installation key unavailable" }
+        require(identity.installation == installation) { "Installation changed" }
+        return signIdentity(identity, challenge)
+    }
+
+    private fun signIdentity(identity: Identity, challenge: ByteArray): String {
         val keystore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         val key = requireNotNull(keystore.getKey(PREFIX + identity.installation, null))
         val signature = Signature.getInstance("SHA256withECDSA")

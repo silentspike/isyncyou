@@ -5,8 +5,9 @@
 
 pub mod projection;
 pub mod edit;
+pub mod reminders;
 
-use isyncyou_store::{ProviderChange, ProviderDavIndex, ProviderObject, ProviderScope, Store};
+use isyncyou_store::{ProviderAlarmIndex, ProviderChange, ProviderDavIndex, ProviderObject, ProviderScope, Store};
 use quick_xml::events::Event;
 use quick_xml::name::ResolveResult;
 use quick_xml::reader::NsReader;
@@ -69,6 +70,7 @@ impl<'a> Staging<'a> {
         self.store.replace_provider_staged_object(self.scope, &self.generation, object).map_err(|e| DavError::Store(e.to_string()))?;
         if self.scope.service == "calendar" {
             self.store.stage_provider_dav_index(self.scope, &self.generation, &object.remote_id, &dav_index(&object.raw)).map_err(|e| DavError::Store(e.to_string()))?;
+            self.store.stage_provider_alarm_index(self.scope, &self.generation, &object.remote_id, &alarm_index(&object.raw)).map_err(|e| DavError::Store(e.to_string()))?;
         }
         Ok(())
     }
@@ -89,6 +91,13 @@ fn dav_index(raw: &[u8]) -> ProviderDavIndex {
         Ok(edit::ResourceIndex::Event { uid }) => ProviderDavIndex::Valid { uid, kind:"event".into(), parent_uid:None },
         Ok(edit::ResourceIndex::Task(task)) => ProviderDavIndex::Valid { uid:task.uid, kind:"task".into(), parent_uid:task.parent_uid },
         Err(_) => ProviderDavIndex::Invalid,
+    }
+}
+
+fn alarm_index(raw: &[u8]) -> ProviderAlarmIndex {
+    match edit::resource_has_alarms(raw) {
+        Ok(has_alarm) => ProviderAlarmIndex::Valid { has_alarm },
+        Err(_) => ProviderAlarmIndex::Invalid,
     }
 }
 
@@ -182,12 +191,18 @@ fn escape_xml(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
 }
 
+fn valid_lock_token(token: &str) -> bool {
+    let Some(inner) = token.strip_prefix('<').and_then(|value| value.strip_suffix('>')) else { return false; };
+    !inner.is_empty() && inner.len() <= 4096 && !inner.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c,'<' | '>' | '(' | ')')) && Url::parse(inner).is_ok()
+}
+
 #[derive(Default)]
 struct XmlNode {
     namespace: String,
     name: String,
     text: String,
     children: Vec<XmlNode>,
+    has_attributes: bool,
 }
 
 impl XmlNode {
@@ -207,13 +222,17 @@ fn parse_tree(bytes: &[u8]) -> Result<XmlNode, DavError> {
             Event::Start(e) => {
                 count += 1;
                 if count > 50_000 || stack.len() > 32 { return Err(DavError::InvalidResponse); }
-                let node = XmlNode { namespace, name: String::from_utf8_lossy(e.local_name().as_ref()).into_owned(), ..Default::default() };
+                let mut has_attributes = false;
+                for attr in e.attributes() { let attr = attr.map_err(|_| DavError::InvalidResponse)?; let key = attr.key.as_ref(); if key != b"xmlns" && !key.starts_with(b"xmlns:") { has_attributes = true; } }
+                let node = XmlNode { namespace, name: String::from_utf8_lossy(e.local_name().as_ref()).into_owned(), has_attributes, ..Default::default() };
                 stack.push(node);
             }
             Event::Empty(e) => {
                 count += 1;
                 if count > 50_000 || stack.len() > 32 { return Err(DavError::InvalidResponse); }
-                let node = XmlNode { namespace, name: String::from_utf8_lossy(e.local_name().as_ref()).into_owned(), ..Default::default() };
+                let mut has_attributes = false;
+                for attr in e.attributes() { let attr = attr.map_err(|_| DavError::InvalidResponse)?; let key = attr.key.as_ref(); if key != b"xmlns" && !key.starts_with(b"xmlns:") { has_attributes = true; } }
+                let node = XmlNode { namespace, name: String::from_utf8_lossy(e.local_name().as_ref()).into_owned(), has_attributes, ..Default::default() };
                 stack.last_mut().ok_or(DavError::InvalidResponse)?.children.push(node);
             }
             Event::End(_) => {
@@ -257,6 +276,7 @@ pub struct ExpandedCalendar {
 
 /// One server-reported access control entry. Protected/inherited entries are
 /// presented as such and must not be rewritten by a client-side share editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AclEntry {
     pub principal: String,
     pub granted: bool,
@@ -418,6 +438,37 @@ impl DavClient {
         Ok(result)
     }
 
+    /// Server-declared scheduling addresses for the authenticated principal.
+    /// Missing or ambiguous properties do not authorize an attendee response.
+    pub fn calendar_user_addresses(&self, entry: &str) -> Result<Vec<String>, DavError> {
+        const D: &str = "DAV:";
+        const C: &str = "urn:ietf:params:xml:ns:caldav";
+        let entry_url = self.checked_url(entry)?;
+        let (actual, root) = self.propfind(entry_url,"0",r#"<d:propfind xmlns:d="DAV:"><d:prop><d:current-user-principal/></d:prop></d:propfind>"#)?;
+        let response = root.children.iter().find(|n| n.namespace == D && n.name == "response" && n.child(D,"href").and_then(|h| self.checked_from(&actual,h.text.trim()).ok()).as_ref() == Some(&actual)).ok_or(DavError::InvalidResponse)?;
+        let principal = response.children.iter().filter(|n| n.namespace == D && n.name == "propstat").find_map(|p| {
+            if status(p.child(D,"status")?.text.trim()) != Some(200) { return None; }
+            p.child(D,"prop")?.child(D,"current-user-principal")?.child(D,"href")
+        }).ok_or(DavError::InvalidResponse)?;
+        let principal_url = self.checked_from(&actual,principal.text.trim())?;
+        let (actual, root) = self.propfind(principal_url.clone(),"0",r#"<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><c:calendar-user-address-set/></d:prop></d:propfind>"#)?;
+        if actual != principal_url { return Err(DavError::InvalidUrl); }
+        let response = root.children.iter().find(|n| n.namespace == D && n.name == "response" && n.child(D,"href").and_then(|h| self.checked_from(&actual,h.text.trim()).ok()).as_ref() == Some(&actual)).ok_or(DavError::InvalidResponse)?;
+        let addresses = response.children.iter().filter(|n| n.namespace == D && n.name == "propstat").find_map(|p| {
+            if status(p.child(D,"status")?.text.trim()) != Some(200) { return None; }
+            p.child(D,"prop")?.child(C,"calendar-user-address-set")
+        }).ok_or(DavError::InvalidResponse)?;
+        if addresses.children.is_empty() || addresses.children.len() > 128 || addresses.children.iter().any(|n| n.namespace != D || n.name != "href") { return Err(DavError::InvalidResponse); }
+        let mut result = Vec::new();
+        for value in &addresses.children {
+            let address = value.text.trim();
+            let parsed = Url::parse(address).map_err(|_| DavError::InvalidResponse)?;
+            if address.len() > 4096 || address.chars().any(char::is_control) || !matches!(parsed.scheme(),"mailto" | "https") { return Err(DavError::InvalidResponse); }
+            result.push(address.to_owned());
+        }
+        Ok(result)
+    }
+
     fn collection(&self, scope: &ProviderScope) -> Result<Url, DavError> {
         let declared = Url::parse(&scope.origin).map_err(|_| DavError::InvalidUrl)?;
         if declared.origin() != self.origin.origin() { return Err(DavError::InvalidUrl); }
@@ -479,8 +530,16 @@ impl DavClient {
             n.child(D,"prop")?.child(D,"acl")
         }).ok_or(DavError::InvalidResponse)?;
         let mut result = Vec::new();
+        fn representable(node: &XmlNode) -> bool { !node.has_attributes && node.children.iter().all(representable) }
+        if !representable(acl) { return Err(DavError::InvalidResponse); }
+        if acl.children.iter().any(|n| n.namespace != D || n.name != "ace") { return Err(DavError::InvalidResponse); }
         for ace in acl.children.iter().filter(|n| n.namespace == D && n.name == "ace") {
+            if ace.children.iter().any(|n| n.namespace != D || !matches!(n.name.as_str(), "principal" | "grant" | "deny" | "protected" | "inherited")) { return Err(DavError::InvalidResponse); }
+            for name in ["principal", "grant", "deny", "protected", "inherited"] {
+                if ace.children.iter().filter(|n| n.namespace == D && n.name == name).count() > 1 { return Err(DavError::InvalidResponse); }
+            }
             let principal = ace.child(D,"principal").ok_or(DavError::InvalidResponse)?;
+            if principal.children.len() != 1 { return Err(DavError::InvalidResponse); }
             let identifier = if let Some(href) = principal.child(D,"href") {
                 self.checked_from(&target,href.text.trim())?.to_string()
             } else {
@@ -490,6 +549,7 @@ impl DavClient {
             };
             let grant = ace.child(D,"grant"); let deny = ace.child(D,"deny");
             let (granted, privileges) = match (grant,deny) { (Some(value),None) => (true,value), (None,Some(value)) => (false,value), _ => return Err(DavError::InvalidResponse) };
+            if privileges.children.iter().any(|n| n.namespace != D || n.name != "privilege") { return Err(DavError::InvalidResponse); }
             let mut names = Vec::new();
             for item in privileges.children.iter().filter(|n| n.namespace == D && n.name == "privilege") {
                 if item.children.len() != 1 { return Err(DavError::InvalidResponse); }
@@ -500,6 +560,61 @@ impl DavClient {
             result.push(AclEntry { principal:identifier, granted, privileges:names, inherited:ace.child(D,"inherited").is_some(), protected:ace.child(D,"protected").is_some() });
         }
         Ok(result)
+    }
+
+    /// Replace the visible editable ACEs while holding an exclusive WebDAV lock.
+    /// Protected and inherited entries are excluded by RFC 3744; all editable
+    /// entries are represented exactly or the operation is rejected.
+    pub fn update_acl_locked(&self, scope: &ProviderScope, expected: &[AclEntry], principal: &str, privilege: Option<&str>) -> Result<(), DavError> {
+        if !matches!(privilege, None | Some("read") | Some("write") | Some("read-write")) { return Err(DavError::InvalidResponse); }
+        let target = self.collection(scope)?;
+        let principal_url = self.checked_url(principal)?;
+        if principal_url.query().is_some() || principal_url.fragment().is_some() || !principal_url.username().is_empty() || principal_url.password().is_some() { return Err(DavError::InvalidUrl); }
+        if !self.permits(scope, None, "write-acl")? || !self.permits(scope, None, "read-acl")? { return Err(DavError::Http(403)); }
+        let lock_body = r#"<d:lockinfo xmlns:d="DAV:"><d:lockscope><d:exclusive/></d:lockscope><d:locktype><d:write/></d:locktype></d:lockinfo>"#;
+        let response = self.http.request(reqwest::Method::from_bytes(b"LOCK").map_err(|_| DavError::InvalidResponse)?, target.clone()).bearer_auth(&self.token)
+            .header("Depth", "0").header("Timeout", "Second-60").header(CONTENT_TYPE, "application/xml; charset=utf-8").body(lock_body).send()
+            .map_err(|_| DavError::Transport("DAV lock outcome unknown".into()))?;
+        if !response.status().is_success() { return Err(DavError::Http(response.status().as_u16())); }
+        let token = response.headers().get("Lock-Token").and_then(|v| v.to_str().ok()).filter(|v| valid_lock_token(v)).ok_or(DavError::InvalidResponse)?.to_owned();
+        let result = (|| {
+            let actual = self.acl(scope)?;
+            if actual != expected { return Err(DavError::Conflict); }
+            let selected: Vec<_> = actual.iter().filter(|ace| ace.principal == principal_url.as_str()).collect();
+            if selected.iter().any(|ace| ace.protected || ace.inherited || !ace.granted) || selected.len() > 1 { return Err(DavError::InvalidResponse); }
+            let replacement = privilege.map(|p| match p { "read" => "<d:privilege><d:read/></d:privilege>", "write" => "<d:privilege><d:write/></d:privilege>", _ => "<d:privilege><d:read/></d:privilege><d:privilege><d:write/></d:privilege>" });
+            let mut xml = String::from("<d:acl xmlns:d=\"DAV:\">");
+            let mut inserted = false;
+            for ace in actual.iter().filter(|ace| !ace.protected && !ace.inherited) {
+                if ace.principal == principal_url.as_str() {
+                    if let Some(privileges) = replacement { xml.push_str(&format!("<d:ace><d:principal><d:href>{}</d:href></d:principal><d:grant>{privileges}</d:grant></d:ace>", escape_xml(principal_url.as_str()))); }
+                    inserted = true;
+                    continue;
+                }
+                let principal_xml = if ace.principal.starts_with("DAV:") {
+                    let name = &ace.principal[4..];
+                    if !matches!(name, "all" | "authenticated" | "unauthenticated" | "self") { return Err(DavError::InvalidResponse); }
+                    format!("<d:{name}/>")
+                } else { format!("<d:href>{}</d:href>", escape_xml(&ace.principal)) };
+                xml.push_str(&format!("<d:ace><d:principal>{principal_xml}</d:principal><d:{}>", if ace.granted {"grant"} else {"deny"}));
+                for name in &ace.privileges {
+                    let (namespace, local) = name.strip_prefix('{').and_then(|v| v.split_once('}')).ok_or(DavError::InvalidResponse)?;
+                    if local.is_empty() || !local.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') || namespace.is_empty() { return Err(DavError::InvalidResponse); }
+                    xml.push_str(&format!("<d:privilege><p:{local} xmlns:p=\"{}\"/></d:privilege>", escape_xml(namespace)));
+                }
+                xml.push_str(if ace.granted {"</d:grant></d:ace>"} else {"</d:deny></d:ace>"});
+            }
+            if !inserted { if let Some(privileges) = replacement { xml.push_str(&format!("<d:ace><d:principal><d:href>{}</d:href></d:principal><d:grant>{privileges}</d:grant></d:ace>", escape_xml(principal_url.as_str()))); } }
+            xml.push_str("</d:acl>");
+            let response = self.http.request(reqwest::Method::from_bytes(b"ACL").map_err(|_| DavError::InvalidResponse)?, target.clone()).bearer_auth(&self.token)
+                .header("If", format!("({token})")).header("Cache-Control", "no-cache").header(CONTENT_TYPE, "application/xml; charset=utf-8").body(xml).send()
+                .map_err(|_| DavError::Transport("DAV ACL outcome unknown".into()))?;
+            if matches!(response.status().as_u16(), 409 | 412) { return Err(DavError::Conflict); }
+            if !response.status().is_success() { return Err(DavError::Http(response.status().as_u16())); }
+            Ok(())
+        })();
+        let _ = self.http.request(reqwest::Method::from_bytes(b"UNLOCK").map_err(|_| DavError::InvalidResponse)?, target).bearer_auth(&self.token).header("Lock-Token", token).send();
+        result
     }
 
     /// CalDAV free-busy REPORT for a single collection. This has collection
@@ -519,11 +634,21 @@ impl DavClient {
     /// Ask the server to expand event recurrence for a bounded UTC window.
     /// This is a read-only view; it must never replace the original ICS bytes.
     pub fn expanded_events(&self, scope: &ProviderScope, start: &str, end: &str) -> Result<Vec<ExpandedCalendar>, DavError> {
+        self.expanded_components(scope, start, end, "VEVENT")
+    }
+
+    /// Expand native tasks independently of events; VTODO and VEVENT may
+    /// reside in the same calendar collection.
+    pub fn expanded_tasks(&self, scope: &ProviderScope, start: &str, end: &str) -> Result<Vec<ExpandedCalendar>, DavError> {
+        self.expanded_components(scope, start, end, "VTODO")
+    }
+
+    fn expanded_components(&self, scope: &ProviderScope, start: &str, end: &str, kind: &str) -> Result<Vec<ExpandedCalendar>, DavError> {
         const D: &str = "DAV:";
         const C: &str = "urn:ietf:params:xml:ns:caldav";
         if scope.service != "calendar" || !utc_time(start) || !utc_time(end) || start >= end { return Err(DavError::InvalidResponse); }
         let collection = self.collection(scope)?;
-        let body = format!("<c:calendar-query xmlns:c=\"{C}\" xmlns:d=\"DAV:\"><d:prop><d:getetag/><c:calendar-data><c:expand start=\"{start}\" end=\"{end}\"/></c:calendar-data></d:prop><c:filter><c:comp-filter name=\"VCALENDAR\"><c:comp-filter name=\"VEVENT\"><c:time-range start=\"{start}\" end=\"{end}\"/></c:comp-filter></c:comp-filter></c:filter></c:calendar-query>");
+        let body = format!("<c:calendar-query xmlns:c=\"{C}\" xmlns:d=\"DAV:\"><d:prop><d:getetag/><c:calendar-data><c:expand start=\"{start}\" end=\"{end}\"/></c:calendar-data></d:prop><c:filter><c:comp-filter name=\"VCALENDAR\"><c:comp-filter name=\"{kind}\"><c:time-range start=\"{start}\" end=\"{end}\"/></c:comp-filter></c:comp-filter></c:filter></c:calendar-query>");
         let response = self.http.request(reqwest::Method::from_bytes(b"REPORT").map_err(|_| DavError::InvalidResponse)?, collection.clone()).bearer_auth(&self.token)
             .header("Depth", "1").header(CONTENT_TYPE, "application/xml; charset=utf-8").body(body).send()
             .map_err(|_| DavError::Transport("DAV calendar query failed".into()))?;
@@ -550,7 +675,7 @@ impl DavClient {
     pub fn sync_collection(&self, store: &Store, scope: &ProviderScope) -> Result<usize, DavError> {
         let collection = self.collection(scope)?;
         let mut cursor = store.provider_cursor(scope).map_err(|e| DavError::Store(e.to_string()))?.unwrap_or_default();
-        let mut full = cursor.is_empty() || scope.service == "calendar" && store.provider_dav_unindexed_count(scope).map_err(|e| DavError::Store(e.to_string()))? > 0;
+        let mut full = cursor.is_empty() || scope.service == "calendar" && (store.provider_dav_unindexed_count(scope).map_err(|e| DavError::Store(e.to_string()))? > 0 || store.provider_alarm_unindexed_count(scope).map_err(|e| DavError::Store(e.to_string()))? > 0);
         if full { cursor.clear(); }
         let mut staging = if full { Some(Staging::begin(store, scope)?) } else { None };
         let mut count = 0;
@@ -624,9 +749,10 @@ impl DavClient {
                 if scope.service == "calendar" {
                     let indexed: Vec<_> = changes.into_iter().map(|change| {
                         let index = match &change { ProviderChange::Upsert(object) => Some(dav_index(&object.raw)), ProviderChange::Destroyed(_) => None };
-                        (change, index)
+                        let alarm = match &change { ProviderChange::Upsert(object) => Some(alarm_index(&object.raw)), ProviderChange::Destroyed(_) => None };
+                        (change, index, alarm)
                     }).collect();
-                    store.apply_provider_dav_page(scope, &indexed, &page.token).map_err(|e| DavError::Store(e.to_string()))?;
+                    store.apply_provider_dav_page_indexed(scope, &indexed, &page.token).map_err(|e| DavError::Store(e.to_string()))?;
                 } else {
                     store.apply_provider_page(scope, &changes, &page.token).map_err(|e| DavError::Store(e.to_string()))?;
                 }
@@ -639,6 +765,42 @@ impl DavClient {
     /// Create only when absent, or replace exactly the version the caller read.
     pub fn put(&self, scope: &ProviderScope, href: &str, raw: Vec<u8>, etag: Option<&str>) -> Result<Option<String>, DavError> {
         self.put_with_collection_precondition(scope, href, raw, etag, None)
+    }
+
+    /// Execute an operation while the server holds an exclusive depth-infinity
+    /// lock on the collection. Lock lifetime is bounded if the client crashes.
+    pub fn with_locked_collection<T>(&self, scope: &ProviderScope, operation: impl FnOnce(&str) -> Result<T, DavError>) -> Result<T, DavError> {
+        let target = self.collection(scope)?;
+        let body = r#"<d:lockinfo xmlns:d="DAV:"><d:lockscope><d:exclusive/></d:lockscope><d:locktype><d:write/></d:locktype></d:lockinfo>"#;
+        let response = self.http.request(reqwest::Method::from_bytes(b"LOCK").map_err(|_| DavError::InvalidResponse)?,target.clone()).bearer_auth(&self.token)
+            .header("Depth","infinity").header("Timeout","Second-60").header(CONTENT_TYPE,"application/xml; charset=utf-8").body(body).send()
+            .map_err(|_| DavError::Transport("DAV lock outcome unknown".into()))?;
+        if !response.status().is_success() { return Err(DavError::Http(response.status().as_u16())); }
+        let token = response.headers().get("Lock-Token").and_then(|v| v.to_str().ok()).filter(|v| valid_lock_token(v)).ok_or(DavError::InvalidResponse)?.to_owned();
+        let result = operation(&token);
+        let _ = self.http.request(reqwest::Method::from_bytes(b"UNLOCK").map_err(|_| DavError::InvalidResponse)?,target).bearer_auth(&self.token).header("Lock-Token",token).send();
+        result
+    }
+
+    /// Replace a resource under an already-held ancestor lock and strong ETag.
+    pub fn put_under_lock(&self, scope: &ProviderScope, href: &str, raw: Vec<u8>, etag: &str, token: &str) -> Result<Option<String>, DavError> {
+        if etag.is_empty() || !valid_lock_token(token) { return Err(DavError::InvalidResponse); }
+        let url = self.resource(&self.collection(scope)?,href)?;
+        let media = match scope.service.as_str() {"calendar" => "text/calendar; charset=utf-8", "contacts" => "text/vcard; charset=utf-8", _ => return Err(DavError::InvalidUrl)};
+        let response = self.http.put(url).bearer_auth(&self.token).header(CONTENT_TYPE,media).header(IF_MATCH,etag).header("If",format!("({token})")).header("Cache-Control","no-cache").body(raw).send().map_err(|_| DavError::Transport("DAV write outcome unknown".into()))?;
+        if matches!(response.status().as_u16(),409 | 412 | 423) { return Err(DavError::Conflict); }
+        if !response.status().is_success() { return Err(DavError::Http(response.status().as_u16())); }
+        Ok(response.headers().get(ETAG).and_then(|v| v.to_str().ok()).map(str::to_owned))
+    }
+
+    /// Delete a resource only while its ancestor lock and ETag both match.
+    pub fn delete_under_lock(&self, scope: &ProviderScope, href: &str, etag: &str, token: &str) -> Result<(), DavError> {
+        if etag.is_empty() || !valid_lock_token(token) { return Err(DavError::InvalidResponse); }
+        let url = self.resource(&self.collection(scope)?,href)?;
+        let response = self.http.delete(url).bearer_auth(&self.token).header(IF_MATCH,etag).header("If",format!("({token})")).header("Cache-Control","no-cache").send().map_err(|_| DavError::Transport("DAV delete outcome unknown".into()))?;
+        if matches!(response.status().as_u16(),409 | 412 | 423) { return Err(DavError::Conflict); }
+        if !response.status().is_success() { return Err(DavError::Http(response.status().as_u16())); }
+        Ok(())
     }
 
     /// A collection sync-token condition protects cross-resource invariants,
@@ -674,6 +836,120 @@ impl DavClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acl_update_locks_checks_snapshot_and_preserves_other_editable_entries() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap());
+        let other = format!("{}users/other", origin);
+        let selected = format!("{}users/selected", origin);
+        let server = std::thread::spawn(move || {
+            for index in 0..6 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = Vec::new(); let mut buf = [0u8; 2048];
+                loop {
+                    let n = socket.read(&mut buf).unwrap(); assert_ne!(n, 0); request.extend_from_slice(&buf[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length = headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|n| n.trim().parse::<usize>().ok())).unwrap_or(0);
+                        if request.len() >= end + 4 + length { break; }
+                    }
+                }
+                let wire = String::from_utf8_lossy(&request);
+                let (status, headers, body) = match index {
+                    0 | 1 => ("207 Multi-Status", "", "<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/cal/</d:href><d:propstat><d:prop><d:current-user-privilege-set><d:privilege><d:all/></d:privilege></d:current-user-privilege-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"),
+                    2 => { assert!(wire.starts_with("LOCK ")); ("200 OK", "Lock-Token: <opaquelocktoken:fixture>\r\n", "") },
+                    3 => ("207 Multi-Status", "", "<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/cal/</d:href><d:propstat><d:prop><d:acl><d:ace><d:principal><d:href>/users/other</d:href></d:principal><d:grant><d:privilege><d:read/></d:privilege></d:grant></d:ace><d:ace><d:principal><d:all/></d:principal><d:deny><d:privilege><d:write/></d:privilege></d:deny><d:protected/></d:ace></d:acl></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"),
+                    4 => { assert!(wire.starts_with("ACL ")); assert!(wire.contains("(\u{3c}opaquelocktoken:fixture\u{3e})")); assert!(wire.contains("users/other")); assert!(wire.contains("users/selected")); assert!(!wire.contains("<d:protected")); ("200 OK", "", "") },
+                    _ => { assert!(wire.starts_with("UNLOCK ")); ("204 No Content", "", "") },
+                };
+                write!(socket, "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let client = DavClient { http: Client::builder().no_proxy().timeout(std::time::Duration::from_secs(5)).redirect(reqwest::redirect::Policy::none()).build().unwrap(), origin: Url::parse(&origin).unwrap(), token: "fixture".into(), trusted_public_origin:None };
+        let scope = ProviderScope { account_id:"fixture".into(), origin, service:"calendar".into(), collection:"/cal/".into() };
+        let expected = vec![AclEntry {principal:other,granted:true,privileges:vec!["{DAV:}read".into()],inherited:false,protected:false}, AclEntry {principal:"DAV:all".into(),granted:false,privileges:vec!["{DAV:}write".into()],inherited:false,protected:true}];
+        client.update_acl_locked(&scope, &expected, &selected, Some("read")).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn calendar_addresses_are_taken_from_authenticated_principal() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}/",listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for index in 0..2 {
+                let (mut socket,_) = listener.accept().unwrap();
+                let mut data = Vec::new(); let mut buf = [0u8;2048];
+                loop {
+                    let n = socket.read(&mut buf).unwrap(); assert_ne!(n,0); data.extend_from_slice(&buf[..n]);
+                    if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&data[..end]);
+                        let length = headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|n| n.trim().parse::<usize>().ok())).unwrap_or(0);
+                        if data.len() >= end + 4 + length { break; }
+                    }
+                }
+                let body = if index == 0 { "<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/dav/</d:href><d:propstat><d:prop><d:current-user-principal><d:href>/principals/me/</d:href></d:current-user-principal></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>" } else { "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/principals/me/</d:href><d:propstat><d:prop><c:calendar-user-address-set><d:href>mailto:me@example.test</d:href></c:calendar-user-address-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>" };
+                write!(socket,"HTTP/1.1 207 Multi-Status\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        let client = DavClient {http:Client::builder().no_proxy().timeout(std::time::Duration::from_secs(5)).redirect(reqwest::redirect::Policy::none()).build().unwrap(),origin:Url::parse(&origin).unwrap(),token:"fixture".into(),trusted_public_origin:None};
+        assert_eq!(client.calendar_user_addresses("/dav/").unwrap(),vec!["mailto:me@example.test"]);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn collection_lock_put_uses_lock_token_and_resource_etag() {
+        use std::io::{Read,Write}; use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}/",listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for index in 0..4 {
+                let (mut socket,_) = listener.accept().unwrap(); let mut data=Vec::new(); let mut buf=[0u8;2048];
+                loop { let n=socket.read(&mut buf).unwrap(); assert_ne!(n,0); data.extend_from_slice(&buf[..n]);
+                    if let Some(end)=data.windows(4).position(|w|w==b"\r\n\r\n") { let headers=String::from_utf8_lossy(&data[..end]); let length=headers.lines().find_map(|line|line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v|v.trim().parse::<usize>().ok())).unwrap_or(0); if data.len()>=end+4+length {break;} }
+                }
+                let wire=String::from_utf8_lossy(&data).to_ascii_lowercase();
+                let (status,headers)=match index {
+                    0 => {assert!(wire.starts_with("lock ")); assert!(wire.contains("depth: infinity")); ("200 OK","Lock-Token: <opaquelocktoken:fixture>\r\n")},
+                    1 => {assert!(wire.starts_with("put ")); assert!(wire.contains("if: (<opaquelocktoken:fixture>)")); assert!(wire.contains("if-match: \"v1\"")); ("204 No Content","")},
+                    2 => {assert!(wire.starts_with("delete ")); assert!(wire.contains("if: (<opaquelocktoken:fixture>)")); assert!(wire.contains("if-match: \"v1\"")); ("204 No Content","")},
+                    _ => {assert!(wire.starts_with("unlock ")); ("204 No Content","")},
+                };
+                write!(socket,"HTTP/1.1 {status}\r\nContent-Length: 0\r\n{headers}Connection: close\r\n\r\n").unwrap();
+            }
+        });
+        let client=DavClient {http:Client::builder().no_proxy().timeout(std::time::Duration::from_secs(5)).redirect(reqwest::redirect::Policy::none()).build().unwrap(),origin:Url::parse(&origin).unwrap(),token:"fixture".into(),trusted_public_origin:None};
+        let scope=ProviderScope {account_id:"fixture".into(),origin,service:"calendar".into(),collection:"/cal/".into()};
+        assert!(!valid_lock_token("<opaquelocktoken:fixture><urn:other>"));
+        client.with_locked_collection(&scope,|token| {client.put_under_lock(&scope,"task.ics",b"fixture".to_vec(),"\"v1\"",token)?; client.delete_under_lock(&scope,"task.ics","\"v1\"",token)}).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn collection_lock_releases_after_failed_graph_check() {
+        use std::io::{Read,Write}; use std::net::TcpListener;
+        let listener=TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin=format!("http://{}/",listener.local_addr().unwrap());
+        let server=std::thread::spawn(move || {
+            for index in 0..2 {
+                let (mut socket,_)=listener.accept().unwrap(); let mut data=Vec::new(); let mut buf=[0u8;2048];
+                loop { let n=socket.read(&mut buf).unwrap(); assert_ne!(n,0); data.extend_from_slice(&buf[..n]);
+                    if let Some(end)=data.windows(4).position(|w|w==b"\r\n\r\n") { let headers=String::from_utf8_lossy(&data[..end]); let length=headers.lines().find_map(|line|line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v|v.trim().parse::<usize>().ok())).unwrap_or(0); if data.len()>=end+4+length {break;} }
+                }
+                let wire=String::from_utf8_lossy(&data); let (status,headers)=if index == 0 {assert!(wire.starts_with("LOCK ")); ("200 OK","Lock-Token: <opaquelocktoken:fixture>\r\n")} else {assert!(wire.starts_with("UNLOCK ")); ("204 No Content","")};
+                write!(socket,"HTTP/1.1 {status}\r\nContent-Length: 0\r\n{headers}Connection: close\r\n\r\n").unwrap();
+            }
+        });
+        let client=DavClient {http:Client::builder().no_proxy().timeout(std::time::Duration::from_secs(5)).redirect(reqwest::redirect::Policy::none()).build().unwrap(),origin:Url::parse(&origin).unwrap(),token:"fixture".into(),trusted_public_origin:None};
+        let scope=ProviderScope {account_id:"fixture".into(),origin,service:"calendar".into(),collection:"/cal/".into()};
+        assert!(matches!(client.with_locked_collection::<()>(&scope,|_| Err(DavError::Conflict)),Err(DavError::Conflict)));
+        server.join().unwrap();
+    }
 
     #[test]
     fn sync_page_distinguishes_deleted_resources_and_page_boundary() {
@@ -925,7 +1201,10 @@ mod tests {
         let scope = ProviderScope { account_id:"fixture".into(), origin, service:"calendar".into(), collection:"/cal/".into() };
         let store = Store::open_in_memory().unwrap();
         let old = ProviderObject { remote_id:"old".into(), etag:Some("\"old\"".into()), raw:b"preserved".to_vec() };
-        store.apply_provider_page(&scope, &[ProviderChange::Upsert(old.clone())], "expired").unwrap();
+        // The cached resource already has index entries, as it would after a
+        // completed DAV sync. An unindexed legacy resource deliberately starts
+        // a full rebuild before the expired cursor can be tested.
+        store.apply_provider_dav_page_indexed(&scope, &[(ProviderChange::Upsert(old.clone()), Some(ProviderDavIndex::Invalid), Some(ProviderAlarmIndex::Invalid))], "expired").unwrap();
         assert!(matches!(client.sync_collection(&store, &scope), Err(DavError::Http(403))));
         assert_eq!(store.provider_cursor(&scope).unwrap().as_deref(), Some("expired"));
         assert_eq!(store.provider_object(&scope, "old").unwrap(), Some(old));

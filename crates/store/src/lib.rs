@@ -99,10 +99,10 @@ fn bounded_fts_snippet(value: String) -> String {
 }
 
 /// Current schema version. Bump + add a migration step when the schema changes.
-pub const SCHEMA_VERSION: i64 = 18;
+pub const SCHEMA_VERSION: i64 = 20;
 
 mod provider;
-pub use provider::{ProviderAlarmIdentity, ProviderCapture, ProviderChange, ProviderCollectionSnapshot, ProviderDavIndex, ProviderDavIndexEntry, ProviderEvent, ProviderExportSnapshot, ProviderObject, ProviderScope, ProviderSubmission};
+pub use provider::{ProviderAlarmIdentity, ProviderAlarmIndex, ProviderCapture, ProviderChange, ProviderCollectionSnapshot, ProviderDavIndex, ProviderDavIndexEntry, ProviderEvent, ProviderExportSnapshot, ProviderObject, ProviderScope, ProviderSubmission};
 
 pub const STORE_KEY_ENV: &str = "ISYNCYOU_STORE_KEY";
 pub const STORE_KEY_FILE_ENV: &str = "ISYNCYOU_STORE_KEY_FILE";
@@ -786,6 +786,7 @@ impl Store {
         let lock = Self::acquire_lock(path)?;
         let conn = Connection::open(path)?;
         apply_sqlcipher_key(&conn, secret)?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
         Self::init(&conn)?;
         Ok(Store {
             conn,
@@ -854,6 +855,7 @@ impl Store {
         if secret.is_empty() { return Err(StoreError::InvalidStoreSecret("secret must not be empty".into())); }
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
         apply_sqlcipher_key(&conn,secret)?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
         let _: i64 = conn.query_row("PRAGMA user_version",[],|r| r.get(0))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Store { conn, _lock:None, protected:true })
@@ -3082,6 +3084,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     }
     if v < 18 {
         conn.execute_batch(provider::MIGRATION_V18)?;
+    }
+    if v < 19 {
+        conn.execute_batch(provider::MIGRATION_V19)?;
+    }
+    if v < 20 {
+        conn.execute_batch(provider::MIGRATION_V20)?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;

@@ -206,6 +206,23 @@ pub struct Config {
 }
 
 impl Config {
+    /// Apply the native Android files-directory mapping to the `me` account.
+    /// Callers coordinate the load and any write with `with_config_lock`.
+    pub fn prepare_mobile_for_files_dir(&mut self, base: &Path) -> Result<(), String> {
+        let archive_root = base.join("archive");
+        let sync_root = base.join("sync");
+        let cache_root = base.join("cache");
+        if let Some(account) = self.accounts.iter_mut().find(|account| account.id == "me") {
+            account.sync_root = sync_root;
+            account.archive_root = archive_root;
+            account.cache_root = cache_root;
+            account.mount_point = None;
+        } else {
+            self.accounts.push(AccountConfig { id:"me".into(), username:"me".into(), sync_root, archive_root, cache_root, mount_point:None });
+        }
+        self.validate().map_err(|errors| errors.join("; "))
+    }
+
     /// Serialize a complete read/modify/validate/save operation across processes.
     /// All concurrent config mutators must use this API; locking only the final
     /// write cannot protect against stale snapshots.
@@ -370,6 +387,23 @@ impl Config {
 mod tests {
     use super::*;
     use crate::onedrive_mode::OneDriveMode;
+
+    #[test]
+    fn mobile_files_dir_normalization_preserves_account_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.prepare_mobile_for_files_dir(dir.path()).unwrap();
+        assert_eq!(cfg.accounts[0].username, "me");
+        cfg.accounts[0].username = "existing".into();
+        cfg.accounts[0].mount_point = Some(dir.path().join("old"));
+        cfg.prepare_mobile_for_files_dir(dir.path()).unwrap();
+        assert_eq!(cfg.accounts.len(), 1);
+        assert_eq!(cfg.accounts[0].username, "existing");
+        assert_eq!(cfg.accounts[0].archive_root, dir.path().join("archive"));
+        assert_eq!(cfg.accounts[0].sync_root, dir.path().join("sync"));
+        assert_eq!(cfg.accounts[0].cache_root, dir.path().join("cache"));
+        assert!(cfg.accounts[0].mount_point.is_none());
+    }
 
     #[test]
     fn atomic_updates_merge_concurrent_config_mutations() {

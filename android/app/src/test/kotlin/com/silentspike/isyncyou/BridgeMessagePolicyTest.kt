@@ -8,8 +8,21 @@ import org.junit.Test
 
 class BridgeMessagePolicyTest {
     @Test
+    fun providerDownloadRejectsUnknownFieldsAndUnsafeAccount() {
+        fun envelope(account: String, extra: Boolean = false): String {
+            val payload = JSONObject().put("account", account).put("id", "m1")
+                .put("blob_id", "b1").put("filename", "file.txt")
+            if (extra) payload.put("url", "https://example.test")
+            return JSONObject().put("t", "native").put("id", "d1")
+                .put("op", "downloadProviderAttachment").put("payload", payload).toString()
+        }
+        assertValid(BridgeMessagePolicy.validateEnvelope(envelope("me")), "native", "d1")
+        assertInvalid(BridgeMessagePolicy.validateEnvelope(envelope("../bad")), "invalid_attachment")
+        assertInvalid(BridgeMessagePolicy.validateEnvelope(envelope("me", true)), "invalid_attachment")
+    }
+    @Test
     fun providerOperationsAcceptOnlyAccountIdentifiers() {
-        for (op in listOf("providerSignIn", "providerStatus", "providerSignOut", "providerPushSetup", "providerPushStatus", "providerQuarantineList")) {
+        for (op in listOf("providerSignIn", "providerStatus", "providerSignOut", "providerPushSetup", "providerPushStatus", "providerQuarantineList", "providerAuthResolve")) {
             fun envelope(payload: JSONObject) = JSONObject().put("t", "native").put("id", "p1")
                 .put("op", op).put("payload", payload).toString()
             assertValid(BridgeMessagePolicy.validateEnvelope(envelope(JSONObject().put("account", "me"))), "native", "p1")

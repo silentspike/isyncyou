@@ -79,4 +79,19 @@ mod tests {
         assert!(view.to_string().contains("x-custom"));
         assert!(raw.windows(8).any(|w| w == b"X-CUSTOM"));
     }
+
+    #[test]
+    fn calendar_view_retains_series_exception_and_native_task_fields() {
+        let raw = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//fixture//EN\r\nBEGIN:VEVENT\r\nUID:event\r\nDTSTAMP:20261001T100000Z\r\nDTSTART:20261028T100000Z\r\nSUMMARY:Series\r\nRRULE:FREQ=DAILY;COUNT=3\r\nEXDATE:20261029T100000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:event\r\nDTSTAMP:20261001T100000Z\r\nRECURRENCE-ID:20261030T100000Z\r\nDTSTART:20261030T110000Z\r\nSUMMARY:Changed\r\nEND:VEVENT\r\nBEGIN:VTODO\r\nUID:task\r\nDTSTAMP:20261001T100000Z\r\nSUMMARY:Task\r\nDUE:20261029T100000Z\r\nSTATUS:NEEDS-ACTION\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let view = calendar(raw).unwrap();
+        let components = view["components"].as_array().unwrap();
+        assert_eq!(components.len(),3);
+        assert_eq!(components[0]["properties"]["RRULE"][0]["value"],"FREQ=DAILY;COUNT=3");
+        assert_eq!(components[0]["properties"]["EXDATE"][0]["value"],"20261029T100000Z");
+        assert_eq!(components[1]["properties"]["RECURRENCE-ID"][0]["value"],"20261030T100000Z");
+        assert_eq!(components[2]["kind"],"VTODO");
+        assert_eq!(components[2]["properties"]["DUE"][0]["value"],"20261029T100000Z");
+        assert_eq!(components[2]["properties"]["STATUS"][0]["value"],"NEEDS-ACTION");
+        assert_eq!(view["jcal"][0],"vcalendar");
+    }
 }

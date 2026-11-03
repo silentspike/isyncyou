@@ -377,6 +377,14 @@ object BridgeMessagePolicy {
             }
         }
         when (op) {
+            "downloadProviderAttachment" -> {
+                if (!hasExactKeys(payload, setOf("account", "id", "blob_id", "filename")) ||
+                    exactString(payload, "account")?.matches(Regex("[A-Za-z0-9._-]{1,128}")) != true ||
+                    listOf("id", "blob_id", "filename").any {
+                        val value = exactString(payload, it)
+                        value.isNullOrBlank() || value.length > 512 || value.any(Char::isISOControl)
+                    }) return BridgeValidation(false, type, id, "invalid_attachment")
+            }
             "providerCreateAccount" -> {
                 if (!hasExactKeys(payload, setOf("account", "username", "origin", "client_id")) ||
                     exactString(payload, "account")?.matches(Regex("[A-Za-z0-9_-]{1,64}")) != true ||
@@ -385,7 +393,7 @@ object BridgeMessagePolicy {
                         value.isNullOrBlank() || value.length > 2048 || value.any(Char::isISOControl)
                     }) return BridgeValidation(false, type, id, "invalid_account_setup")
             }
-            "providerSignIn", "providerSignOut", "providerStatus", "providerPushSetup", "providerPushStatus", "providerQuarantineList" -> {
+            "providerSignIn", "providerSignOut", "providerStatus", "providerPushSetup", "providerPushStatus", "providerQuarantineList", "providerAuthResolve" -> {
                 val account = exactString(payload, "account")
                 if (!hasOnlyKeys(payload, setOf("account")) || account == null ||
                     !account.matches(Regex("[A-Za-z0-9._-]{1,128}"))) {

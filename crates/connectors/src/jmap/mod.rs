@@ -3,13 +3,15 @@
 use reqwest::blocking::{Client, Response};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::Duration;
 use url::Url;
 
 const CORE: &str = "urn:ietf:params:jmap:core";
 const MAIL: &str = "urn:ietf:params:jmap:mail";
+const MAIL_SHARE: &str = "urn:ietf:params:jmap:mail:share";
 const SUBMISSION: &str = "urn:ietf:params:jmap:submission";
 const VAPID: &str = "urn:ietf:params:jmap:webpush-vapid";
 const MAX_JSON: u64 = 16 * 1024 * 1024;
@@ -180,6 +182,64 @@ fn endpoint(origin: &Url, value: &str) -> Result<Url, JmapError> {
     }
     Ok(url)
 }
+
+fn event_source_endpoint(origin: &Url, template: &str) -> Result<Url, JmapError> {
+    if template.len() > 8192 || ["{types}","{closeafter}","{ping}"].iter().any(|part| template.matches(part).count() != 1) { return Err(JmapError::InvalidUrl); }
+    let value = template.replace("{types}", "Email%2CMailbox%2CCalendar%2CCalendarEvent%2CAddressBook%2CContactCard").replace("{closeafter}", "no").replace("{ping}", "30");
+    if value.contains('{') || value.contains('}') { return Err(JmapError::InvalidUrl); }
+    endpoint(origin, &value)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventDomains { pub mail: bool, pub dav: bool }
+
+fn state_change_domains(data: &str, account: &str) -> Result<EventDomains, JmapError> {
+    let value: Value = serde_json::from_str(data).map_err(|_| JmapError::InvalidResponse)?;
+    if value["@type"].as_str() != Some("StateChange") { return Err(JmapError::InvalidResponse); }
+    let changed = value["changed"].as_object().ok_or(JmapError::InvalidResponse)?;
+    let mut domains = EventDomains { mail:false, dav:false };
+    for (changed_account, types) in changed {
+        let types = types.as_object().ok_or(JmapError::InvalidResponse)?;
+        for name in ["Email","Mailbox","Calendar","CalendarEvent","AddressBook","ContactCard"] {
+            if let Some(state) = types.get(name) {
+                if state.as_str().is_none_or(str::is_empty) { return Err(JmapError::InvalidResponse); }
+                if matches!(name, "Email" | "Mailbox") { domains.mail |= changed_account == account; } else { domains.dav = true; }
+            }
+        }
+    }
+    Ok(domains)
+}
+
+fn consume_mail_event_stream(reader: &mut impl BufRead, account: &str, stop: &AtomicBool, on_change: &mut impl FnMut(EventDomains) -> Result<(), ()>) -> Result<(), JmapError> {
+    let mut event = String::new(); let mut data = String::new();
+    while !stop.load(Ordering::Relaxed) {
+        let mut line = Vec::new();
+        let n = (&mut *reader).take(65_537).read_until(b'\n', &mut line).map_err(|_| JmapError::Transport)?;
+        if n == 0 { return Ok(()); }
+        if line.len() > 65_536 { return Err(JmapError::InvalidResponse); }
+        let line = std::str::from_utf8(&line).map_err(|_| JmapError::InvalidResponse)?.trim_end_matches(['\r','\n']);
+        if line.is_empty() {
+            if event == "state" {
+                let domains = state_change_domains(&data, account)?;
+                if domains.mail || domains.dav { on_change(domains).map_err(|_| JmapError::Transport)?; }
+            } else if event == "ping" {
+                let ping: Value = serde_json::from_str(&data).map_err(|_| JmapError::InvalidResponse)?;
+                if ping["interval"].as_u64().is_none_or(|interval| interval == 0 || interval > 3600) { return Err(JmapError::InvalidResponse); }
+                on_change(EventDomains {mail:false,dav:false}).map_err(|_| JmapError::Transport)?;
+            }
+            event.clear(); data.clear(); continue;
+        }
+        if line.starts_with(':') { continue; }
+        let (field,value) = line.split_once(':').unwrap_or((line,""));
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        match field {
+            "event" => event = value.to_owned(),
+            "data" => { if !data.is_empty() { data.push('\n'); } data.push_str(value); if data.len()>65_536 { return Err(JmapError::InvalidResponse); } },
+            _ => {}
+        }
+    }
+    Ok(())
+}
 fn allowed_origin(origin: &Url, loopback: bool) -> bool {
     if loopback {
         origin.scheme() == "http" && (matches!(origin.host(), Some(url::Host::Ipv4(ip)) if ip == std::net::Ipv4Addr::LOCALHOST)
@@ -215,7 +275,9 @@ pub struct JmapClient {
     api: Url,
     download: String,
     upload: String,
+    event_source: Option<Url>,
     submission: bool,
+    mail_share: bool,
     gate: Arc<Gate>,
     max_get: usize,
     max_request: usize,
@@ -303,10 +365,18 @@ impl JmapClient {
         }
         let submission =
             capabilities.contains_key(SUBMISSION) && account_caps.contains_key(SUBMISSION);
+        let mail_share = capabilities.contains_key(MAIL_SHARE) && account_caps.contains_key(MAIL_SHARE);
         let map = |value: &str| -> Result<String, JmapError> { if let Some(public) = &public { rewrite_loopback_endpoint(&origin, public, value) } else { Ok(value.to_owned()) } };
         let api = endpoint(&origin, &map(nonempty(session.get("apiUrl"))?)?)?;
         let download = map(nonempty(session.get("downloadUrl"))?)?;
         let upload = map(nonempty(session.get("uploadUrl"))?)?;
+        let event_source = if loopback { None } else {
+            match session.get("eventSourceUrl") {
+                Some(Value::String(template)) => Some(event_source_endpoint(&origin, template)?),
+                None | Some(Value::Null) => None,
+                _ => return Err(JmapError::InvalidResponse),
+            }
+        };
         // Validate templates before retaining them; substitute safe placeholders.
         endpoint(
             &origin,
@@ -330,7 +400,9 @@ impl JmapClient {
             api,
             download,
             upload,
+            event_source,
             submission,
+            mail_share,
             gate,
             max_get,
             max_request,
@@ -358,6 +430,21 @@ impl JmapClient {
         self.vapid_public_key.as_deref()
     }
 
+    /// One bounded authenticated stream. A successful connection requests an
+    /// immediate delta pass before consuming notifications, closing the gap on
+    /// every reconnect. Caller owns lifecycle, backoff and token refresh.
+    pub fn watch_mail_events(&self, stop: &AtomicBool, mut on_change: impl FnMut(EventDomains) -> Result<(), ()>) -> Result<(), JmapError> {
+        let url = self.event_source.clone().ok_or(JmapError::Unsupported)?;
+        let response = self.http.get(url).bearer_auth(&self.token).header(reqwest::header::ACCEPT,"text/event-stream").send().map_err(|_| JmapError::Transport)?;
+        if !response.status().is_success() { return Err(JmapError::Http(response.status().as_u16())); }
+        let content_type = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+        if !content_type.split(';').next().is_some_and(|v| v.trim().eq_ignore_ascii_case("text/event-stream")) { return Err(JmapError::InvalidResponse); }
+        if stop.load(Ordering::Relaxed) { return Ok(()); }
+        on_change(EventDomains {mail:true,dav:true}).map_err(|_| JmapError::Transport)?;
+        let mut reader = BufReader::new(response);
+        consume_mail_event_stream(&mut reader, &self.account, stop, &mut on_change)
+    }
+
     fn call_payload(
         &self,
         method: &str,
@@ -367,6 +454,9 @@ impl JmapClient {
     ) -> Result<Value, JmapError> {
         let _permit = self.gate.acquire(false);
         let mut using = vec![CORE, MAIL];
+        if self.mail_share {
+            using.push(MAIL_SHARE);
+        }
         if submission {
             if !self.submission {
                 return Err(JmapError::Unsupported);
@@ -487,14 +577,14 @@ impl JmapClient {
         self.call("Mailbox/query", json!({"accountId":self.account,"position":position,"limit":limit,"calculateTotal":true}), false, false)
     }
     pub fn changes(&self, kind: &str, since: &str, max: usize) -> Result<Value, JmapError> {
-        if !matches!(kind, "Email" | "Mailbox") || since.is_empty() || max == 0 || max > 1000 {
+        if !matches!(kind, "Email" | "Mailbox" | "EmailSubmission") || since.is_empty() || max == 0 || max > 1000 {
             return Err(JmapError::InvalidResponse);
         }
         self.call(
             &format!("{kind}/changes"),
             json!({"accountId":self.account,"sinceState":since,"maxChanges":max}),
             false,
-            false,
+            kind == "EmailSubmission",
         )
     }
     pub fn query_changes(
@@ -526,7 +616,7 @@ impl JmapClient {
         {
             return Err(JmapError::InvalidResponse);
         }
-        self.call("Email/get", json!({"accountId":self.account,"ids":ids,"fetchTextBodyValues":true,"fetchHTMLBodyValues":true,"maxBodyValueBytes":max_body_value_bytes}), false, false)
+        self.call("Email/get", json!({"accountId":self.account,"ids":ids,"properties":["id","blobId","threadId","mailboxIds","keywords","size","receivedAt","messageId","inReplyTo","references","sender","from","to","cc","bcc","replyTo","subject","sentAt","hasAttachment","preview","textBody","htmlBody","bodyStructure","attachments","bodyValues","header:Importance:asText","header:Disposition-Notification-To:asAddresses"],"fetchTextBodyValues":true,"fetchHTMLBodyValues":true,"maxBodyValueBytes":max_body_value_bytes}), false, false)
     }
     pub fn query_submissions(
         &self,
@@ -962,6 +1052,50 @@ fn parse_method(payload: &Value, method: &str) -> Result<Value, JmapError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn event_stream_limits_scope_and_dispatches_only_mail_hints() {
+        let origin = Url::parse("https://mail.example/").unwrap();
+        let url = event_source_endpoint(&origin,"https://mail.example/jmap/eventsource/?types={types}&closeafter={closeafter}&ping={ping}").unwrap();
+        assert_eq!(url.query(),Some("types=Email%2CMailbox%2CCalendar%2CCalendarEvent%2CAddressBook%2CContactCard&closeafter=no&ping=30"));
+        assert!(event_source_endpoint(&origin,"https://evil.example/?types={types}&closeafter={closeafter}&ping={ping}").is_err());
+        assert!(event_source_endpoint(&origin,"/events?types={types}&ping={ping}").is_err());
+        let stream = b"event: ping\ndata: {\"interval\":30}\n\nevent: state\ndata: {\"@type\":\"StateChange\",\"changed\":{\"other\":{\"Email\":\"a\"}}}\n\nevent: state\ndata: {\"@type\":\"StateChange\",\"changed\":{\"account\":{\"Email\":\"b\"}}}\n\n";
+        let stop = AtomicBool::new(false); let mut events = Vec::new();
+        consume_mail_event_stream(&mut std::io::Cursor::new(stream),"account",&stop,&mut |domains| {events.push(domains); Ok(())}).unwrap();
+        assert_eq!(events,vec![EventDomains {mail:false,dav:false},EventDomains {mail:true,dav:false}]);
+        let oversized = vec![b'x';65_538];
+        assert_eq!(consume_mail_event_stream(&mut std::io::Cursor::new(oversized),"account",&stop,&mut |_| Ok(())),Err(JmapError::InvalidResponse));
+        assert!(state_change_domains("{}","account").is_err());
+        assert_eq!(state_change_domains(r#"{"@type":"StateChange","changed":{"shared":{"CalendarEvent":"s"}}}"#,"account").unwrap(),EventDomains {mail:false,dav:true});
+    }
+
+    #[test]
+    fn event_stream_authenticates_and_reconciles_on_connect_and_hint() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+          for _ in 0..2 {
+            let (mut socket,_) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut input = Vec::new(); let mut buf = [0u8;1024];
+            while !input.windows(4).any(|part| part == b"\r\n\r\n") { let n=socket.read(&mut buf).unwrap(); assert!(n>0); input.extend_from_slice(&buf[..n]); }
+            let request = String::from_utf8(input).unwrap().to_ascii_lowercase();
+            assert!(request.contains("authorization: bearer fixture-token"));
+            assert!(request.contains("accept: text/event-stream"));
+            let body = b"event: state\ndata: {\"@type\":\"StateChange\",\"changed\":{\"account\":{\"Email\":\"s1\"}}}\n\n";
+            write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).unwrap();
+            socket.write_all(body).unwrap();
+          }
+        });
+        let origin=Url::parse(&format!("http://{address}/")).unwrap();
+        let client=JmapClient { http:Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().unwrap(), origin:origin.clone(), token:"fixture-token".into(), account:"account".into(), api:origin.clone(), download:String::new(), upload:String::new(), event_source:Some(origin.join("/events").unwrap()), submission:false, mail_share:false, gate:account_gate("event-test",2,1), max_get:10, max_request:1024, max_upload:1024, session_state:"state".into(), vapid_public_key:None };
+        let mut events = Vec::new();
+        client.watch_mail_events(&AtomicBool::new(false),|domains| {events.push(domains); Ok(())}).unwrap();
+        client.watch_mail_events(&AtomicBool::new(false),|domains| {events.push(domains); Ok(())}).unwrap();
+        server.join().unwrap();
+        assert_eq!(events,vec![EventDomains {mail:true,dav:true},EventDomains {mail:true,dav:false},EventDomains {mail:true,dav:true},EventDomains {mail:true,dav:false}]);
+    }
     #[test]
     fn method_responses_require_matching_id_and_keep_errors_distinct() {
         assert_eq!(

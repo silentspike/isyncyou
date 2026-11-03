@@ -19,6 +19,8 @@ class PushEnrollmentWorker(context: Context, params: WorkerParameters) : Corouti
         if (!runCatching { EngineBootstrap.ensureStarted(applicationContext.filesDir).isNotEmpty() }.getOrDefault(false)) {
             return@withContext Result.retry()
         }
+        val origin = NativeEngine.nativeProviderOrigin(applicationContext.filesDir.absolutePath, account)
+        if (origin.isEmpty() || state.optString("origin") != origin) return@withContext Result.failure()
         try {
             when (state.optString("stage")) {
                 "destroy_unknown", "replacement_destroy_unknown" -> {
@@ -206,6 +208,8 @@ class PushEnrollmentWorker(context: Context, params: WorkerParameters) : Corouti
                 PushJmap.scheduleRenewal(applicationContext, instance, actualExpiry)
             }
             val before = PushEnrollmentStore.get(applicationContext, instance)?.optLong("hint_generation", 0) ?: 0
+            val pendingHint = PushEnrollmentStore.get(applicationContext, instance)?.optBoolean("hint_pending", false) == true
+            if (!pendingHint) return@withContext Result.success()
             if (NativeEngine.nativeWaitProviderRefresh(account) != 1) return@withContext Result.retry()
             PushEnrollmentStore.update(applicationContext, instance) {
                 if (it.optLong("hint_generation", 0) == before) it.put("hint_pending", false)

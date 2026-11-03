@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use zeroize::Zeroizing;
 
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 22;
 const CONTROL_KEY_DOMAIN: &[u8] = b"isyncyou-agent-control-store-root/v1";
 const CONTROL_SUBKEY_SALT: &[u8] = b"isyncyou-agent-control-store-subkeys/v1";
 const SQLCIPHER_KEY_INFO: &[u8] = b"isyncyou-agent-control-sqlcipher/v1";
@@ -35,6 +35,8 @@ const MAX_MUTATION_STAGED_BYTES: i64 = 256 * 1024 * 1024;
 const MAX_MUTATION_CHUNKS: u32 = 8_192;
 const MUTATION_FREE_SPACE_RESERVE: u64 = 128 * 1024 * 1024;
 const MAX_SEALED_MUTATION_CHUNK_BYTES: usize = isyncyou_webui::MUTATION_CHUNK_BYTES * 2 + 4 * 1024;
+pub(crate) const RECOVERY_CHUNK_BYTES:usize = 256 * 1024;
+const MAX_SEALED_RECOVERY_CHUNK_BYTES:usize = RECOVERY_CHUNK_BYTES * 2 + 4 * 1024;
 const PRODUCT_REQUEST_RECEIPT_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 const AGENT_TURN_ROUTE_DOMAIN: &str = "post:/api/v1/agent/turn";
 const MAX_AGENT_TURN_ADMISSIONS: i64 = 8;
@@ -127,6 +129,29 @@ pub(crate) enum ProductRequestBinding {
     Existing,
     Conflict,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryStagedObject {
+    pub generation:String, pub object:String, pub version:String,
+    pub operation_id:String, pub confirmation:String, pub size:u64, pub sha256:String,
+    pub selection_sha256:String, pub kind:String, pub encoding:String, pub state:String, pub label:String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryBatchManifest {
+    pub approval_sha256:String, pub origin:String, pub entry:String, pub collection:String,
+    pub objects:Vec<RecoveryStagedObject>, pub uid_map:std::collections::BTreeMap<String,String>, pub execution_order:Vec<String>, pub projections:Vec<serde_json::Value>,
+}
+
+pub(crate) fn recovery_batch_effect(manifest:&RecoveryBatchManifest) -> serde_json::Value {
+    serde_json::json!({"origin":manifest.origin,"collection":manifest.collection,"entry":manifest.entry,"approval_sha256":manifest.approval_sha256,
+        "objects":manifest.objects.iter().map(|item| serde_json::json!({"generation":item.generation,"object":item.object,"version":item.version,"kind":item.kind,"label":item.label,"sha256":item.sha256,"size":item.size,"operation_id":item.operation_id})).collect::<Vec<_>>(),
+        "execution_order":manifest.execution_order,"uid_mapping_count":manifest.uid_map.len(),"projections":manifest.projections,
+        "effects":"Creates personal recovered copies with new identities; scheduling participants and alarms are removed. Timezone definitions are shown as untrusted data and their rules are not independently validated."})
+}
+pub(crate) fn recovery_batch_effect_sha256(manifest:&RecoveryBatchManifest)->String { sha256_hex(recovery_batch_effect(manifest).to_string().as_bytes()) }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -652,7 +677,7 @@ impl AgentControlStore {
                    request_id TEXT NOT NULL,
                    turn_id TEXT NOT NULL,
                    owner_binding TEXT NOT NULL,
-                   code TEXT NOT NULL CHECK(code IN ('executing','completed','failed','outcome_unknown')),
+                   code TEXT NOT NULL CHECK(code IN ('executing','completed','failed','provider_rejected','provider_conflict','outcome_unknown')),
                    created_at_ms INTEGER NOT NULL,
                    logical_bytes INTEGER NOT NULL,
                    FOREIGN KEY(pending_id) REFERENCES confirmation_intents(intent_id) ON DELETE CASCADE
@@ -731,6 +756,29 @@ impl AgentControlStore {
                  );
                  CREATE INDEX IF NOT EXISTS mutation_intent_owner_state
                    ON mutation_intents(owner_binding,state,expires_at_ms);
+                 CREATE TABLE IF NOT EXISTS mutation_upload_bindings (
+                   intent_id TEXT PRIMARY KEY NOT NULL,
+                   installation_account_binding TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS recovery_batches (
+                   batch_id TEXT PRIMARY KEY NOT NULL, identity_binding TEXT NOT NULL,
+                   manifest_sha256 TEXT NOT NULL, sealed_manifest BLOB NOT NULL,
+                   total_bytes INTEGER NOT NULL, object_count INTEGER NOT NULL,
+                   expires_at_ms INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('staging','ready','approved','claimed','confirmed')),
+                   pending_id TEXT NOT NULL DEFAULT '', action_hash TEXT NOT NULL DEFAULT '', logical_bytes INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS recovery_requests (
+                   batch_id TEXT PRIMARY KEY NOT NULL, identity_binding TEXT NOT NULL,
+                   request_sha256 TEXT NOT NULL, sealed_request BLOB NOT NULL,
+                   expires_at_ms INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','approved','claimed')),
+                   pending_id TEXT NOT NULL DEFAULT '', action_hash TEXT NOT NULL DEFAULT '', logical_bytes INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS recovery_batch_chunks (
+                   batch_id TEXT NOT NULL, object_index INTEGER NOT NULL, chunk_index INTEGER NOT NULL,
+                   chunk_bytes INTEGER NOT NULL, chunk_sha256 TEXT NOT NULL,
+                   PRIMARY KEY(batch_id,object_index,chunk_index),
+                   FOREIGN KEY(batch_id) REFERENCES recovery_batches(batch_id) ON DELETE CASCADE
+                 );
                  CREATE TABLE IF NOT EXISTS mutation_request_bindings (
                    request_id TEXT PRIMARY KEY NOT NULL,
                    route_domain TEXT NOT NULL,
@@ -864,6 +912,10 @@ impl AgentControlStore {
         ensure_request_key_column(&migration, "product_request_bindings")?;
         ensure_integer_column(&migration, "mutation_intents", "terminal_expires_at_ms")?;
         ensure_text_column(&migration, "mutation_intents", "result_digest", "")?;
+        ensure_text_column(&migration, "mutation_upload_bindings", "dispatch_state", "unknown")?;
+        migration.execute_batch("CREATE TRIGGER IF NOT EXISTS mutation_upload_state_update AFTER UPDATE OF state ON mutation_intents BEGIN UPDATE mutation_upload_bindings SET dispatch_state=CASE NEW.state WHEN 'committing' THEN 'dispatching' WHEN 'committed' THEN 'settled' WHEN 'cancelled' THEN 'not_dispatched' WHEN 'expired' THEN 'not_dispatched' ELSE dispatch_state END WHERE intent_id=NEW.intent_id; END;").map_err(|_| "control_store_migration_failed")?;
+        migration.execute_batch("CREATE TRIGGER IF NOT EXISTS recovery_batch_approval_consumed AFTER UPDATE OF state ON confirmation_intents WHEN NEW.state='consumed' AND OLD.state='pending' BEGIN UPDATE recovery_batches SET state='approved' WHERE pending_id=NEW.intent_id AND action_hash=NEW.action_hash AND state='ready'; END;").map_err(|_| "control_store_migration_failed")?;
+        migration.execute_batch("CREATE TRIGGER IF NOT EXISTS recovery_request_approval_consumed AFTER UPDATE OF state ON confirmation_intents WHEN NEW.state='consumed' AND OLD.state='pending' BEGIN UPDATE recovery_requests SET state='approved' WHERE pending_id=NEW.intent_id AND action_hash=NEW.action_hash AND state='prepared'; END;").map_err(|_| "control_store_migration_failed")?;
         ensure_integer_column(&migration, "mutation_request_bindings", "expires_at_ms")?;
         for table in [
             "confirmation_intents",
@@ -898,6 +950,22 @@ impl AgentControlStore {
             )
             .map_err(|_| "control_store_migration_failed")?;
         let stored_schema_version = stored_control_schema_version(&migration)?;
+        if matches!(stored_schema_version, Some(1..=18)) {
+            migration.execute_batch(
+                "DROP INDEX IF EXISTS pending_confirm_projection_created;
+                 ALTER TABLE pending_confirm_projections RENAME TO pending_confirm_projections_v18;
+                 CREATE TABLE pending_confirm_projections (
+                   pending_id TEXT PRIMARY KEY NOT NULL, account_id TEXT NOT NULL, session_id TEXT NOT NULL,
+                   request_id TEXT NOT NULL, turn_id TEXT NOT NULL, owner_binding TEXT NOT NULL,
+                   code TEXT NOT NULL CHECK(code IN ('executing','completed','failed','provider_rejected','provider_conflict','outcome_unknown')),
+                   created_at_ms INTEGER NOT NULL, logical_bytes INTEGER NOT NULL,
+                   FOREIGN KEY(pending_id) REFERENCES confirmation_intents(intent_id) ON DELETE CASCADE
+                 );
+                 INSERT INTO pending_confirm_projections SELECT * FROM pending_confirm_projections_v18;
+                 DROP TABLE pending_confirm_projections_v18;
+                 CREATE INDEX pending_confirm_projection_created ON pending_confirm_projections(code,created_at_ms);"
+            ).map_err(|_| "control_store_migration_failed")?;
+        }
         if matches!(stored_schema_version, Some(1..=8)) {
             migrate_mutation_retention_v9(&migration, &row_wrap_key, migration_now_ms)?;
         }
@@ -1151,6 +1219,21 @@ impl AgentControlStore {
                 )
                 .map_err(|_| "control_store_unavailable")?;
             consume_reaper_budget(&mut remaining, mutation_bindings)?;
+            let recovery_requests=connection.execute("DELETE FROM recovery_requests WHERE batch_id IN (SELECT batch_id FROM recovery_requests WHERE state='prepared' AND expires_at_ms<=?1 LIMIT ?2)",params![now,remaining]).map_err(|_| "control_store_unavailable")?;
+            consume_reaper_budget(&mut remaining,recovery_requests)?;
+            let expired_batches:Vec<String> = {
+                let mut stmt=connection.prepare("SELECT batch_id FROM recovery_batches WHERE state NOT IN ('approved','claimed') AND expires_at_ms<=?1 LIMIT ?2").map_err(|_| "control_store_unavailable")?;
+                let rows=stmt.query_map(params![now,remaining],|r| r.get(0)).map_err(|_| "control_store_unavailable")?;
+                rows.collect::<Result<Vec<_>,_>>().map_err(|_| "control_store_unavailable")?
+            };
+            for id in &expired_batches {
+                let staging=self.root.join("recovery-staging");
+                if staging.exists() { create_private_directory(&staging)?; }
+                let path=staging.join(id);
+                match std::fs::symlink_metadata(&path) { Ok(_) => { remove_private_tree_no_follow(&path)?; sync_directory(path.parent().ok_or("control_store_unavailable")?).map_err(|_| "control_store_unavailable")?; }, Err(e) if e.kind()==std::io::ErrorKind::NotFound => {}, Err(_) => return Err("control_store_unavailable".into()) }
+                connection.execute("DELETE FROM recovery_batches WHERE batch_id=?1",params![id]).map_err(|_| "control_store_unavailable")?;
+            }
+            consume_reaper_budget(&mut remaining,expired_batches.len())?;
             let reaped = confirmations
                 .saturating_add(presence)
                 .saturating_add(pairing)
@@ -1166,6 +1249,7 @@ impl AgentControlStore {
                 .saturating_add(product_receipts)
                 .saturating_add(product_bindings)
                 .saturating_add(mutation_bindings);
+            let reaped=reaped.saturating_add(expired_batches.len()).saturating_add(recovery_requests);
             Ok(reaped)
         })();
         // Always checkpoint, including after a partially successful bounded pass.
@@ -1316,7 +1400,7 @@ impl AgentControlStore {
         code: &str,
         now_ms: u64,
     ) -> Result<(), String> {
-        if !matches!(code, "completed" | "failed" | "provider_rejected" | "outcome_unknown") {
+        if !matches!(code, "completed" | "failed" | "provider_rejected" | "provider_conflict" | "outcome_unknown") {
             return Err("control_store_unavailable".into());
         }
         let connection = self
@@ -1420,6 +1504,392 @@ impl AgentControlStore {
         Ok(URL_SAFE_NO_PAD.encode(context.finish()))
     }
 
+    pub(crate) fn owned_mutation_state(&self, owner:&str, intent_id:&str) -> Result<Option<String>,String> {
+        let binding = self.mutation_owner_binding(owner)?;
+        let connection = self.connection.lock().map_err(|_| "mutation_intent_failed")?;
+        connection.query_row("SELECT state FROM mutation_intents WHERE intent_id=?1 AND owner_binding=?2", params![intent_id,binding], |row| row.get(0)).optional().map_err(|_| "mutation_intent_failed".into())
+    }
+
+    fn upload_installation_binding(&self, intent_id:&str, account:&str, origin:&str, subject:&str) -> Result<String,String> {
+        if [intent_id,account,origin,subject].iter().any(|value| value.is_empty() || value.len() > 4096) { return Err("mutation_intent_invalid".into()); }
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &self.row_wrap_key[..]);
+        let mut context = ring::hmac::Context::with_key(&key);
+        context.update(b"isyncyou-upload-installation-binding-v1\0");
+        for value in [self.installation_principal.as_str(),intent_id,account,origin,subject] { context.update(&(value.len() as u64).to_be_bytes()); context.update(value.as_bytes()); }
+        Ok(URL_SAFE_NO_PAD.encode(context.sign().as_ref()))
+    }
+
+    pub(crate) fn bind_upload_installation(&self, owner:&str, intent_id:&str, account:&str, origin:&str, subject:&str) -> Result<(),String> {
+        let owner_binding = self.mutation_owner_binding(owner)?;
+        let binding = self.upload_installation_binding(intent_id,account,origin,subject)?;
+        let mut connection = self.connection.lock().map_err(|_| "mutation_intent_failed")?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| "mutation_intent_failed")?;
+        let owned:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM mutation_intents WHERE intent_id=?1 AND owner_binding=?2 AND state='active')",params![intent_id,owner_binding],|row| row.get(0)).map_err(|_| "mutation_intent_failed")?;
+        if !owned { return Err("mutation_intent_not_found".into()); }
+        let existing:Option<String> = tx.query_row("SELECT installation_account_binding FROM mutation_upload_bindings WHERE intent_id=?1",params![intent_id],|row| row.get(0)).optional().map_err(|_| "mutation_intent_failed")?;
+        if let Some(existing) = existing { if !constant_time_eq(existing.as_bytes(),binding.as_bytes()) { return Err("mutation_intent_conflict".into()); } }
+        else {
+            let count:i64 = tx.query_row("SELECT COUNT(*) FROM mutation_upload_bindings",[],|row| row.get(0)).map_err(|_| "mutation_intent_failed")?;
+            if count >= 4096 { return Err("mutation_intent_capacity".into()); }
+            tx.execute("INSERT INTO mutation_upload_bindings(intent_id,installation_account_binding,dispatch_state) VALUES(?1,?2,'staged')",params![intent_id,binding]).map_err(|_| "mutation_intent_failed")?;
+        }
+        tx.commit().map_err(|_| "mutation_intent_failed".into())
+    }
+
+    pub(crate) fn stable_upload_state(&self, intent_id:&str, account:&str, origin:&str, subject:&str) -> Result<Option<String>,String> {
+        let expected = self.upload_installation_binding(intent_id,account,origin,subject)?;
+        let connection = self.connection.lock().map_err(|_| "mutation_intent_failed")?;
+        let row:Option<(String,String,Option<String>)> = connection.query_row("SELECT b.installation_account_binding,b.dispatch_state,m.state FROM mutation_upload_bindings b LEFT JOIN mutation_intents m ON m.intent_id=b.intent_id WHERE b.intent_id=?1",params![intent_id],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().map_err(|_| "mutation_intent_failed")?;
+        let Some((binding,dispatch_state,state)) = row else { return Ok(None); };
+        if !constant_time_eq(binding.as_bytes(),expected.as_bytes()) { return Ok(None); }
+        Ok(Some(state.unwrap_or(dispatch_state)))
+    }
+
+    pub(crate) fn stable_upload_ids(&self,account:&str,origin:&str,subject:&str)->Result<Vec<String>,String> {
+        let connection=self.connection.lock().map_err(|_| "mutation_intent_failed")?;
+        let mut stmt=connection.prepare("SELECT intent_id,installation_account_binding FROM mutation_upload_bindings ORDER BY intent_id LIMIT 4096").map_err(|_| "mutation_intent_failed")?;
+        let rows=stmt.query_map([],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).map_err(|_| "mutation_intent_failed")?;
+        let mut ids=Vec::new();
+        for row in rows { let (id,binding)=row.map_err(|_| "mutation_intent_failed")?; let expected=self.upload_installation_binding(&id,account,origin,subject)?; if constant_time_eq(binding.as_bytes(),expected.as_bytes()) { ids.push(id); } }
+        Ok(ids)
+    }
+
+    pub(crate) fn store_recovery_request(&self,batch_id:&str,account:&str,origin:&str,subject:&str,request:&serde_json::Value,expires:u64,now:u64)->Result<String,String> {
+        if batch_id.is_empty() || batch_id.len()>128 || !batch_id.bytes().all(|b| b.is_ascii_alphanumeric()||b==b'-'||b==b'_') || expires<=now || expires.saturating_sub(now)>24*60*60*1000 { return Err("recovery_request_invalid".into()); }
+        let plain=serde_json::to_vec(request).map_err(|_| "recovery_request_invalid")?; if plain.len()>128*1024 { return Err("recovery_request_invalid".into()); }
+        let digest=sha256_hex(&plain); let binding=self.upload_installation_binding(&format!("recovery-request:{batch_id}"),account,origin,subject)?;
+        let sealed=seal_row(&self.row_wrap_key,"recovery-request",batch_id,&plain)?; let bytes=sealed.len() as i64;
+        let mut connection=self.connection.lock().map_err(|_| "control_store_unavailable")?; let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| "control_store_unavailable")?;
+        enforce_control_quota(&tx,bytes)?;
+        tx.execute("INSERT INTO recovery_requests(batch_id,identity_binding,request_sha256,sealed_request,expires_at_ms,state,logical_bytes) VALUES(?1,?2,?3,?4,?5,'prepared',?6)",params![batch_id,binding,digest,sealed,u64_to_i64(expires)?,bytes]).map_err(|_| "recovery_request_conflict")?;
+        tx.commit().map_err(|_| "control_store_unavailable")?; Ok(digest)
+    }
+
+    pub(crate) fn bind_recovery_request(&self,batch_id:&str,account:&str,origin:&str,subject:&str,digest:&str,pending_id:&str,action_hash:&str,now:u64)->Result<(),String> {
+        let binding=self.upload_installation_binding(&format!("recovery-request:{batch_id}"),account,origin,subject)?;
+        let mut connection=self.connection.lock().map_err(|_| "control_store_unavailable")?; let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| "control_store_unavailable")?;
+        let pending:Vec<u8>=tx.query_row("SELECT sealed_payload FROM confirmation_intents WHERE intent_id=?1 AND account_id=?2 AND owner_binding=?3 AND action_hash=?4 AND state='pending' AND expires_at_ms>?5",params![pending_id,account,self.installation_binding,action_hash,u64_to_i64(now)?],|r| r.get(0)).map_err(|_| "recovery_confirmation_required")?;
+        let secret:PendingSecretV1=serde_json::from_slice(&open_row(&self.row_wrap_key,"agent-tool",pending_id,&pending)?).map_err(|_| "recovery_confirmation_required")?;
+        let sealed:Vec<u8>=tx.query_row("SELECT sealed_request FROM recovery_requests WHERE batch_id=?1 AND identity_binding=?2 AND request_sha256=?3 AND state='prepared' AND pending_id='' AND expires_at_ms>?4",params![batch_id,binding,digest,u64_to_i64(now)?],|r| r.get(0)).map_err(|_| "recovery_request_unavailable")?;
+        let plain=open_row(&self.row_wrap_key,"recovery-request",batch_id,&sealed)?; if sha256_hex(&plain)!=digest { return Err("recovery_request_invalid".into()); }
+        let request:serde_json::Value=serde_json::from_slice(&plain).map_err(|_| "recovery_request_invalid")?;
+        match secret.action { ToolAction::LiveWrite { account:ref a,service:ref s,ref change,.. } if secret.version==1 && a==account && s=="calendar" && change.get("verb").and_then(serde_json::Value::as_str)==Some("recovery_jobs") && change.get("batch_id").and_then(serde_json::Value::as_str)==Some(batch_id) && change.get("request_sha256").and_then(serde_json::Value::as_str)==Some(digest) && change.get("effect")==request.get("effect") => {}, _=>return Err("recovery_confirmation_required".into()) }
+        if tx.execute("UPDATE recovery_requests SET pending_id=?1,action_hash=?2 WHERE batch_id=?3 AND state='prepared' AND pending_id=''",params![pending_id,action_hash,batch_id]).map_err(|_| "control_store_unavailable")?!=1 { return Err("recovery_request_conflict".into()); }
+        tx.commit().map_err(|_| "control_store_unavailable".into())
+    }
+
+    pub(crate) fn claim_recovery_request(&self,batch_id:&str,account:&str,origin:&str,subject:&str,digest:&str,pending_id:&str,action_hash:&str,now:u64)->Result<serde_json::Value,String> {
+        let binding=self.upload_installation_binding(&format!("recovery-request:{batch_id}"),account,origin,subject)?;
+        let mut connection=self.connection.lock().map_err(|_| "control_store_unavailable")?; let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| "control_store_unavailable")?;
+        let sealed:Vec<u8>=tx.query_row("SELECT sealed_request FROM recovery_requests WHERE batch_id=?1 AND identity_binding=?2 AND request_sha256=?3 AND pending_id=?4 AND action_hash=?5 AND state='approved'",params![batch_id,binding,digest,pending_id,action_hash],|r| r.get(0)).map_err(|_| "recovery_request_unavailable")?;
+        let _=now;
+        let plain=open_row(&self.row_wrap_key,"recovery-request",batch_id,&sealed)?; if sha256_hex(&plain)!=digest { return Err("recovery_request_invalid".into()); }
+        let request=serde_json::from_slice(&plain).map_err(|_| "recovery_request_invalid")?;
+        if tx.execute("UPDATE recovery_requests SET state='claimed' WHERE batch_id=?1 AND state='approved'",params![batch_id]).map_err(|_| "control_store_unavailable")?!=1 { return Err("recovery_request_conflict".into()); }
+        tx.commit().map_err(|_| "control_store_unavailable")?; Ok(request)
+    }
+
+    pub(crate) fn read_claimed_recovery_request(&self,batch_id:&str,account:&str,origin:&str,subject:&str)->Result<serde_json::Value,String> {
+        let binding=self.upload_installation_binding(&format!("recovery-request:{batch_id}"),account,origin,subject)?;
+        let connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
+        let (sealed,digest):(Vec<u8>,String)=connection.query_row("SELECT sealed_request,request_sha256 FROM recovery_requests WHERE batch_id=?1 AND identity_binding=?2 AND state='claimed'",params![batch_id,binding],|r| Ok((r.get(0)?,r.get(1)?))).map_err(|_| "recovery_request_unavailable")?;
+        let plain=open_row(&self.row_wrap_key,"recovery-request",batch_id,&sealed)?;
+        if sha256_hex(&plain)!=digest { return Err("recovery_request_invalid".into()); }
+        serde_json::from_slice(&plain).map_err(|_| "recovery_request_invalid".into())
+    }
+
+    pub(crate) fn recovery_request_refs(&self,batch_id:&str,account:&str,origin:&str,subject:&str)->Result<(String,String,String,String),String> {
+        let binding=self.upload_installation_binding(&format!("recovery-request:{batch_id}"),account,origin,subject)?;
+        let connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
+        connection.query_row("SELECT state,request_sha256,pending_id,action_hash FROM recovery_requests WHERE batch_id=?1 AND identity_binding=?2 AND state IN ('approved','claimed')",params![batch_id,binding],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(|_| "recovery_request_unavailable".into())
+    }
+
+    pub(crate) fn list_recovery_requests(&self,account:&str,origin:&str,subject:&str,service:&str)->Result<Vec<serde_json::Value>,String> {
+        let kind=match service { "calendar"=>"event", "todo"=>"task", _=>return Err("recovery_service_mismatch".into()) };
+        let connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
+        let mut stmt=connection.prepare("SELECT batch_id,identity_binding,sealed_request,request_sha256,state FROM recovery_requests WHERE state IN ('approved','claimed') ORDER BY batch_id LIMIT 4096").map_err(|_| "control_store_unavailable")?;
+        let rows=stmt.query_map([],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Vec<u8>>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?))).map_err(|_| "control_store_unavailable")?;
+        let mut result=Vec::new();
+        for row in rows { let (id,binding,sealed,digest,state)=row.map_err(|_| "control_store_unavailable")?; let expected=self.upload_installation_binding(&format!("recovery-request:{id}"),account,origin,subject)?; if !constant_time_eq(binding.as_bytes(),expected.as_bytes()) { continue; } let plain=open_row(&self.row_wrap_key,"recovery-request",&id,&sealed)?; if sha256_hex(&plain)!=digest { return Err("recovery_request_invalid".into()); } let value:serde_json::Value=serde_json::from_slice(&plain).map_err(|_| "recovery_request_invalid")?; let Some(objects)=value.pointer("/effect/objects").and_then(serde_json::Value::as_array) else { return Err("recovery_request_invalid".into()); }; if objects.is_empty() || objects.iter().any(|item| item.get("kind").and_then(serde_json::Value::as_str)!=Some(kind)) { continue; } result.push(serde_json::json!({"batch_id":id,"state":state})); if result.len()>=100 { break; } }
+        Ok(result)
+    }
+
+    pub(crate) fn list_recovery_requests_for_ui(&self,account:&str,origin:&str,subject:&str,after:&str)->Result<serde_json::Value,String> {
+        if after.len()>128 || after.chars().any(char::is_control) { return Err("recovery_request_invalid".into()); }
+        let connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
+        let mut stmt=connection.prepare("SELECT batch_id,identity_binding,sealed_request,request_sha256,state FROM recovery_requests WHERE state IN ('approved','claimed') AND batch_id>?1 ORDER BY batch_id").map_err(|_| "control_store_unavailable")?;
+        let rows=stmt.query_map(params![after],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Vec<u8>>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?))).map_err(|_| "control_store_unavailable")?;
+        let mut items=Vec::new(); let mut last=None;
+        for row in rows {
+            let (id,binding,sealed,digest,state)=row.map_err(|_| "control_store_unavailable")?;
+            let expected=self.upload_installation_binding(&format!("recovery-request:{id}"),account,origin,subject)?;
+            if !constant_time_eq(binding.as_bytes(),expected.as_bytes()) { continue; }
+            let plain=open_row(&self.row_wrap_key,"recovery-request",&id,&sealed)?;
+            if sha256_hex(&plain)!=digest { return Err("recovery_request_invalid".into()); }
+            let value:serde_json::Value=serde_json::from_slice(&plain).map_err(|_| "recovery_request_invalid")?;
+            let objects=value.pointer("/effect/objects").and_then(serde_json::Value::as_array).ok_or("recovery_request_invalid")?;
+            last=Some(id.clone());
+            items.push(serde_json::json!({"batch_id":id,"state":state,"objects":objects}));
+            if items.len()>=100 { break; }
+        }
+        let next=if items.len()>=100 { last } else { None };
+        Ok(serde_json::json!({"items":items,"next":next}))
+    }
+
+    /// Internal-only broker staging. No web mutation purpose can create these rows.
+    /// The manifest contains references and effects, never original bytes.
+    pub(crate) fn reserve_recovery_batch(&self, batch_id:&str, account:&str, origin:&str, subject:&str, manifest:&RecoveryBatchManifest, expires_at_ms:u64, now_ms:u64) -> Result<String,String> {
+        use std::collections::HashSet;
+        if batch_id.is_empty() || batch_id.len()>128 || !batch_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') || manifest.origin!=origin || manifest.objects.is_empty() || manifest.objects.len()>32 || !manifest.approval_sha256.is_empty() || !manifest.uid_map.is_empty() || !manifest.execution_order.is_empty() || !manifest.projections.is_empty() || [&manifest.entry,&manifest.collection].iter().any(|s| s.is_empty() || s.len()>4096 || s.chars().any(char::is_control)) || expires_at_ms<=now_ms || expires_at_ms.saturating_sub(now_ms)>24*60*60*1000 { return Err("recovery_batch_invalid".into()); }
+        let mut total = 0u64; let mut operations = HashSet::new(); let mut confirmations = HashSet::new(); let mut sources = HashSet::new();
+        for item in &manifest.objects {
+            if !valid_sha256(&item.generation) || !valid_sha256(&item.object) || !valid_sha256(&item.version) || !valid_sha256(&item.sha256) || !valid_sha256(&item.selection_sha256) || !matches!(item.kind.as_str(),"event" | "task") || item.encoding!="raw" || item.state!="available" || item.label.chars().count()>512 || item.label.chars().any(char::is_control) || item.size==0 || item.size>16*1024*1024 || item.operation_id.is_empty() || item.operation_id.len()>128 || !item.operation_id.bytes().all(|b| b.is_ascii_alphanumeric() || b==b'-' || b==b'_') || item.confirmation.is_empty() || item.confirmation.len()>512 || item.confirmation.chars().any(char::is_control) || !operations.insert(&item.operation_id) || !confirmations.insert(&item.confirmation) || !sources.insert((&item.generation,&item.object,&item.version)) { return Err("recovery_batch_invalid".into()); }
+            total=total.checked_add(item.size).ok_or("recovery_batch_invalid")?;
+        }
+        if total > MAX_MUTATION_STAGED_BYTES as u64 { return Err("recovery_batch_capacity".into()); }
+        let plaintext=serde_json::to_vec(manifest).map_err(|_| "recovery_batch_invalid")?;
+        if plaintext.len()>4*1024*1024 { return Err("recovery_batch_invalid".into()); }
+        let digest=sha256_hex(&plaintext); let binding=self.upload_installation_binding(&format!("recovery-batch:{batch_id}"),account,origin,subject)?;
+        let sealed=seal_row(&self.row_wrap_key,"recovery-batch-manifest",batch_id,&plaintext)?;
+        let logical=i64::try_from(sealed.len()).map_err(|_| "recovery_batch_invalid")?;
+        self.require_mutation_free_space(total.saturating_mul(2))?;
+        let mut connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
+        let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| "control_store_unavailable")?;
+        let existing:Option<(String,String,i64)>=tx.query_row("SELECT identity_binding,manifest_sha256,expires_at_ms FROM recovery_batches WHERE batch_id=?1",params![batch_id],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|_| "control_store_unavailable")?;
+        if let Some((old_binding,old_digest,expiry))=existing {
+            if !constant_time_eq(old_binding.as_bytes(),binding.as_bytes()) || old_digest!=digest || expiry<=u64_to_i64(now_ms)? { return Err("recovery_batch_conflict".into()); }
+            tx.commit().map_err(|_| "control_store_unavailable")?; return Ok(digest);
+        }
+        let reserved:i64=tx.query_row("SELECT COALESCE((SELECT SUM(total_bytes) FROM mutation_intents WHERE state IN ('active','committing')),0)+COALESCE((SELECT SUM(total_bytes) FROM recovery_batches),0)",[],|r| r.get(0)).map_err(|_| "control_store_unavailable")?;
+        if reserved.saturating_add(total as i64)>MAX_MUTATION_STAGED_BYTES { return Err("recovery_batch_capacity".into()); }
+        enforce_control_quota(&tx,logical)?;
+        tx.execute("INSERT INTO recovery_batches(batch_id,identity_binding,manifest_sha256,sealed_manifest,total_bytes,object_count,expires_at_ms,state,logical_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7,'staging',?8)",params![batch_id,binding,digest,sealed,total as i64,manifest.objects.len() as i64,u64_to_i64(expires_at_ms)?,logical]).map_err(|_| "recovery_batch_conflict")?;
+        tx.commit().map_err(|_| "control_store_unavailable")?; Ok(digest)
+    }
+
+    pub(crate) fn put_recovery_batch_chunk(&self, batch_id:&str, account:&str, origin:&str, subject:&str, object_index:usize, chunk_index:u32, bytes:&[u8], now_ms:u64) -> Result<(),String> {
+        if bytes.is_empty() || bytes.len()>RECOVERY_CHUNK_BYTES { return Err("recovery_batch_invalid".into()); }
+        let binding=self.upload_installation_binding(&format!("recovery-batch:{batch_id}"),account,origin,subject)?;
+        let mut connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
+        let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| "control_store_unavailable")?;
+        let row:Option<(String,Vec<u8>)>=tx.query_row("SELECT identity_binding,sealed_manifest FROM recovery_batches WHERE batch_id=?1 AND state='staging' AND expires_at_ms>?2",params![batch_id,u64_to_i64(now_ms)?],|r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(|_| "control_store_unavailable")?;
+        let Some((stored,sealed))=row else { return Err("recovery_batch_unavailable".into()); };
+        if !constant_time_eq(binding.as_bytes(),stored.as_bytes()) { return Err("recovery_batch_unavailable".into()); }
+        let manifest:RecoveryBatchManifest=serde_json::from_slice(&open_row(&self.row_wrap_key,"recovery-batch-manifest",batch_id,&sealed)?).map_err(|_| "recovery_batch_invalid")?;
+        let item=manifest.objects.get(object_index).ok_or("recovery_batch_invalid")?;
+        let offset=u64::from(chunk_index).checked_mul(RECOVERY_CHUNK_BYTES as u64).ok_or("recovery_batch_invalid")?;
+        let expected=item.size.saturating_sub(offset).min(RECOVERY_CHUNK_BYTES as u64);
+        if expected==0 || bytes.len() as u64 != expected { return Err("recovery_batch_invalid".into()); }
+        let chunk_sha=sha256_hex(bytes); let chunk_id=format!("{batch_id}:{object_index}:{chunk_index}");
+        let existing:Option<(i64,String)>=tx.query_row("SELECT chunk_bytes,chunk_sha256 FROM recovery_batch_chunks WHERE batch_id=?1 AND object_index=?2 AND chunk_index=?3",params![batch_id,object_index as i64,chunk_index],|r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(|_| "control_store_unavailable")?;
+        let path=self.root.join("recovery-staging").join(batch_id).join(format!("{object_index}-{chunk_index}.chunk"));
+        if let Some((len,hash))=existing {
+            if len != bytes.len() as i64 || hash != chunk_sha { return Err("recovery_batch_conflict".into()); }
+            let saved=read_private_regular_file_bounded(&path,MAX_SEALED_RECOVERY_CHUNK_BYTES).map_err(|_| "recovery_batch_unavailable")?;
+            if open_row(&self.row_wrap_key,"recovery-batch-chunk",&chunk_id,&saved)? != bytes { return Err("recovery_batch_conflict".into()); }
+            tx.commit().map_err(|_| "control_store_unavailable")?; return Ok(());
+        }
+        create_private_directory(&self.root.join("recovery-staging"))?;
+        create_private_directory(path.parent().ok_or("recovery_batch_invalid")?)?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => return Err("recovery_batch_conflict".into()),
+            Ok(_) => { reject_symlink_or_insecure_file(&path).map_err(|_| "recovery_batch_unavailable")?; remove_private_regular_file_and_sync(&path).map_err(|_| "recovery_batch_unavailable")?; },
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound => {},
+            Err(_) => return Err("recovery_batch_unavailable".into()),
+        }
+        let encrypted=seal_row(&self.row_wrap_key,"recovery-batch-chunk",&chunk_id,bytes)?;
+        write_private_atomic(&path,&encrypted)?;
+        if tx.execute("INSERT INTO recovery_batch_chunks(batch_id,object_index,chunk_index,chunk_bytes,chunk_sha256) VALUES(?1,?2,?3,?4,?5)",params![batch_id,object_index as i64,chunk_index,bytes.len() as i64,chunk_sha]).is_err() { let _=remove_private_regular_file_and_sync(&path); return Err("control_store_unavailable".into()); }
+        tx.commit().map_err(|_| "control_store_unavailable".into())
+    }
+
+    fn read_recovery_batch_chunks(&self, tx:&rusqlite::Transaction<'_>, batch_id:&str, manifest:&RecoveryBatchManifest) -> Result<Vec<Vec<u8>>,String> {
+        let staging=self.root.join("recovery-staging"); let batch_dir=staging.join(batch_id);
+        if !staging.exists() || !batch_dir.exists() { return Err("recovery_batch_unavailable".into()); }
+        create_private_directory(&staging)?; create_private_directory(&batch_dir)?;
+        let mut result=Vec::with_capacity(manifest.objects.len());
+        let mut count=0usize;
+        for (object_index,item) in manifest.objects.iter().enumerate() {
+            let mut bytes=Vec::with_capacity(usize::try_from(item.size).map_err(|_| "recovery_batch_invalid")?);
+            let expected_chunks=(item.size+(RECOVERY_CHUNK_BYTES as u64)-1)/(RECOVERY_CHUNK_BYTES as u64);
+            for chunk_index in 0..expected_chunks {
+                let (length,digest):(i64,String)=tx.query_row("SELECT chunk_bytes,chunk_sha256 FROM recovery_batch_chunks WHERE batch_id=?1 AND object_index=?2 AND chunk_index=?3",params![batch_id,object_index as i64,chunk_index as i64],|r| Ok((r.get(0)?,r.get(1)?))).map_err(|_| "recovery_batch_unavailable")?;
+                let path=batch_dir.join(format!("{object_index}-{chunk_index}.chunk"));
+                let sealed=read_private_regular_file_bounded(&path,MAX_SEALED_RECOVERY_CHUNK_BYTES).map_err(|_| "recovery_batch_unavailable")?;
+                let chunk=open_row(&self.row_wrap_key,"recovery-batch-chunk",&format!("{batch_id}:{object_index}:{chunk_index}"),&sealed)?;
+                if chunk.len() as i64 != length || sha256_hex(&chunk)!=digest { return Err("recovery_batch_invalid".into()); }
+                bytes.extend_from_slice(&chunk); count+=1;
+            }
+            if bytes.len() as u64 != item.size || sha256_hex(&bytes)!=item.sha256 { return Err("recovery_batch_invalid".into()); }
+            result.push(bytes);
+        }
+        let recorded:i64=tx.query_row("SELECT COUNT(*) FROM recovery_batch_chunks WHERE batch_id=?1",params![batch_id],|r| r.get(0)).map_err(|_| "control_store_unavailable")?;
+        if recorded != count as i64 { return Err("recovery_batch_invalid".into()); }
+        Ok(result)
+    }
+
+    pub(crate) fn inspect_staged_recovery_batch(&self, batch_id:&str, account:&str, origin:&str, subject:&str, now_ms:u64) -> Result<(RecoveryBatchManifest,Vec<Vec<u8>>),String> {
+        let binding=self.upload_installation_binding(&format!("recovery-batch:{batch_id}"),account,origin,subject)?;
+        let mut connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
+        let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| "control_store_unavailable")?;
+        let (sealed,digest):(Vec<u8>,String)=tx.query_row("SELECT sealed_manifest,manifest_sha256 FROM recovery_batches WHERE batch_id=?1 AND identity_binding=?2 AND state='staging' AND expires_at_ms>?3",params![batch_id,binding,u64_to_i64(now_ms)?],|r| Ok((r.get(0)?,r.get(1)?))).map_err(|_| "recovery_batch_unavailable")?;
+        let bytes=open_row(&self.row_wrap_key,"recovery-batch-manifest",batch_id,&sealed)?;
+        if sha256_hex(&bytes)!=digest { return Err("recovery_batch_invalid".into()); }
+        let manifest:RecoveryBatchManifest=serde_json::from_slice(&bytes).map_err(|_| "recovery_batch_invalid")?;
+        let originals=self.read_recovery_batch_chunks(&tx,batch_id,&manifest)?;
+        tx.commit().map_err(|_| "control_store_unavailable")?; Ok((manifest,originals))
+    }
+
+    pub(crate) fn recovery_staging_info(&self,batch_id:&str,account:&str,origin:&str,subject:&str,now_ms:u64)->Result<Option<(String,String,RecoveryBatchManifest)>,String> {
+        let binding=self.upload_installation_binding(&format!("recovery-batch:{batch_id}"),account,origin,subject)?;
+        let connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
+        let row:Option<(String,String,Vec<u8>)>=connection.query_row("SELECT state,manifest_sha256,sealed_manifest FROM recovery_batches WHERE batch_id=?1 AND identity_binding=?2 AND state IN ('staging','ready') AND expires_at_ms>?3",params![batch_id,binding,u64_to_i64(now_ms)?],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|_| "control_store_unavailable")?;
+        let Some((state,digest,sealed))=row else { return Ok(None); };
+        let plain=open_row(&self.row_wrap_key,"recovery-batch-manifest",batch_id,&sealed)?; if sha256_hex(&plain)!=digest { return Err("recovery_batch_invalid".into()); }
+        let manifest=serde_json::from_slice(&plain).map_err(|_| "recovery_batch_invalid")?;
+        Ok(Some((state,digest,manifest)))
+    }
+
+    pub(crate) fn finalize_recovery_batch_manifest(&self, batch_id:&str, account:&str, origin:&str, subject:&str, updated:&RecoveryBatchManifest, now_ms:u64) -> Result<String,String> {
+        if !valid_sha256(&updated.approval_sha256) || updated.projections.len()!=updated.objects.len() || updated.execution_order.len()!=updated.objects.len() || updated.execution_order.iter().collect::<std::collections::HashSet<_>>().len()!=updated.objects.len() || updated.execution_order.iter().any(|op| !updated.objects.iter().any(|item| &item.operation_id==op)) { return Err("recovery_batch_invalid".into()); }
+        let binding=self.upload_installation_binding(&format!("recovery-batch:{batch_id}"),account,origin,subject)?;
+        let plain=serde_json::to_vec(updated).map_err(|_| "recovery_batch_invalid")?;
+        if plain.len()>4*1024*1024 { return Err("recovery_batch_invalid".into()); }
+        let digest=sha256_hex(&plain); let sealed_new=seal_row(&self.row_wrap_key,"recovery-batch-manifest",batch_id,&plain)?;
+        let mut connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
+        let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| "control_store_unavailable")?;
+        let (sealed_old,logical):(Vec<u8>,i64)=tx.query_row("SELECT sealed_manifest,logical_bytes FROM recovery_batches WHERE batch_id=?1 AND identity_binding=?2 AND state='staging' AND expires_at_ms>?3",params![batch_id,binding,u64_to_i64(now_ms)?],|r| Ok((r.get(0)?,r.get(1)?))).map_err(|_| "recovery_batch_unavailable")?;
+        let old_plain=open_row(&self.row_wrap_key,"recovery-batch-manifest",batch_id,&sealed_old)?;
+        let previous:RecoveryBatchManifest=serde_json::from_slice(&old_plain).map_err(|_| "recovery_batch_invalid")?;
+        if !previous.approval_sha256.is_empty() {
+            if old_plain != plain { return Err("recovery_batch_conflict".into()); }
+            tx.commit().map_err(|_| "control_store_unavailable")?; return Ok(digest);
+        }
+        if previous.objects!=updated.objects || previous.origin!=updated.origin || previous.entry!=updated.entry || previous.collection!=updated.collection { return Err("recovery_batch_conflict".into()); }
+        let bytes=i64::try_from(sealed_new.len()).map_err(|_| "recovery_batch_invalid")?;
+        enforce_control_quota(&tx,bytes.saturating_sub(logical))?;
+        tx.execute("UPDATE recovery_batches SET sealed_manifest=?1,manifest_sha256=?2,logical_bytes=?3 WHERE batch_id=?4 AND state='staging'",params![sealed_new,digest,bytes,batch_id]).map_err(|_| "control_store_unavailable")?;
+        tx.commit().map_err(|_| "control_store_unavailable")?; Ok(digest)
+    }
+
+    pub(crate) fn ready_recovery_batch(&self, batch_id:&str, account:&str, origin:&str, subject:&str, now_ms:u64) -> Result<(),String> {
+        let binding=self.upload_installation_binding(&format!("recovery-batch:{batch_id}"),account,origin,subject)?;
+        let mut connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
+        let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| "control_store_unavailable")?;
+        let sealed:Vec<u8>=tx.query_row("SELECT sealed_manifest FROM recovery_batches WHERE batch_id=?1 AND identity_binding=?2 AND state='staging' AND expires_at_ms>?3",params![batch_id,binding,u64_to_i64(now_ms)?],|r| r.get(0)).map_err(|_| "recovery_batch_unavailable")?;
+        let manifest:RecoveryBatchManifest=serde_json::from_slice(&open_row(&self.row_wrap_key,"recovery-batch-manifest",batch_id,&sealed)?).map_err(|_| "recovery_batch_invalid")?;
+        if !valid_sha256(&manifest.approval_sha256) { return Err("recovery_batch_invalid".into()); }
+        let _ = self.read_recovery_batch_chunks(&tx,batch_id,&manifest)?;
+        if tx.execute("UPDATE recovery_batches SET state='ready' WHERE batch_id=?1 AND state='staging'",params![batch_id]).map_err(|_| "control_store_unavailable")? != 1 { return Err("recovery_batch_conflict".into()); }
+        tx.commit().map_err(|_| "control_store_unavailable".into())
+    }
+
+    pub(crate) fn bind_recovery_batch_confirmation(&self, batch_id:&str, account:&str, origin:&str, subject:&str, manifest_sha256:&str, pending_id:&str, action_hash:&str, now_ms:u64) -> Result<(),String> {
+        let binding=self.upload_installation_binding(&format!("recovery-batch:{batch_id}"),account,origin,subject)?;
+        let mut connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
+        let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| "control_store_unavailable")?;
+        let sealed:Vec<u8>=tx.query_row("SELECT sealed_payload FROM confirmation_intents WHERE intent_id=?1 AND account_id=?2 AND owner_binding=?3 AND action_hash=?4 AND state='pending' AND expires_at_ms>?5",params![pending_id,account,self.installation_binding,action_hash,u64_to_i64(now_ms)?],|r| r.get(0)).map_err(|_| "recovery_confirmation_required")?;
+        let secret:PendingSecretV1=serde_json::from_slice(&open_row(&self.row_wrap_key,"agent-tool",pending_id,&sealed)?).map_err(|_| "recovery_confirmation_required")?;
+        let (manifest_sealed,old_pending):(Vec<u8>,String)=tx.query_row("SELECT sealed_manifest,pending_id FROM recovery_batches WHERE batch_id=?1 AND identity_binding=?2 AND manifest_sha256=?3 AND state='ready' AND expires_at_ms>?4",params![batch_id,binding,manifest_sha256,u64_to_i64(now_ms)?],|r| Ok((r.get(0)?,r.get(1)?))).map_err(|_| "recovery_batch_unavailable")?;
+        if !old_pending.is_empty() {
+            let old:Option<(String,i64)>=tx.query_row("SELECT state,expires_at_ms FROM confirmation_intents WHERE intent_id=?1",params![old_pending],|r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(|_| "control_store_unavailable")?;
+            if old.is_some_and(|(state,expiry)| state=="consumed" || (state=="pending" && expiry>now_ms as i64)) { return Err("recovery_batch_conflict".into()); }
+        }
+        let manifest_bytes=open_row(&self.row_wrap_key,"recovery-batch-manifest",batch_id,&manifest_sealed)?;
+        if sha256_hex(&manifest_bytes)!=manifest_sha256 { return Err("recovery_batch_invalid".into()); }
+        let manifest:RecoveryBatchManifest=serde_json::from_slice(&manifest_bytes).map_err(|_| "recovery_batch_invalid")?;
+        match secret.action { ToolAction::LiveWrite { account:ref a, service:ref s, ref change,.. } if secret.version==1 && a==account && s=="calendar" && change.get("verb").and_then(serde_json::Value::as_str)==Some("recovery_batch_import") && change.get("batch_id").and_then(serde_json::Value::as_str)==Some(batch_id) && change.get("manifest_sha256").and_then(serde_json::Value::as_str)==Some(manifest_sha256) && change.get("approval_sha256").and_then(serde_json::Value::as_str)==Some(manifest.approval_sha256.as_str()) && change.get("effect_sha256").and_then(serde_json::Value::as_str)==Some(recovery_batch_effect_sha256(&manifest).as_str()) => {}, _ => return Err("recovery_confirmation_required".into()) }
+        if tx.execute("UPDATE recovery_batches SET pending_id=?1,action_hash=?2 WHERE batch_id=?3 AND state='ready'",params![pending_id,action_hash,batch_id]).map_err(|_| "control_store_unavailable")? != 1 { return Err("recovery_batch_conflict".into()); }
+        tx.commit().map_err(|_| "control_store_unavailable".into())
+    }
+
+    /// A first claim requires the consumed approval. Reconciliation may read a
+    /// claimed batch under the same installation/subject; it must use engine
+    /// journal readback and never resend an unknown native write.
+    pub(crate) fn load_recovery_batch(&self, batch_id:&str, account:&str, origin:&str, subject:&str, manifest_sha256:&str, pending_id:&str, action_hash:&str, first_claim:bool, now_ms:u64) -> Result<(RecoveryBatchManifest,Vec<Vec<u8>>),String> {
+        let binding=self.upload_installation_binding(&format!("recovery-batch:{batch_id}"),account,origin,subject)?;
+        let mut connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
+        let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| "control_store_unavailable")?;
+        let expected_state=if first_claim { "approved" } else { "claimed" };
+        let sealed:Vec<u8>=tx.query_row("SELECT sealed_manifest FROM recovery_batches WHERE batch_id=?1 AND identity_binding=?2 AND manifest_sha256=?3 AND pending_id=?4 AND action_hash=?5 AND state=?6",params![batch_id,binding,manifest_sha256,pending_id,action_hash,expected_state],|r| r.get(0)).map_err(|_| "recovery_batch_unavailable")?;
+        let _=now_ms;
+        let manifest_bytes=open_row(&self.row_wrap_key,"recovery-batch-manifest",batch_id,&sealed)?;
+        if sha256_hex(&manifest_bytes)!=manifest_sha256 { return Err("recovery_batch_invalid".into()); }
+        let manifest:RecoveryBatchManifest=serde_json::from_slice(&manifest_bytes).map_err(|_| "recovery_batch_invalid")?;
+        let originals=self.read_recovery_batch_chunks(&tx,batch_id,&manifest)?;
+        if first_claim && tx.execute("UPDATE recovery_batches SET state='claimed' WHERE batch_id=?1 AND state='approved'",params![batch_id]).map_err(|_| "control_store_unavailable")? != 1 { return Err("recovery_batch_conflict".into()); }
+        tx.commit().map_err(|_| "control_store_unavailable")?;
+        Ok((manifest,originals))
+    }
+
+    /// Called only after the engine has confirmed every item. Preserve the
+    /// authenticated manifest as a status receipt while releasing chunk quota.
+    pub(crate) fn complete_recovery_batch(&self, batch_id:&str, account:&str, origin:&str, subject:&str, manifest_sha256:&str) -> Result<(),String> {
+        let binding=self.upload_installation_binding(&format!("recovery-batch:{batch_id}"),account,origin,subject)?;
+        let request_binding=self.upload_installation_binding(&format!("recovery-request:{batch_id}"),account,origin,subject)?;
+        let connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
+        let changed=connection.execute("UPDATE recovery_batches SET state='confirmed',total_bytes=0 WHERE batch_id=?1 AND identity_binding=?2 AND manifest_sha256=?3 AND state='claimed'",params![batch_id,binding,manifest_sha256]).map_err(|_| "control_store_unavailable")?;
+        if changed!=1 { return Err("recovery_batch_unavailable".into()); }
+        let staging=self.root.join("recovery-staging"); let path=staging.join(batch_id);
+        if staging.exists() { create_private_directory(&staging)?; }
+        match std::fs::symlink_metadata(&path) { Ok(_) => { remove_private_tree_no_follow(&path)?; sync_directory(&staging).map_err(|_| "control_store_unavailable")?; }, Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{}, Err(_)=>return Err("control_store_unavailable".into()) }
+        connection.execute("DELETE FROM recovery_batch_chunks WHERE batch_id=?1",params![batch_id]).map_err(|_| "control_store_unavailable")?;
+        connection.execute("DELETE FROM recovery_requests WHERE batch_id=?1 AND identity_binding=?2 AND state='claimed'",params![batch_id,request_binding]).map_err(|_| "control_store_unavailable")?;
+        checkpoint_secure_erasure(&connection).map_err(|_| "control_store_unavailable".into())
+    }
+
+    pub(crate) fn recovery_batch_refs(&self,batch_id:&str,account:&str,origin:&str,subject:&str)->Result<(String,String,String,String),String> {
+        let binding=self.upload_installation_binding(&format!("recovery-batch:{batch_id}"),account,origin,subject)?;
+        let connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
+        connection.query_row("SELECT state,manifest_sha256,pending_id,action_hash FROM recovery_batches WHERE batch_id=?1 AND identity_binding=?2 AND state IN ('approved','claimed','confirmed')",params![batch_id,binding],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(|_| "recovery_batch_unavailable".into())
+    }
+
+    pub(crate) fn pending_recovery_effect(&self,pending_id:&str,action_hash:&str,account:&str,origin:&str,subject:&str,now_ms:u64)->Result<serde_json::Value,String> {
+        let connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
+        let sealed:Vec<u8>=connection.query_row("SELECT sealed_payload FROM confirmation_intents WHERE intent_id=?1 AND account_id=?2 AND owner_binding=?3 AND action_hash=?4 AND state='pending' AND expires_at_ms>?5",params![pending_id,account,self.installation_binding,action_hash,u64_to_i64(now_ms)?],|r| r.get(0)).map_err(|_| "recovery_confirmation_required")?;
+        let secret:PendingSecretV1=serde_json::from_slice(&open_row(&self.row_wrap_key,"agent-tool",pending_id,&sealed)?).map_err(|_| "recovery_confirmation_required")?;
+        let ToolAction::LiveWrite { account:action_account,service,change,.. }=secret.action else { return Err("recovery_confirmation_required".into()); };
+        if secret.version!=1 || action_account!=account || service!="calendar" || change.get("verb").and_then(serde_json::Value::as_str)!=Some("recovery_batch_import") { return Err("recovery_confirmation_required".into()); }
+        let batch=change.get("batch_id").and_then(serde_json::Value::as_str).ok_or("recovery_confirmation_required")?;
+        let digest=change.get("manifest_sha256").and_then(serde_json::Value::as_str).ok_or("recovery_confirmation_required")?;
+        let binding=self.upload_installation_binding(&format!("recovery-batch:{batch}"),account,origin,subject)?;
+        let manifest_sealed:Vec<u8>=connection.query_row("SELECT sealed_manifest FROM recovery_batches WHERE batch_id=?1 AND identity_binding=?2 AND manifest_sha256=?3 AND pending_id=?4 AND action_hash=?5 AND state='ready'",params![batch,binding,digest,pending_id,action_hash],|r| r.get(0)).map_err(|_| "recovery_batch_unavailable")?;
+        let plain=open_row(&self.row_wrap_key,"recovery-batch-manifest",batch,&manifest_sealed)?; if sha256_hex(&plain)!=digest { return Err("recovery_batch_invalid".into()); }
+        let manifest:RecoveryBatchManifest=serde_json::from_slice(&plain).map_err(|_| "recovery_batch_invalid")?;
+        if change.get("approval_sha256").and_then(serde_json::Value::as_str)!=Some(manifest.approval_sha256.as_str()) || change.get("effect_sha256").and_then(serde_json::Value::as_str)!=Some(recovery_batch_effect_sha256(&manifest).as_str()) { return Err("recovery_confirmation_required".into()); }
+        Ok(recovery_batch_effect(&manifest))
+    }
+
+    pub(crate) fn cancel_stable_upload_staging(&self, request_id:&str, intent_id:&str, account:&str, origin:&str, subject:&str, now_ms:u64) -> Result<(),String> {
+        let expected = self.upload_installation_binding(intent_id,account,origin,subject)?;
+        let mut connection = self.connection.lock().map_err(|_| "mutation_intent_failed")?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| "mutation_intent_failed")?;
+        let row:Option<(String,String)> = tx.query_row("SELECT b.installation_account_binding,m.state FROM mutation_upload_bindings b JOIN mutation_intents m ON m.intent_id=b.intent_id WHERE b.intent_id=?1",params![intent_id],|row| Ok((row.get(0)?,row.get(1)?))).optional().map_err(|_| "mutation_intent_failed")?;
+        let Some((binding,state)) = row else { return Err("mutation_intent_not_found".into()); };
+        if !constant_time_eq(binding.as_bytes(),expected.as_bytes()) { return Err("mutation_intent_not_found".into()); }
+        let _ = bind_mutation_request(&tx,request_id,"post:/api/v1/mutation-intent/attachment-cancel",&[expected.as_bytes(),intent_id.as_bytes()],now_ms)?;
+        if state == "active" {
+            let expiry = now_ms.checked_add(MUTATION_TERMINAL_TTL_MS).ok_or("mutation_intent_failed")?;
+            if tx.execute("UPDATE mutation_intents SET state='cancelled',purpose_json=X'',result_json=NULL,terminal_expires_at_ms=?2,logical_bytes=512 WHERE intent_id=?1 AND state='active'",params![intent_id,u64_to_i64(expiry)?]).map_err(|_| "mutation_intent_failed")? != 1 { return Err("mutation_intent_conflict".into()); }
+        } else if !matches!(state.as_str(),"cancelled" | "expired") { return Err("mutation_intent_conflict".into()); }
+        tx.commit().map_err(|_| "mutation_intent_failed")?;
+        self.remove_mutation_chunk_files(&connection,intent_id)?;
+        checkpoint_secure_erasure(&connection).map_err(|_| "mutation_intent_failed".into())
+    }
+
+    pub(crate) fn release_confirmed_upload_binding(&self,request_id:&str,intent_id:&str,account:&str,origin:&str,subject:&str,now_ms:u64)->Result<(),String> {
+        let expected=self.upload_installation_binding(intent_id,account,origin,subject)?;
+        let mut connection=self.connection.lock().map_err(|_| "mutation_intent_failed")?;
+        let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| "mutation_intent_failed")?;
+        let row:Option<String>=tx.query_row("SELECT installation_account_binding FROM mutation_upload_bindings WHERE intent_id=?1",params![intent_id],|r| r.get(0)).optional().map_err(|_| "mutation_intent_failed")?;
+        let Some(binding)=row else { return Err("mutation_intent_not_found".into()); };
+        if !constant_time_eq(binding.as_bytes(),expected.as_bytes()) { return Err("mutation_intent_not_found".into()); }
+        let _=bind_mutation_request(&tx,request_id,"post:/api/v1/mutation-intent/attachment-release",&[expected.as_bytes(),intent_id.as_bytes()],now_ms)?;
+        tx.execute("DELETE FROM mutation_upload_bindings WHERE intent_id=?1",params![intent_id]).map_err(|_| "mutation_intent_failed")?;
+        tx.commit().map_err(|_| "mutation_intent_failed")?;
+        checkpoint_secure_erasure(&connection).map_err(|_| "mutation_intent_failed".into())
+    }
+
     fn require_mutation_free_space(&self, additional_bytes: u64) -> Result<(), String> {
         let required = additional_bytes
             .checked_add(MUTATION_FREE_SPACE_RESERVE)
@@ -1437,7 +1907,8 @@ impl AgentControlStore {
     ) -> Result<isyncyou_webui::MutationIntentInfo, String> {
         let max_bytes = match &request.purpose {
             isyncyou_webui::MutationPurpose::OnedriveUpload { .. }
-            | isyncyou_webui::MutationPurpose::OnedriveReplace { .. } => 64 * 1024 * 1024,
+            | isyncyou_webui::MutationPurpose::OnedriveReplace { .. }
+            | isyncyou_webui::MutationPurpose::MailAttachment { .. } => 64 * 1024 * 1024,
             isyncyou_webui::MutationPurpose::MailBody { .. }
             | isyncyou_webui::MutationPurpose::OnenoteBody { .. } => 2 * 1024 * 1024,
             isyncyou_webui::MutationPurpose::TodoDeleteBatch { .. } => 512 * 1024,
@@ -1557,8 +2028,7 @@ impl AgentControlStore {
             .map_err(|_| "mutation_intent_failed")?;
         let reserved: i64 = transaction
             .query_row(
-                "SELECT COALESCE(SUM(total_bytes),0) FROM mutation_intents
-                 WHERE state IN ('active','committing')",
+                "SELECT COALESCE((SELECT SUM(total_bytes) FROM mutation_intents WHERE state IN ('active','committing')),0) + COALESCE((SELECT SUM(total_bytes) FROM recovery_batches),0)",
                 [],
                 |row| row.get(0),
             )
@@ -5246,6 +5716,9 @@ fn ensure_text_column(
             "ALTER TABLE agent_turn_admissions ADD COLUMN state TEXT NOT NULL DEFAULT 'active'"
                 .into()
         }
+        ("mutation_upload_bindings", "dispatch_state", "unknown") => {
+            "ALTER TABLE mutation_upload_bindings ADD COLUMN dispatch_state TEXT NOT NULL DEFAULT 'unknown'".into()
+        }
         ("pairing_claims", "local_account", "") | ("pairing_claims", "recovery_request_id", "") => {
             format!("ALTER TABLE pairing_claims ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
         }
@@ -6193,7 +6666,7 @@ fn initialize_metadata(
         }
         match schema.parse::<i64>() {
             Ok(SCHEMA_VERSION) => {}
-            Ok(1..=17) if SCHEMA_VERSION == 18 => {
+            Ok(1..=21) if SCHEMA_VERSION == 22 => {
                 connection
                     .execute(
                         "UPDATE control_metadata SET value=?1 WHERE key='schema_version'",
@@ -6304,7 +6777,9 @@ fn enforce_control_quota(connection: &Connection, additional_bytes: i64) -> Resu
                COALESCE((SELECT SUM(logical_bytes) FROM product_request_bindings),0) +
                COALESCE((SELECT SUM(logical_bytes) FROM product_request_receipts),0) +
                COALESCE((SELECT SUM(logical_bytes) FROM agent_turn_admissions),0) +
-               COALESCE((SELECT SUM(logical_bytes) FROM mutation_intents),0)",
+               COALESCE((SELECT SUM(logical_bytes) FROM mutation_intents),0) +
+               COALESCE((SELECT SUM(logical_bytes) FROM recovery_requests),0) +
+               COALESCE((SELECT SUM(logical_bytes) FROM recovery_batches),0)",
             [],
             |row| row.get(0),
         )
@@ -6337,8 +6812,7 @@ fn enforce_mutation_reservation_quota(
         .map_err(|_| "mutation_intent_failed")?;
     let reserved: i64 = connection
         .query_row(
-            "SELECT COALESCE(SUM(total_bytes),0) FROM mutation_intents
-             WHERE state IN ('active','committing')",
+            "SELECT COALESCE((SELECT SUM(total_bytes) FROM mutation_intents WHERE state IN ('active','committing')),0) + COALESCE((SELECT SUM(total_bytes) FROM recovery_batches),0)",
             [],
             |row| row.get(0),
         )
@@ -8755,6 +9229,77 @@ mod tests {
     }
 
     #[test]
+    fn recovery_batch_chunks_reserve_verify_claim_and_reconcile_without_replay() {
+        let root=temp_root("recovery-batch"); let credentials=credential_store(&root);
+        let control=Arc::new(AgentControlStore::open(&root,&credentials,INSTALLATION_PRINCIPAL,1).unwrap());
+        let registry=PendingRegistry::with_persistence(control.clone()); let account=owner().account;
+        let mut manifest=RecoveryBatchManifest { approval_sha256:String::new(), origin:"https://example.test".into(), entry:"/.well-known/caldav".into(), collection:"/recovered/".into(), uid_map:std::collections::BTreeMap::new(), execution_order:Vec::new(), projections:Vec::new(), objects:vec![RecoveryStagedObject { generation:"b".repeat(64),object:"c".repeat(64),version:"d".repeat(64),operation_id:"operation-1".into(),confirmation:"confirmation-1".into(),size:3,sha256:sha256_hex(b"abc"),selection_sha256:"e".repeat(64),kind:"event".into(),encoding:"raw".into(),state:"available".into(),label:"Meeting".into() }] };
+        control.reserve_recovery_batch("batch-1",&account,"https://example.test","subject-a",&manifest,60_000,1_000).unwrap();
+        assert!(control.put_recovery_batch_chunk("batch-1",&account,"https://example.test","subject-b",0,0,b"abc",1_001).is_err());
+        control.put_recovery_batch_chunk("batch-1",&account,"https://example.test","subject-a",0,0,b"abc",1_001).unwrap();
+        assert!(control.put_recovery_batch_chunk("batch-1",&account,"https://example.test","subject-a",0,0,b"xyz",1_001).is_err());
+        let chunk=control.root.join("recovery-staging/batch-1/0-0.chunk");
+        let saved=std::fs::read(&chunk).unwrap();
+        write_private_atomic(&chunk,b"tampered").unwrap();
+        assert!(control.inspect_staged_recovery_batch("batch-1",&account,"https://example.test","subject-a",1_002).is_err());
+        write_private_atomic(&chunk,&saved).unwrap();
+        assert_eq!(control.inspect_staged_recovery_batch("batch-1",&account,"https://example.test","subject-a",1_002).unwrap().1,vec![b"abc".to_vec()]);
+        manifest.approval_sha256="a".repeat(64);
+        manifest.execution_order.push("operation-1".into());
+        manifest.projections.push(json!({"kind":"event","title":"Meeting"}));
+        let digest=control.finalize_recovery_batch_manifest("batch-1",&account,"https://example.test","subject-a",&manifest,1_002).unwrap();
+        control.ready_recovery_batch("batch-1",&account,"https://example.test","subject-a",1_002).unwrap();
+        let action=ToolAction::LiveWrite { account:account.clone(),service:"calendar".into(),target:None,change:json!({"verb":"recovery_batch_import","batch_id":"batch-1","manifest_sha256":digest,"approval_sha256":manifest.approval_sha256,"effect_sha256":recovery_batch_effect_sha256(&manifest)}) };
+        let (pending,token)=registry.register_bound(action,"restore batch",1_003,50_000,owner()).unwrap();
+        assert!(control.bind_recovery_batch_confirmation("batch-1",&account,"https://example.test","subject-a",&"f".repeat(64),&pending.id,&pending.action_hash,1_004).is_err());
+        control.bind_recovery_batch_confirmation("batch-1",&account,"https://example.test","subject-a",&digest,&pending.id,&pending.action_hash,1_004).unwrap();
+        assert!(control.pending_recovery_effect(&pending.id,&pending.action_hash,&account,"https://example.test","other-subject",1_004).is_err());
+        let effect=control.pending_recovery_effect(&pending.id,&pending.action_hash,&account,"https://example.test","subject-a",1_004).unwrap();
+        assert_eq!(effect["projections"][0]["title"],"Meeting");
+        assert!(!effect.to_string().contains("abc"));
+        assert!(control.load_recovery_batch("batch-1",&account,"https://example.test","subject-a",&digest,&pending.id,&pending.action_hash,true,1_005).is_err());
+        assert!(matches!(registry.confirm(&pending.id,&token,&pending.action_hash,&owner_proof(),1_006),PendingConfirmOutcome::Confirmed(_)));
+        let (_,originals)=control.load_recovery_batch("batch-1",&account,"https://example.test","subject-a",&digest,&pending.id,&pending.action_hash,true,1_007).unwrap(); assert_eq!(originals,vec![b"abc".to_vec()]);
+        assert!(control.load_recovery_batch("batch-1",&account,"https://example.test","subject-a",&digest,&pending.id,&pending.action_hash,true,1_008).is_err());
+        drop(registry); drop(control);
+        let reopened=AgentControlStore::open(&root,&credentials,INSTALLATION_PRINCIPAL,1).unwrap();
+        assert!(reopened.load_recovery_batch("batch-1",&account,"https://example.test","other-subject",&digest,&pending.id,&pending.action_hash,false,1_009).is_err());
+        assert_eq!(reopened.load_recovery_batch("batch-1",&account,"https://example.test","subject-a",&digest,&pending.id,&pending.action_hash,false,1_010).unwrap().1,vec![b"abc".to_vec()]);
+        reopened.reap_expired(60_000,256).unwrap(); assert!(reopened.root.join("recovery-staging/batch-1").exists());
+        reopened.complete_recovery_batch("batch-1",&account,"https://example.test","subject-a",&digest).unwrap();
+        assert!(!reopened.root.join("recovery-staging/batch-1").exists());
+        drop(reopened); std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_request_claim_survives_new_session_without_second_approval() {
+        let root=temp_root("recovery-request"); let credentials=credential_store(&root);
+        let control=Arc::new(AgentControlStore::open(&root,&credentials,INSTALLATION_PRINCIPAL,1).unwrap());
+        let registry=PendingRegistry::with_persistence(control.clone()); let account=owner().account;
+        let request=json!({"device":"device-a","effect":{"objects":[{"kind":"event","label":"Meeting"}]},"selections":[{"operation_id":"op-1"}]});
+        let digest=control.store_recovery_request("batch-1",&account,"https://example.test","subject-a",&request,60_000,1_000).unwrap();
+        let action=ToolAction::LiveWrite {account:account.clone(),service:"calendar".into(),target:None,change:json!({"verb":"recovery_jobs","batch_id":"batch-1","request_sha256":digest,"effect":request["effect"]})};
+        let (pending,token)=registry.register_bound(action,"request recovery",1_000,50_000,owner()).unwrap();
+        control.bind_recovery_request("batch-1",&account,"https://example.test","subject-a",&digest,&pending.id,&pending.action_hash,1_001).unwrap();
+        assert!(control.claim_recovery_request("batch-1",&account,"https://example.test","subject-a",&digest,&pending.id,&pending.action_hash,1_002).is_err());
+        assert!(matches!(registry.confirm(&pending.id,&token,&pending.action_hash,&owner_proof(),1_003),PendingConfirmOutcome::Confirmed(_)));
+        drop(registry); drop(control);
+        let reopened=AgentControlStore::open(&root,&credentials,INSTALLATION_PRINCIPAL,1).unwrap();
+        assert!(reopened.claim_recovery_request("batch-1",&account,"https://example.test","other-subject",&digest,&pending.id,&pending.action_hash,1_004).is_err());
+        assert_eq!(reopened.claim_recovery_request("batch-1",&account,"https://example.test","subject-a",&digest,&pending.id,&pending.action_hash,1_005).unwrap(),request);
+        assert!(reopened.claim_recovery_request("batch-1",&account,"https://example.test","subject-a",&digest,&pending.id,&pending.action_hash,1_006).is_err());
+        assert_eq!(reopened.read_claimed_recovery_request("batch-1",&account,"https://example.test","subject-a").unwrap(),request);
+        let visible=reopened.list_recovery_requests_for_ui(&account,"https://example.test","subject-a","").unwrap();
+        assert_eq!(visible["items"][0]["batch_id"],"batch-1");
+        assert_eq!(visible["items"][0]["objects"][0]["label"],"Meeting");
+        assert!(!visible.to_string().contains("device-a"));
+        assert!(reopened.list_recovery_requests_for_ui(&account,"https://example.test","other-subject","").unwrap()["items"].as_array().unwrap().is_empty());
+        assert!(reopened.list_recovery_requests_for_ui("other-account","https://example.test","subject-a","").unwrap()["items"].as_array().unwrap().is_empty());
+        assert!(reopened.list_recovery_requests_for_ui(&account,"https://example.test","subject-a","batch-1").unwrap()["items"].as_array().unwrap().is_empty());
+        drop(reopened); std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn confirmation_store_rejects_session_request_or_turn_owner_mismatch_without_consumption() {
         let root = temp_root("owner-mismatch");
         let store = credential_store(&root);
@@ -9124,17 +9669,43 @@ mod tests {
         let credentials = credential_store(&root);
         let persistence = Arc::new(AgentControlStore::open(&root, &credentials, INSTALLATION_PRINCIPAL, 1).unwrap());
         let registry = PendingRegistry::with_persistence(persistence.clone());
-        for (timestamp, code) in [(1_000, "provider_rejected"), (2_000, "outcome_unknown")] {
+        for (timestamp, code) in [(1_000, "provider_rejected"), (2_000, "provider_conflict"), (3_000, "outcome_unknown")] {
             let (pending, token) = registry.register_bound(backup_action(), "backup", timestamp, 60_000, owner()).unwrap();
             assert!(matches!(registry.confirm(&pending.id, &token, &pending.action_hash, &owner_proof(), timestamp + 1), PendingConfirmOutcome::Confirmed(_)));
             persistence.finish_pending_confirmation(&pending.id, code, timestamp + 2).unwrap();
         }
         let projections = persistence.pending_confirm_projections(8).unwrap();
-        assert_eq!(projections.len(), 2);
+        assert_eq!(projections.len(), 3);
         assert_eq!(projections[0].code, "provider_rejected");
-        assert_eq!(projections[1].code, "outcome_unknown");
+        assert_eq!(projections[1].code, "provider_conflict");
+        assert_eq!(projections[2].code, "outcome_unknown");
         drop(registry);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_projection_migration_preserves_inflight_and_accepts_conflict() {
+        let root = temp_root("confirm-projection-v18");
+        let credentials = credential_store(&root);
+        let persistence = Arc::new(AgentControlStore::open(&root, &credentials, INSTALLATION_PRINCIPAL, 1).unwrap());
+        let registry = PendingRegistry::with_persistence(persistence.clone());
+        let (pending, token) = registry.register_bound(backup_action(), "backup", 1_000, 60_000, owner()).unwrap();
+        assert!(matches!(registry.confirm(&pending.id, &token, &pending.action_hash, &owner_proof(), 1_001), PendingConfirmOutcome::Confirmed(_)));
+        {
+            let connection = persistence.connection.lock().unwrap();
+            connection.execute_batch("DROP INDEX pending_confirm_projection_created;
+                ALTER TABLE pending_confirm_projections RENAME TO pending_confirm_projections_v19;
+                CREATE TABLE pending_confirm_projections (pending_id TEXT PRIMARY KEY NOT NULL, account_id TEXT NOT NULL, session_id TEXT NOT NULL, request_id TEXT NOT NULL, turn_id TEXT NOT NULL, owner_binding TEXT NOT NULL, code TEXT NOT NULL CHECK(code IN ('executing','completed','failed','outcome_unknown')), created_at_ms INTEGER NOT NULL, logical_bytes INTEGER NOT NULL, FOREIGN KEY(pending_id) REFERENCES confirmation_intents(intent_id) ON DELETE CASCADE);
+                INSERT INTO pending_confirm_projections SELECT * FROM pending_confirm_projections_v19;
+                DROP TABLE pending_confirm_projections_v19;
+                CREATE INDEX pending_confirm_projection_created ON pending_confirm_projections(code,created_at_ms);
+                UPDATE control_metadata SET value='18' WHERE key='schema_version';").unwrap();
+        }
+        drop(registry); drop(persistence);
+        let reopened = AgentControlStore::open(&root, &credentials, INSTALLATION_PRINCIPAL, 1).unwrap();
+        reopened.finish_pending_confirmation(&pending.id, "provider_conflict", 1_002).unwrap();
+        assert_eq!(reopened.pending_confirm_projections(8).unwrap()[0].code, "provider_conflict");
+        drop(reopened); std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -11159,6 +11730,82 @@ mod tests {
             total_bytes: bytes.len() as u64,
             sha256: sha256_hex(bytes),
         }
+    }
+
+    #[test]
+    fn attachment_status_lookup_requires_original_mutation_owner() {
+        let root = temp_root("attachment-status-owner");
+        let credentials = credential_store(&root);
+        let store = AgentControlStore::open(&root, &credentials, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let mut request = mutation_create("019f0000-0000-4000-8000-000000000101", "owner-a", b"data");
+        request.purpose = isyncyou_webui::MutationPurpose::MailAttachment { account:"controlled".into(), filename:"file.txt".into(), content_type:"text/plain".into() };
+        let info = store.create_mutation_intent(&request, 1_000).unwrap();
+        assert_eq!(store.owned_mutation_state("owner-a", &info.intent_id).unwrap().as_deref(), Some("active"));
+        assert_eq!(store.owned_mutation_state("owner-b", &info.intent_id).unwrap(), None);
+        drop(store); std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stable_upload_binding_survives_restart_without_replaying_or_crossing_identity() {
+        let root = temp_root("stable-upload-restart");
+        let credentials = credential_store(&root);
+        let store = AgentControlStore::open(&root, &credentials, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let mut request = mutation_create("019f0000-0000-4000-8000-000000000201", "old-session", b"data");
+        request.purpose = isyncyou_webui::MutationPurpose::MailAttachment { account:"account-a".into(), filename:"file.txt".into(), content_type:"text/plain".into() };
+        let info = store.create_mutation_intent(&request, 1_000).unwrap();
+        store.bind_upload_installation("old-session",&info.intent_id,"account-a","https://example.test","subject-a").unwrap();
+        assert_eq!(store.stable_upload_state(&info.intent_id,"account-b","https://example.test","subject-a").unwrap(),None);
+        assert_eq!(store.stable_upload_state(&info.intent_id,"account-a","https://other.test","subject-a").unwrap(),None);
+        assert_eq!(store.stable_upload_state(&info.intent_id,"account-a","https://example.test","subject-b").unwrap(),None);
+        drop(store);
+        let reopened = AgentControlStore::open(&root,&credentials,INSTALLATION_PRINCIPAL,1).unwrap();
+        assert_eq!(reopened.owned_mutation_state("new-session",&info.intent_id).unwrap(),None);
+        assert_eq!(reopened.stable_upload_state(&info.intent_id,"account-a","https://example.test","subject-a").unwrap().as_deref(),Some("active"));
+        reopened.cancel_stable_upload_staging("019f0000-0000-4000-8000-000000000202",&info.intent_id,"account-a","https://example.test","subject-a",2_000).unwrap();
+        assert_eq!(reopened.stable_upload_state(&info.intent_id,"account-a","https://example.test","subject-a").unwrap().as_deref(),Some("cancelled"));
+        { let connection = reopened.connection.lock().unwrap(); connection.execute("DELETE FROM mutation_intents WHERE intent_id=?1",params![info.intent_id]).unwrap(); }
+        assert_eq!(reopened.stable_upload_state(&info.intent_id,"account-a","https://example.test","subject-a").unwrap().as_deref(),Some("not_dispatched"));
+        assert!(reopened.begin_mutation_commit("new-session","019f0000-0000-4000-8000-000000000203",&info.intent_id,4,&sha256_hex(b"data"),2_001).is_err());
+        drop(reopened); std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "encrypted-store")]
+    #[test]
+    fn confirmed_upload_ledger_reconciles_after_restart_and_receipt_expiry() {
+        use isyncyou_core::{config::ProviderConfig,Config};
+        use isyncyou_store::{ProviderScope,Store};
+        let root = temp_root("confirmed-upload-restart"); let credentials = credential_store(&root);
+        let control = AgentControlStore::open(&root,&credentials,INSTALLATION_PRINCIPAL,1).unwrap();
+        let mut request = mutation_create("019f0000-0000-4000-8000-000000000211","old-session",b"data");
+        request.purpose = isyncyou_webui::MutationPurpose::MailAttachment { account:"account-a".into(), filename:"file.txt".into(), content_type:"text/plain".into() };
+        let info = control.create_mutation_intent(&request,1_000).unwrap();
+        control.bind_upload_installation("old-session",&info.intent_id,"account-a","https://example.test","subject-a").unwrap();
+        let mut unknown_request = mutation_create("019f0000-0000-4000-8000-000000000212","old-session",b"data");
+        unknown_request.purpose = isyncyou_webui::MutationPurpose::MailAttachment { account:"account-a".into(), filename:"other.txt".into(), content_type:"text/plain".into() };
+        let unknown = control.create_mutation_intent(&unknown_request,1_001).unwrap();
+        control.bind_upload_installation("old-session",&unknown.intent_id,"account-a","https://example.test","subject-a").unwrap();
+        let provider_path = root.join("provider.sqlite");
+        let provider = Store::open_encrypted(&provider_path,b"fixture-store-key").unwrap();
+        let scope = ProviderScope {account_id:"account-a".into(),origin:"https://example.test".into(),service:"mail".into(),collection:"native-a".into()};
+        let intent = serde_json::json!({"filename":"file.txt","content_type":"text/plain","size":4,"sha256":sha256_hex(b"data")}).to_string();
+        assert!(provider.claim_provider_mutation(&scope,&info.intent_id,"mail_attachment_upload",&intent,"fixture-digest").unwrap());
+        assert!(provider.finish_provider_mutation(&scope,&info.intent_id,Some("blob-a")).unwrap());
+        assert!(provider.claim_provider_mutation(&scope,&unknown.intent_id,"mail_attachment_upload",&intent,"fixture-digest").unwrap());
+        { let connection = control.connection.lock().unwrap(); connection.execute("UPDATE mutation_intents SET state='committed' WHERE intent_id=?1",params![info.intent_id]).unwrap(); connection.execute("DELETE FROM mutation_intents WHERE intent_id=?1",params![info.intent_id]).unwrap(); }
+        drop(provider); drop(control);
+        assert!(AgentControlStore::open(&root,&credentials,"other-installation",1).is_err());
+        let reopened = AgentControlStore::open(&root,&credentials,INSTALLATION_PRINCIPAL,1).unwrap();
+        assert_eq!(reopened.owned_mutation_state("new-session",&info.intent_id).unwrap(),None);
+        assert_eq!(reopened.stable_upload_state(&info.intent_id,"account-a","https://example.test","subject-a").unwrap().as_deref(),Some("settled"));
+        assert_eq!(reopened.stable_upload_state(&info.intent_id,"account-a","https://example.test","other-subject").unwrap(),None);
+        let provider = Store::open_encrypted(&provider_path,b"fixture-store-key").unwrap();
+        let mut cfg = Config::default(); cfg.provider_accounts.insert("account-a".into(),ProviderConfig::SelfHosted {origin:"https://example.test".into(),client_id:"client".into()});
+        let status = isyncyou_engine::self_hosted_mail::draft_attachment_upload_status(&cfg,"account-a",&provider,&info.intent_id).unwrap().unwrap();
+        assert_eq!(status.blob_id.as_deref(),Some("blob-a")); assert_eq!(status.state,"confirmed");
+        let uncertain = isyncyou_engine::self_hosted_mail::draft_attachment_upload_status(&cfg,"account-a",&provider,&unknown.intent_id).unwrap().unwrap();
+        assert_eq!(uncertain.state,"unknown"); assert_eq!(uncertain.blob_id,None);
+        assert!(!provider.claim_provider_mutation(&scope,&unknown.intent_id,"mail_attachment_upload",&intent,"fixture-digest").unwrap());
+        drop(provider); drop(reopened); std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

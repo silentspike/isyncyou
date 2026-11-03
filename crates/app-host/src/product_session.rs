@@ -1965,6 +1965,41 @@ impl<'a> ProductSessionRegistry<'a> {
         Ok(session)
     }
 
+    /// Persist a user-initiated confirmation in the same session history used by agent turns.
+    /// The caller must register the bound action first and cancel it if this publish fails.
+    pub fn append_user_pending(
+        &self,
+        graph_token: &str,
+        owner: &PendingOwnerBinding,
+        installation_principal: &str,
+        created_at_ms: u64,
+    ) -> Result<(), String> {
+        if owner.session_id == "legacy-local" { return Err("session_state_invalid".into()); }
+        let store = self.ensure_remote_session(graph_token, &owner.session_id)?;
+        let lease_id = new_ulid().map_err(|_| "session_store_unavailable")?;
+        let holder_binding = self.store.domain_hmac(
+            TURN_HOLDER_DOMAIN,
+            format!("{installation_principal}:{}", owner.session_id).as_bytes(),
+        ).map(|bytes| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+            .map_err(|_| "session_store_unavailable")?;
+        let mut guard = store.acquire_lease(&owner.session_id, &lease_id, &holder_binding).map_err(map_session_error)?;
+        let current = guard.manifest_snapshot().map_err(map_session_error)?;
+        let existing = store.visible_records_for_request_from_manifest(&current, &owner.request_id, &owner.turn_id).map_err(map_session_error)?;
+        if !existing.is_empty() { return Err("request_id_conflict".into()); }
+        let observed_head = guard.visible_record_head().map_err(map_session_error)?;
+        let lease = guard.binding().map_err(map_session_error)?;
+        let record = SessionRecordV2 {
+            record_version: SESSION_RECORD_VERSION,
+            record_id: new_ulid().map_err(|_| "session_store_unavailable")?,
+            session_id: owner.session_id.clone(), request_id: owner.request_id.clone(), turn_id: owner.turn_id.clone(),
+            kind: SessionRecordKind::PendingOperation { code: "confirmation_required".into() },
+            parent_record_ids: visible_parent_ids(&[], &observed_head), observed_head, lease, created_at_ms,
+        };
+        guard.publish(SessionCommitV1 { visible_records:vec![record], request_objects:vec![], uuid_bindings:vec![] }).map_err(map_session_error)?;
+        guard.release().map_err(map_session_error)?;
+        Ok(())
+    }
+
     pub fn append_pending_cancelled(
         &self,
         graph_token: &str,
@@ -1994,7 +2029,7 @@ impl<'a> ProductSessionRegistry<'a> {
         }
         if !matches!(
             code,
-            "cancelled" | "completed" | "failed" | "provider_rejected" | "outcome_unknown"
+            "cancelled" | "completed" | "failed" | "provider_rejected" | "provider_conflict" | "outcome_unknown"
         ) {
             return Err("session_state_invalid".into());
         }
