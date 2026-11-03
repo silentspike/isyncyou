@@ -25,6 +25,9 @@ import android.webkit.WebViewClient
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.Lifecycle
 import androidx.webkit.JavaScriptReplyProxy
@@ -143,7 +146,28 @@ class MainActivity : FragmentActivity() {
         if ((applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
             WebView.setWebContentsDebuggingEnabled(true)
         }
+        // Own the edge-to-edge safe area once, at the native WebView boundary.
+        // The embedded page therefore lays out its fixed navigation inside the
+        // usable viewport on both gesture and three-button navigation devices.
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        @Suppress("DEPRECATION")
+        window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        val content = android.widget.FrameLayout(this)
         web = WebView(this)
+        content.addView(web, android.widget.FrameLayout.LayoutParams(
+            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+        ))
+        ViewCompat.setOnApplyWindowInsetsListener(content) { view, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
+            // Before API 30 adjustResize already shortens the window for IME.
+            // On newer Android edge-to-edge windows receive the IME inset instead.
+            val bottom = if (Build.VERSION.SDK_INT >= 30) {
+                maxOf(bars.bottom, insets.getInsets(WindowInsetsCompat.Type.ime()).bottom)
+            } else bars.bottom
+            view.setPadding(bars.left, bars.top, bars.right, bottom)
+            insets
+        }
         web.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
@@ -208,7 +232,7 @@ class MainActivity : FragmentActivity() {
                 }
             }
         }
-        setContentView(web)
+        setContentView(content)
         handleProviderCallback(intent)
 
         val bridgeDecision = setupBridgeOrFail(APP_ORIGIN)
