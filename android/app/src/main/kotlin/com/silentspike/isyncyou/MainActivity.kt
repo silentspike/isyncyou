@@ -24,7 +24,6 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.Lifecycle
@@ -52,6 +51,7 @@ class MainActivity : FragmentActivity() {
         const val TAG = "iSyncYou"
         const val BIO_TIMEOUT_MS = 120_000L
         const val DEVICE_CREDENTIAL_REQUEST_CODE = 640
+        const val ATTACHMENT_DOCUMENT_REQUEST_CODE = 641
         val attachmentBusy = java.util.concurrent.atomic.AtomicBoolean(false)
         val providerScheduleLock = Any()
 
@@ -65,7 +65,7 @@ class MainActivity : FragmentActivity() {
     private lateinit var web: WebView
 
     private var pendingAttachmentPath: String? = null
-    private val attachmentDocument = registerForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+    private fun completeAttachmentDocument(uri: android.net.Uri?) {
         val path = pendingAttachmentPath
         pendingAttachmentPath = null
         if (uri != null && path != null) {
@@ -540,7 +540,12 @@ class MainActivity : FragmentActivity() {
                             .appendQueryParameter("blob_id", payload.getString("blob_id")).build().encodedQuery
                         pendingAttachmentPath = "/api/v1/attachment?$query"
                         try {
-                            attachmentDocument.launch(AttachmentDownloadPolicy.filename(payload.getString("filename")))
+                            val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                                addCategory(Intent.CATEGORY_OPENABLE)
+                                type = "application/octet-stream"
+                                putExtra(Intent.EXTRA_TITLE, AttachmentDownloadPolicy.filename(payload.getString("filename")))
+                            }
+                            startActivityForResult(intent, ATTACHMENT_DOCUMENT_REQUEST_CODE)
                             postBridgeResponse(reply, id, 200, JSONObject().put("opened", true))
                         } catch (_: Exception) {
                             pendingAttachmentPath = null
@@ -1259,6 +1264,10 @@ class MainActivity : FragmentActivity() {
     @Deprecated("Android activity-result callback required by the system credential intent")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == ATTACHMENT_DOCUMENT_REQUEST_CODE) {
+            completeAttachmentDocument(if (resultCode == Activity.RESULT_OK) data?.data else null)
+            return
+        }
         if (requestCode != DEVICE_CREDENTIAL_REQUEST_CODE) return
         val (pat, reqId) = activeDeviceCredential ?: return
         activeDeviceCredential = null
