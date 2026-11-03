@@ -737,6 +737,16 @@ impl Store {
         Ok(Some((scope,intent,state,result)))
     }
 
+    /// Read a draft result only when exactly one native account owns the operation.
+    pub fn provider_mail_draft_result(&self, account:&str, origin:&str, operation:&str) -> Result<Option<(String,Option<String>)>> {
+        let mut stmt = self.conn.prepare("SELECT state,result_id FROM provider_mutations WHERE account_id=?1 AND origin=?2 AND service='mail' AND operation_id=?3 AND kind='draft' ORDER BY remote_account LIMIT 2")?;
+        let mut rows = stmt.query(params![account,origin,operation])?;
+        let Some(row) = rows.next()? else { return Ok(None); };
+        let state:String = row.get(0)?; let result:Option<String> = row.get(1)?;
+        if rows.next()?.is_some() { return Err(StoreError::InvalidProgressiveSearch("ambiguous native draft account".into())); }
+        Ok(Some((state,result)))
+    }
+
     pub fn conflict_provider_mutation(&self, scope: &ProviderScope, operation: &str) -> Result<bool> {
         Ok(self.conn.execute("UPDATE provider_mutations SET state='conflict' WHERE account_id=?1 AND origin=?2 AND service=?3 AND remote_account=?4 AND operation_id=?5 AND state='unknown'", params![scope.account_id,scope.origin,scope.service,scope.collection,operation])? == 1)
     }
@@ -1053,6 +1063,20 @@ fn capture_observation(tx: &rusqlite::Transaction<'_>, scope: &ProviderScope, ob
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_draft_result_is_scoped_and_rejects_ambiguous_native_accounts() {
+        let store = Store::open_in_memory().unwrap();
+        let scope = ProviderScope {account_id:"a".into(),origin:"https://example.test".into(),service:"mail".into(),collection:"native-one".into()};
+        assert!(store.claim_provider_mutation(&scope,"op","draft","{}","digest").unwrap());
+        assert_eq!(store.provider_mail_draft_result("a","https://example.test","op").unwrap(),Some(("unknown".into(),None)));
+        assert!(store.finish_provider_mutation(&scope,"op",Some("draft-id")).unwrap());
+        assert_eq!(store.provider_mail_draft_result("a","https://example.test","op").unwrap(),Some(("confirmed".into(),Some("draft-id".into()))));
+        assert!(store.provider_mail_draft_result("other","https://example.test","op").unwrap().is_none());
+        let second = ProviderScope {collection:"native-two".into(),..scope};
+        assert!(store.claim_provider_mutation(&second,"op","draft","{}","digest").unwrap());
+        assert!(store.provider_mail_draft_result("a","https://example.test","op").is_err());
+    }
 
     #[test]
     fn offline_upload_lookup_is_scoped_and_rejects_ambiguous_native_accounts() {

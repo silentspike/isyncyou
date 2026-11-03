@@ -799,6 +799,10 @@ fn parse_strict_scalar_mutation(
     Ok(parsed)
 }
 
+fn valid_recovery_catalog_service(value: &str) -> bool {
+    matches!(value, "calendar" | "todo" | "mail" | "contacts")
+}
+
 fn valid_opaque_agent_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -3846,6 +3850,8 @@ pub trait MutationIntentHandler: Send + Sync {
     fn cancel_attachment_staging(&self, _owner:&str, _request_id:&str, _intent_id:&str, _account:&str) -> Result<(),String> { Err("mutation_intent_unavailable".into()) }
     fn release_confirmed_attachment(&self, _owner:&str, _request_id:&str, _intent_id:&str, _account:&str) -> Result<(),String> { Err("mutation_intent_unavailable".into()) }
     fn attachment_status(&self, _owner:&str, _account:&str, _intent_id:&str) -> Result<Value,String> { Err("mutation_intent_unavailable".into()) }
+    fn mail_status(&self, _owner:&str, _account:&str, _intent_id:&str) -> Result<Value,String> { Err("mutation_intent_unavailable".into()) }
+    fn legacy_mail_status(&self, _owner:&str, _account:&str) -> Result<Value,String> { Err("mutation_intent_unavailable".into()) }
     fn confirmed_attachments(&self, _owner:&str, _account:&str) -> Result<Value,String> { Err("mutation_intent_unavailable".into()) }
 }
 
@@ -5297,6 +5303,7 @@ impl Router {
             "/api/v1/agent/recovery/requests" => self.agent_recovery_requests(req),
             "/api/v1/agent/recovery/review" => self.agent_recovery_review(req),
             "/api/v1/mutation-intent/attachment-status" => self.mutation_attachment_status(req),
+            "/api/v1/mutation-intent/mail-status" => self.mutation_mail_status(req),
             "/api/v1/item" => self.item(req),
             "/api/v1/body" => self.body(req),
             "/api/v1/attachment" => self.attachment(req),
@@ -6402,6 +6409,16 @@ impl Router {
         let Some(intent_id)=req.q("intent_id") else { return no_store_json_error(400,"invalid_attachment_status"); };
         if account.is_empty() || intent_id.is_empty() || intent_id.len() > 128 { return no_store_json_error(400,"invalid_attachment_status"); }
         match handler.attachment_status(&owner,account,intent_id) { Ok(value) => with_no_store(ApiResponse::ok_json(&value)), Err(_) => no_store_json_error(409,"attachment_status_unavailable") }
+    }
+
+    fn mutation_mail_status(&self, req: &ApiRequest) -> ApiResponse {
+        let (handler, owner) = match self.mutation_intent_gate(req) { Ok(value) => value, Err(response) => return with_no_store(response) };
+        let Some(account) = req.q("account") else { return no_store_json_error(400,"invalid_mail_status"); };
+        if account.is_empty() { return no_store_json_error(400,"invalid_mail_status"); }
+        if req.q("list") == Some("legacy") { return match handler.legacy_mail_status(&owner,account) { Ok(value) => with_no_store(ApiResponse::ok_json(&value)), Err(_) => no_store_json_error(409,"mail_status_unavailable") }; }
+        let Some(intent_id) = req.q("intent_id") else { return no_store_json_error(400,"invalid_mail_status"); };
+        if account.is_empty() || intent_id.is_empty() || intent_id.len() > 128 { return no_store_json_error(400,"invalid_mail_status"); }
+        match handler.mail_status(&owner,account,intent_id) { Ok(value) => with_no_store(ApiResponse::ok_json(&value)), Err(_) => no_store_json_error(409,"mail_status_unavailable") }
     }
 
     fn mutation_intent_create(&self, req: &ApiRequest) -> ApiResponse {
@@ -8237,7 +8254,7 @@ impl Router {
         let handler = match self.agent_gate(req) { Ok(handler) => handler, Err(error) => return with_no_store(error) };
         let (Some(account),Some(session),Some(service)) = (req.q("account"),req.q("session_id"),req.q("service")) else { return no_store_json_error(400,"invalid recovery request"); };
         let after = match req.q("after").unwrap_or("0").parse::<u64>() { Ok(value) => value, Err(_) => return no_store_json_error(400,"invalid recovery request") };
-        if account.is_empty() || !valid_opaque_agent_id(session) || !matches!(service,"calendar" | "todo") { return no_store_json_error(400,"invalid recovery request"); }
+        if account.is_empty() || !valid_opaque_agent_id(session) || !valid_recovery_catalog_service(service) { return no_store_json_error(400,"invalid recovery request"); }
         match handler.recovery_catalog(account,session,service,after) { Ok(value) => with_no_store(ApiResponse::ok_json(&value)), Err(_) => no_store_json_error(409,"recovery_catalog_unavailable") }
     }
     fn agent_recovery_requests(&self, req:&ApiRequest) -> ApiResponse {
@@ -8349,7 +8366,22 @@ impl Router {
         let handler=match self.agent_gate(req) { Ok(handler)=>handler, Err(error)=>return with_no_store(error) };
         let request:AgentRecoveryImportPrepareRequest=match parse_agent_strict_json(req,"recovery import prepare") { Ok(request)=>request, Err(error)=>return error };
         if !valid_client_request_id(&request.request_id) || !valid_opaque_agent_id(&request.session_id) || request.account.is_empty() || request.batch_id.is_empty() || request.collection.is_empty() { return no_store_json_error(400,"invalid recovery request"); }
-        match handler.prepare_recovery_import(&request) { Ok(value)=>with_no_store(ApiResponse::ok_json(&value)), Err(_)=>no_store_json_error(409,"recovery_import_prepare_unavailable") }
+        match handler.prepare_recovery_import(&request) {
+            Ok(value)=>with_no_store(ApiResponse::ok_json(&value)),
+            Err(error)=> {
+                let code=match error.as_str() {
+                    "recovery_prepare_request_unavailable"=>"recovery_prepare_request_unavailable",
+                    "recovery_prepare_device_unavailable"=>"recovery_prepare_device_unavailable",
+                    "recovery_prepare_status_unavailable"=>"recovery_prepare_status_unavailable",
+                    "recovery_prepare_collection_unavailable"=>"recovery_prepare_collection_unavailable",
+                    "recovery_prepare_staging_unavailable"=>"recovery_prepare_staging_unavailable",
+                    "recovery_prepare_result_unavailable"=>"recovery_prepare_result_unavailable",
+                    "recovery_prepare_projection_unavailable"=>"recovery_prepare_projection_unavailable",
+                    _=>"recovery_import_prepare_unavailable",
+                };
+                no_store_json_error(409,code)
+            }
+        }
     }
     fn agent_recovery_reconcile(&self, req:&ApiRequest) -> ApiResponse {
         let handler=match self.agent_gate(req) { Ok(handler)=>handler, Err(error)=>return with_no_store(error) };
@@ -10738,6 +10770,15 @@ fn mail_preview_enrichment(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovery_catalog_accepts_four_domains_only() {
+        for service in ["calendar", "todo", "mail", "contacts"] {
+            assert!(super::valid_recovery_catalog_service(service));
+        }
+        for service in ["", "files", "contact", "MAIL"] {
+            assert!(!super::valid_recovery_catalog_service(service));
+        }
+    }
     use super::*;
     use isyncyou_core::config::AccountConfig;
 

@@ -766,7 +766,7 @@ async function hashMutationSource(source) {
   }
   return hash.hex();
 }
-async function mutationPostWithTransportRetry(path, value, timeoutMs) {
+async function mutationPostWithTransportRetry(path, value, timeoutMs, retryTransport = true) {
   const send = () => request("POST", path, {
     capToken: CAP.mutationIntent,
     timeoutMs,
@@ -779,7 +779,7 @@ async function mutationPostWithTransportRetry(path, value, timeoutMs) {
     if (error && error.code === "mutation_intent_already_completed") {
       return { status: "completed" };
     }
-    if (error && error.responseReceived) throw error;
+    if (!retryTransport || (error && error.responseReceived)) throw error;
     try {
       return await send();
     } catch (retryError) {
@@ -790,6 +790,51 @@ async function mutationPostWithTransportRetry(path, value, timeoutMs) {
     }
   }
 }
+const MAIL_INTENT_TRACKING_KEY = "isyncyou-mail-intents-v1";
+function storedMailIntents() {
+  const raw=localStorage.getItem(MAIL_INTENT_TRACKING_KEY);
+  if (!raw) return [];
+  const rows=JSON.parse(raw);
+  if (!Array.isArray(rows) || rows.length>256 || rows.some(row => !row || typeof row.account!=="string" || typeof row.intent_id!=="string" || typeof row.operation!=="string")) throw new Error("Mail status tracking unavailable");
+  return rows;
+}
+function rememberMailIntent(account, operation, intent_id) {
+  const rows=storedMailIntents();
+  if (rows.length>=256 || rows.some(row=>row.intent_id===intent_id)) throw new Error("Mail status tracking unavailable");
+  rows.push({account,operation,intent_id});
+  localStorage.setItem(MAIL_INTENT_TRACKING_KEY,JSON.stringify(rows));
+}
+function openProviderMailIntentStatus(account) {
+  if (App.account!==account) return;
+  const list=el("div",{class:"list"});
+  let rows;
+  try { rows=storedMailIntents().filter(row=>row.account===account); }
+  catch (_) { openSheet("Mail operation status",el("p",{text:"Saved operation status is unavailable."})); return; }
+  if (!rows.length) list.append(el("p",{text:"No tracked mail operations for this account."}));
+  const legacy=el("p",{class:"dim",text:"Checking older unbound operations…"});
+  list.append(legacy);
+  request("GET","/api/v1/mutation-intent/mail-status?"+qs({account,list:"legacy"}),{capToken:CAP.mutationIntent,timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS}).then(result=>{
+    if (App.account!==account) return;
+    if (result?.identity_binding!=="unavailable" || result?.terminal_coverage!=="unavailable" || !Number.isSafeInteger(result.staged) || result.staged<0 || !Number.isSafeInteger(result.unknown) || result.unknown<0) throw new Error("Invalid legacy status");
+    legacy.textContent=`Older unbound operations: ${result.staged} staged, ${result.unknown} unknown. They cannot be attributed to a specific operation; historical terminal status is unavailable.`;
+  }).catch(()=>{ legacy.textContent="Older unbound operation counts are unavailable."; });
+  for (const row of rows) {
+    const state=el("span",{text:"Checking…"});
+    const line=el("div",{class:"row"},el("span",{text:row.operation+" · "+row.intent_id}),state);
+    list.append(line);
+    request("GET","/api/v1/mutation-intent/mail-status?"+qs({account,intent_id:row.intent_id}),{capToken:CAP.mutationIntent,timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS}).then(result=>{
+      if (App.account!==account) return;
+      const value=result?.state;
+      if (!["staged","unknown","completed","not_dispatched","rejected"].includes(value)) throw new Error("Invalid status");
+      state.textContent=value==="unknown" ? "Outcome unknown; do not submit again." : value==="not_dispatched" ? "Not dispatched." : value==="completed" ? "Completed." + (typeof result.native_id === "string" && result.native_id.length <= 512 && !/[\u0000-\u001f\u007f]/.test(result.native_id) ? " Native ID: " + result.native_id : "") : value==="rejected" ? "Rejected by the provider." : "Staged; not yet confirmed as completed.";
+      if (value==="completed" || value==="not_dispatched" || value==="rejected") line.append(el("button",{class:"btn sm",type:"button",onclick:()=>{
+        try { const remaining=storedMailIntents().filter(item=>!(item.account===account && item.intent_id===row.intent_id)); localStorage.setItem(MAIL_INTENT_TRACKING_KEY,JSON.stringify(remaining)); line.remove(); } catch (_) { toast("Could not remove saved status.","err"); }
+      }},"Forget status"));
+    }).catch(()=>{ state.textContent="Status unavailable; no operation was repeated."; });
+  }
+  openSheet("Mail operation status",el("div",{class:"compose"},el("p",{class:"dim",text:"Checking status does not send or repeat an operation. Unknown results remain saved."}),list));
+}
+
 async function stageMutation(purpose, metadata, input, onCreated = null, knownHash = null) {
   const source = await mutationSource(input);
   const totalHash = knownHash || await hashMutationSource(source);
@@ -801,6 +846,7 @@ async function stageMutation(purpose, metadata, input, onCreated = null, knownHa
   if (!created.intent_id || chunkBytes !== 8192) throw new Error("Invalid upload contract");
   let commitAttempted = false;
   try {
+    if (purpose === "mail_body" && (App.accounts || []).some(account => account.id === metadata.account && account.provider === "self_hosted")) rememberMailIntent(metadata.account,metadata.operation,created.intent_id);
     if (onCreated) await onCreated({ intent_id:created.intent_id, sha256:totalHash, size:source.length });
     for (let offset = 0, index = 0; offset < source.length; offset += chunkBytes, index++) {
       const chunk = await source.read(offset, Math.min(offset + chunkBytes, source.length));
@@ -814,7 +860,7 @@ async function stageMutation(purpose, metadata, input, onCreated = null, knownHa
     const committed = await mutationPostWithTransportRetry("/api/v1/mutation-intent/commit", {
       request_id: crypto.randomUUID(), intent_id: created.intent_id,
       total_bytes: source.length, sha256: totalHash,
-    }, MUTATION_COMMIT_TIMEOUT_MS);
+    }, MUTATION_COMMIT_TIMEOUT_MS, purpose !== "mail_body");
     return { ...committed, intent_id:created.intent_id };
   } catch (error) {
     if (error && commitAttempted) { error.mutationCommitAttempted = true; error.mutationIntentId = created.intent_id; }
@@ -947,7 +993,7 @@ function accountDisplayLabel(account) {
   if (username
       && username !== accountId
       && !INTERNAL_ACCOUNT_LABELS.has(username.toLowerCase())) return username;
-  return "Microsoft 365 account";
+  return account && account.provider === "self_hosted" ? "Self-hosted account" : "Microsoft 365 account";
 }
 // Per-service filter sub-items shown in the LEFT sidebar, indented under the
 // active service (NOT a separate rail). Lazy so Mail.cats is populated at call.
@@ -1797,6 +1843,10 @@ async function renderMailView(view) {
           el("option", { value: "oldest", text: "Oldest first" }),
           el("option", { value: "sender", text: "Sender A–Z" }))),
       el("button", { id: "mail-thread-toggle", class: "btn sm" + (Mail.threaded ? " active" : ""), title: "Group messages into conversations", onclick: (e) => { Mail.threaded = !Mail.threaded; e.currentTarget.classList.toggle("active", Mail.threaded); mailRender(); } }, icon("mail-open", "icon-sm"), "Conversations"),
+      CAP.agent && (App.accounts || []).some(account => account.id === App.account && account.provider === "self_hosted") ? el("button", { class:"btn sm", type:"button", onclick:() => {
+        openProviderRecovery(App.account,"Recovered","mail");
+      } }, "Recover…") : null,
+      CAP.mutationIntent && (App.accounts || []).some(account => account.id === App.account && account.provider === "self_hosted") ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderMailIntentStatus(App.account) }, "Operation status") : null,
       verifyButton(() => renderMailView(view)),
       CAP.mailwrite && CAP.mutationIntent ? el("button", { class: "btn sm primary", title: "Compose a new message", onclick: () => openCompose() }, icon("send", "icon-sm"), "Compose") : null,
       el("button", { class: "btn sm", title: "View sync log", onclick: () => go("overview") }, icon("clock", "icon-sm"), "Sync log")),
@@ -3497,18 +3547,19 @@ const startOfDay = (d) => { const x = new Date(d); x.setHours(0, 0, 0, 0); retur
 function startOfWeek(d) { const x = startOfDay(d); const dow = (x.getDay() + 6) % 7; x.setDate(x.getDate() - dow); return x; } // Monday
 const hhmm = (d) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
 
-function openProviderRecovery(account, collection) {
+function openProviderRecovery(account, collection, domain = "calendar") {
   if (App.account !== account) return;
   const list = el("div", { class:"list" });
   const status = el("p", { class:"dim", text:"Loading the recovery catalog…" });
   const choices = [];
-  const nextPages = { calendar:0, todo:0 };
+  const recoveryServices = domain === "contacts" ? ["contacts"] : domain === "mail" ? ["mail"] : ["calendar", "todo"];
+  const nextPages = Object.fromEntries(recoveryServices.map(service => [service, 0]));
   const more = el("button",{class:"btn sm",type:"button",text:"Load more",style:"display:none",onclick:()=>void load()});
   const saved = el("div", { class:"list" });
   const savedStatus = el("p", {class:"dim",text:"Loading saved recovery requests…"});
   let savedCursor="";
   const savedMore=el("button",{class:"btn sm",type:"button",text:"Load more requests",style:"display:none",onclick:()=>void loadSaved()});
-  const appendSaved = item => { const batch_id=item.batch_id; const labels=(item.objects || []).map(object=>object.label || (object.kind === "task" ? "Untitled task" : "Untitled event")); saved.append(el("div", {class:"row"}, el("span",{text:(labels.join(", ") || "Recovery request")+" · "+batch_id}), el("button", { class:"btn sm", type:"button", onclick:async event => {
+  const appendSaved = item => { const batch_id=item.batch_id; const labels=(item.objects || []).map(object=>object.label || (object.kind === "task" ? "Untitled task" : object.kind === "contact" ? "Untitled contact" : object.kind === "mail" ? "Untitled message" : "Untitled event")); saved.append(el("div", {class:"row"}, el("span",{text:(labels.join(", ") || "Recovery request")+" · "+batch_id}), el("button", { class:"btn sm", type:"button", onclick:async event => {
     const button=event.currentTarget; button.disabled=true;
     try {
       const session_id=await ensureAgentSession(); if (App.account!==account) throw new Error("Account changed");
@@ -3534,7 +3585,7 @@ function openProviderRecovery(account, collection) {
       const session_id=await ensureAgentSession(); if (App.account!==account) throw new Error("Account changed");
       const page=await request("GET","/api/v1/agent/recovery/requests?"+qs({account,session_id,after:savedCursor}),{capToken:CAP.agent,timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS});
       if (App.account!==account) throw new Error("Account changed");
-      for (const item of page.items || []) appendSaved(item);
+      for (const item of page.items || []) { const kinds=(item.objects || []).map(object=>object.kind); if (kinds.length && kinds.every(kind => domain === "contacts" ? kind === "contact" : domain === "mail" ? kind === "mail" : kind === "event" || kind === "task")) appendSaved(item); }
       savedCursor=page.next || ""; savedMore.style.display=savedCursor ? "" : "none";
       savedStatus.textContent=saved.childElementCount ? "Saved requests are stored for this account and installation." : savedCursor ? "More saved request records are available to check." : "No saved approved recovery requests.";
     } catch (_) { savedStatus.textContent="Saved recovery requests are unavailable."; }
@@ -3544,7 +3595,7 @@ function openProviderRecovery(account, collection) {
     try {
       const session_id=await ensureAgentSession(); if (App.account!==account) throw new Error("Account changed");
       more.disabled=true;
-      for (const service of ["calendar","todo"]) {
+      for (const service of recoveryServices) {
         let cursor=nextPages[service], pages=0;
         if (cursor == null) continue;
         do {
@@ -3554,15 +3605,15 @@ function openProviderRecovery(account, collection) {
             const choice={cursor,generation:item.generation,object:item.object,version:item.version,kind:item.kind};
             const check=el("input",{type:"checkbox","aria-label":"Select recovered object"});
             check.addEventListener("change",()=>{ const index=choices.indexOf(choice); if (check.checked && index<0) choices.push(choice); else if (!check.checked && index>=0) choices.splice(index,1); });
-            list.append(el("label",{class:"row"},check,el("span",{text:(item.kind === "task" ? "Task: " : "Event: ")+(item.label || "Untitled historical object")})));
+            list.append(el("label",{class:"row"},check,el("span",{text:(item.kind === "task" ? "Task: " : item.kind === "contact" ? "Contact: " : item.kind === "mail" ? "Mail: " : "Event: ")+(item.label || "Untitled historical object")})));
           }
           cursor=page.next; pages++;
         } while (cursor != null && pages<10);
         nextPages[service]=cursor;
       }
-      const partial=nextPages.calendar != null || nextPages.todo != null;
+      const partial=recoveryServices.some(service => nextPages[service] != null);
       more.style.display=partial ? "" : "none";
-      status.textContent="Select up to 32 historical objects. Related tasks must be selected together. The import is reviewed separately."+(partial ? " More catalog pages are available." : "");
+      status.textContent="Select up to 32 historical objects. "+(domain === "calendar" ? "Related tasks must be selected together. " : "")+"The import is reviewed separately."+(partial ? " More catalog pages are available." : "");
     } catch (_) { status.textContent="The recovery catalog is unavailable or the device is not enrolled."; }
     finally { more.disabled=false; }
   };
@@ -3577,7 +3628,7 @@ function openProviderRecovery(account, collection) {
       AssistantState.pendingCardsById.set(record.pending_id,record); closeSheet(); openSheet("Review recovery request",renderAgentPendingCard(record));
     } catch (_) { toast("The recovery request could not be prepared.","err"); prepare.disabled=false; }
   }},"Review retrieval");
-  openSheet("Recover calendar and tasks",el("div",{class:"compose"},el("p",{class:"dim",text:"Choose a personal collection named Recovered before importing. Retrieval and import require separate confirmations. Checking an approved import may continue its remaining objects after confirming an earlier uncertain result."}),status,list,more,prepare,el("h3",{text:"Previous recovery requests"}),savedStatus,saved,savedMore)); void loadSaved(); void load();
+  openSheet(domain === "contacts" ? "Recover contacts" : domain === "mail" ? "Recover mail" : "Recover calendar and tasks",el("div",{class:"compose"},el("p",{class:"dim",text:domain === "mail" ? "The personal Recovered folder will be created if needed. Retrieval and import require separate confirmations. No message is sent." : "A personal Recovered collection will be created if needed. Retrieval and import require separate confirmations. Checking an approved import may continue its remaining objects after confirming an earlier uncertain result."}),status,list,more,prepare,el("h3",{text:"Previous recovery requests"}),savedStatus,saved,savedMore)); void loadSaved(); void load();
 }
 
 function openProviderCalendarText(account, collection, href, uid, recurrenceId, field, current) {
@@ -3895,7 +3946,7 @@ async function renderProviderCalendarView(view, service) {
   };
   select.addEventListener("change", () => { cursor = null; void load(true); });
   more.addEventListener("click", () => { if (cursor) void load(false); });
-  view.append(el("div", { class:"con-page" }, el("h2", { text:service === "todo" ? "Tasks" : "Calendar" }), select, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCreate(account, select.value, service === "todo" ? "task" : "event") }, service === "todo" ? "New task" : "New event") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCollectionAccess(account, "calendar", select.value) }, "Manage collection access") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderRecovery(account,select.value) }, "Recover…") : null, status, note, list, more, service === "calendar" ? month : null, service === "calendar" ? expand : null, service === "calendar" ? freebusy : null, service === "calendar" ? expanded : null));
+  view.append(el("div", { class:"con-page" }, el("h2", { text:service === "todo" ? "Tasks" : "Calendar" }), select, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCreate(account, select.value, service === "todo" ? "task" : "event") }, service === "todo" ? "New task" : "New event") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCollectionAccess(account, "calendar", select.value) }, "Manage collection access") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderRecovery(account,"Recovered") }, "Recover…") : null, status, note, list, more, service === "calendar" ? month : null, service === "calendar" ? expand : null, service === "calendar" ? freebusy : null, service === "calendar" ? expanded : null));
   try {
     const result = await api("/api/v1/items?" + qs({ account, service }));
     if (App.account !== account || !view.isConnected) return;
@@ -4433,7 +4484,7 @@ async function renderProviderContactsView(view) {
   };
   select.addEventListener("change", () => { cursor = null; void load(true); });
   more.addEventListener("click", () => { if (cursor) void load(false); });
-  view.append(el("div", { class:"con-page" }, el("h2", { text:"Contacts" }), select, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCreate(account, select.value, "contact") }, "New contact") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCollectionAccess(account, "contacts", select.value) }, "Manage collection access") : null, status, list, more));
+  view.append(el("div", { class:"con-page" }, el("h2", { text:"Contacts" }), select, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCreate(account, select.value, "contact") }, "New contact") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCollectionAccess(account, "contacts", select.value) }, "Manage collection access") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderRecovery(account,"Recovered","contacts") }, "Recover…") : null, status, list, more));
   try {
     const result = await api("/api/v1/items?" + qs({ account, service:"contacts" }));
     if (App.account !== account || !view.isConnected) return;
@@ -7657,10 +7708,14 @@ function renderAgentPendingCard(pending, trackNode = true) {
     card.insertBefore(details, card.querySelector(".asst-pending-actions"));
   }
   if (recoveryReview) {
-    const details=el("div",{class:"asst-pending-meta"},el("p",{text:"Loading the complete bound recovery review…"}));
+    const details=el("div",{class:"asst-pending-meta"},el("p",{text:"Loading the bound recovery review…"}));
     card.insertBefore(details,card.querySelector(".asst-pending-actions"));
     const show=effect=>{
       details.replaceChildren(el("p",{text:`Destination: ${effect.origin || ""} · ${effect.collection || ""}. ${effect.effects || ""}`}));
+      if (effect.collection_creation) {
+        const plan=effect.collection_creation.intent || {};
+        details.append(el("p",{text:`A personal Recovered collection may be created before import. Account: ${plan.account_id || ""}; service: ${plan.service || ""}; principal: ${plan.principal || ""}; home: ${plan.home || ""}; target: ${plan.target || ""}; operation: ${plan.operation_id || ""}.`}));
+      }
       const order=Array.isArray(effect.execution_order) ? effect.execution_order : [];
       const objects=Array.isArray(effect.objects) ? effect.objects : [];
       const projections=Array.isArray(effect.projections) ? effect.projections : [];
@@ -7669,6 +7724,7 @@ function renderAgentPendingCard(pending, trackNode = true) {
         const source=objects.find(item=>item.operation_id===operation);
         if (!source) return;
         const group=el("details",{open:"open"},el("summary",{text:`${index+1}. ${source.kind}: ${source.label || "Untitled historical object"}`}));
+        if (projections[index]?.preview_truncated === true) group.append(el("p",{text:"The contact preview is incomplete. Additional properties or photos are not shown; the complete original remains bound to the displayed digest."}));
         group.append(el("pre",{style:"white-space:pre-wrap;overflow-wrap:anywhere",text:JSON.stringify(projections[index],null,2)})); details.append(group);
       });
       if (order.some(operation=>!objects.some(item=>item.operation_id===operation))) { details.append(el("p",{text:"The recovery review is incomplete."})); return; }
@@ -9299,14 +9355,14 @@ function renderAccountMenu(body) {
     const row = el("div", { class: "acct-row" + (active ? " active" : "") });
     row.append(el("div", { class: "acct-main" },
       el("span", { class: "avatar mail-av", style: "--c:var(--accent)", text: initials(accountLabel) }),
-      el("button", { class: "acct-pick grow", title: "Switch to this account", onclick: () => { if (!active) { App.account = a.id; toast("Switched to " + accountLabel); closeAccountMenu(); onRoute(); } } },
+      el("button", { class: "acct-pick grow", title: "Switch to this account", onclick: () => { if (!active) { App.account = a.id; toast("Switched to " + accountLabel); } closeAccountMenu(); if (!active) onRoute(); } },
         el("div", { class: "truncate", text: accountLabel }),
         el("div", { class: "dim", style: "font-size:11px", text: active ? "Currently selected" : (a.provider === "self_hosted" ? "Self-hosted account" : "Microsoft 365 account") })),
       active ? icon("check", "icon-sm") : null));
     if (CAP.account && a.provider === "self_hosted") {
       const connected = accountRoleStatus(a, "reader").state === "connected";
       const controls = el("div", { class: "acct-acts" });
-      const connectButton = el("button", { class: "btn sm", disabled: providerActionsUnknown.has(a.id), onclick: () => providerAccountAction(a, body, connected) }, connected ? "Disconnect" : "Connect");
+      const connectButton = el("button", { class: "btn sm", disabled: providerActionsUnknown.has(a.id) ? "disabled" : null, onclick: () => providerAccountAction(a, body, connected) }, connected ? "Disconnect" : "Connect");
       controls.append(connectButton);
       if (BRIDGE && !connected) {
         const resolveButton = el("button", { class:"btn sm", type:"button", style:providerActionsUnknown.has(a.id) ? "" : "display:none", onclick:async () => {
@@ -9386,12 +9442,13 @@ function renderAccountMenu(body) {
     }
     body.append(row);
   });
-  if (CAP.account) body.append(el("button", { class: "btn sm", type: "button", onclick: () => openProviderAccountSetup(body) }, icon("plus", "icon-sm"), "Add self-hosted account"));
+  if (CAP.account) body.append(el("button", { class: "btn sm", type: "button", onclick: openProviderAccountSetup }, icon("plus", "icon-sm"), "Add self-hosted account"));
   body.append(el("div", { class: "acct-note dim" }, CAP.account
     ? "Microsoft accounts connect Reader and Writer separately."
     : "Read-only server — account switching only."));
 }
-function openProviderAccountSetup(menuBody) {
+function openProviderAccountSetup() {
+  closeAccountMenu();
   const account = el("input", { class: "input", placeholder: "Account identifier" });
   const username = el("input", { class: "input", placeholder: "Provider username or email" });
   const origin = el("input", { class: "input", placeholder: "https://provider.example" });
@@ -9410,7 +9467,6 @@ function openProviderAccountSetup(menuBody) {
         if (!result || result.created !== true) throw new Error("account_setup_failed");
         await reloadAccounts();
         closeSheet();
-        renderAccountMenu(menuBody);
         toast("Account added. Connect it to sign in.");
       } catch (error) {
         if (error.message === "Bridge timeout") {

@@ -42,11 +42,30 @@ struct Resource {
     prop_status: Option<u16>,
     propstats: usize,
     etag: Option<String>,
+    self_href_count: usize,
+    self_status_count: usize,
+    self_prop_status_count: usize,
+    self_prop_count: usize,
+    self_etag_count: usize,
+    self_unexpected: bool,
 }
 
 struct Page {
     token: String,
     entries: Vec<Resource>,
+}
+
+fn valid_collection_self(entry: &Resource) -> bool {
+    !entry.self_unexpected && entry.self_href_count == 1 && entry.self_status_count == 0 &&
+        entry.propstats == 1 && entry.self_prop_count == 1 && entry.self_prop_status_count == 1 &&
+        entry.prop_status == Some(200) && entry.self_etag_count == 1 &&
+        entry.etag.as_deref().is_some_and(|etag| !etag.is_empty())
+}
+
+fn accept_collection_self(entry: &Resource, seen: &mut bool) -> Result<(), DavError> {
+    if *seen || !valid_collection_self(entry) { return Err(DavError::InvalidResponse); }
+    *seen = true;
+    Ok(())
 }
 
 struct Staging<'a> {
@@ -152,6 +171,18 @@ fn parse_page(bytes: &[u8]) -> Result<Page, DavError> {
                 if name == "response" { current = Some(Resource::default()); }
                 if name == "propstat" { if let Some(r) = &mut current { r.propstats += 1; } }
                 stack.push(name);
+                if let Some(r) = &mut current {
+                    let path: Vec<&str> = stack.iter().map(String::as_str).collect();
+                    match path.as_slice() {
+                        ["multistatus", "response"] | ["multistatus", "response", "propstat"] => {},
+                        ["multistatus", "response", "href"] => r.self_href_count += 1,
+                        ["multistatus", "response", "status"] => r.self_status_count += 1,
+                        ["multistatus", "response", "propstat", "prop"] => r.self_prop_count += 1,
+                        ["multistatus", "response", "propstat", "status"] => r.self_prop_status_count += 1,
+                        ["multistatus", "response", "propstat", "prop", "getetag"] => r.self_etag_count += 1,
+                        _ => r.self_unexpected = true,
+                    }
+                }
                 text.clear();
             }
             Event::End(_) => {
@@ -178,6 +209,7 @@ fn parse_page(bytes: &[u8]) -> Result<Page, DavError> {
                 let encoded = format!("&{entity};");
                 text.push_str(&quick_xml::escape::unescape(&encoded).map_err(|_| DavError::InvalidResponse)?);
             }
+            Event::Empty(_) => if let Some(r) = &mut current { r.self_unexpected = true; },
             Event::Eof => break,
             Event::DocType(_) => return Err(DavError::InvalidResponse),
             _ => {}
@@ -265,6 +297,32 @@ pub struct Collection {
     /// `Some(true)` only when DAV:owner equals the authenticated principal.
     /// Shared or unknown ownership must not be treated as backup ownership.
     pub owned_by_current_principal: Option<bool>,
+}
+
+/// Authenticated, server-advertised personal DAV home. Fields are private so a
+/// caller cannot manufacture a home outside the principal's discovery result.
+#[derive(Debug, Clone)]
+pub struct PersonalDavHome { home: Url, principal: Url, service: String }
+
+// Some DAV servers redirect discovery to a collection URL without its final
+// slash, then identify that same collection with a trailing slash in the 207.
+fn dav_response_matches(request: &Url, response: &Url, allow_slash: bool) -> bool {
+    if request == response { return true; }
+    if !allow_slash || request.path().ends_with('/') { return false; }
+    let mut canonical = request.clone();
+    canonical.set_path(&format!("{}/", request.path()));
+    &canonical == response
+}
+
+impl PersonalDavHome {
+    pub fn home_url(&self) -> &str { self.home.as_str() }
+    pub fn principal_url(&self) -> &str { self.principal.as_str() }
+    pub fn service(&self) -> &str { &self.service }
+    /// The operation id must be a freshly generated, persisted 128-bit value.
+    pub fn recovered_target(&self, operation_id: &str) -> Result<String, DavError> {
+        if operation_id.len() != 32 || !operation_id.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) { return Err(DavError::InvalidResponse); }
+        Ok(self.home.join(&format!("wp16-recovered-{operation_id}/")).map_err(|_| DavError::InvalidUrl)?.to_string())
+    }
 }
 
 /// Server-expanded calendar projection, separate from the stored raw original.
@@ -381,6 +439,101 @@ impl DavClient {
         Ok((url, root))
     }
 
+    /// Resolve one unambiguous home directly from the authenticated principal.
+    pub fn personal_home(&self, entry: &str, service: &str) -> Result<PersonalDavHome, DavError> {
+        const D: &str = "DAV:";
+        let (ns, home_property) = match service {
+            "calendar" => ("urn:ietf:params:xml:ns:caldav", "calendar-home-set"),
+            "contacts" => ("urn:ietf:params:xml:ns:carddav", "addressbook-home-set"),
+            _ => return Err(DavError::InvalidResponse),
+        };
+        fn response<'a>(client: &DavClient, root: &'a XmlNode, target: &Url, allow_slash: bool) -> Result<(&'a XmlNode,Url), DavError> {
+            let mut matches = Vec::new();
+            let rows: Vec<_> = root.children.iter().filter(|n| n.namespace == "DAV:" && n.name == "response").collect();
+            if rows.len() != 1 { return Err(DavError::InvalidResponse); }
+            for node in rows {
+                let hrefs: Vec<_> = node.children.iter().filter(|n| n.namespace == "DAV:" && n.name == "href").collect();
+                if hrefs.len() != 1 || hrefs[0].text.trim().is_empty() { return Err(DavError::InvalidResponse); }
+                let href = hrefs[0];
+                let url = client.checked_from(target,href.text.trim())?;
+                if dav_response_matches(target,&url,allow_slash) { matches.push((node,url)); }
+            }
+            if matches.len() != 1 { return Err(DavError::InvalidResponse); } Ok(matches.remove(0))
+        }
+        fn property<'a>(node: &'a XmlNode, ns: &str, name: &str) -> Result<&'a XmlNode, DavError> {
+            let props: Vec<_> = node.children.iter().filter(|n| n.namespace == "DAV:" && n.name == "propstat").filter(|p| p.child("DAV:","status").and_then(|s| status(s.text.trim())) == Some(200)).filter_map(|p| p.child("DAV:","prop").and_then(|p| p.child(ns,name))).collect();
+            if props.len() != 1 { return Err(DavError::InvalidResponse); } Ok(props[0])
+        }
+        let start = self.checked_url(entry)?;
+        let (entry_url, entry_tree) = self.propfind(start, "0", r#"<d:propfind xmlns:d="DAV:"><d:prop><d:current-user-principal/></d:prop></d:propfind>"#)?;
+        let (node,canonical_entry) = response(self,&entry_tree,&entry_url,true)?;
+        let principal_href = property(node,D,"current-user-principal")?.child(D,"href").ok_or(DavError::InvalidResponse)?.text.trim();
+        if principal_href.is_empty() { return Err(DavError::InvalidResponse); }
+        let principal = self.checked_from(&canonical_entry,principal_href)?;
+        let body = r#"<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:a="urn:ietf:params:xml:ns:carddav"><d:prop><c:calendar-home-set/><a:addressbook-home-set/></d:prop></d:propfind>"#;
+        let (actual, tree) = self.propfind(principal.clone(),"0",body)?;
+        if actual != principal { return Err(DavError::InvalidResponse); }
+        let home_set = property(response(self,&tree,&principal,false)?.0,ns,home_property)?;
+        let homes: Vec<_> = home_set.children.iter().filter(|n| n.namespace == D && n.name == "href" && !n.text.trim().is_empty()).collect();
+        if homes.len() != 1 { return Err(DavError::InvalidResponse); }
+        let home = self.checked_from(&principal,homes[0].text.trim())?;
+        if !home.path().ends_with('/') { return Err(DavError::InvalidUrl); }
+        Ok(PersonalDavHome {home,principal,service:service.into()})
+    }
+
+    /// Issue a single create-only request. The caller must durably claim the
+    /// approved operation before dispatch and never repeat an uncertain write.
+    pub fn create_recovered_collection(&self, home: &PersonalDavHome, operation_id: &str) -> Result<(), DavError> {
+        let target = self.checked_url(&home.recovered_target(operation_id)?)?;
+        if self.checked_url(home.home.as_str())? != home.home { return Err(DavError::InvalidUrl); }
+        let scope = ProviderScope { account_id: String::new(), origin: self.origin.to_string(), service: home.service.clone(), collection: home.home.to_string() };
+        if !self.permits(&scope,None,"bind")? { return Err(DavError::Http(403)); }
+        let body = if home.service == "calendar" {
+            format!(r#"<c:mkcalendar xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:d="DAV:" xmlns:i="urn:isyncyou:recovery"><d:set><d:prop><d:displayname>Recovered</d:displayname><i:operation>{operation_id}</i:operation></d:prop></d:set></c:mkcalendar>"#)
+        } else if home.service == "contacts" {
+            format!(r#"<d:mkcol xmlns:d="DAV:" xmlns:a="urn:ietf:params:xml:ns:carddav" xmlns:i="urn:isyncyou:recovery"><d:set><d:prop><d:resourcetype><d:collection/><a:addressbook/></d:resourcetype><d:displayname>Recovered</d:displayname><i:operation>{operation_id}</i:operation></d:prop></d:set></d:mkcol>"#)
+        } else { return Err(DavError::InvalidResponse); };
+        let method = if home.service == "calendar" { b"MKCALENDAR".as_slice() } else { b"MKCOL".as_slice() };
+        let response = self.http.request(reqwest::Method::from_bytes(method).map_err(|_| DavError::InvalidResponse)?,target)
+            .bearer_auth(&self.token).header(IF_NONE_MATCH,"*").header(CONTENT_TYPE,"application/xml; charset=utf-8").header("Prefer","return=minimal").body(body).send()
+            .map_err(|_| DavError::Transport("DAV collection creation outcome unknown".into()))?;
+        if response.status().as_u16() != 201 { return Err(DavError::Http(response.status().as_u16())); }
+        Ok(())
+    }
+
+    /// Verify the exact marked collection, principal ownership and privileges.
+    /// False means a native 404 only; malformed or foreign collections fail.
+    pub fn read_recovered_collection(&self, home: &PersonalDavHome, operation_id: &str) -> Result<bool, DavError> {
+        const D: &str = "DAV:";
+        fn one<'a>(node: &'a XmlNode, ns: &str, name: &str) -> Result<&'a XmlNode, DavError> {
+            let mut matches = node.children.iter().filter(|n| n.namespace == ns && n.name == name);
+            let value = matches.next().ok_or(DavError::InvalidResponse)?;
+            if matches.next().is_some() { return Err(DavError::InvalidResponse); }
+            Ok(value)
+        }
+        let target = self.checked_url(&home.recovered_target(operation_id)?)?;
+        let body = r#"<d:propfind xmlns:d="DAV:" xmlns:i="urn:isyncyou:recovery"><d:prop><d:displayname/><d:resourcetype/><d:owner/><d:current-user-privilege-set/><i:operation/></d:prop></d:propfind>"#;
+        let (actual, root) = match self.propfind(target.clone(),"0",body) { Err(DavError::Http(404)) => return Ok(false), other => other? };
+        if actual != target { return Err(DavError::InvalidResponse); }
+        let rows: Vec<_> = root.children.iter().filter(|n| n.namespace == D && n.name == "response").collect();
+        if rows.len() != 1 || rows[0].child(D,"status").is_some() || self.checked_from(&target,one(rows[0],D,"href")?.text.trim())? != target { return Err(DavError::InvalidResponse); }
+        let props: Vec<_> = rows[0].children.iter().filter(|n| n.namespace == D && n.name == "propstat").collect();
+        if props.len() != 1 || status(one(props[0],D,"status")?.text.trim()) != Some(200) { return Err(DavError::InvalidResponse); }
+        let prop = one(props[0],D,"prop")?;
+        let owner = one(one(prop,D,"owner")?,D,"href")?;
+        let ty = one(prop,D,"resourcetype")?;
+        let required_type = if home.service == "calendar" { ("urn:ietf:params:xml:ns:caldav","calendar") } else if home.service == "contacts" { ("urn:ietf:params:xml:ns:carddav","addressbook") } else { return Err(DavError::InvalidResponse); };
+        if self.checked_from(&target,owner.text.trim())? != home.principal || one(prop,D,"displayname")?.text.trim() != "Recovered" || ty.child(D,"collection").is_none() || ty.child(required_type.0,required_type.1).is_none() || one(prop,"urn:isyncyou:recovery","operation")?.text.trim() != operation_id { return Err(DavError::InvalidResponse); }
+        let privileges = one(prop,D,"current-user-privilege-set")?;
+        let mut read = false; let mut bind = false;
+        for privilege in privileges.children.iter().filter(|p| p.namespace == D && p.name == "privilege").flat_map(|p| p.children.iter()).filter(|p| p.namespace == D) {
+            read |= privilege.name == "all" || privilege.name == "read";
+            bind |= privilege.name == "all" || privilege.name == "write" || privilege.name == "bind";
+        }
+        if !read || !bind { return Err(DavError::InvalidResponse); }
+        Ok(true)
+    }
+
     /// Discover principal, home sets, and collections with bounded same-origin
     /// redirects. Credentials never go to a different origin. Entry is an authenticated
     /// server-provided DAV endpoint, not an arbitrary cross-origin URL.
@@ -396,15 +549,22 @@ impl DavClient {
             })
         }
         fn href(node: &XmlNode) -> Result<&str, DavError> {
-            node.child(D, "href").map(|n| n.text.trim()).filter(|s| !s.is_empty()).ok_or(DavError::InvalidResponse)
+            let mut values = node.children.iter().filter(|n| n.namespace == D && n.name == "href");
+            let value = values.next().map(|n| n.text.trim()).filter(|s| !s.is_empty()).ok_or(DavError::InvalidResponse)?;
+            if values.next().is_some() { return Err(DavError::InvalidResponse); }
+            Ok(value)
         }
         let principal_body = r#"<d:propfind xmlns:d="DAV:"><d:prop><d:current-user-principal/></d:prop></d:propfind>"#;
         let entry_url = self.checked_url(entry)?;
         let (entry_url, result) = self.propfind(entry_url, "0", principal_body)?;
-        let principal_response = result.children.iter().find(|n| n.namespace == D && n.name == "response" && href(n).ok().and_then(|h| self.checked_from(&entry_url, h).ok()).as_ref() == Some(&entry_url)).ok_or(DavError::InvalidResponse)?;
+        let responses: Vec<_> = result.children.iter().filter(|n| n.namespace == D && n.name == "response").collect();
+        if responses.len() != 1 { return Err(DavError::InvalidResponse); }
+        let principal_response = responses[0];
+        let canonical_entry = self.checked_from(&entry_url,href(principal_response)?)?;
+        if !dav_response_matches(&entry_url,&canonical_entry,true) { return Err(DavError::InvalidResponse); }
         let principal = href(property(principal_response, D, "current-user-principal").ok_or(DavError::InvalidResponse)?)?;
         let homes_body = r#"<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:a="urn:ietf:params:xml:ns:carddav"><d:prop><c:calendar-home-set/><a:addressbook-home-set/></d:prop></d:propfind>"#;
-        let principal_url = self.checked_from(&entry_url, principal)?;
+        let principal_url = self.checked_from(&canonical_entry, principal)?;
         let (principal_url, homes) = self.propfind(principal_url, "0", homes_body)?;
         let home_response = homes.children.iter().find(|n| n.namespace == D && n.name == "response" && href(n).ok().and_then(|h| self.checked_from(&principal_url, h).ok()).as_ref() == Some(&principal_url)).ok_or(DavError::InvalidResponse)?;
         let mut result = Vec::new();
@@ -704,9 +864,14 @@ impl DavClient {
             let mut changes = Vec::new();
             let mut page_bytes = 0usize;
             let mut more = false;
+            let mut seen_collection_self = false;
             for entry in page.entries {
                 let candidate = self.checked_from(&collection, &entry.href)?;
                 if candidate == collection && entry.status == Some(507) { more = true; continue; }
+                if candidate == collection {
+                    accept_collection_self(&entry, &mut seen_collection_self)?;
+                    continue;
+                }
                 let url = self.resource(&collection, &entry.href)?;
                 let id = url.as_str().to_owned();
                 match entry.status {
@@ -835,6 +1000,154 @@ impl DavClient {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn personal_home_accepts_only_collection_slash_and_rebases_relative_principal() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}/",listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for n in 0..2 {
+                let (mut socket,_) = listener.accept().unwrap(); let mut request=Vec::new(); let mut buffer=[0u8;4096];
+                loop { let read=socket.read(&mut buffer).unwrap(); assert_ne!(read,0); request.extend_from_slice(&buffer[..read]);
+                    if let Some(end)=request.windows(4).position(|w| w==b"\r\n\r\n") {
+                        let headers=String::from_utf8_lossy(&request[..end]);
+                        let length=headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|x| x.trim().parse::<usize>().ok())).unwrap_or(0);
+                        if request.len()>=end+4+length { break; }
+                    }
+                }
+                let request=String::from_utf8(request).unwrap();
+                let body=if n==0 {
+                    assert!(request.starts_with("PROPFIND /dav/cal "));
+                    r#"<d:multistatus xmlns:d="DAV:"><d:response><d:href>/dav/cal/</d:href><d:propstat><d:prop><d:current-user-principal><d:href>../pal/me</d:href></d:current-user-principal></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#
+                } else {
+                    assert!(request.starts_with("PROPFIND /dav/pal/me "));
+                    r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>/dav/pal/me</d:href><d:propstat><d:prop><c:calendar-home-set><d:href>/dav/cal/me/</d:href></c:calendar-home-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#
+                };
+                write!(socket,"HTTP/1.1 207 Multi-Status\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        let client=super::DavClient {http:reqwest::blocking::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(5)).build().unwrap(),origin:url::Url::parse(&origin).unwrap(),token:"fixture".into(),trusted_public_origin:None};
+        let home=client.personal_home("/dav/cal","calendar").unwrap();
+        assert_eq!(home.home_url(),format!("{origin}dav/cal/me/"));
+        assert_eq!(home.principal_url(),format!("{origin}dav/pal/me"));
+        let target=url::Url::parse(&format!("{origin}dav/cal")).unwrap();
+        assert!(!super::dav_response_matches(&target,&url::Url::parse(&format!("{origin}dav/card/")).unwrap(),true));
+        assert!(!super::dav_response_matches(&target,&url::Url::parse(&format!("{origin}dav/cal/")).unwrap(),false));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn personal_home_rejects_ambiguous_discovery_responses() {
+        use std::io::{Read, Write};
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin=format!("http://{}/",listener.local_addr().unwrap());
+        let server=std::thread::spawn(move || {
+            let (mut socket,_)=listener.accept().unwrap(); let mut bytes=Vec::new(); let mut buf=[0;4096];
+            loop { let n=socket.read(&mut buf).unwrap(); assert_ne!(n,0); bytes.extend_from_slice(&buf[..n]);
+                if let Some(end)=bytes.windows(4).position(|w| w==b"\r\n\r\n") {
+                    let headers=String::from_utf8_lossy(&bytes[..end]); let size=headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok())).unwrap_or(0);
+                    if bytes.len()>=end+4+size { break; }
+                }
+            }
+            let body=r#"<d:multistatus xmlns:d="DAV:"><d:response><d:href>/dav/cal</d:href></d:response><d:response><d:href>/dav/cal/</d:href></d:response></d:multistatus>"#;
+            write!(socket,"HTTP/1.1 207 Multi-Status\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+        });
+        let client=super::DavClient {http:reqwest::blocking::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(5)).build().unwrap(),origin:url::Url::parse(&origin).unwrap(),token:"fixture".into(),trusted_public_origin:None};
+        assert!(matches!(client.personal_home("/dav/cal","calendar"),Err(super::DavError::InvalidResponse)));
+        server.join().unwrap();
+    }
+    #[test]
+    fn recovered_collection_creation_is_conditional_and_marked_for_each_dav_type() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}/",listener.local_addr().unwrap());
+        let operation = "0123456789abcdef0123456789abcdef";
+        let server = std::thread::spawn(move || {
+            for n in 0..4 {
+                let (mut socket,_) = listener.accept().unwrap(); let mut request = Vec::new(); let mut buffer=[0u8;4096];
+                loop {
+                    let read=socket.read(&mut buffer).unwrap(); assert_ne!(read,0); request.extend_from_slice(&buffer[..read]);
+                    if let Some(end)=request.windows(4).position(|w| w==b"\r\n\r\n") {
+                        let headers=String::from_utf8_lossy(&request[..end]);
+                        let length=headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|x| x.trim().parse::<usize>().ok())).unwrap_or(0);
+                        if request.len()>=end+4+length {break;}
+                    }
+                }
+                let request=String::from_utf8(request).unwrap();
+                let (status,body) = if n%2==0 {
+                    assert!(request.starts_with("PROPFIND /home/"));
+                    ("207 Multi-Status",r#"<d:multistatus xmlns:d="DAV:"><d:response><d:href>/home/</d:href><d:propstat><d:prop><d:current-user-privilege-set><d:privilege><d:bind/></d:privilege></d:current-user-privilege-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#.to_owned())
+                } else {
+                    assert!(request.starts_with(if n==1 {"MKCALENDAR "} else {"MKCOL "}));
+                    assert!(request.to_ascii_lowercase().contains("if-none-match: *"));
+                    assert!(request.contains(operation)); assert!(request.contains("<d:displayname>Recovered</d:displayname>"));
+                    ("201 Created",String::new())
+                };
+                write!(socket,"HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        let client=super::DavClient {http:reqwest::blocking::Client::builder().no_proxy().build().unwrap(),origin:url::Url::parse(&origin).unwrap(),token:"fixture".into(),trusted_public_origin:None};
+        for service in ["calendar","contacts"] {
+            let home=super::PersonalDavHome {home:url::Url::parse(&format!("{origin}home/")).unwrap(),principal:url::Url::parse(&format!("{origin}principal/")).unwrap(),service:service.into()};
+            client.create_recovered_collection(&home,operation).unwrap();
+        }
+        server.join().unwrap();
+    }
+    #[test]
+    fn recovered_collection_readback_requires_matching_marker_owner_and_privileges() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap());
+        let operation = "0123456789abcdef0123456789abcdef";
+        let server = std::thread::spawn(move || {
+            for n in 0..3 {
+                let (mut socket,_) = listener.accept().unwrap();
+                let mut request = Vec::new(); let mut buffer = [0u8; 4096];
+                loop {
+                    let read = socket.read(&mut buffer).unwrap(); assert_ne!(read,0); request.extend_from_slice(&buffer[..read]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length = headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|x| x.trim().parse::<usize>().ok())).unwrap_or(0);
+                        if request.len() >= end + 4 + length { break; }
+                    }
+                }
+                let marker = if n == 1 { "ffffffffffffffffffffffffffffffff" } else { operation };
+                let body = if n == 2 { String::new() } else { format!(r#"<d:multistatus xmlns:d="DAV:" xmlns:a="urn:ietf:params:xml:ns:carddav" xmlns:i="urn:isyncyou:recovery"><d:response><d:href>/home/wp16-recovered-{operation}/</d:href><d:propstat><d:prop><d:displayname>Recovered</d:displayname><d:resourcetype><d:collection/><a:addressbook/></d:resourcetype><d:owner><d:href>/principal/</d:href></d:owner><d:current-user-privilege-set><d:privilege><d:all/></d:privilege></d:current-user-privilege-set><i:operation>{marker}</i:operation></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#) };
+                let status = if n == 2 { "404 Not Found" } else { "207 Multi-Status" };
+                write!(socket,"HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        let client = super::DavClient {http:reqwest::blocking::Client::builder().no_proxy().build().unwrap(),origin:url::Url::parse(&origin).unwrap(),token:"fixture".into(),trusted_public_origin:None};
+        let home = super::PersonalDavHome {home:url::Url::parse(&format!("{origin}home/")).unwrap(),principal:url::Url::parse(&format!("{origin}principal/")).unwrap(),service:"contacts".into()};
+        assert!(client.read_recovered_collection(&home,operation).unwrap());
+        assert!(client.read_recovered_collection(&home,operation).is_err());
+        assert!(!client.read_recovered_collection(&home,operation).unwrap());
+        assert!(home.recovered_target("../../foreign").is_err());
+        server.join().unwrap();
+    }
+    #[test]
+    fn collection_self_requires_exact_successful_propstat() {
+        fn response(inner: &str) -> super::Resource {
+            let xml = format!("<d:multistatus xmlns:d=\"DAV:\"><d:response>{inner}</d:response><d:sync-token>next</d:sync-token></d:multistatus>");
+            super::parse_page(xml.as_bytes()).unwrap().entries.remove(0)
+        }
+        let ok = "<d:href>/cal/</d:href><d:propstat><d:prop><d:getetag>&quot;v1&quot;</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>";
+        assert!(super::valid_collection_self(&response(ok)));
+        assert!(super::valid_collection_self(&response(&ok.replace("/cal/", "/card/"))));
+        let mut seen = false;
+        assert!(super::accept_collection_self(&response(ok), &mut seen).is_ok());
+        assert!(super::accept_collection_self(&response(ok), &mut seen).is_err());
+        for invalid in [
+            ok.replace("200 OK", "403 Forbidden"),
+            ok.replace("200 OK", "404 Not Found"),
+            "<d:href>/cal/</d:href><d:status>HTTP/1.1 403 Forbidden</d:status>".into(),
+            "<d:href>/cal/</d:href><d:status>HTTP/1.1 404 Not Found</d:status>".into(),
+            format!("{ok}<d:status>HTTP/1.1 200 OK</d:status>"),
+            ok.replace("<d:getetag>&quot;v1&quot;</d:getetag>", "<d:getetag/>"),
+            ok.replace("</d:prop>", "<d:extra/></d:prop>"),
+            format!("{ok}<d:href>/cal/</d:href>"),
+        ] { assert!(!super::valid_collection_self(&response(&invalid))); }
+    }
     use super::*;
 
     #[test]
@@ -1023,7 +1336,7 @@ mod tests {
                     "BEGIN:VCALENDAR\r\nX-CUSTOM;FOO=BAR:value\r\nEND:VCALENDAR\r\n".to_owned()
                 } else {
                     assert!(first.starts_with("REPORT /cal/ "));
-                    format!("<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/cal/a.ics</d:href><d:propstat><d:prop><d:getetag>&quot;v1&quot;</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:sync-token>token-{index}</d:sync-token></d:multistatus>")
+                    format!("<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/cal/</d:href><d:propstat><d:prop><d:getetag>&quot;collection&quot;</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/cal/a.ics</d:href><d:propstat><d:prop><d:getetag>&quot;v1&quot;</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:sync-token>token-{index}</d:sync-token></d:multistatus>")
                 };
                 let etag = if index == 1 { "ETag: \"v1\"\r\n" } else { "" };
                 let status = if index == 1 { "200 OK" } else { "207 Multi-Status" };

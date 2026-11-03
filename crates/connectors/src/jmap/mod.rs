@@ -183,6 +183,30 @@ fn endpoint(origin: &Url, value: &str) -> Result<Url, JmapError> {
     Ok(url)
 }
 
+/// Discovery alone may follow at most three same-origin redirects. The HTTP
+/// client itself never follows redirects, so a bearer token cannot be sent to
+/// an unvalidated target. Loopback exporters may map only their enrolled public
+/// origin back to the same local listener.
+fn fetch_session(http: &Client, origin: &Url, token: &str, public: Option<&Url>) -> Result<Response, JmapError> {
+    let mut current = endpoint(origin, "/.well-known/jmap")?;
+    let mut visited = std::collections::HashSet::new();
+    for redirects in 0..=3 {
+        if !visited.insert(current.clone()) { return Err(JmapError::InvalidUrl); }
+        let response = http.get(current.clone()).bearer_auth(token).send().map_err(|_| JmapError::Transport)?;
+        if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) { return Ok(response); }
+        if redirects == 3 { return Err(JmapError::InvalidUrl); }
+        let location = response.headers().get(reqwest::header::LOCATION).and_then(|value| value.to_str().ok()).ok_or(JmapError::InvalidUrl)?;
+        let target = current.join(location).map_err(|_| JmapError::InvalidUrl)?;
+        if !target.username().is_empty() || target.password().is_some() || target.fragment().is_some() { return Err(JmapError::InvalidUrl); }
+        let mapped = match public {
+            Some(public) if target.origin() == public.origin() => rewrite_loopback_endpoint(origin, public, target.as_str())?,
+            _ => target.to_string(),
+        };
+        current = endpoint(origin, &mapped)?;
+    }
+    Err(JmapError::InvalidUrl)
+}
+
 fn event_source_endpoint(origin: &Url, template: &str) -> Result<Url, JmapError> {
     if template.len() > 8192 || ["{types}","{closeafter}","{ping}"].iter().any(|part| template.matches(part).count() != 1) { return Err(JmapError::InvalidUrl); }
     let value = template.replace("{types}", "Email%2CMailbox%2CCalendar%2CCalendarEvent%2CAddressBook%2CContactCard").replace("{closeafter}", "no").replace("{ping}", "30");
@@ -284,6 +308,20 @@ pub struct JmapClient {
     max_upload: u64,
     session_state: String,
     vapid_public_key: Option<String>,
+    metrics: Mutex<JmapSyncMetrics>,
+}
+
+/// Per-client aggregate counters; never contains account identifiers or payloads.
+#[derive(Clone, Copy, Default)]
+pub struct JmapSyncMetrics {
+    pub email_get: u64,
+    pub email_changes: u64,
+    pub body_fetch: u64,
+    pub blob_download: u64,
+    pub response_bytes: u64,
+    pub blob_bytes: u64,
+    pub created: u64,
+    pub updated: u64,
 }
 
 impl JmapClient {
@@ -315,11 +353,7 @@ impl JmapClient {
         if loopback { builder = builder.no_proxy(); }
         let http = builder.build()
             .map_err(|_| JmapError::Transport)?;
-        let response = http
-            .get(endpoint(&origin, "/.well-known/jmap")?)
-            .bearer_auth(&token)
-            .send()
-            .map_err(|_| JmapError::Transport)?;
+        let response = fetch_session(&http, &origin, &token, public.as_ref())?;
         if !response.status().is_success() {
             return Err(JmapError::Http(response.status().as_u16()));
         }
@@ -409,7 +443,16 @@ impl JmapClient {
             max_upload,
             session_state,
             vapid_public_key,
+            metrics: Mutex::new(JmapSyncMetrics::default()),
         })
+    }
+    pub fn sync_metrics(&self) -> JmapSyncMetrics {
+        *self.metrics.lock().unwrap_or_else(|error| error.into_inner())
+    }
+    pub fn record_email_changes(&self, created: usize, updated: usize) {
+        let mut metrics = self.metrics.lock().unwrap_or_else(|error| error.into_inner());
+        metrics.created += created as u64;
+        metrics.updated += updated as u64;
     }
     pub fn account_id(&self) -> &str {
         &self.account
@@ -453,6 +496,17 @@ impl JmapClient {
         submission: bool,
     ) -> Result<Value, JmapError> {
         let _permit = self.gate.acquire(false);
+        {
+            let mut metrics = self.metrics.lock().unwrap_or_else(|error| error.into_inner());
+            if method == "Email/get" {
+                metrics.email_get += 1;
+                if args["fetchTextBodyValues"].as_bool() == Some(true) || args["fetchHTMLBodyValues"].as_bool() == Some(true) {
+                    metrics.body_fetch += 1;
+                }
+            } else if method == "Email/changes" {
+                metrics.email_changes += 1;
+            }
+        }
         let mut using = vec![CORE, MAIL];
         if self.mail_share {
             using.push(MAIL_SHARE);
@@ -498,6 +552,7 @@ impl JmapClient {
                 e
             }
         })?;
+        self.metrics.lock().unwrap_or_else(|error| error.into_inner()).response_bytes += raw.len() as u64;
         serde_json::from_slice(&raw).map_err(|_| {
             if mutation {
                 JmapError::OutcomeUnknown
@@ -844,6 +899,7 @@ impl JmapClient {
         media_type: &str,
     ) -> Result<Vec<u8>, JmapError> {
         let _permit = self.gate.acquire(true);
+        self.metrics.lock().unwrap_or_else(|error| error.into_inner()).blob_download += 1;
         let template = self
             .download
             .replace("{accountId}", &encode(&self.account))
@@ -859,7 +915,9 @@ impl JmapClient {
         if !response.status().is_success() {
             return Err(JmapError::Http(response.status().as_u16()));
         }
-        body(response, MAX_BLOB)
+        let bytes = body(response, MAX_BLOB)?;
+        self.metrics.lock().unwrap_or_else(|error| error.into_inner()).blob_bytes += bytes.len() as u64;
+        Ok(bytes)
     }
     pub fn upload(&self, bytes: Vec<u8>, media_type: &str) -> Result<Value, JmapError> {
         if bytes.len() as u64 > self.max_upload {
@@ -1052,6 +1110,101 @@ fn parse_method(payload: &Value, method: &str) -> Result<Value, JmapError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_follows_307_only_after_same_origin_validation() {
+        use std::io::{Read, Write};
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address=listener.local_addr().unwrap();
+        let server=std::thread::spawn(move || {
+            for (path, status, headers, payload) in [
+                ("/.well-known/jmap", "307 Temporary Redirect", "Location: /jmap/session\r\n", ""),
+                ("/jmap/session", "200 OK", "", "{}"),
+                ("/not-discovery", "307 Temporary Redirect", "Location: /jmap/session\r\n", ""),
+            ] {
+                let (mut socket,_) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut request=Vec::new(); let mut chunk=[0u8;1024];
+                while !request.windows(4).any(|v| v==b"\r\n\r\n") { let n=socket.read(&mut chunk).unwrap(); assert!(n>0); request.extend_from_slice(&chunk[..n]); }
+                let request=String::from_utf8(request).unwrap();
+                assert!(request.starts_with(&format!("GET {path} ")));
+                if path!="/not-discovery" { assert!(request.to_ascii_lowercase().contains("authorization: bearer fixture-token")); }
+                write!(socket,"HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",payload.len()).unwrap();
+            }
+        });
+        let origin=Url::parse(&format!("http://{address}/")).unwrap();
+        let http=Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(5)).build().unwrap();
+        assert_eq!(fetch_session(&http,&origin,"fixture-token",None).unwrap().status().as_u16(),200);
+        assert_eq!(http.get(origin.join("/not-discovery").unwrap()).send().unwrap().status().as_u16(),307);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn discovery_rejects_foreign_origin_and_redirect_loops() {
+        use std::io::{Read, Write};
+        let foreign=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        foreign.set_nonblocking(true).unwrap();
+        let foreign_location=format!("http://{}/session",foreign.local_addr().unwrap());
+        for location in [foreign_location.as_str(), "/.well-known/jmap"] {
+            let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address=listener.local_addr().unwrap();
+            let location=location.to_owned();
+            let server=std::thread::spawn(move || {
+                let (mut socket,_) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut request=Vec::new(); let mut buf=[0u8;1024];
+                while !request.windows(4).any(|v| v==b"\r\n\r\n") { let n=socket.read(&mut buf).unwrap(); assert!(n>0); request.extend_from_slice(&buf[..n]); }
+                write!(socket,"HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            });
+            let origin=Url::parse(&format!("http://{address}/")).unwrap();
+            let http=Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(5)).build().unwrap();
+            assert!(matches!(fetch_session(&http,&origin,"fixture-token",None),Err(JmapError::InvalidUrl)));
+            server.join().unwrap();
+        }
+        assert!(matches!(foreign.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
+    }
+
+    #[test]
+    fn discovery_loopback_rebases_only_enrolled_public_origin() {
+        use std::io::{Read, Write};
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address=listener.local_addr().unwrap();
+        let server=std::thread::spawn(move || {
+            for step in 0..2 {
+                let (mut socket,_) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut request=Vec::new(); let mut buf=[0u8;1024];
+                while !request.windows(4).any(|v| v==b"\r\n\r\n") { let n=socket.read(&mut buf).unwrap(); assert!(n>0); request.extend_from_slice(&buf[..n]); }
+                if step==0 { write!(socket,"HTTP/1.1 307 Temporary Redirect\r\nLocation: https://public.example/jmap/session\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap(); }
+                else { assert!(request.starts_with(b"GET /jmap/session ")); write!(socket,"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap(); }
+            }
+        });
+        let origin=Url::parse(&format!("http://{address}/")).unwrap();
+        let public=Url::parse("https://public.example/").unwrap();
+        let http=Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(5)).build().unwrap();
+        assert_eq!(fetch_session(&http,&origin,"fixture-token",Some(&public)).unwrap().status().as_u16(),200);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn discovery_rejects_more_than_three_redirects() {
+        use std::io::{Read, Write};
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address=listener.local_addr().unwrap();
+        let server=std::thread::spawn(move || {
+            for step in 0..4 {
+                let (mut socket,_) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut request=Vec::new(); let mut buf=[0u8;1024];
+                while !request.windows(4).any(|v| v==b"\r\n\r\n") { let n=socket.read(&mut buf).unwrap(); assert!(n>0); request.extend_from_slice(&buf[..n]); }
+                write!(socket,"HTTP/1.1 307 Temporary Redirect\r\nLocation: /step{step}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            }
+        });
+        let origin=Url::parse(&format!("http://{address}/")).unwrap();
+        let http=Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(5)).build().unwrap();
+        assert!(matches!(fetch_session(&http,&origin,"fixture-token",None),Err(JmapError::InvalidUrl)));
+        server.join().unwrap();
+    }
     #[test]
     fn event_stream_limits_scope_and_dispatches_only_mail_hints() {
         let origin = Url::parse("https://mail.example/").unwrap();
@@ -1089,7 +1242,7 @@ mod tests {
           }
         });
         let origin=Url::parse(&format!("http://{address}/")).unwrap();
-        let client=JmapClient { http:Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().unwrap(), origin:origin.clone(), token:"fixture-token".into(), account:"account".into(), api:origin.clone(), download:String::new(), upload:String::new(), event_source:Some(origin.join("/events").unwrap()), submission:false, mail_share:false, gate:account_gate("event-test",2,1), max_get:10, max_request:1024, max_upload:1024, session_state:"state".into(), vapid_public_key:None };
+        let client=JmapClient { http:Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().unwrap(), origin:origin.clone(), token:"fixture-token".into(), account:"account".into(), api:origin.clone(), download:String::new(), upload:String::new(), event_source:Some(origin.join("/events").unwrap()), submission:false, mail_share:false, gate:account_gate("event-test",2,1), max_get:10, max_request:1024, max_upload:1024, session_state:"state".into(), vapid_public_key:None, metrics:Mutex::new(JmapSyncMetrics::default()) };
         let mut events = Vec::new();
         client.watch_mail_events(&AtomicBool::new(false),|domains| {events.push(domains); Ok(())}).unwrap();
         client.watch_mail_events(&AtomicBool::new(false),|domains| {events.push(domains); Ok(())}).unwrap();

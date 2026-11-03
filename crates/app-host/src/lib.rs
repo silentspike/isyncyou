@@ -210,7 +210,7 @@ fn with_current_recovery_config<T>(path:&std::sync::RwLock<Option<PathBuf>>, fal
 
 #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
 fn recovery_calendar_catalog(value:serde_json::Value, service:&str) -> Result<serde_json::Value,String> {
-    let allowed_kind = match service { "calendar" => "event", "todo" => "task", _ => return Err("invalid_recovery_service".into()) };
+    let allowed_kind = match service { "calendar" => "event", "todo" => "task", "mail" => "mail", "contacts" => "contact", _ => return Err("invalid_recovery_service".into()) };
     fn id<'a>(row:&'a serde_json::Value,name:&str) -> Result<&'a str,String> {
         row.get(name).and_then(serde_json::Value::as_str).filter(|s| s.len()==64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))).ok_or_else(|| "invalid_recovery_catalog".into())
     }
@@ -236,7 +236,7 @@ fn prepare_recovery_job_action(cfg:&Config,control:&agent_control_store::AgentCo
     let batch_id=uuid_v4()?; let mut selections=Vec::new(); let mut shown=Vec::new(); let mut unique=std::collections::HashSet::new();
     isyncyou_engine::provider_auth::with_platform_credential_store(cfg,account,|credentials| {
         for choice in items {
-            let service=match choice.kind.as_str() { "event"=>"calendar", "task"=>"todo", _=>return Err("invalid_recovery_selection".into()) };
+            let service=match choice.kind.as_str() { "event"=>"calendar", "task"=>"todo", "mail"=>"mail", "contact"=>"contacts", _=>return Err("invalid_recovery_selection".into()) };
             if !unique.insert((choice.generation.clone(),choice.object.clone(),choice.version.clone())) { return Err("invalid_recovery_selection".into()); }
             let catalog=recovery_calendar_catalog(recovery_catalog_with_store(cfg,account,signer.as_ref(),credentials,choice.cursor)?,service)?;
             let rows=catalog.get("items").and_then(serde_json::Value::as_array).ok_or("invalid_recovery_catalog")?;
@@ -256,8 +256,8 @@ fn prepare_recovery_job_action(cfg:&Config,control:&agent_control_store::AgentCo
 #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
 fn bind_model_recovery_jobs(cfg:&Config,control:Option<&agent_control_store::AgentControlStore>,action:isyncyou_agent::ToolAction)->Result<isyncyou_agent::ToolAction,String> {
     let isyncyou_agent::ToolAction::LiveWrite {account,service,change,..}=&action else { return Ok(action); };
-    if !matches!(service.as_str(),"calendar" | "todo") { return Ok(action); }
-    let allowed_kind=if service=="calendar" {"event"} else {"task"};
+    if !matches!(service.as_str(),"calendar" | "todo" | "mail" | "contacts") { return Ok(action); }
+    let allowed_kind=match service.as_str() { "calendar"=>"event", "todo"=>"task", "mail"=>"mail", "contacts"=>"contact", _=>unreachable!() };
     if change.get("verb").and_then(serde_json::Value::as_str)==Some("recovery_import") {
         let batch_id=change.get("batch_id").and_then(serde_json::Value::as_str).ok_or("recovery_request_invalid")?;
         let collection=change.get("collection").and_then(serde_json::Value::as_str).ok_or("recovery_request_invalid")?;
@@ -307,6 +307,76 @@ fn rebuild_recovery_batch(account:&str, origin:&str, manifest:agent_control_stor
     Ok(ApprovedCalendarBatch { items, approval_sha256:manifest.approval_sha256 })
 }
 
+#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+fn execute_staged_recovery_batch(cfg:&Config,account:&str,origin:&str,manifest:agent_control_store::RecoveryBatchManifest,originals:Vec<Vec<u8>>,credentials:&dyn isyncyou_engine::provider_credential::ProviderCredentialStore) -> Result<isyncyou_engine::self_hosted_mail_restore::CalendarBatchOutcome,String> {
+    use isyncyou_engine::self_hosted_mail_restore::{CalendarBatchOutcome,execute_contact_restore_with_store};
+    if let Some(value)=&manifest.collection_intent {
+        let intent:isyncyou_engine::self_hosted_mail_restore::ApprovedRecoveryCollection=serde_json::from_value(value.clone()).map_err(|_| "recovery_batch_invalid")?;
+        if intent.account_id!=account || intent.origin!=origin || intent.entry!=manifest.entry || intent.target!=manifest.collection || !match intent.service.as_str() { "calendar"=>manifest.objects.iter().all(|item|matches!(item.kind.as_str(),"event" | "task")), "contacts"=>manifest.objects.iter().all(|item|item.kind=="contact"), _=>false } { return Err("recovery_confirmation_mismatch".into()); }
+        match isyncyou_engine::self_hosted_mail_restore::ensure_recovery_collection_with_store(cfg,&intent,&intent.approval_sha256,credentials)? {
+            isyncyou_engine::self_hosted_mail_restore::RecoveryCollectionOutcome::Ready(target) if target==manifest.collection=>{},
+            isyncyou_engine::self_hosted_mail_restore::RecoveryCollectionOutcome::Rejected=>return Ok(CalendarBatchOutcome::Stopped {completed:Vec::new(),next_index:0,reason:"rejected"}),
+            isyncyou_engine::self_hosted_mail_restore::RecoveryCollectionOutcome::Conflict=>return Ok(CalendarBatchOutcome::Stopped {completed:Vec::new(),next_index:0,reason:"conflict"}),
+            _=>return Ok(CalendarBatchOutcome::Stopped {completed:Vec::new(),next_index:0,reason:"unknown"}),
+        }
+    }
+    if manifest.objects.iter().all(|item| matches!(item.kind.as_str(),"event" | "task")) {
+        let approval=manifest.approval_sha256.clone(); let batch=rebuild_recovery_batch(account,origin,manifest,originals)?;
+        return isyncyou_engine::self_hosted_mail_restore::execute_calendar_restore_batch_with_store(cfg,&batch,&approval,credentials);
+    }
+    if manifest.objects.iter().all(|item| item.kind=="mail") {
+        use isyncyou_engine::self_hosted_mail_restore::{RecoverySelection,BoundRecoveryStatus,RestoreOutcome,load_registered_recovery_signer,prepare_staged_mail_restore,execute_bound_mail_restore_with_store};
+        if manifest.origin!=origin || manifest.objects.is_empty() || originals.len()!=manifest.objects.len() || manifest.projections.len()!=originals.len() || manifest.execution_order.len()!=originals.len() || !manifest.uid_map.is_empty() { return Err("recovery_batch_invalid".into()); }
+        let bound=serde_json::to_vec(&manifest.projections).map_err(|_| "recovery_batch_invalid")?;
+        let digest:String=ring::digest::digest(&ring::digest::SHA256,&bound).as_ref().iter().map(|b|format!("{b:02x}")).collect();
+        if digest!=manifest.approval_sha256 { return Err("recovery_confirmation_mismatch".into()); }
+        let signer=load_registered_recovery_signer(cfg,account)?;
+        let mut ready=Vec::new();
+        for (index,(item,bytes)) in manifest.objects.iter().zip(originals).enumerate() {
+            if manifest.execution_order[index]!=item.operation_id { return Err("recovery_batch_invalid".into()); }
+            let selection=RecoverySelection {operation_id:item.operation_id.clone(),account_id:account.into(),origin:origin.into(),generation:item.generation.clone(),object:item.object.clone(),version:item.version.clone(),confirmation:item.confirmation.clone()};
+            let status=BoundRecoveryStatus {state:item.state.clone(),kind:item.kind.clone(),encoding:item.encoding.clone(),size:item.size,sha256:item.sha256.clone(),selection_sha256:item.selection_sha256.clone()};
+            let (op,summary)=prepare_staged_mail_restore(&selection,&status,signer.as_ref(),bytes,&manifest.collection)?;
+            if serde_json::to_value(&summary).map_err(|_| "recovery_batch_invalid")?!=manifest.projections[index] { return Err("recovery_confirmation_mismatch".into()); }
+            ready.push((op,summary.approval_sha256));
+        }
+        let mut completed=Vec::new();
+        for (index,(op,approval)) in ready.iter().enumerate() {
+            match execute_bound_mail_restore_with_store(cfg,op,approval,credentials)? {
+                RestoreOutcome::Verified(id)=>completed.push(id),
+                RestoreOutcome::Unknown=>return Ok(CalendarBatchOutcome::Stopped {completed,next_index:index,reason:"unknown"}),
+                RestoreOutcome::Rejected | RestoreOutcome::RecoveredFolderUnavailable=>return Ok(CalendarBatchOutcome::Stopped {completed,next_index:index,reason:"rejected"}),
+            }
+        }
+        return Ok(CalendarBatchOutcome::Confirmed(completed));
+    }
+    if manifest.origin!=origin || manifest.objects.is_empty() || !manifest.objects.iter().all(|item| item.kind=="contact") || originals.len()!=manifest.objects.len() || manifest.projections.len()!=originals.len() || manifest.execution_order.len()!=originals.len() || manifest.uid_map.len()!=originals.len() { return Err("recovery_batch_invalid".into()); }
+    let bytes=serde_json::to_vec(&manifest.projections).map_err(|_| "recovery_batch_invalid")?;
+    let digest:String=ring::digest::digest(&ring::digest::SHA256,&bytes).as_ref().iter().map(|b|format!("{b:02x}")).collect();
+    if digest!=manifest.approval_sha256 { return Err("recovery_confirmation_mismatch".into()); }
+    let signer=isyncyou_engine::self_hosted_mail_restore::load_registered_recovery_signer(cfg,account)?;
+    let mut ready=Vec::new();
+    for (index,(item,original)) in manifest.objects.iter().zip(originals).enumerate() {
+        if manifest.execution_order[index]!=item.operation_id { return Err("recovery_batch_invalid".into()); }
+        let uid=manifest.uid_map.get(&item.operation_id).ok_or("recovery_batch_invalid")?;
+        let selection=isyncyou_engine::self_hosted_mail_restore::RecoverySelection {operation_id:item.operation_id.clone(),account_id:account.into(),origin:origin.into(),generation:item.generation.clone(),object:item.object.clone(),version:item.version.clone(),confirmation:item.confirmation.clone()};
+        let status=isyncyou_engine::self_hosted_mail_restore::BoundRecoveryStatus {state:item.state.clone(),kind:item.kind.clone(),encoding:item.encoding.clone(),size:item.size,sha256:item.sha256.clone(),selection_sha256:item.selection_sha256.clone()};
+        let (op,summary)=isyncyou_engine::self_hosted_mail_restore::prepare_staged_contact_restore(&selection,&status,signer.as_ref(),original,&manifest.entry,&manifest.collection,uid)?;
+        if serde_json::to_value(&summary).map_err(|_| "recovery_batch_invalid")?!=manifest.projections[index] { return Err("recovery_confirmation_mismatch".into()); }
+        ready.push((op,summary.approval_sha256));
+    }
+    let mut completed=Vec::new();
+    for (index,(op,approval)) in ready.iter().enumerate() {
+        match execute_contact_restore_with_store(cfg,op,approval,credentials)? {
+            isyncyou_engine::dav_live::RecoveryImportOutcome::Confirmed {href}=>completed.push(href),
+            isyncyou_engine::dav_live::RecoveryImportOutcome::Unknown=>return Ok(CalendarBatchOutcome::Stopped {completed,next_index:index,reason:"unknown"}),
+            isyncyou_engine::dav_live::RecoveryImportOutcome::Conflict=>return Ok(CalendarBatchOutcome::Stopped {completed,next_index:index,reason:"conflict"}),
+            isyncyou_engine::dav_live::RecoveryImportOutcome::Rejected=>return Ok(CalendarBatchOutcome::Stopped {completed,next_index:index,reason:"rejected"}),
+        }
+    }
+    Ok(CalendarBatchOutcome::Confirmed(completed))
+}
+
 fn calendar_month_bounds(year:u32, month:u32) -> Option<(String,String)> {
     if !(1900..=9998).contains(&year) || !(1..=12).contains(&month) { return None; }
     let (next_year,next_month) = if month == 12 { (year+1,1) } else { (year,month+1) };
@@ -325,7 +395,7 @@ impl isyncyou_agent::ToolExecutor for ProviderMailExecutor {
         let store = isyncyou_engine::provider_store::open_readonly(&self.cfg, &self.account)
             .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
         match action {
-            ToolAction::List { service, parent:Some(parent), .. } if matches!(service.as_str(),"calendar" | "todo") && parent=="recovery-requests" => {
+            ToolAction::List { service, parent:Some(parent), .. } if matches!(service.as_str(),"calendar" | "todo" | "mail" | "contacts") && parent=="recovery-requests" => {
                 let path=self.config_path.read().map_err(|_| AgentError::Provider("account configuration unavailable".into()))?.clone();
                 let read=|cfg:&Config| -> Result<serde_json::Value,String> {
                     if !cfg.accounts.iter().any(|a| a.id==self.account) || cfg.provider_accounts.get(&self.account)!=self.cfg.provider_accounts.get(&self.account) { return Err("account_config_changed".into()); }
@@ -337,7 +407,7 @@ impl isyncyou_agent::ToolExecutor for ProviderMailExecutor {
                 let result=match path {Some(path)=>Config::with_config_lock(&path,|| {let cfg=load_host_runtime_config(&path)?;read(&cfg)}),None=>read(&self.cfg)}.map_err(|_| AgentError::Provider("recovery requests unavailable".into()))?;
                 Ok(result.to_string())
             }
-            ToolAction::List { service, parent:Some(parent), .. } if matches!(service.as_str(),"calendar" | "todo") && parent.starts_with("recovery:") => {
+            ToolAction::List { service, parent:Some(parent), .. } if matches!(service.as_str(),"calendar" | "todo" | "mail" | "contacts") && parent.starts_with("recovery:") => {
                 let after = parent[9..].parse::<u64>().map_err(|_| AgentError::ToolArgs("invalid recovery cursor".into()))?;
                 let path = self.config_path.read().map_err(|_| AgentError::Provider("account configuration unavailable".into()))?.clone();
                 let read_catalog = |cfg:&Config| -> Result<serde_json::Value,String> {
@@ -3833,8 +3903,7 @@ impl DaemonAgent {
                 let origin=match cfg.provider_accounts.get(account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin,..}) if cfg.accounts.iter().any(|a| a.id==*account)=>origin, _=>return Err("provider_unavailable".into()) };
                 let (manifest,originals)=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| control.load_recovery_batch(batch_id,account,origin,subject.ok_or("provider_login_required")?,manifest_hash,pending_id,action_hash,true,unix_now_ms()))?;
                 if manifest.approval_sha256!=approval || change.get("effect_sha256").and_then(serde_json::Value::as_str)!=Some(agent_control_store::recovery_batch_effect_sha256(&manifest).as_str()) { return Err("recovery_confirmation_mismatch".into()); }
-                let batch=rebuild_recovery_batch(account,origin,manifest,originals)?;
-                let result=isyncyou_engine::provider_auth::with_platform_credential_store(cfg,account,|credentials| isyncyou_engine::self_hosted_mail_restore::execute_calendar_restore_batch_with_store(cfg,&batch,approval,credentials))?;
+                let result=isyncyou_engine::provider_auth::with_platform_credential_store(cfg,account,|credentials| execute_staged_recovery_batch(cfg,account,origin,manifest,originals,credentials))?;
                 if matches!(&result,isyncyou_engine::self_hosted_mail_restore::CalendarBatchOutcome::Confirmed(_)) {
                     let _=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| control.complete_recovery_batch(batch_id,account,origin,subject.ok_or("provider_login_required")?,manifest_hash));
                 }
@@ -11346,40 +11415,68 @@ fn session_transport_token(cfg: &Config, account: &str) -> Result<String, String
 #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
 fn prepare_recovery_import_action(cfg:&Config,control:&agent_control_store::AgentControlStore,origin:&str,request:&isyncyou_webui::AgentRecoveryImportPrepareRequest)->Result<(isyncyou_agent::ToolAction,String),String> {
     use isyncyou_engine::self_hosted_mail_restore::{RecoverySelection,bound_recovery_status,read_bound_recovery_result,prepare_staged_calendar_batch,load_registered_recovery_signer};
-                let saved=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.read_claimed_recovery_request(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?))?;
-                let signer=load_registered_recovery_signer(cfg,&request.account)?;
+                let saved=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.read_claimed_recovery_request(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?)).map_err(|_| "recovery_prepare_request_unavailable")?;
+                let signer=load_registered_recovery_signer(cfg,&request.account).map_err(|_| "recovery_prepare_device_unavailable")?;
                 if saved.get("device").and_then(serde_json::Value::as_str)!=Some(signer.device_id()) { return Err("recovery_device_changed".into()); }
                 let selections:Vec<RecoverySelection>=serde_json::from_value(saved.get("selections").cloned().ok_or("recovery_request_invalid")?).map_err(|_| "recovery_request_invalid")?;
                 if selections.is_empty() || selections.len()>32 || selections.iter().any(|s| s.account_id!=request.account || s.origin!=origin) { return Err("recovery_request_invalid".into()); }
                 let labels=saved.pointer("/effect/objects").and_then(serde_json::Value::as_array).ok_or("recovery_request_invalid")?;
                 if labels.len()!=selections.len() { return Err("recovery_request_invalid".into()); }
                 let existing=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.recovery_staging_info(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,unix_now_ms()))?;
-                if let Some((state,manifest_sha,manifest))=existing {
+                if let Some((state,manifest_sha,manifest))=&existing {
                     if !manifest.approval_sha256.is_empty() {
-                        if manifest.origin!=origin || manifest.collection!=request.collection || manifest.objects.len()!=selections.len() || manifest.objects.iter().zip(&selections).any(|(a,b)| a.operation_id!=b.operation_id || a.generation!=b.generation || a.object!=b.object || a.version!=b.version || a.confirmation!=b.confirmation) { return Err("recovery_batch_conflict".into()); }
+                        if manifest.origin!=origin || (request.collection!="Recovered" && manifest.collection!=request.collection) || manifest.objects.len()!=selections.len() || manifest.objects.iter().zip(&selections).any(|(a,b)| a.operation_id!=b.operation_id || a.generation!=b.generation || a.object!=b.object || a.version!=b.version || a.confirmation!=b.confirmation) { return Err("recovery_batch_conflict".into()); }
                         if state=="staging" { isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.ready_recovery_batch(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,unix_now_ms()))?; }
                         let action=isyncyou_agent::ToolAction::LiveWrite {account:request.account.clone(),service:"calendar".into(),target:None,change:serde_json::json!({"verb":"recovery_batch_import","batch_id":request.batch_id,"manifest_sha256":manifest_sha,"approval_sha256":manifest.approval_sha256,"effect_sha256":agent_control_store::recovery_batch_effect_sha256(&manifest)})};
-                        return Ok((action,manifest_sha));
+                        return Ok((action,manifest_sha.clone()));
                     }
                 }
                 let mut statuses=Vec::new();
-                isyncyou_engine::provider_auth::with_platform_credential_store(cfg,&request.account,|credentials| { for selection in &selections { statuses.push(bound_recovery_status(cfg,selection,signer.as_ref(),credentials)?); } Ok(()) })?;
+                isyncyou_engine::provider_auth::with_platform_credential_store(cfg,&request.account,|credentials| { for selection in &selections { statuses.push(bound_recovery_status(cfg,selection,signer.as_ref(),credentials).map_err(|_| "recovery_prepare_status_unavailable")?); } Ok(()) })?;
                 let objects=selections.iter().zip(&statuses).zip(labels).map(|((s,status),label)| agent_control_store::RecoveryStagedObject { generation:s.generation.clone(),object:s.object.clone(),version:s.version.clone(),operation_id:s.operation_id.clone(),confirmation:s.confirmation.clone(),size:status.size,sha256:status.sha256.clone(),selection_sha256:status.selection_sha256.clone(),kind:status.kind.clone(),encoding:status.encoding.clone(),state:status.state.clone(),label:label.get("label").and_then(serde_json::Value::as_str).unwrap_or("").into() }).collect();
-                let mut manifest=agent_control_store::RecoveryBatchManifest { approval_sha256:String::new(),origin:origin.to_string(),entry:"/.well-known/caldav".into(),collection:request.collection.clone(),objects,uid_map:std::collections::BTreeMap::new(),execution_order:Vec::new(),projections:Vec::new() };
+                let contact_batch=labels.iter().all(|item| item.get("kind").and_then(serde_json::Value::as_str)==Some("contact"));
+                let mail_batch=labels.iter().all(|item| item.get("kind").and_then(serde_json::Value::as_str)==Some("mail"));
+                if !contact_batch && !mail_batch && labels.iter().any(|item| !matches!(item.get("kind").and_then(serde_json::Value::as_str),Some("event" | "task"))) { return Err("recovery_service_mismatch".into()); }
+                let entry=if contact_batch {"/.well-known/carddav"} else if mail_batch {"mail"} else {"/.well-known/caldav"};
+                let collection_intent=if mail_batch { None } else if let Some((_,_,prior))=&existing { prior.collection_intent.clone() } else {
+                    let intent=isyncyou_engine::provider_auth::with_platform_credential_store(cfg,&request.account,|credentials| isyncyou_engine::self_hosted_mail_restore::prepare_recovery_collection_with_store(cfg,&request.account,entry,if contact_batch {"contacts"} else {"calendar"},credentials)).map_err(|_| "recovery_prepare_collection_unavailable")?;
+                    Some(serde_json::to_value(intent).map_err(|_| "recovery_batch_invalid")?)
+                };
+                let collection=if let Some(intent)=&collection_intent { intent.get("target").and_then(serde_json::Value::as_str).ok_or("recovery_batch_invalid")?.to_string() } else if let Some((_,_,prior))=&existing { prior.collection.clone() } else { request.collection.clone() };
+                if !mail_batch && collection_intent.is_none() && existing.is_none() && request.collection=="Recovered" { return Err("recovery_collection_unavailable".into()); }
+                let mut manifest=agent_control_store::RecoveryBatchManifest { approval_sha256:String::new(),origin:origin.to_string(),entry:entry.into(),collection,objects,uid_map:std::collections::BTreeMap::new(),execution_order:Vec::new(),projections:Vec::new(),collection_intent };
                 let expires=unix_now_ms().checked_add(24*60*60*1000).ok_or("recovery_batch_invalid")?;
-                isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.reserve_recovery_batch(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,&manifest,expires,unix_now_ms()).map(|_| ()))?;
+                isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.reserve_recovery_batch(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,&manifest,expires,unix_now_ms()).map(|_| ())).map_err(|_| "recovery_prepare_staging_unavailable")?;
                 for (index,selection) in selections.iter().enumerate() {
-                    let payload=isyncyou_engine::provider_auth::with_platform_credential_store(cfg,&request.account,|credentials| read_bound_recovery_result(cfg,selection,signer.as_ref(),credentials))?;
+                    let payload=isyncyou_engine::provider_auth::with_platform_credential_store(cfg,&request.account,|credentials| read_bound_recovery_result(cfg,selection,signer.as_ref(),credentials)).map_err(|_| "recovery_prepare_result_unavailable")?;
                     if payload.sha256!=statuses[index].sha256 || payload.bytes.len() as u64!=statuses[index].size || payload.kind!=statuses[index].kind || payload.encoding!=statuses[index].encoding { return Err("recovery_result_changed".into()); }
                     for (chunk,bytes) in payload.bytes.chunks(agent_control_store::RECOVERY_CHUNK_BYTES).enumerate() {
                         isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.put_recovery_batch_chunk(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,index,u32::try_from(chunk).map_err(|_| "recovery_batch_invalid")?,bytes,unix_now_ms()))?;
                     }
                 }
                 let (_,originals)=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.inspect_staged_recovery_batch(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,unix_now_ms()))?;
-                let (batch,summaries)=prepare_staged_calendar_batch(&selections,&statuses,signer.as_ref(),originals,&manifest.entry,&manifest.collection)?;
-                manifest.approval_sha256=batch.approval_sha256.clone(); manifest.execution_order=batch.items.iter().map(|item| item.operation_id.clone()).collect();
-                manifest.uid_map=batch.items.first().ok_or("recovery_batch_invalid")?.uid_map.iter().map(|(k,v)|(k.clone(),v.clone())).collect();
-                manifest.projections=summaries.iter().map(serde_json::to_value).collect::<Result<Vec<_>,_>>().map_err(|_| "recovery_batch_invalid")?;
+                if contact_batch || mail_batch {
+                    for ((selection,status),bytes) in selections.iter().zip(&statuses).zip(originals) {
+                        let summary=if contact_batch {
+                            let uid=format!("{}@recovered.invalid",uuid_v4()?);
+                            let (_,summary)=isyncyou_engine::self_hosted_mail_restore::prepare_staged_contact_restore(selection,status,signer.as_ref(),bytes,&manifest.entry,&manifest.collection,&uid)?;
+                            manifest.uid_map.insert(selection.operation_id.clone(),uid);
+                            serde_json::to_value(summary).map_err(|_| "recovery_batch_invalid")?
+                        } else {
+                            let (_,summary)=isyncyou_engine::self_hosted_mail_restore::prepare_staged_mail_restore(selection,status,signer.as_ref(),bytes,&manifest.collection)?;
+                            serde_json::to_value(summary).map_err(|_| "recovery_batch_invalid")?
+                        };
+                        manifest.execution_order.push(selection.operation_id.clone());
+                        manifest.projections.push(summary);
+                    }
+                    let bound=serde_json::to_vec(&manifest.projections).map_err(|_| "recovery_batch_invalid")?;
+                    manifest.approval_sha256=ring::digest::digest(&ring::digest::SHA256,&bound).as_ref().iter().map(|b|format!("{b:02x}")).collect();
+                } else {
+                    let (batch,summaries)=prepare_staged_calendar_batch(&selections,&statuses,signer.as_ref(),originals,&manifest.entry,&manifest.collection).map_err(|_| "recovery_prepare_projection_unavailable")?;
+                    manifest.approval_sha256=batch.approval_sha256.clone(); manifest.execution_order=batch.items.iter().map(|item| item.operation_id.clone()).collect();
+                    manifest.uid_map=batch.items.first().ok_or("recovery_batch_invalid")?.uid_map.iter().map(|(k,v)|(k.clone(),v.clone())).collect();
+                    manifest.projections=summaries.iter().map(serde_json::to_value).collect::<Result<Vec<_>,_>>().map_err(|_| "recovery_batch_invalid")?;
+                }
                 let manifest_sha=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.finalize_recovery_batch_manifest(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,&manifest,unix_now_ms()))?;
                 isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.ready_recovery_batch(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,unix_now_ms()))?;
                 let action=isyncyou_agent::ToolAction::LiveWrite {account:request.account.clone(),service:"calendar".into(),target:None,change:serde_json::json!({"verb":"recovery_batch_import","batch_id":request.batch_id,"manifest_sha256":manifest_sha,"approval_sha256":manifest.approval_sha256,"effect_sha256":agent_control_store::recovery_batch_effect_sha256(&manifest)})};
@@ -11452,8 +11549,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 };
                 if state=="confirmed" { return Ok(serde_json::json!({"state":"confirmed"})); }
                 let (manifest,originals)=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.load_recovery_batch(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,&digest,&pending,&action_hash,state=="approved",unix_now_ms()))?;
-                let approval=manifest.approval_sha256.clone(); let batch=rebuild_recovery_batch(&request.account,origin,manifest,originals)?;
-                let outcome=isyncyou_engine::provider_auth::with_platform_credential_store(cfg,&request.account,|credentials| isyncyou_engine::self_hosted_mail_restore::execute_calendar_restore_batch_with_store(cfg,&batch,&approval,credentials))?;
+                let outcome=isyncyou_engine::provider_auth::with_platform_credential_store(cfg,&request.account,|credentials| execute_staged_recovery_batch(cfg,&request.account,origin,manifest,originals,credentials))?;
                 match outcome {
                     isyncyou_engine::self_hosted_mail_restore::CalendarBatchOutcome::Confirmed(items)=>{
                         let _=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.complete_recovery_batch(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,&digest));
@@ -15798,6 +15894,9 @@ fn provider_callback_serve(listener: std::net::TcpListener, state: Arc<Mutex<Log
                     Some(isyncyou_engine::provider_auth::AuthFinishError::RevocationPending) => "account_revocation_pending",
                     Some(isyncyou_engine::provider_auth::AuthFinishError::RevocationUnrecoverable) => "account_revocation_unrecoverable",
                     Some(isyncyou_engine::provider_auth::AuthFinishError::Failed(message)) if message == "System keyring unavailable" => "account_keyring_unavailable",
+                    Some(isyncyou_engine::provider_auth::AuthFinishError::Failed(message)) if message == "Provider identity verification failed" => "account_provider_identity_verification_failed",
+                    Some(isyncyou_engine::provider_auth::AuthFinishError::Failed(message)) if message == "Provider identity binding failed" => "account_provider_identity_binding_failed",
+                    Some(isyncyou_engine::provider_auth::AuthFinishError::Failed(message)) if message == "Provider credential storage failed" => "account_provider_credential_storage_failed",
                     _ => "account_authorization_failed",
                 });
             }
@@ -16675,6 +16774,34 @@ where I:IntoIterator<Item=(String,Result<Option<isyncyou_engine::self_hosted_mai
     feature = "agent-subscription-experimental"
 ))]
 impl isyncyou_webui::MutationIntentHandler for DaemonMutationIntents {
+    fn legacy_mail_status(&self, _owner:&str, account:&str) -> Result<serde_json::Value,String> {
+        self.mail.with_locked_runtime_config(|cfg| {
+            if !cfg.provider_accounts.contains_key(account) || !cfg.accounts.iter().any(|a| a.id == account) { return Err("provider_unavailable".into()); }
+            isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| {
+                subject.ok_or("provider_login_required")?;
+                let (staged,unknown) = self.store.legacy_mail_intent_counts(account)?;
+                Ok(serde_json::json!({"identity_binding":"unavailable", "staged":staged, "unknown":unknown, "terminal_coverage":"unavailable"}))
+            })
+        })
+    }
+    fn mail_status(&self, _owner:&str, account:&str, intent_id:&str) -> Result<serde_json::Value,String> {
+        self.mail.with_locked_runtime_config(|cfg| {
+            let origin = match cfg.provider_accounts.get(account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) if cfg.accounts.iter().any(|a| a.id == account) => origin, _ => return Err("provider_unavailable".into()) };
+            isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| {
+                let subject = subject.ok_or("provider_login_required")?;
+                let state = self.store.bound_mail_intent_state(intent_id,account,origin,subject)?.ok_or("mutation_intent_not_found")?;
+                if state == "active" { return Ok(serde_json::json!({"state":"staged"})); }
+                if matches!(state.as_str(),"cancelled" | "expired") { return Ok(serde_json::json!({"state":"not_dispatched"})); }
+                let store = isyncyou_engine::provider_store::open_readonly(cfg,account)?;
+                let native = store.provider_mail_draft_result(account,origin,intent_id).map_err(|_| "mutation_intent_unavailable")?;
+                match native {
+                    Some((state,Some(id))) if state == "confirmed" && !id.is_empty() => Ok(serde_json::json!({"state":"completed", "native_id":id})),
+                    Some((state,_)) if state == "rejected" => Ok(serde_json::json!({"state":"rejected"})),
+                    _ => Ok(serde_json::json!({"state":"unknown"})),
+                }
+            })
+        })
+    }
     fn confirmed_attachments(&self, _owner:&str, account:&str)->Result<serde_json::Value,String> {
         self.mail.with_locked_runtime_config(|cfg| {
             let origin=match cfg.provider_accounts.get(account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin,..}) if cfg.accounts.iter().any(|a| a.id==account)=>origin, _=>return Err("provider_unavailable".into()) };
@@ -16718,6 +16845,20 @@ impl isyncyou_webui::MutationIntentHandler for DaemonMutationIntents {
         &self,
         request: isyncyou_webui::MutationIntentCreate,
     ) -> Result<isyncyou_webui::MutationIntentInfo, String> {
+        if let isyncyou_webui::MutationPurpose::MailBody { account, .. } = &request.purpose {
+            let own = self.mail.with_locked_runtime_config(|cfg| Ok(cfg.provider_accounts.contains_key(account)))?;
+            if own {
+                return self.mail.with_locked_runtime_config(|cfg| {
+                    let origin = match cfg.provider_accounts.get(account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) if cfg.accounts.iter().any(|a| a.id == account.as_str()) => origin, _ => return Err("provider_unavailable".into()) };
+                    isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| {
+                        let subject = subject.ok_or("provider_login_required")?;
+                        let info = self.store.create_mutation_intent(&request,unix_now_ms())?;
+                        self.store.bind_mail_installation(&request.owner,&info.intent_id,account,origin,subject)?;
+                        Ok(info)
+                    })
+                });
+            }
+        }
         if let isyncyou_webui::MutationPurpose::MailAttachment { account, .. } = &request.purpose {
             return self.mail.with_locked_runtime_config(|cfg| {
             let origin = match cfg.provider_accounts.get(account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) if cfg.accounts.iter().any(|a| a.id == account.as_str()) => origin.clone(), _ => return Err("provider_unavailable".into()) };
@@ -17832,6 +17973,12 @@ mod tests {
         assert_eq!(result["items"][0]["kind"],"event");
         assert!(result["items"][0].get("extra").is_none());
         assert_eq!(result["next"],100);
+        for (service, kind) in [("mail", "mail"), ("contacts", "contact")] {
+            let item = serde_json::json!({"generation":id,"object":id,"version":id,"kind":kind,"label":"Recovered"});
+            let selected = recovery_calendar_catalog(serde_json::json!({"items":[item],"next":null}),service).unwrap();
+            assert_eq!(selected["items"][0]["kind"],kind);
+            assert!(recovery_calendar_catalog(serde_json::json!({"items":[selected["items"][0]],"next":null}),"calendar").unwrap()["items"].as_array().unwrap().is_empty());
+        }
     }
 
     #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]

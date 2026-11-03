@@ -594,8 +594,16 @@ pub fn sync(
     store: &Store,
     client: &SelfHostedClient,
 ) -> Result<usize, String> {
+    let before = client.client.sync_metrics();
     let folders = sync_mailboxes_inner(cfg, account, store, client, false)?;
-    Ok(folders + sync_inner(cfg, account, store, client, false)?)
+    let messages = sync_inner(cfg, account, store, client, false)?;
+    let after = client.client.sync_metrics();
+    eprintln!("isyncyou_provider_mail_cycle email_get={} email_changes={} created={} updated={} body_fetch={} blob_download={} response_bytes={} blob_bytes={}",
+        after.email_get.saturating_sub(before.email_get), after.email_changes.saturating_sub(before.email_changes),
+        after.created.saturating_sub(before.created), after.updated.saturating_sub(before.updated),
+        after.body_fetch.saturating_sub(before.body_fetch), after.blob_download.saturating_sub(before.blob_download),
+        after.response_bytes.saturating_sub(before.response_bytes), after.blob_bytes.saturating_sub(before.blob_bytes));
+    Ok(folders + messages)
 }
 
 /// Mailbox identity and state are distinct from Email identity and state.
@@ -711,7 +719,9 @@ fn sync_mailboxes_inner(
         }
         let next = field(&page, "newState")?.to_owned();
         let mut ids = list(&page, "created")?;
-        ids.extend(list(&page, "updated")?);
+        let updated = list(&page, "updated")?;
+        client.record_email_changes(ids.len(), updated.len());
+        ids.extend(updated);
         let mut changes = Vec::new();
         if !ids.is_empty() {
             let fetched = client

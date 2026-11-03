@@ -143,13 +143,17 @@ pub(crate) struct RecoveryStagedObject {
 pub(crate) struct RecoveryBatchManifest {
     pub approval_sha256:String, pub origin:String, pub entry:String, pub collection:String,
     pub objects:Vec<RecoveryStagedObject>, pub uid_map:std::collections::BTreeMap<String,String>, pub execution_order:Vec<String>, pub projections:Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub collection_intent:Option<serde_json::Value>,
 }
 
 pub(crate) fn recovery_batch_effect(manifest:&RecoveryBatchManifest) -> serde_json::Value {
-    serde_json::json!({"origin":manifest.origin,"collection":manifest.collection,"entry":manifest.entry,"approval_sha256":manifest.approval_sha256,
+    let mut effect=serde_json::json!({"origin":manifest.origin,"collection":manifest.collection,"entry":manifest.entry,"approval_sha256":manifest.approval_sha256,
         "objects":manifest.objects.iter().map(|item| serde_json::json!({"generation":item.generation,"object":item.object,"version":item.version,"kind":item.kind,"label":item.label,"sha256":item.sha256,"size":item.size,"operation_id":item.operation_id})).collect::<Vec<_>>(),
         "execution_order":manifest.execution_order,"uid_mapping_count":manifest.uid_map.len(),"projections":manifest.projections,
-        "effects":"Creates personal recovered copies with new identities; scheduling participants and alarms are removed. Timezone definitions are shown as untrusted data and their rules are not independently validated."})
+        "effects":if manifest.objects.iter().all(|item| matches!(item.kind.as_str(),"event" | "task")) { "Creates personal recovered copies with new identities; scheduling participants and alarms are removed. Timezone definitions are shown as untrusted data and their rules are not independently validated." } else if manifest.objects.iter().all(|item| item.kind=="mail") { "Creates the personal Recovered mail folder if needed and imports the reviewed original message; no message is sent." } else { "Creates the reviewed personal recovered contact copy." }});
+    if let Some(intent)=&manifest.collection_intent { effect["collection_creation"]=serde_json::json!({"intent":intent,"effect":"Create the personal Recovered collection if needed before importing."}); }
+    effect
 }
 pub(crate) fn recovery_batch_effect_sha256(manifest:&RecoveryBatchManifest)->String { sha256_hex(recovery_batch_effect(manifest).to_string().as_bytes()) }
 
@@ -913,6 +917,7 @@ impl AgentControlStore {
         ensure_integer_column(&migration, "mutation_intents", "terminal_expires_at_ms")?;
         ensure_text_column(&migration, "mutation_intents", "result_digest", "")?;
         ensure_text_column(&migration, "mutation_upload_bindings", "dispatch_state", "unknown")?;
+        migration.execute_batch("CREATE TABLE IF NOT EXISTS mutation_mail_bindings (intent_id TEXT PRIMARY KEY NOT NULL, identity_binding TEXT NOT NULL, FOREIGN KEY(intent_id) REFERENCES mutation_intents(intent_id) ON DELETE CASCADE);").map_err(|_| "control_store_migration_failed")?;
         migration.execute_batch("CREATE TRIGGER IF NOT EXISTS mutation_upload_state_update AFTER UPDATE OF state ON mutation_intents BEGIN UPDATE mutation_upload_bindings SET dispatch_state=CASE NEW.state WHEN 'committing' THEN 'dispatching' WHEN 'committed' THEN 'settled' WHEN 'cancelled' THEN 'not_dispatched' WHEN 'expired' THEN 'not_dispatched' ELSE dispatch_state END WHERE intent_id=NEW.intent_id; END;").map_err(|_| "control_store_migration_failed")?;
         migration.execute_batch("CREATE TRIGGER IF NOT EXISTS recovery_batch_approval_consumed AFTER UPDATE OF state ON confirmation_intents WHEN NEW.state='consumed' AND OLD.state='pending' BEGIN UPDATE recovery_batches SET state='approved' WHERE pending_id=NEW.intent_id AND action_hash=NEW.action_hash AND state='ready'; END;").map_err(|_| "control_store_migration_failed")?;
         migration.execute_batch("CREATE TRIGGER IF NOT EXISTS recovery_request_approval_consumed AFTER UPDATE OF state ON confirmation_intents WHEN NEW.state='consumed' AND OLD.state='pending' BEGIN UPDATE recovery_requests SET state='approved' WHERE pending_id=NEW.intent_id AND action_hash=NEW.action_hash AND state='prepared'; END;").map_err(|_| "control_store_migration_failed")?;
@@ -1510,6 +1515,43 @@ impl AgentControlStore {
         connection.query_row("SELECT state FROM mutation_intents WHERE intent_id=?1 AND owner_binding=?2", params![intent_id,binding], |row| row.get(0)).optional().map_err(|_| "mutation_intent_failed".into())
     }
 
+    pub(crate) fn bind_mail_installation(&self, owner:&str, intent_id:&str, account:&str, origin:&str, subject:&str) -> Result<(),String> {
+        let owner_binding = self.mutation_owner_binding(owner)?;
+        let binding = self.upload_installation_binding(&format!("mail-intent:{intent_id}"),account,origin,subject)?;
+        let connection = self.connection.lock().map_err(|_| "mutation_intent_failed")?;
+        let exists: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM mutation_intents WHERE intent_id=?1 AND owner_binding=?2 AND state='active')",params![intent_id,owner_binding],|row| row.get(0)).map_err(|_| "mutation_intent_failed")?;
+        if !exists { return Err("mutation_intent_not_found".into()); }
+        connection.execute("INSERT OR IGNORE INTO mutation_mail_bindings(intent_id,identity_binding) VALUES (?1,?2)",params![intent_id,binding]).map_err(|_| "mutation_intent_failed")?;
+        let actual:String = connection.query_row("SELECT identity_binding FROM mutation_mail_bindings WHERE intent_id=?1",params![intent_id],|row| row.get(0)).map_err(|_| "mutation_intent_failed")?;
+        if !constant_time_eq(actual.as_bytes(),binding.as_bytes()) { return Err("mutation_intent_conflict".into()); }
+        Ok(())
+    }
+
+    pub(crate) fn bound_mail_intent_state(&self, intent_id:&str, account:&str, origin:&str, subject:&str) -> Result<Option<String>,String> {
+        let binding = self.upload_installation_binding(&format!("mail-intent:{intent_id}"),account,origin,subject)?;
+        let connection = self.connection.lock().map_err(|_| "mutation_intent_failed")?;
+        let row:Option<(String,String)> = connection.query_row("SELECT m.state,b.identity_binding FROM mutation_intents m JOIN mutation_mail_bindings b ON b.intent_id=m.intent_id WHERE m.intent_id=?1",params![intent_id],|row| Ok((row.get(0)?,row.get(1)?))).optional().map_err(|_| "mutation_intent_failed")?;
+        match row { Some((state, actual)) if constant_time_eq(actual.as_bytes(),binding.as_bytes()) => Ok(Some(state)), _ => Ok(None) }
+    }
+
+    /// Older unfinished rows have no durable identity binding; counts cannot
+    /// establish which provider subject or operation they belong to.
+    pub(crate) fn legacy_mail_intent_counts(&self, account:&str) -> Result<(usize,usize),String> {
+        let connection = self.connection.lock().map_err(|_| "mutation_intent_failed")?;
+        let mut statement = connection.prepare("SELECT m.intent_id,m.state,m.purpose_json FROM mutation_intents m LEFT JOIN mutation_mail_bindings b ON b.intent_id=m.intent_id WHERE b.intent_id IS NULL AND m.state IN ('active','committing') LIMIT 257").map_err(|_| "mutation_intent_failed")?;
+        let rows = statement.query_map([],|row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Vec<u8>>(2)?))).map_err(|_| "mutation_intent_failed")?.collect::<Result<Vec<_>,_>>().map_err(|_| "mutation_intent_failed")?;
+        if rows.len() > 256 { return Err("mutation_intent_capacity".into()); }
+        let (mut active,mut committing) = (0,0);
+        for (id,state,sealed) in rows {
+            let plain = open_row(&self.row_wrap_key,"mutation-purpose",&id,&sealed)?;
+            let purpose:isyncyou_webui::MutationPurpose = serde_json::from_slice(&plain).map_err(|_| "mutation_intent_failed")?;
+            if matches!(purpose,isyncyou_webui::MutationPurpose::MailBody { account:ref a, .. } if a == account) {
+                if state == "active" { active += 1; } else { committing += 1; }
+            }
+        }
+        Ok((active,committing))
+    }
+
     fn upload_installation_binding(&self, intent_id:&str, account:&str, origin:&str, subject:&str) -> Result<String,String> {
         if [intent_id,account,origin,subject].iter().any(|value| value.is_empty() || value.len() > 4096) { return Err("mutation_intent_invalid".into()); }
         let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &self.row_wrap_key[..]);
@@ -1605,7 +1647,7 @@ impl AgentControlStore {
     }
 
     pub(crate) fn list_recovery_requests(&self,account:&str,origin:&str,subject:&str,service:&str)->Result<Vec<serde_json::Value>,String> {
-        let kind=match service { "calendar"=>"event", "todo"=>"task", _=>return Err("recovery_service_mismatch".into()) };
+        let kind=match service { "calendar"=>"event", "todo"=>"task", "mail"=>"mail", "contacts"=>"contact", _=>return Err("recovery_service_mismatch".into()) };
         let connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
         let mut stmt=connection.prepare("SELECT batch_id,identity_binding,sealed_request,request_sha256,state FROM recovery_requests WHERE state IN ('approved','claimed') ORDER BY batch_id LIMIT 4096").map_err(|_| "control_store_unavailable")?;
         let rows=stmt.query_map([],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Vec<u8>>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?))).map_err(|_| "control_store_unavailable")?;
@@ -1643,7 +1685,7 @@ impl AgentControlStore {
         if batch_id.is_empty() || batch_id.len()>128 || !batch_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') || manifest.origin!=origin || manifest.objects.is_empty() || manifest.objects.len()>32 || !manifest.approval_sha256.is_empty() || !manifest.uid_map.is_empty() || !manifest.execution_order.is_empty() || !manifest.projections.is_empty() || [&manifest.entry,&manifest.collection].iter().any(|s| s.is_empty() || s.len()>4096 || s.chars().any(char::is_control)) || expires_at_ms<=now_ms || expires_at_ms.saturating_sub(now_ms)>24*60*60*1000 { return Err("recovery_batch_invalid".into()); }
         let mut total = 0u64; let mut operations = HashSet::new(); let mut confirmations = HashSet::new(); let mut sources = HashSet::new();
         for item in &manifest.objects {
-            if !valid_sha256(&item.generation) || !valid_sha256(&item.object) || !valid_sha256(&item.version) || !valid_sha256(&item.sha256) || !valid_sha256(&item.selection_sha256) || !matches!(item.kind.as_str(),"event" | "task") || item.encoding!="raw" || item.state!="available" || item.label.chars().count()>512 || item.label.chars().any(char::is_control) || item.size==0 || item.size>16*1024*1024 || item.operation_id.is_empty() || item.operation_id.len()>128 || !item.operation_id.bytes().all(|b| b.is_ascii_alphanumeric() || b==b'-' || b==b'_') || item.confirmation.is_empty() || item.confirmation.len()>512 || item.confirmation.chars().any(char::is_control) || !operations.insert(&item.operation_id) || !confirmations.insert(&item.confirmation) || !sources.insert((&item.generation,&item.object,&item.version)) { return Err("recovery_batch_invalid".into()); }
+            if !valid_sha256(&item.generation) || !valid_sha256(&item.object) || !valid_sha256(&item.version) || !valid_sha256(&item.sha256) || !valid_sha256(&item.selection_sha256) || !matches!(item.kind.as_str(),"event" | "task" | "contact" | "mail") || !match item.kind.as_str() { "event" | "task" | "contact" => item.encoding=="raw", "mail" => matches!(item.encoding.as_str(),"mime" | "isync-mime-1"), _ => false } || item.state!="available" || item.label.chars().count()>512 || item.label.chars().any(char::is_control) || item.size==0 || item.size>if item.kind=="mail" { 100*1024*1024 } else { 16*1024*1024 } || item.operation_id.is_empty() || item.operation_id.len()>128 || !item.operation_id.bytes().all(|b| b.is_ascii_alphanumeric() || b==b'-' || b==b'_') || item.confirmation.is_empty() || item.confirmation.len()>512 || item.confirmation.chars().any(char::is_control) || !operations.insert(&item.operation_id) || !confirmations.insert(&item.confirmation) || !sources.insert((&item.generation,&item.object,&item.version)) { return Err("recovery_batch_invalid".into()); }
             total=total.checked_add(item.size).ok_or("recovery_batch_invalid")?;
         }
         if total > MAX_MUTATION_STAGED_BYTES as u64 { return Err("recovery_batch_capacity".into()); }
@@ -1765,7 +1807,7 @@ impl AgentControlStore {
             if old_plain != plain { return Err("recovery_batch_conflict".into()); }
             tx.commit().map_err(|_| "control_store_unavailable")?; return Ok(digest);
         }
-        if previous.objects!=updated.objects || previous.origin!=updated.origin || previous.entry!=updated.entry || previous.collection!=updated.collection { return Err("recovery_batch_conflict".into()); }
+        if previous.objects!=updated.objects || previous.origin!=updated.origin || previous.entry!=updated.entry || previous.collection!=updated.collection || previous.collection_intent!=updated.collection_intent { return Err("recovery_batch_conflict".into()); }
         let bytes=i64::try_from(sealed_new.len()).map_err(|_| "recovery_batch_invalid")?;
         enforce_control_quota(&tx,bytes.saturating_sub(logical))?;
         tx.execute("UPDATE recovery_batches SET sealed_manifest=?1,manifest_sha256=?2,logical_bytes=?3 WHERE batch_id=?4 AND state='staging'",params![sealed_new,digest,bytes,batch_id]).map_err(|_| "control_store_unavailable")?;
@@ -9229,11 +9271,31 @@ mod tests {
     }
 
     #[test]
+    fn recovery_mail_effect_includes_optional_folder_and_no_send() {
+        let item=RecoveryStagedObject { generation:"a".repeat(64),object:"b".repeat(64),version:"c".repeat(64),operation_id:"op".into(),confirmation:"confirm".into(),size:3,sha256:"d".repeat(64),selection_sha256:"e".repeat(64),kind:"mail".into(),encoding:"mime".into(),state:"available".into(),label:"mail".into() };
+        let mut manifest=RecoveryBatchManifest {approval_sha256:"f".repeat(64),origin:"https://example.test".into(),entry:"mail".into(),collection:"Recovered".into(),objects:vec![item],uid_map:std::collections::BTreeMap::new(),execution_order:vec!["op".into()],projections:vec![],collection_intent:None};
+        let effect=recovery_batch_effect(&manifest);
+        let text=effect["effects"].as_str().unwrap();
+        assert!(text.contains("folder if needed"));
+        assert!(text.contains("no message is sent"));
+        assert_eq!(effect["collection"],"Recovered");
+        assert!(effect.get("collection_creation").is_none());
+        let legacy=serde_json::to_value(&manifest).unwrap();
+        assert!(legacy.get("collection_intent").is_none());
+        let restored:RecoveryBatchManifest=serde_json::from_value(legacy).unwrap();
+        assert_eq!(recovery_batch_effect_sha256(&restored),recovery_batch_effect_sha256(&manifest));
+        let before=recovery_batch_effect_sha256(&manifest);
+        manifest.collection_intent=Some(serde_json::json!({"target":"/personal/recovered/","operation_id":"ensure-1"}));
+        assert_ne!(before,recovery_batch_effect_sha256(&manifest));
+        assert_eq!(recovery_batch_effect(&manifest)["collection_creation"]["intent"]["operation_id"],"ensure-1");
+    }
+
+    #[test]
     fn recovery_batch_chunks_reserve_verify_claim_and_reconcile_without_replay() {
         let root=temp_root("recovery-batch"); let credentials=credential_store(&root);
         let control=Arc::new(AgentControlStore::open(&root,&credentials,INSTALLATION_PRINCIPAL,1).unwrap());
         let registry=PendingRegistry::with_persistence(control.clone()); let account=owner().account;
-        let mut manifest=RecoveryBatchManifest { approval_sha256:String::new(), origin:"https://example.test".into(), entry:"/.well-known/caldav".into(), collection:"/recovered/".into(), uid_map:std::collections::BTreeMap::new(), execution_order:Vec::new(), projections:Vec::new(), objects:vec![RecoveryStagedObject { generation:"b".repeat(64),object:"c".repeat(64),version:"d".repeat(64),operation_id:"operation-1".into(),confirmation:"confirmation-1".into(),size:3,sha256:sha256_hex(b"abc"),selection_sha256:"e".repeat(64),kind:"event".into(),encoding:"raw".into(),state:"available".into(),label:"Meeting".into() }] };
+        let mut manifest=RecoveryBatchManifest { approval_sha256:String::new(), origin:"https://example.test".into(), entry:"/.well-known/caldav".into(), collection:"/recovered/".into(), uid_map:std::collections::BTreeMap::new(), execution_order:Vec::new(), projections:Vec::new(), collection_intent:None, objects:vec![RecoveryStagedObject { generation:"b".repeat(64),object:"c".repeat(64),version:"d".repeat(64),operation_id:"operation-1".into(),confirmation:"confirmation-1".into(),size:3,sha256:sha256_hex(b"abc"),selection_sha256:"e".repeat(64),kind:"event".into(),encoding:"raw".into(),state:"available".into(),label:"Meeting".into() }] };
         control.reserve_recovery_batch("batch-1",&account,"https://example.test","subject-a",&manifest,60_000,1_000).unwrap();
         assert!(control.put_recovery_batch_chunk("batch-1",&account,"https://example.test","subject-b",0,0,b"abc",1_001).is_err());
         control.put_recovery_batch_chunk("batch-1",&account,"https://example.test","subject-a",0,0,b"abc",1_001).unwrap();
@@ -11730,6 +11792,26 @@ mod tests {
             total_bytes: bytes.len() as u64,
             sha256: sha256_hex(bytes),
         }
+    }
+
+    #[test]
+    fn mail_intent_status_survives_restart_and_rejects_other_subjects() {
+        let root = temp_root("mail-intent-binding");
+        let credentials = credential_store(&root);
+        let store = AgentControlStore::open(&root, &credentials, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let mut request = mutation_create("019f0000-0000-4000-8000-000000000102", "owner-a", b"data");
+        request.purpose = isyncyou_webui::MutationPurpose::MailBody { account:"controlled".into(), operation:"draft".into(), target:String::new(), recipients:vec!["to@example.invalid".into()], cc:vec![], bcc:vec![], subject:"fixture".into(), importance:None, read_receipt:false, identity_id:None, all:false };
+        let info = store.create_mutation_intent(&request,1_000).unwrap();
+        assert_eq!(store.legacy_mail_intent_counts("controlled").unwrap(),(1,0));
+        assert_eq!(store.legacy_mail_intent_counts("other").unwrap(),(0,0));
+        store.bind_mail_installation("owner-a",&info.intent_id,"controlled","https://provider.example","subject-a").unwrap();
+        assert_eq!(store.legacy_mail_intent_counts("controlled").unwrap(),(0,0));
+        assert_eq!(store.bound_mail_intent_state(&info.intent_id,"controlled","https://provider.example","subject-b").unwrap(),None);
+        drop(store);
+        let store = AgentControlStore::open(&root,&credentials,INSTALLATION_PRINCIPAL,1).unwrap();
+        assert_eq!(store.bound_mail_intent_state(&info.intent_id,"controlled","https://provider.example","subject-a").unwrap().as_deref(),Some("active"));
+        assert_eq!(store.bound_mail_intent_state(&info.intent_id,"controlled","https://other.example","subject-a").unwrap(),None);
+        drop(store); std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

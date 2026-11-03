@@ -338,9 +338,14 @@ pub fn finish_self_hosted_auth_detailed_with_store(
     if token.access_token.is_empty() || token.refresh_token.as_deref().is_none_or(str::is_empty) {
         return Err(AuthFinishError::Failed("Incomplete OAuth token response".into()));
     }
-    let subject = verify_userinfo(&attempt.origin,&token.access_token,&attempt.expected_username);
+    let subject = verify_userinfo(&attempt.origin,&token.access_token,&attempt.expected_username)
+        .map_err(|_| "Provider identity verification failed".to_string());
     let _lock = lock(&attempt.cache_path)?;
-    let subject = match subject.and_then(|subject| { bind_subject(&attempt,store,&subject)?; Ok(subject) }) {
+    let subject = match subject.and_then(|subject| {
+        bind_subject(&attempt,store,&subject)
+            .map_err(|_| "Provider identity binding failed".to_string())?;
+        Ok(subject)
+    }) {
         Ok(subject) => subject,
         Err(error) => {
             return match revoke_unaccepted_grant(&attempt,store,&token) {
@@ -366,8 +371,8 @@ pub fn finish_self_hosted_auth_detailed_with_store(
             if store.load(&marker, &attempt.origin)?.is_some() { store.delete(&marker, &attempt.origin)?; }
             Ok(())
         },
-        Err(error) => match revoke_unaccepted_grant(&attempt,store,&token) {
-            Ok(()) => Err(AuthFinishError::Failed(error)),
+        Err(_) => match revoke_unaccepted_grant(&attempt,store,&token) {
+            Ok(()) => Err(AuthFinishError::Failed("Provider credential storage failed".into())),
             Err(recovery) => Err(recovery),
         }
     }

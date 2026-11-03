@@ -7,6 +7,7 @@ use isyncyou_exporter::{Collection, Event, Manifest, Object};
 use isyncyou_store::{ProviderScope, Store};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::error::Error;
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -61,7 +62,8 @@ fn credential(name: &str) -> Result<Vec<u8>> {
     Ok(value)
 }
 
-fn run(config: Config) -> Result<()> {
+fn run(config: Config, stage: &Cell<&'static str>) -> Result<()> {
+    stage.set("configuration");
     let origin = Url::parse(&config.origin)?;
     let loopback = match origin.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
@@ -101,6 +103,7 @@ fn run(config: Config) -> Result<()> {
     if used >= config.max_staging_bytes {
         return Err("export staging limit reached".into());
     }
+    stage.set("credentials");
     let token = String::from_utf8(credential("provider-token")?)?
         .trim()
         .to_owned();
@@ -108,11 +111,25 @@ fn run(config: Config) -> Result<()> {
         return Err("invalid provider token".into());
     }
     let key = credential("store-key")?;
+    stage.set("store");
     let store = Store::open_encrypted(&config.store, &key)?;
     // The dedicated collector lock excludes other writers. Preserve captured
     // staged versions before releasing an interrupted source enumeration.
     store.recover_abandoned_provider_staging()?;
-    let jmap = LoopbackJmapReader::discover(&config.origin, token.clone(), &config.trusted_public_origin)?;
+    stage.set("jmap-discovery");
+    let jmap = LoopbackJmapReader::discover(&config.origin, token.clone(), &config.trusted_public_origin)
+        .map_err(|error| {
+            use isyncyou_connectors::jmap::JmapError;
+            stage.set(match &error {
+                JmapError::InvalidUrl => "jmap-invalid-url",
+                JmapError::InvalidResponse => "jmap-invalid-response",
+                JmapError::Unsupported => "jmap-unsupported",
+                JmapError::Http(_) => "jmap-http",
+                JmapError::Transport => "jmap-transport",
+                _ => "jmap-other",
+            });
+            error
+        })?;
     let account = jmap.account_id().to_owned();
     let mail_scope = ProviderScope {
         account_id: account.clone(),
@@ -129,8 +146,11 @@ fn run(config: Config) -> Result<()> {
         remaining: config.max_staging_bytes - used,
         reserve: config.minimum_free_bytes,
     };
+    stage.set("mail-capture");
     mail::sync(&jmap, &store, &mail_scope, &mut budget)?;
+    stage.set("mailbox-capture");
     mail::sync_mailboxes(&jmap, &store, &mailbox_scope)?;
+    stage.set("dav-discovery");
     let dav = LoopbackDavReader::new_with_public_origin(&config.origin, token, &config.trusted_public_origin)?;
     let collections = dav.discover(&config.dav_entry)?;
     if !collections.iter().any(|x| x.calendar) || !collections.iter().any(|x| x.addressbook) {
@@ -167,6 +187,7 @@ fn run(config: Config) -> Result<()> {
                 return Err("DAV staging capacity unavailable".into());
             }
             budget.remaining -= 256 * 1024 * 1024;
+            stage.set("dav-capture");
             dav.sync_collection(&store, &scope)?;
             expected.push(scope);
         }
@@ -175,6 +196,7 @@ fn run(config: Config) -> Result<()> {
        !expected.iter().any(|scope| scope.service == "contacts") {
         return Err("required owned DAV collections unavailable".into());
     }
+    stage.set("source-completeness");
     let snapshot = store.provider_export_snapshot(&account, &config.origin)?;
     if snapshot.collections.len() != expected.len()
         || snapshot.collections.iter().any(|c| {
@@ -200,6 +222,7 @@ fn run(config: Config) -> Result<()> {
             complete: true,
         })
         .collect();
+    stage.set("generation-assembly");
     let current = config.archive.join("current");
     let (mut objects, mut events, mut capture, mut after) = if current.exists() {
         let generation = fs::read_to_string(&current)?;
@@ -319,12 +342,14 @@ fn run(config: Config) -> Result<()> {
         objects,
         events,
     };
+    stage.set("generation-publication");
     let generation = isyncyou_exporter::publish(&config.archive, &manifest)?;
     println!("{{\"state\":\"captured_locally\",\"generation\":\"{generation}\"}}");
     Ok(())
 }
 
 fn main() {
+    let stage = Cell::new("configuration");
     let result = (|| -> Result<()> {
         let args: Vec<_> = std::env::args_os().collect();
         if args.len() != 2 {
@@ -342,11 +367,11 @@ fn main() {
         if !path.is_absolute() || !metadata.file_type().is_file() || !(private_file || systemd_file) {
             return Err("private config required".into());
         }
-        run(serde_json::from_slice(&fs::read(path)?)?)
+        run(serde_json::from_slice(&fs::read(path)?)?, &stage)
     })();
     if result.is_err() {
         // Native errors may contain provider URLs or object identities.
-        eprintln!("export failed; inspect private diagnostics");
+        eprintln!("export failed at {}", stage.get());
         std::process::exit(1);
     }
 }

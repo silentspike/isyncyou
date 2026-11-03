@@ -453,6 +453,112 @@ pub struct RecoverySelection {
 
 pub enum RecoveryJobOutcome { Created(String), Unknown }
 
+/// Persist this exact discovery and operation identity in the encrypted host
+/// intent before asking the user to approve creating the personal collection.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct ApprovedRecoveryCollection {
+    pub account_id: String,
+    pub origin: String,
+    pub entry: String,
+    pub service: String,
+    pub home: String,
+    pub principal: String,
+    pub target: String,
+    pub operation_id: String,
+    pub approval_sha256: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RecoveryCollectionOutcome { Ready(String), Rejected, Conflict, Unknown }
+
+fn collection_approval(op: &ApprovedRecoveryCollection) -> String {
+    let effect = json!({"schema":"recovery-collection-approval-v1", "account_id":op.account_id,
+        "origin":op.origin, "entry":op.entry, "service":op.service, "home":op.home,
+        "principal":op.principal, "target":op.target, "operation_id":op.operation_id});
+    format!("{:x}", Sha256::digest(effect.to_string().as_bytes()))
+}
+
+pub fn prepare_recovery_collection_with_store(cfg: &Config, account: &str, entry: &str, service: &str,
+    credentials: &dyn ProviderCredentialStore) -> Result<ApprovedRecoveryCollection, String> {
+    use ring::rand::SecureRandom;
+    let origin = match cfg.provider_accounts.get(account) {
+        Some(ProviderConfig::SelfHosted { origin, .. }) => origin.clone(),
+        _ => return Err("Recovery account unavailable".into()),
+    };
+    if !matches!(service, "calendar" | "contacts") { return Err("Unsupported recovery collection".into()); }
+    let mut random = [0u8; 16];
+    ring::rand::SystemRandom::new().fill(&mut random).map_err(|_| "Recovery identity unavailable")?;
+    let operation_id: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    crate::provider_auth::with_locked_provider_access_token(cfg, account, credentials, |token| {
+        let client = isyncyou_connectors::dav::DavClient::new(&origin, token.to_owned()).map_err(|e| e.to_string())?;
+        let home = client.personal_home(entry, service).map_err(|e| e.to_string())?;
+        let target = home.recovered_target(&operation_id).map_err(|e| e.to_string())?;
+        let mut op = ApprovedRecoveryCollection { account_id:account.into(), origin:origin.clone(), entry:entry.into(),
+            service:service.into(), home:home.home_url().into(), principal:home.principal_url().into(),
+            target, operation_id, approval_sha256:String::new() };
+        op.approval_sha256 = collection_approval(&op);
+        Ok(op)
+    })
+}
+
+pub fn ensure_recovery_collection_with_store(cfg: &Config, op: &ApprovedRecoveryCollection,
+    approved_sha256: &str, credentials: &dyn ProviderCredentialStore) -> Result<RecoveryCollectionOutcome, String> {
+    use isyncyou_connectors::dav::{DavClient, DavError};
+    if op.approval_sha256 != approved_sha256 || collection_approval(op) != approved_sha256 ||
+        !matches!(cfg.provider_accounts.get(&op.account_id), Some(ProviderConfig::SelfHosted { origin, .. }) if origin == &op.origin) {
+        return Err("Recovery collection approval or account changed".into());
+    }
+    let store = crate::provider_store::open(cfg, &op.account_id)?;
+    crate::provider_auth::with_locked_provider_access_token(cfg, &op.account_id, credentials, |token| {
+        let client = DavClient::new(&op.origin, token.to_owned()).map_err(|e| e.to_string())?;
+        let home = client.personal_home(&op.entry, &op.service).map_err(|e| e.to_string())?;
+        if home.home_url() != op.home || home.principal_url() != op.principal || home.service() != op.service ||
+            home.recovered_target(&op.operation_id).map_err(|e| e.to_string())? != op.target {
+            return Err("Recovery collection identity changed".into());
+        }
+        let scope = ProviderScope { account_id:op.account_id.clone(), origin:op.origin.clone(),
+            service:"recovery-collection".into(), collection:op.home.clone() };
+        let intent = serde_json::to_string(op).map_err(|_| "Invalid collection intent")?;
+        let digest = format!("{:x}", Sha256::digest(intent.as_bytes()));
+        let reconcile = || -> Result<RecoveryCollectionOutcome, String> {
+            match client.read_recovered_collection(&home, &op.operation_id) {
+                Ok(true) => if store.finish_provider_mutation(&scope, &op.operation_id, Some(&op.target)).map_err(|e| e.to_string())? {
+                    Ok(RecoveryCollectionOutcome::Ready(op.target.clone()))
+                } else { Ok(RecoveryCollectionOutcome::Unknown) },
+                _ => Ok(RecoveryCollectionOutcome::Unknown),
+            }
+        };
+        if let Some((previous, state, result)) = store.provider_mutation(&scope, &op.operation_id).map_err(|e| e.to_string())? {
+            if previous != digest { return Err("Recovery collection differs from recorded intent".into()); }
+            return match state.as_str() {
+                "confirmed" if result.as_deref() == Some(op.target.as_str()) =>
+                    if matches!(client.read_recovered_collection(&home, &op.operation_id), Ok(true)) {
+                        Ok(RecoveryCollectionOutcome::Ready(op.target.clone()))
+                    } else { Ok(RecoveryCollectionOutcome::Unknown) },
+                "rejected" => Ok(RecoveryCollectionOutcome::Rejected),
+                "conflict" => Ok(RecoveryCollectionOutcome::Conflict),
+                _ => reconcile(),
+            };
+        }
+        match client.read_recovered_collection(&home, &op.operation_id) {
+            Ok(false) => {},
+            Ok(true) => return Ok(RecoveryCollectionOutcome::Conflict),
+            Err(_) => return Ok(RecoveryCollectionOutcome::Unknown),
+        }
+        if !store.claim_provider_mutation(&scope, &op.operation_id, "recovery-collection", &intent, &digest).map_err(|e| e.to_string())? {
+            return Ok(RecoveryCollectionOutcome::Unknown);
+        }
+        match client.create_recovered_collection(&home, &op.operation_id) {
+            Ok(()) => reconcile(),
+            Err(DavError::Http(code)) if (400..500).contains(&code) && code != 408 && code != 429 && code != 409 && code != 412 =>
+                if store.finish_provider_mutation(&scope, &op.operation_id, None).map_err(|e| e.to_string())? { Ok(RecoveryCollectionOutcome::Rejected) } else { Ok(RecoveryCollectionOutcome::Unknown) },
+            Err(DavError::Http(409 | 412)) | Err(DavError::Conflict) =>
+                if store.conflict_provider_mutation(&scope, &op.operation_id).map_err(|e| e.to_string())? { Ok(RecoveryCollectionOutcome::Conflict) } else { Ok(RecoveryCollectionOutcome::Unknown) },
+            Err(_) => reconcile(),
+        }
+    })
+}
+
 /// Journal the account, registered device and exact protected selection before
 /// sending a create request. Re-entry only returns the recorded native ID; an
 /// ambiguous dispatch with no ID remains unknown and is never submitted again.
@@ -1088,6 +1194,7 @@ fn execute_calendar_restore_with_token(cfg: &Config, op: &ApprovedCalendarRestor
         &op.original, &op.original_sha256, &op.uid_map, None, token)
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ApprovedMailRestore {
     pub operation_id: String,
     pub account_id: String,
@@ -1098,6 +1205,228 @@ pub struct ApprovedMailRestore {
     pub source_version: String,
     pub original_sha256: String,
     pub original_mime: Vec<u8>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct ApprovedBoundMailRestore {
+    pub intent: ApprovedMailRestore,
+    pub protected_sha256: String,
+    pub encoding: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct MailRestoreSummary {
+    pub approval_sha256: String,
+    pub mime_sha256: String,
+    pub mime_size: usize,
+    /// Untrusted bounded headers and an explicit notice about omitted parts;
+    /// only for the protected human review route.
+    pub review_text: String,
+}
+
+fn recovery_mail_folder_operation(operation_id: &str) -> String {
+    format!("recovery-folder-{:x}", Sha256::digest(operation_id.as_bytes()))
+}
+
+fn review_mail_headers(bytes: &[u8]) -> String {
+    // Metadata is an untrusted preview only. The complete original MIME is
+    // imported unchanged and may contain attachments or parts not shown here.
+    let end = bytes.windows(4).position(|w| w == b"\r\n\r\n")
+        .or_else(|| bytes.windows(2).position(|w| w == b"\n\n"));
+    let Some(end) = end.filter(|n| *n <= 16 * 1024) else {
+        return "Message headers unavailable for preview; original content and attachments are not shown.".into();
+    };
+    let header = String::from_utf8_lossy(&bytes[..end]);
+    let text: String = header.chars().map(|c| if c.is_control() && !matches!(c, '\r' | '\n' | '\t') { '\u{fffd}' } else { c }).collect();
+    format!("Untrusted original headers (encoded values may not be decoded):\n{text}\n\nThe message body, attachments and other MIME parts are not displayed; the complete original message will be imported without sending it.")
+}
+
+pub fn prepare_bound_mail_restore(cfg: &Config, selection: &RecoverySelection,
+    signer: &dyn RecoveryDeviceSigner, credentials: &dyn ProviderCredentialStore,
+    mailbox_id: &str) -> Result<(ApprovedBoundMailRestore, MailRestoreSummary), String> {
+    let payload = read_bound_recovery_result(cfg, selection, signer, credentials)?;
+    mail_restore_from_payload(selection, payload, mailbox_id)
+}
+
+fn mail_restore_from_payload(selection: &RecoverySelection, payload: RecoveredPayload,
+    mailbox_id: &str) -> Result<(ApprovedBoundMailRestore, MailRestoreSummary), String> {
+    if payload.kind != "mail" || format!("{:x}", Sha256::digest(&payload.bytes)) != payload.sha256 {
+        return Err("Recovery result is not verified mail".into());
+    }
+    let mime = match payload.encoding.as_str() {
+        "mime" => payload.bytes.as_slice(),
+        "isync-mime-1" => {
+            const MAGIC: &[u8] = b"ISYNC-MIME-1\n";
+            if !payload.bytes.starts_with(MAGIC) || payload.bytes.len() < MAGIC.len() + 4 { return Err("Invalid recovered mail envelope".into()); }
+            let start = MAGIC.len() + 4;
+            let size = u32::from_be_bytes(payload.bytes[MAGIC.len()..start].try_into().map_err(|_| "Invalid mail metadata")?) as usize;
+            let end = start.checked_add(size).filter(|end| *end <= payload.bytes.len()).ok_or("Invalid mail metadata")?;
+            let metadata: Value = serde_json::from_slice(&payload.bytes[start..end]).map_err(|_| "Invalid mail metadata")?;
+            if !metadata.is_object() { return Err("Invalid mail metadata".into()); }
+            &payload.bytes[end..]
+        },
+        _ => return Err("Unknown recovered mail encoding".into()),
+    };
+    if mime.len() > 64 * 1024 * 1024 { return Err("Recovered mail is too large".into()); }
+    let op = ApprovedBoundMailRestore { intent: ApprovedMailRestore {
+        operation_id:selection.operation_id.clone(), account_id:selection.account_id.clone(), origin:selection.origin.clone(),
+        mailbox_id:mailbox_id.into(), source_generation:selection.generation.clone(), source_object:selection.object.clone(),
+        source_version:selection.version.clone(), original_sha256:format!("{:x}", Sha256::digest(mime)), original_mime:mime.to_vec(),
+    }, protected_sha256:payload.sha256, encoding:payload.encoding };
+    let summary = prepare_mail_restore(&op)?;
+    Ok((op, summary))
+}
+
+pub fn prepare_mail_restore(op: &ApprovedBoundMailRestore) -> Result<MailRestoreSummary, String> {
+    let m = &op.intent;
+    let hash = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if m.operation_id.is_empty() || m.operation_id.len() > 128 ||
+        !m.operation_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') ||
+        [&m.account_id, &m.origin, &m.mailbox_id].iter().any(|s| s.is_empty() || s.len() > 4096 || s.chars().any(char::is_control)) || m.mailbox_id != "Recovered" ||
+        [&m.source_generation, &m.source_object, &m.source_version, &m.original_sha256, &op.protected_sha256].iter().any(|s| !hash(s)) ||
+        !matches!(op.encoding.as_str(), "mime" | "isync-mime-1") || m.original_mime.len() > 64 * 1024 * 1024 ||
+        format!("{:x}", Sha256::digest(&m.original_mime)) != m.original_sha256 {
+        return Err("Invalid mail recovery intent".into());
+    }
+    let review_text = review_mail_headers(&m.original_mime);
+    let approval = json!({"schema":"mail-recovery-approval-v1", "operation_id":m.operation_id,
+        "account_id":m.account_id, "origin":m.origin, "target":"Recovered",
+        "folder_operation_id":recovery_mail_folder_operation(&m.operation_id),
+        "generation":m.source_generation, "object":m.source_object, "version":m.source_version,
+        "protected_sha256":op.protected_sha256, "encoding":op.encoding, "mime_sha256":m.original_sha256,
+        "mime_size":m.original_mime.len()});
+    Ok(MailRestoreSummary { approval_sha256:format!("{:x}", Sha256::digest(approval.to_string().as_bytes())),
+        mime_sha256:m.original_sha256.clone(), mime_size:m.original_mime.len(), review_text })
+}
+
+pub fn execute_bound_mail_restore_with_store(cfg: &Config, op: &ApprovedBoundMailRestore, approved_sha256: &str,
+    credentials: &dyn ProviderCredentialStore) -> Result<RestoreOutcome, String> {
+    if prepare_mail_restore(op)?.approval_sha256 != approved_sha256 { return Err("Mail recovery approval does not match intent".into()); }
+    let folder = match ensure_recovered_folder_with_store(cfg, &op.intent.account_id, &op.intent.origin,
+        &recovery_mail_folder_operation(&op.intent.operation_id), credentials)? {
+        FolderOutcome::Ready(id) => id,
+        FolderOutcome::Rejected => return Ok(RestoreOutcome::Rejected),
+        FolderOutcome::Unknown => return Ok(RestoreOutcome::Unknown),
+    };
+    let mut intent = op.intent.clone();
+    intent.mailbox_id = folder;
+    execute_with_store(cfg, &intent, credentials)
+}
+
+/// A contact copy is bound to the protected result and to its personal target.
+/// Keep this intent in the encrypted host confirmation store.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct ApprovedContactRestore {
+    pub operation_id: String,
+    pub account_id: String,
+    pub origin: String,
+    pub entry: String,
+    pub collection: String,
+    pub source_generation: String,
+    pub source_object: String,
+    pub source_version: String,
+    pub original_sha256: String,
+    #[serde(with = "recovery_payload_base64")]
+    pub original: Vec<u8>,
+    pub new_uid: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct ContactRestoreSummary {
+    pub approval_sha256: String,
+    pub projected_sha256: String,
+    pub projected_size: usize,
+    pub preview_truncated: bool,
+    /// Untrusted text for the protected human review route only.
+    pub projected_vcard: String,
+}
+
+pub fn prepare_bound_contact_restore(cfg: &Config, selection: &RecoverySelection,
+    signer: &dyn RecoveryDeviceSigner, credentials: &dyn ProviderCredentialStore,
+    entry: &str, collection: &str) -> Result<(ApprovedContactRestore, ContactRestoreSummary), String> {
+    use ring::rand::SecureRandom;
+    let payload = read_bound_recovery_result(cfg, selection, signer, credentials)?;
+    let mut random = [0u8; 16];
+    ring::rand::SystemRandom::new().fill(&mut random).map_err(|_| "Recovery identity unavailable")?;
+    let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    contact_restore_from_payload(selection, payload, entry, collection, &format!("{suffix}@recovered.invalid"))
+}
+
+fn contact_restore_from_payload(selection: &RecoverySelection, payload: RecoveredPayload, entry: &str,
+    collection: &str, new_uid: &str) -> Result<(ApprovedContactRestore, ContactRestoreSummary), String> {
+    if payload.kind != "contact" || payload.encoding != "raw" { return Err("Recovery result is not a contact".into()); }
+    let op = ApprovedContactRestore { operation_id: selection.operation_id.clone(), account_id: selection.account_id.clone(),
+        origin: selection.origin.clone(), entry: entry.into(), collection: collection.into(),
+        source_generation: selection.generation.clone(), source_object: selection.object.clone(),
+        source_version: selection.version.clone(), original_sha256: payload.sha256,
+        original: payload.bytes, new_uid: new_uid.into() };
+    let summary = prepare_contact_restore(&op)?;
+    Ok((op, summary))
+}
+
+fn staged_item(selection: &RecoverySelection, status: &BoundRecoveryStatus, signer: &dyn RecoveryDeviceSigner,
+    bytes: Vec<u8>, kind: &str) -> Result<RecoveredPayload, String> {
+    if status.selection_sha256 != recovery_selection_digest(selection, signer.device_id()) || status.state != "available" ||
+        status.kind != kind || bytes.len() as u64 != status.size || bytes.len() > 100 * 1024 * 1024 ||
+        format!("{:x}", Sha256::digest(&bytes)) != status.sha256 {
+        return Err("Recovery staged payload mismatch".into());
+    }
+    Ok(RecoveredPayload { bytes, kind:status.kind.clone(), encoding:status.encoding.clone(), sha256:status.sha256.clone() })
+}
+
+pub fn prepare_staged_mail_restore(selection: &RecoverySelection, status: &BoundRecoveryStatus,
+    signer: &dyn RecoveryDeviceSigner, bytes: Vec<u8>, mailbox_id: &str)
+    -> Result<(ApprovedBoundMailRestore, MailRestoreSummary), String> {
+    mail_restore_from_payload(selection, staged_item(selection, status, signer, bytes, "mail")?, mailbox_id)
+}
+
+/// The host must persist new_uid with the staged manifest before approval and
+/// reuse it on every reconstruction, including reconciliation.
+pub fn prepare_staged_contact_restore(selection: &RecoverySelection, status: &BoundRecoveryStatus,
+    signer: &dyn RecoveryDeviceSigner, bytes: Vec<u8>, entry: &str, collection: &str, new_uid: &str)
+    -> Result<(ApprovedContactRestore, ContactRestoreSummary), String> {
+    contact_restore_from_payload(selection, staged_item(selection, status, signer, bytes, "contact")?, entry, collection, new_uid)
+}
+
+pub fn prepare_contact_restore(op: &ApprovedContactRestore) -> Result<ContactRestoreSummary, String> {
+    let hash = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if op.operation_id.is_empty() || op.operation_id.len() > 128 ||
+        !op.operation_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') ||
+        [&op.account_id, &op.origin, &op.entry, &op.collection, &op.new_uid].iter().any(|s| s.is_empty() || s.len() > 4096 || s.chars().any(char::is_control)) ||
+        [&op.source_generation, &op.source_object, &op.source_version, &op.original_sha256].iter().any(|s| !hash(s)) ||
+        op.original.len() > 16 * 1024 * 1024 || format!("{:x}", Sha256::digest(&op.original)) != op.original_sha256 {
+        return Err("Invalid contact recovery intent".into());
+    }
+    let projected = isyncyou_connectors::dav::edit::recovered_contact(&op.original, &op.new_uid)?;
+    // Retain the complete card, including embedded photos. Preview only a
+    // bounded untrusted prefix and explicitly disclose any omitted bytes.
+    let shown = projected.len().min(64 * 1024);
+    let preview_truncated = shown < projected.len();
+    let text: String = String::from_utf8_lossy(&projected[..shown]).chars()
+        .map(|c| if c.is_control() && !matches!(c, '\r' | '\n' | '\t') { '\u{fffd}' } else { c }).collect();
+    let projected_sha256 = format!("{:x}", Sha256::digest(&projected));
+    let approval = json!({"schema":"contact-recovery-approval-v1", "operation_id":op.operation_id,
+        "account_id":op.account_id, "origin":op.origin, "entry":op.entry, "collection":op.collection,
+        "generation":op.source_generation, "object":op.source_object, "version":op.source_version,
+        "original_sha256":op.original_sha256, "projected_sha256":projected_sha256, "new_uid":op.new_uid});
+    let approval_sha256 = format!("{:x}", Sha256::digest(approval.to_string().as_bytes()));
+    Ok(ContactRestoreSummary { approval_sha256, projected_sha256, projected_size:projected.len(),
+        preview_truncated, projected_vcard: text })
+}
+
+pub fn execute_contact_restore_with_store(cfg: &Config, op: &ApprovedContactRestore, approved_sha256: &str,
+    credentials: &dyn ProviderCredentialStore) -> Result<crate::dav_live::RecoveryImportOutcome, String> {
+    if prepare_contact_restore(op)?.approval_sha256 != approved_sha256 { return Err("Contact recovery approval does not match intent".into()); }
+    match cfg.provider_accounts.get(&op.account_id) {
+        Some(ProviderConfig::SelfHosted { origin, .. }) if origin == &op.origin => {},
+        _ => return Err("Account or origin changed after approval".into()),
+    }
+    let store = crate::provider_store::open(cfg, &op.account_id)?;
+    crate::provider_auth::with_locked_provider_access_token(cfg, &op.account_id, credentials, |token| {
+        crate::dav_live::import_recovered_with_token(cfg, &op.account_id, &op.origin, &store, &op.entry, &op.collection,
+            "contacts", &op.operation_id, &op.source_generation, &op.source_object, &op.source_version,
+            &op.original, &op.original_sha256, &HashMap::new(), Some(&op.new_uid), token)
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1398,6 +1727,57 @@ fn execute_inner(cfg: &Config, op: &ApprovedMailRestore, credentials: Option<&dy
 mod tests {
     use super::*;
     use std::cell::Cell;
+    #[test]
+    fn recovery_collection_approval_binds_identity_and_target() {
+        let mut op = ApprovedRecoveryCollection { account_id:"account".into(), origin:"https://example.test/".into(),
+            entry:"https://example.test/dav/".into(), service:"calendar".into(), home:"https://example.test/home/".into(),
+            principal:"https://example.test/principal/".into(), target:"https://example.test/home/recovered/".into(),
+            operation_id:"0123456789abcdef0123456789abcdef".into(), approval_sha256:String::new() };
+        op.approval_sha256 = collection_approval(&op);
+        let saved = serde_json::to_string(&op).unwrap();
+        let restored: ApprovedRecoveryCollection = serde_json::from_str(&saved).unwrap();
+        assert_eq!(collection_approval(&restored), op.approval_sha256);
+        op.target.push_str("other/");
+        assert_ne!(collection_approval(&op), restored.approval_sha256);
+    }
+    #[test]
+    fn recovery_contact_approval_binds_target_and_full_copy() {
+        use sha2::{Digest, Sha256};
+        let raw = b"BEGIN:VCARD\r\nVERSION:4.0\r\nUID:source\r\nFN:Fixture Person\r\nEND:VCARD\r\n".to_vec();
+        let mut op = super::ApprovedContactRestore { operation_id:"operation-a".into(), account_id:"account".into(),
+            origin:"https://example.test/".into(), entry:"https://example.test/dav/".into(), collection:"https://example.test/dav/recovered/".into(),
+            source_generation:"a".repeat(64), source_object:"b".repeat(64), source_version:"c".repeat(64),
+            original_sha256:format!("{:x}",Sha256::digest(&raw)), original:raw, new_uid:"new@recovered.invalid".into() };
+        let first = super::prepare_contact_restore(&op).unwrap();
+        assert!(first.projected_vcard.contains("FN:Fixture Person"));
+        assert!(first.projected_vcard.contains("UID:new@recovered.invalid"));
+        op.collection.push_str("other/");
+        assert_ne!(first.approval_sha256, super::prepare_contact_restore(&op).unwrap().approval_sha256);
+        op.original.push(b'x');
+        assert!(super::prepare_contact_restore(&op).is_err());
+    }
+    #[test]
+    fn recovery_contact_large_photo_is_retained_and_disclosed() {
+        use sha2::{Digest, Sha256};
+        let raw = format!("BEGIN:VCARD\r\nVERSION:4.0\r\nUID:old\r\nFN:Fixture\r\nPHOTO:data:image/png;base64,{}\r\nEND:VCARD\r\n", "A".repeat(70000)).into_bytes();
+        let op = super::ApprovedContactRestore { operation_id:"photo-a".into(), account_id:"account".into(),
+            origin:"https://example.test/".into(), entry:"https://example.test/dav/".into(), collection:"https://example.test/dav/recovered/".into(),
+            source_generation:"a".repeat(64), source_object:"b".repeat(64), source_version:"c".repeat(64),
+            original_sha256:format!("{:x}",Sha256::digest(&raw)), original:raw, new_uid:"new@recovered.invalid".into() };
+        let summary = super::prepare_contact_restore(&op).unwrap();
+        assert!(summary.preview_truncated);
+        assert!(summary.projected_size > 64 * 1024);
+        assert_eq!(summary.projected_sha256, format!("{:x}",Sha256::digest(isyncyou_connectors::dav::edit::recovered_contact(&op.original,&op.new_uid).unwrap())));
+    }
+    #[test]
+    fn recovery_mail_review_warns_about_unrendered_mime() {
+        let raw = b"From: a@example.test\r\nSubject: fixture\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\n";
+        let review = super::review_mail_headers(raw);
+        assert!(review.contains("Subject: fixture"));
+        assert!(review.contains("attachments and other MIME parts are not displayed"));
+        assert!(!review.contains("--x"));
+        assert!(super::review_mail_headers(b"malformed").contains("headers unavailable"));
+    }
     #[cfg(all(target_os = "linux", feature = "desktop-keyring"))]
     #[test]
     fn linux_signer_uses_verifiable_p256_asn1_and_rejects_empty_challenge() {
