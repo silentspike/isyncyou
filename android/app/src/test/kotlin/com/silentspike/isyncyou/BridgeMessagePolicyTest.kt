@@ -41,7 +41,7 @@ class BridgeMessagePolicyTest {
     }
     @Test
     fun providerOperationsAcceptOnlyAccountIdentifiers() {
-        for (op in listOf("providerSignIn", "providerStatus", "providerSignOut", "providerPushSetup", "providerPushStatus", "providerPushCancelPrepare", "providerPushDetachCancelled", "providerPushRegisterReplacement", "providerQuarantineList", "providerAuthResolve", "providerAuthCancelPending")) {
+        for (op in listOf("providerSignIn", "providerStatus", "providerSignOut", "providerPushSetup", "providerPushStatus", "providerPushCancelPrepare", "providerPushDetachCancelled", "providerPushRegisterReplacement", "providerPushRetryReplacement", "providerQuarantineList", "providerAuthResolve", "providerAuthCancelPending")) {
             fun envelope(payload: JSONObject) = JSONObject().put("t", "native").put("id", "p1")
                 .put("op", op).put("payload", payload).toString()
             assertValid(BridgeMessagePolicy.validateEnvelope(envelope(JSONObject().put("account", "me"))), "native", "p1")
@@ -53,6 +53,12 @@ class BridgeMessagePolicyTest {
             .put("payload", JSONObject().put("account", "me").put("recovery_id", recovery)).toString()
         assertValid(BridgeMessagePolicy.validateEnvelope(revoke("a".repeat(64))), "native", "r1")
         assertInvalid(BridgeMessagePolicy.validateEnvelope(revoke("bad")), "invalid_recovery")
+    }
+    @Test fun reminderStatusRequiresEmptyPayload() {
+        fun envelope(payload: JSONObject) = JSONObject().put("t", "native").put("id", "s1")
+            .put("op", "providerReminderStatus").put("payload", payload).toString()
+        assertValid(BridgeMessagePolicy.validateEnvelope(envelope(JSONObject())), "native", "s1")
+        assertInvalid(BridgeMessagePolicy.validateEnvelope(envelope(JSONObject().put("account", "me"))), "unknown_field")
     }
     @Test
     fun android_bridge_forwards_only_bounded_public_progress_projection() {

@@ -1425,7 +1425,7 @@ function renderShell() {
     el("div", { class: "brand" }, logoGlyph(30), el("div", { class: "wordmark", html: "iSync<b>You</b>" })),
     el("button", { class: "sb-account", onclick: openAccountSwitcher, title: "Switch account" },
       el("span", { class: "avatar", text: initials(accountLabel) }),
-      el("span", { class: "who" }, el("b", { text: accountLabel }), el("span", { class: "dim", text: "Microsoft 365" })),
+      el("span", { class: "who" }, el("b", { text: accountLabel }), el("span", { class: "dim", text: acc?.provider === "self_hosted" ? "Self-hosted" : "Microsoft 365" })),
     ),
     el("div", { class: "sb-section", text: "Library" }),
     nav,
@@ -3846,10 +3846,10 @@ function openProviderAlarm(account, collection, href, uid, recurrenceId, index, 
   const description = el("input", { class:"input", "aria-label":"Reminder text", value:oldDescription || "Reminder" });
   const delivery = el("p", { class:"dim", role:"status", text:"Reminder planning status is unknown on this device." });
   void nativeCall("providerReminderStatus", {}, 10000).then(status => {
-    if (!status || !["idle", "planning", "ready", "unavailable", "unsupported_alarm_coverage"].includes(status.planning)
+    if (!status || !["idle", "planning", "ready", "unavailable", "partial_coverage", "unsupported_alarm_coverage"].includes(status.planning)
         || !Number.isSafeInteger(status.last_checked_at) || status.last_checked_at < 0
         || typeof status.notifications_enabled !== "boolean" || typeof status.network_validated !== "boolean") return;
-    const labels = { idle:"No completed reminder plan is reported", planning:"Reminder planning is in progress or was interrupted", ready:"The last reminder plan completed", unavailable:"Reminder planning or delivery is unavailable for this plan", unsupported_alarm_coverage:"Some reminders cannot be planned on this device" };
+    const labels = { idle:"No completed reminder plan is reported", planning:"Reminder planning is in progress or was interrupted", ready:"The last reminder plan completed", unavailable:"Reminder planning or delivery is unavailable for this plan", partial_coverage:"Reminder coverage is incomplete; some reminders were not planned", unsupported_alarm_coverage:"Some reminders cannot be planned on this device" };
     const checked = status.last_checked_at > 0 && Number.isFinite(new Date(status.last_checked_at).getTime())
       ? ` Last checked: ${new Date(status.last_checked_at).toLocaleString()}.` : " Check time unknown.";
     const network = status.network_validated ? " Network validated." : " Offline or network not validated.";
@@ -7853,6 +7853,10 @@ async function cancelAgentTurn(turnId) {
   }
 }
 
+function loadBoundRecoveryReview(pending) {
+  return request("GET","/api/v1/agent/recovery/review?"+qs({pending:pending.pending_id,action_hash:pending.action_hash,session_id:pending.session_id,turn_request_id:pending.turn_request_id,turn_id:pending.turn_id}),{capToken:CAP.agent,timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS});
+}
+
 function renderAgentPendingCard(pending, trackNode = true) {
   const status = pendingStatus(pending);
   const risk = pending.risk ? `Risk: ${pending.risk}` : "Review required";
@@ -7940,7 +7944,7 @@ function renderAgentPendingCard(pending, trackNode = true) {
       pending.recoveryReviewReady=true; pending.recoveryReview=effect; if (!confirmDisabled) confirm.removeAttribute("disabled");
     };
     if (pending.recoveryReviewReady && pending.recoveryReview) show(pending.recoveryReview);
-    else request("GET","/api/v1/agent/recovery/review?"+qs({pending:pending.pending_id,action_hash:pending.action_hash,session_id:pending.session_id,turn_request_id:pending.turn_request_id,turn_id:pending.turn_id}),{capToken:CAP.agent,timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS}).then(show).catch(()=>{details.replaceChildren(el("p",{text:"The bound recovery review could not be loaded. Confirmation remains unavailable."}));});
+    else loadBoundRecoveryReview(pending).then(show).catch(()=>{details.replaceChildren(el("p",{text:"The bound recovery review could not be loaded. Confirmation remains unavailable."}));});
   }
   if (trackNode && pending.pending_id) {
     const nodes = AssistantState.pendingCardNodesById.get(pending.pending_id) || new Set();
@@ -9636,16 +9640,18 @@ function renderAccountMenu(body) {
         const reconcile = el("button", {class:"btn sm",type:"button",style:"display:none"}, "Resolve uncertain setup");
         const detach = el("button", {class:"btn sm",type:"button",style:"display:none"}, "Remove local connector");
         const replacement = el("button", {class:"btn sm",type:"button",style:"display:none"}, "Register replacement");
+        const retryReplacement = el("button", {class:"btn sm",type:"button",style:"display:none"}, "Review replacement retry");
         const showPush = result => {
           const state = result && result.status;
-          const labels = { not_registered: "Not configured", configuration_required: "Configuration required", registering: "Registering", endpoint_received: "Endpoint received", credentials_ready: "Configure distributor", credentials_expired: "Push preparation expired", awaiting_proof: "Awaiting verification", verification_pending: "Verification pending", active: "Registered; delivery not yet observed", degraded: "Delayed", account_changed: "Push configuration must be reviewed", create_unknown: "Enrollment outcome unknown", delivery_unknown: "Verification outcome unknown", prepare_unknown: "Push setup outcome unknown", prepare_cancel_unknown: "Setup cancellation outcome unknown", prepare_cancelled: "Uncertain preparation cancelled", prepare_cancel_conflict: "A server binding remains; review required", distributor_detached: "Local connector removed; distributor acknowledgement unknown", distributor_unregister_unknown: "Local connector removal outcome unknown", unavailable: "Unavailable" };
+          const labels = { not_registered: "Not configured", configuration_required: "Configuration required", registering: "Registering", endpoint_received: "Endpoint received", credentials_ready: "Configure distributor", credentials_expired: "Push preparation expired", awaiting_proof: "Awaiting verification", verification_pending: "Verification pending", active: "Registered; delivery not yet observed", degraded: "Delayed", account_changed: "Push configuration must be reviewed", create_unknown: "Enrollment outcome unknown", delivery_unknown: "Verification outcome unknown", prepare_unknown: "Push setup outcome unknown", prepare_cancel_unknown: "Setup cancellation outcome unknown", prepare_cancelled: "Uncertain preparation cancelled", prepare_cancel_conflict: "A server binding remains; review required", distributor_detached: "Local connector removed; distributor acknowledgement unknown", distributor_unregister_unknown: "Local connector removal outcome unknown", replacement_revoke_retry_ready: "Previous replacement revoke can be retried", broker_bound_logout: "Push remains bound; sign out again to finish removal", broker_revoked_logout: "Push revoked; sign out again to finish local cleanup", unavailable: "Unavailable" };
           const uncertain = state === "prepare_unknown" || state === "prepare_cancel_unknown" || state === "credentials_expired";
-          setup.disabled = !state || uncertain || ["prepare_cancel_conflict","prepare_cancelled","distributor_detached","distributor_unregister_unknown"].includes(state);
+          setup.disabled = !state || uncertain || ["prepare_cancel_conflict","prepare_cancelled","distributor_detached","distributor_unregister_unknown","replacement_revoke_retry_ready","broker_bound_logout","broker_revoked_logout"].includes(state);
           reconcile.style.display = uncertain ? "" : "none";
           detach.style.display = state === "prepare_cancelled" ? "" : "none";
           replacement.style.display = state === "distributor_detached" ? "" : "none";
+          retryReplacement.style.display = state === "replacement_revoke_retry_ready" ? "" : "none";
           const lastSync = result && Number(result.last_sync_at) > 0 ? ` · Last account sync ${new Date(Number(result.last_sync_at) * 1000).toLocaleString()}` : " · No successful account sync observed";
-          pushStatus.textContent = (labels[state] || "Status unavailable") + (result && result.catch_up_pending ? " · Catch-up pending" : "") + lastSync;
+          pushStatus.textContent = (labels[state] || "Status unavailable") + (result && result.endpoint_change_pending === true ? " · A distributor endpoint change is pending review" : "") + (result && result.catch_up_pending ? " · Catch-up pending" : "") + lastSync;
         };
         const refreshPush = () => nativeCall("providerPushStatus", { account: a.id }, NATIVE_TIMEOUT_MS).then(showPush).catch(() => showPush(null));
         setup.addEventListener("click",async () => {
@@ -9678,8 +9684,23 @@ function renderAccountMenu(body) {
           content.append(el("button",{class:"btn sm",type:"button",onclick:async event=>{event.currentTarget.disabled=true;replacement.disabled=true;try {const result=await nativeCall("providerPushRegisterReplacement",{account:a.id},PROVIDER_NATIVE_TIMEOUT_MS);if(!result || result.status!=="registering") throw new Error("unconfirmed");toast("Replacement registration requested; endpoint not yet received.");closeSheet();await refreshPush();} catch (_) {toast("Registration result is unknown. No automatic retry was sent.","err");await refreshPush();} finally {replacement.disabled=false;}}},"Confirm replacement registration"));
           openSheet("Register replacement",content);
         });
+        retryReplacement.addEventListener("click",()=>{
+          const content=el("div",{class:"compose"},el("p",{text:"Retry removal of the previous push binding before handling the changed distributor endpoint. This is a separate action and does not establish delivery."}));
+          content.append(el("button",{class:"btn sm",type:"button",onclick:async event=>{
+            if (App.account!==a.id) return;
+            event.currentTarget.disabled=true;retryReplacement.disabled=true;
+            try {
+              const result=await nativeCall("providerPushRetryReplacement",{account:a.id},PROVIDER_NATIVE_TIMEOUT_MS);
+              if (!result || result.status!=="endpoint_changed") throw new Error("unconfirmed");
+              toast("Retry scheduled; check status for the result.");closeSheet();await refreshPush();
+            } catch (_) { toast("The retry result could not be confirmed. Check status before any further action.","err");await refreshPush(); }
+            finally { retryReplacement.disabled=false; }
+          }},"Confirm retry"));
+          closeAccountMenu();
+          openSheet("Retry previous binding removal",content);
+        });
         void refreshPush();
-        row.append(el("div", { class: "acct-role" }, el("span", { class: "acct-role-copy" }, el("b", { text: "Push updates" }), pushStatus), setup, reconcile, detach, replacement));
+        row.append(el("div", { class: "acct-role" }, el("span", { class: "acct-role-copy" }, el("b", { text: "Push updates" }), pushStatus), setup, reconcile, detach, replacement, retryReplacement));
       }    } else if (CAP.account) {
       const roles = el("div", { class: "acct-roles" });
       for (const role of ["reader", "writer"]) {

@@ -13186,7 +13186,9 @@ mod tests {
                  CREATE TABLE product_request_bindings(logical_bytes INTEGER NOT NULL);
                  CREATE TABLE mutation_intents(logical_bytes INTEGER NOT NULL);
                  CREATE TABLE product_request_receipts(logical_bytes INTEGER NOT NULL);
-                 CREATE TABLE agent_turn_admissions(logical_bytes INTEGER NOT NULL);",
+                 CREATE TABLE agent_turn_admissions(logical_bytes INTEGER NOT NULL);
+                 CREATE TABLE recovery_requests(logical_bytes INTEGER NOT NULL);
+                 CREATE TABLE recovery_batches(logical_bytes INTEGER NOT NULL);",
             )
             .unwrap();
         connection

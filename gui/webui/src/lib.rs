@@ -16146,7 +16146,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     fn product_post_transport_retry_reuses_one_serialized_body_and_skips_ephemeral_authority() {
         let source = include_str!("app.js");
         let helper = source
-            .split("async function postJson(path, capToken, value) {")
+            .split("async function postJson(path, capToken, value, timeoutMs) {")
             .nth(1)
             .unwrap()
             .split("function isReplayedRequest")
@@ -22837,7 +22837,8 @@ Content-Type: text/html; charset=utf-8\r\n\
         assert!(!source.contains("postJson(\"/api/v1/onenote/create\""));
         assert!(!source.contains("postJson(\"/api/v1/onenote/append\""));
         assert!(source.contains("async function mutationPostWithTransportRetry"));
-        assert!(source.contains("if (error && error.responseReceived) throw error"));
+        assert!(source.contains("if (!retryTransport || (error && error.responseReceived)) throw error"));
+        assert!(source.contains("MUTATION_COMMIT_TIMEOUT_MS, purpose !== \"mail_body\""));
         assert!(source.contains("error.code === \"mutation_intent_already_completed\""));
         assert!(source.contains("return { status: \"completed\" }"));
         assert!(source.contains("if (!commitAttempted && error && error.responseReceived)"));
@@ -23026,7 +23027,7 @@ Content-Type: text/html; charset=utf-8\r\n\
         assert!(source.contains("async function deleteTodoBatch(items)"));
         assert!(source.contains("return stageMutation(\"todo_delete_batch\""));
         assert!(source.contains("const MUTATION_COMMIT_TIMEOUT_MS = 125000"));
-        assert!(source.contains("}, MUTATION_COMMIT_TIMEOUT_MS);"));
+        assert!(source.contains("}, MUTATION_COMMIT_TIMEOUT_MS, purpose !== \"mail_body\");"));
         assert!(source.contains("function selectAllVisibleTodoTasks()"));
         assert!(source.contains("function todoTaskCanBeDeleted(t)"));
         assert!(source.contains("stateKey(t) !== \"backup_only\""));

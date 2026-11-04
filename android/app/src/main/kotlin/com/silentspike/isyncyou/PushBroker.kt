@@ -7,12 +7,16 @@ import org.json.JSONObject
 /** OAuth bearer transport is native; signed broker challenges stay outside the WebView. */
 internal object PushBroker {
     fun operation(context: Context, account: String, endpoint: String, action: String, nonce: String? = null,
-                  beforeDispatch: (() -> Boolean)? = null): JSONObject {
-        require(action in setOf("prepare", "deliver", "confirm", "revoke", "cancel"))
-        val identity = if (action == "cancel") requireNotNull(PushInstallationKey.existing(context, account))
+                  beforeDispatch: (() -> Boolean)? = null, operationId: String? = null): JSONObject {
+        require(action in setOf("prepare", "deliver", "confirm", "revoke", "cancel", "status"))
+        val identity = if (action in setOf("cancel", "status")) requireNotNull(PushInstallationKey.existing(context, account))
             else PushInstallationKey.getOrCreate(context, account)
         val request = JSONObject().put("action", action).put("installation_id", identity.installation)
             .put("endpoint", endpoint).put("public_key", identity.publicKey)
+        if (operationId != null) {
+            require(action in setOf("status", "revoke") && operationId.matches(Regex("[0-9a-f]{32}")))
+            request.put("operation_id", operationId)
+        }
         return PushDispatchGate.run(challenge = {
             val challenge = call(context, account, "challenge", request)
             val id = challenge.getString("challenge_id")
@@ -24,6 +28,7 @@ internal object PushBroker {
                 require(payload.getInt("version") == 1 && payload.getString("challenge_id") == id &&
                     payload.getString("action") == action && payload.getString("installation_id") == identity.installation &&
                     payload.getString("endpoint") == endpoint && payload.getString("public_key") == identity.publicKey &&
+                    (operationId == null || payload.optString("operation_id") == operationId) &&
                     payload.getLong("expires") in now..(now + 180))
                 val signature = PushInstallationKey.sign(context, account, bytes)
                 JSONObject().put("challenge_id", id).put("signature", signature).apply {

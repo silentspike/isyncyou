@@ -2,6 +2,7 @@
 //! Payloads and native responses can contain capability values and must never be logged.
 
 use isyncyou_core::{config::ProviderConfig, Config};
+use isyncyou_connectors::request_budget::BudgetedSend;
 use serde_json::Value;
 use std::io::Read;
 use std::time::Duration;
@@ -26,7 +27,7 @@ pub(crate) fn post_with_token(cfg: &Config, account: &str, operation: &str, requ
 fn post_inner(cfg: &Config, account: &str, operation: &str, request: &Value, supplied_token: Option<&str>) -> Result<Value, &'static str> {
     if !matches!(
         operation,
-        "challenge" | "prepare" | "deliver" | "confirm" | "revoke" | "cancel"
+        "challenge" | "prepare" | "deliver" | "confirm" | "revoke" | "cancel" | "status"
     ) || !request.is_object()
     {
         return Err("invalid_request");
@@ -75,7 +76,7 @@ fn post_inner(cfg: &Config, account: &str, operation: &str, request: &Value, sup
         .bearer_auth(token)
         .header("Content-Type", "application/json")
         .body(body)
-        .send()
+        .budgeted_send_auto()
         .map_err(|_| "outcome_unknown")?;
     if response.status().is_server_error() {
         return Err("outcome_unknown");
@@ -108,6 +109,7 @@ mod tests {
         let cfg = Config::default();
         // A valid operation reaches account validation without making a request.
         assert_eq!(post(&cfg, "missing", "cancel", &json!({})), Err("invalid_account"));
+        assert_eq!(post(&cfg, "missing", "status", &json!({})), Err("invalid_account"));
         for operation in ["", "../cancel", "cancel/other", "CANCEL", "delete"] {
             assert_eq!(post(&cfg, "missing", operation, &json!({})), Err("invalid_request"));
         }

@@ -29,23 +29,7 @@ class UnifiedPushReceiver : MessagingReceiver() {
         val keys = endpoint.pubKeySet ?: return
         if (endpoint.temporary || endpoint.url.length > 2048) return
         val changed = PushEnrollmentStore.update(context, instance) { state ->
-            val old = state.optString("endpoint", "")
-            if (old.isNotEmpty() && old != endpoint.url) {
-                if (state.optString("stage") == "endpoint_changed") return@update false
-                state.put("replacement_from", state.optString("stage"))
-                    .put("replacement", JSONObject().put("endpoint", endpoint.url)
-                        .put("public_key", keys.pubKey).put("auth", keys.auth))
-                    .put("stage", "endpoint_changed")
-            } else if (old.isEmpty()) {
-                state.put("endpoint", endpoint.url).put("public_key", keys.pubKey).put("auth", keys.auth)
-                    .put("stage", "endpoint_received")
-                state.remove("degraded")
-            } else if (state.optBoolean("degraded", false)) {
-                // NEW_ENDPOINT also signals that a temporarily unavailable
-                // distributor is reachable again, even if its URL is unchanged.
-                state.put("degraded", false)
-            } else return@update false
-            true
+            PushEndpointTransition.receive(state, endpoint.url, keys.pubKey, keys.auth)
         }
         if (changed) PushScheduler.enqueue(context, instance)
     }

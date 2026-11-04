@@ -611,6 +611,20 @@ class MainActivity : FragmentActivity() {
             "providerPushCancelPrepare" -> cancelUncertainPushPrepare(payload.getString("account"), id, reply)
             "providerPushDetachCancelled" -> detachCancelledPush(payload.getString("account"), id, reply)
             "providerPushRegisterReplacement" -> registerReplacementPush(payload.getString("account"), id, reply)
+            "providerPushRetryReplacement" -> dispatchBridge {
+                val account = payload.optString("account")
+                val identity = runCatching { PushInstallationKey.existing(this, account) }.getOrNull()
+                val origin = NativeEngine.nativeProviderOrigin(filesDir.absolutePath, account)
+                val claimed = identity != null && origin.isNotEmpty() && PushEnrollmentStore.update(this, identity.installation) {
+                    if (it.optString("account") != account || it.optString("origin") != origin ||
+                        it.optString("stage") != "replacement_revoke_retry_ready" || !it.has("replacement")) return@update false
+                    it.put("stage", "endpoint_changed"); true
+                }
+                if (claimed && identity != null) {
+                    PushScheduler.enqueue(this, identity.installation)
+                    postBridgeResponse(reply, id, 200, JSONObject().put("status", "endpoint_changed"))
+                } else postBridgeError(reply, id, 409, "unavailable", "push_reconcile_changed")
+            }
             "providerReminderStatus" -> dispatchBridge {
                 val status = runCatching { ReminderStatus.snapshot(this) }
                     .getOrElse { JSONObject().put("planning", "unavailable") }
@@ -633,7 +647,8 @@ class MainActivity : FragmentActivity() {
                         stage == "active" && expiry != null && expiry <= System.currentTimeMillis() -> "expired"
                         else -> stage
                     }
-                    JSONObject().put("status", status).put("catch_up_pending", state?.optBoolean("hint_pending", false) ?: false)
+                    JSONObject().put("status", status).put("endpoint_change_pending", state?.has("replacement") == true)
+                        .put("catch_up_pending", state?.optBoolean("hint_pending", false) ?: false)
                         .put("last_hint_at", state?.optLong("last_hint_at", 0) ?: 0)
                         .put("last_sync_at", state?.optLong("last_sync_at", 0) ?: 0)
                 }.getOrElse { JSONObject().put("status", "unavailable") }
@@ -1000,6 +1015,10 @@ class MainActivity : FragmentActivity() {
                 return@dispatchBridge
             }
             if (state?.optString("stage") == "credentials_ready") {
+                if (state.has("replacement")) {
+                    postBridgeError(reply, id, 409, "unavailable", "push_endpoint_change_pending")
+                    return@dispatchBridge
+                }
                 if (state.optLong("expires", 0) <= System.currentTimeMillis() / 1000) {
                     postBridgeError(reply, id, 503, "unavailable", "push_enrollment_expired")
                     return@dispatchBridge
@@ -1022,13 +1041,15 @@ class MainActivity : FragmentActivity() {
                         .setPositiveButton("Configured") { _, _ ->
                             dispatchBridge {
                                 try {
-                                    state.put("stage", "awaiting_proof")
-                                    PushEnrollmentStore.put(this, identity.installation, state)
+                                    if (!PushEnrollmentStore.update(this, identity.installation) {
+                                            PushEndpointTransition.beginDelivery(it, state, account, origin)
+                                        }) return@dispatchBridge
                                     PushBroker.operation(this, account, state.getString("endpoint"), "deliver")
                                 } catch (_: Exception) {
-                                    val latest = PushEnrollmentStore.get(this, identity.installation)
-                                    if (latest?.optString("stage") == "awaiting_proof") {
-                                        PushEnrollmentStore.put(this, identity.installation, latest.put("stage", "delivery_unknown"))
+                                    PushEnrollmentStore.update(this, identity.installation) {
+                                        if (it.optString("stage") != "awaiting_proof" || it.optString("account") != account ||
+                                            it.optString("origin") != origin || it.optString("endpoint") != state.optString("endpoint")) return@update false
+                                        it.put("stage", "delivery_unknown"); true
                                     }
                                 }
                             }
@@ -1038,7 +1059,7 @@ class MainActivity : FragmentActivity() {
                 return@dispatchBridge
             }
             if (state != null) {
-                if (state.optString("stage") in setOf("create_unknown", "destroy_unknown", "replacement_destroy_unknown", "renew_unknown")) {
+                if (state.optString("stage") in setOf("create_unknown", "destroy_unknown", "replacement_destroy_unknown", "renew_unknown", "confirm_unknown", "revoke_unknown", "replacement_revoke_unknown")) {
                     PushScheduler.enqueue(this, identity.installation)
                 }
                 postBridgeResponse(reply, id, 200, JSONObject().put("status", state.optString("stage", "unavailable")))
@@ -1087,6 +1108,10 @@ class MainActivity : FragmentActivity() {
             val origin = NativeEngine.nativeProviderOrigin(filesDir.absolutePath, account)
             check(origin.isNotEmpty() && state.optString("origin") == origin)
             val initialStage = state.optString("stage")
+            if (initialStage in setOf("destroy_unknown", "revoke_unknown", "replacement_destroy_unknown", "replacement_revoke_unknown", "confirm_unknown")) {
+                PushScheduler.enqueue(this, identity.installation)
+                return false
+            }
             if (initialStage in setOf("active", "verification_pending")) {
                 val id = state.getString("subscription_id")
                 check(PushEnrollmentStore.update(this, identity.installation) {
@@ -1100,16 +1125,19 @@ class MainActivity : FragmentActivity() {
                     it.put("stage", "broker_bound_logout"); true
                 })
             }
-            // Unknown or provisional server mutations need reconciliation, never blind logout.
-            check(PushEnrollmentStore.update(this, identity.installation) {
-                if (it.optString("stage") !in setOf("broker_bound", "broker_bound_logout") ||
-                    it.optString("endpoint") != state.optString("endpoint")) return@update false
-                it.put("stage", "revoke_unknown"); true
-            })
-            val result = PushBroker.operation(this, account, state.getString("endpoint"), "revoke")
-            check(result.optString("status") == "revoked")
+            // An unknown prior revoke must be reconciled by signed status, never replayed.
+            if (initialStage != "broker_revoked_logout") {
+                val operationId = java.util.UUID.randomUUID().toString().replace("-", "")
+                check(PushEnrollmentStore.update(this, identity.installation) {
+                    if (it.optString("stage") !in setOf("broker_bound", "broker_bound_logout") ||
+                        it.optString("endpoint") != state.optString("endpoint")) return@update false
+                    it.put("stage", "revoke_unknown").put("revoke_operation_id", operationId); true
+                })
+                val result = PushBroker.operation(this, account, state.getString("endpoint"), "revoke", operationId = operationId)
+                check(result.optString("status") == "revoked")
+            }
             check(PushEnrollmentStore.removeIf(this, identity.installation) {
-                it.optString("stage") == "revoke_unknown" && it.optString("endpoint") == state.optString("endpoint")
+                it.optString("stage") in setOf("revoke_unknown", "broker_revoked_logout") && it.optString("endpoint") == state.optString("endpoint")
             })
             org.unifiedpush.android.connector.UnifiedPush.unregister(this, identity.installation, WebPushKeyManager(this))
             PushScheduler.cancel(this, identity.installation)

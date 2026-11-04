@@ -17,7 +17,7 @@ class ReminderStatusInstrumentedTest {
         val permission = Build.VERSION.SDK_INT < 33 ||
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
         if (!appEnabled || !permission) check(!status.getBoolean("notifications_enabled"))
-        check(status.getString("planning") in setOf("idle", "planning", "ready", "unavailable", "unsupported_alarm_coverage"))
+        check(status.getString("planning") in setOf("idle", "planning", "ready", "unavailable", "partial_coverage", "unsupported_alarm_coverage"))
         check(status.getLong("last_checked_at") >= 0)
         check(status.has("network_validated"))
         println("WP16_REMINDER_NOTIFICATION_PERMISSION=$permission")

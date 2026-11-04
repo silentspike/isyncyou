@@ -16,23 +16,70 @@ class PushEnrollmentWorker(context: Context, params: WorkerParameters) : Corouti
         val account = state.optString("account", "")
         val endpoint = state.optString("endpoint", "")
         if (!account.matches(Regex("[A-Za-z0-9._-]{1,128}"))) return@withContext Result.failure()
+        if (runCatching { PushInstallationKey.existing(applicationContext, account)?.installation }.getOrNull() != instance) {
+            return@withContext Result.failure()
+        }
         if (!runCatching { EngineBootstrap.ensureStarted(applicationContext.filesDir).isNotEmpty() }.getOrDefault(false)) {
             return@withContext Result.retry()
         }
         val origin = NativeEngine.nativeProviderOrigin(applicationContext.filesDir.absolutePath, account)
         if (origin.isEmpty() || state.optString("origin") != origin) return@withContext Result.failure()
         try {
+            val prior = state.optString("stage")
+            if (state.has("replacement") && (prior == "prepare_unknown" ||
+                (prior in setOf("credentials_ready", "awaiting_proof", "delivery_unknown", "proof_received") &&
+                    state.optLong("expires", 0) > 0 && System.currentTimeMillis() / 1000 >= state.optLong("expires", 0) + 180))) {
+                val observed = PushBroker.operation(applicationContext, account, endpoint, "status").optString("binding")
+                val changed = PushEnrollmentStore.update(applicationContext, instance) {
+                    PushEndpointTransition.reconcileStatus(it, prior, account, origin, endpoint, observed)
+                }
+                if (changed) PushScheduler.enqueue(applicationContext, instance)
+                return@withContext Result.success()
+            }
             when (state.optString("stage")) {
+                "renew_unknown", "verify_unknown" -> {
+                    val id = state.optString("subscription_id", "")
+                    if (state.has("replacement") && id.isNotEmpty()) {
+                        if (!PushRenewReplacement.dispatch(
+                                claim = { PushEnrollmentStore.update(applicationContext, instance) {
+                                    if (it.optString("account") != account || it.optString("origin") != origin || it.optString("endpoint") != endpoint) return@update false
+                                    PushEndpointTransition.claimRenewReplacement(it, id)
+                                } },
+                                destroy = {
+                                    val result = PushJmap.call(applicationContext, account, "destroy", org.json.JSONObject().put("id", id))
+                                    check(result.optString("status") == "applied")
+                                },
+                            )) {
+                            return@withContext Result.success()
+                        }
+                        // Destroy is a distinct compensation for the replaced endpoint;
+                        // uncertain renew/verify is never replayed. A lost destroy response
+                        // stays in replacement_destroy_unknown for read-only reconciliation.
+                        if (PushEnrollmentStore.update(applicationContext, instance) {
+                                if (it.optString("stage") != "replacement_destroy_unknown" || it.optString("subscription_id") != id) return@update false
+                                it.remove("subscription_id"); it.put("replacement_from", "broker_bound").put("stage", "endpoint_changed"); true
+                            }) PushScheduler.enqueue(applicationContext, instance)
+                        return@withContext Result.success()
+                    }
+                }
+                "confirm_unknown", "revoke_unknown", "replacement_revoke_unknown" -> {
+                    val prior = state.getString("stage")
+                    val operationId = state.optString("revoke_operation_id", "").takeIf { it.matches(Regex("[0-9a-f]{32}")) }
+                    val changed = PushStatusRead.reconcile(
+                        read = { PushBroker.operation(applicationContext, account, endpoint, "status", operationId = operationId) },
+                        apply = { status -> PushEnrollmentStore.update(applicationContext, instance) {
+                            PushEndpointTransition.reconcileStatus(it, prior, account, origin, endpoint, status.optString("binding"),
+                                fencedOperation = operationId != null && status.optBoolean("operation_fenced"), expectedOperation = operationId)
+                        } },
+                    )
+                    if (changed && prior != "revoke_unknown") PushScheduler.enqueue(applicationContext, instance)
+                }
                 "destroy_unknown", "replacement_destroy_unknown" -> {
                     val previousStage = state.getString("stage")
                     val id = state.getString("subscription_id")
                     if (PushJmap.lookup(applicationContext, account, instance, id) == PushJmap.Lookup.Absent) {
                         PushEnrollmentStore.update(applicationContext, instance) {
-                            if (it.optString("stage") != previousStage || it.optString("subscription_id") != id) return@update false
-                            it.remove("subscription_id")
-                            if (previousStage == "destroy_unknown") it.put("stage", "broker_bound_logout")
-                            else it.put("replacement_from", "broker_bound").put("stage", "endpoint_changed")
-                            true
+                            PushEndpointTransition.reconcileDestroyed(it, previousStage, id, absent = true)
                         }
                         if (previousStage == "replacement_destroy_unknown") PushScheduler.enqueue(applicationContext, instance)
                     }
@@ -51,11 +98,25 @@ class PushEnrollmentWorker(context: Context, params: WorkerParameters) : Corouti
                         check(destroyed.optString("status") == "applied")
                     }
                     val expected = if (oldSubscription.isEmpty()) "endpoint_changed" else "replacement_destroy_unknown"
+                    if (state.optJSONObject("replacement")?.optString("endpoint") == endpoint) {
+                        val applied = PushEnrollmentStore.update(applicationContext, instance) {
+                            if (it.optString("stage") != expected || it.optString("endpoint") != endpoint) return@update false
+                            val replacement = it.optJSONObject("replacement") ?: return@update false
+                            if (replacement.optString("endpoint") != endpoint) return@update false
+                            it.put("public_key", replacement.getString("public_key")).put("auth", replacement.getString("auth"))
+                                .put("stage", "broker_bound")
+                            listOf("replacement", "replacement_from", "subscription_id", "expires", "verify_id", "verify_code").forEach { key -> it.remove(key) }
+                            true
+                        }
+                        PushScheduler.enqueue(applicationContext, instance)
+                        return@withContext if (applied) Result.success() else Result.retry()
+                    }
+                    val operationId = java.util.UUID.randomUUID().toString().replace("-", "")
                     if (!PushEnrollmentStore.update(applicationContext, instance) {
                             if (it.optString("stage") != expected) return@update false
-                            it.put("stage", "replacement_revoke_unknown"); true
+                            it.put("stage", "replacement_revoke_unknown").put("revoke_operation_id", operationId); true
                         }) return@withContext Result.success()
-                    val revoked = PushBroker.operation(applicationContext, account, endpoint, "revoke")
+                    val revoked = PushBroker.operation(applicationContext, account, endpoint, "revoke", operationId = operationId)
                     check(revoked.optString("status") == "revoked")
                     PushEnrollmentStore.update(applicationContext, instance) {
                         if (it.optString("stage") != "replacement_revoke_unknown") return@update false
@@ -64,7 +125,7 @@ class PushEnrollmentWorker(context: Context, params: WorkerParameters) : Corouti
                             .put("public_key", replacement.getString("public_key"))
                             .put("auth", replacement.getString("auth"))
                             .put("stage", "endpoint_received")
-                        listOf("replacement", "replacement_from", "subscription_id", "expires", "verify_id", "verify_code").forEach { key -> it.remove(key) }
+                        listOf("replacement", "replacement_from", "subscription_id", "expires", "verify_id", "verify_code", "revoke_operation_id").forEach { key -> it.remove(key) }
                         true
                     }
                     PushScheduler.enqueue(applicationContext, instance)
@@ -100,6 +161,10 @@ class PushEnrollmentWorker(context: Context, params: WorkerParameters) : Corouti
                         it.remove("password"); it.remove("proof_nonce"); it.put("stage", "broker_bound"); true
                     }
                 }
+            }
+            if (PushEnrollmentStore.update(applicationContext, instance) { PushEndpointTransition.promote(it) }) {
+                PushScheduler.enqueue(applicationContext, instance)
+                return@withContext Result.success()
             }
             val current = PushEnrollmentStore.get(applicationContext, instance) ?: return@withContext Result.failure()
             if (current.optString("stage") == "broker_bound") {
@@ -209,6 +274,9 @@ class PushEnrollmentWorker(context: Context, params: WorkerParameters) : Corouti
                     it.put("expires", actualExpiry).put("stage", "active"); true
                 }
                 PushJmap.scheduleRenewal(applicationContext, instance, actualExpiry)
+            }
+            if (PushEnrollmentStore.update(applicationContext, instance) { PushEndpointTransition.promote(it) }) {
+                PushScheduler.enqueue(applicationContext, instance)
             }
             val before = PushEnrollmentStore.get(applicationContext, instance)?.optLong("hint_generation", 0) ?: 0
             val pendingHint = PushEnrollmentStore.get(applicationContext, instance)?.optBoolean("hint_pending", false) == true
