@@ -492,6 +492,16 @@ fn classify_execution(result: Result<WriteOutcome,String>, entered: bool, stage:
     result.map_err(|_| if entered { DavWriteExecutionError::DispatchUncertain } else { DavWriteExecutionError::PreDispatch(stage) })
 }
 
+fn discover_write_collection(
+    discover: impl FnOnce() -> Result<Vec<isyncyou_connectors::dav::Collection>, DavError>,
+    collection: &str,
+    service: &str,
+) -> Result<isyncyou_connectors::dav::Collection, String> {
+    discover().map_err(|e| e.to_string())?.into_iter().find(|c| {
+        c.url == collection && if service == "calendar" { c.calendar } else { c.addressbook }
+    }).ok_or_else(|| "Collection is not currently accessible".into())
+}
+
 fn execute_inner_impl(
     cfg: &Config,
     entry: &str,
@@ -539,19 +549,7 @@ fn execute_inner_impl(
     #[cfg(debug_assertions)]
     let discovery_start = std::time::Instant::now();
     stage.set(DavPreDispatchStage::Discovery);
-    let collection = client
-        .discover(entry)
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .find(|c| {
-            c.url == op.collection
-                && if op.service == "calendar" {
-                    c.calendar
-                } else {
-                    c.addressbook
-                }
-        })
-        .ok_or("Collection is not currently accessible")?;
+    let collection = discover_write_collection(|| client.discover(entry), &op.collection, &op.service)?;
     #[cfg(debug_assertions)]
     eprintln!("isyncyou: dav_confirm discovery_ms={}", discovery_start.elapsed().as_millis());
     let scope = ProviderScope {
@@ -706,6 +704,38 @@ mod tests {
         assert_eq!(classify_execution(Ok(WriteOutcome::Unknown), true, DavPreDispatchStage::Privilege), Ok(WriteOutcome::Unknown));
         let (_, op) = fixture();
         assert_eq!(execute_task_attributes_with_start_classified(&Config::default(), "/.well-known/caldav", &op, "uid", None, None, None, None), Err(DavWriteExecutionError::DispatchUncertain));
+    }
+
+    #[test]
+    fn discovery_http_failure_stops_before_any_write_dispatch() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buffer).unwrap();
+                assert_ne!(n, 0);
+                request.extend_from_slice(&buffer[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length = headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok())).unwrap_or(0);
+                    if request.len() >= end + 4 + length { break; }
+                }
+            }
+            assert!(request.starts_with(b"PROPFIND "));
+            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let client = isyncyou_connectors::dav::LoopbackDavReader::new(&origin, "fixture".into()).unwrap();
+        let writes = Cell::new(0usize);
+        let result = discover_write_collection(|| client.discover("/.well-known/caldav"), &format!("{origin}cal/"), "calendar")
+            .map(|_| { writes.set(writes.get() + 1); WriteOutcome::Unknown });
+        assert_eq!(classify_execution(result, false, DavPreDispatchStage::Discovery), Err(DavWriteExecutionError::PreDispatch(DavPreDispatchStage::Discovery)));
+        assert_eq!(writes.get(), 0);
+        server.join().unwrap();
     }
 
     #[test]

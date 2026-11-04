@@ -46,7 +46,7 @@ class ReminderPlanningWorker(context: Context, params: WorkerParameters) : Corou
                 val result = JSONObject(NativeEngine.nativeReminderPlan(base, request.toString()))
                 if (!result.optBoolean("ok")) {
                     val status = if (result.optString("reason") == "unsupported_alarm_coverage") "unsupported_alarm_coverage" else "unavailable"
-                    val reason = result.optString("reason").takeIf { it in setOf("reminder_window", "reminder_changed", "reminder_config", "reminder_client", "reminder_discovery", "reminder_sync", "reminder_cache", "reminder_events_report", "reminder_tasks_report", "reminder_read", "reminder_plan") } ?: ""
+                    val reason = result.optString("reason").takeIf { it in setOf("reminder_window", "reminder_changed", "reminder_config", "reminder_client", "reminder_discovery", "reminder_sync", "reminder_cache", "reminder_events_report", "reminder_tasks_report", "reminder_read", "reminder_access_check", "reminder_access_denied", "reminder_resource_get", "reminder_plan") } ?: ""
                     ReminderStatus.record(applicationContext, status, reason); return@withContext Result.retry()
                 }
                 val records = result.getJSONArray("records")

@@ -1546,6 +1546,35 @@ impl AgentControlStore {
         match row { Some((state, actual)) if constant_time_eq(actual.as_bytes(),binding.as_bytes()) => Ok(Some(state)), _ => Ok(None) }
     }
 
+    /// Recover a lost browser tracking ID only when the exact subject digest and
+    /// current installation binding identify one record. Never attribute legacy rows.
+    pub(crate) fn find_bound_mail_intent_by_subject_digest(&self, account:&str, origin:&str, subject:&str, subject_sha256:&str) -> Result<(Vec<String>,bool),String> {
+        if subject_sha256.len()!=64 || !subject_sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) { return Err("mutation_intent_invalid".into()); }
+        let rows = {
+            let connection = self.connection.lock().map_err(|_| "mutation_intent_failed")?;
+            let mut statement = connection.prepare("SELECT m.intent_id,m.purpose_json,b.identity_binding FROM mutation_intents m JOIN mutation_mail_bindings b ON b.intent_id=m.intent_id LIMIT 257").map_err(|_| "mutation_intent_failed")?;
+            let rows=statement.query_map([],|row| Ok((row.get::<_,String>(0)?,row.get::<_,Vec<u8>>(1)?,row.get::<_,String>(2)?))).map_err(|_| "mutation_intent_failed")?.collect::<Result<Vec<_>,_>>().map_err(|_| "mutation_intent_failed")?;
+            if rows.len()>256 { return Err("mutation_intent_capacity".into()); }
+            rows
+        };
+        let mut matches=Vec::new(); let mut opaque=false;
+        for (id,sealed,binding) in rows {
+            let expected=self.upload_installation_binding(&format!("mail-intent:{id}"),account,origin,subject)?;
+            if !constant_time_eq(binding.as_bytes(),expected.as_bytes()) { continue; }
+            // Terminal compaction deliberately erases the purpose; it cannot be
+            // ruled out as another match and must prevent unique attribution.
+            if sealed.is_empty() { opaque=true; continue; }
+            let plain=open_row(&self.row_wrap_key,"mutation-purpose",&id,&sealed)?;
+            let purpose:isyncyou_webui::MutationPurpose=serde_json::from_slice(&plain).map_err(|_| "mutation_intent_failed")?;
+            if let isyncyou_webui::MutationPurpose::MailBody { account:ref a, operation:ref op, subject:ref title, .. } = purpose {
+                let digest=ring::digest::digest(&ring::digest::SHA256,title.as_bytes());
+                let hex=digest.as_ref().iter().map(|b| format!("{b:02x}")).collect::<String>();
+                if a==account && op=="draft" && constant_time_eq(hex.as_bytes(),subject_sha256.as_bytes()) { matches.push(id); }
+            }
+        }
+        Ok((matches,opaque))
+    }
+
     /// Older unfinished rows have no durable identity binding; counts cannot
     /// establish which provider subject or operation they belong to.
     pub(crate) fn legacy_mail_intent_counts(&self, account:&str) -> Result<(usize,usize),String> {
@@ -11965,6 +11994,27 @@ mod tests {
             total_bytes: bytes.len() as u64,
             sha256: sha256_hex(bytes),
         }
+    }
+
+    #[test]
+    fn lost_mail_status_lookup_requires_exact_current_binding_and_handles_ambiguity() {
+        let root=temp_root("mail-lost-status"); let credentials=credential_store(&root);
+        let store=AgentControlStore::open(&root,&credentials,INSTALLATION_PRINCIPAL,1).unwrap();
+        let make=|id:&str| { let mut r=mutation_create(id,"owner-a",b"data");r.purpose=isyncyou_webui::MutationPurpose::MailBody { account:"controlled".into(),operation:"draft".into(),target:String::new(),recipients:vec!["to@example.invalid".into()],cc:vec![],bcc:vec![],subject:"fixture".into(),importance:None,read_receipt:false,identity_id:None,all:false };r };
+        let first=store.create_mutation_intent(&make("019f0000-0000-4000-8000-000000000201"),1_000).unwrap();
+        let hash=sha256_hex(b"fixture");
+        assert!(store.find_bound_mail_intent_by_subject_digest("controlled","https://provider.example","subject-a",&hash).unwrap().0.is_empty());
+        store.bind_mail_installation("owner-a",&first.intent_id,"controlled","https://provider.example","subject-a").unwrap();
+        assert_eq!(store.find_bound_mail_intent_by_subject_digest("controlled","https://provider.example","subject-a",&hash).unwrap(),(vec![first.intent_id.clone()],false));
+        assert!(store.find_bound_mail_intent_by_subject_digest("controlled","https://provider.example","other-subject",&hash).unwrap().0.is_empty());
+        assert!(store.find_bound_mail_intent_by_subject_digest("controlled","https://other.example","subject-a",&hash).unwrap().0.is_empty());
+        let second=store.create_mutation_intent(&make("019f0000-0000-4000-8000-000000000202"),1_001).unwrap();
+        store.bind_mail_installation("owner-a",&second.intent_id,"controlled","https://provider.example","subject-a").unwrap();
+        assert_eq!(store.find_bound_mail_intent_by_subject_digest("controlled","https://provider.example","subject-a",&hash).unwrap().0.len(),2);
+        { let connection=store.connection.lock().unwrap();connection.execute("UPDATE mutation_intents SET purpose_json=X'' WHERE intent_id=?1",params![second.intent_id]).unwrap(); }
+        let (ids,opaque)=store.find_bound_mail_intent_by_subject_digest("controlled","https://provider.example","subject-a",&hash).unwrap();
+        assert_eq!(ids,vec![first.intent_id]);assert!(opaque);
+        drop(store);std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

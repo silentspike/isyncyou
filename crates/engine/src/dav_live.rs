@@ -369,8 +369,8 @@ pub fn plan_account_reminders_with_store(cfg: &Config, account: &str, entry: &st
                 let standalone = isyncyou_connectors::dav::reminders::is_standalone(&object.raw).map_err(|_| "unsupported_alarm_coverage")?;
                 if !standalone { isyncyou_connectors::dav::reminders::require_bounded_relative_alarms(&object.raw).map_err(|_| "unsupported_alarm_coverage")?; }
                 if !standalone && expansion.is_none() { continue; }
-                if !client.permits(&scope, Some(&object.remote_id), "read").map_err(|_| "reminder_read")? { return Err("reminder_read".into()); }
-                let source = client.read_resource(&scope, &object.remote_id).map_err(|_| "reminder_read")?;
+                if !client.permits(&scope, Some(&object.remote_id), "read").map_err(|_| "reminder_access_check")? { return Err("reminder_access_denied".into()); }
+                let source = client.read_resource(&scope, &object.remote_id).map_err(|_| "reminder_resource_get")?;
                 let etag = source.etag.clone().ok_or("Reminder ETag unavailable")?;
                 if object.etag.as_deref() != Some(etag.as_str()) { return Err("reminder_changed".into()); }
                 let data = if standalone { source.raw.as_slice() } else { expansion.as_ref().ok_or("Missing expansion")?.calendar_data.as_bytes() };

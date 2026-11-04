@@ -3959,6 +3959,7 @@ pub trait MutationIntentHandler: Send + Sync {
     fn release_confirmed_attachment(&self, _owner:&str, _request_id:&str, _intent_id:&str, _account:&str) -> Result<(),String> { Err("mutation_intent_unavailable".into()) }
     fn attachment_status(&self, _owner:&str, _account:&str, _intent_id:&str) -> Result<Value,String> { Err("mutation_intent_unavailable".into()) }
     fn mail_status(&self, _owner:&str, _account:&str, _intent_id:&str) -> Result<Value,String> { Err("mutation_intent_unavailable".into()) }
+    fn recover_mail_status(&self, _owner:&str, _account:&str, _subject_sha256:&str) -> Result<Value,String> { Err("mutation_intent_unavailable".into()) }
     fn legacy_mail_status(&self, _owner:&str, _account:&str) -> Result<Value,String> { Err("mutation_intent_unavailable".into()) }
     fn confirmed_attachments(&self, _owner:&str, _account:&str) -> Result<Value,String> { Err("mutation_intent_unavailable".into()) }
 }
@@ -6547,6 +6548,10 @@ impl Router {
         let Some(account) = req.q("account") else { return no_store_json_error(400,"invalid_mail_status"); };
         if account.is_empty() { return no_store_json_error(400,"invalid_mail_status"); }
         if req.q("list") == Some("legacy") { return match handler.legacy_mail_status(&owner,account) { Ok(value) => with_no_store(ApiResponse::ok_json(&value)), Err(_) => no_store_json_error(409,"mail_status_unavailable") }; }
+        if let Some(digest) = req.q("subject_sha256") {
+            if !valid_sha256(digest) || req.q("intent_id").is_some() { return no_store_json_error(400,"invalid_mail_status"); }
+            return match handler.recover_mail_status(&owner,account,digest) { Ok(value) => with_no_store(ApiResponse::ok_json(&value)), Err(_) => no_store_json_error(409,"mail_status_unavailable") };
+        }
         let Some(intent_id) = req.q("intent_id") else { return no_store_json_error(400,"invalid_mail_status"); };
         if account.is_empty() || intent_id.is_empty() || intent_id.len() > 128 { return no_store_json_error(400,"invalid_mail_status"); }
         match handler.mail_status(&owner,account,intent_id) { Ok(value) => with_no_store(ApiResponse::ok_json(&value)), Err(_) => no_store_json_error(409,"mail_status_unavailable") }

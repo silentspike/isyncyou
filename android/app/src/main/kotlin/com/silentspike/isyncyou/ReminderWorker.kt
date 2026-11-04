@@ -19,7 +19,7 @@ internal object ReminderStatus {
     private const val PREFS = "reminder_status_v1"
     fun record(context: Context, status: String, reason: String = "") {
         require(status in setOf("idle", "planning", "ready", "unavailable", "unsupported_alarm_coverage"))
-        require(reason in setOf("", "reminder_window", "reminder_changed", "reminder_config", "reminder_client", "reminder_discovery", "reminder_sync", "reminder_cache", "reminder_events_report", "reminder_tasks_report", "reminder_read", "reminder_plan"))
+        require(reason in setOf("", "reminder_window", "reminder_changed", "reminder_config", "reminder_client", "reminder_discovery", "reminder_sync", "reminder_cache", "reminder_events_report", "reminder_tasks_report", "reminder_read", "reminder_access_check", "reminder_access_denied", "reminder_resource_get", "reminder_plan"))
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putString("status", status).putString("reason", reason).putLong("at", System.currentTimeMillis()).apply()
     }

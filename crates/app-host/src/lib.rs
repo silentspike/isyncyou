@@ -17302,6 +17302,28 @@ where I:IntoIterator<Item=(String,Result<Option<isyncyou_engine::self_hosted_mai
     feature = "agent-subscription-experimental"
 ))]
 impl isyncyou_webui::MutationIntentHandler for DaemonMutationIntents {
+    fn recover_mail_status(&self, _owner:&str, account:&str, subject_sha256:&str) -> Result<serde_json::Value,String> {
+        self.mail.with_locked_runtime_config(|cfg| {
+            let origin = match cfg.provider_accounts.get(account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) if cfg.accounts.iter().any(|a| a.id == account) => origin, _ => return Err("provider_unavailable".into()) };
+            isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| {
+                let subject = subject.ok_or("provider_login_required")?;
+                let (ids,opaque) = self.store.find_bound_mail_intent_by_subject_digest(account,origin,subject,subject_sha256)?;
+                if ids.is_empty() { return Ok(serde_json::json!({"state":"unknown"})); }
+                if ids.len()!=1 || opaque { return Ok(serde_json::json!({"state":"ambiguous"})); }
+                let id=&ids[0];
+                let state=self.store.bound_mail_intent_state(id,account,origin,subject)?.ok_or("mutation_intent_not_found")?;
+                let (state,native_id) = if state=="active" { ("staged",None) } else if matches!(state.as_str(),"cancelled"|"expired") { ("not_dispatched",None) } else {
+                    let store=isyncyou_engine::provider_store::open_readonly(cfg,account)?;
+                    match store.provider_mail_draft_result(account,origin,id).map_err(|_| "mutation_intent_unavailable")? {
+                        Some((state,Some(id))) if state=="confirmed" && !id.is_empty() => ("completed",Some(id)),
+                        Some((state,_)) if state=="rejected" => ("rejected",None),
+                        _ => ("unknown",None),
+                    }
+                };
+                Ok(serde_json::json!({"state":state,"intent_id":id,"native_id":native_id}))
+            })
+        })
+    }
     fn legacy_mail_status(&self, _owner:&str, account:&str) -> Result<serde_json::Value,String> {
         self.mail.with_locked_runtime_config(|cfg| {
             if !cfg.provider_accounts.contains_key(account) || !cfg.accounts.iter().any(|a| a.id == account) { return Err("provider_unavailable".into()); }

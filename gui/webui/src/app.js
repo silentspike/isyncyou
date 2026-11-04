@@ -813,6 +813,23 @@ function openProviderMailIntentStatus(account) {
   if (!rows.length) list.append(el("p",{text:"No tracked mail operations for this account."}));
   const legacy=el("p",{class:"dim",text:"Checking older unbound operations…"});
   list.append(legacy);
+  const recoverySubject=el("input",{class:"input", "aria-label":"Exact draft subject", placeholder:"Exact draft subject"});
+  const recoveryStatus=el("p",{class:"dim",role:"status",text:""});
+  const recover=el("button",{class:"btn sm",type:"button",onclick:async()=>{
+    if (App.account!==account || !recoverySubject.value) return;
+    recover.disabled=true;
+    try {
+      const digest=await sha256Hex(new TextEncoder().encode(recoverySubject.value));
+      const result=await request("GET","/api/v1/mutation-intent/mail-status?"+qs({account,subject_sha256:digest}),{capToken:CAP.mutationIntent,timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS});
+      if (App.account!==account) throw new Error("account_changed");
+      if (result?.state === "ambiguous") recoveryStatus.textContent="More than one bound draft matches. Status cannot be attributed safely.";
+      else if (!result?.intent_id) recoveryStatus.textContent="No uniquely bound operation was found. Its outcome remains unknown.";
+      else if (!["staged","unknown","completed","not_dispatched","rejected"].includes(result.state)) throw new Error("invalid_status");
+      else recoveryStatus.textContent=`Operation ${result.intent_id}: ${result.state === "unknown" ? "outcome unknown; do not submit again" : result.state}.` + (result.state === "completed" && typeof result.native_id === "string" ? ` Native ID: ${result.native_id}` : "");
+    } catch (_) { recoveryStatus.textContent="Status is unavailable; no operation was repeated."; }
+    finally { recover.disabled=false; }
+  }},"Find lost draft status");
+  list.append(el("p",{class:"dim",text:"Find a lost draft operation by its exact subject. Only records bound to this account and current provider identity are checked."}),recoverySubject,recover,recoveryStatus);
   request("GET","/api/v1/mutation-intent/mail-status?"+qs({account,list:"legacy"}),{capToken:CAP.mutationIntent,timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS}).then(result=>{
     if (App.account!==account) return;
     if (result?.identity_binding!=="unavailable" || result?.terminal_coverage!=="unavailable" || !Number.isSafeInteger(result.staged) || result.staged<0 || !Number.isSafeInteger(result.unknown) || result.unknown<0) throw new Error("Invalid legacy status");
@@ -3965,7 +3982,7 @@ async function renderProviderCalendarView(view, service) {
     expand.disabled = true; clear(expanded); expanded.append(el("p", { class:"dim", text:"Loading live occurrences…" }));
     try {
       const result = await api("/api/v1/calendar/expanded?" + qs({ account, collection, year:match[1], month:match[2], ...(service === "todo" ? {tasks:"1"} : {}) }));
-      if (App.account !== account || select.value !== collection || !view.isConnected) return;
+      if (App.account !== account || select.value !== collection || month.value !== match[0] || !view.isConnected) return;
       clear(expanded);
       for (const item of result.items || []) for (const component of (item.view && item.view.components || [])) {
         const props = component.properties || {}, rid = props["RECURRENCE-ID"];
@@ -4079,8 +4096,14 @@ async function renderProviderCalendarView(view, service) {
     } catch (_) { status.textContent = "Cached calendar resources are unavailable."; }
     finally { more.disabled = false; }
   };
-  select.addEventListener("change", () => { cursor = null; void load(true); });
+  select.addEventListener("change", () => { cursor = null; clear(expanded); void load(true); });
+  month.addEventListener("change", () => clear(expanded));
   more.addEventListener("click", () => { if (cursor) void load(false); });
+  // A sync event must refresh cached rows without rebuilding the view: the
+  // selected collection, month and server-expanded occurrences are user state.
+  App.liveUpdate = () => {
+    if (view.isConnected && App.account === account && select.value && !more.disabled) void load(true);
+  };
   view.append(el("div", { class:"con-page" }, el("h2", { text:service === "todo" ? "Tasks" : "Calendar" }), select, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCreate(account, select.value, service === "todo" ? "task" : "event") }, service === "todo" ? "New task" : "New event") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCollectionAccess(account, "calendar", select.value) }, "Manage collection access") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderRecovery(account,"Recovered") }, "Recover…") : null, status, note, list, more, month, expand, service === "calendar" ? freebusy : null, expanded));
   try {
     const result = await api("/api/v1/items?" + qs({ account, service }));
