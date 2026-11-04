@@ -823,9 +823,14 @@ fn sync_provider_dav(cfg: &Config, account: &str) -> Result<(), ()> {
 /// backend is reconcile-only (or where no watcher could start) are left to the
 /// timer. The periodic reconcile stays authoritative, so a missed/dropped event is
 /// harmless; this only shortens the latency between a local edit and its sync.
+fn local_watch_eligible(cfg: &Config, account: &isyncyou_core::AccountConfig) -> bool {
+    !account.sync_root.as_os_str().is_empty() && !cfg.provider_accounts.contains_key(&account.id)
+}
+
 fn watch_loop(cfg: Config, sched: Arc<Scheduler>) {
     use isyncyou_change_source::ChangeSource as _;
     for acc in &cfg.accounts {
+        if !local_watch_eligible(&cfg,acc) { continue; }
         let root = acc.sync_root.clone();
         let account = acc.id.clone();
         let change_source = cfg.sync.clone();
@@ -1350,6 +1355,17 @@ impl isyncyou_dbus_status::StatusProvider for DaemonStatusProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_watcher_ignores_self_hosted_and_empty_roots() {
+        let mut cfg = Config::default();
+        let mut account = isyncyou_core::AccountConfig {id:"account".into(),username:"fixture".into(),sync_root:PathBuf::new(),archive_root:PathBuf::from("/archive"),cache_root:PathBuf::new(),mount_point:None};
+        assert!(!local_watch_eligible(&cfg,&account));
+        account.sync_root = PathBuf::from("/sync");
+        assert!(local_watch_eligible(&cfg,&account));
+        cfg.provider_accounts.insert(account.id.clone(),isyncyou_core::config::ProviderConfig::SelfHosted {origin:"https://example.test".into(),client_id:"client".into()});
+        assert!(!local_watch_eligible(&cfg,&account));
+    }
 
     #[test]
     fn provider_watch_identity_tracks_native_config_and_skips_microsoft() {
