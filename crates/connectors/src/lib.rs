@@ -19,6 +19,8 @@ pub mod dav;
 pub mod export;
 #[cfg(feature = "http")]
 pub mod jmap;
+#[cfg(feature = "http")]
+pub mod request_budget;
 pub mod mail;
 pub mod mime;
 pub mod onedrive;

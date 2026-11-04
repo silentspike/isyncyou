@@ -12,6 +12,7 @@ use quick_xml::events::Event;
 use quick_xml::name::ResolveResult;
 use quick_xml::reader::NsReader;
 use reqwest::blocking::Client;
+use crate::request_budget::{BudgetedSend, BudgetResponse};
 use reqwest::header::{CONTENT_TYPE, ETAG, IF_MATCH, IF_NONE_MATCH};
 use std::collections::HashSet;
 use std::io::Read;
@@ -26,6 +27,16 @@ pub enum DavError {
     InvalidResponse,
     Transport(String),
     Store(String),
+}
+
+/// Disk-backed generation operations. Implementations must not retain a writer
+/// across calls: network requests occur between these operations.
+pub trait DetachedSyncStage {
+    fn reset(&mut self, full: bool) -> Result<(), DavError>;
+    fn existing(&mut self, id: &str) -> Result<Option<ProviderObject>, DavError>;
+    fn put(&mut self, object: &ProviderObject, index: &ProviderDavIndex, alarm: &ProviderAlarmIndex) -> Result<(), DavError>;
+    fn remove(&mut self, id: &str) -> Result<(), DavError>;
+    fn finish(&mut self, cursor: &str) -> Result<(), DavError>;
 }
 
 impl std::fmt::Display for DavError {
@@ -126,7 +137,7 @@ impl Drop for Staging<'_> {
     }
 }
 
-fn bounded_body(response: reqwest::blocking::Response) -> Result<Vec<u8>, DavError> {
+fn bounded_body(response: BudgetResponse) -> Result<Vec<u8>, DavError> {
     const MAX: u64 = 16 * 1024 * 1024;
     let mut bytes = Vec::new();
     response.take(MAX + 1).read_to_end(&mut bytes).map_err(|_| DavError::Transport("DAV response failed".into()))?;
@@ -433,7 +444,7 @@ impl DavClient {
         let response = loop {
             if redirects.len() >= 4 || !redirects.insert(url.clone()) { return Err(DavError::InvalidResponse); }
             let response = self.http.request(reqwest::Method::from_bytes(b"PROPFIND").map_err(|_| DavError::InvalidResponse)?, url.clone())
-                .bearer_auth(&self.token).header("Depth", depth).header(CONTENT_TYPE, "application/xml; charset=utf-8").body(body.to_owned()).send()
+                .bearer_auth(&self.token).header("Depth", depth).header(CONTENT_TYPE, "application/xml; charset=utf-8").body(body.to_owned()).budgeted_send(&self.origin)
                 .map_err(|_| DavError::Transport("DAV discovery failed".into()))?;
             if matches!(response.status().as_u16(), 301 | 302 | 307 | 308) {
                 if self.origin.scheme() != "https" { return Err(DavError::Http(response.status().as_u16())); }
@@ -505,7 +516,7 @@ impl DavClient {
         } else { return Err(DavError::InvalidResponse); };
         let method = if home.service == "calendar" { b"MKCALENDAR".as_slice() } else { b"MKCOL".as_slice() };
         let response = self.http.request(reqwest::Method::from_bytes(method).map_err(|_| DavError::InvalidResponse)?,target)
-            .bearer_auth(&self.token).header(IF_NONE_MATCH,"*").header(CONTENT_TYPE,"application/xml; charset=utf-8").header("Prefer","return=minimal").body(body).send()
+            .bearer_auth(&self.token).header(IF_NONE_MATCH,"*").header(CONTENT_TYPE,"application/xml; charset=utf-8").header("Prefer","return=minimal").body(body).budgeted_send(&self.origin)
             .map_err(|_| DavError::Transport("DAV collection creation outcome unknown".into()))?;
         if response.status().as_u16() != 201 { return Err(DavError::Http(response.status().as_u16())); }
         Ok(())
@@ -541,7 +552,27 @@ impl DavClient {
             bind |= privilege.name == "all" || privilege.name == "write" || privilege.name == "bind";
         }
         if !read || !bind { return Err(DavError::InvalidResponse); }
+        let scope = ProviderScope { account_id:String::new(), origin:self.origin.to_string(), service:home.service.clone(), collection:target.to_string() };
+        self.require_private_acl(&scope, &home.principal)?;
         Ok(true)
+    }
+
+    /// Refuse a recovery destination unless every visible ACL entry is an
+    /// explicit grant to the verified owner. Unknown or inherited grants fail
+    /// closed; an empty ACL is valid for servers with implicit owner rights.
+    fn require_private_acl(&self, scope: &ProviderScope, owner: &Url) -> Result<(), DavError> {
+        let entries = self.acl(scope)?;
+        if entries.iter().any(|ace| ace.inherited || !ace.granted || ace.principal != owner.as_str()) {
+            return Err(DavError::InvalidResponse);
+        }
+        Ok(())
+    }
+
+    /// Check the live ACL using the authenticated principal derived from the
+    /// provider's personal home. Call immediately before recovery import.
+    pub fn require_private_recovery_collection(&self, entry: &str, scope: &ProviderScope) -> Result<(), DavError> {
+        let home = self.personal_home(entry, &scope.service)?;
+        self.require_private_acl(scope, &home.principal)
     }
 
     /// Discover principal, home sets, and collections with bounded same-origin
@@ -669,7 +700,7 @@ impl DavClient {
     /// Missing or inaccessible resources remain HTTP errors, not deletions.
     pub fn read_resource(&self, scope: &ProviderScope, href: &str) -> Result<ProviderObject, DavError> {
         let url = self.resource(&self.collection(scope)?, href)?;
-        let response = self.http.get(url.clone()).bearer_auth(&self.token).send().map_err(|_| DavError::Transport("DAV read failed".into()))?;
+        let response = self.http.get(url.clone()).bearer_auth(&self.token).budgeted_send(&self.origin).map_err(|_| DavError::Transport("DAV read failed".into()))?;
         if response.status().as_u16() != 200 { return Err(DavError::Http(response.status().as_u16())); }
         let etag = response.headers().get(ETAG).and_then(|v| v.to_str().ok()).map(str::to_owned).ok_or(DavError::InvalidResponse)?;
         Ok(ProviderObject { remote_id: url.to_string(), etag: Some(etag), raw: bounded_body(response)? })
@@ -700,11 +731,14 @@ impl DavClient {
         let body = r#"<d:propfind xmlns:d="DAV:"><d:prop><d:acl/></d:prop></d:propfind>"#;
         let (actual, root) = self.propfind(target.clone(), "0", body)?;
         if actual != target { return Err(DavError::InvalidUrl); }
-        let response = root.children.iter().find(|n| n.namespace == D && n.name == "response" && n.child(D,"href").and_then(|h| self.checked_from(&target,h.text.trim()).ok()).as_ref() == Some(&target)).ok_or(DavError::InvalidResponse)?;
-        let acl = response.children.iter().filter(|n| n.namespace == D && n.name == "propstat").find_map(|n| {
+        let responses: Vec<_> = root.children.iter().filter(|n| n.namespace == D && n.name == "response").collect();
+        if responses.len() != 1 || responses[0].child(D,"href").and_then(|h| self.checked_from(&target,h.text.trim()).ok()).as_ref() != Some(&target) { return Err(DavError::InvalidResponse); }
+        let mut acls = responses[0].children.iter().filter(|n| n.namespace == D && n.name == "propstat").filter_map(|n| {
             if status(n.child(D,"status")?.text.trim()) != Some(200) { return None; }
             n.child(D,"prop")?.child(D,"acl")
-        }).ok_or(DavError::InvalidResponse)?;
+        });
+        let acl = acls.next().ok_or(DavError::InvalidResponse)?;
+        if acls.next().is_some() { return Err(DavError::InvalidResponse); }
         let mut result = Vec::new();
         fn representable(node: &XmlNode) -> bool { !node.has_attributes && node.children.iter().all(representable) }
         if !representable(acl) { return Err(DavError::InvalidResponse); }
@@ -749,10 +783,11 @@ impl DavClient {
         if !self.permits(scope, None, "write-acl")? || !self.permits(scope, None, "read-acl")? { return Err(DavError::Http(403)); }
         let lock_body = r#"<d:lockinfo xmlns:d="DAV:"><d:lockscope><d:exclusive/></d:lockscope><d:locktype><d:write/></d:locktype></d:lockinfo>"#;
         let response = self.http.request(reqwest::Method::from_bytes(b"LOCK").map_err(|_| DavError::InvalidResponse)?, target.clone()).bearer_auth(&self.token)
-            .header("Depth", "0").header("Timeout", "Second-60").header(CONTENT_TYPE, "application/xml; charset=utf-8").body(lock_body).send()
+            .header("Depth", "0").header("Timeout", "Second-60").header(CONTENT_TYPE, "application/xml; charset=utf-8").body(lock_body).budgeted_send(&self.origin)
             .map_err(|_| DavError::Transport("DAV lock outcome unknown".into()))?;
         if !response.status().is_success() { return Err(DavError::Http(response.status().as_u16())); }
         let token = response.headers().get("Lock-Token").and_then(|v| v.to_str().ok()).filter(|v| valid_lock_token(v)).ok_or(DavError::InvalidResponse)?.to_owned();
+        drop(response);
         let result = (|| {
             let actual = self.acl(scope)?;
             if actual != expected { return Err(DavError::Conflict); }
@@ -783,13 +818,13 @@ impl DavClient {
             if !inserted { if let Some(privileges) = replacement { xml.push_str(&format!("<d:ace><d:principal><d:href>{}</d:href></d:principal><d:grant>{privileges}</d:grant></d:ace>", escape_xml(principal_url.as_str()))); } }
             xml.push_str("</d:acl>");
             let response = self.http.request(reqwest::Method::from_bytes(b"ACL").map_err(|_| DavError::InvalidResponse)?, target.clone()).bearer_auth(&self.token)
-                .header("If", format!("({token})")).header("Cache-Control", "no-cache").header(CONTENT_TYPE, "application/xml; charset=utf-8").body(xml).send()
+                .header("If", format!("({token})")).header("Cache-Control", "no-cache").header(CONTENT_TYPE, "application/xml; charset=utf-8").body(xml).budgeted_send(&self.origin)
                 .map_err(|_| DavError::Transport("DAV ACL outcome unknown".into()))?;
             if matches!(response.status().as_u16(), 409 | 412) { return Err(DavError::Conflict); }
             if !response.status().is_success() { return Err(DavError::Http(response.status().as_u16())); }
             Ok(())
         })();
-        let _ = self.http.request(reqwest::Method::from_bytes(b"UNLOCK").map_err(|_| DavError::InvalidResponse)?, target).bearer_auth(&self.token).header("Lock-Token", token).send();
+        let _ = self.http.request(reqwest::Method::from_bytes(b"UNLOCK").map_err(|_| DavError::InvalidResponse)?, target).bearer_auth(&self.token).header("Lock-Token", token).budgeted_send(&self.origin);
         result
     }
 
@@ -801,7 +836,7 @@ impl DavClient {
         let collection = self.collection(scope)?;
         let body = format!("<c:free-busy-query xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><c:time-range start=\"{start}\" end=\"{end}\"/></c:free-busy-query>");
         let response = self.http.request(reqwest::Method::from_bytes(b"REPORT").map_err(|_| DavError::InvalidResponse)?, collection).bearer_auth(&self.token)
-            .header("Depth", "1").header(CONTENT_TYPE, "application/xml; charset=utf-8").body(body).send()
+            .header("Depth", "1").header(CONTENT_TYPE, "application/xml; charset=utf-8").body(body).budgeted_send(&self.origin)
             .map_err(|_| DavError::Transport("DAV availability request failed".into()))?;
         if response.status().as_u16() != 200 { return Err(DavError::Http(response.status().as_u16())); }
         bounded_body(response)
@@ -826,7 +861,7 @@ impl DavClient {
         let collection = self.collection(scope)?;
         let body = format!("<c:calendar-query xmlns:c=\"{C}\" xmlns:d=\"DAV:\"><d:prop><d:getetag/><c:calendar-data><c:expand start=\"{start}\" end=\"{end}\"/></c:calendar-data></d:prop><c:filter><c:comp-filter name=\"VCALENDAR\"><c:comp-filter name=\"{kind}\"><c:time-range start=\"{start}\" end=\"{end}\"/></c:comp-filter></c:comp-filter></c:filter></c:calendar-query>");
         let response = self.http.request(reqwest::Method::from_bytes(b"REPORT").map_err(|_| DavError::InvalidResponse)?, collection.clone()).bearer_auth(&self.token)
-            .header("Depth", "1").header(CONTENT_TYPE, "application/xml; charset=utf-8").body(body).send()
+            .header("Depth", "1").header(CONTENT_TYPE, "application/xml; charset=utf-8").body(body).budgeted_send(&self.origin)
             .map_err(|_| DavError::Transport("DAV calendar query failed".into()))?;
         if response.status().as_u16() != 207 { return Err(DavError::Http(response.status().as_u16())); }
         let root = parse_tree(&bounded_body(response)?)?;
@@ -846,6 +881,64 @@ impl DavClient {
         Ok(out)
     }
 
+    /// Stream a complete logical generation to a disk-backed stage. Individual
+    /// responses remain bounded; collection size does not determine RAM use.
+    pub fn sync_detached_staged(&self, scope: &ProviderScope, expected_cursor: Option<String>, expected_accessible: Option<bool>, force_full: bool, stage: &mut dyn DetachedSyncStage) -> Result<usize, DavError> {
+        let collection = self.collection(scope)?;
+        let mut full = force_full || expected_accessible != Some(true) || expected_cursor.as_deref().is_none_or(str::is_empty);
+        let mut cursor = if full { String::new() } else { expected_cursor.unwrap_or_default() };
+        stage.reset(full)?;
+        let mut seen_tokens = HashSet::new();
+        let mut count = 0usize;
+        loop {
+            if !seen_tokens.insert(cursor.clone()) { return Err(DavError::InvalidResponse); }
+            let body = format!("<?xml version=\"1.0\"?><d:sync-collection xmlns:d=\"DAV:\"><d:sync-token>{}</d:sync-token><d:sync-level>1</d:sync-level><d:prop><d:getetag/></d:prop></d:sync-collection>", escape_xml(&cursor));
+            let response = self.http.request(reqwest::Method::from_bytes(b"REPORT").map_err(|_| DavError::InvalidResponse)?, collection.clone()).bearer_auth(&self.token).header("Depth", "0").header(CONTENT_TYPE, "application/xml; charset=utf-8").body(body).budgeted_send(&self.origin).map_err(|_| DavError::Transport("DAV report failed".into()))?;
+            let code = response.status().as_u16();
+            if code == 403 {
+                if invalid_sync_token(&bounded_body(response)?)? {
+                    if full { return Err(DavError::InvalidSyncToken); }
+                    cursor.clear(); full = true; count = 0; seen_tokens.clear(); stage.reset(true)?; continue;
+                }
+                return Err(DavError::Http(code));
+            }
+            if code != 207 { return Err(DavError::Http(code)); }
+            let page = parse_page(&bounded_body(response)?)?;
+            let mut more = false;
+            let mut seen_collection_self = false;
+            for entry in page.entries {
+                let candidate = self.checked_from(&collection, &entry.href)?;
+                if candidate == collection && entry.status == Some(507) { more = true; continue; }
+                if candidate == collection { accept_collection_self(&entry, &mut seen_collection_self)?; continue; }
+                let url = self.resource(&collection, &entry.href)?;
+                let id = url.to_string();
+                match entry.status {
+                    Some(404) => { stage.remove(&id)?; count += 1; }
+                    Some(code) if code != 200 => return Err(DavError::Http(code)),
+                    _ => {
+                        if entry.propstats != 1 || entry.prop_status != Some(200) || entry.etag.as_deref().is_none_or(str::is_empty) { return Err(DavError::InvalidResponse); }
+                        let existing = stage.existing(&id)?;
+                        if existing.as_ref().and_then(|o| o.etag.as_deref()) == entry.etag.as_deref() {
+                            let object = existing.ok_or(DavError::InvalidResponse)?;
+                            stage.put(&object, &dav_index(&object.raw), &alarm_index(&object.raw))?;
+                            continue;
+                        }
+                        let response = self.http.get(url).bearer_auth(&self.token).budgeted_send(&self.origin).map_err(|_| DavError::Transport("DAV object fetch failed".into()))?;
+                        let code = response.status().as_u16();
+                        if code != 200 { return Err(DavError::Http(code)); }
+                        let etag = response.headers().get(ETAG).and_then(|v| v.to_str().ok()).filter(|v| !v.is_empty()).map(str::to_owned).ok_or(DavError::InvalidResponse)?;
+                        let raw = bounded_body(response)?;
+                        let object = ProviderObject { remote_id: id, etag: Some(etag), raw };
+                        stage.put(&object, &dav_index(&object.raw), &alarm_index(&object.raw))?;
+                        count += 1;
+                    }
+                }
+            }
+            cursor = page.token;
+            if !more { stage.finish(&cursor)?; return Ok(count); }
+        }
+    }
+
     /// Advance each completed page transactionally. A denied collection or
     /// resource preserves existing objects and its previous checkpoint.
     pub fn fetch_sync_batch(&self, scope: &ProviderScope, expected_cursor: Option<String>, expected_accessible: Option<bool>, force_full: bool) -> Result<DavNetworkBatch, DavError> {
@@ -859,7 +952,7 @@ impl DavClient {
             if !seen_tokens.insert(cursor.clone()) { return Err(DavError::InvalidResponse); }
             let body = format!("<?xml version=\"1.0\"?><d:sync-collection xmlns:d=\"DAV:\"><d:sync-token>{}</d:sync-token><d:sync-level>1</d:sync-level><d:prop><d:getetag/></d:prop></d:sync-collection>",escape_xml(&cursor));
             let response = self.http.request(reqwest::Method::from_bytes(b"REPORT").map_err(|_| DavError::InvalidResponse)?,collection.clone())
-                .bearer_auth(&self.token).header("Depth","0").header(CONTENT_TYPE,"application/xml; charset=utf-8").body(body).send()
+                .bearer_auth(&self.token).header("Depth","0").header(CONTENT_TYPE,"application/xml; charset=utf-8").body(body).budgeted_send(&self.origin)
                 .map_err(|_| DavError::Transport("DAV report failed".into()))?;
             let code = response.status().as_u16();
             if code == 403 {
@@ -884,7 +977,7 @@ impl DavClient {
                     Some(code) if code != 200 => return Err(DavError::Http(code)),
                     _ => {
                         if entry.propstats != 1 || entry.prop_status != Some(200) || entry.etag.as_deref().is_none_or(str::is_empty) { return Err(DavError::InvalidResponse); }
-                        let response = self.http.get(url).bearer_auth(&self.token).send().map_err(|_| DavError::Transport("DAV object fetch failed".into()))?;
+                        let response = self.http.get(url).bearer_auth(&self.token).budgeted_send(&self.origin).map_err(|_| DavError::Transport("DAV object fetch failed".into()))?;
                         let code = response.status().as_u16();
                         if code != 200 { return Err(DavError::Http(code)); }
                         let etag = response.headers().get(ETAG).and_then(|v| v.to_str().ok()).filter(|v| !v.is_empty()).map(str::to_owned).ok_or(DavError::InvalidResponse)?;
@@ -951,7 +1044,7 @@ impl DavClient {
         loop {
             if !seen_tokens.insert(cursor.clone()) { return Err(DavError::InvalidResponse); }
             let body = format!("<?xml version=\"1.0\"?><d:sync-collection xmlns:d=\"DAV:\"><d:sync-token>{}</d:sync-token><d:sync-level>1</d:sync-level><d:prop><d:getetag/></d:prop></d:sync-collection>", escape_xml(&cursor));
-            let response = self.http.request(reqwest::Method::from_bytes(b"REPORT").map_err(|_| DavError::InvalidResponse)?, collection.clone()).bearer_auth(&self.token).header("Depth", "0").header(CONTENT_TYPE, "application/xml; charset=utf-8").body(body).send().map_err(|_| DavError::Transport("DAV report failed".into()))?;
+            let response = self.http.request(reqwest::Method::from_bytes(b"REPORT").map_err(|_| DavError::InvalidResponse)?, collection.clone()).bearer_auth(&self.token).header("Depth", "0").header(CONTENT_TYPE, "application/xml; charset=utf-8").body(body).budgeted_send(&self.origin).map_err(|_| DavError::Transport("DAV report failed".into()))?;
             let code = response.status().as_u16();
             if code == 403 {
                 let error = bounded_body(response)?;
@@ -996,7 +1089,7 @@ impl DavClient {
                             if let (Some(stage), Some(object)) = (&staging, existing) { stage.put(&object)?; }
                             continue;
                         }
-                        let response = self.http.get(url).bearer_auth(&self.token).send().map_err(|_| DavError::Transport("DAV object fetch failed".into()))?;
+                        let response = self.http.get(url).bearer_auth(&self.token).budgeted_send(&self.origin).map_err(|_| DavError::Transport("DAV object fetch failed".into()))?;
                         let code = response.status().as_u16();
                         if code == 403 { store.set_provider_accessible(scope, false).map_err(|e| DavError::Store(e.to_string()))?; return Err(DavError::Http(code)); }
                         if code != 200 { return Err(DavError::Http(code)); }
@@ -1046,12 +1139,13 @@ impl DavClient {
         let target = self.collection(scope)?;
         let body = r#"<d:lockinfo xmlns:d="DAV:"><d:lockscope><d:exclusive/></d:lockscope><d:locktype><d:write/></d:locktype></d:lockinfo>"#;
         let response = self.http.request(reqwest::Method::from_bytes(b"LOCK").map_err(|_| DavError::InvalidResponse)?,target.clone()).bearer_auth(&self.token)
-            .header("Depth","infinity").header("Timeout","Second-60").header(CONTENT_TYPE,"application/xml; charset=utf-8").body(body).send()
+            .header("Depth","infinity").header("Timeout","Second-60").header(CONTENT_TYPE,"application/xml; charset=utf-8").body(body).budgeted_send(&self.origin)
             .map_err(|_| DavError::Transport("DAV lock outcome unknown".into()))?;
         if !response.status().is_success() { return Err(DavError::Http(response.status().as_u16())); }
         let token = response.headers().get("Lock-Token").and_then(|v| v.to_str().ok()).filter(|v| valid_lock_token(v)).ok_or(DavError::InvalidResponse)?.to_owned();
+        drop(response);
         let result = operation(&token);
-        let _ = self.http.request(reqwest::Method::from_bytes(b"UNLOCK").map_err(|_| DavError::InvalidResponse)?,target).bearer_auth(&self.token).header("Lock-Token",token).send();
+        let _ = self.http.request(reqwest::Method::from_bytes(b"UNLOCK").map_err(|_| DavError::InvalidResponse)?,target).bearer_auth(&self.token).header("Lock-Token",token).budgeted_send(&self.origin);
         result
     }
 
@@ -1060,7 +1154,7 @@ impl DavClient {
         if etag.is_empty() || !valid_lock_token(token) { return Err(DavError::InvalidResponse); }
         let url = self.resource(&self.collection(scope)?,href)?;
         let media = match scope.service.as_str() {"calendar" => "text/calendar; charset=utf-8", "contacts" => "text/vcard; charset=utf-8", _ => return Err(DavError::InvalidUrl)};
-        let response = self.http.put(url).bearer_auth(&self.token).header(CONTENT_TYPE,media).header(IF_MATCH,etag).header("If",format!("({token})")).header("Cache-Control","no-cache").body(raw).send().map_err(|_| DavError::Transport("DAV write outcome unknown".into()))?;
+        let response = self.http.put(url).bearer_auth(&self.token).header(CONTENT_TYPE,media).header(IF_MATCH,etag).header("If",format!("({token})")).header("Cache-Control","no-cache").body(raw).budgeted_send(&self.origin).map_err(|_| DavError::Transport("DAV write outcome unknown".into()))?;
         if matches!(response.status().as_u16(),409 | 412 | 423) { return Err(DavError::Conflict); }
         if !response.status().is_success() { return Err(DavError::Http(response.status().as_u16())); }
         Ok(response.headers().get(ETAG).and_then(|v| v.to_str().ok()).map(str::to_owned))
@@ -1070,7 +1164,7 @@ impl DavClient {
     pub fn delete_under_lock(&self, scope: &ProviderScope, href: &str, etag: &str, token: &str) -> Result<(), DavError> {
         if etag.is_empty() || !valid_lock_token(token) { return Err(DavError::InvalidResponse); }
         let url = self.resource(&self.collection(scope)?,href)?;
-        let response = self.http.delete(url).bearer_auth(&self.token).header(IF_MATCH,etag).header("If",format!("({token})")).header("Cache-Control","no-cache").send().map_err(|_| DavError::Transport("DAV delete outcome unknown".into()))?;
+        let response = self.http.delete(url).bearer_auth(&self.token).header(IF_MATCH,etag).header("If",format!("({token})")).header("Cache-Control","no-cache").budgeted_send(&self.origin).map_err(|_| DavError::Transport("DAV delete outcome unknown".into()))?;
         if matches!(response.status().as_u16(),409 | 412 | 423) { return Err(DavError::Conflict); }
         if !response.status().is_success() { return Err(DavError::Http(response.status().as_u16())); }
         Ok(())
@@ -1088,7 +1182,7 @@ impl DavClient {
             if token.len() > 4096 || Url::parse(token).is_err() || token.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '<' | '>' | '(' | ')')) { return Err(DavError::InvalidResponse); }
             req = req.header("If", format!("<{collection}> (<{token}>)"));
         }
-        let response = req.send().map_err(|_| DavError::Transport("DAV write outcome unknown".into()))?;
+        let response = req.budgeted_send(&self.origin).map_err(|_| DavError::Transport("DAV write outcome unknown".into()))?;
         let code = response.status().as_u16();
         if code == 412 { return Err(DavError::Conflict); }
         if !response.status().is_success() { return Err(DavError::Http(code)); }
@@ -1098,7 +1192,7 @@ impl DavClient {
     pub fn delete(&self, scope: &ProviderScope, href: &str, etag: &str) -> Result<(), DavError> {
         if etag.is_empty() { return Err(DavError::InvalidResponse); }
         let url = self.resource(&self.collection(scope)?, href)?;
-        let response = self.http.delete(url).bearer_auth(&self.token).header(IF_MATCH, etag).send().map_err(|_| DavError::Transport("DAV delete outcome unknown".into()))?;
+        let response = self.http.delete(url).bearer_auth(&self.token).header(IF_MATCH, etag).budgeted_send(&self.origin).map_err(|_| DavError::Transport("DAV delete outcome unknown".into()))?;
         let code = response.status().as_u16();
         if code == 412 { return Err(DavError::Conflict); }
         if !response.status().is_success() { return Err(DavError::Http(code)); }
@@ -1108,6 +1202,78 @@ impl DavClient {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature="encrypted-store")]
+    #[test]
+    fn detached_staging_streams_large_collection_and_reuses_unchanged_bodies() {
+        use super::{DavClient, DavError, DetachedSyncStage};
+        use isyncyou_store::{ProviderAlarmIndex, ProviderDavIndex, ProviderObject, ProviderScope, Store};
+        use std::io::{Read, Write};
+        struct Stage { store: Store, scope: ProviderScope, active: bool, full: bool, puts: usize }
+        impl DetachedSyncStage for Stage {
+            fn reset(&mut self, full: bool) -> Result<(), DavError> {
+                self.store.begin_provider_staging(&self.scope,"fixture").unwrap(); self.active = true; self.full = full; self.puts = 0; Ok(())
+            }
+            fn existing(&mut self, id: &str) -> Result<Option<ProviderObject>, DavError> { Ok(self.store.provider_object(&self.scope,id).unwrap()) }
+            fn put(&mut self, object: &ProviderObject, _: &ProviderDavIndex, _: &ProviderAlarmIndex) -> Result<(), DavError> { self.puts += 1; self.store.replace_provider_staged_object(&self.scope,"fixture",object).unwrap(); Ok(()) }
+            fn remove(&mut self, id: &str) -> Result<(), DavError> { if self.full { self.store.remove_provider_staged_object(&self.scope,"fixture",id).unwrap(); } else { self.store.stage_provider_dav_tombstone(&self.scope,"fixture",id).unwrap(); } Ok(()) }
+            fn finish(&mut self, cursor: &str) -> Result<(), DavError> { if self.full { self.store.finish_provider_staging(&self.scope,"fixture",cursor).unwrap(); } else { self.store.finish_provider_delta_staging(&self.scope,"fixture",cursor).unwrap(); } self.active = false; Ok(()) }
+        }
+        impl Drop for Stage { fn drop(&mut self) { if self.active { self.store.abort_provider_staging(&self.scope,"fixture").unwrap(); } } }
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open_encrypted(temp.path().join("provider.db"),b"test-key").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}/",listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut report = String::from("<d:multistatus xmlns:d=\"DAV:\">");
+            for i in 0..9 { report.push_str(&format!("<d:response><d:href>/book/{i}.vcf</d:href><d:propstat><d:prop><d:getetag>&quot;v1&quot;</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>")); }
+            report.push_str("<d:sync-token>https://example.test/token/1</d:sync-token></d:multistatus>");
+            let bytes = vec![b'x'; 8 * 1024 * 1024];
+            for n in 0..15 {
+                let (mut socket,_) = listener.accept().unwrap(); let mut request = Vec::new(); let mut buf = [0u8;4096];
+                loop { let len = socket.read(&mut buf).unwrap(); assert_ne!(len,0); request.extend_from_slice(&buf[..len]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length = headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok())).unwrap_or(0);
+                        if request.len() >= end+4+length { break; }
+                    }
+                }
+                if n == 0 || n == 10 {
+                    assert!(request.starts_with(b"REPORT "));
+                    write!(socket,"HTTP/1.1 207 Multi-Status\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",report.len(),report).unwrap();
+                } else if n == 11 || n == 13 {
+                    assert!(request.starts_with(b"REPORT "));
+                    let body = "<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/book/0.vcf</d:href><d:propstat><d:prop><d:getetag>&quot;v2&quot;</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/book/1.vcf</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response><d:sync-token>https://example.test/token/2</d:sync-token></d:multistatus>";
+                    let body = if n == 13 { body.replace("&quot;v2&quot;", "&quot;v3&quot;") } else { body.to_owned() };
+                    write!(socket,"HTTP/1.1 207 Multi-Status\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+                } else if n == 12 {
+                    assert!(request.starts_with(b"GET "));
+                    write!(socket,"HTTP/1.1 200 OK\r\nETag: \"v2\"\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnew!").unwrap();
+                } else if n == 14 {
+                    assert!(request.starts_with(b"GET "));
+                    write!(socket,"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                } else {
+                    assert!(request.starts_with(b"GET "));
+                    write!(socket,"HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",bytes.len()).unwrap();
+                    socket.write_all(&bytes).unwrap();
+                }
+            }
+        });
+        let scope = ProviderScope { account_id:"fixture".into(),origin:origin.clone(),service:"contacts".into(),collection:"/book/".into() };
+        let client = DavClient { http:reqwest::blocking::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(30)).build().unwrap(),origin:url::Url::parse(&origin).unwrap(),token:"fixture".into(),trusted_public_origin:None };
+        let mut stage = Stage { store,scope:scope.clone(),active:false,full:false,puts:0 };
+        assert_eq!(client.sync_detached_staged(&scope,None,None,true,&mut stage).unwrap(),9);
+        assert_eq!(stage.store.provider_objects_page(&scope,"",1).unwrap()[0].raw.len(),8 * 1024 * 1024);
+        assert_eq!(client.sync_detached_staged(&scope,Some("https://example.test/token/1".into()),Some(true),true,&mut stage).unwrap(),0);
+        assert_eq!(client.sync_detached_staged(&scope,Some("https://example.test/token/1".into()),Some(true),false,&mut stage).unwrap(),2);
+        assert_eq!(stage.puts,1);
+        assert_eq!(stage.store.provider_object(&scope,&format!("{origin}book/0.vcf")).unwrap().unwrap().raw,b"new!");
+        assert!(stage.store.provider_object(&scope,&format!("{origin}book/1.vcf")).unwrap().is_none());
+        assert_eq!(stage.store.provider_object(&scope,&format!("{origin}book/2.vcf")).unwrap().unwrap().raw.len(),8 * 1024 * 1024);
+        // A later denied fetch leaves both the published cursor and contents intact.
+        assert!(matches!(client.sync_detached_staged(&scope,Some("https://example.test/token/2".into()),Some(true),true,&mut stage),Err(DavError::Http(403))));
+        assert_eq!(stage.store.provider_cursor(&scope).unwrap().as_deref(),Some("https://example.test/token/2"));
+        server.join().unwrap();
+    }
     #[cfg(feature="encrypted-store")]
     #[test]
     fn detached_sync_allows_writer_during_network_and_rejects_stale_cursor() {
@@ -1245,7 +1411,7 @@ mod tests {
         let origin = format!("http://{}/", listener.local_addr().unwrap());
         let operation = "0123456789abcdef0123456789abcdef";
         let server = std::thread::spawn(move || {
-            for n in 0..3 {
+            for n in 0..4 {
                 let (mut socket,_) = listener.accept().unwrap();
                 let mut request = Vec::new(); let mut buffer = [0u8; 4096];
                 loop {
@@ -1256,9 +1422,9 @@ mod tests {
                         if request.len() >= end + 4 + length { break; }
                     }
                 }
-                let marker = if n == 1 { "ffffffffffffffffffffffffffffffff" } else { operation };
-                let body = if n == 2 { String::new() } else { format!(r#"<d:multistatus xmlns:d="DAV:" xmlns:a="urn:ietf:params:xml:ns:carddav" xmlns:i="urn:isyncyou:recovery"><d:response><d:href>/home/wp16-recovered-{operation}/</d:href><d:propstat><d:prop><d:displayname>Recovered</d:displayname><d:resourcetype><d:collection/><a:addressbook/></d:resourcetype><d:owner><d:href>/principal/</d:href></d:owner><d:current-user-privilege-set><d:privilege><d:all/></d:privilege></d:current-user-privilege-set><i:operation>{marker}</i:operation></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#) };
-                let status = if n == 2 { "404 Not Found" } else { "207 Multi-Status" };
+                let marker = if n == 2 { "ffffffffffffffffffffffffffffffff" } else { operation };
+                let body = if n == 3 { String::new() } else if n == 1 { format!(r#"<d:multistatus xmlns:d="DAV:"><d:response><d:href>/home/wp16-recovered-{operation}/</d:href><d:propstat><d:prop><d:acl/></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#) } else { format!(r#"<d:multistatus xmlns:d="DAV:" xmlns:a="urn:ietf:params:xml:ns:carddav" xmlns:i="urn:isyncyou:recovery"><d:response><d:href>/home/wp16-recovered-{operation}/</d:href><d:propstat><d:prop><d:displayname>Recovered</d:displayname><d:resourcetype><d:collection/><a:addressbook/></d:resourcetype><d:owner><d:href>/principal/</d:href></d:owner><d:current-user-privilege-set><d:privilege><d:all/></d:privilege></d:current-user-privilege-set><i:operation>{marker}</i:operation></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#) };
+                let status = if n == 3 { "404 Not Found" } else { "207 Multi-Status" };
                 write!(socket,"HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
             }
         });
@@ -1268,6 +1434,45 @@ mod tests {
         assert!(client.read_recovered_collection(&home,operation).is_err());
         assert!(!client.read_recovered_collection(&home,operation).unwrap());
         assert!(home.recovered_target("../../foreign").is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn recovery_privacy_rejects_foreign_special_inherited_and_missing_acl() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let cases = [
+                "<d:acl/>",
+                "<d:acl><d:ace><d:principal><d:href>/principal/</d:href></d:principal><d:grant><d:privilege><d:all/></d:privilege></d:grant></d:ace></d:acl>",
+                "<d:acl><d:ace><d:principal><d:href>/other/</d:href></d:principal><d:grant><d:privilege><d:read/></d:privilege></d:grant></d:ace></d:acl>",
+                "<d:acl><d:ace><d:principal><d:all/></d:principal><d:grant><d:privilege><d:read/></d:privilege></d:grant></d:ace></d:acl>",
+                "<d:acl><d:ace><d:principal><d:href>/principal/</d:href></d:principal><d:grant><d:privilege><d:read/></d:privilege></d:grant><d:inherited><d:href>/home/</d:href></d:inherited></d:ace></d:acl>",
+                "",
+            ];
+            for acl in cases {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new(); let mut buffer = [0u8;4096];
+                loop {
+                    let n=socket.read(&mut buffer).unwrap(); assert_ne!(n,0); request.extend_from_slice(&buffer[..n]);
+                    if let Some(end)=request.windows(4).position(|w| w==b"\r\n\r\n") {
+                        let headers=String::from_utf8_lossy(&request[..end]);
+                        let len=headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok())).unwrap_or(0);
+                        if request.len()>=end+4+len { break; }
+                    }
+                }
+                let body=format!(r#"<d:multistatus xmlns:d="DAV:"><d:response><d:href>/book/</d:href><d:propstat><d:prop>{acl}</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#);
+                write!(socket,"HTTP/1.1 207 Multi-Status\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        let client=super::DavClient {http:reqwest::blocking::Client::builder().no_proxy().build().unwrap(),origin:url::Url::parse(&origin).unwrap(),token:"fixture".into(),trusted_public_origin:None};
+        let scope=isyncyou_store::ProviderScope {account_id:"fixture".into(),origin:origin.clone(),service:"contacts".into(),collection:format!("{origin}book/")};
+        let owner=url::Url::parse(&format!("{origin}principal/")).unwrap();
+        assert!(client.require_private_acl(&scope,&owner).is_ok());
+        assert!(client.require_private_acl(&scope,&owner).is_ok());
+        for _ in 0..4 { assert!(client.require_private_acl(&scope,&owner).is_err()); }
         server.join().unwrap();
     }
     #[test]

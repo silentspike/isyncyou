@@ -434,10 +434,13 @@ mod tests {
             fn max_get(&self) -> usize { 16 }
         }
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open_in_memory().unwrap();
+        let database = dir.path().join("provider.db");
+        let store = Store::open_encrypted(&database, b"fixture-only-store-key").unwrap();
         let mut budget = Budget { path: dir.path(), remaining: 1024 * 1024, reserve: 0 };
         assert!(sync_source(&Partial, &store, &scope(), &mut budget).is_err());
         assert_eq!(store.provider_cursor(&scope()).unwrap(), None);
+        drop(store);
+        let store = Store::open_encrypted(&database, b"fixture-only-store-key").unwrap();
         store.recover_abandoned_provider_staging().unwrap();
         let captured = store.provider_captures(0, 10).unwrap();
         assert_eq!(captured.len(), 1);

@@ -2,10 +2,10 @@
 
 use reqwest::blocking::{Client, Response};
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex};
+use crate::request_budget::{account_gate, origin_gate, Gate};
 use std::time::Duration;
 use url::Url;
 
@@ -85,79 +85,6 @@ impl LoopbackJmapReader {
     pub fn query_mailboxes(&self, position: usize, limit: usize) -> Result<Value, JmapError> { self.0.query_mailboxes(position, limit) }
     pub fn changes(&self, kind: &str, since: &str, max: usize) -> Result<Value, JmapError> { self.0.changes(kind, since, max) }
     pub fn download(&self, blob_id: &str, name: &str, media_type: &str) -> Result<Vec<u8>, JmapError> { self.0.download(blob_id, name, media_type) }
-}
-
-struct Counts {
-    requests: usize,
-    attachments: usize,
-    request_limit: usize,
-    attachment_limit: usize,
-}
-impl Default for Counts {
-    fn default() -> Self {
-        Self {
-            requests: 0,
-            attachments: 0,
-            request_limit: 4,
-            attachment_limit: 2,
-        }
-    }
-}
-#[derive(Default)]
-struct Gate {
-    counts: Mutex<Counts>,
-    changed: Condvar,
-}
-struct Permit<'a> {
-    gate: &'a Gate,
-    attachment: bool,
-}
-impl Gate {
-    fn acquire(&self, attachment: bool) -> Permit<'_> {
-        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
-        while counts.requests >= counts.request_limit
-            || (attachment && counts.attachments >= counts.attachment_limit)
-        {
-            counts = self.changed.wait(counts).unwrap_or_else(|e| e.into_inner());
-        }
-        counts.requests += 1;
-        if attachment {
-            counts.attachments += 1;
-        }
-        Permit {
-            gate: self,
-            attachment,
-        }
-    }
-}
-impl Drop for Permit<'_> {
-    fn drop(&mut self) {
-        let mut counts = self.gate.counts.lock().unwrap_or_else(|e| e.into_inner());
-        counts.requests -= 1;
-        if self.attachment {
-            counts.attachments -= 1;
-        }
-        self.gate.changed.notify_all();
-    }
-}
-fn account_gate(key: &str, request_limit: usize, attachment_limit: usize) -> Arc<Gate> {
-    static GATES: OnceLock<Mutex<HashMap<String, Weak<Gate>>>> = OnceLock::new();
-    let mut gates = GATES
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    gates.retain(|_, v| v.strong_count() > 0);
-    let gate = gates.get(key).and_then(Weak::upgrade).unwrap_or_else(|| {
-        let gate = Arc::new(Gate::default());
-        gates.insert(key.to_owned(), Arc::downgrade(&gate));
-        gate
-    });
-    {
-        let mut counts = gate.counts.lock().unwrap_or_else(|e| e.into_inner());
-        counts.request_limit = counts.request_limit.min(request_limit);
-        counts.attachment_limit = counts.attachment_limit.min(attachment_limit);
-    }
-    gate
 }
 
 fn body(response: Response, max: u64) -> Result<Vec<u8>, JmapError> {
@@ -368,12 +295,15 @@ impl JmapClient {
         if loopback { builder = builder.no_proxy(); }
         let http = builder.build()
             .map_err(|_| JmapError::Transport)?;
+        let gate = origin_gate(&origin);
+        let discovery_permit = gate.acquire(false);
         let response = fetch_session(&http, &origin, &token, public.as_ref())?;
         if !response.status().is_success() {
             return Err(JmapError::Http(response.status().as_u16()));
         }
         let session: Value = serde_json::from_slice(&body(response, MAX_JSON)?)
             .map_err(|_| JmapError::InvalidResponse)?;
+        drop(discovery_permit);
         let capabilities = session
             .get("capabilities")
             .and_then(Value::as_object)
@@ -448,7 +378,7 @@ impl JmapClient {
         )?;
         endpoint(&origin, &upload.replace("{accountId}", "a"))?;
         let gate = account_gate(
-            &format!("{}|{}", origin.origin().ascii_serialization(), account),
+            &origin.origin().ascii_serialization(),
             request_limit,
             attachment_limit,
         );
@@ -555,6 +485,9 @@ impl JmapClient {
     /// every reconnect. Caller owns lifecycle, backoff and token refresh.
     pub fn watch_mail_events(&self, stop: &AtomicBool, mut on_change: impl FnMut(EventDomains) -> Result<(), ()>) -> Result<(), JmapError> {
         let url = self.event_source.clone().ok_or(JmapError::Unsupported)?;
+        let stream_gate = account_gate(&format!("stream|{}|{}", self.origin.origin().ascii_serialization(), self.primary_account), 4, 2);
+        let _stream_identity_permit = stream_gate.acquire_stream_identity();
+        let _stream_permit = self.gate.acquire_stream().ok_or(JmapError::Unsupported)?;
         let response = self.http.get(url).bearer_auth(&self.token).header(reqwest::header::ACCEPT,"text/event-stream").send().map_err(|_| JmapError::Transport)?;
         if !response.status().is_success() { return Err(JmapError::Http(response.status().as_u16())); }
         let content_type = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");

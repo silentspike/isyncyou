@@ -869,6 +869,14 @@ impl Store {
         Ok(Store { conn, _lock:None, protected:true })
     }
 
+    /// Open a pre-initialized provider database for short WAL transactions.
+    /// The caller coordinates staging recovery separately; this connection does
+    /// not own the archive-wide advisory writer lock.
+    #[cfg(feature = "encrypted-store")]
+    pub fn open_provider_sync_encrypted(path: impl AsRef<Path>, secret: &[u8]) -> Result<Self> {
+        Self::open_readonly_encrypted(path, secret)
+    }
+
     /// In-memory store for tests (no lock, no WAL).
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;

@@ -1,6 +1,7 @@
 //! OAuth authorization-code flow for a configured HTTPS provider.
 //! Refresh credentials are stored only in the desktop keyring.
 
+use isyncyou_connectors::request_budget::{BudgetedSend, BudgetResponse};
 use crate::provider_credential::{ProviderCredential, ProviderCredentialStore};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use fs2::FileExt;
@@ -135,7 +136,7 @@ fn random() -> Result<String, String> {
         .map_err(|_| "OAuth random source unavailable")?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
-fn json_response(response: reqwest::blocking::Response) -> Result<Value, String> {
+fn json_response(response: BudgetResponse) -> Result<Value, String> {
     if !response.status().is_success() {
         return Err("OAuth server rejected request".into());
     }
@@ -200,7 +201,7 @@ fn metadata(origin: &str) -> Result<(String, String, String), String> {
     let metadata = json_response(
         client()?
             .get(url)
-            .send()
+            .budgeted_send_auto()
             .map_err(|_| "OAuth discovery unavailable")?,
     )?;
     let issuer = metadata["issuer"].as_str().ok_or("Missing OAuth issuer")?;
@@ -331,7 +332,7 @@ pub fn finish_self_hosted_auth_detailed_with_store(
             ("redirect_uri", &attempt.redirect_uri),
             ("code_verifier", &attempt.verifier),
         ])
-        .send()
+        .budgeted_send_auto()
         .map_err(|_| "OAuth exchange unavailable")?;
     let token: TokenResponse = serde_json::from_value(json_response(response)?)
         .map_err(|_| "Invalid OAuth token response")?;
@@ -404,7 +405,7 @@ fn revoke_unaccepted_grant(attempt:&AuthAttempt, store:&dyn ProviderCredentialSt
         map.insert(id.clone(),refresh.into());
         save_quarantine(store,&attempt.account_id,&attempt.origin,&map)
     })().is_ok();
-    let revoked = client().and_then(|http| http.post(&attempt.revocation_endpoint).form(&[("token",refresh),("token_type_hint","refresh_token"),("client_id",&attempt.client_id)]).send().map_err(|_| "Grant revocation unconfirmed".to_string())).is_ok_and(|response| response.status().is_success());
+    let revoked = client().and_then(|http| http.post(&attempt.revocation_endpoint).form(&[("token",refresh),("token_type_hint","refresh_token"),("client_id",&attempt.client_id)]).budgeted_send_auto().map_err(|_| "Grant revocation unconfirmed".to_string())).is_ok_and(|response| response.status().is_success());
     if !revoked { return Err(if saved { AuthFinishError::RevocationPending } else { AuthFinishError::RevocationUnrecoverable }); }
     if saved {
         let mut map=load_quarantine(store,&attempt.account_id,&attempt.origin).map_err(|_| AuthFinishError::RevocationPending)?;
@@ -422,7 +423,7 @@ pub fn revoke_quarantined_grant_with_store(cfg:&Config, account_id:&str, recover
     let mut map=load_quarantine(store,account_id,&origin)?;
     let token = map.get(recovery_id).ok_or("Quarantined grant not found")?;
     let (_,_,endpoint) = metadata(&origin)?;
-    let response = client()?.post(endpoint).form(&[("token",token.as_str()),("token_type_hint","refresh_token"),("client_id",client_id.as_str())]).send().map_err(|_| "Grant revocation unconfirmed")?;
+    let response = client()?.post(endpoint).form(&[("token",token.as_str()),("token_type_hint","refresh_token"),("client_id",client_id.as_str())]).budgeted_send_auto().map_err(|_| "Grant revocation unconfirmed")?;
     if !response.status().is_success() { return Err("Grant revocation unconfirmed".into()); }
     map.remove(recovery_id);
     save_quarantine(store,account_id,&origin,&map)
@@ -473,10 +474,10 @@ fn bind_subject(attempt:&AuthAttempt, store:&dyn ProviderCredentialStore, subjec
 
 fn verify_userinfo(origin:&str, token:&str, expected_username:&str) -> Result<String,String> {
     let base = reqwest::Url::parse(origin).map_err(|_| "Invalid provider origin")?;
-    let discovery = json_response(client()?.get(base.join("/.well-known/openid-configuration").map_err(|_| "Invalid provider origin")?).send().map_err(|_| "Identity discovery unavailable")?)?;
+    let discovery = json_response(client()?.get(base.join("/.well-known/openid-configuration").map_err(|_| "Invalid provider origin")?).budgeted_send_auto().map_err(|_| "Identity discovery unavailable")?)?;
     if discovery["issuer"].as_str() != Some(origin) { return Err("OAuth issuer mismatch".into()); }
     let endpoint = same_origin(&base,discovery["userinfo_endpoint"].as_str().ok_or("Identity endpoint unavailable")?)?;
-    let identity = json_response(client()?.get(endpoint).bearer_auth(token).send().map_err(|_| "Identity lookup unavailable")?)?;
+    let identity = json_response(client()?.get(endpoint).bearer_auth(token).budgeted_send_auto().map_err(|_| "Identity lookup unavailable")?)?;
     validate_userinfo(&identity,expected_username)
 }
 
@@ -613,7 +614,7 @@ fn access_token_locked(id: &str, origin: &str, client_id: &str, store: &dyn Prov
             ("client_id", &client_id),
             ("refresh_token", refresh),
         ])
-        .send()
+        .budgeted_send_auto()
         .map_err(|_| "OAuth refresh unavailable")?;
     let token: TokenResponse = serde_json::from_value(json_response(response)?)
         .map_err(|_| "Invalid OAuth refresh response")?;
@@ -694,7 +695,7 @@ pub fn probe_public_admin_boundary(cfg:&Config, id:&str) -> Result<u16,String> {
     let target=root.join("/api/principal").map_err(|_| "invalid provider origin")?;
     with_platform_credential_store(cfg,id,|credentials| with_locked_provider_access_token(cfg,id,credentials,|token| {
         let http=reqwest::blocking::Client::builder().redirect(reqwest::redirect::Policy::none()).timeout(std::time::Duration::from_secs(20)).build().map_err(|_| "probe unavailable")?;
-        let response=http.get(target).bearer_auth(token).send().map_err(|_| "probe unavailable")?;
+        let response=http.get(target).bearer_auth(token).budgeted_send_auto().map_err(|_| "probe unavailable")?;
         Ok(response.status().as_u16())
     }))
 }
@@ -907,7 +908,7 @@ pub fn logout_self_hosted_with_store(
             ("token_type_hint", "refresh_token"),
             ("client_id", &client_id),
         ])
-        .send()
+        .budgeted_send_auto()
         .map_err(|_| "Revocation outcome unknown")?;
     if !response.status().is_success() {
         if response.status().is_client_error() {

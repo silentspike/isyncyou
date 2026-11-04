@@ -33,7 +33,7 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeReminder
         let window_end = request.get("window_end").and_then(serde_json::Value::as_i64).ok_or(())?;
         let cfg = config(Path::new(&base)).map_err(|_| ())?;
         let credentials = AndroidProviderCredentialStore::new(Path::new(&base)).map_err(|_| ())?;
-        let records = match isyncyou_engine::dav_live::plan_account_reminders_with_store(
+        let plan = match isyncyou_engine::dav_live::plan_account_reminders_with_store(
             &cfg, account, "/.well-known/caldav", start, end, window_start, window_end,
             Some(timezone), &credentials,
         ) {
@@ -42,7 +42,7 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeReminder
             Err(error) if ["reminder_window", "reminder_changed", "reminder_config", "reminder_client", "reminder_discovery", "reminder_sync", "reminder_cache", "reminder_events_report", "reminder_tasks_report", "reminder_read", "reminder_access_check", "reminder_access_denied", "reminder_resource_get", "reminder_plan"].contains(&error.as_str()) => return Ok(serde_json::json!({"ok":false,"reason":error})),
             Err(_) => return Err(()),
         };
-        Ok(serde_json::json!({"ok":true,"records":records}))
+        Ok(serde_json::json!({"ok":true,"records":plan.records,"unsupported_count":plan.unsupported_count}))
     })).ok().and_then(Result::ok).unwrap_or_else(|| serde_json::json!({"ok":false}));
     jni_new_string(&mut env, output.to_string())
 }

@@ -2,6 +2,7 @@
 //! The selected MIME and exact intent are persisted in the encrypted provider
 //! ledger before any remote write. No submission method is used.
 
+use isyncyou_connectors::request_budget::{BudgetedSend, BudgetResponse};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use isyncyou_connectors::jmap::{JmapClient, JmapError, MailboxCreateResult};
 use isyncyou_core::{config::ProviderConfig, Config};
@@ -103,7 +104,7 @@ pub fn prove_linux_recovery_device(cfg: &Config, account: &str, signer: &LinuxRe
     let http = reqwest::blocking::Client::builder().redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(30)).build().map_err(|_| "Recovery transport unavailable")?;
     let response = match http.post(origin.join("/recovery/enrollment/challenge").map_err(|_| "Invalid recovery route")?)
-        .bearer_auth(&token).json(&json!({"device":signer.installation,"public_key":signer.public_key})).send() {
+        .bearer_auth(&token).json(&json!({"device":signer.installation,"public_key":signer.public_key})).budgeted_send_auto() {
         Ok(value) => value, Err(_) => return Ok(LinuxRegistrationOutcome::Unknown),
     };
     let response: Value = match RecoveryBroker::bounded(response,16384).and_then(|b| serde_json::from_slice(&b).map_err(|_| "Invalid device challenge".into())) {
@@ -122,7 +123,7 @@ pub fn prove_linux_recovery_device(cfg: &Config, account: &str, signer: &LinuxRe
         return Ok(LinuxRegistrationOutcome::Unknown);
     }
     let response = match http.post(origin.join("/recovery/enrollment/prove").map_err(|_| "Invalid recovery route")?)
-        .bearer_auth(&token).json(&json!({"challenge_id":id,"signature":signer.sign(&bytes)?})).send() {
+        .bearer_auth(&token).json(&json!({"challenge_id":id,"signature":signer.sign(&bytes)?})).budgeted_send_auto() {
         Ok(value) => value, Err(_) => return Ok(LinuxRegistrationOutcome::Unknown),
     };
     let result: Value = match RecoveryBroker::bounded(response,16384).and_then(|b| serde_json::from_slice(&b).map_err(|_| "Invalid device proof response".into())) {
@@ -335,7 +336,7 @@ impl RecoveryBroker {
         Ok(Self { http, origin: parsed, token:token.into(), native_account: native.account_id().to_owned() })
     }
 
-    fn bounded(response: reqwest::blocking::Response, limit: u64) -> Result<Vec<u8>, String> {
+    fn bounded(response: BudgetResponse, limit: u64) -> Result<Vec<u8>, String> {
         if !response.status().is_success() { return Err("Recovery request unavailable".into()); }
         let mut bytes = Vec::new();
         response.take(limit + 1).read_to_end(&mut bytes).map_err(|_| "Recovery response unavailable")?;
@@ -349,7 +350,7 @@ impl RecoveryBroker {
         let device = signer.device_id();
         if device.is_empty() || device.len() > 256 || device.chars().any(char::is_control) { return Err("Invalid recovery device".into()); }
         let challenge = self.http.post(self.origin.join("/recovery/challenge").map_err(|_| "Invalid recovery route")?)
-            .bearer_auth(&self.token).json(&json!({"device":device,"action":action,"effect":effect})).send()
+            .bearer_auth(&self.token).json(&json!({"device":device,"action":action,"effect":effect})).budgeted_send_auto()
             .map_err(|_| "Recovery challenge unavailable")?;
         if !challenge.status().is_success() { return Err(format!("recovery_challenge_http_{}", challenge.status().as_u16())); }
         let response: Value = serde_json::from_slice(&Self::bounded(challenge, 16384)?).map_err(|_| "Invalid recovery challenge")?;
@@ -378,7 +379,7 @@ impl RecoveryBroker {
         let (challenge, signature) = self.signed(signer, "read", &effect)?;
         let url = self.origin.join(&format!("/recovery/catalog/{after}")).map_err(|_| "Invalid recovery route")?;
         let response = self.http.get(url).bearer_auth(&self.token).header("X-Recovery-Device", signer.device_id())
-            .header("X-Recovery-Challenge", challenge).header("X-Recovery-Signature", signature).send().map_err(|_| "Recovery catalog unavailable")?;
+            .header("X-Recovery-Challenge", challenge).header("X-Recovery-Signature", signature).budgeted_send_auto().map_err(|_| "Recovery catalog unavailable")?;
         serde_json::from_slice(&Self::bounded(response, 256 * 1024)?).map_err(|_| "Invalid recovery catalog".into())
     }
 
@@ -397,7 +398,7 @@ impl RecoveryBroker {
     fn create_job(&self, signer: &dyn RecoveryDeviceSigner, effect: &Value, challenge: String, signature: String) -> Result<Value, String> {
         let response = self.http.post(self.origin.join("/recovery/jobs").map_err(|_| "Invalid recovery route")?)
             .bearer_auth(&self.token).header("X-Recovery-Device", signer.device_id())
-            .header("X-Recovery-Challenge", challenge).header("X-Recovery-Signature", signature).json(effect).send()
+            .header("X-Recovery-Challenge", challenge).header("X-Recovery-Signature", signature).json(effect).budgeted_send_auto()
             .map_err(|_| "Recovery job outcome unknown")?;
         let data = Self::bounded(response, 16384).map_err(|_| "Recovery job outcome unknown")?;
         serde_json::from_slice(&data).map_err(|_| "Recovery job outcome unknown".into())
@@ -415,7 +416,7 @@ impl RecoveryBroker {
         let suffix = if result { "/result" } else { "" };
         let url = self.origin.join(&format!("/recovery/jobs/{id}{suffix}")).map_err(|_| "Invalid recovery route")?;
         let response = self.http.get(url).bearer_auth(&self.token).header("X-Recovery-Device", signer.device_id())
-            .header("X-Recovery-Challenge", challenge).header("X-Recovery-Signature", signature).send().map_err(|_| "recovery_read_transport_unavailable")?;
+            .header("X-Recovery-Challenge", challenge).header("X-Recovery-Signature", signature).budgeted_send_auto().map_err(|_| "recovery_read_transport_unavailable")?;
         if !response.status().is_success() { return Err(format!("recovery_read_http_{}", response.status().as_u16())); }
         let expected = if result { "application/octet-stream" } else { "application/json" };
         if response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok())
@@ -610,7 +611,7 @@ pub fn execute_single_capture_with_phase(cfg:&Config, op:&ApprovedSingleCapture,
         let url = match broker.origin.join("/recovery/captures") { Ok(url)=>url, Err(_)=>return Ok(SingleCaptureOutcome::Unknown) };
         let response = match broker.http.post(url)
             .bearer_auth(&broker.token).header("X-Recovery-Device",signer.device_id())
-            .header("X-Recovery-Challenge",challenge).header("X-Recovery-Signature",signature).json(&effect).send() {
+            .header("X-Recovery-Challenge",challenge).header("X-Recovery-Signature",signature).json(&effect).budgeted_send_auto() {
             Ok(response) => response, Err(_) => return Ok(SingleCaptureOutcome::Unknown),
         };
         let data = match RecoveryBroker::bounded(response,16384) { Ok(data)=>data, Err(_)=>return Ok(SingleCaptureOutcome::Unknown) };
@@ -664,7 +665,7 @@ pub fn read_single_capture_status_with_store(cfg:&Config, account:&str, operatio
         let (challenge,signature)=broker.signed(signer,"read",&json!({"capture_id":id}))?;
         let response=broker.http.get(broker.origin.join(&format!("/recovery/captures/{id}")).map_err(|_| "Invalid capture route")?)
             .bearer_auth(&broker.token).header("X-Recovery-Device",signer.device_id())
-            .header("X-Recovery-Challenge",challenge).header("X-Recovery-Signature",signature).send().map_err(|_| "Capture status unavailable")?;
+            .header("X-Recovery-Challenge",challenge).header("X-Recovery-Signature",signature).budgeted_send_auto().map_err(|_| "Capture status unavailable")?;
         let value:Value=serde_json::from_slice(&RecoveryBroker::bounded(response,16384)?).map_err(|_| "Invalid capture status")?;
         if value.get("id").and_then(Value::as_str)!=Some(id.as_str()) || !value.get("state").and_then(Value::as_str).is_some_and(|x| matches!(x,"queued"|"capturing"|"captured_locally"|"awaiting_pbs"|"protected_off_node"|"expired"|"failed")) { return Err("Invalid capture status".into()); }
         Ok(value)

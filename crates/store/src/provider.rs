@@ -508,7 +508,7 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         let mut after = 0i64;
         loop {
-            let row: Option<(i64,ProviderScope,ProviderObject)> = tx.query_row("SELECT rowid,account_id,origin,service,collection,remote_id,etag,raw FROM provider_stage_objects WHERE rowid>?1 ORDER BY rowid LIMIT 1",[after],|r| Ok((r.get(0)?,ProviderScope {account_id:r.get(1)?,origin:r.get(2)?,service:r.get(3)?,collection:r.get(4)?},ProviderObject {remote_id:r.get(5)?,etag:r.get(6)?,raw:r.get(7)?}))).optional()?;
+            let row: Option<(i64,ProviderScope,ProviderObject)> = tx.query_row("SELECT rowid,account_id,origin,service,collection,remote_id,etag,raw FROM provider_stage_objects WHERE rowid>?1 AND (etag IS NOT NULL OR service NOT IN ('calendar','contacts')) ORDER BY rowid LIMIT 1",[after],|r| Ok((r.get(0)?,ProviderScope {account_id:r.get(1)?,origin:r.get(2)?,service:r.get(3)?,collection:r.get(4)?},ProviderObject {remote_id:r.get(5)?,etag:r.get(6)?,raw:r.get(7)?}))).optional()?;
             let Some((rowid,scope,object)) = row else { break; };
             after = rowid; capture_observation(&tx,&scope,&object)?;
         }
@@ -548,6 +548,15 @@ impl Store {
     /// Publish a fully enumerated generation with scoped diff, capture, events,
     /// and cursor atomically. At most one object's raw bytes are held at once.
     pub fn finish_provider_staging(&self, scope: &ProviderScope, generation: &str, cursor: &str) -> Result<()> {
+        self.finish_provider_staging_inner(scope, generation, cursor, true)
+    }
+
+    /// Apply only staged changes, retaining untouched resources atomically.
+    pub fn finish_provider_delta_staging(&self, scope: &ProviderScope, generation: &str, cursor: &str) -> Result<()> {
+        self.finish_provider_staging_inner(scope, generation, cursor, false)
+    }
+
+    fn finish_provider_staging_inner(&self, scope: &ProviderScope, generation: &str, cursor: &str, full: bool) -> Result<()> {
         if !self.protected_provider_storage() { return Err(StoreError::MissingStoreKey); }
         let tx = self.conn.unchecked_transaction()?;
         let base: Option<(Option<String>,Option<bool>)> = tx.query_row("SELECT base_cursor,base_accessible FROM provider_stage_runs WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5",params![scope.account_id,scope.origin,scope.service,scope.collection,generation],|r| Ok((r.get(0)?,r.get(1)?))).optional()?;
@@ -555,22 +564,26 @@ impl Store {
         let current: Option<(Option<String>,bool)> = tx.query_row("SELECT cursor,accessible FROM provider_collections WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4",params![scope.account_id,scope.origin,scope.service,scope.collection],|r| Ok((r.get(0)?,r.get(1)?))).optional()?;
         if base != (current.as_ref().and_then(|v| v.0.clone()), current.as_ref().map(|v| v.1)) { return Err(StoreError::InvalidProgressiveSearch("provider scope changed during staging".into())); }
         if scope.service == "calendar" {
-            let missing:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_stage_objects p LEFT JOIN provider_stage_dav_index i ON i.account_id=p.account_id AND i.origin=p.origin AND i.service=p.service AND i.collection=p.collection AND i.generation=p.generation AND i.remote_id=p.remote_id WHERE p.account_id=?1 AND p.origin=?2 AND p.service=?3 AND p.collection=?4 AND p.generation=?5 AND i.remote_id IS NULL)",params![scope.account_id,scope.origin,scope.service,scope.collection,generation],|r| r.get(0))?;
+            let missing:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_stage_objects p LEFT JOIN provider_stage_dav_index i ON i.account_id=p.account_id AND i.origin=p.origin AND i.service=p.service AND i.collection=p.collection AND i.generation=p.generation AND i.remote_id=p.remote_id WHERE p.account_id=?1 AND p.origin=?2 AND p.service=?3 AND p.collection=?4 AND p.generation=?5 AND (?6 OR p.etag IS NOT NULL) AND i.remote_id IS NULL)",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,full],|r| r.get(0))?;
             if missing { return Err(StoreError::InvalidProgressiveSearch("staged DAV index incomplete".into())); }
-            let missing_alarm:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_stage_objects p LEFT JOIN provider_stage_alarm_index i ON i.account_id=p.account_id AND i.origin=p.origin AND i.service=p.service AND i.collection=p.collection AND i.generation=p.generation AND i.remote_id=p.remote_id WHERE p.account_id=?1 AND p.origin=?2 AND p.service=?3 AND p.collection=?4 AND p.generation=?5 AND i.remote_id IS NULL)",params![scope.account_id,scope.origin,scope.service,scope.collection,generation],|r| r.get(0))?;
+            let missing_alarm:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_stage_objects p LEFT JOIN provider_stage_alarm_index i ON i.account_id=p.account_id AND i.origin=p.origin AND i.service=p.service AND i.collection=p.collection AND i.generation=p.generation AND i.remote_id=p.remote_id WHERE p.account_id=?1 AND p.origin=?2 AND p.service=?3 AND p.collection=?4 AND p.generation=?5 AND (?6 OR p.etag IS NOT NULL) AND i.remote_id IS NULL)",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,full],|r| r.get(0))?;
             if missing_alarm { return Err(StoreError::InvalidProgressiveSearch("staged alarm index incomplete".into())); }
         }
         let mut after = String::new();
-        loop {
+        if full { loop {
             let id: Option<String> = tx.query_row("SELECT p.remote_id FROM provider_objects p WHERE p.account_id=?1 AND p.origin=?2 AND p.service=?3 AND p.collection=?4 AND p.remote_id>?6 AND NOT EXISTS(SELECT 1 FROM provider_stage_objects s WHERE s.account_id=p.account_id AND s.origin=p.origin AND s.service=p.service AND s.collection=p.collection AND s.generation=?5 AND s.remote_id=p.remote_id) ORDER BY p.remote_id LIMIT 1",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,after],|r| r.get(0)).optional()?;
             let Some(id) = id else { break; };
             after = id.clone(); apply_changes(&tx,scope,&[ProviderChange::Destroyed(id)],cursor)?;
-        }
+        } }
         after.clear();
         loop {
             let object: Option<ProviderObject> = tx.query_row("SELECT remote_id,etag,raw FROM provider_stage_objects WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5 AND remote_id>?6 ORDER BY remote_id LIMIT 1",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,after],|r| Ok(ProviderObject {remote_id:r.get(0)?,etag:r.get(1)?,raw:r.get(2)?})).optional()?;
             let Some(object) = object else { break; };
             after = object.remote_id.clone();
+            if !full && object.etag.is_none() {
+                apply_changes(&tx,scope,&[ProviderChange::Destroyed(object.remote_id)],cursor)?;
+                continue;
+            }
             let index = if scope.service == "calendar" {
                 Some(tx.query_row("SELECT valid,uid,kind,parent_uid FROM provider_stage_dav_index WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5 AND remote_id=?6",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,after],|r| {
                     let valid:bool=r.get(0)?;
@@ -602,7 +615,8 @@ impl Store {
         loop {
             let object: Option<ProviderObject> = tx.query_row("SELECT remote_id,etag,raw FROM provider_stage_objects WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5 AND remote_id>?6 ORDER BY remote_id LIMIT 1",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,after],|r| Ok(ProviderObject {remote_id:r.get(0)?,etag:r.get(1)?,raw:r.get(2)?})).optional()?;
             let Some(object) = object else { break; };
-            after = object.remote_id.clone(); capture_observation(&tx,scope,&object)?;
+            after = object.remote_id.clone();
+            if object.etag.is_some() || !matches!(scope.service.as_str(), "calendar" | "contacts") { capture_observation(&tx,scope,&object)?; }
         }
         tx.execute("DELETE FROM provider_stage_objects WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5",params![scope.account_id,scope.origin,scope.service,scope.collection,generation])?;
         tx.execute("DELETE FROM provider_stage_dav_index WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5",params![scope.account_id,scope.origin,scope.service,scope.collection,generation])?;
@@ -618,6 +632,18 @@ impl Store {
         let active: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_stage_runs WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5)",params![scope.account_id,scope.origin,scope.service,scope.collection,generation],|r| r.get(0))?;
         if !active { return Err(StoreError::InvalidProgressiveSearch("staging generation not found".into())); }
         tx.execute("DELETE FROM provider_stage_objects WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5 AND remote_id=?6",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,id])?;
+        tx.execute("DELETE FROM provider_stage_dav_index WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5 AND remote_id=?6",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,id])?;
+        tx.execute("DELETE FROM provider_stage_alarm_index WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5 AND remote_id=?6",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,id])?;
+        tx.commit()?; Ok(())
+    }
+
+    /// Record a DAV delta deletion without retaining a fake captured version.
+    pub fn stage_provider_dav_tombstone(&self, scope: &ProviderScope, generation: &str, id: &str) -> Result<()> {
+        if !self.protected_provider_storage() || !matches!(scope.service.as_str(), "calendar" | "contacts") || id.is_empty() { return Err(StoreError::InvalidProgressiveSearch("invalid DAV tombstone".into())); }
+        let tx = self.conn.unchecked_transaction()?;
+        let active: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_stage_runs WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5)",params![scope.account_id,scope.origin,scope.service,scope.collection,generation],|r| r.get(0))?;
+        if !active { return Err(StoreError::InvalidProgressiveSearch("staging generation not found".into())); }
+        tx.execute("INSERT INTO provider_stage_objects(account_id,origin,service,collection,generation,remote_id,etag,raw) VALUES (?1,?2,?3,?4,?5,?6,NULL,X'') ON CONFLICT(account_id,origin,service,collection,generation,remote_id) DO UPDATE SET etag=NULL,raw=X''",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,id])?;
         tx.execute("DELETE FROM provider_stage_dav_index WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5 AND remote_id=?6",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,id])?;
         tx.execute("DELETE FROM provider_stage_alarm_index WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5 AND remote_id=?6",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,id])?;
         tx.commit()?; Ok(())
@@ -972,17 +998,19 @@ impl Store {
     }
 
     /// Keyset pagination avoids rescanning or loading an entire collection.
+    /// A single supported object may use up to 16 MiB; pages containing multiple
+    /// objects retain the 8 MiB aggregate budget.
     pub fn provider_objects_page(&self, scope: &ProviderScope, after: &str, limit: usize) -> Result<Vec<ProviderObject>> {
         let mut stmt = self.conn.prepare("SELECT remote_id,etag,raw,length(raw) FROM provider_objects WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND remote_id>?5 ORDER BY remote_id LIMIT ?6")?;
         let mut rows = stmt.query(params![scope.account_id,scope.origin,scope.service,scope.collection,after,limit.min(200) as i64])?;
         let mut output = Vec::new(); let mut bytes = 0usize;
         while let Some(r) = rows.next()? {
             let size = r.get::<_, i64>(3)? as usize;
-            if size > 8 * 1024 * 1024 {
+            if size > 16 * 1024 * 1024 {
                 if output.is_empty() { return Err(StoreError::ProviderObjectTooLarge); }
                 break;
             }
-            if bytes + size > 8 * 1024 * 1024 { break; }
+            if !output.is_empty() && bytes + size > 8 * 1024 * 1024 { break; }
             bytes += size;
             output.push(ProviderObject { remote_id:r.get(0)?, etag:r.get(1)?, raw:r.get(2)? });
         }
@@ -992,6 +1020,17 @@ impl Store {
     pub fn set_provider_accessible(&self, scope: &ProviderScope, accessible: bool) -> Result<()> {
         self.conn.execute("INSERT INTO provider_collections(account_id,origin,service,collection,accessible) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(account_id,origin,service,collection) DO UPDATE SET accessible=excluded.accessible", params![scope.account_id,scope.origin,scope.service,scope.collection,accessible])?;
         Ok(())
+    }
+
+    /// Hide a denied collection only if its observed cursor and visibility are
+    /// still current, in the same transaction as the visibility update.
+    pub fn set_provider_accessible_if_state(&self, scope: &ProviderScope, cursor: Option<&str>, expected: Option<bool>, accessible: bool) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let state: Option<(Option<String>, bool)> = tx.query_row("SELECT cursor,accessible FROM provider_collections WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4",params![scope.account_id,scope.origin,scope.service,scope.collection],|r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+        if state.as_ref().and_then(|v| v.0.as_deref()) != cursor || state.as_ref().map(|v| v.1) != expected { return Ok(false); }
+        tx.execute("INSERT INTO provider_collections(account_id,origin,service,collection,accessible) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(account_id,origin,service,collection) DO UPDATE SET accessible=excluded.accessible",params![scope.account_id,scope.origin,scope.service,scope.collection,accessible])?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Publish or hide the shared message and mailbox scopes as one visibility decision.
@@ -1195,6 +1234,17 @@ fn capture_observation(tx: &rusqlite::Transaction<'_>, scope: &ProviderScope, ob
 #[cfg(test)]
 mod tests {
     #[test]
+    fn denied_dav_access_does_not_override_newer_collection_state() {
+        use super::*;
+        let store = Store::open_in_memory().unwrap();
+        let scope = ProviderScope { account_id:"fixture".into(), origin:"https://example.test/".into(), service:"contacts".into(), collection:"https://example.test/book/".into() };
+        store.apply_provider_page(&scope,&[],"newer").unwrap();
+        assert!(!store.set_provider_accessible_if_state(&scope,Some("older"),Some(true),false).unwrap());
+        assert_eq!(store.provider_accessible(&scope).unwrap(),Some(true));
+        assert!(store.set_provider_accessible_if_state(&scope,Some("newer"),Some(true),false).unwrap());
+        assert_eq!(store.provider_accessible(&scope).unwrap(),Some(false));
+    }
+    #[test]
     fn shared_mail_visibility_is_scoped_and_never_exports_history() {
         let store = super::Store::open_in_memory().unwrap();
         let scope = super::ProviderScope {account_id:"local".into(),origin:"https://example.test".into(),service:"mail-shared".into(),collection:"foreign".into()};
@@ -1259,6 +1309,20 @@ mod tests {
         assert!(super::mail_capture_object(&native, &digest, 64 * 1024 * 1024 + 1).is_err());
     }
     use super::*;
+
+    #[test]
+    fn provider_pagination_keeps_supported_large_object_and_following_row() {
+        let store = Store::open_in_memory().unwrap();
+        let scope = ProviderScope { account_id:"account".into(), origin:"https://example.test".into(), service:"contacts".into(), collection:"https://example.test/book/".into() };
+        let large = ProviderObject { remote_id:"a".into(), etag:None, raw:vec![b'x'; 9 * 1024 * 1024] };
+        let small = ProviderObject { remote_id:"b".into(), etag:None, raw:b"small".to_vec() };
+        store.apply_provider_page(&scope, &[ProviderChange::Upsert(large.clone()), ProviderChange::Upsert(small.clone())], "cursor").unwrap();
+        let first = store.provider_objects_page(&scope, "", 10).unwrap();
+        assert_eq!(first, vec![large]);
+        let second = store.provider_objects_page(&scope, &first[0].remote_id, 10).unwrap();
+        assert_eq!(second, vec![small]);
+        assert!(store.provider_objects_page(&scope, &second[0].remote_id, 10).unwrap().is_empty());
+    }
 
     #[test]
     #[cfg(feature = "encrypted-store")]

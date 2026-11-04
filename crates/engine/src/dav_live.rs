@@ -1,6 +1,6 @@
 //! Authenticated DAV discovery and collection sync for configured accounts.
 
-use isyncyou_connectors::dav::{AclEntry, Collection, DavClient, DavError, ExpandedCalendar};
+use isyncyou_connectors::dav::{AclEntry, Collection, DavClient, DavError, DetachedSyncStage, ExpandedCalendar};
 use isyncyou_core::{config::ProviderConfig, Config};
 use isyncyou_store::{ProviderObject, ProviderScope, Store};
 use crate::provider_credential::ProviderCredentialStore;
@@ -86,6 +86,68 @@ fn collection_sync_lease(cfg: &Config, scope: &ProviderScope) -> Result<std::fs:
     Ok(file)
 }
 
+struct DetachedStage<'a> {
+    store: Store,
+    scope: &'a ProviderScope,
+    generation: Option<String>,
+    cursor: Option<String>,
+    accessible: Option<bool>,
+    full: bool,
+}
+
+impl DetachedStage<'_> {
+    fn abort(&mut self) -> Result<(), DavError> {
+        if let Some(generation) = self.generation.take() {
+            self.store.abort_provider_staging(self.scope, &generation).map_err(|e| DavError::Store(e.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+impl DetachedSyncStage for DetachedStage<'_> {
+    fn reset(&mut self, full: bool) -> Result<(), DavError> {
+        use ring::rand::{SecureRandom, SystemRandom};
+        self.abort()?;
+        let store = &self.store;
+        if store.provider_cursor(self.scope).map_err(|e| DavError::Store(e.to_string()))? != self.cursor || store.provider_accessible(self.scope).map_err(|e| DavError::Store(e.to_string()))? != self.accessible { return Err(DavError::Conflict); }
+        let mut bytes = [0u8; 16];
+        SystemRandom::new().fill(&mut bytes).map_err(|_| DavError::Transport("DAV staging random source unavailable".into()))?;
+        let generation: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        store.begin_provider_staging(self.scope, &generation).map_err(|e| DavError::Store(e.to_string()))?;
+        self.generation = Some(generation);
+        if self.store.provider_cursor(self.scope).map_err(|e| DavError::Store(e.to_string()))? != self.cursor || self.store.provider_accessible(self.scope).map_err(|e| DavError::Store(e.to_string()))? != self.accessible { return Err(DavError::Conflict); }
+        self.full = full;
+        Ok(())
+    }
+    fn existing(&mut self, id: &str) -> Result<Option<ProviderObject>, DavError> {
+        self.store.provider_object(self.scope, id).map_err(|e| DavError::Store(e.to_string()))
+    }
+    fn put(&mut self, object: &ProviderObject, index: &isyncyou_store::ProviderDavIndex, alarm: &isyncyou_store::ProviderAlarmIndex) -> Result<(), DavError> {
+        let store = &self.store;
+        let generation = self.generation.as_deref().ok_or(DavError::Conflict)?;
+        store.replace_provider_staged_object(self.scope, generation, object).map_err(|e| DavError::Store(e.to_string()))?;
+        if self.scope.service == "calendar" {
+            store.stage_provider_dav_index(self.scope, generation, &object.remote_id, index).map_err(|e| DavError::Store(e.to_string()))?;
+            store.stage_provider_alarm_index(self.scope, generation, &object.remote_id, alarm).map_err(|e| DavError::Store(e.to_string()))?;
+        }
+        Ok(())
+    }
+    fn remove(&mut self, id: &str) -> Result<(), DavError> {
+        let generation = self.generation.as_deref().ok_or(DavError::Conflict)?;
+        if self.full { self.store.remove_provider_staged_object(self.scope, generation, id) } else { self.store.stage_provider_dav_tombstone(self.scope, generation, id) }.map_err(|e| DavError::Store(e.to_string()))
+    }
+    fn finish(&mut self, cursor: &str) -> Result<(), DavError> {
+        let generation = self.generation.as_deref().ok_or(DavError::Conflict)?;
+        if self.full { self.store.finish_provider_staging(self.scope, generation, cursor) } else { self.store.finish_provider_delta_staging(self.scope, generation, cursor) }.map_err(|e| DavError::Store(e.to_string()))?;
+        self.generation = None;
+        Ok(())
+    }
+}
+
+impl Drop for DetachedStage<'_> {
+    fn drop(&mut self) { let _ = self.abort(); }
+}
+
 fn sync_detached(cfg: &Config, client: &DavClient, scope: &ProviderScope) -> Result<usize,String> {
     let _lease=collection_sync_lease(cfg,scope)?;
     let snapshot = match crate::provider_store::open_readonly(cfg,&scope.account_id) {
@@ -100,21 +162,21 @@ fn sync_detached(cfg: &Config, client: &DavClient, scope: &ProviderScope) -> Res
     let accessible=snapshot.provider_accessible(scope).map_err(|e| e.to_string())?;
     let full = scope.service == "calendar" && (snapshot.provider_dav_unindexed_count(scope).map_err(|e| e.to_string())? > 0 || snapshot.provider_alarm_unindexed_count(scope).map_err(|e| e.to_string())? > 0);
     drop(snapshot);
-    let batch=match client.fetch_sync_batch(scope,cursor.clone(),accessible,full) {
-        Ok(batch) => batch,
+    let _staging_lease = crate::provider_store::sync_staging_lease(cfg, &scope.account_id)?;
+    let store = crate::provider_store::open_sync(cfg, &scope.account_id)?;
+    let mut stage = DetachedStage { store, scope, generation: None, cursor: cursor.clone(), accessible, full };
+    let count=match client.sync_detached_staged(scope,cursor.clone(),accessible,full,&mut stage) {
+        Ok(count) => count,
         Err(DavError::Http(403)) => {
             // A denial must not overwrite an access/cursor change observed by
             // another writer while this network request was in flight.
             let store=crate::provider_store::open_for_session(cfg,&scope.account_id)?;
-            if store.provider_cursor(scope).map_err(|e| e.to_string())? == cursor && store.provider_accessible(scope).map_err(|e| e.to_string())? == accessible {
-                store.set_provider_accessible(scope,false).map_err(|e| e.to_string())?;
-            }
+            store.set_provider_accessible_if_state(scope,cursor.as_deref(),accessible,false).map_err(|e| e.to_string())?;
             return Err("DAV collection access denied".into());
         },
         Err(error) => return Err(error.to_string()),
     };
     let store=crate::provider_store::open_for_session(cfg,&scope.account_id)?;
-    let count=DavClient::commit_sync_batch(&store,scope,batch).map_err(|e| e.to_string())?;
     store.backfill_provider_dav_search(scope,100).map_err(|e| e.to_string())?;
     Ok(count)
 }
@@ -331,11 +393,33 @@ impl ReminderPlan {
     }
 }
 
+/// A partial plan contains usable records, but does not establish full coverage.
+pub struct ReminderAccountPlan {
+    pub records: Vec<serde_json::Value>,
+    pub unsupported_count: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReminderResourceCoverage { NoAlarms, Standalone, Expanded, Unsupported }
+
+fn reminder_resource_coverage(raw: &[u8]) -> ReminderResourceCoverage {
+    match isyncyou_connectors::dav::edit::resource_has_alarms(raw) {
+        Ok(false) => return ReminderResourceCoverage::NoAlarms,
+        Err(_) => return ReminderResourceCoverage::Unsupported,
+        Ok(true) => {}
+    }
+    match isyncyou_connectors::dav::reminders::is_standalone(raw) {
+        Ok(true) => ReminderResourceCoverage::Standalone,
+        Ok(false) if isyncyou_connectors::dav::reminders::require_bounded_relative_alarms(raw).is_ok() => ReminderResourceCoverage::Expanded,
+        _ => ReminderResourceCoverage::Unsupported,
+    }
+}
+
 /// Enumerate a bounded occurrence window across every currently discovered
-/// calendar. Every collection is synchronized first and any error aborts the
-/// pass. This is occurrence-window coverage, not proof that alarms attached to
-/// occurrences outside that window cannot fire inside the trigger window.
-pub fn plan_account_reminders_with_store(cfg: &Config, account: &str, entry: &str, occurrence_start: &str, occurrence_end: &str, window_start: i64, window_end: i64, floating_tzid: Option<&str>, credentials: &dyn ProviderCredentialStore) -> Result<Vec<serde_json::Value>, String> {
+/// calendar. Synchronization, access and consistency errors abort the pass;
+/// unsupported individual resources are counted without exposing content.
+/// This does not establish coverage outside the occurrence window.
+pub fn plan_account_reminders_with_store(cfg: &Config, account: &str, entry: &str, occurrence_start: &str, occurrence_end: &str, window_start: i64, window_end: i64, floating_tzid: Option<&str>, credentials: &dyn ProviderCredentialStore) -> Result<ReminderAccountPlan, String> {
     if window_end <= window_start || window_end.saturating_sub(window_start) > 31 * 86400 || occurrence_start >= occurrence_end { return Err("reminder_window".into()); }
     let start = isyncyou_connectors::dav::reminders::utc_window_bound(occurrence_start).map_err(|_| "reminder_window")?; let end = isyncyou_connectors::dav::reminders::utc_window_bound(occurrence_end).map_err(|_| "reminder_window")?;
     if start > window_start.saturating_sub(368 * 86400) || end < window_end.saturating_add(368 * 86400) { return Err("reminder_window".into()); }
@@ -343,6 +427,7 @@ pub fn plan_account_reminders_with_store(cfg: &Config, account: &str, entry: &st
     let client = client_with_store(cfg, account, &origin, credentials).map_err(|_| "reminder_client")?;
     let collections = client.discover(entry).map_err(|_| "reminder_discovery")?;
     let mut records = Vec::new();
+    let mut unsupported_count = 0usize;
     let mut objects_seen = 0usize;
     for collection in collections.into_iter().filter(|c| c.calendar) {
         let scope = ProviderScope { account_id:account.into(), origin:origin.clone(), service:"calendar".into(), collection:collection.url };
@@ -350,6 +435,7 @@ pub fn plan_account_reminders_with_store(cfg: &Config, account: &str, entry: &st
         let store = crate::provider_store::open_readonly(cfg,account).map_err(|_| "reminder_cache")?;
         let initial_cursor = store.provider_cursor(&scope).map_err(|_| "reminder_cache")?;
         let initial_access = store.provider_accessible(&scope).map_err(|_| "reminder_cache")?;
+        if initial_access != Some(true) { return Err("reminder_access_denied".into()); }
         let mut expanded = client.expanded_events(&scope, occurrence_start, occurrence_end).map_err(|_| "reminder_events_report")?;
         expanded.extend(client.expanded_tasks(&scope, occurrence_start, occurrence_end).map_err(|_| "reminder_tasks_report")?);
         let mut by_href = std::collections::HashMap::new();
@@ -365,16 +451,23 @@ pub fn plan_account_reminders_with_store(cfg: &Config, account: &str, entry: &st
                 if objects_seen > 10000 { return Err("Reminder account resource limit exceeded".into()); }
                 let expansion = by_href.remove(&object.remote_id);
                 if expansion.as_ref().is_some_and(|v| object.etag.as_deref() != Some(v.etag.as_str())) { return Err("reminder_changed".into()); }
-                if !isyncyou_connectors::dav::edit::resource_has_alarms(&object.raw)? { continue; }
-                let standalone = isyncyou_connectors::dav::reminders::is_standalone(&object.raw).map_err(|_| "unsupported_alarm_coverage")?;
-                if !standalone { isyncyou_connectors::dav::reminders::require_bounded_relative_alarms(&object.raw).map_err(|_| "unsupported_alarm_coverage")?; }
+                let standalone = match reminder_resource_coverage(&object.raw) {
+                    ReminderResourceCoverage::NoAlarms => continue,
+                    ReminderResourceCoverage::Standalone => true,
+                    ReminderResourceCoverage::Expanded => false,
+                    ReminderResourceCoverage::Unsupported => { unsupported_count += 1; continue; }
+                };
                 if !standalone && expansion.is_none() { continue; }
                 if !client.permits(&scope, Some(&object.remote_id), "read").map_err(|_| "reminder_access_check")? { return Err("reminder_access_denied".into()); }
                 let source = client.read_resource(&scope, &object.remote_id).map_err(|_| "reminder_resource_get")?;
                 let etag = source.etag.clone().ok_or("Reminder ETag unavailable")?;
                 if object.etag.as_deref() != Some(etag.as_str()) { return Err("reminder_changed".into()); }
                 let data = if standalone { source.raw.as_slice() } else { expansion.as_ref().ok_or("Missing expansion")?.calendar_data.as_bytes() };
-                let items = isyncyou_connectors::dav::reminders::plan(data, &source.raw, floating_tzid, window_start, window_end).map_err(|_| "unsupported_alarm_coverage")?.into_iter().map(|identity| ReminderPlanItem { notification_tag:identity.notification_tag(&scope), identity }).collect();
+                let planned = match isyncyou_connectors::dav::reminders::plan(data, &source.raw, floating_tzid, window_start, window_end) {
+                    Ok(planned) => planned,
+                    Err(_) => { unsupported_count += 1; continue; }
+                };
+                let items = planned.into_iter().map(|identity| ReminderPlanItem { notification_tag:identity.notification_tag(&scope), identity }).collect();
                 let plan = ReminderPlan { scope:scope.clone(), href:object.remote_id.clone(), etag, occurrence_start:occurrence_start.into(), occurrence_end:occurrence_end.into(), window_start, window_end, items };
                 records.extend(plan.native_records(floating_tzid)?);
                 if records.len() > 10000 { return Err("Reminder account plan limit exceeded".into()); }
@@ -384,7 +477,7 @@ pub fn plan_account_reminders_with_store(cfg: &Config, account: &str, entry: &st
         if !by_href.is_empty() { return Err("reminder_changed".into()); }
         if store.provider_cursor(&scope).map_err(|_| "reminder_cache")? != initial_cursor || store.provider_accessible(&scope).map_err(|_| "reminder_cache")? != initial_access { return Err("reminder_changed".into()); }
     }
-    Ok(records)
+    Ok(ReminderAccountPlan { records, unsupported_count })
 }
 
 /// A content-free revision for deciding whether a previously complete account
@@ -1399,6 +1492,7 @@ pub(crate) fn import_recovered_with_token(cfg: &Config, account: &str, origin: &
     let collections = client.discover(entry).map_err(|e| e.to_string())?;
     if !collections.iter().any(|c| c.url == collection && c.name == "Recovered" && c.owned_by_current_principal == Some(true) && if service == "calendar" { c.calendar } else { c.addressbook }) { return Err("Selected personal Recovered collection is unavailable".into()); }
     let scope = ProviderScope {account_id:account.into(), origin:origin.into(), service:service.into(), collection:collection.into()};
+    client.require_private_recovery_collection(entry, &scope).map_err(|_| "Recovered collection privacy is unavailable")?;
     let file = format!("recovered-{:x}.{}",Sha256::digest(operation_id.as_bytes()),if service == "calendar" {"ics"} else {"vcf"});
     let href = client.validate_target(&scope,&file).map_err(|e| e.to_string())?;
     let intent = serde_json::json!({"generation":generation,"object_id":object_id,"version":version,"href":href,"original_sha256":source_digest,"original":base64::engine::general_purpose::STANDARD.encode(original),"projection":base64::engine::general_purpose::STANDARD.encode(&projected)}).to_string();
@@ -1472,6 +1566,27 @@ pub fn objects(cfg: &Config, account: &str, collection: &str, service: &str, aft
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_recurring_alarm_does_not_hide_supported_reminder() {
+        let valid = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//fixture//EN\r\nBEGIN:VEVENT\r\nUID:event\r\nDTSTAMP:20261001T100000Z\r\nDTSTART:20261028T100000Z\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nDESCRIPTION:Alarm\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let unsupported = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//fixture//EN\r\nBEGIN:VEVENT\r\nUID:series\r\nDTSTAMP:20261001T100000Z\r\nDTSTART:20261028T100000Z\r\nRRULE:FREQ=DAILY\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER;VALUE=DATE-TIME:20261028T094500Z\r\nDESCRIPTION:Alarm\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let mut plan = ReminderAccountPlan { records:Vec::new(), unsupported_count:0 };
+        for raw in [valid.as_slice(), unsupported.as_slice()] {
+            match reminder_resource_coverage(raw) {
+                ReminderResourceCoverage::Unsupported => plan.unsupported_count += 1,
+                ReminderResourceCoverage::Standalone => {
+                    for reminder in isyncyou_connectors::dav::reminders::plan(raw,raw,None,1793180000,1793190000).unwrap() {
+                        plan.records.push(serde_json::json!({"trigger_at":reminder.trigger_at}));
+                    }
+                }
+                _ => panic!("unexpected coverage"),
+            }
+        }
+        assert_eq!(plan.unsupported_count, 1);
+        assert_eq!(plan.records.len(), 1);
+        assert_eq!(plan.records[0]["trigger_at"], 1793180700);
+    }
 
     #[test]
     fn recovery_token_seam_rejects_unconfigured_origin_before_network() {

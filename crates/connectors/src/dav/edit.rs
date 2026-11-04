@@ -431,7 +431,72 @@ pub fn preview_event_time_zoned(raw: &[u8], uid: &str, start: &str, end: &str, t
     Ok((old_start,start_zone,old_end,end_zone,event_time_zoned(raw,uid,None,start,end,tzid)?))
 }
 
-/// Create one UTC recurrence override only after the server has expanded and
+/// Map server-expanded UTC instants back to the master's native time form.
+/// Reject ambiguous folds and embedded timezone definitions that disagree
+/// with the installed IANA rules rather than silently changing an occurrence.
+fn exception_native_times(tree: &IcalCst<'_>, master: &IcalCst<'_>, end_key: &str, times: &[&str]) -> Result<Vec<(String,Option<String>)>, String> {
+    use chrono::{LocalResult, NaiveDateTime, TimeZone};
+    let field = |key: &str| -> Result<(String,Option<String>),String> {
+        let lines: Vec<_> = master.items.iter().filter_map(|x| match x { IcalItem::Prop(line) if line.name.get().eq_ignore_ascii_case(key) => Some(line), _ => None }).collect();
+        if lines.len()!=1 || lines[0].params.len()>1 { return Err("Ambiguous recurrence time".into()); }
+        let zone = match lines[0].params.first() {
+            None => None,
+            Some(p) if p.name.get().eq_ignore_ascii_case("TZID") && p.values.len()==1 => Some(p.values[0].get().trim_matches('"').to_owned()),
+            _ => return Err("Unsupported recurrence time parameters".into()),
+        };
+        Ok((lines[0].value.decode().into_owned(),zone))
+    };
+    let (start,start_zone) = field("DTSTART")?; let (end,end_zone) = field(end_key)?;
+    if start_zone != end_zone { return Err("Mixed recurrence timezones need expanded approval".into()); }
+    let Some(tzid) = start_zone else {
+        if !start.ends_with('Z') || !end.ends_with('Z') { return Err("Floating recurrence time needs a timezone".into()); }
+        return Ok(times.iter().map(|v| ((*v).to_owned(),None)).collect());
+    };
+    if tzid.is_empty() || tzid.len()>128 || !tzid.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b,b'/' | b'_' | b'-' | b'+')) { return Err("Invalid recurrence timezone".into()); }
+    let zone: chrono_tz::Tz = tzid.parse().map_err(|_| "Unknown recurrence timezone")?;
+    let mut validation = tree.clone();
+    for entry in &mut validation.items { if let IcalItem::Component(component) = entry {
+        if matches!(name(component).as_deref(),Some("VEVENT" | "VTODO")) {
+            component.items.retain(|item| !matches!(item,IcalItem::Component(child) if name(child).as_deref()==Some("VALARM")));
+            for item in &mut component.items { if let IcalItem::Prop(line) = item { line.params.retain(|p| !p.name.get().eq_ignore_ascii_case("TZID")); } }
+        }
+    } }
+    let calendar = validation.decode().validate().map_err(|_| "Calendar timezone cannot be validated")?.into_inner();
+    let embedded = ical::tz::IcalTz::of_calendar(&calendar,&tzid);
+    if embedded.as_ref().is_some_and(|v| v.observances.is_empty()) { return Err("Calendar timezone has no transitions".into()); }
+    for value in [&start,&end] {
+        if value.len()!=15 { return Err("Invalid native recurrence time".into()); }
+        let local = NaiveDateTime::parse_from_str(value,"%Y%m%dT%H%M%S").map_err(|_| "Invalid native recurrence time")?;
+        let instant = match zone.from_local_datetime(&local) { LocalResult::Single(v) => v.timestamp(), _ => return Err("Native recurrence time is ambiguous or nonexistent".into()) };
+        if let Some(ref embedded) = embedded {
+            let civil = ical::recur::IcalRecurDateTime::parse(value).map_err(|_| "Invalid native recurrence time")?;
+            if embedded.resolve(civil).instant(civil) != Some(instant) { return Err("Embedded timezone differs from recurrence timezone".into()); }
+        }
+    }
+    let mut output = Vec::with_capacity(times.len());
+    for value in times {
+        let instant = NaiveDateTime::parse_from_str(value,"%Y%m%dT%H%M%SZ").map_err(|_| "Invalid UTC occurrence time")?.and_utc();
+        let local = instant.with_timezone(&zone).naive_local();
+        if !matches!(zone.from_local_datetime(&local),LocalResult::Single(v) if v.timestamp()==instant.timestamp()) { return Err("Occurrence time is ambiguous or nonexistent".into()); }
+        let text = local.format("%Y%m%dT%H%M%S").to_string();
+        if let Some(ref embedded) = embedded {
+            let civil = ical::recur::IcalRecurDateTime::parse(&text).map_err(|_| "Invalid local occurrence time")?;
+            if embedded.resolve(civil).instant(civil) != Some(instant.timestamp()) { return Err("Embedded timezone differs from recurrence timezone".into()); }
+        }
+        output.push((text,Some(tzid.clone())));
+    }
+    Ok(output)
+}
+
+fn exception_time_line(key: &str, value: &(String,Option<String>)) -> IcalLine<'static> {
+    let mut line = IcalLine::text(key.to_owned(),value.0.clone());
+    if let Some(tzid) = &value.1 {
+        let mut p = ical::tree::param::node::IcalParamNode::parse("TZID=placeholder"); p.values[0].set(tzid.clone()); line.params.push(p);
+    }
+    line
+}
+
+/// Create one recurrence override only after the server has expanded and
 /// confirmed the occurrence. The original master and existing exceptions stay
 /// byte-faithful; inherited properties are copied from the native master.
 pub fn create_event_exception(raw: &[u8], expanded: &[u8], uid: &str, recurrence_id: &str, start: &str, end: &str) -> Result<Vec<u8>, String> {
@@ -455,19 +520,25 @@ pub fn create_event_exception(raw: &[u8], expanded: &[u8], uid: &str, recurrence
         if name(child).as_deref() != Some("VEVENT") || ids.len() != 1 || ids[0] != uid { continue; }
         let rid = values(child,"RECURRENCE-ID");
         if child.items.iter().any(|item| matches!(item,IcalItem::Prop(line) if line.name.get().eq_ignore_ascii_case("RECURRENCE-ID") && line.params.iter().any(|p| p.name.get().eq_ignore_ascii_case("RANGE")))) { return Err("Range override requires explicit series handling".into()); }
-        if rid.len() > 1 || rid.first().is_some_and(|value| value == recurrence_id) { return Err("Occurrence already has an override or ambiguous identity".into()); }
+        if rid.len() > 1 { return Err("Occurrence already has an override or ambiguous identity".into()); }
         if rid.is_empty() && master.replace(child.clone()).is_some() { return Err("Ambiguous series master".into()); }
     }
     let mut child = master.ok_or("Series master missing")?;
     if values(&child,"RRULE").is_empty() && values(&child,"RDATE").is_empty() { return Err("Event is not recurring".into()); }
-    let original_start = values(&child,"DTSTART");
-    let original_end = values(&child,"DTEND");
-    if original_start.len() != 1 || original_end.len() != 1 || !valid_utc(&original_start[0]) || !valid_utc(&original_end[0]) || !values(&child,"DURATION").is_empty() { return Err("Only UTC date-time series with explicit end are supported".into()); }
-    for item in &child.items { if let IcalItem::Prop(line) = item {
-        if ["DTSTART","DTEND","RECURRENCE-ID"].iter().any(|key| line.name.get().eq_ignore_ascii_case(key)) && !line.params.is_empty() { return Err("Parameterized time requires zone-aware exception handling".into()); }
+    if !values(&child,"DURATION").is_empty() { return Err("Duration-based series needs expanded approval".into()); }
+    let native = exception_native_times(&tree,&child,"DTEND",&[recurrence_id,start,end])?;
+    for item in &tree.items { if let IcalItem::Component(existing) = item {
+        if name(existing).as_deref() != Some("VEVENT") || values(existing,"UID") != [uid] { continue; }
+        let ids = values(existing,"RECURRENCE-ID");
+        for item in &existing.items { if let IcalItem::Prop(line) = item { if line.name.get().eq_ignore_ascii_case("RECURRENCE-ID") {
+            if line.params.len()>1 || line.params.first().is_some_and(|p| !p.name.get().eq_ignore_ascii_case("TZID") || p.values.len()!=1 || native[0].1.as_deref()!=Some(p.values[0].get().trim_matches('"'))) { return Err("Existing recurrence timezone requires expanded approval".into()); }
+            if line.params.is_empty() && !line.value.decode().ends_with('Z') { return Err("Existing recurrence timezone missing".into()); }
+        } } }
+        if ids.first().is_some_and(|v| v == recurrence_id || v == &native[0].0) { return Err("Occurrence already has an override".into()); }
+        if ids.first().is_some_and(|v| !v.ends_with('Z') && (native[0].1.is_none() || v.len()!=15)) { return Err("Existing recurrence identity requires expanded approval".into()); }
     } }
     child.items.retain(|entry| !matches!(entry, IcalItem::Prop(line) if ["RRULE","RDATE","EXDATE","EXRULE","DTSTART","DTEND","RECURRENCE-ID"].iter().any(|key| line.name.get().eq_ignore_ascii_case(key))));
-    for (key,value) in [("RECURRENCE-ID",recurrence_id),("DTSTART",start),("DTEND",end)] { child.items.push(IcalItem::Prop(IcalLine::text(key,value.to_owned()))); }
+    for (key,value) in ["RECURRENCE-ID","DTSTART","DTEND"].into_iter().zip(native.iter()) { child.items.push(IcalItem::Prop(exception_time_line(key,value))); }
     tree.items.push(IcalItem::Component(child));
     Ok(tree.to_bytes())
 }
@@ -806,7 +877,13 @@ pub fn preview_task_completion(raw: &[u8], uid: &str, recurrence_id: Option<&str
     if recurrence_id.is_none() && (!values(target,"RRULE").is_empty() || !values(target,"RDATE").is_empty()) { return Err("Recurring task master requires series approval".into()); }
     for item in &target.items {
         if let IcalItem::Prop(line) = item {
-            if ["SUMMARY","STATUS","PERCENT-COMPLETE","COMPLETED","RECURRENCE-ID"].iter().any(|key| line.name.get().eq_ignore_ascii_case(key)) && !line.params.is_empty() { return Err("Parameterized task preview is unsupported".into()); }
+            if ["SUMMARY","STATUS","PERCENT-COMPLETE","COMPLETED"].iter().any(|key| line.name.get().eq_ignore_ascii_case(key)) && !line.params.is_empty() { return Err("Parameterized task preview is unsupported".into()); }
+            if line.name.get().eq_ignore_ascii_case("RECURRENCE-ID") && !line.params.is_empty() {
+                if line.params.len()!=1 || !line.params[0].name.get().eq_ignore_ascii_case("TZID") || line.params[0].values.len()!=1 { return Err("Unsupported task recurrence identity parameters".into()); }
+                let zone = line.params[0].values[0].get().trim_matches('"');
+                let masters: Vec<_> = tree.items.iter().filter_map(|entry| match entry { IcalItem::Component(c) if name(c).as_deref()==Some("VTODO") && values(c,"UID")==[uid] && values(c,"RECURRENCE-ID").is_empty() => Some(c), _ => None }).collect();
+                if masters.len()!=1 || zone.parse::<chrono_tz::Tz>().is_err() || !masters[0].items.iter().any(|entry| matches!(entry,IcalItem::Prop(start) if start.name.get().eq_ignore_ascii_case("DTSTART") && start.params.len()==1 && start.params[0].name.get().eq_ignore_ascii_case("TZID") && start.params[0].values.len()==1 && start.params[0].values[0].get().trim_matches('"')==zone)) { return Err("Task recurrence timezone is ambiguous".into()); }
+            }
         }
     }
     let single = |key: &str| -> Result<Option<String>, String> {
@@ -855,20 +932,27 @@ pub fn preview_task_occurrence_completion(raw: &[u8], expanded: &[u8], uid: &str
         if name(child).as_deref() != Some("VTODO") || values(child,"UID") != [uid] { continue; }
         if child.items.iter().any(|item| matches!(item,IcalItem::Prop(line) if line.name.get().eq_ignore_ascii_case("RECURRENCE-ID") && line.params.iter().any(|p| p.name.get().eq_ignore_ascii_case("RANGE")))) { return Err("Range override requires series approval".into()); }
         let rid = values(child,"RECURRENCE-ID");
-        if rid.len() > 1 || rid.first().is_some_and(|v| v == recurrence_id) { return Err("Task occurrence already exists or is ambiguous".into()); }
+        if rid.len() > 1 { return Err("Task occurrence already exists or is ambiguous".into()); }
         if rid.is_empty() && master.replace(child.clone()).is_some() { return Err("Task series master is ambiguous".into()); }
     } }
     let mut child = master.ok_or("Task series master missing")?;
     if values(&child,"RRULE").is_empty() && values(&child,"RDATE").is_empty() { return Err("Task is not recurring".into()); }
     if ["ORGANIZER","ATTENDEE","DURATION"].iter().any(|k| !values(&child,k).is_empty()) || child.items.iter().any(|v| matches!(v,IcalItem::Component(_) | IcalItem::Opaque(_))) { return Err("Scheduled or alarmed task requires expanded approval".into()); }
-    for entry in &child.items { if let IcalItem::Prop(line) = entry {
-        if ["DTSTART","DUE","RECURRENCE-ID"].iter().any(|key| line.name.get().eq_ignore_ascii_case(key)) && !line.params.is_empty() { return Err("Parameterized task occurrence requires zone-aware approval".into()); }
+    let native = exception_native_times(&tree,&child,"DUE",&[recurrence_id,start.as_str(),due.as_str()])?;
+    for entry in &tree.items { if let IcalItem::Component(existing) = entry {
+        if name(existing).as_deref()!=Some("VTODO") || values(existing,"UID") != [uid] { continue; }
+        let ids = values(existing,"RECURRENCE-ID");
+        for item in &existing.items { if let IcalItem::Prop(line) = item { if line.name.get().eq_ignore_ascii_case("RECURRENCE-ID") {
+            if line.params.len()>1 || line.params.first().is_some_and(|p| !p.name.get().eq_ignore_ascii_case("TZID") || p.values.len()!=1 || native[0].1.as_deref()!=Some(p.values[0].get().trim_matches('"'))) { return Err("Existing recurrence timezone requires expanded approval".into()); }
+            if line.params.is_empty() && !line.value.decode().ends_with('Z') { return Err("Existing recurrence timezone missing".into()); }
+        } } }
+        if ids.first().is_some_and(|v| v==recurrence_id || v==&native[0].0) { return Err("Task occurrence already exists".into()); }
     } }
     let summary = single(&child,"SUMMARY")?;
     child.items.retain(|entry| !matches!(entry,IcalItem::Prop(line) if ["RRULE","RDATE","EXDATE","EXRULE","DTSTART","DUE","RECURRENCE-ID"].iter().any(|key| line.name.get().eq_ignore_ascii_case(key))));
-    for (key,value) in [("RECURRENCE-ID",recurrence_id),("DTSTART",start.as_str()),("DUE",due.as_str())] { child.items.push(IcalItem::Prop(IcalLine::text(key,value.to_owned()))); }
+    for (key,value) in ["RECURRENCE-ID","DTSTART","DUE"].into_iter().zip(native.iter()) { child.items.push(IcalItem::Prop(exception_time_line(key,value))); }
     tree.items.push(IcalItem::Component(child));
-    let result = task_completion(&tree.to_bytes(),uid,Some(recurrence_id),completed_at)?;
+    let result = task_completion(&tree.to_bytes(),uid,Some(&native[0].0),completed_at)?;
     Ok((summary,start,due,result))
 }
 
@@ -1327,6 +1411,41 @@ mod tests {
         assert_eq!(result.matches("X-KEEP:yes").count(),2);
         assert!(result.contains("RECURRENCE-ID:20270102T100000Z")); assert!(result.contains("STATUS:COMPLETED"));
         assert!(preview_task_occurrence_completion(raw,expanded,"task","20270103T100000Z",None).is_err());
+    }
+
+    #[test]
+    fn zoned_event_and_task_occurrences_preserve_civil_identity_across_dst() {
+        let event = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//fixture//EN\r\nBEGIN:VEVENT\r\nUID:event\r\nDTSTAMP:20261001T100000Z\r\nSUMMARY:Review\r\nDTSTART;TZID=Europe/Vienna:20261024T100000\r\nDTEND;TZID=Europe/Vienna:20261024T110000\r\nRRULE:FREQ=DAILY;COUNT=3\r\nX-KEEP:event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let expanded = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Review\r\nRECURRENCE-ID:20261025T090000Z\r\nDTSTART:20261025T090000Z\r\nDTEND:20261025T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let output = create_event_exception(event,expanded,"event","20261025T090000Z","20261025T110000Z","20261025T120000Z").unwrap();
+        let text = String::from_utf8(output).unwrap();
+        for expected in ["RECURRENCE-ID;TZID=Europe/Vienna:20261025T100000", "DTSTART;TZID=Europe/Vienna:20261025T120000", "DTEND;TZID=Europe/Vienna:20261025T130000", "X-KEEP:event", "RRULE:FREQ=DAILY;COUNT=3"] { assert!(text.contains(expected),"{expected}"); }
+        let task = String::from_utf8(event.to_vec()).unwrap().replace("VEVENT","VTODO").replace("UID:event","UID:task").replace("DTEND","DUE");
+        let task_expanded = String::from_utf8(expanded.to_vec()).unwrap().replace("VEVENT","VTODO").replace("UID:event","UID:task").replace("DTEND","DUE");
+        let (_,_,_,output) = preview_task_occurrence_completion(task.as_bytes(),task_expanded.as_bytes(),"task","20261025T090000Z",Some("20261025T120000Z")).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        for expected in ["RECURRENCE-ID;TZID=Europe/Vienna:20261025T100000", "DTSTART;TZID=Europe/Vienna:20261025T100000", "DUE;TZID=Europe/Vienna:20261025T110000", "STATUS:COMPLETED", "RRULE:FREQ=DAILY;COUNT=3"] { assert!(text.contains(expected),"{expected}"); }
+        let (_,_,_,_,reopened) = preview_task_completion(text.as_bytes(),"task",Some("20261025T100000"),None).unwrap();
+        let reopened = String::from_utf8(reopened).unwrap();
+        assert!(reopened.contains("RECURRENCE-ID;TZID=Europe/Vienna:20261025T100000")); assert!(reopened.contains("STATUS:NEEDS-ACTION")); assert!(reopened.contains("RRULE:FREQ=DAILY;COUNT=3"));
+        assert!(preview_task_occurrence_completion(text.as_bytes(),task_expanded.as_bytes(),"task","20261025T090000Z",None).is_err());
+    }
+
+    #[test]
+    fn zoned_occurrence_rejects_ambiguous_dst_fold() {
+        let task = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//fixture//EN\r\nBEGIN:VTODO\r\nUID:task\r\nDTSTAMP:20261001T100000Z\r\nSUMMARY:Work\r\nDTSTART;TZID=Europe/Vienna:20261024T023000\r\nDUE;TZID=Europe/Vienna:20261024T033000\r\nRRULE:FREQ=DAILY;COUNT=3\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let expanded = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:task\r\nRECURRENCE-ID:20261025T003000Z\r\nDTSTART:20261025T003000Z\r\nDUE:20261025T023000Z\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        assert!(preview_task_occurrence_completion(task,expanded,"task","20261025T003000Z",Some("20261025T120000Z")).is_err());
+    }
+
+    #[test]
+    fn zoned_exception_preserves_embedded_timezone_definition() {
+        let zone = "BEGIN:VTIMEZONE\r\nTZID:Europe/Vienna\r\nBEGIN:STANDARD\r\nDTSTART:19701025T030000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nDTSTART:19700329T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0200\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\n";
+        let raw = format!("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//fixture//EN\r\n{zone}BEGIN:VEVENT\r\nUID:event\r\nDTSTAMP:20261001T100000Z\r\nSUMMARY:Review\r\nDTSTART;TZID=Europe/Vienna:20261024T100000\r\nDTEND;TZID=Europe/Vienna:20261024T110000\r\nRRULE:FREQ=DAILY;COUNT=3\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n");
+        let expanded = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nRECURRENCE-ID:20261025T090000Z\r\nDTSTART:20261025T090000Z\r\nDTEND:20261025T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let out = create_event_exception(raw.as_bytes(),expanded,"event","20261025T090000Z","20261025T110000Z","20261025T120000Z").unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(zone)); assert!(text.contains("RECURRENCE-ID;TZID=Europe/Vienna:20261025T100000"));
     }
 
     #[test]
