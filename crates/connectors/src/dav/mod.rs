@@ -1126,11 +1126,48 @@ impl DavClient {
                         == Some(&principal_url)
             })
             .ok_or(DavError::InvalidResponse)?;
+        // A transient property failure must not turn an incomplete home
+        // observation into an authoritative list of inaccessible scopes.
+        for propstat in home_response
+            .children
+            .iter()
+            .filter(|n| n.namespace == D && n.name == "propstat")
+        {
+            let code = propstat
+                .child(D, "status")
+                .and_then(|node| status(node.text.trim()))
+                .ok_or(DavError::InvalidResponse)?;
+            if code != 200 && code != 404 {
+                return Err(DavError::Http(code));
+            }
+        }
         let mut result = Vec::new();
         for (ns, name) in [(C, "calendar-home-set"), (A, "addressbook-home-set")] {
             let Some(home) = property(home_response, ns, name) else {
-                continue;
+                let absent = home_response
+                    .children
+                    .iter()
+                    .filter(|n| n.namespace == D && n.name == "propstat")
+                    .any(|p| {
+                        p.child(D, "status")
+                            .and_then(|node| status(node.text.trim()))
+                            == Some(404)
+                            && p.child(D, "prop")
+                                .and_then(|prop| prop.child(ns, name))
+                                .is_some()
+                    });
+                if absent {
+                    continue;
+                }
+                return Err(DavError::InvalidResponse);
             };
+            if !home
+                .children
+                .iter()
+                .any(|n| n.namespace == D && n.name == "href" && !n.text.trim().is_empty())
+            {
+                return Err(DavError::InvalidResponse);
+            }
             for home_href in home
                 .children
                 .iter()
@@ -1145,21 +1182,24 @@ impl DavClient {
                 if !home_url.path().ends_with('/') {
                     return Err(DavError::InvalidUrl);
                 }
+                let mut saw_home = false;
                 for response in listing
                     .children
                     .iter()
                     .filter(|n| n.namespace == D && n.name == "response")
                 {
                     let url = self.checked_from(&home_url, href(response)?)?;
+                    if url == home_url {
+                        saw_home = true;
+                    }
                     // Assisted discovery can return an authorized shared
                     // collection outside this principal's home path. The
                     // server's response is trusted only for this origin.
                     if !url.path().ends_with('/') {
                         return Err(DavError::InvalidUrl);
                     }
-                    let Some(ty) = property(response, D, "resourcetype") else {
-                        continue;
-                    };
+                    let ty =
+                        property(response, D, "resourcetype").ok_or(DavError::InvalidResponse)?;
                     let calendar = ty.child(C, "calendar").is_some();
                     let addressbook = ty.child(A, "addressbook").is_some();
                     if !calendar && !addressbook {
@@ -1189,6 +1229,9 @@ impl DavClient {
                         addressbook,
                         owned_by_current_principal,
                     });
+                }
+                if !saw_home {
+                    return Err(DavError::InvalidResponse);
                 }
             }
         }
@@ -4367,6 +4410,51 @@ mod tests {
     }
 
     #[test]
+    fn discovery_rejects_partial_home_listing() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for index in 0..3 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 2048];
+                loop {
+                    let n = socket.read(&mut buffer).unwrap();
+                    assert_ne!(n, 0);
+                    request.extend_from_slice(&buffer[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let body = match index {
+                    0 => "<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/dav/</d:href><d:propstat><d:prop><d:current-user-principal><d:href>/dav/pal/me/</d:href></d:current-user-principal></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>",
+                    1 => "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\" xmlns:a=\"urn:ietf:params:xml:ns:carddav\"><d:response><d:href>/dav/pal/me/</d:href><d:propstat><d:prop><c:calendar-home-set><d:href>/dav/cal/me/</d:href></c:calendar-home-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat><d:propstat><d:prop><a:addressbook-home-set/></d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat></d:response></d:multistatus>",
+                    _ => "<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/dav/cal/me/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/dav/cal/me/shared/</d:href><d:propstat><d:prop><d:resourcetype/></d:prop><d:status>HTTP/1.1 503 Service Unavailable</d:status></d:propstat></d:response></d:multistatus>",
+                };
+                write!(socket, "HTTP/1.1 207 Multi-Status\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let reader = LoopbackDavReader::new(&origin, "fixture".into()).unwrap();
+        assert!(matches!(
+            reader.discover("/dav/"),
+            Err(DavError::InvalidResponse)
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
     fn discovery_distinguishes_own_shared_and_unknown_ownership() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -4398,8 +4486,8 @@ mod tests {
                 }
                 let body = match index {
                     0 => "<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/dav/</d:href><d:propstat><d:prop><d:current-user-principal><d:href>/dav/pal/me/</d:href></d:current-user-principal></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>",
-                    1 => "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/dav/pal/me/</d:href><d:propstat><d:prop><c:calendar-home-set><d:href>/dav/cal/me/</d:href></c:calendar-home-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>",
-                    _ => "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/dav/cal/me/own/</d:href><d:propstat><d:prop><d:resourcetype><c:calendar/></d:resourcetype><d:owner><d:href>/dav/pal/me/</d:href></d:owner></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/dav/cal/other/shared/</d:href><d:propstat><d:prop><d:resourcetype><c:calendar/></d:resourcetype><d:owner><d:href>/dav/pal/other/</d:href></d:owner></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/dav/cal/me/unknown/</d:href><d:propstat><d:prop><d:resourcetype><c:calendar/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>",
+                    1 => "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\" xmlns:a=\"urn:ietf:params:xml:ns:carddav\"><d:response><d:href>/dav/pal/me/</d:href><d:propstat><d:prop><c:calendar-home-set><d:href>/dav/cal/me/</d:href></c:calendar-home-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat><d:propstat><d:prop><a:addressbook-home-set/></d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat></d:response></d:multistatus>",
+                    _ => "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/dav/cal/me/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/dav/cal/me/own/</d:href><d:propstat><d:prop><d:resourcetype><c:calendar/></d:resourcetype><d:owner><d:href>/dav/pal/me/</d:href></d:owner></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/dav/cal/other/shared/</d:href><d:propstat><d:prop><d:resourcetype><c:calendar/></d:resourcetype><d:owner><d:href>/dav/pal/other/</d:href></d:owner></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/dav/cal/me/unknown/</d:href><d:propstat><d:prop><d:resourcetype><c:calendar/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>",
                 };
                 write!(socket, "HTTP/1.1 207 Multi-Status\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }

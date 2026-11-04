@@ -191,6 +191,9 @@ pub struct ProviderObject {
     pub raw: Vec<u8>,
 }
 
+pub type ProviderDavResolvedObject = (ProviderScope, ProviderObject, Option<i64>, Option<String>);
+pub type ProviderDavPageSnapshot = (Option<i64>, Option<String>, Vec<ProviderObject>);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderDavIndex {
     Valid {
@@ -1347,7 +1350,7 @@ impl Store {
             || progress.is_some_and(|(objects, indexed, invalid)| {
                 objects < 0 || indexed != objects || invalid != 0
             });
-        let mut stmt = self.conn.prepare("SELECT p.remote_id,p.etag,p.raw,length(p.raw) FROM provider_dav_search_fts f JOIN provider_objects p ON p.account_id=f.account_id AND p.origin=f.origin AND p.service=f.service AND p.collection=f.collection AND p.remote_id=f.remote_id JOIN provider_dav_search_indexed i ON i.account_id=p.account_id AND i.origin=p.origin AND i.service=p.service AND i.collection=p.collection AND i.remote_id=p.remote_id AND i.index_version=?6 AND i.valid=1 WHERE provider_dav_search_fts MATCH ?1 AND f.account_id=?2 AND f.origin=?3 AND f.service=?4 AND f.collection=?5 ORDER BY rank LIMIT ?7")?;
+        let mut stmt = self.conn.prepare("SELECT p.remote_id,p.etag,p.raw,length(p.raw) FROM provider_dav_search_fts f JOIN provider_objects p ON p.account_id=f.account_id AND p.origin=f.origin AND p.service=f.service AND p.collection=f.collection AND p.remote_id=f.remote_id JOIN provider_dav_search_indexed i ON i.account_id=p.account_id AND i.origin=p.origin AND i.service=p.service AND i.collection=p.collection AND i.remote_id=p.remote_id AND i.index_version=?6 AND i.valid=1 WHERE provider_dav_search_fts MATCH ?1 AND f.account_id=?2 AND f.origin=?3 AND f.service=?4 AND f.collection=?5 AND EXISTS(SELECT 1 FROM provider_collections c WHERE c.account_id=p.account_id AND c.origin=p.origin AND c.service=p.service AND c.collection=p.collection AND c.accessible=1 AND c.complete=1) ORDER BY rank LIMIT ?7")?;
         let mut rows = stmt.query(params![
             query,
             scope.account_id,
@@ -1918,6 +1921,41 @@ impl Store {
         Ok(self.conn.query_row("SELECT remote_id,etag,raw FROM provider_objects WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND remote_id=?5", params![scope.account_id,scope.origin,scope.service,scope.collection,id], |r| Ok(ProviderObject { remote_id:r.get(0)?, etag:r.get(1)?, raw:r.get(2)? })).optional()?)
     }
 
+    /// Resolve at most two accessible DAV matches in one SQLite snapshot.
+    /// Two matches are sufficient to reject an ambiguous unscoped identity.
+    pub fn provider_accessible_dav_by_id(
+        &self,
+        account: &str,
+        origin: &str,
+        service: &str,
+        id: &str,
+    ) -> Result<Vec<ProviderDavResolvedObject>> {
+        if !matches!(service, "calendar" | "contacts") {
+            return Err(StoreError::InvalidProgressiveSearch(
+                "invalid DAV scope".into(),
+            ));
+        }
+        let mut stmt = self.conn.prepare("SELECT p.collection,p.remote_id,p.etag,p.raw,c.observed_at,c.cursor FROM provider_objects p JOIN provider_collections c ON c.account_id=p.account_id AND c.origin=p.origin AND c.service=p.service AND c.collection=p.collection WHERE p.account_id=?1 AND p.origin=?2 AND p.service=?3 AND p.remote_id=?4 AND c.accessible=1 ORDER BY p.collection LIMIT 2")?;
+        let rows = stmt.query_map(params![account, origin, service, id], |r| {
+            Ok((
+                ProviderScope {
+                    account_id: account.into(),
+                    origin: origin.into(),
+                    service: service.into(),
+                    collection: r.get(0)?,
+                },
+                ProviderObject {
+                    remote_id: r.get(1)?,
+                    etag: r.get(2)?,
+                    raw: r.get(3)?,
+                },
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn provider_objects(&self, scope: &ProviderScope) -> Result<Vec<ProviderObject>> {
         let mut stmt = self.conn.prepare("SELECT remote_id,etag,raw FROM provider_objects WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 ORDER BY remote_id")?;
         let rows = stmt.query_map(
@@ -1966,14 +2004,59 @@ impl Store {
         after: &str,
         limit: usize,
     ) -> Result<Vec<ProviderObject>> {
-        let mut stmt = self.conn.prepare("SELECT remote_id,etag,raw,length(raw) FROM provider_objects WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND remote_id>?5 ORDER BY remote_id LIMIT ?6")?;
+        self.provider_objects_page_inner(scope, after, limit, false)
+    }
+
+    /// Live DAV views may expose only a currently accessible scope. The
+    /// access predicate and the object bytes are read in one SQLite snapshot.
+    pub fn provider_accessible_dav_objects_page(
+        &self,
+        scope: &ProviderScope,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<ProviderObject>> {
+        if !matches!(scope.service.as_str(), "calendar" | "contacts") {
+            return Err(StoreError::InvalidProgressiveSearch(
+                "invalid DAV scope".into(),
+            ));
+        }
+        self.provider_objects_page_inner(scope, after, limit, true)
+    }
+
+    /// Read visibility, checkpoint, and page from one consistent snapshot.
+    pub fn provider_accessible_dav_snapshot(
+        &self,
+        scope: &ProviderScope,
+        after: &str,
+        limit: usize,
+    ) -> Result<Option<ProviderDavPageSnapshot>> {
+        let tx = self.conn.unchecked_transaction()?;
+        if self.provider_accessible(scope)? != Some(true) {
+            return Ok(None);
+        }
+        let observed = self.provider_observed_at(scope)?;
+        let cursor = self.provider_cursor(scope)?;
+        let objects = self.provider_accessible_dav_objects_page(scope, after, limit)?;
+        tx.commit()?;
+        Ok(Some((observed, cursor, objects)))
+    }
+
+    fn provider_objects_page_inner(
+        &self,
+        scope: &ProviderScope,
+        after: &str,
+        limit: usize,
+        require_access: bool,
+    ) -> Result<Vec<ProviderObject>> {
+        let mut stmt = self.conn.prepare("SELECT remote_id,etag,raw,length(raw) FROM provider_objects WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND remote_id>?5 AND (?7=0 OR EXISTS(SELECT 1 FROM provider_collections c WHERE c.account_id=provider_objects.account_id AND c.origin=provider_objects.origin AND c.service=provider_objects.service AND c.collection=provider_objects.collection AND c.accessible=1)) ORDER BY remote_id LIMIT ?6")?;
         let mut rows = stmt.query(params![
             scope.account_id,
             scope.origin,
             scope.service,
             scope.collection,
             after,
-            limit.min(200) as i64
+            limit.min(200) as i64,
+            require_access
         ])?;
         let mut output = Vec::new();
         let mut bytes = 0usize;
@@ -2494,6 +2577,82 @@ fn capture_observation(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "encrypted-store")]
+    #[test]
+    fn accessible_dav_lookup_ignores_revoked_duplicates_and_uses_one_read_snapshot() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("provider.db");
+        let store = Store::open_encrypted(&path, b"test-key").unwrap();
+        let first = ProviderScope {
+            account_id: "a".into(),
+            origin: "https://example.test/".into(),
+            service: "contacts".into(),
+            collection: "/first/".into(),
+        };
+        let second = ProviderScope {
+            collection: "/second/".into(),
+            ..first.clone()
+        };
+        let object = ProviderObject {
+            remote_id: "same-id".into(),
+            etag: Some("v1".into()),
+            raw: b"original".to_vec(),
+        };
+        for scope in [&first, &second] {
+            store
+                .apply_provider_page(scope, &[ProviderChange::Upsert(object.clone())], "one")
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .provider_accessible_dav_by_id("a", &first.origin, "contacts", "same-id")
+                .unwrap()
+                .len(),
+            2
+        );
+        store.set_provider_accessible(&second, false).unwrap();
+        let visible = store
+            .provider_accessible_dav_by_id("a", &first.origin, "contacts", "same-id")
+            .unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].0, first);
+        assert_eq!(visible[0].1, object);
+        let reader = Store::open_readonly_encrypted(&path, b"test-key").unwrap();
+        let snapshot = reader.conn.unchecked_transaction().unwrap();
+        assert_eq!(
+            reader
+                .provider_accessible_dav_by_id("a", &first.origin, "contacts", "same-id")
+                .unwrap()
+                .len(),
+            1
+        );
+        store.set_provider_accessible(&first, false).unwrap();
+        assert_eq!(
+            reader
+                .provider_accessible_dav_by_id("a", &first.origin, "contacts", "same-id")
+                .unwrap()
+                .len(),
+            1
+        );
+        snapshot.commit().unwrap();
+        assert!(reader
+            .provider_accessible_dav_by_id("a", &first.origin, "contacts", "same-id")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.provider_object(&first, "same-id").unwrap(),
+            Some(object.clone())
+        );
+        store.set_provider_accessible(&first, true).unwrap();
+        assert_eq!(
+            reader
+                .provider_accessible_dav_by_id("a", &first.origin, "contacts", "same-id")
+                .unwrap()[0]
+                .1,
+            object
+        );
+    }
     #[test]
     fn full_reconcile_reuses_unchanged_objects_and_repairs_missing_indexes() {
         use super::*;

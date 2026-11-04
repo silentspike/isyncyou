@@ -2158,6 +2158,10 @@ pub fn prepare_submission(
         .as_str()
         .filter(|s| !s.is_empty() && s.len() <= 320 && !s.chars().any(char::is_control))
         .ok_or("Invalid sending identity")?;
+    let from = email["from"].as_array().ok_or("Draft sender unavailable")?;
+    if from.len() != 1 || from[0]["email"].as_str() != Some(mail_from) {
+        return Err("Draft sender does not match selected identity".into());
+    }
     let boxes = provider
         .client
         .get("Mailbox", None, None)
@@ -2310,6 +2314,124 @@ mod recipient_tests {
         validate_complete_body,
     };
     use serde_json::json;
+
+    #[test]
+    fn draft_http_uses_only_authorized_native_identity_as_from() {
+        use isyncyou_core::{config::ProviderConfig, Config};
+        use isyncyou_store::Store;
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for index in 0..4 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0; 4096];
+                let end = loop {
+                    let n = socket.read(&mut buf).unwrap();
+                    assert_ne!(n, 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]);
+                        let len = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if bytes.len() >= end + 4 + len {
+                            break end + 4;
+                        }
+                    }
+                };
+                let request: serde_json::Value = serde_json::from_slice(&bytes[end..]).unwrap();
+                let call = &request["methodCalls"][0];
+                let method = call[0].as_str().unwrap();
+                let result = match index {
+                    0 | 1 => {
+                        assert_eq!(method, "Identity/get");
+                        json!({"accountId":"account","list":[{"id":"allowed","name":"Sender","email":"sender@example.test"}],"notFound":[]})
+                    }
+                    2 => {
+                        assert_eq!(method, "Mailbox/get");
+                        json!({"accountId":"account","list":[{"id":"drafts","role":"drafts","myRights":{"mayAddItems":true}}],"notFound":[]})
+                    }
+                    _ => {
+                        assert_eq!(method, "Email/set");
+                        let creations = call[1]["create"].as_object().unwrap();
+                        assert_eq!(creations.len(), 1);
+                        let (id, draft) = creations.iter().next().unwrap();
+                        assert_eq!(
+                            draft["from"],
+                            json!([{"name":"Sender","email":"sender@example.test"}])
+                        );
+                        json!({"accountId":"account","created":{id:{"id":"new-draft"}}})
+                    }
+                };
+                let body = json!({"methodResponses":[[method,result,"c1"]]}).to_string();
+                write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        let mut cfg = Config::default();
+        cfg.provider_accounts.insert(
+            "local".into(),
+            ProviderConfig::SelfHosted {
+                origin: origin.clone(),
+                client_id: "client".into(),
+            },
+        );
+        let provider = super::SelfHostedClient {
+            client: super::JmapClient::test_loopback(&origin).unwrap(),
+            account: "local".into(),
+            origin,
+        };
+        let store = Store::open_in_memory().unwrap();
+        let email = json!({"mailboxIds":{"drafts":true},"keywords":{"$draft":true},"subject":"Subject","to":[{"email":"recipient@example.test"}],"bodyValues":{"body":{"value":"Hello"}},"htmlBody":[{"partId":"body","type":"text/html"}]});
+        let mut forged = email.clone();
+        forged["from"] = json!([{"email":"attacker@example.test"}]);
+        assert!(super::create_draft_with_identity(
+            &cfg,
+            "local",
+            &store,
+            &provider,
+            "forged",
+            &forged,
+            Some("allowed")
+        )
+        .is_err());
+        assert!(super::create_draft_with_identity(
+            &cfg,
+            "local",
+            &store,
+            &provider,
+            "denied",
+            &email,
+            Some("not-authorized")
+        )
+        .is_err());
+        assert!(store
+            .provider_mutation(&super::scope(&cfg, "local", &provider).unwrap(), "denied")
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            super::create_draft_with_identity(
+                &cfg,
+                "local",
+                &store,
+                &provider,
+                "allowed",
+                &email,
+                Some("allowed")
+            ),
+            Ok(super::SendOutcome::Confirmed(_))
+        ));
+        server.join().unwrap();
+    }
 
     #[test]
     fn discovery_access_observation_is_scoped_and_does_not_touch_credentials() {
@@ -2602,6 +2724,20 @@ pub fn create_draft(
     operation_id: &str,
     email: &Value,
 ) -> Result<SendOutcome, String> {
+    create_draft_with_identity(cfg, account, store, provider, operation_id, email, None)
+}
+
+/// Resolve the chosen native sending identity before creating the draft.
+#[allow(clippy::too_many_arguments)]
+pub fn create_draft_with_identity(
+    cfg: &Config,
+    account: &str,
+    store: &Store,
+    provider: &SelfHostedClient,
+    operation_id: &str,
+    email: &Value,
+    identity_id: Option<&str>,
+) -> Result<SendOutcome, String> {
     let scope = scope(cfg, account, provider)?;
     if operation_id.is_empty()
         || !email.is_object()
@@ -2714,6 +2850,28 @@ pub fn create_draft(
     {
         return Err("Invalid draft HTML part".into());
     }
+    let identities = selectable_sending_identities(cfg, account, provider)?;
+    let identity = match identity_id {
+        Some(id) => identities
+            .into_iter()
+            .find(|identity| identity.id == id)
+            .ok_or("Sending identity unavailable")?,
+        None if identities.len() == 1 => identities
+            .into_iter()
+            .next()
+            .ok_or("Sending identity unavailable")?,
+        None => return Err("Choose a sending identity".into()),
+    };
+    if identity.email.chars().any(char::is_whitespace) || !identity.email.contains('@') {
+        return Err("Invalid sending identity".into());
+    }
+    let mut signed_email = email.clone();
+    signed_email["from"] = if identity.name.is_empty() {
+        serde_json::json!([{"email":identity.email}])
+    } else {
+        serde_json::json!([{"name":identity.name,"email":identity.email}])
+    };
+    let email = &signed_email;
     let intent = serde_json::to_string(email).map_err(|_| "Invalid draft intent")?;
     if intent.len() > 16 * 1024 * 1024 {
         return Err("Draft intent exceeds size limit".into());

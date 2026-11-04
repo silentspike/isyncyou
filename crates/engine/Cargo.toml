@@ -29,6 +29,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 keyring-core = { version = "1", optional = true }
 
 [dev-dependencies]
+isyncyou-connectors = { path = "../connectors", default-features = false, features = ["http", "test-support"] }
 # Temp files for the ledger Upload/Replace body-source tests (#655).
 tempfile = "3"
 

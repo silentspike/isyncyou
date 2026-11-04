@@ -423,6 +423,47 @@ pub struct JmapSyncMetrics {
 }
 
 impl JmapClient {
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_loopback(origin: &str) -> Result<Self, JmapError> {
+        let origin = Url::parse(origin).map_err(|_| JmapError::InvalidUrl)?;
+        if origin.scheme() != "http"
+            || !origin
+                .host_str()
+                .and_then(|v| v.parse::<std::net::IpAddr>().ok())
+                .is_some_and(|ip| ip.is_loopback())
+            || origin.path() != "/"
+        {
+            return Err(JmapError::InvalidUrl);
+        }
+        Ok(Self {
+            http: Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .map_err(|_| JmapError::Transport)?,
+            origin: origin.clone(),
+            token: "fixture".into(),
+            account: "account".into(),
+            primary_account: "account".into(),
+            mail_accounts: vec![("account".into(), false)],
+            read_only: false,
+            api: origin.clone(),
+            download: String::new(),
+            upload: String::new(),
+            event_source: None,
+            submission: true,
+            mail_share: false,
+            gate: account_gate("draft-test", 2, 1),
+            max_get: 100,
+            max_request: 1024 * 1024,
+            max_upload: 1024,
+            session_state: "state".into(),
+            vapid_public_key: None,
+            metrics: Mutex::new(JmapSyncMetrics::default()),
+            sync_failure: Arc::new(Mutex::new(None)),
+        })
+    }
     pub fn discover(origin: &str, token: String) -> Result<Self, JmapError> {
         Self::discover_inner(origin, token, None)
     }

@@ -20,6 +20,34 @@ fn configured(cfg: &Config, account: &str) -> Result<(String, Store), String> {
     Ok((origin, store))
 }
 
+fn reject_known_dav_access_loss(
+    cfg: &Config,
+    account: &str,
+    collection: &str,
+    service: &str,
+) -> Result<(), String> {
+    let origin = configured_origin(cfg, account)?;
+    let store = match crate::provider_store::open_readonly(cfg, account) {
+        Ok(store) => store,
+        Err(error) if error == "Provider cache is not initialized" => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let scope = ProviderScope {
+        account_id: account.into(),
+        origin,
+        service: service.into(),
+        collection: collection.into(),
+    };
+    if store
+        .provider_accessible(&scope)
+        .map_err(|e| e.to_string())?
+        == Some(false)
+    {
+        return Err("DAV collection is not currently accessible".into());
+    }
+    Ok(())
+}
+
 fn client(cfg: &Config, account: &str, origin: &str) -> Result<DavClient, String> {
     let token = crate::provider_auth::self_hosted_access_token(cfg, account)?;
     DavClient::new(origin, token).map_err(|e| e.to_string())
@@ -510,6 +538,7 @@ pub fn expanded_events(
     end: &str,
     credentials: Option<&dyn ProviderCredentialStore>,
 ) -> Result<Vec<ExpandedCalendar>, String> {
+    reject_known_dav_access_loss(cfg, account, collection, "calendar")?;
     let origin = configured_origin(cfg, account)?;
     let client = match credentials {
         Some(credentials) => client_with_store(cfg, account, &origin, credentials)?,
@@ -565,6 +594,7 @@ pub fn expanded_task_views(
     end: &str,
     credentials: Option<&dyn ProviderCredentialStore>,
 ) -> Result<Vec<ProjectedObject>, String> {
+    reject_known_dav_access_loss(cfg, account, collection, "calendar")?;
     let origin = configured_origin(cfg, account)?;
     let client = match credentials {
         Some(c) => client_with_store(cfg, account, &origin, c)?,
@@ -611,6 +641,7 @@ pub fn read_current(
     if !matches!(service, "calendar" | "contacts") {
         return Err("Unsupported DAV service".into());
     }
+    reject_known_dav_access_loss(cfg, account, collection, service)?;
     let origin = configured_origin(cfg, account)?;
     let client = match credentials {
         Some(credentials) => client_with_store(cfg, account, &origin, credentials)?,
@@ -4153,25 +4184,76 @@ pub fn objects(
         service: service.into(),
         collection: collection.into(),
     };
+    cached_live_objects(&store, &scope, after, limit)
+}
+
+fn cached_live_objects(
+    store: &Store,
+    scope: &ProviderScope,
+    after: &str,
+    limit: usize,
+) -> Result<CachedObjects, String> {
+    let (observed_at, cursor, objects) = store
+        .provider_accessible_dav_snapshot(scope, after, limit)
+        .map_err(|e| e.to_string())?
+        .ok_or("DAV collection access not established")?;
     Ok(CachedObjects {
         account_id: scope.account_id.clone(),
         origin: scope.origin.clone(),
-        accessible: store
-            .provider_accessible(&scope)
-            .map_err(|e| e.to_string())?,
-        observed_at: store
-            .provider_observed_at(&scope)
-            .map_err(|e| e.to_string())?,
-        cursor: store.provider_cursor(&scope).map_err(|e| e.to_string())?,
-        objects: store
-            .provider_objects_page(&scope, after, limit)
-            .map_err(|e| e.to_string())?,
+        accessible: Some(true),
+        observed_at,
+        cursor,
+        objects,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_dav_pages_hide_lost_access_and_restore_without_deleting_originals() {
+        let store = Store::open_in_memory().unwrap();
+        for service in ["calendar", "contacts"] {
+            let scope = ProviderScope {
+                account_id: "fixture".into(),
+                origin: "https://example.test/".into(),
+                service: service.into(),
+                collection: format!("/{service}/"),
+            };
+            let original = ProviderObject {
+                remote_id: format!("/{service}/one"),
+                etag: Some("v1".into()),
+                raw: b"private fixture bytes".to_vec(),
+            };
+            store
+                .apply_provider_page(
+                    &scope,
+                    &[isyncyou_store::ProviderChange::Upsert(original.clone())],
+                    "one",
+                )
+                .unwrap();
+            assert_eq!(
+                cached_live_objects(&store, &scope, "", 10).unwrap().objects,
+                vec![original.clone()]
+            );
+            store.set_provider_accessible(&scope, false).unwrap();
+            assert!(cached_live_objects(&store, &scope, "", 10).is_err());
+            assert!(store
+                .provider_accessible_dav_objects_page(&scope, "", 10)
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                store.provider_object(&scope, &original.remote_id).unwrap(),
+                Some(original.clone())
+            );
+            store.set_provider_accessible(&scope, true).unwrap();
+            assert_eq!(
+                cached_live_objects(&store, &scope, "", 10).unwrap().objects,
+                vec![original]
+            );
+        }
+    }
 
     #[test]
     fn unsupported_recurring_alarm_does_not_hide_supported_reminder() {

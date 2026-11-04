@@ -1362,44 +1362,14 @@ impl isyncyou_agent::ToolExecutor for ProviderMailExecutor {
                 } else {
                     service.as_str()
                 };
-                let scopes = store
-                    .provider_scopes(&self.account, origin, native_service)
+                let matches = store
+                    .provider_accessible_dav_by_id(&self.account, origin, native_service, id)
                     .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
-                if scopes.len() > 1000 {
-                    return Err(AgentError::Provider(
-                        "provider collection lookup limit reached".into(),
-                    ));
-                }
-                let mut matches = Vec::new();
-                for scope in scopes {
-                    if store
-                        .provider_object(&scope, id)
-                        .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?
-                        .is_some()
-                    {
-                        matches.push(scope);
-                    }
-                }
-                let [scope] = matches.as_slice() else {
+                let [(scope, object, observed_at, cursor)] = matches.as_slice() else {
                     return Err(AgentError::Provider(
                         "provider object missing or ambiguous".into(),
                     ));
                 };
-                let accessible = store
-                    .provider_accessible(scope)
-                    .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
-                if accessible != Some(true) {
-                    return Err(AgentError::Provider(
-                        "provider collection access not established".into(),
-                    ));
-                }
-                let observed_at = store
-                    .provider_observed_at(scope)
-                    .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
-                let object = store
-                    .provider_object(scope, id)
-                    .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?
-                    .ok_or_else(|| AgentError::Provider("provider object unavailable".into()))?;
                 let maximum = max_bytes.unwrap_or(65536).clamp(1, 1024 * 1024) as usize;
                 if object.raw.len() > maximum {
                     return Err(AgentError::Provider(
@@ -1412,10 +1382,7 @@ impl isyncyou_agent::ToolExecutor for ProviderMailExecutor {
                     isyncyou_connectors::dav::projection::contact(&object.raw)
                 }
                 .map_err(|_| AgentError::Provider("provider projection unavailable".into()))?;
-                let cursor = store
-                    .provider_cursor(scope)
-                    .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
-                Ok(serde_json::json!({"account":self.account,"provider":origin,"service":service,"collection":scope.collection,"id":object.remote_id,"etag":object.etag,"view":view,"provenance":"local","accessible":accessible,"observed_at":observed_at,"cursor":cursor,"freshness":"last observed, not live"}).to_string())
+                Ok(serde_json::json!({"account":self.account,"provider":origin,"service":service,"collection":scope.collection,"id":object.remote_id,"etag":object.etag,"view":view,"provenance":"local","accessible":true,"observed_at":observed_at,"cursor":cursor,"freshness":"last observed, not live"}).to_string())
             }
             ToolAction::Search {
                 services,
@@ -19989,8 +19956,14 @@ impl isyncyou_webui::MailWriteHandler for DaemonMailWrite {
             email["header:Disposition-Notification-To:asAddresses"] =
                 serde_json::json!([{"email":identity.email}]);
         }
-        match isyncyou_engine::self_hosted_mail::create_draft(
-            &cfg, account, &store, &client, request_id, &email,
+        match isyncyou_engine::self_hosted_mail::create_draft_with_identity(
+            &cfg,
+            account,
+            &store,
+            &client,
+            request_id,
+            &email,
+            identity_id,
         )? {
             isyncyou_engine::self_hosted_mail::SendOutcome::Confirmed(id) => {
                 let synced =
