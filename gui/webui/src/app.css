@@ -1051,8 +1051,10 @@ a.note-meta-chip:hover { color: var(--accent); }
   .sync-widget { padding: var(--sp-2); align-items: center; }
 }
 
+/* Phone-only elements are hidden on desktop and the tablet rail. */
+.mobile-header, .mobile-nav { display: none; }
 /* ============================================================ responsive: mobile (bottom nav) */
-@media (max-width: 720px) {
+@media (max-width: 720px), (max-width: 1040px) and (max-height: 500px) and (pointer: coarse) {
   :root { --sidebar-w: 0px; }
   #app { grid-template-columns: 1fr; }
   .sidebar {
@@ -1124,6 +1126,61 @@ a.note-meta-chip:hover { color: var(--accent); }
      phone — stack the columns full-width instead. */
   .todo-board { flex-direction: column; overflow-x: visible; }
   .todo-col { flex: 1 1 auto; width: 100%; }
+  #app { height: 100dvh; }
+  .sidebar { display: none; }
+  .mobile-header {
+    flex: none; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    min-height: 68px; padding: calc(8px + env(safe-area-inset-top, 0px)) 16px 8px;
+    border-bottom: 1px solid var(--line); background: color-mix(in oklab, var(--bg-1) 92%, transparent);
+    backdrop-filter: blur(18px); z-index: 10;
+  }
+  .mobile-heading { min-width: 0; }
+  .mobile-eyebrow { display: block; color: var(--text-lo); font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; }
+  .mobile-title { margin: 2px 0 0; overflow: hidden; color: var(--text-hi); font-size: 20px; line-height: 1.15; letter-spacing: -.02em; text-overflow: ellipsis; white-space: nowrap; }
+  .mobile-account { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-width: 52px; max-width: 54%; min-height: 48px; padding: 4px 6px; color: var(--text-mid); background: var(--bg-2); border: 1px solid var(--line); border-radius: 16px; }
+  .mobile-account .avatar { width: 32px; height: 32px; font-size: 12px; }
+  .mobile-account-label { min-width: 0; max-width: 140px; overflow: hidden; color: var(--text-hi); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+  .mobile-nav {
+    position: fixed; z-index: 60; left: 0; right: 0; bottom: 0; display: grid; grid-template-columns: repeat(var(--mobile-nav-count, 5), minmax(0, 1fr));
+    gap: 4px; padding: 6px max(8px, env(safe-area-inset-right, 0px)) calc(6px + env(safe-area-inset-bottom, 0px)) max(8px, env(safe-area-inset-left, 0px));
+    border-top: 1px solid var(--line-2); background: color-mix(in oklab, var(--bg-1) 94%, transparent); backdrop-filter: blur(20px);
+  }
+  .mobile-nav-item { min-width: 0; min-height: 52px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; padding: 4px; border: 0; border-radius: 14px; background: transparent; color: var(--text-mid); }
+  .mobile-nav-item.active { color: var(--text-hi); background: var(--accent-soft); }
+  .mobile-nav-item.active .mobile-nav-icon { color: var(--accent); }
+  .mobile-nav-icon { display: grid; place-items: center; height: 22px; }
+  .mobile-nav-icon .icon { width: 20px; height: 20px; }
+  .mobile-nav-sub { max-width: 100%; overflow: hidden; color: var(--text-mid); font-size: 9px; line-height: 1; text-overflow: ellipsis; white-space: nowrap; }
+  .mobile-nav-label { width: 100%; overflow: hidden; font-size: 10px; line-height: 1.1; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
+  .view { padding: 16px 16px calc(88px + env(safe-area-inset-bottom, 0px)); }
+  .sheet:has(.mobile-more-body) { background-color: var(--bg-1); }
+  .mobile-more-body { padding: 16px; }
+  .mobile-more-intro { margin: 0 0 16px; color: var(--text-mid); font-size: var(--fs-md); }
+  .mobile-more-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .mobile-more-item { min-width: 0; min-height: 104px; display: flex; flex-direction: column; align-items: flex-start; gap: 8px; padding: 16px; border: 1px solid var(--line); border-radius: 16px; background: var(--bg-2); color: var(--text-hi); text-align: left; }
+  .mobile-more-item.active { border-color: var(--accent-line); background: var(--accent-soft); }
+  .mobile-more-icon { display: grid; place-items: center; width: 36px; height: 36px; border-radius: 12px; color: var(--svc); background: color-mix(in oklab, var(--svc) 12%, transparent); }
+  .mobile-more-label { max-width: 100%; overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+  .mobile-more-current { color: var(--text-mid); font-size: var(--fs-xs); }
+  .sheet header { padding-top: calc(16px + env(safe-area-inset-top, 0px)); }
+  .sheet .body { padding-bottom: calc(24px + env(safe-area-inset-bottom, 0px)); }
+  .acct-menu { top: calc(68px + env(safe-area-inset-top, 0px)); right: 12px; bottom: auto; left: auto; max-height: min(70dvh, 620px); }
+  .btn.sm, .cmp-tb-btn, .seg-btn, .nav-subitem, .state-chip { min-height: 44px; }
+  .btn.sm.icon-only, .cmp-tb-btn, .seg-btn { min-width: 44px; }
+  .cal-bar, .con-toolbar, .drive-bar, .todo-head { gap: 8px; }
+  .cal-bar > *, .con-toolbar > *, .drive-bar > * { min-width: 0; }
+  .view:has(.provider-calendar-page) { padding: 16px 16px calc(88px + env(safe-area-inset-bottom, 0px)); overflow: auto; }
+  .provider-calendar-page { height: auto; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .provider-calendar-page > h2, .provider-calendar-page > select, .provider-calendar-page > p,
+  .provider-calendar-page > .pick-list { flex: 1 0 100%; min-width: 0; }
+  .provider-calendar-page > h2 { margin: 0 0 4px; }
+  .provider-calendar-page > button { flex: 0 1 auto; }
+  .provider-calendar-page > .provider-create { background: var(--grad-accent); border-color: transparent; color: #fff; box-shadow: var(--sh-1); }
+  .provider-calendar-page > input[type="month"] { flex: 1 1 150px; min-width: 0; }
+  .view .view-actions { justify-content: flex-start; }
+  .view .view-actions > * { flex: 1 1 auto; min-width: 0; }
+  .view .state-chips { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 8px; scrollbar-width: thin; }
+  .view .state-chip { flex: 0 0 auto; white-space: nowrap; }
 }
 
 /* ============================================================ mail responsive (container query on .view) */

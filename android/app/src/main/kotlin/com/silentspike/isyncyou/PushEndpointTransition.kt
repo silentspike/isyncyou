@@ -117,3 +117,19 @@ internal object PushRenewReplacement {
 internal object PushStatusRead {
     fun reconcile(read: () -> JSONObject, apply: (JSONObject) -> Boolean): Boolean = apply(read())
 }
+
+/** Claim only the same enrollment after authenticated identity revalidation. */
+internal object PushCreateGuard {
+    fun claim(state: JSONObject, snapshot: JSONObject, account: String, origin: String, endpoint: String,
+              identityBinding: String, sessionState: String): Boolean {
+        if (state.optString("stage") != "broker_bound" || snapshot.optString("stage") != "broker_bound" ||
+            state.optString("account") != account || state.optString("origin") != origin ||
+            state.optString("endpoint") != endpoint || state.has("replacement") || snapshot.has("replacement") ||
+            !identityBinding.matches(Regex("[0-9a-f]{64}")) || sessionState.isEmpty()) return false
+        for (key in listOf("account", "origin", "endpoint", "public_key", "auth", "vapid", "session_state")) {
+            if (state.opt(key)?.toString() != snapshot.opt(key)?.toString()) return false
+        }
+        state.put("identity_binding", identityBinding).put("session_state", sessionState).put("stage", "create_unknown")
+        return true
+    }
+}

@@ -1012,6 +1012,16 @@ function accountDisplayLabel(account) {
       && !INTERNAL_ACCOUNT_LABELS.has(username.toLowerCase())) return username;
   return account && account.provider === "self_hosted" ? "Self-hosted account" : "Microsoft 365 account";
 }
+function accountSelectionLabel(account) {
+  const candidate = a => {
+    const label = accountDisplayLabel(a);
+    return App.accounts.length > 1 && label === "Self-hosted account"
+      ? String(a.username || a.id || label) : label;
+  };
+  const label = candidate(account);
+  const duplicate = App.accounts.some(other => other !== account && candidate(other) === label);
+  return duplicate && account.id ? `${label} · ${account.id}` : label;
+}
 // Per-service filter sub-items shown in the LEFT sidebar, indented under the
 // active service (NOT a separate rail). Lazy so Mail.cats is populated at call.
 // Map a well-known mail folder to an icon; custom folders fall back to "folder".
@@ -1382,9 +1392,32 @@ function invadersGame(canvas) {
   fit(); reset(); SFX.init(); raf = requestAnimationFrame(step);
 }
 
+const MOBILE_PRIMARY_ROUTES = ["overview", "mail", "calendar", "assistant"];
+function openMobileMore() {
+  const entries = visibleServices().filter(s => !MOBILE_PRIMARY_ROUTES.includes(s.id));
+  entries.push({ id:"search", label:"Search", icon:"search" }, { id:"settings", label:"Settings", icon:"settings" });
+  if (eggOn()) entries.push({ id:"invaders", label:"Invaders", icon:"sparkles" });
+  const grid = el("div", { class:"mobile-more-grid" }, entries.map(s =>
+    el("button", { class:"mobile-more-item" + (App.route === s.id ? " active" : ""), type:"button", dataset:{ route:s.id }, onclick:() => { closeSheet(); go(s.id); } },
+      el("span", { class:"mobile-more-icon", style:`--svc:var(--svc-${s.id}, var(--accent))` }, icon(s.icon)),
+      el("span", { class:"mobile-more-label", text:s.label }),
+      App.route === s.id ? el("span", { class:"mobile-more-current", text:"Current" }) : null)));
+  openSheet("More", el("div", { class:"body mobile-more-body" },
+    el("p", { class:"mobile-more-intro", text:"Your workspace" }), grid));
+}
+function renderMobileNavigation() {
+  const primary = MOBILE_PRIMARY_ROUTES.map(id => visibleServices().find(s => s.id === id)).filter(Boolean);
+  const secondary = !MOBILE_PRIMARY_ROUTES.includes(App.route);
+  return el("nav", { class:"mobile-nav", style:`--mobile-nav-count:${primary.length + 1}`, "aria-label":"Main navigation" },
+    primary.map(s => el("button", { type:"button", class:"mobile-nav-item" + (App.route === s.id ? " active" : ""), dataset:{ route:s.id }, "aria-current":App.route === s.id ? "page" : null, onclick:() => go(s.id) },
+      el("span", { class:"mobile-nav-icon" }, icon(s.icon)), el("span", { class:"mobile-nav-label", text:s.label }))),
+    el("button", { type:"button", class:"mobile-nav-item" + (secondary ? " active" : ""), "aria-label":secondary ? `More, current: ${routeLabel(App.route)}` : "More", onclick:openMobileMore },
+      el("span", { class:"mobile-nav-icon" }, icon("layout-dashboard")), el("span", { class:"mobile-nav-label", text:"More" }), secondary ? el("span", { class:"mobile-nav-sub", text:routeLabel(App.route) }) : null));
+}
 function renderShell() {
   const acc = App.accounts.find(a => a.id === App.account) || {};
   const accountLabel = accountDisplayLabel(acc);
+  const mobileAccountLabel = accountSelectionLabel(acc);
   const nav = el("nav", { class: "nav" },
     visibleServices().map(s => {
       const cnt = App.counts[s.id];
@@ -1450,9 +1483,13 @@ function renderShell() {
       icon("search", "icon-sm"), el("span", { class: "label-text", text: "Search everything" }), el("span", { class: "kbd", text: "⌘K" })),
     el("button", { class: "topbar-btn" + (App.route === "settings" ? " active" : ""), title: "Settings", onclick: () => go("settings") }, icon("settings", "icon-sm")),
   );
-  const main = el("main", { class: "main" }, topbar, el("div", { id: "view", class: "view" }));
+  const mobileHeader = el("header", { class:"mobile-header" },
+    el("div", { class:"mobile-heading" }, el("span", { class:"mobile-eyebrow", text:"iSyncYou" }), el("h1", { class:"mobile-title", text:routeLabel(App.route) })),
+    el("button", { class:"mobile-account", type:"button", title:"Switch account", "aria-label":`Switch account: ${mobileAccountLabel}`, onclick:openAccountSwitcher },
+      el("span", { class:"avatar", text:initials(mobileAccountLabel) }), el("span", { class:"mobile-account-label", text:mobileAccountLabel }), icon("chevron-down", "icon-sm")));
+  const main = el("main", { class: "main" }, topbar, mobileHeader, el("div", { id: "view", class: "view" }));
   const app = clear($("#app"));
-  app.append(sidebar, main);
+  app.append(sidebar, main, renderMobileNavigation());
   renderSyncWidget();
 }
 
@@ -3974,10 +4011,10 @@ function openProviderCreate(account, collection, kind) {
 async function renderProviderCalendarView(view, service) {
   const account = App.account, wanted = service === "todo" ? "VTODO" : "VEVENT";
   clear(view);
-  view.append(el("button",{class:"btn sm",type:"button",onclick:()=>openSingleCaptureStatus(account)},"Backup status"));
-  const select = el("select", { class:"input" }, el("option", { value:"", text:"Choose a calendar", selected:"selected", disabled:"disabled" }));
-  const status = el("p", { class:"dim", text:"Loading cached calendars…" });
-  const note = el("p", { class:"dim", text:"Native cached resources are shown; repeating events are not expanded into occurrences here." });
+  const backupStatus = el("button",{class:"btn sm",type:"button",onclick:()=>openSingleCaptureStatus(account)},"Backup status");
+  const select = el("select", { class:"input" }, el("option", { value:"", text:service === "todo" ? "Choose a task list" : "Choose a calendar", selected:"selected", disabled:"disabled" }));
+  const status = el("p", { class:"dim", text:service === "todo" ? "Loading task lists…" : "Loading calendars…" });
+  const note = el("p", { class:"dim", text:"Saved items are shown here. Repeating items appear as a series until you expand them." });
   const list = el("div", { class:"pick-list" });
   const expanded = el("div", { class:"pick-list" });
   const month = el("input", { type:"month", class:"input", "aria-label":"Month to expand" });
@@ -4083,7 +4120,7 @@ async function renderProviderCalendarView(view, service) {
               try {
                 const sessionId = await ensureAgentSession();
                 if (App.account !== account || select.value !== collection) throw new Error("Account changed");
-                const pending = await postJson("/api/v1/agent/task/completion/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, href:item.href, uid:component.uid, recurrence_id:recurrenceId, complete });
+                const pending = await postJson("/api/v1/agent/task/completion/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, href:item.href, uid:component.uid, recurrence_id:recurrenceId, complete }, PROVIDER_NATIVE_TIMEOUT_MS);
                 if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
                 const record = { ...pending, status:"pending", cancelled_result:"The task was not changed." };
                 AssistantState.pendingCardsById.set(record.pending_id, record);
@@ -4110,12 +4147,12 @@ async function renderProviderCalendarView(view, service) {
   App.liveUpdate = () => {
     if (view.isConnected && App.account === account && select.value && !more.disabled) void load(true);
   };
-  view.append(el("div", { class:"con-page" }, el("h2", { text:service === "todo" ? "Tasks" : "Calendar" }), select, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCreate(account, select.value, service === "todo" ? "task" : "event") }, service === "todo" ? "New task" : "New event") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCollectionAccess(account, "calendar", select.value) }, "Manage collection access") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderRecovery(account,"Recovered") }, "Recover…") : null, status, note, list, more, month, expand, service === "calendar" ? freebusy : null, expanded));
+  view.append(el("div", { class:"con-page provider-calendar-page" }, el("h2", { text:service === "todo" ? "Tasks" : "Calendar" }), select, backupStatus, CAP.agent ? el("button", { class:"btn sm provider-create", type:"button", onclick:() => openProviderCreate(account, select.value, service === "todo" ? "task" : "event") }, service === "todo" ? "New task" : "New event") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCollectionAccess(account, "calendar", select.value) }, "Manage collection access") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderRecovery(account,"Recovered") }, "Recover…") : null, status, note, list, more, month, expand, service === "calendar" ? freebusy : null, expanded));
   try {
     const result = await api("/api/v1/items?" + qs({ account, service }));
     if (App.account !== account || !view.isConnected) return;
     for (const collection of result.collections || []) if (typeof collection === "string") select.append(el("option", { value:collection, text:collection }));
-    status.textContent = result.collections && result.collections.length ? "Choose a cached calendar." : "No cached calendars. Connect and synchronize the account.";
+    status.textContent = result.collections && result.collections.length ? (service === "todo" ? "Choose a task list." : "Choose a calendar.") : (service === "todo" ? "No saved task lists. Connect and sync the account." : "No saved calendars. Connect and sync the account.");
   } catch (_) { status.textContent = "Cached calendars are unavailable."; }
 }
 
@@ -4625,7 +4662,7 @@ function chooseProviderContactPhoto(account,collection,href,forAssistant=false) 
 async function renderProviderContactsView(view) {
   const account = App.account;
   clear(view);
-  view.append(el("button",{class:"btn sm",type:"button",onclick:()=>openSingleCaptureStatus(account)},"Backup status"));
+  const backupStatus = el("button",{class:"btn sm",type:"button",onclick:()=>openSingleCaptureStatus(account)},"Backup status");
   const select = el("select", { class:"input" }, el("option", { value:"", text:"Choose an address book", selected:"selected", disabled:"disabled" }));
   const status = el("p", { class:"dim", text:"Loading cached address books…" });
   const list = el("div", { class:"pick-list" });
@@ -4683,7 +4720,7 @@ async function renderProviderContactsView(view) {
   };
   select.addEventListener("change", () => { cursor = null; void load(true); });
   more.addEventListener("click", () => { if (cursor) void load(false); });
-  view.append(el("div", { class:"con-page" }, el("h2", { text:"Contacts" }), select, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCreate(account, select.value, "contact") }, "New contact") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCollectionAccess(account, "contacts", select.value) }, "Manage collection access") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderRecovery(account,"Recovered","contacts") }, "Recover…") : null, status, list, more));
+  view.append(el("div", { class:"con-page provider-calendar-page" }, el("h2", { text:"Contacts" }), select, backupStatus, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCreate(account, select.value, "contact") }, "New contact") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCollectionAccess(account, "contacts", select.value) }, "Manage collection access") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderRecovery(account,"Recovered","contacts") }, "Recover…") : null, status, list, more));
   try {
     const result = await api("/api/v1/items?" + qs({ account, service:"contacts" }));
     if (App.account !== account || !view.isConnected) return;
@@ -9576,7 +9613,7 @@ function renderAccountMenu(body) {
   clear(body);
   App.accounts.forEach(a => {
     const active = a.id === App.account;
-    const accountLabel = accountDisplayLabel(a);
+    const accountLabel = accountSelectionLabel(a);
     const row = el("div", { class: "acct-row" + (active ? " active" : "") });
     row.append(el("div", { class: "acct-main" },
       el("span", { class: "avatar mail-av", style: "--c:var(--accent)", text: initials(accountLabel) }),

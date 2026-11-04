@@ -84,6 +84,26 @@ class PushEndpointTransitionTest {
         assertEquals("new-key", s.getJSONObject("replacement").getString("public_key"))
     }
 
+    @Test fun accountBindingUsesExactDomainAndUtf8() {
+        assertEquals("e884a48bde87d635d27af6364ffd4b5dbcb92f05f6c3741128a44053695cf52d", pushAccountBinding("fixture"))
+        assertFalse(pushAccountBinding("fixture") == pushAccountBinding("different"))
+    }
+
+    @Test fun createClaimRevalidatesEnrollmentAndKeepsUnknownNonReplayable() {
+        fun ready() = state("broker_bound").put("public_key", "key").put("auth", "auth")
+            .put("vapid", "vapid").put("session_state", "old")
+        val original = ready()
+        val changed = ready().put("endpoint", "https://new.example/topic")
+        assertFalse(PushCreateGuard.claim(changed, original, "fixture", "https://provider.example", "https://old.example/topic", "a".repeat(64), "new"))
+        val replacement = ready().put("replacement", JSONObject())
+        assertFalse(PushCreateGuard.claim(replacement, original, "fixture", "https://provider.example", "https://old.example/topic", "a".repeat(64), "new"))
+        val claim = ready()
+        assertTrue(PushCreateGuard.claim(claim, original, "fixture", "https://provider.example", "https://old.example/topic", "a".repeat(64), "new"))
+        assertEquals("create_unknown", claim.getString("stage"))
+        assertEquals("new", claim.getString("session_state"))
+        assertFalse(PushCreateGuard.claim(claim, original, "fixture", "https://provider.example", "https://old.example/topic", "a".repeat(64), "new"))
+    }
+
     @Test fun expiredDeliveryReplacementRequiresRetiredFence() {
         for (stage in listOf("credentials_ready", "awaiting_proof", "delivery_unknown", "proof_received", "confirm_unknown")) {
             val s = state(stage).put("expires", System.currentTimeMillis() / 1000 - 181)

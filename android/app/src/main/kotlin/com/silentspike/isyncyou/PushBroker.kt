@@ -4,10 +4,19 @@ import android.content.Context
 import android.util.Base64
 import org.json.JSONObject
 
+internal fun pushAccountBinding(nativeAccount: String): String {
+    val digest = java.security.MessageDigest.getInstance("SHA-256")
+    digest.update("isyncyou-push-account-v1".toByteArray(Charsets.UTF_8))
+    digest.update(0.toByte())
+    return digest.digest(nativeAccount.toByteArray(Charsets.UTF_8))
+        .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+}
+
 /** OAuth bearer transport is native; signed broker challenges stay outside the WebView. */
 internal object PushBroker {
     fun operation(context: Context, account: String, endpoint: String, action: String, nonce: String? = null,
-                  beforeDispatch: (() -> Boolean)? = null, operationId: String? = null): JSONObject {
+                  beforeDispatch: (() -> Boolean)? = null, operationId: String? = null,
+                  expectedAccountBinding: String? = null): JSONObject {
         require(action in setOf("prepare", "deliver", "confirm", "revoke", "cancel", "status"))
         val identity = if (action in setOf("cancel", "status")) requireNotNull(PushInstallationKey.existing(context, account))
             else PushInstallationKey.getOrCreate(context, account)
@@ -30,6 +39,11 @@ internal object PushBroker {
                     payload.getString("endpoint") == endpoint && payload.getString("public_key") == identity.publicKey &&
                     (operationId == null || payload.optString("operation_id") == operationId) &&
                     payload.getLong("expires") in now..(now + 180))
+                if (expectedAccountBinding != null) {
+                    require(action == "status" && expectedAccountBinding.matches(Regex("[0-9a-f]{64}")))
+                    val actual = pushAccountBinding(payload.getString("account"))
+                    require(java.security.MessageDigest.isEqual(actual.toByteArray(Charsets.US_ASCII), expectedAccountBinding.toByteArray(Charsets.US_ASCII)))
+                }
                 val signature = PushInstallationKey.sign(context, account, bytes)
                 JSONObject().put("challenge_id", id).put("signature", signature).apply {
                     if (nonce != null) put("received_nonce", nonce)

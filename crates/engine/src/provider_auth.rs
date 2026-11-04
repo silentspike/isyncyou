@@ -934,6 +934,22 @@ pub(crate) fn with_locked_provider_access_token<T>(
     action(&token)
 }
 
+/// Hold the account authorization lock while using both its token and its
+/// verified subject. The callback must not reacquire the account lock.
+pub(crate) fn with_locked_provider_identity<T>(
+    cfg: &Config,
+    id: &str,
+    store: &dyn ProviderCredentialStore,
+    action: impl FnOnce(&str, &str) -> Result<T, String>,
+) -> Result<T, String> {
+    let (origin, client_id, path) = account(cfg, id)?;
+    let _lock = lock(&path)?;
+    let token = access_token_locked(id, &origin, &client_id, store)?;
+    let subject = verified_subject_locked(store, id, &origin)?
+        .ok_or("Provider account identity unavailable")?;
+    action(&token, &subject)
+}
+
 #[cfg(not(target_os = "android"))]
 fn load_keyring(path: &std::path::Path) -> Result<TokenCache, String> {
     let marker: Value =

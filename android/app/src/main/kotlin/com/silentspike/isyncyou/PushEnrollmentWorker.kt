@@ -171,13 +171,22 @@ class PushEnrollmentWorker(context: Context, params: WorkerParameters) : Corouti
                 val metadata = PushJmap.call(applicationContext, account, "metadata")
                 val oldVapid = if (current.isNull("vapid")) null else current.optString("vapid")
                 val newVapid = if (metadata.isNull("vapid")) null else metadata.optString("vapid")
-                check(oldVapid == newVapid && current.optString("session_state") == metadata.optString("session_state"))
+                check(oldVapid == newVapid)
+                val accountBinding = metadata.getString("account_binding")
+                val identityBinding = metadata.getString("identity_binding")
+                val sessionState = metadata.getString("session_state")
+                check(accountBinding.matches(Regex("[0-9a-f]{64}")) && identityBinding.matches(Regex("[0-9a-f]{64}")) && sessionState.isNotEmpty())
+                val broker = PushBroker.operation(applicationContext, account, endpoint, "status", expectedAccountBinding = accountBinding)
+                check(broker.optString("binding") == "active")
                 val create = org.json.JSONObject().put("creation_id", "push")
                     .put("device_client_id", instance).put("endpoint", endpoint)
                     .put("p256dh", current.getString("public_key")).put("auth", current.getString("auth"))
+                    .put("identity_binding", identityBinding).put("expected_session_state", sessionState)
+                    .put("expected_vapid", newVapid ?: org.json.JSONObject.NULL)
+                if (PushInstallationKey.existing(applicationContext, account)?.installation != instance) return@withContext Result.failure()
                 if (!PushEnrollmentStore.update(applicationContext, instance) {
-                        if (it.optString("stage") != "broker_bound") return@update false
-                        it.put("stage", "create_unknown"); true
+                        if (!PushCreateGuard.claim(it, current, account, origin, endpoint, identityBinding, sessionState)) return@update false
+                        true
                     }) return@withContext Result.success()
                 val outcome = PushJmap.call(applicationContext, account, "create", create)
                 check(outcome.optString("status") == "applied")
@@ -195,6 +204,8 @@ class PushEnrollmentWorker(context: Context, params: WorkerParameters) : Corouti
             if (afterCreate.optString("stage") == "create_unknown") {
                 // A read can reconcile a lost response; absence is not proof to retry create.
                 val metadata = PushJmap.call(applicationContext, account, "metadata")
+                val expectedBinding = afterCreate.optString("identity_binding", "")
+                if (!expectedBinding.matches(Regex("[0-9a-f]{64}")) || metadata.optString("identity_binding") != expectedBinding) return@withContext Result.failure()
                 val oldVapid = if (afterCreate.isNull("vapid")) null else afterCreate.optString("vapid")
                 val newVapid = if (metadata.isNull("vapid")) null else metadata.optString("vapid")
                 if (oldVapid != newVapid) {

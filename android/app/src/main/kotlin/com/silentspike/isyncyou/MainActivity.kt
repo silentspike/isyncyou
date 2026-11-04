@@ -1097,7 +1097,7 @@ class MainActivity : FragmentActivity() {
                 return@dispatchBridge
             }
             if (state != null) {
-                if (state.optString("stage") in setOf("create_unknown", "destroy_unknown", "replacement_destroy_unknown", "renew_unknown", "confirm_unknown", "revoke_unknown", "replacement_revoke_unknown") ||
+                if (state.optString("stage") in setOf("broker_bound", "create_unknown", "destroy_unknown", "replacement_destroy_unknown", "renew_unknown", "confirm_unknown", "revoke_unknown", "replacement_revoke_unknown") ||
                     (state.optString("stage") in setOf("credentials_ready", "awaiting_proof", "delivery_unknown", "proof_received") &&
                         state.optLong("expires", 0) > 0 && System.currentTimeMillis() / 1000 >= state.optLong("expires", 0) + 180)) {
                     PushScheduler.enqueue(this, identity.installation)
