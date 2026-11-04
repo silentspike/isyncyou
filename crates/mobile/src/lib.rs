@@ -8,13 +8,13 @@
 //! minted here, used only by trusted native request paths, and required on every
 //! `/api/v1/*` route. Tokens are NEVER logged or exposed to WebView JavaScript.
 
-use isyncyou_core::{Config, OneDriveMode};
 #[cfg(test)]
 use isyncyou_core::AccountConfig;
-mod provider_credentials;
-mod reminder_mobile;
+use isyncyou_core::{Config, OneDriveMode};
 mod provider_auth_mobile;
+mod provider_credentials;
 mod recovery_signer;
+mod reminder_mobile;
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -939,20 +939,28 @@ fn refresh_self_hosted_data(cfg: &Config, base: &Path) -> (bool, HashMap<String,
     let mut changed = false;
     let mut outcomes = HashMap::new();
     for account in &cfg.accounts {
-        if !cfg.provider_accounts.contains_key(&account.id) { continue; }
+        if !cfg.provider_accounts.contains_key(&account.id) {
+            continue;
+        }
         let mut successful = true;
-        provider_jmap_diagnostics().lock().unwrap_or_else(|e| e.into_inner()).remove(&account.id);
+        provider_jmap_diagnostics()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&account.id);
         let protected = isyncyou_engine::provider_store::open(cfg, &account.id)
-            .map(|store| store.protected_provider_storage()).unwrap_or(false);
+            .map(|store| store.protected_provider_storage())
+            .unwrap_or(false);
         if !protected {
             android_info("provider_refresh_failed phase=store");
             outcomes.insert(account.id.clone(), false);
             continue;
         }
         let result = (|| -> Result<usize, &'static str> {
-            let store = isyncyou_engine::provider_store::open(cfg, &account.id)
-                .map_err(|_| "store")?;
-            if !store.protected_provider_storage() { return Err("store"); }
+            let store =
+                isyncyou_engine::provider_store::open(cfg, &account.id).map_err(|_| "store")?;
+            if !store.protected_provider_storage() {
+                return Err("store");
+            }
             let client = isyncyou_engine::self_hosted_mail::client(cfg, &account.id)
                 .map_err(|_| "jmap_discovery")?;
             isyncyou_engine::self_hosted_mail::sync_with_phase(cfg, &account.id, &store, &client)
@@ -978,13 +986,25 @@ fn refresh_self_hosted_data(cfg: &Config, base: &Path) -> (bool, HashMap<String,
             Err(phase) => {
                 match phase {
                     "store" => android_info("provider_refresh_failed phase=store"),
-                    "jmap_discovery" => android_info("provider_refresh_failed phase=jmap_discovery"),
-                    "jmap_configuration" => android_info("provider_refresh_failed phase=jmap_configuration"),
-                    "jmap_shared_access" => android_info("provider_refresh_failed phase=jmap_shared_access"),
+                    "jmap_discovery" => {
+                        android_info("provider_refresh_failed phase=jmap_discovery")
+                    }
+                    "jmap_configuration" => {
+                        android_info("provider_refresh_failed phase=jmap_configuration")
+                    }
+                    "jmap_shared_access" => {
+                        android_info("provider_refresh_failed phase=jmap_shared_access")
+                    }
                     "jmap_primary" => android_info("provider_refresh_failed phase=jmap_primary"),
-                    "jmap_shared_selection" => android_info("provider_refresh_failed phase=jmap_shared_selection"),
-                    "jmap_shared_mailbox" => android_info("provider_refresh_failed phase=jmap_shared_mailbox"),
-                    "jmap_shared_email" => android_info("provider_refresh_failed phase=jmap_shared_email"),
+                    "jmap_shared_selection" => {
+                        android_info("provider_refresh_failed phase=jmap_shared_selection")
+                    }
+                    "jmap_shared_mailbox" => {
+                        android_info("provider_refresh_failed phase=jmap_shared_mailbox")
+                    }
+                    "jmap_shared_email" => {
+                        android_info("provider_refresh_failed phase=jmap_shared_email")
+                    }
                     _ => android_info("provider_refresh_failed phase=jmap_sync"),
                 }
                 successful = false;
@@ -994,7 +1014,10 @@ fn refresh_self_hosted_data(cfg: &Config, base: &Path) -> (bool, HashMap<String,
         // have been dropped before starting this independent protocol pass.
         if let Ok(credentials) = provider_credentials::AndroidProviderCredentialStore::new(base) {
             match isyncyou_engine::dav_live::sync_all_with_store(
-                cfg, &account.id, "/.well-known/caldav", &credentials,
+                cfg,
+                &account.id,
+                "/.well-known/caldav",
+                &credentials,
             ) {
                 Ok(report) => {
                     changed |= report.changes > 0;
@@ -1003,9 +1026,15 @@ fn refresh_self_hosted_data(cfg: &Config, base: &Path) -> (bool, HashMap<String,
                         successful = false;
                     }
                 }
-                Err(_) => { android_info("provider_refresh_failed phase=dav_sync"); successful = false; }
+                Err(_) => {
+                    android_info("provider_refresh_failed phase=dav_sync");
+                    successful = false;
+                }
             }
-        } else { android_info("provider_refresh_failed phase=dav_credentials"); successful = false; }
+        } else {
+            android_info("provider_refresh_failed phase=dav_credentials");
+            successful = false;
+        }
         outcomes.insert(account.id.clone(), successful);
     }
     (changed, outcomes)
@@ -1029,24 +1058,31 @@ fn refresh_loop(
             cfg = load_mobile_loop_config(&config_path, &base, &cfg, &reload_warned);
             let (refreshed, provider_successful) = {
                 let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
-                let (self_hosted_changed, provider_successful) = refresh_self_hosted_data(&cfg, &base);
+                let (self_hosted_changed, provider_successful) =
+                    refresh_self_hosted_data(&cfg, &base);
                 let microsoft_changed = if cfg.provider_accounts.contains_key(ACCOUNT) {
                     false
-                } else { match isyncyou_engine::auth::resolve_cache_refresh_token(&cfg, ACCOUNT) {
-                    Ok(read) => {
-                        let write =
-                            isyncyou_engine::auth::resolve_cached_restore_token(&cfg, ACCOUNT).ok();
-                        // Notify the UI ONLY when the pass actually changed something —
-                        // a no-op refresh (the common idle case every poll_interval_secs)
-                        // must not wake SSE, or the whole view reloads periodically (the
-                        // visible "screen flicker"). `.changed()` is false for a no-op.
-                        isyncyou_engine::refresh_cache_account(&cfg, ACCOUNT, read, write)
-                            .map(|counts| counts.changed())
-                            .unwrap_or(false)
+                } else {
+                    match isyncyou_engine::auth::resolve_cache_refresh_token(&cfg, ACCOUNT) {
+                        Ok(read) => {
+                            let write =
+                                isyncyou_engine::auth::resolve_cached_restore_token(&cfg, ACCOUNT)
+                                    .ok();
+                            // Notify the UI ONLY when the pass actually changed something —
+                            // a no-op refresh (the common idle case every poll_interval_secs)
+                            // must not wake SSE, or the whole view reloads periodically (the
+                            // visible "screen flicker"). `.changed()` is false for a no-op.
+                            isyncyou_engine::refresh_cache_account(&cfg, ACCOUNT, read, write)
+                                .map(|counts| counts.changed())
+                                .unwrap_or(false)
+                        }
+                        Err(_) => false, // not signed in yet — skip quietly
                     }
-                    Err(_) => false, // not signed in yet — skip quietly
-                }};
-                (self_hosted_changed || microsoft_changed, provider_successful)
+                };
+                (
+                    self_hosted_changed || microsoft_changed,
+                    provider_successful,
+                )
             };
             // #655/#718: after the read-only cache refresh, run the mobile scoped OneDrive pass
             // for any explicit Sync/Offline folders, then wake SSE if either changed data.
@@ -1055,25 +1091,38 @@ fn refresh_loop(
                 events.notify(); // wake SSE subscribers so the UI refetches
             }
             provider_successful
-        })).unwrap_or_default();
+        }))
+        .unwrap_or_default();
         finish_provider_refresh(generation, successful);
     }
 }
 
 #[derive(Default)]
-struct RefreshSignal { requested: u64, completed: u64, outcomes: HashMap<String, bool> }
+struct RefreshSignal {
+    requested: u64,
+    completed: u64,
+    outcomes: HashMap<String, bool>,
+}
 
 fn provider_refresh_wakeup() -> &'static (Mutex<RefreshSignal>, std::sync::Condvar) {
     static WAKE: OnceLock<(Mutex<RefreshSignal>, std::sync::Condvar)> = OnceLock::new();
-    WAKE.get_or_init(|| (Mutex::new(RefreshSignal::default()), std::sync::Condvar::new()))
+    WAKE.get_or_init(|| {
+        (
+            Mutex::new(RefreshSignal::default()),
+            std::sync::Condvar::new(),
+        )
+    })
 }
 
 fn wait_for_provider_refresh(timeout: Duration) -> u64 {
     let (flag, wake) = provider_refresh_wakeup();
     let guard = flag.lock().unwrap_or_else(|e| e.into_inner());
-    let (mut guard, _) = wake.wait_timeout_while(guard, timeout, |state| state.requested == state.completed)
+    let (mut guard, _) = wake
+        .wait_timeout_while(guard, timeout, |state| state.requested == state.completed)
         .unwrap_or_else(|e| e.into_inner());
-    if guard.requested == guard.completed { guard.requested = guard.requested.saturating_add(1); }
+    if guard.requested == guard.completed {
+        guard.requested = guard.requested.saturating_add(1);
+    }
     guard.requested
 }
 
@@ -1097,22 +1146,28 @@ fn finish_provider_refresh(generation: u64, outcomes: HashMap<String, bool>) {
 fn wait_for_completed_refresh(generation: u64, account: &str, timeout: Duration) -> bool {
     let (flag, wake) = provider_refresh_wakeup();
     let guard = flag.lock().unwrap_or_else(|e| e.into_inner());
-    let (guard, _) = wake.wait_timeout_while(guard, timeout, |state| state.completed < generation)
+    let (guard, _) = wake
+        .wait_timeout_while(guard, timeout, |state| state.completed < generation)
         .unwrap_or_else(|e| e.into_inner());
     guard.completed >= generation && guard.outcomes.get(account).copied().unwrap_or(false)
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeWakeProviderRefresh<'a>(
-    _env: jni::EnvUnowned<'a>, _class: jni::objects::JClass<'a>,
+    _env: jni::EnvUnowned<'a>,
+    _class: jni::objects::JClass<'a>,
 ) {
     let _ = wake_provider_refresh();
 }
 
 /// Native-only, fixed diagnostic metadata for one locally selected account.
 #[no_mangle]
-pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeProviderRefreshDiagnostic<'a>(
-    mut env: jni::EnvUnowned<'a>, _class: jni::objects::JClass<'a>, account: jni::objects::JString<'a>,
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeProviderRefreshDiagnostic<
+    'a,
+>(
+    mut env: jni::EnvUnowned<'a>,
+    _class: jni::objects::JClass<'a>,
+    account: jni::objects::JString<'a>,
 ) -> jni::sys::jstring {
     let mut value = jni_get_string(&mut env, &account).and_then(|id| {
         provider_jmap_diagnostics().lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned()
@@ -1126,22 +1181,36 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeProvider
 /// Wait for a successful provider pass; timeout, partial errors and panic fail closed.
 #[no_mangle]
 pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeWaitProviderRefresh<'a>(
-    mut env: jni::EnvUnowned<'a>, _class: jni::objects::JClass<'a>, account: jni::objects::JString<'a>,
+    mut env: jni::EnvUnowned<'a>,
+    _class: jni::objects::JClass<'a>,
+    account: jni::objects::JString<'a>,
 ) -> jni::sys::jint {
-    let Some(account) = jni_get_string(&mut env, &account) else { return 0 };
+    let Some(account) = jni_get_string(&mut env, &account) else {
+        return 0;
+    };
     let generation = wake_provider_refresh();
-    i32::from(wait_for_completed_refresh(generation, &account, Duration::from_secs(120)))
+    i32::from(wait_for_completed_refresh(
+        generation,
+        &account,
+        Duration::from_secs(120),
+    ))
 }
 
 /// One pass can cover all accounts; callers must check each requested outcome.
 #[no_mangle]
-pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeWaitProviderRefreshResults<'a>(
-    mut env: jni::EnvUnowned<'a>, _class: jni::objects::JClass<'a>,
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeWaitProviderRefreshResults<
+    'a,
+>(
+    mut env: jni::EnvUnowned<'a>,
+    _class: jni::objects::JClass<'a>,
 ) -> jni::sys::jstring {
     let generation = wake_provider_refresh();
     let (flag, wake) = provider_refresh_wakeup();
     let guard = flag.lock().unwrap_or_else(|e| e.into_inner());
-    let (guard, _) = wake.wait_timeout_while(guard, Duration::from_secs(120), |state| state.completed < generation)
+    let (guard, _) = wake
+        .wait_timeout_while(guard, Duration::from_secs(120), |state| {
+            state.completed < generation
+        })
         .unwrap_or_else(|e| e.into_inner());
     let value = if guard.completed >= generation {
         serde_json::json!({"ok":true,"accounts":guard.outcomes})

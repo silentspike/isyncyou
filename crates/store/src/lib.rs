@@ -102,8 +102,13 @@ fn bounded_fts_snippet(value: String) -> String {
 pub const SCHEMA_VERSION: i64 = 21;
 
 mod provider;
+pub use provider::{
+    capture_identity, capture_version, mail_capture_object, ProviderAlarmIdentity,
+    ProviderAlarmIndex, ProviderCapture, ProviderChange, ProviderCollectionSnapshot,
+    ProviderDavIndex, ProviderDavIndexEntry, ProviderEvent, ProviderExportSnapshot, ProviderObject,
+    ProviderScope, ProviderSubmission,
+};
 pub use provider::{ProviderMailUploadIntentRecord, ProviderMutationIntentRecord};
-pub use provider::{capture_identity, capture_version, mail_capture_object, ProviderAlarmIdentity, ProviderAlarmIndex, ProviderCapture, ProviderChange, ProviderCollectionSnapshot, ProviderDavIndex, ProviderDavIndexEntry, ProviderEvent, ProviderExportSnapshot, ProviderObject, ProviderScope, ProviderSubmission};
 
 pub const STORE_KEY_ENV: &str = "ISYNCYOU_STORE_KEY";
 pub const STORE_KEY_FILE_ENV: &str = "ISYNCYOU_STORE_KEY_FILE";
@@ -788,7 +793,10 @@ impl Store {
         let lock_start = std::time::Instant::now();
         let lock = Self::acquire_lock(path)?;
         #[cfg(debug_assertions)]
-        eprintln!("isyncyou: encrypted_store lock_ms={}", lock_start.elapsed().as_millis());
+        eprintln!(
+            "isyncyou: encrypted_store lock_ms={}",
+            lock_start.elapsed().as_millis()
+        );
         #[cfg(debug_assertions)]
         let init_start = std::time::Instant::now();
         let conn = Connection::open(path)?;
@@ -796,7 +804,10 @@ impl Store {
         conn.pragma_update(None, "temp_store", "MEMORY")?;
         Self::init(&conn)?;
         #[cfg(debug_assertions)]
-        eprintln!("isyncyou: encrypted_store init_ms={}", init_start.elapsed().as_millis());
+        eprintln!(
+            "isyncyou: encrypted_store init_ms={}",
+            init_start.elapsed().as_millis()
+        );
         Ok(Store {
             conn,
             _lock: Some(lock),
@@ -854,20 +865,35 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         #[cfg(not(feature = "encrypted-store"))]
         let protected = false;
-        Ok(Store { conn, _lock: None, protected })
+        Ok(Store {
+            conn,
+            _lock: None,
+            protected,
+        })
     }
 
     /// Open an existing encrypted provider store for concurrent reads without
     /// creating a database or acquiring the writer lock.
     #[cfg(feature = "encrypted-store")]
     pub fn open_readonly_encrypted(path: impl AsRef<Path>, secret: &[u8]) -> Result<Self> {
-        if secret.is_empty() { return Err(StoreError::InvalidStoreSecret("secret must not be empty".into())); }
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-        apply_sqlcipher_key(&conn,secret)?;
+        if secret.is_empty() {
+            return Err(StoreError::InvalidStoreSecret(
+                "secret must not be empty".into(),
+            ));
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        apply_sqlcipher_key(&conn, secret)?;
         conn.pragma_update(None, "temp_store", "MEMORY")?;
-        let _: i64 = conn.query_row("PRAGMA user_version",[],|r| r.get(0))?;
+        let _: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        Ok(Store { conn, _lock:None, protected:true })
+        Ok(Store {
+            conn,
+            _lock: None,
+            protected: true,
+        })
     }
 
     /// Open a pre-initialized provider database for short WAL transactions.
@@ -883,11 +909,17 @@ impl Store {
         let conn = Connection::open_in_memory()?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&conn)?;
-        Ok(Store { conn, _lock: None, protected: true })
+        Ok(Store {
+            conn,
+            _lock: None,
+            protected: true,
+        })
     }
 
     /// Whether this store uses encrypted persistence or exists only in memory.
-    pub fn protected_provider_storage(&self) -> bool { self.protected }
+    pub fn protected_provider_storage(&self) -> bool {
+        self.protected
+    }
 
     /// Consume this read handle and begin one consistent progressive-search snapshot.
     ///
@@ -3045,7 +3077,9 @@ fn map_restore_op(r: &rusqlite::Row) -> rusqlite::Result<RestoreOperation> {
 
 fn migrate(conn: &Connection) -> Result<()> {
     let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if v > SCHEMA_VERSION { return Err(StoreError::FutureSchema(v)); }
+    if v > SCHEMA_VERSION {
+        return Err(StoreError::FutureSchema(v));
+    }
     let tx = conn.unchecked_transaction()?;
     let conn = &*tx;
     if v < 1 {
@@ -3124,20 +3158,33 @@ mod tests {
 
     #[test]
     fn failed_provider_migration_rolls_back_schema_and_version() {
-        let store=Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         store.conn.execute_batch("DROP TABLE provider_dav_index; DROP TABLE provider_stage_dav_index; DROP TABLE provider_sessions; DROP TABLE provider_session_objects; DROP TABLE provider_session_quotas; PRAGMA user_version=17; CREATE TABLE provider_sessions(blocker INTEGER);").unwrap();
         assert!(migrate(&store.conn).is_err());
-        assert_eq!(store.schema_version().unwrap(),17);
-        let created:i64=store.conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='provider_dav_index'",[],|r| r.get(0)).unwrap();
-        assert_eq!(created,0);
+        assert_eq!(store.schema_version().unwrap(), 17);
+        let created: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='provider_dav_index'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(created, 0);
     }
 
     #[test]
     fn future_schema_is_rejected_without_version_downgrade() {
-        let store=Store::open_in_memory().unwrap();
-        store.conn.pragma_update(None,"user_version",SCHEMA_VERSION+1).unwrap();
-        assert!(matches!(migrate(&store.conn),Err(StoreError::FutureSchema(_))));
-        assert_eq!(store.schema_version().unwrap(),SCHEMA_VERSION+1);
+        let store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        assert!(matches!(
+            migrate(&store.conn),
+            Err(StoreError::FutureSchema(_))
+        ));
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION + 1);
     }
 
     #[cfg(feature = "encrypted-store")]
@@ -3145,14 +3192,19 @@ mod tests {
     fn encrypted_provider_readonly_requires_existing_database_and_correct_key() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.db");
-        assert!(Store::open_readonly_encrypted(&missing,b"secret").is_err());
+        assert!(Store::open_readonly_encrypted(&missing, b"secret").is_err());
         assert!(!missing.exists());
         let path = dir.path().join("provider.db");
-        let writer = Store::open_encrypted(&path,b"secret").unwrap();
-        writer.upsert_item(&Item::new("a","mail","m","subject","message")).unwrap();
-        let reader = Store::open_readonly_encrypted(&path,b"secret").unwrap();
-        assert_eq!(reader.get_item("a","mail","m").unwrap().unwrap().name,"subject");
-        assert!(Store::open_readonly_encrypted(&path,b"wrong").is_err());
+        let writer = Store::open_encrypted(&path, b"secret").unwrap();
+        writer
+            .upsert_item(&Item::new("a", "mail", "m", "subject", "message"))
+            .unwrap();
+        let reader = Store::open_readonly_encrypted(&path, b"secret").unwrap();
+        assert_eq!(
+            reader.get_item("a", "mail", "m").unwrap().unwrap().name,
+            "subject"
+        );
+        assert!(Store::open_readonly_encrypted(&path, b"wrong").is_err());
     }
 
     #[cfg(feature = "encrypted-store")]
@@ -3160,18 +3212,45 @@ mod tests {
     fn abandoned_provider_staging_preserves_observed_versions_and_published_cursor() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("provider.db");
-        let scope = ProviderScope { account_id:"a".into(),origin:"https://example.test".into(),service:"contacts".into(),collection:"c".into() };
-        let writer = Store::open_encrypted(&path,b"secret").unwrap();
-        writer.apply_provider_page(&scope,&[],"original").unwrap();
-        writer.begin_provider_staging(&scope,"abandoned").unwrap();
-        writer.stage_provider_objects(&scope,"abandoned",&[ProviderObject {remote_id:"id".into(),etag:None,raw:b"observed".to_vec()}]).unwrap();
+        let scope = ProviderScope {
+            account_id: "a".into(),
+            origin: "https://example.test".into(),
+            service: "contacts".into(),
+            collection: "c".into(),
+        };
+        let writer = Store::open_encrypted(&path, b"secret").unwrap();
+        writer.apply_provider_page(&scope, &[], "original").unwrap();
+        writer.begin_provider_staging(&scope, "abandoned").unwrap();
+        writer
+            .stage_provider_objects(
+                &scope,
+                "abandoned",
+                &[ProviderObject {
+                    remote_id: "id".into(),
+                    etag: None,
+                    raw: b"observed".to_vec(),
+                }],
+            )
+            .unwrap();
         drop(writer);
-        let recovered = Store::open_encrypted(&path,b"secret").unwrap();
+        let recovered = Store::open_encrypted(&path, b"secret").unwrap();
         recovered.recover_abandoned_provider_staging().unwrap();
-        assert_eq!(recovered.provider_cursor(&scope).unwrap().as_deref(),Some("original"));
+        assert_eq!(
+            recovered.provider_cursor(&scope).unwrap().as_deref(),
+            Some("original")
+        );
         assert!(recovered.provider_objects(&scope).unwrap().is_empty());
-        assert_eq!(recovered.provider_captures_for("a","https://example.test",0,10).unwrap()[0].object.raw,b"observed");
-        assert!(recovered.finish_provider_staging(&scope,"abandoned","new").is_err());
+        assert_eq!(
+            recovered
+                .provider_captures_for("a", "https://example.test", 0, 10)
+                .unwrap()[0]
+                .object
+                .raw,
+            b"observed"
+        );
+        assert!(recovered
+            .finish_provider_staging(&scope, "abandoned", "new")
+            .is_err());
     }
 
     fn item(acc: &str, id: &str, name: &str) -> Item {

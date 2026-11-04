@@ -1,11 +1,11 @@
 //! JMAP mail transport. Store checkpoints and mutation intents belong to the caller.
 
+use crate::request_budget::{account_gate, origin_gate, Gate};
 use reqwest::blocking::{Client, Response};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use crate::request_budget::{account_gate, origin_gate, Gate};
 use std::time::Duration;
 use url::Url;
 
@@ -72,19 +72,52 @@ pub enum MailboxCreateResult {
 /// Read-only API-key client for a local exporter. No writable client is exposed.
 pub struct LoopbackJmapReader(JmapClient);
 impl LoopbackJmapReader {
-    pub fn discover(origin: &str, api_key: String, trusted_public_origin: &str) -> Result<Self, JmapError> {
+    pub fn discover(
+        origin: &str,
+        api_key: String,
+        trusted_public_origin: &str,
+    ) -> Result<Self, JmapError> {
         JmapClient::discover_inner(origin, api_key, Some(trusted_public_origin)).map(Self)
     }
-    pub fn account_id(&self) -> &str { self.0.account_id() }
-    pub fn max_objects_in_get(&self) -> usize { self.0.max_objects_in_get() }
-    pub fn get(&self, kind: &str, ids: Option<&[String]>, properties: Option<&[String]>) -> Result<Value, JmapError> {
-        if !matches!(kind, "Email" | "Mailbox") { return Err(JmapError::Unsupported); }
+    pub fn account_id(&self) -> &str {
+        self.0.account_id()
+    }
+    pub fn max_objects_in_get(&self) -> usize {
+        self.0.max_objects_in_get()
+    }
+    pub fn get(
+        &self,
+        kind: &str,
+        ids: Option<&[String]>,
+        properties: Option<&[String]>,
+    ) -> Result<Value, JmapError> {
+        if !matches!(kind, "Email" | "Mailbox") {
+            return Err(JmapError::Unsupported);
+        }
         self.0.get(kind, ids, properties)
     }
-    pub fn query_emails(&self, position: usize, limit: usize, filter: Option<Value>) -> Result<Value, JmapError> { self.0.query_emails(position, limit, filter) }
-    pub fn query_mailboxes(&self, position: usize, limit: usize) -> Result<Value, JmapError> { self.0.query_mailboxes(position, limit) }
-    pub fn changes(&self, kind: &str, since: &str, max: usize) -> Result<Value, JmapError> { self.0.changes(kind, since, max) }
-    pub fn download(&self, blob_id: &str, name: &str, media_type: &str) -> Result<Vec<u8>, JmapError> { self.0.download(blob_id, name, media_type) }
+    pub fn query_emails(
+        &self,
+        position: usize,
+        limit: usize,
+        filter: Option<Value>,
+    ) -> Result<Value, JmapError> {
+        self.0.query_emails(position, limit, filter)
+    }
+    pub fn query_mailboxes(&self, position: usize, limit: usize) -> Result<Value, JmapError> {
+        self.0.query_mailboxes(position, limit)
+    }
+    pub fn changes(&self, kind: &str, since: &str, max: usize) -> Result<Value, JmapError> {
+        self.0.changes(kind, since, max)
+    }
+    pub fn download(
+        &self,
+        blob_id: &str,
+        name: &str,
+        media_type: &str,
+    ) -> Result<Vec<u8>, JmapError> {
+        self.0.download(blob_id, name, media_type)
+    }
 }
 
 fn body(response: Response, max: u64) -> Result<Vec<u8>, JmapError> {
@@ -114,19 +147,45 @@ fn endpoint(origin: &Url, value: &str) -> Result<Url, JmapError> {
 /// client itself never follows redirects, so a bearer token cannot be sent to
 /// an unvalidated target. Loopback exporters may map only their enrolled public
 /// origin back to the same local listener.
-fn fetch_session(http: &Client, origin: &Url, token: &str, public: Option<&Url>) -> Result<Response, JmapError> {
+fn fetch_session(
+    http: &Client,
+    origin: &Url,
+    token: &str,
+    public: Option<&Url>,
+) -> Result<Response, JmapError> {
     let mut current = endpoint(origin, "/.well-known/jmap")?;
     let mut visited = std::collections::HashSet::new();
     for redirects in 0..=3 {
-        if !visited.insert(current.clone()) { return Err(JmapError::InvalidUrl); }
-        let response = http.get(current.clone()).bearer_auth(token).send().map_err(|_| JmapError::Transport)?;
-        if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) { return Ok(response); }
-        if redirects == 3 { return Err(JmapError::InvalidUrl); }
-        let location = response.headers().get(reqwest::header::LOCATION).and_then(|value| value.to_str().ok()).ok_or(JmapError::InvalidUrl)?;
+        if !visited.insert(current.clone()) {
+            return Err(JmapError::InvalidUrl);
+        }
+        let response = http
+            .get(current.clone())
+            .bearer_auth(token)
+            .send()
+            .map_err(|_| JmapError::Transport)?;
+        if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+            return Ok(response);
+        }
+        if redirects == 3 {
+            return Err(JmapError::InvalidUrl);
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or(JmapError::InvalidUrl)?;
         let target = current.join(location).map_err(|_| JmapError::InvalidUrl)?;
-        if !target.username().is_empty() || target.password().is_some() || target.fragment().is_some() { return Err(JmapError::InvalidUrl); }
+        if !target.username().is_empty()
+            || target.password().is_some()
+            || target.fragment().is_some()
+        {
+            return Err(JmapError::InvalidUrl);
+        }
         let mapped = match public {
-            Some(public) if target.origin() == public.origin() => rewrite_loopback_endpoint(origin, public, target.as_str())?,
+            Some(public) if target.origin() == public.origin() => {
+                rewrite_loopback_endpoint(origin, public, target.as_str())?
+            }
             _ => target.to_string(),
         };
         current = endpoint(origin, &mapped)?;
@@ -135,57 +194,133 @@ fn fetch_session(http: &Client, origin: &Url, token: &str, public: Option<&Url>)
 }
 
 fn event_source_endpoint(origin: &Url, template: &str) -> Result<Url, JmapError> {
-    if template.len() > 8192 || ["{types}","{closeafter}","{ping}"].iter().any(|part| template.matches(part).count() != 1) { return Err(JmapError::InvalidUrl); }
-    let value = template.replace("{types}", "Email%2CMailbox%2CCalendar%2CCalendarEvent%2CAddressBook%2CContactCard").replace("{closeafter}", "no").replace("{ping}", "30");
-    if value.contains('{') || value.contains('}') { return Err(JmapError::InvalidUrl); }
+    if template.len() > 8192
+        || ["{types}", "{closeafter}", "{ping}"]
+            .iter()
+            .any(|part| template.matches(part).count() != 1)
+    {
+        return Err(JmapError::InvalidUrl);
+    }
+    let value = template
+        .replace(
+            "{types}",
+            "Email%2CMailbox%2CCalendar%2CCalendarEvent%2CAddressBook%2CContactCard",
+        )
+        .replace("{closeafter}", "no")
+        .replace("{ping}", "30");
+    if value.contains('{') || value.contains('}') {
+        return Err(JmapError::InvalidUrl);
+    }
     endpoint(origin, &value)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EventDomains { pub mail: bool, pub dav: bool }
+pub struct EventDomains {
+    pub mail: bool,
+    pub dav: bool,
+}
 
 fn state_change_domains(data: &str, _account: &str) -> Result<EventDomains, JmapError> {
     let value: Value = serde_json::from_str(data).map_err(|_| JmapError::InvalidResponse)?;
-    if value["@type"].as_str() != Some("StateChange") { return Err(JmapError::InvalidResponse); }
-    let changed = value["changed"].as_object().ok_or(JmapError::InvalidResponse)?;
-    let mut domains = EventDomains { mail:false, dav:false };
+    if value["@type"].as_str() != Some("StateChange") {
+        return Err(JmapError::InvalidResponse);
+    }
+    let changed = value["changed"]
+        .as_object()
+        .ok_or(JmapError::InvalidResponse)?;
+    let mut domains = EventDomains {
+        mail: false,
+        dav: false,
+    };
     for (_changed_account, types) in changed {
         let types = types.as_object().ok_or(JmapError::InvalidResponse)?;
-        for name in ["Email","Mailbox","Calendar","CalendarEvent","AddressBook","ContactCard"] {
+        for name in [
+            "Email",
+            "Mailbox",
+            "Calendar",
+            "CalendarEvent",
+            "AddressBook",
+            "ContactCard",
+        ] {
             if let Some(state) = types.get(name) {
-                if state.as_str().is_none_or(str::is_empty) { return Err(JmapError::InvalidResponse); }
-                if matches!(name, "Email" | "Mailbox") { domains.mail = true; } else { domains.dav = true; }
+                if state.as_str().is_none_or(str::is_empty) {
+                    return Err(JmapError::InvalidResponse);
+                }
+                if matches!(name, "Email" | "Mailbox") {
+                    domains.mail = true;
+                } else {
+                    domains.dav = true;
+                }
             }
         }
     }
     Ok(domains)
 }
 
-fn consume_mail_event_stream(reader: &mut impl BufRead, account: &str, stop: &AtomicBool, on_change: &mut impl FnMut(EventDomains) -> Result<(), ()>) -> Result<(), JmapError> {
-    let mut event = String::new(); let mut data = String::new();
+fn consume_mail_event_stream(
+    reader: &mut impl BufRead,
+    account: &str,
+    stop: &AtomicBool,
+    on_change: &mut impl FnMut(EventDomains) -> Result<(), ()>,
+) -> Result<(), JmapError> {
+    let mut event = String::new();
+    let mut data = String::new();
     while !stop.load(Ordering::Relaxed) {
         let mut line = Vec::new();
-        let n = (&mut *reader).take(65_537).read_until(b'\n', &mut line).map_err(|_| JmapError::Transport)?;
-        if n == 0 { return Ok(()); }
-        if line.len() > 65_536 { return Err(JmapError::InvalidResponse); }
-        let line = std::str::from_utf8(&line).map_err(|_| JmapError::InvalidResponse)?.trim_end_matches(['\r','\n']);
+        let n = (&mut *reader)
+            .take(65_537)
+            .read_until(b'\n', &mut line)
+            .map_err(|_| JmapError::Transport)?;
+        if n == 0 {
+            return Ok(());
+        }
+        if line.len() > 65_536 {
+            return Err(JmapError::InvalidResponse);
+        }
+        let line = std::str::from_utf8(&line)
+            .map_err(|_| JmapError::InvalidResponse)?
+            .trim_end_matches(['\r', '\n']);
         if line.is_empty() {
             if event == "state" {
                 let domains = state_change_domains(&data, account)?;
-                if domains.mail || domains.dav { on_change(domains).map_err(|_| JmapError::Transport)?; }
+                if domains.mail || domains.dav {
+                    on_change(domains).map_err(|_| JmapError::Transport)?;
+                }
             } else if event == "ping" {
-                let ping: Value = serde_json::from_str(&data).map_err(|_| JmapError::InvalidResponse)?;
-                if ping["interval"].as_u64().is_none_or(|interval| interval == 0 || interval > 3600) { return Err(JmapError::InvalidResponse); }
-                on_change(EventDomains {mail:false,dav:false}).map_err(|_| JmapError::Transport)?;
+                let ping: Value =
+                    serde_json::from_str(&data).map_err(|_| JmapError::InvalidResponse)?;
+                if ping["interval"]
+                    .as_u64()
+                    .is_none_or(|interval| interval == 0 || interval > 3600)
+                {
+                    return Err(JmapError::InvalidResponse);
+                }
+                on_change(EventDomains {
+                    mail: false,
+                    dav: false,
+                })
+                .map_err(|_| JmapError::Transport)?;
             }
-            event.clear(); data.clear(); continue;
+            event.clear();
+            data.clear();
+            continue;
         }
-        if line.starts_with(':') { continue; }
-        let (field,value) = line.split_once(':').unwrap_or((line,""));
+        if line.starts_with(':') {
+            continue;
+        }
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
         let value = value.strip_prefix(' ').unwrap_or(value);
         match field {
             "event" => event = value.to_owned(),
-            "data" => { if !data.is_empty() { data.push('\n'); } data.push_str(value); if data.len()>65_536 { return Err(JmapError::InvalidResponse); } },
+            "data" => {
+                if !data.is_empty() {
+                    data.push('\n');
+                }
+                data.push_str(value);
+                if data.len() > 65_536 {
+                    return Err(JmapError::InvalidResponse);
+                }
+            }
             _ => {}
         }
     }
@@ -193,21 +328,42 @@ fn consume_mail_event_stream(reader: &mut impl BufRead, account: &str, stop: &At
 }
 fn allowed_origin(origin: &Url, loopback: bool) -> bool {
     if loopback {
-        origin.scheme() == "http" && (matches!(origin.host(), Some(url::Host::Ipv4(ip)) if ip == std::net::Ipv4Addr::LOCALHOST)
-            || matches!(origin.host(), Some(url::Host::Ipv6(ip)) if ip == std::net::Ipv6Addr::LOCALHOST))
-    } else { origin.scheme() == "https" }
+        origin.scheme() == "http"
+            && (matches!(origin.host(), Some(url::Host::Ipv4(ip)) if ip == std::net::Ipv4Addr::LOCALHOST)
+                || matches!(origin.host(), Some(url::Host::Ipv6(ip)) if ip == std::net::Ipv6Addr::LOCALHOST))
+    } else {
+        origin.scheme() == "https"
+    }
 }
 fn rewrite_loopback_endpoint(local: &Url, public: &Url, value: &str) -> Result<String, JmapError> {
-    let vars = [("{accountId}", "JMAPVARACCOUNT"), ("{blobId}", "JMAPVARBLOB"), ("{name}", "JMAPVARNAME"), ("{type}", "JMAPVARTYPE")];
+    let vars = [
+        ("{accountId}", "JMAPVARACCOUNT"),
+        ("{blobId}", "JMAPVARBLOB"),
+        ("{name}", "JMAPVARNAME"),
+        ("{type}", "JMAPVARTYPE"),
+    ];
     let mut encoded = value.to_owned();
-    for (var, marker) in vars { if encoded.contains(marker) { return Err(JmapError::InvalidUrl); } encoded = encoded.replace(var, marker); }
+    for (var, marker) in vars {
+        if encoded.contains(marker) {
+            return Err(JmapError::InvalidUrl);
+        }
+        encoded = encoded.replace(var, marker);
+    }
     let url = local.join(&encoded).map_err(|_| JmapError::InvalidUrl)?;
-    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() || (url.origin() != local.origin() && url.origin() != public.origin()) { return Err(JmapError::InvalidUrl); }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || (url.origin() != local.origin() && url.origin() != public.origin())
+    {
+        return Err(JmapError::InvalidUrl);
+    }
     let mut mapped = local.clone();
     mapped.set_path(url.path());
     mapped.set_query(url.query());
     let mut result = mapped.to_string();
-    for (var, marker) in vars { result = result.replace(marker, var); }
+    for (var, marker) in vars {
+        result = result.replace(marker, var);
+    }
     Ok(result)
 }
 fn nonempty(value: Option<&Value>) -> Result<&str, JmapError> {
@@ -270,7 +426,11 @@ impl JmapClient {
     pub fn discover(origin: &str, token: String) -> Result<Self, JmapError> {
         Self::discover_inner(origin, token, None)
     }
-    fn discover_inner(origin: &str, token: String, trusted_public_origin: Option<&str>) -> Result<Self, JmapError> {
+    fn discover_inner(
+        origin: &str,
+        token: String,
+        trusted_public_origin: Option<&str>,
+    ) -> Result<Self, JmapError> {
         let loopback = trusted_public_origin.is_some();
         let origin = Url::parse(origin).map_err(|_| JmapError::InvalidUrl)?;
         if !allowed_origin(&origin, loopback)
@@ -286,15 +446,27 @@ impl JmapClient {
         }
         let public = if let Some(value) = trusted_public_origin {
             let url = Url::parse(value).map_err(|_| JmapError::InvalidUrl)?;
-            if !allowed_origin(&url, false) || url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() || url.path() != "/" || url.query().is_some() || url.fragment().is_some() { return Err(JmapError::InvalidUrl); }
+            if !allowed_origin(&url, false)
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.path() != "/"
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                return Err(JmapError::InvalidUrl);
+            }
             Some(url)
-        } else { None };
+        } else {
+            None
+        };
         let mut builder = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(60));
-        if loopback { builder = builder.no_proxy(); }
-        let http = builder.build()
-            .map_err(|_| JmapError::Transport)?;
+        if loopback {
+            builder = builder.no_proxy();
+        }
+        let http = builder.build().map_err(|_| JmapError::Transport)?;
         let gate = origin_gate(&origin);
         let discovery_permit = gate.acquire(false);
         let response = fetch_session(&http, &origin, &token, public.as_ref())?;
@@ -342,25 +514,53 @@ impl JmapClient {
         if !account_caps.contains_key(MAIL) {
             return Err(JmapError::Unsupported);
         }
-        let advertised = session.get("accounts").and_then(Value::as_object).ok_or(JmapError::InvalidResponse)?;
-        if advertised.len() > 256 { return Err(JmapError::InvalidResponse); }
+        let advertised = session
+            .get("accounts")
+            .and_then(Value::as_object)
+            .ok_or(JmapError::InvalidResponse)?;
+        if advertised.len() > 256 {
+            return Err(JmapError::InvalidResponse);
+        }
         let mut mail_accounts = Vec::new();
         for (id, entry) in advertised {
-            let caps = entry.get("accountCapabilities").and_then(Value::as_object).ok_or(JmapError::InvalidResponse)?;
-            if !caps.contains_key(MAIL) { continue; }
-            if id.is_empty() || id.len() > 1024 || id.chars().any(char::is_control) { return Err(JmapError::InvalidResponse); }
-            let read_only = entry.get("isReadOnly").and_then(Value::as_bool).unwrap_or(id != &account);
+            let caps = entry
+                .get("accountCapabilities")
+                .and_then(Value::as_object)
+                .ok_or(JmapError::InvalidResponse)?;
+            if !caps.contains_key(MAIL) {
+                continue;
+            }
+            if id.is_empty() || id.len() > 1024 || id.chars().any(char::is_control) {
+                return Err(JmapError::InvalidResponse);
+            }
+            let read_only = entry
+                .get("isReadOnly")
+                .and_then(Value::as_bool)
+                .unwrap_or(id != &account);
             mail_accounts.push((id.clone(), read_only));
         }
-        let read_only = mail_accounts.iter().find(|(id,_)| id == &account).map(|(_,v)| *v).ok_or(JmapError::InvalidResponse)?;
+        let read_only = mail_accounts
+            .iter()
+            .find(|(id, _)| id == &account)
+            .map(|(_, v)| *v)
+            .ok_or(JmapError::InvalidResponse)?;
         let submission =
             capabilities.contains_key(SUBMISSION) && account_caps.contains_key(SUBMISSION);
-        let mail_share = capabilities.contains_key(MAIL_SHARE) && account_caps.contains_key(MAIL_SHARE);
-        let map = |value: &str| -> Result<String, JmapError> { if let Some(public) = &public { rewrite_loopback_endpoint(&origin, public, value) } else { Ok(value.to_owned()) } };
+        let mail_share =
+            capabilities.contains_key(MAIL_SHARE) && account_caps.contains_key(MAIL_SHARE);
+        let map = |value: &str| -> Result<String, JmapError> {
+            if let Some(public) = &public {
+                rewrite_loopback_endpoint(&origin, public, value)
+            } else {
+                Ok(value.to_owned())
+            }
+        };
         let api = endpoint(&origin, &map(nonempty(session.get("apiUrl"))?)?)?;
         let download = map(nonempty(session.get("downloadUrl"))?)?;
         let upload = map(nonempty(session.get("uploadUrl"))?)?;
-        let event_source = if loopback { None } else {
+        let event_source = if loopback {
+            None
+        } else {
             match session.get("eventSourceUrl") {
                 Some(Value::String(template)) => Some(event_source_endpoint(&origin, template)?),
                 None | Some(Value::Null) => None,
@@ -386,7 +586,7 @@ impl JmapClient {
             http,
             origin,
             token,
-            primary_account:account.clone(),
+            primary_account: account.clone(),
             account,
             mail_accounts,
             read_only,
@@ -407,62 +607,143 @@ impl JmapClient {
         })
     }
     pub fn sync_metrics(&self) -> JmapSyncMetrics {
-        *self.metrics.lock().unwrap_or_else(|error| error.into_inner())
+        *self
+            .metrics
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
     pub fn record_email_changes(&self, created: usize, updated: usize) {
-        let mut metrics = self.metrics.lock().unwrap_or_else(|error| error.into_inner());
+        let mut metrics = self
+            .metrics
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         metrics.created += created as u64;
         metrics.updated += updated as u64;
     }
     pub fn record_email_reconciliation(&self) {
-        self.metrics.lock().unwrap_or_else(|error| error.into_inner()).email_reconciliations += 1;
+        self.metrics
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .email_reconciliations += 1;
     }
-    pub fn clear_sync_failure(&self) { *self.sync_failure.lock().unwrap_or_else(|e|e.into_inner())=None; }
-    pub fn last_sync_failure(&self) -> Option<JmapSyncFailure> { *self.sync_failure.lock().unwrap_or_else(|e|e.into_inner()) }
-    pub fn record_store_failure(&self) { *self.sync_failure.lock().unwrap_or_else(|e|e.into_inner())=Some(JmapSyncFailure {operation:"store",class:"store",http_status:None,method_type:None}); }
-    fn record_sync_error(&self, method:&str, error:&JmapError) {
-        let operation=match method { "Mailbox/query"=>"mailbox_query", "Mailbox/get"=>"mailbox_get", "Mailbox/changes"=>"mailbox_changes", "Email/query"=>"email_query", "Email/get"=>"email_get", "Email/changes"=>"email_changes", _=>return };
-        let (class,http_status,method_type)=match error {
-            JmapError::Http(status)=>("http",Some(*status),None),
-            JmapError::Transport=>("transport",None,None),
-            JmapError::InvalidUrl | JmapError::InvalidResponse=>("invalid_response",None,None),
-            JmapError::Unsupported=>("unsupported",None,None),
-            JmapError::OutcomeUnknown=>("outcome_unknown",None,None),
-            JmapError::Method(kind)=>{
-                let safe=match kind.as_str() { "cannotCalculateChanges"=>"cannotCalculateChanges", "stateMismatch"=>"stateMismatch", "accountNotFound"=>"accountNotFound", "accountNotSupportedByMethod"=>"accountNotSupportedByMethod", "accountReadOnly"=>"accountReadOnly", "forbidden"=>"forbidden", "invalidArguments"=>"invalidArguments", "serverFail"=>"serverFail", "unknownMethod"=>"unknownMethod", "requestTooLarge"=>"requestTooLarge", _=>"other" };
-                ("method",None,Some(safe))
+    pub fn clear_sync_failure(&self) {
+        *self.sync_failure.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    pub fn last_sync_failure(&self) -> Option<JmapSyncFailure> {
+        *self.sync_failure.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    pub fn record_store_failure(&self) {
+        *self.sync_failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(JmapSyncFailure {
+            operation: "store",
+            class: "store",
+            http_status: None,
+            method_type: None,
+        });
+    }
+    fn record_sync_error(&self, method: &str, error: &JmapError) {
+        let operation = match method {
+            "Mailbox/query" => "mailbox_query",
+            "Mailbox/get" => "mailbox_get",
+            "Mailbox/changes" => "mailbox_changes",
+            "Email/query" => "email_query",
+            "Email/get" => "email_get",
+            "Email/changes" => "email_changes",
+            _ => return,
+        };
+        let (class, http_status, method_type) = match error {
+            JmapError::Http(status) => ("http", Some(*status), None),
+            JmapError::Transport => ("transport", None, None),
+            JmapError::InvalidUrl | JmapError::InvalidResponse => ("invalid_response", None, None),
+            JmapError::Unsupported => ("unsupported", None, None),
+            JmapError::OutcomeUnknown => ("outcome_unknown", None, None),
+            JmapError::Method(kind) => {
+                let safe = match kind.as_str() {
+                    "cannotCalculateChanges" => "cannotCalculateChanges",
+                    "stateMismatch" => "stateMismatch",
+                    "accountNotFound" => "accountNotFound",
+                    "accountNotSupportedByMethod" => "accountNotSupportedByMethod",
+                    "accountReadOnly" => "accountReadOnly",
+                    "forbidden" => "forbidden",
+                    "invalidArguments" => "invalidArguments",
+                    "serverFail" => "serverFail",
+                    "unknownMethod" => "unknownMethod",
+                    "requestTooLarge" => "requestTooLarge",
+                    _ => "other",
+                };
+                ("method", None, Some(safe))
             }
         };
-        *self.sync_failure.lock().unwrap_or_else(|e|e.into_inner())=Some(JmapSyncFailure {operation,class,http_status,method_type});
+        *self.sync_failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(JmapSyncFailure {
+            operation,
+            class,
+            http_status,
+            method_type,
+        });
     }
     pub fn account_id(&self) -> &str {
         &self.account
     }
     /// One read-only negative check for the fixed administrative method.
     pub fn probe_admin_query(&self) -> &'static str {
-        let payload = match self.call_payload("x:Account/query", json!({"accountId":self.account,"limit":1}), false, false) {
-            Ok(payload)=>payload,
-            Err(JmapError::Http(401))=>return "http_401",
-            Err(JmapError::Http(403))=>return "http_403",
-            Err(JmapError::Http(_))=>return "other_http",
-            Err(_)=>return "unavailable",
+        let payload = match self.call_payload(
+            "x:Account/query",
+            json!({"accountId":self.account,"limit":1}),
+            false,
+            false,
+        ) {
+            Ok(payload) => payload,
+            Err(JmapError::Http(401)) => return "http_401",
+            Err(JmapError::Http(403)) => return "http_403",
+            Err(JmapError::Http(_)) => return "other_http",
+            Err(_) => return "unavailable",
         };
-        match parse_method(&payload,"x:Account/query") {
-            Ok(_)=>"allowed",
-            Err(JmapError::Method(kind)) if kind=="forbidden"=>"forbidden",
-            Err(JmapError::Method(kind)) if kind=="accountNotFound"=>"account_not_found",
-            Err(JmapError::Method(kind)) if kind=="unknownMethod"=>"unknown_method",
-            Err(JmapError::Method(_))=>"other_method_error",
-            Err(_)=>"invalid_response",
+        match parse_method(&payload, "x:Account/query") {
+            Ok(_) => "allowed",
+            Err(JmapError::Method(kind)) if kind == "forbidden" => "forbidden",
+            Err(JmapError::Method(kind)) if kind == "accountNotFound" => "account_not_found",
+            Err(JmapError::Method(kind)) if kind == "unknownMethod" => "unknown_method",
+            Err(JmapError::Method(_)) => "other_method_error",
+            Err(_) => "invalid_response",
         }
     }
-    pub fn primary_account_id(&self) -> &str { &self.primary_account }
+    pub fn primary_account_id(&self) -> &str {
+        &self.primary_account
+    }
     /// Only accounts advertised for mail by this freshly authenticated session.
-    pub fn mail_accounts(&self) -> &[(String, bool)] { &self.mail_accounts }
+    pub fn mail_accounts(&self) -> &[(String, bool)] {
+        &self.mail_accounts
+    }
     /// Bind a client to a discovered account. Shared accounts are read-only locally.
     pub fn for_mail_account(&self, account: &str) -> Result<Self, JmapError> {
-        let advertised_read_only = self.mail_accounts.iter().find(|(id,_)| id == account).map(|(_,read_only)| *read_only).ok_or(JmapError::Unsupported)?;
-        Ok(Self { http:self.http.clone(), origin:self.origin.clone(), token:self.token.clone(), account:account.into(), primary_account:self.primary_account.clone(), mail_accounts:self.mail_accounts.clone(), read_only:advertised_read_only || account != self.primary_account, api:self.api.clone(), download:self.download.clone(), upload:self.upload.clone(), event_source:self.event_source.clone(), submission:self.submission && account == self.primary_account, mail_share:self.mail_share, gate:self.gate.clone(), max_get:self.max_get, max_request:self.max_request, max_upload:self.max_upload, session_state:self.session_state.clone(), vapid_public_key:self.vapid_public_key.clone(), metrics:Mutex::new(JmapSyncMetrics::default()), sync_failure:self.sync_failure.clone() })
+        let advertised_read_only = self
+            .mail_accounts
+            .iter()
+            .find(|(id, _)| id == account)
+            .map(|(_, read_only)| *read_only)
+            .ok_or(JmapError::Unsupported)?;
+        Ok(Self {
+            http: self.http.clone(),
+            origin: self.origin.clone(),
+            token: self.token.clone(),
+            account: account.into(),
+            primary_account: self.primary_account.clone(),
+            mail_accounts: self.mail_accounts.clone(),
+            read_only: advertised_read_only || account != self.primary_account,
+            api: self.api.clone(),
+            download: self.download.clone(),
+            upload: self.upload.clone(),
+            event_source: self.event_source.clone(),
+            submission: self.submission && account == self.primary_account,
+            mail_share: self.mail_share,
+            gate: self.gate.clone(),
+            max_get: self.max_get,
+            max_request: self.max_request,
+            max_upload: self.max_upload,
+            session_state: self.session_state.clone(),
+            vapid_public_key: self.vapid_public_key.clone(),
+            metrics: Mutex::new(JmapSyncMetrics::default()),
+            sync_failure: self.sync_failure.clone(),
+        })
     }
     pub fn origin(&self) -> &str {
         self.origin.as_str()
@@ -483,17 +764,53 @@ impl JmapClient {
     /// One bounded authenticated stream. A successful connection requests an
     /// immediate delta pass before consuming notifications, closing the gap on
     /// every reconnect. Caller owns lifecycle, backoff and token refresh.
-    pub fn watch_mail_events(&self, stop: &AtomicBool, mut on_change: impl FnMut(EventDomains) -> Result<(), ()>) -> Result<(), JmapError> {
+    pub fn watch_mail_events(
+        &self,
+        stop: &AtomicBool,
+        mut on_change: impl FnMut(EventDomains) -> Result<(), ()>,
+    ) -> Result<(), JmapError> {
         let url = self.event_source.clone().ok_or(JmapError::Unsupported)?;
-        let stream_gate = account_gate(&format!("stream|{}|{}", self.origin.origin().ascii_serialization(), self.primary_account), 4, 2);
+        let stream_gate = account_gate(
+            &format!(
+                "stream|{}|{}",
+                self.origin.origin().ascii_serialization(),
+                self.primary_account
+            ),
+            4,
+            2,
+        );
         let _stream_identity_permit = stream_gate.acquire_stream_identity();
         let _stream_permit = self.gate.acquire_stream().ok_or(JmapError::Unsupported)?;
-        let response = self.http.get(url).bearer_auth(&self.token).header(reqwest::header::ACCEPT,"text/event-stream").send().map_err(|_| JmapError::Transport)?;
-        if !response.status().is_success() { return Err(JmapError::Http(response.status().as_u16())); }
-        let content_type = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
-        if !content_type.split(';').next().is_some_and(|v| v.trim().eq_ignore_ascii_case("text/event-stream")) { return Err(JmapError::InvalidResponse); }
-        if stop.load(Ordering::Relaxed) { return Ok(()); }
-        on_change(EventDomains {mail:true,dav:true}).map_err(|_| JmapError::Transport)?;
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(&self.token)
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .send()
+            .map_err(|_| JmapError::Transport)?;
+        if !response.status().is_success() {
+            return Err(JmapError::Http(response.status().as_u16()));
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !content_type
+            .split(';')
+            .next()
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("text/event-stream"))
+        {
+            return Err(JmapError::InvalidResponse);
+        }
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        on_change(EventDomains {
+            mail: true,
+            dav: true,
+        })
+        .map_err(|_| JmapError::Transport)?;
         let mut reader = BufReader::new(response);
         consume_mail_event_stream(&mut reader, &self.account, stop, &mut on_change)
     }
@@ -505,15 +822,22 @@ impl JmapClient {
         mutation: bool,
         submission: bool,
     ) -> Result<Value, JmapError> {
-        if mutation && self.read_only { return Err(JmapError::Unsupported); }
+        if mutation && self.read_only {
+            return Err(JmapError::Unsupported);
+        }
         let _permit = self.gate.acquire(false);
         {
-            let mut metrics = self.metrics.lock().unwrap_or_else(|error| error.into_inner());
+            let mut metrics = self
+                .metrics
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             if method == "Email/query" {
                 metrics.email_query += 1;
             } else if method == "Email/get" {
                 metrics.email_get += 1;
-                if args["fetchTextBodyValues"].as_bool() == Some(true) || args["fetchHTMLBodyValues"].as_bool() == Some(true) {
+                if args["fetchTextBodyValues"].as_bool() == Some(true)
+                    || args["fetchHTMLBodyValues"].as_bool() == Some(true)
+                {
                     metrics.body_fetch += 1;
                 }
             } else if method == "Email/changes" {
@@ -565,7 +889,10 @@ impl JmapClient {
                 e
             }
         })?;
-        self.metrics.lock().unwrap_or_else(|error| error.into_inner()).response_bytes += raw.len() as u64;
+        self.metrics
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .response_bytes += raw.len() as u64;
         serde_json::from_slice(&raw).map_err(|_| {
             if mutation {
                 JmapError::OutcomeUnknown
@@ -583,9 +910,15 @@ impl JmapClient {
     ) -> Result<Value, JmapError> {
         // If a syntactically valid method response fails later engine validation,
         // retain its fixed operation as invalid_response. A successful sync clears it.
-        if !mutation { self.record_sync_error(method,&JmapError::InvalidResponse); }
-        let result = self.call_checked(method,args,mutation,submission);
-        if !mutation { if let Err(error)=&result { self.record_sync_error(method,error); } }
+        if !mutation {
+            self.record_sync_error(method, &JmapError::InvalidResponse);
+        }
+        let result = self.call_checked(method, args, mutation, submission);
+        if !mutation {
+            if let Err(error) = &result {
+                self.record_sync_error(method, error);
+            }
+        }
         result
     }
     fn call_checked(
@@ -659,7 +992,11 @@ impl JmapClient {
         self.call("Mailbox/query", json!({"accountId":self.account,"position":position,"limit":limit,"calculateTotal":true}), false, false)
     }
     pub fn changes(&self, kind: &str, since: &str, max: usize) -> Result<Value, JmapError> {
-        if !matches!(kind, "Email" | "Mailbox" | "EmailSubmission") || since.is_empty() || max == 0 || max > 1000 {
+        if !matches!(kind, "Email" | "Mailbox" | "EmailSubmission")
+            || since.is_empty()
+            || max == 0
+            || max > 1000
+        {
             return Err(JmapError::InvalidResponse);
         }
         self.call(
@@ -734,35 +1071,73 @@ impl JmapClient {
         self.call("Email/import", json!({"accountId":self.account,"emails":{creation_id:{"blobId":blob_id,"mailboxIds":mailbox_ids}}}), true, false)
     }
     /// The caller records the intent before dispatch and reconciles unknown outcomes.
-    pub fn create_mailbox(&self, creation_id: &str, name: &str, if_in_state: &str) -> Result<MailboxCreateResult, JmapError> {
-        if creation_id.is_empty() || name.is_empty() || if_in_state.is_empty() { return Err(JmapError::InvalidResponse); }
+    pub fn create_mailbox(
+        &self,
+        creation_id: &str,
+        name: &str,
+        if_in_state: &str,
+    ) -> Result<MailboxCreateResult, JmapError> {
+        if creation_id.is_empty() || name.is_empty() || if_in_state.is_empty() {
+            return Err(JmapError::InvalidResponse);
+        }
         let response = self.call("Mailbox/set", json!({"accountId":self.account,"ifInState":if_in_state,"create":{creation_id:{"name":name}}}), true, false)?;
         let created = response.get("created").and_then(|v| v.get(creation_id));
         let rejected = response.get("notCreated").and_then(|v| v.get(creation_id));
         match (created, rejected) {
-            (Some(value), None) => Ok(MailboxCreateResult::Created { id: nonempty(value.get("id")).map_err(|_| JmapError::OutcomeUnknown)?.to_owned() }),
+            (Some(value), None) => Ok(MailboxCreateResult::Created {
+                id: nonempty(value.get("id"))
+                    .map_err(|_| JmapError::OutcomeUnknown)?
+                    .to_owned(),
+            }),
             (None, Some(value)) => {
                 let kind = nonempty(value.get("type")).map_err(|_| JmapError::OutcomeUnknown)?;
-                if kind.len() > 80 || !kind.bytes().all(|c| c.is_ascii_alphanumeric()) { return Err(JmapError::OutcomeUnknown); }
-                Ok(MailboxCreateResult::Rejected { kind: kind.to_owned() })
+                if kind.len() > 80 || !kind.bytes().all(|c| c.is_ascii_alphanumeric()) {
+                    return Err(JmapError::OutcomeUnknown);
+                }
+                Ok(MailboxCreateResult::Rejected {
+                    kind: kind.to_owned(),
+                })
             }
             _ => Err(JmapError::OutcomeUnknown),
         }
     }
     /// Change only mailbox memberships and keywords against an observed Email state.
     /// The caller owns the durable intent, authorization and unknown reconciliation.
-    pub fn update_email(&self, email_id: &str, if_in_state: &str, patch: &Value) -> Result<EmailUpdateResult, JmapError> {
-        let entries = patch.as_object().filter(|v| !v.is_empty() && v.len() <= 128).ok_or(JmapError::InvalidResponse)?;
-        if email_id.is_empty() || if_in_state.is_empty() || entries.iter().any(|(key, value)| {
-            let part = key.strip_prefix("keywords/").or_else(|| key.strip_prefix("mailboxIds/"));
-            let valid_path = part.is_some_and(|s| !s.is_empty() && !s.contains('/') && valid_pointer_token(s));
-            !valid_path || !(value.is_null() || value.as_bool() == Some(true))
-        }) { return Err(JmapError::InvalidResponse); }
-        let result = self.call("Email/set", json!({"accountId":self.account,"ifInState":if_in_state,"update":{email_id:patch}}), true, false)?;
+    pub fn update_email(
+        &self,
+        email_id: &str,
+        if_in_state: &str,
+        patch: &Value,
+    ) -> Result<EmailUpdateResult, JmapError> {
+        let entries = patch
+            .as_object()
+            .filter(|v| !v.is_empty() && v.len() <= 128)
+            .ok_or(JmapError::InvalidResponse)?;
+        if email_id.is_empty()
+            || if_in_state.is_empty()
+            || entries.iter().any(|(key, value)| {
+                let part = key
+                    .strip_prefix("keywords/")
+                    .or_else(|| key.strip_prefix("mailboxIds/"));
+                let valid_path = part
+                    .is_some_and(|s| !s.is_empty() && !s.contains('/') && valid_pointer_token(s));
+                !valid_path || !(value.is_null() || value.as_bool() == Some(true))
+            })
+        {
+            return Err(JmapError::InvalidResponse);
+        }
+        let result = self.call(
+            "Email/set",
+            json!({"accountId":self.account,"ifInState":if_in_state,"update":{email_id:patch}}),
+            true,
+            false,
+        )?;
         let updated = result.get("updated").and_then(|v| v.get(email_id));
         let rejected = result.get("notUpdated").and_then(|v| v.get(email_id));
         Ok(match (updated, rejected) {
-            (Some(value), None) if value.is_null() || value.is_object() => EmailUpdateResult::Applied,
+            (Some(value), None) if value.is_null() || value.is_object() => {
+                EmailUpdateResult::Applied
+            }
             (None, Some(value)) if value.is_object() => EmailUpdateResult::Rejected,
             _ => EmailUpdateResult::Unknown,
         })
@@ -928,7 +1303,10 @@ impl JmapClient {
         media_type: &str,
     ) -> Result<Vec<u8>, JmapError> {
         let _permit = self.gate.acquire(true);
-        self.metrics.lock().unwrap_or_else(|error| error.into_inner()).blob_download += 1;
+        self.metrics
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .blob_download += 1;
         let template = self
             .download
             .replace("{accountId}", &encode(&self.account))
@@ -945,11 +1323,16 @@ impl JmapClient {
             return Err(JmapError::Http(response.status().as_u16()));
         }
         let bytes = body(response, MAX_BLOB)?;
-        self.metrics.lock().unwrap_or_else(|error| error.into_inner()).blob_bytes += bytes.len() as u64;
+        self.metrics
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .blob_bytes += bytes.len() as u64;
         Ok(bytes)
     }
     pub fn upload(&self, bytes: Vec<u8>, media_type: &str) -> Result<Value, JmapError> {
-        if self.read_only { return Err(JmapError::Unsupported); }
+        if self.read_only {
+            return Err(JmapError::Unsupported);
+        }
         if bytes.len() as u64 > self.max_upload {
             return Err(JmapError::InvalidResponse);
         }
@@ -983,7 +1366,9 @@ fn pointer_escape(value: &str) -> String {
 fn valid_pointer_token(value: &str) -> bool {
     let mut bytes = value.bytes();
     while let Some(byte) = bytes.next() {
-        if byte == b'~' && !matches!(bytes.next(), Some(b'0' | b'1')) { return false; }
+        if byte == b'~' && !matches!(bytes.next(), Some(b'0' | b'1')) {
+            return false;
+        }
     }
     true
 }
@@ -1144,95 +1529,192 @@ mod tests {
     #[test]
     fn discovery_follows_307_only_after_same_origin_validation() {
         use std::io::{Read, Write};
-        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address=listener.local_addr().unwrap();
-        let server=std::thread::spawn(move || {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
             for (path, status, headers, payload) in [
-                ("/.well-known/jmap", "307 Temporary Redirect", "Location: /jmap/session\r\n", ""),
+                (
+                    "/.well-known/jmap",
+                    "307 Temporary Redirect",
+                    "Location: /jmap/session\r\n",
+                    "",
+                ),
                 ("/jmap/session", "200 OK", "", "{}"),
-                ("/not-discovery", "307 Temporary Redirect", "Location: /jmap/session\r\n", ""),
+                (
+                    "/not-discovery",
+                    "307 Temporary Redirect",
+                    "Location: /jmap/session\r\n",
+                    "",
+                ),
             ] {
-                let (mut socket,_) = listener.accept().unwrap();
-                socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-                let mut request=Vec::new(); let mut chunk=[0u8;1024];
-                while !request.windows(4).any(|v| v==b"\r\n\r\n") { let n=socket.read(&mut chunk).unwrap(); assert!(n>0); request.extend_from_slice(&chunk[..n]); }
-                let request=String::from_utf8(request).unwrap();
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|v| v == b"\r\n\r\n") {
+                    let n = socket.read(&mut chunk).unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&chunk[..n]);
+                }
+                let request = String::from_utf8(request).unwrap();
                 assert!(request.starts_with(&format!("GET {path} ")));
-                if path!="/not-discovery" { assert!(request.to_ascii_lowercase().contains("authorization: bearer fixture-token")); }
+                if path != "/not-discovery" {
+                    assert!(request
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer fixture-token"));
+                }
                 write!(socket,"HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",payload.len()).unwrap();
             }
         });
-        let origin=Url::parse(&format!("http://{address}/")).unwrap();
-        let http=Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(5)).build().unwrap();
-        assert_eq!(fetch_session(&http,&origin,"fixture-token",None).unwrap().status().as_u16(),200);
-        assert_eq!(http.get(origin.join("/not-discovery").unwrap()).send().unwrap().status().as_u16(),307);
+        let origin = Url::parse(&format!("http://{address}/")).unwrap();
+        let http = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        assert_eq!(
+            fetch_session(&http, &origin, "fixture-token", None)
+                .unwrap()
+                .status()
+                .as_u16(),
+            200
+        );
+        assert_eq!(
+            http.get(origin.join("/not-discovery").unwrap())
+                .send()
+                .unwrap()
+                .status()
+                .as_u16(),
+            307
+        );
         server.join().unwrap();
     }
 
     #[test]
     fn discovery_rejects_foreign_origin_and_redirect_loops() {
         use std::io::{Read, Write};
-        let foreign=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let foreign = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         foreign.set_nonblocking(true).unwrap();
-        let foreign_location=format!("http://{}/session",foreign.local_addr().unwrap());
+        let foreign_location = format!("http://{}/session", foreign.local_addr().unwrap());
         for location in [foreign_location.as_str(), "/.well-known/jmap"] {
-            let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let address=listener.local_addr().unwrap();
-            let location=location.to_owned();
-            let server=std::thread::spawn(move || {
-                let (mut socket,_) = listener.accept().unwrap();
-                socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-                let mut request=Vec::new(); let mut buf=[0u8;1024];
-                while !request.windows(4).any(|v| v==b"\r\n\r\n") { let n=socket.read(&mut buf).unwrap(); assert!(n>0); request.extend_from_slice(&buf[..n]); }
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let location = location.to_owned();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|v| v == b"\r\n\r\n") {
+                    let n = socket.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buf[..n]);
+                }
                 write!(socket,"HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
             });
-            let origin=Url::parse(&format!("http://{address}/")).unwrap();
-            let http=Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(5)).build().unwrap();
-            assert!(matches!(fetch_session(&http,&origin,"fixture-token",None),Err(JmapError::InvalidUrl)));
+            let origin = Url::parse(&format!("http://{address}/")).unwrap();
+            let http = Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap();
+            assert!(matches!(
+                fetch_session(&http, &origin, "fixture-token", None),
+                Err(JmapError::InvalidUrl)
+            ));
             server.join().unwrap();
         }
-        assert!(matches!(foreign.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
+        assert!(
+            matches!(foreign.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock)
+        );
     }
 
     #[test]
     fn discovery_loopback_rebases_only_enrolled_public_origin() {
         use std::io::{Read, Write};
-        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address=listener.local_addr().unwrap();
-        let server=std::thread::spawn(move || {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
             for step in 0..2 {
-                let (mut socket,_) = listener.accept().unwrap();
-                socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-                let mut request=Vec::new(); let mut buf=[0u8;1024];
-                while !request.windows(4).any(|v| v==b"\r\n\r\n") { let n=socket.read(&mut buf).unwrap(); assert!(n>0); request.extend_from_slice(&buf[..n]); }
-                if step==0 { write!(socket,"HTTP/1.1 307 Temporary Redirect\r\nLocation: https://public.example/jmap/session\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap(); }
-                else { assert!(request.starts_with(b"GET /jmap/session ")); write!(socket,"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap(); }
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|v| v == b"\r\n\r\n") {
+                    let n = socket.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buf[..n]);
+                }
+                if step == 0 {
+                    write!(socket,"HTTP/1.1 307 Temporary Redirect\r\nLocation: https://public.example/jmap/session\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                } else {
+                    assert!(request.starts_with(b"GET /jmap/session "));
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                }
             }
         });
-        let origin=Url::parse(&format!("http://{address}/")).unwrap();
-        let public=Url::parse("https://public.example/").unwrap();
-        let http=Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(5)).build().unwrap();
-        assert_eq!(fetch_session(&http,&origin,"fixture-token",Some(&public)).unwrap().status().as_u16(),200);
+        let origin = Url::parse(&format!("http://{address}/")).unwrap();
+        let public = Url::parse("https://public.example/").unwrap();
+        let http = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        assert_eq!(
+            fetch_session(&http, &origin, "fixture-token", Some(&public))
+                .unwrap()
+                .status()
+                .as_u16(),
+            200
+        );
         server.join().unwrap();
     }
 
     #[test]
     fn discovery_rejects_more_than_three_redirects() {
         use std::io::{Read, Write};
-        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address=listener.local_addr().unwrap();
-        let server=std::thread::spawn(move || {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
             for step in 0..4 {
-                let (mut socket,_) = listener.accept().unwrap();
-                socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-                let mut request=Vec::new(); let mut buf=[0u8;1024];
-                while !request.windows(4).any(|v| v==b"\r\n\r\n") { let n=socket.read(&mut buf).unwrap(); assert!(n>0); request.extend_from_slice(&buf[..n]); }
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|v| v == b"\r\n\r\n") {
+                    let n = socket.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buf[..n]);
+                }
                 write!(socket,"HTTP/1.1 307 Temporary Redirect\r\nLocation: /step{step}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
             }
         });
-        let origin=Url::parse(&format!("http://{address}/")).unwrap();
-        let http=Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(5)).build().unwrap();
-        assert!(matches!(fetch_session(&http,&origin,"fixture-token",None),Err(JmapError::InvalidUrl)));
+        let origin = Url::parse(&format!("http://{address}/")).unwrap();
+        let http = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        assert!(matches!(
+            fetch_session(&http, &origin, "fixture-token", None),
+            Err(JmapError::InvalidUrl)
+        ));
         server.join().unwrap();
     }
     #[test]
@@ -1240,16 +1722,64 @@ mod tests {
         let origin = Url::parse("https://mail.example/").unwrap();
         let url = event_source_endpoint(&origin,"https://mail.example/jmap/eventsource/?types={types}&closeafter={closeafter}&ping={ping}").unwrap();
         assert_eq!(url.query(),Some("types=Email%2CMailbox%2CCalendar%2CCalendarEvent%2CAddressBook%2CContactCard&closeafter=no&ping=30"));
-        assert!(event_source_endpoint(&origin,"https://evil.example/?types={types}&closeafter={closeafter}&ping={ping}").is_err());
-        assert!(event_source_endpoint(&origin,"/events?types={types}&ping={ping}").is_err());
+        assert!(event_source_endpoint(
+            &origin,
+            "https://evil.example/?types={types}&closeafter={closeafter}&ping={ping}"
+        )
+        .is_err());
+        assert!(event_source_endpoint(&origin, "/events?types={types}&ping={ping}").is_err());
         let stream = b"event: ping\ndata: {\"interval\":30}\n\nevent: state\ndata: {\"@type\":\"StateChange\",\"changed\":{\"other\":{\"Email\":\"a\"}}}\n\nevent: state\ndata: {\"@type\":\"StateChange\",\"changed\":{\"account\":{\"Email\":\"b\"}}}\n\n";
-        let stop = AtomicBool::new(false); let mut events = Vec::new();
-        consume_mail_event_stream(&mut std::io::Cursor::new(stream),"account",&stop,&mut |domains| {events.push(domains); Ok(())}).unwrap();
-        assert_eq!(events,vec![EventDomains {mail:false,dav:false},EventDomains {mail:true,dav:false},EventDomains {mail:true,dav:false}]);
-        let oversized = vec![b'x';65_538];
-        assert_eq!(consume_mail_event_stream(&mut std::io::Cursor::new(oversized),"account",&stop,&mut |_| Ok(())),Err(JmapError::InvalidResponse));
-        assert!(state_change_domains("{}","account").is_err());
-        assert_eq!(state_change_domains(r#"{"@type":"StateChange","changed":{"shared":{"CalendarEvent":"s"}}}"#,"account").unwrap(),EventDomains {mail:false,dav:true});
+        let stop = AtomicBool::new(false);
+        let mut events = Vec::new();
+        consume_mail_event_stream(
+            &mut std::io::Cursor::new(stream),
+            "account",
+            &stop,
+            &mut |domains| {
+                events.push(domains);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                EventDomains {
+                    mail: false,
+                    dav: false
+                },
+                EventDomains {
+                    mail: true,
+                    dav: false
+                },
+                EventDomains {
+                    mail: true,
+                    dav: false
+                }
+            ]
+        );
+        let oversized = vec![b'x'; 65_538];
+        assert_eq!(
+            consume_mail_event_stream(
+                &mut std::io::Cursor::new(oversized),
+                "account",
+                &stop,
+                &mut |_| Ok(())
+            ),
+            Err(JmapError::InvalidResponse)
+        );
+        assert!(state_change_domains("{}", "account").is_err());
+        assert_eq!(
+            state_change_domains(
+                r#"{"@type":"StateChange","changed":{"shared":{"CalendarEvent":"s"}}}"#,
+                "account"
+            )
+            .unwrap(),
+            EventDomains {
+                mail: false,
+                dav: true
+            }
+        );
     }
 
     #[test]
@@ -1258,36 +1788,121 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-          for _ in 0..2 {
-            let (mut socket,_) = listener.accept().unwrap();
-            socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-            let mut input = Vec::new(); let mut buf = [0u8;1024];
-            while !input.windows(4).any(|part| part == b"\r\n\r\n") { let n=socket.read(&mut buf).unwrap(); assert!(n>0); input.extend_from_slice(&buf[..n]); }
-            let request = String::from_utf8(input).unwrap().to_ascii_lowercase();
-            assert!(request.contains("authorization: bearer fixture-token"));
-            assert!(request.contains("accept: text/event-stream"));
-            let body = b"event: state\ndata: {\"@type\":\"StateChange\",\"changed\":{\"account\":{\"Email\":\"s1\"}}}\n\n";
-            write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).unwrap();
-            socket.write_all(body).unwrap();
-          }
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut input = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !input.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let n = socket.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    input.extend_from_slice(&buf[..n]);
+                }
+                let request = String::from_utf8(input).unwrap().to_ascii_lowercase();
+                assert!(request.contains("authorization: bearer fixture-token"));
+                assert!(request.contains("accept: text/event-stream"));
+                let body = b"event: state\ndata: {\"@type\":\"StateChange\",\"changed\":{\"account\":{\"Email\":\"s1\"}}}\n\n";
+                write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).unwrap();
+                socket.write_all(body).unwrap();
+            }
         });
-        let origin=Url::parse(&format!("http://{address}/")).unwrap();
-        let client=JmapClient { http:Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().unwrap(), origin:origin.clone(), token:"fixture-token".into(), account:"account".into(), primary_account:"account".into(), mail_accounts:vec![("account".into(),false),("shared".into(),false)], read_only:false, api:origin.clone(), download:String::new(), upload:String::new(), event_source:Some(origin.join("/events").unwrap()), submission:false, mail_share:false, gate:account_gate("event-test",2,1), max_get:10, max_request:1024, max_upload:1024, session_state:"state".into(), vapid_public_key:None, metrics:Mutex::new(JmapSyncMetrics::default()), sync_failure:Arc::new(Mutex::new(None)) };
+        let origin = Url::parse(&format!("http://{address}/")).unwrap();
+        let client = JmapClient {
+            http: Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            origin: origin.clone(),
+            token: "fixture-token".into(),
+            account: "account".into(),
+            primary_account: "account".into(),
+            mail_accounts: vec![("account".into(), false), ("shared".into(), false)],
+            read_only: false,
+            api: origin.clone(),
+            download: String::new(),
+            upload: String::new(),
+            event_source: Some(origin.join("/events").unwrap()),
+            submission: false,
+            mail_share: false,
+            gate: account_gate("event-test", 2, 1),
+            max_get: 10,
+            max_request: 1024,
+            max_upload: 1024,
+            session_state: "state".into(),
+            vapid_public_key: None,
+            metrics: Mutex::new(JmapSyncMetrics::default()),
+            sync_failure: Arc::new(Mutex::new(None)),
+        };
         assert!(client.for_mail_account("unadvertised").is_err());
-        let shared=client.for_mail_account("shared").unwrap();
+        let shared = client.for_mail_account("shared").unwrap();
         assert!(!shared.supports_submission());
-        assert!(matches!(shared.upload(Vec::new(),"application/octet-stream"),Err(JmapError::Unsupported)));
-        shared.record_sync_error("Email/get",&JmapError::Method("untrusted-provider-text".into()));
-        assert_eq!(client.last_sync_failure(),Some(JmapSyncFailure {operation:"email_get",class:"method",http_status:None,method_type:Some("other")}));
+        assert!(matches!(
+            shared.upload(Vec::new(), "application/octet-stream"),
+            Err(JmapError::Unsupported)
+        ));
+        shared.record_sync_error(
+            "Email/get",
+            &JmapError::Method("untrusted-provider-text".into()),
+        );
+        assert_eq!(
+            client.last_sync_failure(),
+            Some(JmapSyncFailure {
+                operation: "email_get",
+                class: "method",
+                http_status: None,
+                method_type: Some("other")
+            })
+        );
         client.clear_sync_failure();
-        shared.record_sync_error("Mailbox/query",&JmapError::Http(403));
-        assert_eq!(client.last_sync_failure(),Some(JmapSyncFailure {operation:"mailbox_query",class:"http",http_status:Some(403),method_type:None}));
+        shared.record_sync_error("Mailbox/query", &JmapError::Http(403));
+        assert_eq!(
+            client.last_sync_failure(),
+            Some(JmapSyncFailure {
+                operation: "mailbox_query",
+                class: "http",
+                http_status: Some(403),
+                method_type: None
+            })
+        );
         client.clear_sync_failure();
         let mut events = Vec::new();
-        client.watch_mail_events(&AtomicBool::new(false),|domains| {events.push(domains); Ok(())}).unwrap();
-        client.watch_mail_events(&AtomicBool::new(false),|domains| {events.push(domains); Ok(())}).unwrap();
+        client
+            .watch_mail_events(&AtomicBool::new(false), |domains| {
+                events.push(domains);
+                Ok(())
+            })
+            .unwrap();
+        client
+            .watch_mail_events(&AtomicBool::new(false), |domains| {
+                events.push(domains);
+                Ok(())
+            })
+            .unwrap();
         server.join().unwrap();
-        assert_eq!(events,vec![EventDomains {mail:true,dav:true},EventDomains {mail:true,dav:false},EventDomains {mail:true,dav:true},EventDomains {mail:true,dav:false}]);
+        assert_eq!(
+            events,
+            vec![
+                EventDomains {
+                    mail: true,
+                    dav: true
+                },
+                EventDomains {
+                    mail: true,
+                    dav: false
+                },
+                EventDomains {
+                    mail: true,
+                    dav: true
+                },
+                EventDomains {
+                    mail: true,
+                    dav: false
+                }
+            ]
+        );
     }
     #[test]
     fn method_responses_require_matching_id_and_keep_errors_distinct() {
@@ -1312,18 +1927,49 @@ mod tests {
         assert!(endpoint(&origin, "https://other.example/api").is_err());
         assert!(endpoint(&origin, "https://user@mail.example/api").is_err());
         assert!(endpoint(&origin, "/api").is_ok());
-        assert!(allowed_origin(&Url::parse("http://127.0.0.1:8080/").unwrap(), true));
-        assert!(allowed_origin(&Url::parse("http://[::1]:8080/").unwrap(), true));
-        assert!(!allowed_origin(&Url::parse("http://localhost:8080/").unwrap(), true));
-        assert!(!allowed_origin(&Url::parse("http://127.0.0.2:8080/").unwrap(), true));
-        assert!(!allowed_origin(&Url::parse("http://127.0.0.1:8080/").unwrap(), false));
-        assert!(endpoint(&Url::parse("http://127.0.0.1:8080/").unwrap(), "http://127.0.0.1:8081/api").is_err());
+        assert!(allowed_origin(
+            &Url::parse("http://127.0.0.1:8080/").unwrap(),
+            true
+        ));
+        assert!(allowed_origin(
+            &Url::parse("http://[::1]:8080/").unwrap(),
+            true
+        ));
+        assert!(!allowed_origin(
+            &Url::parse("http://localhost:8080/").unwrap(),
+            true
+        ));
+        assert!(!allowed_origin(
+            &Url::parse("http://127.0.0.2:8080/").unwrap(),
+            true
+        ));
+        assert!(!allowed_origin(
+            &Url::parse("http://127.0.0.1:8080/").unwrap(),
+            false
+        ));
+        assert!(endpoint(
+            &Url::parse("http://127.0.0.1:8080/").unwrap(),
+            "http://127.0.0.1:8081/api"
+        )
+        .is_err());
         let local = Url::parse("http://127.0.0.1:8080/").unwrap();
         let public = Url::parse("https://mail.example/").unwrap();
-        assert_eq!(rewrite_loopback_endpoint(&local, &public, "https://mail.example/download/{accountId}/{blobId}/{name}?accept={type}").unwrap(), "http://127.0.0.1:8080/download/{accountId}/{blobId}/{name}?accept={type}");
+        assert_eq!(
+            rewrite_loopback_endpoint(
+                &local,
+                &public,
+                "https://mail.example/download/{accountId}/{blobId}/{name}?accept={type}"
+            )
+            .unwrap(),
+            "http://127.0.0.1:8080/download/{accountId}/{blobId}/{name}?accept={type}"
+        );
         assert!(rewrite_loopback_endpoint(&local, &public, "https://other.example/api").is_err());
-        assert!(rewrite_loopback_endpoint(&local, &public, "https://mail.example:444/api").is_err());
-        assert!(rewrite_loopback_endpoint(&local, &public, "https://user@mail.example/api").is_err());
+        assert!(
+            rewrite_loopback_endpoint(&local, &public, "https://mail.example:444/api").is_err()
+        );
+        assert!(
+            rewrite_loopback_endpoint(&local, &public, "https://user@mail.example/api").is_err()
+        );
         assert!(rewrite_loopback_endpoint(&local, &public, "http://127.0.0.1:8081/api").is_err());
         assert!(valid_pointer_token("a~1b~0c"));
         assert!(!valid_pointer_token("a~2b"));

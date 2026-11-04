@@ -13,7 +13,9 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 4 { return Err("expected config path, account ID and synthetic state".into()); }
+    if args.len() != 4 {
+        return Err("expected config path, account ID and synthetic state".into());
+    }
     let cfg = Config::load(&PathBuf::from(&args[1]))?;
     cfg.validate().map_err(|_| "invalid configuration")?;
     let store = Store::open_in_memory()?;
@@ -24,13 +26,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let next = self_hosted_mail::sync_with_page_limit(&cfg, &args[2], &store, &client, 1)?;
     let final_counts = self_hosted_mail::sync_metrics(&client);
     let scope = self_hosted_mail::scope(&cfg, &args[2], &client)?;
-    let before_ids: Vec<String> = store.provider_objects_page(&scope, "", 200)?.into_iter().map(|v| v.remote_id).collect();
-    if before_ids.is_empty() || before_ids.len() == 200 { return Err("fixture size outside probe bounds".into()); }
+    let before_ids: Vec<String> = store
+        .provider_objects_page(&scope, "", 200)?
+        .into_iter()
+        .map(|v| v.remote_id)
+        .collect();
+    if before_ids.is_empty() || before_ids.len() == 200 {
+        return Err("fixture size outside probe bounds".into());
+    }
     store.apply_provider_page(&scope, &[], &args[3])?;
     let recovered = self_hosted_mail::sync_with_page_limit(&cfg, &args[2], &store, &client, 1)?;
     let recovered_counts = self_hosted_mail::sync_metrics(&client);
-    let after_ids: Vec<String> = store.provider_objects_page(&scope, "", 200)?.into_iter().map(|v| v.remote_id).collect();
-    if before_ids != after_ids || recovered_counts.email_reconciliations.saturating_sub(final_counts.email_reconciliations) != 1 {
+    let after_ids: Vec<String> = store
+        .provider_objects_page(&scope, "", 200)?
+        .into_iter()
+        .map(|v| v.remote_id)
+        .collect();
+    if before_ids != after_ids
+        || recovered_counts
+            .email_reconciliations
+            .saturating_sub(final_counts.email_reconciliations)
+            != 1
+    {
         return Err("server did not reject state and reconcile exact identities".into());
     }
     println!("initial_changes={changes} initial_query_pages={} initial_body_fetch={} initial_blob_download={} unchanged_changes={next} unchanged_email_get={} unchanged_body_fetch={} unchanged_blob_download={}",

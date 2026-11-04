@@ -114,28 +114,44 @@ fn capture_objects(
         }
         // Reuse an immutable MIME blob when only flags or membership changed.
         let existing = store.provider_object(scope, id)?;
-        let prior = existing.as_ref().and_then(|old| serde_json::from_slice::<Value>(&old.raw).ok());
+        let prior = existing
+            .as_ref()
+            .and_then(|old| serde_json::from_slice::<Value>(&old.raw).ok());
         let cached = prior.as_ref().and_then(|v| {
-            if v.get("schema")?.as_str()? != "isyncyou.mail-metadata.v1" ||
-                v.get("native")?.get("blobId")?.as_str()? != blob { return None; }
+            if v.get("schema")?.as_str()? != "isyncyou.mail-metadata.v1"
+                || v.get("native")?.get("blobId")?.as_str()? != blob
+            {
+                return None;
+            }
             let digest = v.get("mime_digest")?.as_str()?;
             let size = v.get("mime_size")?.as_u64()?;
-            if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) { return None; }
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                return None;
+            }
             let meta = std::fs::symlink_metadata(budget.path.join("blobs").join(digest)).ok()?;
-            if !meta.is_file() || meta.len() != size { return None; }
+            if !meta.is_file() || meta.len() != size {
+                return None;
+            }
             Some((digest.to_owned(), size))
         });
         let (mime_digest, mime_size) = match cached {
             Some(value) => value,
             None => {
                 let mime = client.download(blob)?;
-                if mime.len() > MAX_ENVELOPE { return Err(invalid()); }
+                if mime.len() > MAX_ENVELOPE {
+                    return Err(invalid());
+                }
                 budget.admit(mime.len())?;
                 let digest = isyncyou_exporter::put(budget.path, &mime)?;
                 (digest, mime.len() as u64)
             }
         };
-        let captured = isyncyou_store::mail_capture_object(object, &mime_digest, mime_size).map_err(|_| invalid())?;
+        let captured = isyncyou_store::mail_capture_object(object, &mime_digest, mime_size)
+            .map_err(|_| invalid())?;
         budget.admit(captured.raw.len())?;
         changes.push(ProviderChange::Upsert(captured));
     }
@@ -150,8 +166,13 @@ fn initial(
 ) -> Result<()> {
     let initial = client.get("Email", Some(&[]))?;
     let email_state = field(&initial, "state")?.to_owned();
-    let generation = format!("{}-{}", std::process::id(), std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?.as_nanos());
+    let generation = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    );
     store.begin_provider_staging(scope, &generation)?;
     let mut position = 0usize;
     let mut query_state: Option<String> = None;
@@ -176,11 +197,21 @@ fn initial(
         }
         // One MIME at a time; the cursor remains incomplete until final validation.
         for id in &page_ids {
-            let objects = capture_objects(client, store, scope, std::slice::from_ref(id), &email_state, budget)?;
-            let staged: Vec<ProviderObject> = objects.into_iter().map(|change| match change {
-                ProviderChange::Upsert(object) => Ok(object),
-                ProviderChange::Destroyed(_) => Err(invalid()),
-            }).collect::<Result<_>>()?;
+            let objects = capture_objects(
+                client,
+                store,
+                scope,
+                std::slice::from_ref(id),
+                &email_state,
+                budget,
+            )?;
+            let staged: Vec<ProviderObject> = objects
+                .into_iter()
+                .map(|change| match change {
+                    ProviderChange::Upsert(object) => Ok(object),
+                    ProviderChange::Destroyed(_) => Err(invalid()),
+                })
+                .collect::<Result<_>>()?;
             store.stage_provider_objects(scope, &generation, &staged)?;
         }
         position += page_ids.len();
@@ -287,7 +318,11 @@ pub fn sync(
     sync_source(client, store, scope, budget)
 }
 
-pub fn sync_mailboxes(client: &LoopbackJmapReader, store: &Store, scope: &ProviderScope) -> Result<()> {
+pub fn sync_mailboxes(
+    client: &LoopbackJmapReader,
+    store: &Store,
+    scope: &ProviderScope,
+) -> Result<()> {
     let page = LoopbackJmapReader::get(client, "Mailbox", None, None)?;
     let state = field(&page, "state")?;
     let list = page
@@ -385,7 +420,10 @@ mod tests {
         assert_eq!(meta["schema"], "isyncyou.mail-metadata.v1");
         assert_eq!(meta["native"]["id"], "one");
         let hash = meta["mime_digest"].as_str().unwrap();
-        assert_eq!(std::fs::read(dir.path().join("blobs").join(hash)).unwrap(), b"Subject: original\r\n\r\nbody");
+        assert_eq!(
+            std::fs::read(dir.path().join("blobs").join(hash)).unwrap(),
+            b"Subject: original\r\n\r\nbody"
+        );
         assert_eq!(
             store.provider_cursor(&scope()).unwrap().as_deref(),
             Some("state1")
@@ -395,7 +433,15 @@ mod tests {
             .unwrap();
         assert!(snapshot.collections[0].complete);
         // Re-observation of the same server blob must not download it again.
-        initial(&Fixture { fail_download: true }, &store, &scope(), &mut budget).unwrap();
+        initial(
+            &Fixture {
+                fail_download: true,
+            },
+            &store,
+            &scope(),
+            &mut budget,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -417,7 +463,11 @@ mod tests {
         )
         .is_err());
         assert_eq!(store.provider_cursor(&scope()).unwrap(), None);
-        assert!(store.provider_export_snapshot("a", "https://example.test/").unwrap().collections.is_empty());
+        assert!(store
+            .provider_export_snapshot("a", "https://example.test/")
+            .unwrap()
+            .collections
+            .is_empty());
     }
 
     #[test]
@@ -425,18 +475,38 @@ mod tests {
         struct Partial;
         impl MailSource for Partial {
             fn get(&self, _: &str, ids: Option<&[String]>) -> Result<Value> {
-                let list: Vec<_> = ids.unwrap_or(&[]).iter().map(|id| json!({"id": id, "blobId": id})).collect();
+                let list: Vec<_> = ids
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|id| json!({"id": id, "blobId": id}))
+                    .collect();
                 Ok(json!({"state":"s1", "list":list, "notFound":[]}))
             }
-            fn query(&self, _: usize, _: usize) -> Result<Value> { Ok(json!({"queryState":"q", "total":2, "ids":["one","two"]})) }
-            fn changes(&self, _: &str) -> std::result::Result<Value, JmapError> { Err(JmapError::InvalidResponse) }
-            fn download(&self, blob: &str) -> Result<Vec<u8>> { if blob == "two" { Err("offline".into()) } else { Ok(b"mime one".to_vec()) } }
-            fn max_get(&self) -> usize { 16 }
+            fn query(&self, _: usize, _: usize) -> Result<Value> {
+                Ok(json!({"queryState":"q", "total":2, "ids":["one","two"]}))
+            }
+            fn changes(&self, _: &str) -> std::result::Result<Value, JmapError> {
+                Err(JmapError::InvalidResponse)
+            }
+            fn download(&self, blob: &str) -> Result<Vec<u8>> {
+                if blob == "two" {
+                    Err("offline".into())
+                } else {
+                    Ok(b"mime one".to_vec())
+                }
+            }
+            fn max_get(&self) -> usize {
+                16
+            }
         }
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("provider.db");
         let store = Store::open_encrypted(&database, b"fixture-only-store-key").unwrap();
-        let mut budget = Budget { path: dir.path(), remaining: 1024 * 1024, reserve: 0 };
+        let mut budget = Budget {
+            path: dir.path(),
+            remaining: 1024 * 1024,
+            reserve: 0,
+        };
         assert!(sync_source(&Partial, &store, &scope(), &mut budget).is_err());
         assert_eq!(store.provider_cursor(&scope()).unwrap(), None);
         drop(store);
@@ -446,6 +516,9 @@ mod tests {
         assert_eq!(captured.len(), 1);
         let metadata: Value = serde_json::from_slice(&captured[0].object.raw).unwrap();
         let hash = metadata["mime_digest"].as_str().unwrap();
-        assert_eq!(std::fs::read(dir.path().join("blobs").join(hash)).unwrap(), b"mime one");
+        assert_eq!(
+            std::fs::read(dir.path().join("blobs").join(hash)).unwrap(),
+            b"mime one"
+        );
     }
 }

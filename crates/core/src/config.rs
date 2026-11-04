@@ -3,8 +3,8 @@
 
 use crate::onedrive_mode::OneDriveModes;
 use crate::recovery::atomic_write;
-use serde::{Deserialize, Serialize};
 use fs2::FileExt;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -218,7 +218,14 @@ impl Config {
             account.cache_root = cache_root;
             account.mount_point = None;
         } else {
-            self.accounts.push(AccountConfig { id:"me".into(), username:"me".into(), sync_root, archive_root, cache_root, mount_point:None });
+            self.accounts.push(AccountConfig {
+                id: "me".into(),
+                username: "me".into(),
+                sync_root,
+                archive_root,
+                cache_root,
+                mount_point: None,
+            });
         }
         self.validate().map_err(|errors| errors.join("; "))
     }
@@ -226,10 +233,17 @@ impl Config {
     /// Serialize a complete read/modify/validate/save operation across processes.
     /// All concurrent config mutators must use this API; locking only the final
     /// write cannot protect against stale snapshots.
-    pub fn update_atomically<T>(path: impl AsRef<Path>, mutate: impl FnOnce(&mut Config) -> Result<T,String>) -> Result<T,String> {
+    pub fn update_atomically<T>(
+        path: impl AsRef<Path>,
+        mutate: impl FnOnce(&mut Config) -> Result<T, String>,
+    ) -> Result<T, String> {
         let path = path.as_ref();
         Self::with_config_lock(path, || {
-            let mut cfg = if path.exists() { Self::load(path)? } else { Self::default() };
+            let mut cfg = if path.exists() {
+                Self::load(path)?
+            } else {
+                Self::default()
+            };
             let result = mutate(&mut cfg)?;
             cfg.validate().map_err(|errors| errors.join("; "))?;
             cfg.save(path)?;
@@ -239,11 +253,22 @@ impl Config {
 
     /// Serialize specialized configuration operations such as explicit replacement
     /// or coordinated archive moves using the same cross-process gate.
-    pub fn with_config_lock<T>(path: impl AsRef<Path>, action: impl FnOnce() -> Result<T,String>) -> Result<T,String> {
+    pub fn with_config_lock<T>(
+        path: impl AsRef<Path>,
+        action: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
         let path = path.as_ref();
-        let mut lock_path = path.as_os_str().to_os_string(); lock_path.push(".provider-setup.lock");
-        let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(PathBuf::from(lock_path)).map_err(|_| "Configuration lock unavailable")?;
-        lock.lock_exclusive().map_err(|_| "Configuration lock unavailable")?;
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".provider-setup.lock");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(PathBuf::from(lock_path))
+            .map_err(|_| "Configuration lock unavailable")?;
+        lock.lock_exclusive()
+            .map_err(|_| "Configuration lock unavailable")?;
         action()
     }
     /// Parse a TOML string.
@@ -284,7 +309,8 @@ impl Config {
             } else if !seen_ids.insert(a.id.clone()) {
                 errs.push(format!("duplicate account id: {}", a.id));
             }
-            if self.provider_accounts.contains_key(&a.id) && a.id.starts_with("isyncyou-internal:") {
+            if self.provider_accounts.contains_key(&a.id) && a.id.starts_with("isyncyou-internal:")
+            {
                 errs.push(format!("{who}: reserved account id"));
             }
             let self_hosted = self.provider_accounts.contains_key(&a.id);
@@ -332,9 +358,13 @@ impl Config {
             match provider {
                 ProviderConfig::SelfHosted { origin, client_id } => {
                     let valid = url::Url::parse(origin).is_ok_and(|url| {
-                        url.scheme() == "https" && url.host_str().is_some()
-                            && url.username().is_empty() && url.password().is_none()
-                            && url.path() == "/" && url.query().is_none() && url.fragment().is_none()
+                        url.scheme() == "https"
+                            && url.host_str().is_some()
+                            && url.username().is_empty()
+                            && url.password().is_none()
+                            && url.path() == "/"
+                            && url.query().is_none()
+                            && url.fragment().is_none()
                             && url.origin().ascii_serialization() == origin.as_str()
                     });
                     if !valid || client_id.trim().is_empty() {
@@ -345,13 +375,27 @@ impl Config {
         }
         for (account, base) in &self.push_broker_bases {
             let valid = match self.provider_accounts.get(account) {
-                Some(ProviderConfig::SelfHosted { origin, .. }) => match (url::Url::parse(origin), url::Url::parse(base)) {
-                    (Ok(origin), Ok(base)) => base.scheme() == "https" && base.origin() == origin.origin() && base.username().is_empty() && base.password().is_none() && base.query().is_none() && base.fragment().is_none() && base.path().ends_with('/'),
-                    _ => false,
-                },
+                Some(ProviderConfig::SelfHosted { origin, .. }) => {
+                    match (url::Url::parse(origin), url::Url::parse(base)) {
+                        (Ok(origin), Ok(base)) => {
+                            base.scheme() == "https"
+                                && base.origin() == origin.origin()
+                                && base.username().is_empty()
+                                && base.password().is_none()
+                                && base.query().is_none()
+                                && base.fragment().is_none()
+                                && base.path().ends_with('/')
+                        }
+                        _ => false,
+                    }
+                }
                 None => false,
             };
-            if !valid { errs.push(format!("push_broker_bases[{account}]: same-origin HTTPS base required")); }
+            if !valid {
+                errs.push(format!(
+                    "push_broker_bases[{account}]: same-origin HTTPS base required"
+                ));
+            }
         }
         for (acct, modes) in &self.onedrive_modes {
             if !known.contains(acct.as_str()) {
@@ -410,17 +454,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         Config::default().save(&path).unwrap();
-        let a = path.clone(); let b = path.clone();
-        let first = std::thread::spawn(move || Config::update_atomically(a,|cfg| { cfg.sync.body_index=true; Ok(()) }).unwrap());
-        let second = std::thread::spawn(move || Config::update_atomically(b,|cfg| { cfg.sync.wifi_only=true; Ok(()) }).unwrap());
-        first.join().unwrap(); second.join().unwrap();
+        let a = path.clone();
+        let b = path.clone();
+        let first = std::thread::spawn(move || {
+            Config::update_atomically(a, |cfg| {
+                cfg.sync.body_index = true;
+                Ok(())
+            })
+            .unwrap()
+        });
+        let second = std::thread::spawn(move || {
+            Config::update_atomically(b, |cfg| {
+                cfg.sync.wifi_only = true;
+                Ok(())
+            })
+            .unwrap()
+        });
+        first.join().unwrap();
+        second.join().unwrap();
         let cfg = Config::load(path).unwrap();
         assert!(cfg.sync.body_index && cfg.sync.wifi_only);
     }
 
     #[test]
     fn self_hosted_account_needs_no_onedrive_root() {
-        let cfg = Config::from_toml(r#"
+        let cfg = Config::from_toml(
+            r#"
             [[accounts]]
             id = "a"
             username = "user@example.test"
@@ -429,7 +488,9 @@ mod tests {
             kind = "self_hosted"
             origin = "https://mail.example.test"
             client_id = "public-client"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         assert!(cfg.validate().is_ok());
         assert!(cfg.accounts[0].sync_root.as_os_str().is_empty());
     }

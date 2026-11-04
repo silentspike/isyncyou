@@ -1,8 +1,8 @@
 //! Bounded authenticated transport for a configured, same-origin push broker.
 //! Payloads and native responses can contain capability values and must never be logged.
 
-use isyncyou_core::{config::ProviderConfig, Config};
 use isyncyou_connectors::request_budget::BudgetedSend;
+use isyncyou_core::{config::ProviderConfig, Config};
 use serde_json::Value;
 use std::io::Read;
 use std::time::Duration;
@@ -19,12 +19,26 @@ pub fn post(
 }
 
 /// Engine-internal transport for a token already protected by the account lock.
-pub(crate) fn post_with_token(cfg: &Config, account: &str, operation: &str, request: &Value, token: &str) -> Result<Value, &'static str> {
-    if token.is_empty() || token.chars().any(char::is_control) { return Err("auth_unavailable"); }
+pub(crate) fn post_with_token(
+    cfg: &Config,
+    account: &str,
+    operation: &str,
+    request: &Value,
+    token: &str,
+) -> Result<Value, &'static str> {
+    if token.is_empty() || token.chars().any(char::is_control) {
+        return Err("auth_unavailable");
+    }
     post_inner(cfg, account, operation, request, Some(token))
 }
 
-fn post_inner(cfg: &Config, account: &str, operation: &str, request: &Value, supplied_token: Option<&str>) -> Result<Value, &'static str> {
+fn post_inner(
+    cfg: &Config,
+    account: &str,
+    operation: &str,
+    request: &Value,
+    supplied_token: Option<&str>,
+) -> Result<Value, &'static str> {
     if !matches!(
         operation,
         "challenge" | "prepare" | "deliver" | "confirm" | "revoke" | "cancel" | "status"
@@ -62,7 +76,8 @@ fn post_inner(cfg: &Config, account: &str, operation: &str, request: &Value, sup
     let token = match supplied_token {
         Some(token) => token,
         None => {
-            owned_token = crate::provider_auth::self_hosted_access_token(cfg, account).map_err(|_| "auth_unavailable")?;
+            owned_token = crate::provider_auth::self_hosted_access_token(cfg, account)
+                .map_err(|_| "auth_unavailable")?;
             &owned_token
         }
     };
@@ -108,11 +123,23 @@ mod tests {
     fn cancel_is_allowed_but_arbitrary_routes_remain_rejected() {
         let cfg = Config::default();
         // A valid operation reaches account validation without making a request.
-        assert_eq!(post(&cfg, "missing", "cancel", &json!({})), Err("invalid_account"));
-        assert_eq!(post(&cfg, "missing", "status", &json!({})), Err("invalid_account"));
+        assert_eq!(
+            post(&cfg, "missing", "cancel", &json!({})),
+            Err("invalid_account")
+        );
+        assert_eq!(
+            post(&cfg, "missing", "status", &json!({})),
+            Err("invalid_account")
+        );
         for operation in ["", "../cancel", "cancel/other", "CANCEL", "delete"] {
-            assert_eq!(post(&cfg, "missing", operation, &json!({})), Err("invalid_request"));
+            assert_eq!(
+                post(&cfg, "missing", operation, &json!({})),
+                Err("invalid_request")
+            );
         }
-        assert_eq!(post(&cfg, "missing", "cancel", &json!([])), Err("invalid_request"));
+        assert_eq!(
+            post(&cfg, "missing", "cancel", &json!([])),
+            Err("invalid_request")
+        );
     }
 }

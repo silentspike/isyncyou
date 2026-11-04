@@ -333,9 +333,18 @@ fn run(args: &Args) -> Result<(), String> {
         let (interval2, events2) = (live_interval.clone(), events.clone());
         let push2 = push_notifier.clone();
         let config_path2 = args.config.clone();
-        let (event_config, event_gate, event_sched, event_bus) = (config_path2.clone(), gate2.clone(), sched2.clone(), events2.clone());
-        std::thread::spawn(move || provider_event_supervisor(event_config, event_gate, event_sched, event_bus));
-        std::thread::spawn(move || sync_loop(config_path2, gate2, interval2, sched2, events2, push2));
+        let (event_config, event_gate, event_sched, event_bus) = (
+            config_path2.clone(),
+            gate2.clone(),
+            sched2.clone(),
+            events2.clone(),
+        );
+        std::thread::spawn(move || {
+            provider_event_supervisor(event_config, event_gate, event_sched, event_bus)
+        });
+        std::thread::spawn(move || {
+            sync_loop(config_path2, gate2, interval2, sched2, events2, push2)
+        });
         router = router.with_sync_control(sched, cap_token);
     }
 
@@ -661,26 +670,33 @@ fn sync_loop(
         }
         let current = match Config::load(&config_path) {
             Ok(current) if current.validate().is_ok() => current,
-            _ => { eprintln!("isyncyoud: sync skipped because configuration is unavailable"); continue; }
+            _ => {
+                eprintln!("isyncyoud: sync skipped because configuration is unavailable");
+                continue;
+            }
         };
         for acc in &current.accounts {
             if current.provider_accounts.contains_key(&acc.id) {
                 // Provider workers handle event-driven and bounded fallback sync;
                 // an explicit user sync still includes these accounts.
-                if !triggered { continue; }
+                if !triggered {
+                    continue;
+                }
             }
             match sync_account(&current, &acc.id, &gate, &host) {
                 Ok(summary) => eprintln!("isyncyoud: sync {} -> {summary}", acc.id),
                 Err(e) => eprintln!("isyncyoud: sync {} skipped: {e}", acc.id),
             }
-            if current.provider_accounts.contains_key(&acc.id) && sync_provider_dav(&current,&acc.id).is_err() {
+            if current.provider_accounts.contains_key(&acc.id)
+                && sync_provider_dav(&current, &acc.id).is_err()
+            {
                 eprintln!("isyncyoud: provider DAV synchronization incomplete");
             }
             // Keep the per-service archive fresh too (live client, #563 AC-5): an
             // incremental mail pass so new cloud mail lands in the store and the
             // SSE notify below surfaces it without a manual reload.
             if !current.provider_accounts.contains_key(&acc.id) {
-            match isyncyou_app_host::run_backup_account(&current, &acc.id, &gate, &[]) {
+                match isyncyou_app_host::run_backup_account(&current, &acc.id, &gate, &[]) {
                     Ok(run) => {
                         eprintln!("isyncyoud: backup {} -> {}", acc.id, run.summary);
                         // Push (#576): notify the phone when new content was archived. The
@@ -711,109 +727,271 @@ struct ProviderWatchIdentity {
 }
 
 fn provider_watch_identities(cfg: &Config) -> Vec<ProviderWatchIdentity> {
-    cfg.accounts.iter().filter_map(|account| match cfg.provider_accounts.get(&account.id) {
-        Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, client_id }) => Some(ProviderWatchIdentity { account:account.id.clone(), origin:origin.clone(), client_id:client_id.clone(), username:account.username.clone(), archive_root:account.archive_root.clone() }),
-        None => None,
-    }).collect()
+    cfg.accounts
+        .iter()
+        .filter_map(|account| match cfg.provider_accounts.get(&account.id) {
+            Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, client_id }) => {
+                Some(ProviderWatchIdentity {
+                    account: account.id.clone(),
+                    origin: origin.clone(),
+                    client_id: client_id.clone(),
+                    username: account.username.clone(),
+                    archive_root: account.archive_root.clone(),
+                })
+            }
+            None => None,
+        })
+        .collect()
 }
 
 /// Maintain at most one event connection for each configured provider account.
 /// Replacements are joined before restarting so an old grant cannot overlap a
 /// new configuration; the stream's bounded timeout also permits shutdown.
-fn provider_event_supervisor(config_path: PathBuf, gate: Arc<Mutex<()>>, sched: Arc<Scheduler>, events: Arc<isyncyou_webui::EventBus>) {
-    let mut workers = std::collections::HashMap::<String,(ProviderWatchIdentity,Arc<AtomicBool>,std::thread::JoinHandle<()>)>::new();
+fn provider_event_supervisor(
+    config_path: PathBuf,
+    gate: Arc<Mutex<()>>,
+    sched: Arc<Scheduler>,
+    events: Arc<isyncyou_webui::EventBus>,
+) {
+    let mut workers = std::collections::HashMap::<
+        String,
+        (
+            ProviderWatchIdentity,
+            Arc<AtomicBool>,
+            std::thread::JoinHandle<()>,
+        ),
+    >::new();
     loop {
         {
-            let desired = load_config(&config_path).map(|cfg| provider_watch_identities(&cfg)).unwrap_or_default();
-            let obsolete: Vec<String> = workers.iter().filter(|(_, (identity, _, thread))| thread.is_finished() || !desired.contains(identity)).map(|(id,_)| id.clone()).collect();
+            let desired = load_config(&config_path)
+                .map(|cfg| provider_watch_identities(&cfg))
+                .unwrap_or_default();
+            let obsolete: Vec<String> = workers
+                .iter()
+                .filter(|(_, (identity, _, thread))| {
+                    thread.is_finished() || !desired.contains(identity)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
             for id in obsolete {
-                if let Some((_,stop,thread)) = workers.remove(&id) { stop.store(true,Ordering::Relaxed); let _ = thread.join(); }
+                if let Some((_, stop, thread)) = workers.remove(&id) {
+                    stop.store(true, Ordering::Relaxed);
+                    let _ = thread.join();
+                }
             }
             for identity in desired {
-                if workers.contains_key(&identity.account) { continue; }
+                if workers.contains_key(&identity.account) {
+                    continue;
+                }
                 let stop = Arc::new(AtomicBool::new(false));
-                let (path, worker_gate, worker_sched, worker_events, worker_stop, worker_id) = (config_path.clone(),gate.clone(),sched.clone(),events.clone(),stop.clone(),identity.clone());
-                let thread = std::thread::spawn(move || provider_event_worker(path,worker_gate,worker_sched,worker_events,worker_stop,worker_id));
-                workers.insert(identity.account.clone(),(identity,stop,thread));
+                let (path, worker_gate, worker_sched, worker_events, worker_stop, worker_id) = (
+                    config_path.clone(),
+                    gate.clone(),
+                    sched.clone(),
+                    events.clone(),
+                    stop.clone(),
+                    identity.clone(),
+                );
+                let thread = std::thread::spawn(move || {
+                    provider_event_worker(
+                        path,
+                        worker_gate,
+                        worker_sched,
+                        worker_events,
+                        worker_stop,
+                        worker_id,
+                    )
+                });
+                workers.insert(identity.account.clone(), (identity, stop, thread));
             }
         }
         std::thread::sleep(Duration::from_secs(10));
     }
 }
 
-fn provider_event_worker(config_path: PathBuf, gate: Arc<Mutex<()>>, sched: Arc<Scheduler>, events: Arc<isyncyou_webui::EventBus>, stop: Arc<AtomicBool>, identity: ProviderWatchIdentity) {
-    let dirty = Arc::new((Mutex::new((true,true)), Condvar::new()));
+fn provider_event_worker(
+    config_path: PathBuf,
+    gate: Arc<Mutex<()>>,
+    sched: Arc<Scheduler>,
+    events: Arc<isyncyou_webui::EventBus>,
+    stop: Arc<AtomicBool>,
+    identity: ProviderWatchIdentity,
+) {
+    let dirty = Arc::new((Mutex::new((true, true)), Condvar::new()));
     let mut domain_threads = Vec::new();
-    for mail in [true,false] {
-        let (path, domain_gate, domain_sched, domain_events, domain_stop, domain_id, domain_dirty) = (config_path.clone(),gate.clone(),sched.clone(),events.clone(),stop.clone(),identity.clone(),dirty.clone());
-        domain_threads.push(std::thread::spawn(move || provider_domain_worker(path,domain_gate,domain_sched,domain_events,domain_stop,domain_id,domain_dirty,mail)));
+    for mail in [true, false] {
+        let (path, domain_gate, domain_sched, domain_events, domain_stop, domain_id, domain_dirty) = (
+            config_path.clone(),
+            gate.clone(),
+            sched.clone(),
+            events.clone(),
+            stop.clone(),
+            identity.clone(),
+            dirty.clone(),
+        );
+        domain_threads.push(std::thread::spawn(move || {
+            provider_domain_worker(
+                path,
+                domain_gate,
+                domain_sched,
+                domain_events,
+                domain_stop,
+                domain_id,
+                domain_dirty,
+                mail,
+            )
+        }));
     }
     let mut backoff = 1u64;
     let mut degraded = false;
     while !stop.load(Ordering::Relaxed) {
-        let cfg = match load_config(&config_path) { Ok(cfg) if provider_watch_identities(&cfg).contains(&identity) => cfg, _ => break };
+        let cfg = match load_config(&config_path) {
+            Ok(cfg) if provider_watch_identities(&cfg).contains(&identity) => cfg,
+            _ => break,
+        };
         let opened = std::time::Instant::now();
-        let result = isyncyou_engine::self_hosted_mail::watch_mail_events(&cfg,&identity.account,&stop,|domains| {
-            if stop.load(Ordering::Relaxed) { return Ok(()); }
-            if degraded { eprintln!("isyncyoud: provider event stream reconnected; delta reconciliation requested"); degraded = false; }
-            if !domains.mail && !domains.dav { return Ok(()); }
-            let mut flags = dirty.0.lock().unwrap_or_else(|e| e.into_inner());
-            let changed = (domains.mail && !flags.0) || (domains.dav && !flags.1);
-            flags.0 |= domains.mail; flags.1 |= domains.dav;
-            if changed { dirty.1.notify_all(); }
-            Ok(())
-        });
-        if stop.load(Ordering::Relaxed) { break; }
+        let result = isyncyou_engine::self_hosted_mail::watch_mail_events(
+            &cfg,
+            &identity.account,
+            &stop,
+            |domains| {
+                if stop.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                if degraded {
+                    eprintln!("isyncyoud: provider event stream reconnected; delta reconciliation requested");
+                    degraded = false;
+                }
+                if !domains.mail && !domains.dav {
+                    return Ok(());
+                }
+                let mut flags = dirty.0.lock().unwrap_or_else(|e| e.into_inner());
+                let changed = (domains.mail && !flags.0) || (domains.dav && !flags.1);
+                flags.0 |= domains.mail;
+                flags.1 |= domains.dav;
+                if changed {
+                    dirty.1.notify_all();
+                }
+                Ok(())
+            },
+        );
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         if result.is_err() && opened.elapsed() < Duration::from_secs(30) && !degraded {
-            eprintln!("isyncyoud: provider event stream unavailable; periodic delta remains active");
+            eprintln!(
+                "isyncyoud: provider event stream unavailable; periodic delta remains active"
+            );
             degraded = true;
         }
-        if opened.elapsed() >= Duration::from_secs(30) { backoff = 1; } else { backoff = (backoff * 2).min(60); }
+        if opened.elapsed() >= Duration::from_secs(30) {
+            backoff = 1;
+        } else {
+            backoff = (backoff * 2).min(60);
+        }
         for _ in 0..backoff {
-            if stop.load(Ordering::Relaxed) { break; }
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
             std::thread::sleep(Duration::from_secs(1));
         }
     }
-    stop.store(true,Ordering::Relaxed);
+    stop.store(true, Ordering::Relaxed);
     dirty.1.notify_all();
-    for thread in domain_threads { let _ = thread.join(); }
+    for thread in domain_threads {
+        let _ = thread.join();
+    }
 }
 
-fn provider_domain_worker(config_path: PathBuf, gate: Arc<Mutex<()>>, sched: Arc<Scheduler>, events: Arc<isyncyou_webui::EventBus>, stop: Arc<AtomicBool>, identity: ProviderWatchIdentity, dirty: Arc<(Mutex<(bool,bool)>,Condvar)>, mail: bool) {
+fn provider_domain_worker(
+    config_path: PathBuf,
+    gate: Arc<Mutex<()>>,
+    sched: Arc<Scheduler>,
+    events: Arc<isyncyou_webui::EventBus>,
+    stop: Arc<AtomicBool>,
+    identity: ProviderWatchIdentity,
+    dirty: Arc<(Mutex<(bool, bool)>, Condvar)>,
+    mail: bool,
+) {
     let mut last: Option<std::time::Instant> = None;
     let mut retry_secs = 5u64;
     while !stop.load(Ordering::Relaxed) {
         let mut flags = dirty.0.lock().unwrap_or_else(|e| e.into_inner());
         let is_dirty = if mail { flags.0 } else { flags.1 };
-        let remaining = last.map(|time| Duration::from_secs(300).saturating_sub(time.elapsed())).unwrap_or_default();
+        let remaining = last
+            .map(|time| Duration::from_secs(300).saturating_sub(time.elapsed()))
+            .unwrap_or_default();
         if !is_dirty && !remaining.is_zero() {
-            let (next,_) = dirty.1.wait_timeout(flags,remaining).unwrap_or_else(|e| e.into_inner());
-            drop(next); continue;
+            let (next, _) = dirty
+                .1
+                .wait_timeout(flags, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            drop(next);
+            continue;
         }
         if is_dirty {
-            if let Some(delay) = last.map(|time| Duration::from_secs(1).saturating_sub(time.elapsed())).filter(|delay| !delay.is_zero()) {
-                drop(flags); std::thread::sleep(delay); continue;
+            if let Some(delay) = last
+                .map(|time| Duration::from_secs(1).saturating_sub(time.elapsed()))
+                .filter(|delay| !delay.is_zero())
+            {
+                drop(flags);
+                std::thread::sleep(delay);
+                continue;
             }
         }
-        if sched.state.lock().unwrap_or_else(|e| e.into_inner()).paused { drop(flags); std::thread::sleep(Duration::from_secs(1)); continue; }
-        if mail { flags.0 = false; } else { flags.1 = false; }
+        if sched.state.lock().unwrap_or_else(|e| e.into_inner()).paused {
+            drop(flags);
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+        if mail {
+            flags.0 = false;
+        } else {
+            flags.1 = false;
+        }
         drop(flags);
-        let cfg = match load_config(&config_path) { Ok(cfg) if provider_watch_identities(&cfg).contains(&identity) => cfg, _ => break };
-        let ok = if mail { sync_account(&cfg,&identity.account,&gate,&local_host()).is_ok() } else { sync_provider_dav(&cfg,&identity.account).is_ok() };
+        let cfg = match load_config(&config_path) {
+            Ok(cfg) if provider_watch_identities(&cfg).contains(&identity) => cfg,
+            _ => break,
+        };
+        let ok = if mail {
+            sync_account(&cfg, &identity.account, &gate, &local_host()).is_ok()
+        } else {
+            sync_provider_dav(&cfg, &identity.account).is_ok()
+        };
         last = Some(std::time::Instant::now());
-        if ok { retry_secs = 5; events.notify(); } else {
-            if mail { eprintln!("isyncyoud: provider mail delta incomplete"); } else { eprintln!("isyncyoud: provider DAV delta incomplete"); }
-            for _ in 0..retry_secs { if stop.load(Ordering::Relaxed) { break; } std::thread::sleep(Duration::from_secs(1)); }
+        if ok {
+            retry_secs = 5;
+            events.notify();
+        } else {
+            if mail {
+                eprintln!("isyncyoud: provider mail delta incomplete");
+            } else {
+                eprintln!("isyncyoud: provider DAV delta incomplete");
+            }
+            for _ in 0..retry_secs {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
             retry_secs = (retry_secs * 2).min(60);
             let mut flags = dirty.0.lock().unwrap_or_else(|e| e.into_inner());
-            if mail { flags.0 = true; } else { flags.1 = true; }
+            if mail {
+                flags.0 = true;
+            } else {
+                flags.1 = true;
+            }
         }
     }
 }
 
 fn sync_provider_dav(cfg: &Config, account: &str) -> Result<(), ()> {
-    let result = isyncyou_engine::dav_live::sync_all(cfg, account, "/.well-known/caldav").map_err(|_| ())?;
-    if result.failed != 0 { return Err(()); }
+    let result =
+        isyncyou_engine::dav_live::sync_all(cfg, account, "/.well-known/caldav").map_err(|_| ())?;
+    if result.failed != 0 {
+        return Err(());
+    }
     Ok(())
 }
 
@@ -830,7 +1008,9 @@ fn local_watch_eligible(cfg: &Config, account: &isyncyou_core::AccountConfig) ->
 fn watch_loop(cfg: Config, sched: Arc<Scheduler>) {
     use isyncyou_change_source::ChangeSource as _;
     for acc in &cfg.accounts {
-        if !local_watch_eligible(&cfg,acc) { continue; }
+        if !local_watch_eligible(&cfg, acc) {
+            continue;
+        }
         let root = acc.sync_root.clone();
         let account = acc.id.clone();
         let change_source = cfg.sync.clone();
@@ -1359,25 +1539,57 @@ mod tests {
     #[test]
     fn local_watcher_ignores_self_hosted_and_empty_roots() {
         let mut cfg = Config::default();
-        let mut account = isyncyou_core::AccountConfig {id:"account".into(),username:"fixture".into(),sync_root:PathBuf::new(),archive_root:PathBuf::from("/archive"),cache_root:PathBuf::new(),mount_point:None};
-        assert!(!local_watch_eligible(&cfg,&account));
+        let mut account = isyncyou_core::AccountConfig {
+            id: "account".into(),
+            username: "fixture".into(),
+            sync_root: PathBuf::new(),
+            archive_root: PathBuf::from("/archive"),
+            cache_root: PathBuf::new(),
+            mount_point: None,
+        };
+        assert!(!local_watch_eligible(&cfg, &account));
         account.sync_root = PathBuf::from("/sync");
-        assert!(local_watch_eligible(&cfg,&account));
-        cfg.provider_accounts.insert(account.id.clone(),isyncyou_core::config::ProviderConfig::SelfHosted {origin:"https://example.test".into(),client_id:"client".into()});
-        assert!(!local_watch_eligible(&cfg,&account));
+        assert!(local_watch_eligible(&cfg, &account));
+        cfg.provider_accounts.insert(
+            account.id.clone(),
+            isyncyou_core::config::ProviderConfig::SelfHosted {
+                origin: "https://example.test".into(),
+                client_id: "client".into(),
+            },
+        );
+        assert!(!local_watch_eligible(&cfg, &account));
     }
 
     #[test]
     fn provider_watch_identity_tracks_native_config_and_skips_microsoft() {
         let mut cfg = Config::default();
-        for id in ["provider","microsoft"] {
-            cfg.accounts.push(isyncyou_core::AccountConfig {id:id.into(),username:id.into(),sync_root:PathBuf::new(),archive_root:PathBuf::from(format!("/{id}")),cache_root:PathBuf::new(),mount_point:None});
+        for id in ["provider", "microsoft"] {
+            cfg.accounts.push(isyncyou_core::AccountConfig {
+                id: id.into(),
+                username: id.into(),
+                sync_root: PathBuf::new(),
+                archive_root: PathBuf::from(format!("/{id}")),
+                cache_root: PathBuf::new(),
+                mount_point: None,
+            });
         }
-        cfg.provider_accounts.insert("provider".into(),isyncyou_core::config::ProviderConfig::SelfHosted {origin:"https://example.test".into(),client_id:"first".into()});
+        cfg.provider_accounts.insert(
+            "provider".into(),
+            isyncyou_core::config::ProviderConfig::SelfHosted {
+                origin: "https://example.test".into(),
+                client_id: "first".into(),
+            },
+        );
         let original = provider_watch_identities(&cfg);
-        assert_eq!(original.len(),1);
-        assert_eq!(original[0].account,"provider");
-        cfg.provider_accounts.insert("provider".into(),isyncyou_core::config::ProviderConfig::SelfHosted {origin:"https://example.test".into(),client_id:"second".into()});
+        assert_eq!(original.len(), 1);
+        assert_eq!(original[0].account, "provider");
+        cfg.provider_accounts.insert(
+            "provider".into(),
+            isyncyou_core::config::ProviderConfig::SelfHosted {
+                origin: "https://example.test".into(),
+                client_id: "second".into(),
+            },
+        );
         assert!(provider_watch_identities(&cfg) != original);
     }
 

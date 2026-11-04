@@ -19,13 +19,13 @@ pub mod dav;
 pub mod export;
 #[cfg(feature = "http")]
 pub mod jmap;
-#[cfg(feature = "http")]
-pub mod request_budget;
 pub mod mail;
 pub mod mime;
 pub mod onedrive;
 pub mod onenote;
 pub mod quickxor;
+#[cfg(feature = "http")]
+pub mod request_budget;
 pub mod restore;
 pub mod scope;
 pub mod shared;

@@ -27,7 +27,10 @@ mod mobile_jobs;
     feature = "agent-subscription-experimental"
 ))]
 mod product_session;
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 mod provider_session;
 
 pub use agent_ops::{run_backup_account, AgentOperationPolicy, BackupDelta, BackupRun};
@@ -174,272 +177,970 @@ fn make_executor(
     ))
 }
 
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-fn shared_mail_ref(scope:&str, id:&str) -> String {
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn shared_mail_ref(scope: &str, id: &str) -> String {
     use base64::Engine as _;
-    format!("shared-mail:{}:{}",base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(scope),base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id))
+    format!(
+        "shared-mail:{}:{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(scope),
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id)
+    )
 }
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-fn parse_shared_mail_ref(value:&str) -> Result<Option<(String,String)>,String> {
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn parse_shared_mail_ref(value: &str) -> Result<Option<(String, String)>, String> {
     use base64::Engine as _;
-    let Some(rest) = value.strip_prefix("shared-mail:") else { return Ok(None); };
-    let (scope,id) = rest.split_once(':').ok_or("invalid shared mail reference")?;
-    let decode = |v:&str| -> Result<String,String> {
-        if v.len() > 2048 { return Err("invalid shared mail reference".into()); }
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(v).map_err(|_| "invalid shared mail reference")?;
+    let Some(rest) = value.strip_prefix("shared-mail:") else {
+        return Ok(None);
+    };
+    let (scope, id) = rest
+        .split_once(':')
+        .ok_or("invalid shared mail reference")?;
+    let decode = |v: &str| -> Result<String, String> {
+        if v.len() > 2048 {
+            return Err("invalid shared mail reference".into());
+        }
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(v)
+            .map_err(|_| "invalid shared mail reference")?;
         let value = String::from_utf8(bytes).map_err(|_| "invalid shared mail reference")?;
-        if value.is_empty() || value.chars().any(char::is_control) { return Err("invalid shared mail reference".into()); }
+        if value.is_empty() || value.chars().any(char::is_control) {
+            return Err("invalid shared mail reference".into());
+        }
         Ok(value)
     };
-    Ok(Some((decode(scope)?,decode(id)?)))
+    Ok(Some((decode(scope)?, decode(id)?)))
 }
 
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn provider_mail_sources(rows: &[serde_json::Value]) -> Vec<isyncyou_agent::SourceRef> {
-    rows.iter().filter_map(|row| {
-        let id = row["id"].as_str()?;
-        let label = row["subject"].as_str().filter(|subject| !subject.is_empty()).map(str::to_string);
-        let service = row["service"].as_str().filter(|s| matches!(*s,"mail" | "calendar" | "contacts" | "todo"))?;
-        let source = isyncyou_agent::SourceRef { service:service.into(), item_id:id.into(), label };
-        isyncyou_agent::activity::valid_source_ref(&source).then_some(source)
-    }).take(64).collect()
+    rows.iter()
+        .filter_map(|row| {
+            let id = row["id"].as_str()?;
+            let label = row["subject"]
+                .as_str()
+                .filter(|subject| !subject.is_empty())
+                .map(str::to_string);
+            let service = row["service"]
+                .as_str()
+                .filter(|s| matches!(*s, "mail" | "calendar" | "contacts" | "todo"))?;
+            let source = isyncyou_agent::SourceRef {
+                service: service.into(),
+                item_id: id.into(),
+                label,
+            };
+            isyncyou_agent::activity::valid_source_ref(&source).then_some(source)
+        })
+        .take(64)
+        .collect()
 }
 
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn provider_contact_search_names(view: &serde_json::Value) -> Vec<serde_json::Value> {
-    view.get(1).and_then(serde_json::Value::as_array).into_iter().flatten().filter(|field| field.get(0).and_then(serde_json::Value::as_str).is_some_and(|name| name.eq_ignore_ascii_case("fn"))).cloned().collect()
+    view.get(1)
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|field| {
+            field
+                .get(0)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| name.eq_ignore_ascii_case("fn"))
+        })
+        .cloned()
+        .collect()
 }
 
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-struct ProviderMailExecutor { cfg: Config, account: String, config_path:Arc<std::sync::RwLock<Option<PathBuf>>>, control_store:Option<Arc<agent_control_store::AgentControlStore>> }
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+struct ProviderMailExecutor {
+    cfg: Config,
+    account: String,
+    config_path: Arc<std::sync::RwLock<Option<PathBuf>>>,
+    control_store: Option<Arc<agent_control_store::AgentControlStore>>,
+}
 
-fn load_host_runtime_config(path:&std::path::Path) -> Result<Config,String> {
+fn load_host_runtime_config(path: &std::path::Path) -> Result<Config, String> {
     #[allow(unused_mut)]
-    let mut cfg=Config::load(path)?;
-    #[cfg(target_os="android")]
+    let mut cfg = Config::load(path)?;
+    #[cfg(target_os = "android")]
     cfg.prepare_mobile_for_files_dir(path.parent().ok_or("account_config_unavailable")?)?;
     cfg.validate().map_err(|_| "account_config_unavailable")?;
     Ok(cfg)
 }
 
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-fn with_current_recovery_config<T>(path:&std::sync::RwLock<Option<PathBuf>>, fallback:&Config, action:impl FnOnce(&Config)->Result<T,String>)->Result<T,String> {
-    let path=path.read().map_err(|_| "account_config_unavailable")?.clone();
-    match path { Some(path)=>Config::with_config_lock(&path,|| { let cfg=load_host_runtime_config(&path)?; action(&cfg) }),None=>action(fallback) }
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn with_current_recovery_config<T>(
+    path: &std::sync::RwLock<Option<PathBuf>>,
+    fallback: &Config,
+    action: impl FnOnce(&Config) -> Result<T, String>,
+) -> Result<T, String> {
+    let path = path
+        .read()
+        .map_err(|_| "account_config_unavailable")?
+        .clone();
+    match path {
+        Some(path) => Config::with_config_lock(&path, || {
+            let cfg = load_host_runtime_config(&path)?;
+            action(&cfg)
+        }),
+        None => action(fallback),
+    }
 }
 
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-fn recovery_calendar_catalog(value:serde_json::Value, service:&str) -> Result<serde_json::Value,String> {
-    let allowed_kind = match service { "calendar" => "event", "todo" => "task", "mail" => "mail", "contacts" => "contact", _ => return Err("invalid_recovery_service".into()) };
-    fn id<'a>(row:&'a serde_json::Value,name:&str) -> Result<&'a str,String> {
-        row.get(name).and_then(serde_json::Value::as_str).filter(|s| s.len()==64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))).ok_or_else(|| "invalid_recovery_catalog".into())
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn recovery_calendar_catalog(
+    value: serde_json::Value,
+    service: &str,
+) -> Result<serde_json::Value, String> {
+    let allowed_kind = match service {
+        "calendar" => "event",
+        "todo" => "task",
+        "mail" => "mail",
+        "contacts" => "contact",
+        _ => return Err("invalid_recovery_service".into()),
+    };
+    fn id<'a>(row: &'a serde_json::Value, name: &str) -> Result<&'a str, String> {
+        row.get(name)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| {
+                s.len() == 64
+                    && s.bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+            .ok_or_else(|| "invalid_recovery_catalog".into())
     }
-    let rows = value.get("items").and_then(serde_json::Value::as_array).ok_or("invalid_recovery_catalog")?;
-    if rows.len() > 256 { return Err("invalid_recovery_catalog".into()); }
+    let rows = value
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("invalid_recovery_catalog")?;
+    if rows.len() > 256 {
+        return Err("invalid_recovery_catalog".into());
+    }
     let mut items = Vec::new();
     for row in rows {
-        let kind = row.get("kind").and_then(serde_json::Value::as_str).ok_or("invalid_recovery_catalog")?;
-        if kind != allowed_kind { continue; }
-        let label = row.get("label").and_then(serde_json::Value::as_str).filter(|s| s.chars().count()<=512 && !s.chars().any(char::is_control));
+        let kind = row
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("invalid_recovery_catalog")?;
+        if kind != allowed_kind {
+            continue;
+        }
+        let label = row
+            .get("label")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| s.chars().count() <= 512 && !s.chars().any(char::is_control));
         items.push(serde_json::json!({"generation":id(row,"generation")?,"object":id(row,"object")?,"version":id(row,"version")?,"kind":kind,"label":label}));
     }
-    let next = match value.get("next") { None | Some(serde_json::Value::Null) => None, Some(v) => Some(v.as_u64().ok_or("invalid_recovery_catalog")?) };
+    let next = match value.get("next") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => Some(v.as_u64().ok_or("invalid_recovery_catalog")?),
+    };
     Ok(serde_json::json!({"items":items,"next":next}))
 }
 
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-fn prepare_recovery_job_action(cfg:&Config,control:&agent_control_store::AgentControlStore,account:&str,items:&[isyncyou_webui::AgentRecoveryCatalogChoice])->Result<(isyncyou_agent::ToolAction,String,String),String> {
-    use isyncyou_engine::self_hosted_mail_restore::{RecoverySelection,load_registered_recovery_signer,recovery_catalog_with_store};
-    if items.is_empty() || items.len()>32 { return Err("invalid_recovery_selection".into()); }
-    let origin=match cfg.provider_accounts.get(account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin,..}) if cfg.accounts.iter().any(|a| a.id==account)=>origin, _=>return Err("provider_unavailable".into()) };
-    let signer=load_registered_recovery_signer(cfg,account)?;
-    let batch_id=uuid_v4()?; let mut selections=Vec::new(); let mut shown=Vec::new(); let mut unique=std::collections::HashSet::new();
-    isyncyou_engine::provider_auth::with_platform_credential_store(cfg,account,|credentials| {
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn prepare_recovery_job_action(
+    cfg: &Config,
+    control: &agent_control_store::AgentControlStore,
+    account: &str,
+    items: &[isyncyou_webui::AgentRecoveryCatalogChoice],
+) -> Result<(isyncyou_agent::ToolAction, String, String), String> {
+    use isyncyou_engine::self_hosted_mail_restore::{
+        load_registered_recovery_signer, recovery_catalog_with_store, RecoverySelection,
+    };
+    if items.is_empty() || items.len() > 32 {
+        return Err("invalid_recovery_selection".into());
+    }
+    let origin = match cfg.provider_accounts.get(account) {
+        Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. })
+            if cfg.accounts.iter().any(|a| a.id == account) =>
+        {
+            origin
+        }
+        _ => return Err("provider_unavailable".into()),
+    };
+    let signer = load_registered_recovery_signer(cfg, account)?;
+    let batch_id = uuid_v4()?;
+    let mut selections = Vec::new();
+    let mut shown = Vec::new();
+    let mut unique = std::collections::HashSet::new();
+    isyncyou_engine::provider_auth::with_platform_credential_store(cfg, account, |credentials| {
         for choice in items {
-            let service=match choice.kind.as_str() { "event"=>"calendar", "task"=>"todo", "mail"=>"mail", "contact"=>"contacts", _=>return Err("invalid_recovery_selection".into()) };
-            if !unique.insert((choice.generation.clone(),choice.object.clone(),choice.version.clone())) { return Err("invalid_recovery_selection".into()); }
-            let catalog=recovery_calendar_catalog(recovery_catalog_with_store(cfg,account,signer.as_ref(),credentials,choice.cursor)?,service)?;
-            let rows=catalog.get("items").and_then(serde_json::Value::as_array).ok_or("invalid_recovery_catalog")?;
-            let selected=rows.iter().find(|item| item["generation"].as_str()==Some(choice.generation.as_str()) && item["object"].as_str()==Some(choice.object.as_str()) && item["version"].as_str()==Some(choice.version.as_str()) && item["kind"].as_str()==Some(choice.kind.as_str())).ok_or("recovery_selection_changed")?;
-            selections.push(RecoverySelection {operation_id:uuid_v4()?,account_id:account.into(),origin:origin.clone(),generation:choice.generation.clone(),object:choice.object.clone(),version:choice.version.clone(),confirmation:uuid_v4()?}); shown.push(selected.clone());
+            let service = match choice.kind.as_str() {
+                "event" => "calendar",
+                "task" => "todo",
+                "mail" => "mail",
+                "contact" => "contacts",
+                _ => return Err("invalid_recovery_selection".into()),
+            };
+            if !unique.insert((
+                choice.generation.clone(),
+                choice.object.clone(),
+                choice.version.clone(),
+            )) {
+                return Err("invalid_recovery_selection".into());
+            }
+            let catalog = recovery_calendar_catalog(
+                recovery_catalog_with_store(
+                    cfg,
+                    account,
+                    signer.as_ref(),
+                    credentials,
+                    choice.cursor,
+                )?,
+                service,
+            )?;
+            let rows = catalog
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+                .ok_or("invalid_recovery_catalog")?;
+            let selected = rows
+                .iter()
+                .find(|item| {
+                    item["generation"].as_str() == Some(choice.generation.as_str())
+                        && item["object"].as_str() == Some(choice.object.as_str())
+                        && item["version"].as_str() == Some(choice.version.as_str())
+                        && item["kind"].as_str() == Some(choice.kind.as_str())
+                })
+                .ok_or("recovery_selection_changed")?;
+            selections.push(RecoverySelection {
+                operation_id: uuid_v4()?,
+                account_id: account.into(),
+                origin: origin.clone(),
+                generation: choice.generation.clone(),
+                object: choice.object.clone(),
+                version: choice.version.clone(),
+                confirmation: uuid_v4()?,
+            });
+            shown.push(selected.clone());
         }
         Ok(())
     })?;
-    let effect=serde_json::json!({"account":account,"origin":origin,"destination":"recovered","objects":shown,"effect":"Request retrieval of the selected historical objects; no import occurs until a second confirmation."});
-    let protected=serde_json::json!({"device":signer.device_id(),"selections":selections,"effect":effect});
-    let expires=unix_now_ms().checked_add(AGENT_CONFIRM_TTL_MS).ok_or("confirmation_unavailable")?;
-    let digest=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| control.store_recovery_request(&batch_id,account,origin,subject.ok_or("provider_login_required")?,&protected,expires,unix_now_ms()))?;
-    let action=isyncyou_agent::ToolAction::LiveWrite {account:account.into(),service:"calendar".into(),target:None,change:serde_json::json!({"verb":"recovery_jobs","batch_id":batch_id,"request_sha256":digest,"effect":effect})};
-    Ok((action,batch_id,digest))
+    let effect = serde_json::json!({"account":account,"origin":origin,"destination":"recovered","objects":shown,"effect":"Request retrieval of the selected historical objects; no import occurs until a second confirmation."});
+    let protected =
+        serde_json::json!({"device":signer.device_id(),"selections":selections,"effect":effect});
+    let expires = unix_now_ms()
+        .checked_add(AGENT_CONFIRM_TTL_MS)
+        .ok_or("confirmation_unavailable")?;
+    let digest =
+        isyncyou_engine::provider_auth::with_locked_provider_subject(cfg, account, |subject| {
+            control.store_recovery_request(
+                &batch_id,
+                account,
+                origin,
+                subject.ok_or("provider_login_required")?,
+                &protected,
+                expires,
+                unix_now_ms(),
+            )
+        })?;
+    let action = isyncyou_agent::ToolAction::LiveWrite {
+        account: account.into(),
+        service: "calendar".into(),
+        target: None,
+        change: serde_json::json!({"verb":"recovery_jobs","batch_id":batch_id,"request_sha256":digest,"effect":effect}),
+    };
+    Ok((action, batch_id, digest))
 }
 
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-fn bind_contact_photo_action(cfg:&Config,control:&agent_control_store::AgentControlStore,mut action:isyncyou_agent::ToolAction)->Result<isyncyou_agent::ToolAction,String> {
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn bind_contact_photo_action(
+    cfg: &Config,
+    control: &agent_control_store::AgentControlStore,
+    mut action: isyncyou_agent::ToolAction,
+) -> Result<isyncyou_agent::ToolAction, String> {
     use base64::Engine as _;
-    let isyncyou_agent::ToolAction::LiveWrite {account,service,target,change,..}=&mut action else {return Ok(action)};
-    if service!="contacts" || change.get("verb").and_then(serde_json::Value::as_str)!=Some("contact_set_photo") {return Ok(action);}
-    let stage=change.get("stage_id").and_then(serde_json::Value::as_str).filter(|v|!v.is_empty() && v.len()<=128).ok_or("photo_stage_unavailable")?.to_string();
-    let origin=match cfg.provider_accounts.get(account) {Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin,..}) if cfg.accounts.iter().any(|a|a.id==*account)=>origin,_=>return Err("provider_unavailable".into())};
-    let (saved,digest)=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| control.read_prepared_photo(&stage,account,origin,subject.ok_or("provider_login_required")?,unix_now_ms()))?;
-    let field=|name:&str| -> Result<&str,String> {saved.get(name).and_then(serde_json::Value::as_str).ok_or("photo_stage_unavailable".into())};
-    let collection=field("collection")?.to_owned();let href=field("href")?.to_owned();let media=field("media_type")?.to_owned();let sha=field("sha256")?.to_owned();
-    if target.as_ref().is_some_and(|provided|provided!=&href) {return Err("photo_stage_unavailable".into());}
-    let bytes=base64::engine::general_purpose::STANDARD.decode(field("photo_base64")?).map_err(|_| "photo_stage_unavailable")?;
-    let photo=isyncyou_engine::dav_live::prepare_contact_photo(cfg,account,&collection,&href,&media,&bytes)?;
-    if photo.origin!=*origin || photo.new_photo_sha256!=sha || photo.size!=bytes.len() || photo.edit.href!=href || photo.edit.expected_collection_token.is_some() {return Err("photo_stage_unavailable".into());}
-    let raw_sha=ring::digest::digest(&ring::digest::SHA256,&photo.edit.raw).as_ref().iter().map(|b|format!("{b:02x}")).collect::<String>();
-    *target=Some(href.clone());*change=serde_json::json!({"verb":"contact_set_photo","stage_id":stage,"request_sha256":digest,"origin":origin,"collection":collection,"href":href,"media_type":media,"sha256":sha,"size":bytes.len(),"uid":photo.uid,"name":photo.name,"old_photo_uri_sha256":photo.old_photo_uri_sha256,"etag":photo.edit.expected_etag,"raw_sha256":raw_sha});
+    let isyncyou_agent::ToolAction::LiveWrite {
+        account,
+        service,
+        target,
+        change,
+        ..
+    } = &mut action
+    else {
+        return Ok(action);
+    };
+    if service != "contacts"
+        || change.get("verb").and_then(serde_json::Value::as_str) != Some("contact_set_photo")
+    {
+        return Ok(action);
+    }
+    let stage = change
+        .get("stage_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| !v.is_empty() && v.len() <= 128)
+        .ok_or("photo_stage_unavailable")?
+        .to_string();
+    let origin = match cfg.provider_accounts.get(account) {
+        Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. })
+            if cfg.accounts.iter().any(|a| a.id == *account) =>
+        {
+            origin
+        }
+        _ => return Err("provider_unavailable".into()),
+    };
+    let (saved, digest) =
+        isyncyou_engine::provider_auth::with_locked_provider_subject(cfg, account, |subject| {
+            control.read_prepared_photo(
+                &stage,
+                account,
+                origin,
+                subject.ok_or("provider_login_required")?,
+                unix_now_ms(),
+            )
+        })?;
+    let field = |name: &str| -> Result<&str, String> {
+        saved
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .ok_or("photo_stage_unavailable".into())
+    };
+    let collection = field("collection")?.to_owned();
+    let href = field("href")?.to_owned();
+    let media = field("media_type")?.to_owned();
+    let sha = field("sha256")?.to_owned();
+    if target.as_ref().is_some_and(|provided| provided != &href) {
+        return Err("photo_stage_unavailable".into());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(field("photo_base64")?)
+        .map_err(|_| "photo_stage_unavailable")?;
+    let photo = isyncyou_engine::dav_live::prepare_contact_photo(
+        cfg,
+        account,
+        &collection,
+        &href,
+        &media,
+        &bytes,
+    )?;
+    if photo.origin != *origin
+        || photo.new_photo_sha256 != sha
+        || photo.size != bytes.len()
+        || photo.edit.href != href
+        || photo.edit.expected_collection_token.is_some()
+    {
+        return Err("photo_stage_unavailable".into());
+    }
+    let raw_sha = ring::digest::digest(&ring::digest::SHA256, &photo.edit.raw)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    *target = Some(href.clone());
+    *change = serde_json::json!({"verb":"contact_set_photo","stage_id":stage,"request_sha256":digest,"origin":origin,"collection":collection,"href":href,"media_type":media,"sha256":sha,"size":bytes.len(),"uid":photo.uid,"name":photo.name,"old_photo_uri_sha256":photo.old_photo_uri_sha256,"etag":photo.edit.expected_etag,"raw_sha256":raw_sha});
     Ok(action)
 }
 
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-fn bind_model_contact_photo(cfg:&Config,control:Option<&agent_control_store::AgentControlStore>,action:isyncyou_agent::ToolAction)->Result<isyncyou_agent::ToolAction,String> {
-    if matches!(&action,isyncyou_agent::ToolAction::LiveWrite {service,change,..} if service=="contacts" && change.get("verb").and_then(serde_json::Value::as_str)==Some("contact_set_photo")) {bind_contact_photo_action(cfg,control.ok_or("confirmation_unavailable")?,action)} else {Ok(action)}
-}
-
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-fn bind_model_recovery_jobs(cfg:&Config,control:Option<&agent_control_store::AgentControlStore>,action:isyncyou_agent::ToolAction)->Result<isyncyou_agent::ToolAction,String> {
-    let isyncyou_agent::ToolAction::LiveWrite {account,service,change,..}=&action else { return Ok(action); };
-    if !matches!(service.as_str(),"calendar" | "todo" | "mail" | "contacts") { return Ok(action); }
-    let allowed_kind=match service.as_str() { "calendar"=>"event", "todo"=>"task", "mail"=>"mail", "contacts"=>"contact", _=>unreachable!() };
-    if change.get("verb").and_then(serde_json::Value::as_str)==Some("recovery_import") {
-        let batch_id=change.get("batch_id").and_then(serde_json::Value::as_str).ok_or("recovery_request_invalid")?;
-        let collection=change.get("collection").and_then(serde_json::Value::as_str).ok_or("recovery_request_invalid")?;
-        let origin=match cfg.provider_accounts.get(account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin,..}) if cfg.accounts.iter().any(|a| a.id==*account)=>origin, _=>return Err("provider_unavailable".into()) };
-        let control=control.ok_or("confirmation_unavailable")?;
-        let saved=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| control.read_claimed_recovery_request(batch_id,account,origin,subject.ok_or("provider_login_required")?))?;
-        let objects=saved.pointer("/effect/objects").and_then(serde_json::Value::as_array).ok_or("recovery_request_invalid")?;
-        if objects.is_empty() || objects.iter().any(|item| item.get("kind").and_then(serde_json::Value::as_str)!=Some(allowed_kind)) { return Err("recovery_service_mismatch".into()); }
-        let request=isyncyou_webui::AgentRecoveryImportPrepareRequest {request_id:String::new(),session_id:String::new(),account:account.clone(),batch_id:batch_id.into(),collection:collection.into()};
-        return Ok(prepare_recovery_import_action(cfg,control,origin,&request)?.0);
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn bind_model_contact_photo(
+    cfg: &Config,
+    control: Option<&agent_control_store::AgentControlStore>,
+    action: isyncyou_agent::ToolAction,
+) -> Result<isyncyou_agent::ToolAction, String> {
+    if matches!(&action,isyncyou_agent::ToolAction::LiveWrite {service,change,..} if service=="contacts" && change.get("verb").and_then(serde_json::Value::as_str)==Some("contact_set_photo"))
+    {
+        bind_contact_photo_action(cfg, control.ok_or("confirmation_unavailable")?, action)
+    } else {
+        Ok(action)
     }
-    if change.get("verb").and_then(serde_json::Value::as_str)!=Some("recovery_jobs") { return Ok(action); }
-    let choices:Vec<isyncyou_webui::AgentRecoveryCatalogChoice>=serde_json::from_value(change.get("items").cloned().ok_or("invalid_recovery_selection")?).map_err(|_| "invalid_recovery_selection")?;
-    if choices.iter().any(|choice| choice.kind!=allowed_kind) { return Err("recovery_service_mismatch".into()); }
-    Ok(prepare_recovery_job_action(cfg,control.ok_or("confirmation_unavailable")?,account,&choices)?.0)
 }
 
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-fn bind_model_recovery_pending(cfg:&Config,control:Option<&agent_control_store::AgentControlStore>,action:&isyncyou_agent::ToolAction,pending_id:&str,action_hash:&str)->Result<(),String> {
-    let isyncyou_agent::ToolAction::LiveWrite {account,service,change,..}=action else { return Ok(()); };
-    if !matches!(service.as_str(),"calendar"|"contacts") { return Ok(()); }
-    let verb=change.get("verb").and_then(serde_json::Value::as_str).unwrap_or("");
-    if !matches!(verb,"recovery_jobs" | "recovery_batch_import" | "contact_set_photo") { return Ok(()); }
-    let origin=match cfg.provider_accounts.get(account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin,..}) if cfg.accounts.iter().any(|a| a.id==*account)=>origin, _=>return Err("provider_unavailable".into()) };
-    let batch=change.get(if verb=="contact_set_photo" {"stage_id"} else {"batch_id"}).and_then(serde_json::Value::as_str).ok_or("recovery_request_invalid")?;
-    let digest=change.get(if matches!(verb,"recovery_jobs"|"contact_set_photo") {"request_sha256"} else {"manifest_sha256"}).and_then(serde_json::Value::as_str).ok_or("recovery_request_invalid")?;
-    let control=control.ok_or("confirmation_unavailable")?;
-    isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| {
-        let subject=subject.ok_or("provider_login_required")?;
-        if matches!(verb,"recovery_jobs"|"contact_set_photo") { control.bind_recovery_request(batch,account,origin,subject,digest,pending_id,action_hash,unix_now_ms()) } else { control.bind_recovery_batch_confirmation(batch,account,origin,subject,digest,pending_id,action_hash,unix_now_ms()) }
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn bind_model_recovery_jobs(
+    cfg: &Config,
+    control: Option<&agent_control_store::AgentControlStore>,
+    action: isyncyou_agent::ToolAction,
+) -> Result<isyncyou_agent::ToolAction, String> {
+    let isyncyou_agent::ToolAction::LiveWrite {
+        account,
+        service,
+        change,
+        ..
+    } = &action
+    else {
+        return Ok(action);
+    };
+    if !matches!(service.as_str(), "calendar" | "todo" | "mail" | "contacts") {
+        return Ok(action);
+    }
+    let allowed_kind = match service.as_str() {
+        "calendar" => "event",
+        "todo" => "task",
+        "mail" => "mail",
+        "contacts" => "contact",
+        _ => unreachable!(),
+    };
+    if change.get("verb").and_then(serde_json::Value::as_str) == Some("recovery_import") {
+        let batch_id = change
+            .get("batch_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("recovery_request_invalid")?;
+        let collection = change
+            .get("collection")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("recovery_request_invalid")?;
+        let origin = match cfg.provider_accounts.get(account) {
+            Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. })
+                if cfg.accounts.iter().any(|a| a.id == *account) =>
+            {
+                origin
+            }
+            _ => return Err("provider_unavailable".into()),
+        };
+        let control = control.ok_or("confirmation_unavailable")?;
+        let saved = isyncyou_engine::provider_auth::with_locked_provider_subject(
+            cfg,
+            account,
+            |subject| {
+                control.read_claimed_recovery_request(
+                    batch_id,
+                    account,
+                    origin,
+                    subject.ok_or("provider_login_required")?,
+                )
+            },
+        )?;
+        let objects = saved
+            .pointer("/effect/objects")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("recovery_request_invalid")?;
+        if objects.is_empty()
+            || objects.iter().any(|item| {
+                item.get("kind").and_then(serde_json::Value::as_str) != Some(allowed_kind)
+            })
+        {
+            return Err("recovery_service_mismatch".into());
+        }
+        let request = isyncyou_webui::AgentRecoveryImportPrepareRequest {
+            request_id: String::new(),
+            session_id: String::new(),
+            account: account.clone(),
+            batch_id: batch_id.into(),
+            collection: collection.into(),
+        };
+        return Ok(prepare_recovery_import_action(cfg, control, origin, &request)?.0);
+    }
+    if change.get("verb").and_then(serde_json::Value::as_str) != Some("recovery_jobs") {
+        return Ok(action);
+    }
+    let choices: Vec<isyncyou_webui::AgentRecoveryCatalogChoice> = serde_json::from_value(
+        change
+            .get("items")
+            .cloned()
+            .ok_or("invalid_recovery_selection")?,
+    )
+    .map_err(|_| "invalid_recovery_selection")?;
+    if choices.iter().any(|choice| choice.kind != allowed_kind) {
+        return Err("recovery_service_mismatch".into());
+    }
+    Ok(prepare_recovery_job_action(
+        cfg,
+        control.ok_or("confirmation_unavailable")?,
+        account,
+        &choices,
+    )?
+    .0)
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn bind_model_recovery_pending(
+    cfg: &Config,
+    control: Option<&agent_control_store::AgentControlStore>,
+    action: &isyncyou_agent::ToolAction,
+    pending_id: &str,
+    action_hash: &str,
+) -> Result<(), String> {
+    let isyncyou_agent::ToolAction::LiveWrite {
+        account,
+        service,
+        change,
+        ..
+    } = action
+    else {
+        return Ok(());
+    };
+    if !matches!(service.as_str(), "calendar" | "contacts") {
+        return Ok(());
+    }
+    let verb = change
+        .get("verb")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !matches!(
+        verb,
+        "recovery_jobs" | "recovery_batch_import" | "contact_set_photo"
+    ) {
+        return Ok(());
+    }
+    let origin = match cfg.provider_accounts.get(account) {
+        Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. })
+            if cfg.accounts.iter().any(|a| a.id == *account) =>
+        {
+            origin
+        }
+        _ => return Err("provider_unavailable".into()),
+    };
+    let batch = change
+        .get(if verb == "contact_set_photo" {
+            "stage_id"
+        } else {
+            "batch_id"
+        })
+        .and_then(serde_json::Value::as_str)
+        .ok_or("recovery_request_invalid")?;
+    let digest = change
+        .get(if matches!(verb, "recovery_jobs" | "contact_set_photo") {
+            "request_sha256"
+        } else {
+            "manifest_sha256"
+        })
+        .and_then(serde_json::Value::as_str)
+        .ok_or("recovery_request_invalid")?;
+    let control = control.ok_or("confirmation_unavailable")?;
+    isyncyou_engine::provider_auth::with_locked_provider_subject(cfg, account, |subject| {
+        let subject = subject.ok_or("provider_login_required")?;
+        if matches!(verb, "recovery_jobs" | "contact_set_photo") {
+            control.bind_recovery_request(
+                batch,
+                account,
+                origin,
+                subject,
+                digest,
+                pending_id,
+                action_hash,
+                unix_now_ms(),
+            )
+        } else {
+            control.bind_recovery_batch_confirmation(
+                batch,
+                account,
+                origin,
+                subject,
+                digest,
+                pending_id,
+                action_hash,
+                unix_now_ms(),
+            )
+        }
     })
 }
 
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-fn rebuild_recovery_batch(account:&str, origin:&str, manifest:agent_control_store::RecoveryBatchManifest, originals:Vec<Vec<u8>>) -> Result<isyncyou_engine::self_hosted_mail_restore::ApprovedCalendarBatch,String> {
-    use isyncyou_engine::self_hosted_mail_restore::{ApprovedCalendarBatch,ApprovedCalendarRestore,CalendarRestoreKind};
-    if manifest.origin!=origin || originals.len()!=manifest.objects.len() || manifest.execution_order.len()!=originals.len() { return Err("recovery_batch_invalid".into()); }
-    let mut objects:std::collections::HashMap<String,(agent_control_store::RecoveryStagedObject,Vec<u8>)> = manifest.objects.into_iter().zip(originals).map(|(item,bytes)| (item.operation_id.clone(),(item,bytes))).collect();
-    if objects.len()!=manifest.execution_order.len() { return Err("recovery_batch_invalid".into()); }
-    let uid_map:std::collections::HashMap<String,String> = manifest.uid_map.into_iter().collect();
-    let mut items=Vec::with_capacity(manifest.execution_order.len());
-    for operation in manifest.execution_order {
-        let (source,original)=objects.remove(&operation).ok_or("recovery_batch_invalid")?;
-        let kind=match source.kind.as_str() { "event" => CalendarRestoreKind::Event, "task" => CalendarRestoreKind::Task, _ => return Err("recovery_batch_invalid".into()) };
-        items.push(ApprovedCalendarRestore { operation_id:operation, account_id:account.into(), origin:origin.into(), entry:manifest.entry.clone(), collection:manifest.collection.clone(), source_generation:source.generation, source_object:source.object, source_version:source.version, original_sha256:source.sha256, original, uid_map:uid_map.clone(), kind });
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn rebuild_recovery_batch(
+    account: &str,
+    origin: &str,
+    manifest: agent_control_store::RecoveryBatchManifest,
+    originals: Vec<Vec<u8>>,
+) -> Result<isyncyou_engine::self_hosted_mail_restore::ApprovedCalendarBatch, String> {
+    use isyncyou_engine::self_hosted_mail_restore::{
+        ApprovedCalendarBatch, ApprovedCalendarRestore, CalendarRestoreKind,
+    };
+    if manifest.origin != origin
+        || originals.len() != manifest.objects.len()
+        || manifest.execution_order.len() != originals.len()
+    {
+        return Err("recovery_batch_invalid".into());
     }
-    Ok(ApprovedCalendarBatch { items, approval_sha256:manifest.approval_sha256 })
+    let mut objects: std::collections::HashMap<
+        String,
+        (agent_control_store::RecoveryStagedObject, Vec<u8>),
+    > = manifest
+        .objects
+        .into_iter()
+        .zip(originals)
+        .map(|(item, bytes)| (item.operation_id.clone(), (item, bytes)))
+        .collect();
+    if objects.len() != manifest.execution_order.len() {
+        return Err("recovery_batch_invalid".into());
+    }
+    let uid_map: std::collections::HashMap<String, String> = manifest.uid_map.into_iter().collect();
+    let mut items = Vec::with_capacity(manifest.execution_order.len());
+    for operation in manifest.execution_order {
+        let (source, original) = objects.remove(&operation).ok_or("recovery_batch_invalid")?;
+        let kind = match source.kind.as_str() {
+            "event" => CalendarRestoreKind::Event,
+            "task" => CalendarRestoreKind::Task,
+            _ => return Err("recovery_batch_invalid".into()),
+        };
+        items.push(ApprovedCalendarRestore {
+            operation_id: operation,
+            account_id: account.into(),
+            origin: origin.into(),
+            entry: manifest.entry.clone(),
+            collection: manifest.collection.clone(),
+            source_generation: source.generation,
+            source_object: source.object,
+            source_version: source.version,
+            original_sha256: source.sha256,
+            original,
+            uid_map: uid_map.clone(),
+            kind,
+        });
+    }
+    Ok(ApprovedCalendarBatch {
+        items,
+        approval_sha256: manifest.approval_sha256,
+    })
 }
 
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-fn execute_staged_recovery_batch(cfg:&Config,account:&str,origin:&str,manifest:agent_control_store::RecoveryBatchManifest,originals:Vec<Vec<u8>>,credentials:&dyn isyncyou_engine::provider_credential::ProviderCredentialStore) -> Result<isyncyou_engine::self_hosted_mail_restore::CalendarBatchOutcome,String> {
-    use isyncyou_engine::self_hosted_mail_restore::{CalendarBatchOutcome,execute_contact_restore_with_store};
-    if let Some(value)=&manifest.collection_intent {
-        let intent:isyncyou_engine::self_hosted_mail_restore::ApprovedRecoveryCollection=serde_json::from_value(value.clone()).map_err(|_| "recovery_batch_invalid")?;
-        if intent.account_id!=account || intent.origin!=origin || intent.entry!=manifest.entry || intent.target!=manifest.collection || !match intent.service.as_str() { "calendar"=>manifest.objects.iter().all(|item|matches!(item.kind.as_str(),"event" | "task")), "contacts"=>manifest.objects.iter().all(|item|item.kind=="contact"), _=>false } { return Err("recovery_confirmation_mismatch".into()); }
-        match isyncyou_engine::self_hosted_mail_restore::ensure_recovery_collection_with_store(cfg,&intent,&intent.approval_sha256,credentials)? {
-            isyncyou_engine::self_hosted_mail_restore::RecoveryCollectionOutcome::Ready(target) if target==manifest.collection=>{},
-            isyncyou_engine::self_hosted_mail_restore::RecoveryCollectionOutcome::Rejected=>return Ok(CalendarBatchOutcome::Stopped {completed:Vec::new(),next_index:0,reason:"rejected"}),
-            isyncyou_engine::self_hosted_mail_restore::RecoveryCollectionOutcome::Conflict=>return Ok(CalendarBatchOutcome::Stopped {completed:Vec::new(),next_index:0,reason:"conflict"}),
-            _=>return Ok(CalendarBatchOutcome::Stopped {completed:Vec::new(),next_index:0,reason:"unknown"}),
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn execute_staged_recovery_batch(
+    cfg: &Config,
+    account: &str,
+    origin: &str,
+    manifest: agent_control_store::RecoveryBatchManifest,
+    originals: Vec<Vec<u8>>,
+    credentials: &dyn isyncyou_engine::provider_credential::ProviderCredentialStore,
+) -> Result<isyncyou_engine::self_hosted_mail_restore::CalendarBatchOutcome, String> {
+    use isyncyou_engine::self_hosted_mail_restore::{
+        execute_contact_restore_with_store, CalendarBatchOutcome,
+    };
+    if let Some(value) = &manifest.collection_intent {
+        let intent: isyncyou_engine::self_hosted_mail_restore::ApprovedRecoveryCollection =
+            serde_json::from_value(value.clone()).map_err(|_| "recovery_batch_invalid")?;
+        if intent.account_id != account
+            || intent.origin != origin
+            || intent.entry != manifest.entry
+            || intent.target != manifest.collection
+            || !match intent.service.as_str() {
+                "calendar" => manifest
+                    .objects
+                    .iter()
+                    .all(|item| matches!(item.kind.as_str(), "event" | "task")),
+                "contacts" => manifest.objects.iter().all(|item| item.kind == "contact"),
+                _ => false,
+            }
+        {
+            return Err("recovery_confirmation_mismatch".into());
+        }
+        match isyncyou_engine::self_hosted_mail_restore::ensure_recovery_collection_with_store(
+            cfg,
+            &intent,
+            &intent.approval_sha256,
+            credentials,
+        )? {
+            isyncyou_engine::self_hosted_mail_restore::RecoveryCollectionOutcome::Ready(target)
+                if target == manifest.collection => {}
+            isyncyou_engine::self_hosted_mail_restore::RecoveryCollectionOutcome::Rejected => {
+                return Ok(CalendarBatchOutcome::Stopped {
+                    completed: Vec::new(),
+                    next_index: 0,
+                    reason: "rejected",
+                })
+            }
+            isyncyou_engine::self_hosted_mail_restore::RecoveryCollectionOutcome::Conflict => {
+                return Ok(CalendarBatchOutcome::Stopped {
+                    completed: Vec::new(),
+                    next_index: 0,
+                    reason: "conflict",
+                })
+            }
+            _ => {
+                return Ok(CalendarBatchOutcome::Stopped {
+                    completed: Vec::new(),
+                    next_index: 0,
+                    reason: "unknown",
+                })
+            }
         }
     }
-    if manifest.objects.iter().all(|item| matches!(item.kind.as_str(),"event" | "task")) {
-        let approval=manifest.approval_sha256.clone(); let batch=rebuild_recovery_batch(account,origin,manifest,originals)?;
+    if manifest
+        .objects
+        .iter()
+        .all(|item| matches!(item.kind.as_str(), "event" | "task"))
+    {
+        let approval = manifest.approval_sha256.clone();
+        let batch = rebuild_recovery_batch(account, origin, manifest, originals)?;
         return isyncyou_engine::self_hosted_mail_restore::execute_calendar_restore_batch_with_store(cfg,&batch,&approval,credentials);
     }
-    if manifest.objects.iter().all(|item| item.kind=="mail") {
-        use isyncyou_engine::self_hosted_mail_restore::{RecoverySelection,BoundRecoveryStatus,RestoreOutcome,load_registered_recovery_signer,prepare_staged_mail_restore,execute_bound_mail_restore_with_store};
-        if manifest.origin!=origin || manifest.objects.is_empty() || originals.len()!=manifest.objects.len() || manifest.projections.len()!=originals.len() || manifest.execution_order.len()!=originals.len() || !manifest.uid_map.is_empty() { return Err("recovery_batch_invalid".into()); }
-        let bound=serde_json::to_vec(&manifest.projections).map_err(|_| "recovery_batch_invalid")?;
-        let digest:String=ring::digest::digest(&ring::digest::SHA256,&bound).as_ref().iter().map(|b|format!("{b:02x}")).collect();
-        if digest!=manifest.approval_sha256 { return Err("recovery_confirmation_mismatch".into()); }
-        let signer=load_registered_recovery_signer(cfg,account)?;
-        let mut ready=Vec::new();
-        for (index,(item,bytes)) in manifest.objects.iter().zip(originals).enumerate() {
-            if manifest.execution_order[index]!=item.operation_id { return Err("recovery_batch_invalid".into()); }
-            let selection=RecoverySelection {operation_id:item.operation_id.clone(),account_id:account.into(),origin:origin.into(),generation:item.generation.clone(),object:item.object.clone(),version:item.version.clone(),confirmation:item.confirmation.clone()};
-            let status=BoundRecoveryStatus {state:item.state.clone(),kind:item.kind.clone(),encoding:item.encoding.clone(),size:item.size,sha256:item.sha256.clone(),selection_sha256:item.selection_sha256.clone()};
-            let (op,summary)=prepare_staged_mail_restore(&selection,&status,signer.as_ref(),bytes,&manifest.collection)?;
-            if serde_json::to_value(&summary).map_err(|_| "recovery_batch_invalid")?!=manifest.projections[index] { return Err("recovery_confirmation_mismatch".into()); }
-            ready.push((op,summary.approval_sha256));
+    if manifest.objects.iter().all(|item| item.kind == "mail") {
+        use isyncyou_engine::self_hosted_mail_restore::{
+            execute_bound_mail_restore_with_store, load_registered_recovery_signer,
+            prepare_staged_mail_restore, BoundRecoveryStatus, RecoverySelection, RestoreOutcome,
+        };
+        if manifest.origin != origin
+            || manifest.objects.is_empty()
+            || originals.len() != manifest.objects.len()
+            || manifest.projections.len() != originals.len()
+            || manifest.execution_order.len() != originals.len()
+            || !manifest.uid_map.is_empty()
+        {
+            return Err("recovery_batch_invalid".into());
         }
-        let mut completed=Vec::new();
-        for (index,(op,approval)) in ready.iter().enumerate() {
-            match execute_bound_mail_restore_with_store(cfg,op,approval,credentials)? {
-                RestoreOutcome::Verified(id)=>completed.push(id),
-                RestoreOutcome::Unknown=>return Ok(CalendarBatchOutcome::Stopped {completed,next_index:index,reason:"unknown"}),
-                RestoreOutcome::Rejected | RestoreOutcome::RecoveredFolderUnavailable=>return Ok(CalendarBatchOutcome::Stopped {completed,next_index:index,reason:"rejected"}),
+        let bound =
+            serde_json::to_vec(&manifest.projections).map_err(|_| "recovery_batch_invalid")?;
+        let digest: String = ring::digest::digest(&ring::digest::SHA256, &bound)
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        if digest != manifest.approval_sha256 {
+            return Err("recovery_confirmation_mismatch".into());
+        }
+        let signer = load_registered_recovery_signer(cfg, account)?;
+        let mut ready = Vec::new();
+        for (index, (item, bytes)) in manifest.objects.iter().zip(originals).enumerate() {
+            if manifest.execution_order[index] != item.operation_id {
+                return Err("recovery_batch_invalid".into());
+            }
+            let selection = RecoverySelection {
+                operation_id: item.operation_id.clone(),
+                account_id: account.into(),
+                origin: origin.into(),
+                generation: item.generation.clone(),
+                object: item.object.clone(),
+                version: item.version.clone(),
+                confirmation: item.confirmation.clone(),
+            };
+            let status = BoundRecoveryStatus {
+                state: item.state.clone(),
+                kind: item.kind.clone(),
+                encoding: item.encoding.clone(),
+                size: item.size,
+                sha256: item.sha256.clone(),
+                selection_sha256: item.selection_sha256.clone(),
+            };
+            let (op, summary) = prepare_staged_mail_restore(
+                &selection,
+                &status,
+                signer.as_ref(),
+                bytes,
+                &manifest.collection,
+            )?;
+            if serde_json::to_value(&summary).map_err(|_| "recovery_batch_invalid")?
+                != manifest.projections[index]
+            {
+                return Err("recovery_confirmation_mismatch".into());
+            }
+            ready.push((op, summary.approval_sha256));
+        }
+        let mut completed = Vec::new();
+        for (index, (op, approval)) in ready.iter().enumerate() {
+            match execute_bound_mail_restore_with_store(cfg, op, approval, credentials)? {
+                RestoreOutcome::Verified(id) => completed.push(id),
+                RestoreOutcome::Unknown => {
+                    return Ok(CalendarBatchOutcome::Stopped {
+                        completed,
+                        next_index: index,
+                        reason: "unknown",
+                    })
+                }
+                RestoreOutcome::Rejected | RestoreOutcome::RecoveredFolderUnavailable => {
+                    return Ok(CalendarBatchOutcome::Stopped {
+                        completed,
+                        next_index: index,
+                        reason: "rejected",
+                    })
+                }
             }
         }
         return Ok(CalendarBatchOutcome::Confirmed(completed));
     }
-    if manifest.origin!=origin || manifest.objects.is_empty() || !manifest.objects.iter().all(|item| item.kind=="contact") || originals.len()!=manifest.objects.len() || manifest.projections.len()!=originals.len() || manifest.execution_order.len()!=originals.len() || manifest.uid_map.len()!=originals.len() { return Err("recovery_batch_invalid".into()); }
-    let bytes=serde_json::to_vec(&manifest.projections).map_err(|_| "recovery_batch_invalid")?;
-    let digest:String=ring::digest::digest(&ring::digest::SHA256,&bytes).as_ref().iter().map(|b|format!("{b:02x}")).collect();
-    if digest!=manifest.approval_sha256 { return Err("recovery_confirmation_mismatch".into()); }
-    let signer=isyncyou_engine::self_hosted_mail_restore::load_registered_recovery_signer(cfg,account)?;
-    let mut ready=Vec::new();
-    for (index,(item,original)) in manifest.objects.iter().zip(originals).enumerate() {
-        if manifest.execution_order[index]!=item.operation_id { return Err("recovery_batch_invalid".into()); }
-        let uid=manifest.uid_map.get(&item.operation_id).ok_or("recovery_batch_invalid")?;
-        let selection=isyncyou_engine::self_hosted_mail_restore::RecoverySelection {operation_id:item.operation_id.clone(),account_id:account.into(),origin:origin.into(),generation:item.generation.clone(),object:item.object.clone(),version:item.version.clone(),confirmation:item.confirmation.clone()};
-        let status=isyncyou_engine::self_hosted_mail_restore::BoundRecoveryStatus {state:item.state.clone(),kind:item.kind.clone(),encoding:item.encoding.clone(),size:item.size,sha256:item.sha256.clone(),selection_sha256:item.selection_sha256.clone()};
-        let (op,summary)=isyncyou_engine::self_hosted_mail_restore::prepare_staged_contact_restore(&selection,&status,signer.as_ref(),original,&manifest.entry,&manifest.collection,uid)?;
-        if serde_json::to_value(&summary).map_err(|_| "recovery_batch_invalid")?!=manifest.projections[index] { return Err("recovery_confirmation_mismatch".into()); }
-        ready.push((op,summary.approval_sha256));
+    if manifest.origin != origin
+        || manifest.objects.is_empty()
+        || !manifest.objects.iter().all(|item| item.kind == "contact")
+        || originals.len() != manifest.objects.len()
+        || manifest.projections.len() != originals.len()
+        || manifest.execution_order.len() != originals.len()
+        || manifest.uid_map.len() != originals.len()
+    {
+        return Err("recovery_batch_invalid".into());
     }
-    let mut completed=Vec::new();
-    for (index,(op,approval)) in ready.iter().enumerate() {
-        match execute_contact_restore_with_store(cfg,op,approval,credentials)? {
-            isyncyou_engine::dav_live::RecoveryImportOutcome::Confirmed {href}=>completed.push(href),
-            isyncyou_engine::dav_live::RecoveryImportOutcome::Unknown=>return Ok(CalendarBatchOutcome::Stopped {completed,next_index:index,reason:"unknown"}),
-            isyncyou_engine::dav_live::RecoveryImportOutcome::Conflict=>return Ok(CalendarBatchOutcome::Stopped {completed,next_index:index,reason:"conflict"}),
-            isyncyou_engine::dav_live::RecoveryImportOutcome::Rejected=>return Ok(CalendarBatchOutcome::Stopped {completed,next_index:index,reason:"rejected"}),
+    let bytes = serde_json::to_vec(&manifest.projections).map_err(|_| "recovery_batch_invalid")?;
+    let digest: String = ring::digest::digest(&ring::digest::SHA256, &bytes)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if digest != manifest.approval_sha256 {
+        return Err("recovery_confirmation_mismatch".into());
+    }
+    let signer =
+        isyncyou_engine::self_hosted_mail_restore::load_registered_recovery_signer(cfg, account)?;
+    let mut ready = Vec::new();
+    for (index, (item, original)) in manifest.objects.iter().zip(originals).enumerate() {
+        if manifest.execution_order[index] != item.operation_id {
+            return Err("recovery_batch_invalid".into());
+        }
+        let uid = manifest
+            .uid_map
+            .get(&item.operation_id)
+            .ok_or("recovery_batch_invalid")?;
+        let selection = isyncyou_engine::self_hosted_mail_restore::RecoverySelection {
+            operation_id: item.operation_id.clone(),
+            account_id: account.into(),
+            origin: origin.into(),
+            generation: item.generation.clone(),
+            object: item.object.clone(),
+            version: item.version.clone(),
+            confirmation: item.confirmation.clone(),
+        };
+        let status = isyncyou_engine::self_hosted_mail_restore::BoundRecoveryStatus {
+            state: item.state.clone(),
+            kind: item.kind.clone(),
+            encoding: item.encoding.clone(),
+            size: item.size,
+            sha256: item.sha256.clone(),
+            selection_sha256: item.selection_sha256.clone(),
+        };
+        let (op, summary) =
+            isyncyou_engine::self_hosted_mail_restore::prepare_staged_contact_restore(
+                &selection,
+                &status,
+                signer.as_ref(),
+                original,
+                &manifest.entry,
+                &manifest.collection,
+                uid,
+            )?;
+        if serde_json::to_value(&summary).map_err(|_| "recovery_batch_invalid")?
+            != manifest.projections[index]
+        {
+            return Err("recovery_confirmation_mismatch".into());
+        }
+        ready.push((op, summary.approval_sha256));
+    }
+    let mut completed = Vec::new();
+    for (index, (op, approval)) in ready.iter().enumerate() {
+        match execute_contact_restore_with_store(cfg, op, approval, credentials)? {
+            isyncyou_engine::dav_live::RecoveryImportOutcome::Confirmed { href } => {
+                completed.push(href)
+            }
+            isyncyou_engine::dav_live::RecoveryImportOutcome::Unknown => {
+                return Ok(CalendarBatchOutcome::Stopped {
+                    completed,
+                    next_index: index,
+                    reason: "unknown",
+                })
+            }
+            isyncyou_engine::dav_live::RecoveryImportOutcome::Conflict => {
+                return Ok(CalendarBatchOutcome::Stopped {
+                    completed,
+                    next_index: index,
+                    reason: "conflict",
+                })
+            }
+            isyncyou_engine::dav_live::RecoveryImportOutcome::Rejected => {
+                return Ok(CalendarBatchOutcome::Stopped {
+                    completed,
+                    next_index: index,
+                    reason: "rejected",
+                })
+            }
         }
     }
     Ok(CalendarBatchOutcome::Confirmed(completed))
 }
 
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-fn safe_recovery_result_diagnostic(error:&str) -> bool {
-    if matches!(error,"recovery_result_store_unavailable" | "recovery_result_binding_unavailable" | "recovery_result_auth_unavailable" | "recovery_result_status_invalid" | "recovery_result_not_available" | "recovery_result_integrity_size_true_hash_false" | "recovery_result_integrity_size_false_hash_true" | "recovery_result_integrity_size_false_hash_false") { return true; }
-    let Some(detail)=error.strip_prefix("recovery_result_status:").or_else(||error.strip_prefix("recovery_result_body:")) else { return false; };
-    if matches!(detail,"recovery_challenge_unavailable" | "recovery_read_transport_unavailable" | "recovery_read_content_type_invalid" | "recovery_read_length_exceeded" | "recovery_read_body_unavailable") { return true; }
-    detail.strip_prefix("recovery_challenge_http_").or_else(||detail.strip_prefix("recovery_read_http_")).is_some_and(|code|code.len()==3 && code.bytes().all(|b|b.is_ascii_digit()))
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn safe_recovery_result_diagnostic(error: &str) -> bool {
+    if matches!(
+        error,
+        "recovery_result_store_unavailable"
+            | "recovery_result_binding_unavailable"
+            | "recovery_result_auth_unavailable"
+            | "recovery_result_status_invalid"
+            | "recovery_result_not_available"
+            | "recovery_result_integrity_size_true_hash_false"
+            | "recovery_result_integrity_size_false_hash_true"
+            | "recovery_result_integrity_size_false_hash_false"
+    ) {
+        return true;
+    }
+    let Some(detail) = error
+        .strip_prefix("recovery_result_status:")
+        .or_else(|| error.strip_prefix("recovery_result_body:"))
+    else {
+        return false;
+    };
+    if matches!(
+        detail,
+        "recovery_challenge_unavailable"
+            | "recovery_read_transport_unavailable"
+            | "recovery_read_content_type_invalid"
+            | "recovery_read_length_exceeded"
+            | "recovery_read_body_unavailable"
+    ) {
+        return true;
+    }
+    detail
+        .strip_prefix("recovery_challenge_http_")
+        .or_else(|| detail.strip_prefix("recovery_read_http_"))
+        .is_some_and(|code| code.len() == 3 && code.bytes().all(|b| b.is_ascii_digit()))
 }
 
-fn calendar_month_bounds(year:u32, month:u32) -> Option<(String,String)> {
-    if !(1900..=9998).contains(&year) || !(1..=12).contains(&month) { return None; }
-    let (next_year,next_month) = if month == 12 { (year+1,1) } else { (year,month+1) };
-    Some((format!("{year:04}{month:02}01T000000Z"),format!("{next_year:04}{next_month:02}01T000000Z")))
+fn calendar_month_bounds(year: u32, month: u32) -> Option<(String, String)> {
+    if !(1900..=9998).contains(&year) || !(1..=12).contains(&month) {
+        return None;
+    }
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    Some((
+        format!("{year:04}{month:02}01T000000Z"),
+        format!("{next_year:04}{next_month:02}01T000000Z"),
+    ))
 }
 
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 impl isyncyou_agent::ToolExecutor for ProviderMailExecutor {
-    fn execute_read(&self, action: &isyncyou_agent::ToolAction) -> Result<String, isyncyou_agent::AgentError> {
+    fn execute_read(
+        &self,
+        action: &isyncyou_agent::ToolAction,
+    ) -> Result<String, isyncyou_agent::AgentError> {
         use isyncyou_agent::{AgentError, ToolAction};
-        if action.account() != self.account { return Err(AgentError::ToolArgs("account mismatch".into())); }
+        if action.account() != self.account {
+            return Err(AgentError::ToolArgs("account mismatch".into()));
+        }
         let origin = match self.cfg.provider_accounts.get(&self.account) {
             Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) => origin,
             None => return Err(AgentError::Provider("provider unavailable".into())),
@@ -447,145 +1148,461 @@ impl isyncyou_agent::ToolExecutor for ProviderMailExecutor {
         let store = isyncyou_engine::provider_store::open_readonly(&self.cfg, &self.account)
             .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
         match action {
-            ToolAction::List { service, parent:Some(parent), .. } if matches!(service.as_str(),"calendar" | "todo" | "mail" | "contacts") && parent=="recovery-requests" => {
-                let path=self.config_path.read().map_err(|_| AgentError::Provider("account configuration unavailable".into()))?.clone();
-                let read=|cfg:&Config| -> Result<serde_json::Value,String> {
-                    if !cfg.accounts.iter().any(|a| a.id==self.account) || cfg.provider_accounts.get(&self.account)!=self.cfg.provider_accounts.get(&self.account) { return Err("account_config_changed".into()); }
-                    let origin=match cfg.provider_accounts.get(&self.account) {Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin,..})=>origin,_=>return Err("provider_unavailable".into())};
-                    let control=self.control_store.as_ref().ok_or("recovery_unavailable")?;
-                    let rows=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&self.account,|subject| control.list_recovery_requests(&self.account,origin,subject.ok_or("provider_login_required")?,service))?;
-                    Ok(serde_json::json!({"service":service,"kind":"recovery_requests","results":rows}))
+            ToolAction::List {
+                service,
+                parent: Some(parent),
+                ..
+            } if matches!(service.as_str(), "calendar" | "todo" | "mail" | "contacts")
+                && parent == "recovery-requests" =>
+            {
+                let path = self
+                    .config_path
+                    .read()
+                    .map_err(|_| AgentError::Provider("account configuration unavailable".into()))?
+                    .clone();
+                let read = |cfg: &Config| -> Result<serde_json::Value, String> {
+                    if !cfg.accounts.iter().any(|a| a.id == self.account)
+                        || cfg.provider_accounts.get(&self.account)
+                            != self.cfg.provider_accounts.get(&self.account)
+                    {
+                        return Err("account_config_changed".into());
+                    }
+                    let origin = match cfg.provider_accounts.get(&self.account) {
+                        Some(isyncyou_core::config::ProviderConfig::SelfHosted {
+                            origin, ..
+                        }) => origin,
+                        _ => return Err("provider_unavailable".into()),
+                    };
+                    let control = self.control_store.as_ref().ok_or("recovery_unavailable")?;
+                    let rows = isyncyou_engine::provider_auth::with_locked_provider_subject(
+                        cfg,
+                        &self.account,
+                        |subject| {
+                            control.list_recovery_requests(
+                                &self.account,
+                                origin,
+                                subject.ok_or("provider_login_required")?,
+                                service,
+                            )
+                        },
+                    )?;
+                    Ok(
+                        serde_json::json!({"service":service,"kind":"recovery_requests","results":rows}),
+                    )
                 };
-                let result=match path {Some(path)=>Config::with_config_lock(&path,|| {let cfg=load_host_runtime_config(&path)?;read(&cfg)}),None=>read(&self.cfg)}.map_err(|_| AgentError::Provider("recovery requests unavailable".into()))?;
+                let result = match path {
+                    Some(path) => Config::with_config_lock(&path, || {
+                        let cfg = load_host_runtime_config(&path)?;
+                        read(&cfg)
+                    }),
+                    None => read(&self.cfg),
+                }
+                .map_err(|_| AgentError::Provider("recovery requests unavailable".into()))?;
                 Ok(result.to_string())
             }
-            ToolAction::List { service, parent:Some(parent), .. } if matches!(service.as_str(),"calendar" | "todo" | "mail" | "contacts") && parent.starts_with("recovery:") => {
-                let after = parent[9..].parse::<u64>().map_err(|_| AgentError::ToolArgs("invalid recovery cursor".into()))?;
-                let path = self.config_path.read().map_err(|_| AgentError::Provider("account configuration unavailable".into()))?.clone();
-                let read_catalog = |cfg:&Config| -> Result<serde_json::Value,String> {
-                    if !cfg.accounts.iter().any(|a| a.id == self.account) || cfg.provider_accounts.get(&self.account) != self.cfg.provider_accounts.get(&self.account) { return Err("account_config_changed".into()); }
-                    let signer = isyncyou_engine::self_hosted_mail_restore::load_registered_recovery_signer(cfg,&self.account)?;
-                    isyncyou_engine::provider_auth::with_platform_credential_store(cfg,&self.account,|credentials| {
-                        recovery_calendar_catalog(isyncyou_engine::self_hosted_mail_restore::recovery_catalog_with_store(cfg,&self.account,signer.as_ref(),credentials,after)?,service)
-                    })
+            ToolAction::List {
+                service,
+                parent: Some(parent),
+                ..
+            } if matches!(service.as_str(), "calendar" | "todo" | "mail" | "contacts")
+                && parent.starts_with("recovery:") =>
+            {
+                let after = parent[9..]
+                    .parse::<u64>()
+                    .map_err(|_| AgentError::ToolArgs("invalid recovery cursor".into()))?;
+                let path = self
+                    .config_path
+                    .read()
+                    .map_err(|_| AgentError::Provider("account configuration unavailable".into()))?
+                    .clone();
+                let read_catalog = |cfg: &Config| -> Result<serde_json::Value, String> {
+                    if !cfg.accounts.iter().any(|a| a.id == self.account)
+                        || cfg.provider_accounts.get(&self.account)
+                            != self.cfg.provider_accounts.get(&self.account)
+                    {
+                        return Err("account_config_changed".into());
+                    }
+                    let signer =
+                        isyncyou_engine::self_hosted_mail_restore::load_registered_recovery_signer(
+                            cfg,
+                            &self.account,
+                        )?;
+                    isyncyou_engine::provider_auth::with_platform_credential_store(
+                        cfg,
+                        &self.account,
+                        |credentials| {
+                            recovery_calendar_catalog(isyncyou_engine::self_hosted_mail_restore::recovery_catalog_with_store(cfg,&self.account,signer.as_ref(),credentials,after)?,service)
+                        },
+                    )
                 };
-                let catalog = match path { Some(path) => Config::with_config_lock(&path,|| { let cfg=load_host_runtime_config(&path)?; read_catalog(&cfg) }), None => read_catalog(&self.cfg) }.map_err(|_| AgentError::Provider("recovery catalog unavailable".into()))?;
+                let catalog = match path {
+                    Some(path) => Config::with_config_lock(&path, || {
+                        let cfg = load_host_runtime_config(&path)?;
+                        read_catalog(&cfg)
+                    }),
+                    None => read_catalog(&self.cfg),
+                }
+                .map_err(|_| AgentError::Provider("recovery catalog unavailable".into()))?;
                 Ok(serde_json::json!({"account":self.account,"service":service,"kind":"recovery_catalog","provenance":"live","observed_at":unix_now(),"catalog":catalog}).to_string())
             }
-            ToolAction::List { service, parent:Some(parent), .. } if service == "calendar" && parent.starts_with("freebusy:") => {
-                let value:serde_json::Value = serde_json::from_str(&parent[9..]).map_err(|_| AgentError::ToolArgs("invalid free-busy request".into()))?;
-                let collection = value.get("collection").and_then(serde_json::Value::as_str).filter(|v| !v.is_empty() && v.len() <= 2048).ok_or_else(|| AgentError::ToolArgs("invalid collection".into()))?;
-                let year = value.get("year").and_then(serde_json::Value::as_u64).and_then(|v| u32::try_from(v).ok()).ok_or_else(|| AgentError::ToolArgs("invalid year".into()))?;
-                let month = value.get("month").and_then(serde_json::Value::as_u64).and_then(|v| u32::try_from(v).ok()).ok_or_else(|| AgentError::ToolArgs("invalid month".into()))?;
-                let (start,end) = calendar_month_bounds(year,month).ok_or_else(|| AgentError::ToolArgs("invalid month".into()))?;
-                let bytes = isyncyou_engine::dav_live::free_busy(&self.cfg,&self.account,"/.well-known/caldav",collection,&start,&end,None).map_err(|e| AgentError::Provider(if e == "Http(403)" { "free-busy access denied" } else { "free-busy availability unknown" }.into()))?;
-                let content = String::from_utf8(bytes).map_err(|_| AgentError::Provider("invalid free-busy response".into()))?;
-                if content.len() > 1024 * 1024 { return Err(AgentError::Provider("free-busy response exceeds limit".into())); }
+            ToolAction::List {
+                service,
+                parent: Some(parent),
+                ..
+            } if service == "calendar" && parent.starts_with("freebusy:") => {
+                let value: serde_json::Value = serde_json::from_str(&parent[9..])
+                    .map_err(|_| AgentError::ToolArgs("invalid free-busy request".into()))?;
+                let collection = value
+                    .get("collection")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|v| !v.is_empty() && v.len() <= 2048)
+                    .ok_or_else(|| AgentError::ToolArgs("invalid collection".into()))?;
+                let year = value
+                    .get("year")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok())
+                    .ok_or_else(|| AgentError::ToolArgs("invalid year".into()))?;
+                let month = value
+                    .get("month")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok())
+                    .ok_or_else(|| AgentError::ToolArgs("invalid month".into()))?;
+                let (start, end) = calendar_month_bounds(year, month)
+                    .ok_or_else(|| AgentError::ToolArgs("invalid month".into()))?;
+                let bytes = isyncyou_engine::dav_live::free_busy(
+                    &self.cfg,
+                    &self.account,
+                    "/.well-known/caldav",
+                    collection,
+                    &start,
+                    &end,
+                    None,
+                )
+                .map_err(|e| {
+                    AgentError::Provider(
+                        if e == "Http(403)" {
+                            "free-busy access denied"
+                        } else {
+                            "free-busy availability unknown"
+                        }
+                        .into(),
+                    )
+                })?;
+                let content = String::from_utf8(bytes)
+                    .map_err(|_| AgentError::Provider("invalid free-busy response".into()))?;
+                if content.len() > 1024 * 1024 {
+                    return Err(AgentError::Provider(
+                        "free-busy response exceeds limit".into(),
+                    ));
+                }
                 Ok(serde_json::json!({"account":self.account,"provider":origin,"service":"calendar","collection":collection,"start":start,"end":end,"provenance":"live","observed_at":unix_now(),"content":content}).to_string())
             }
-            ToolAction::List { service, parent, limit, offset, .. } if matches!(service.as_str(), "calendar" | "contacts" | "todo") => {
-                if offset.unwrap_or(0) != 0 { return Err(AgentError::ToolArgs("provider offset unavailable".into())); }
-                let native_service = if service == "todo" { "calendar" } else { service.as_str() };
+            ToolAction::List {
+                service,
+                parent,
+                limit,
+                offset,
+                ..
+            } if matches!(service.as_str(), "calendar" | "contacts" | "todo") => {
+                if offset.unwrap_or(0) != 0 {
+                    return Err(AgentError::ToolArgs("provider offset unavailable".into()));
+                }
+                let native_service = if service == "todo" {
+                    "calendar"
+                } else {
+                    service.as_str()
+                };
                 if let Some(collection) = parent.as_deref() {
-                    let page = isyncyou_engine::dav_live::project_page(&self.cfg, &self.account, collection, native_service, "", limit.unwrap_or(20).clamp(1, 100) as usize)
-                        .map_err(|_| AgentError::Provider("provider collection unavailable".into()))?;
-                    if page.accessible != Some(true) { return Err(AgentError::Provider("provider collection access not established".into())); }
+                    let page = isyncyou_engine::dav_live::project_page(
+                        &self.cfg,
+                        &self.account,
+                        collection,
+                        native_service,
+                        "",
+                        limit.unwrap_or(20).clamp(1, 100) as usize,
+                    )
+                    .map_err(|_| AgentError::Provider("provider collection unavailable".into()))?;
+                    if page.accessible != Some(true) {
+                        return Err(AgentError::Provider(
+                            "provider collection access not established".into(),
+                        ));
+                    }
                     let results: Vec<_> = page.objects.into_iter().map(|object| match object.view {
                         Ok(view) => serde_json::json!({"id":object.remote_id,"etag":object.etag,"view":view}),
                         Err(_) => serde_json::json!({"id":object.remote_id,"etag":object.etag,"error":"projection_unavailable"}),
                     }).collect();
                     Ok(serde_json::json!({"account":page.account_id,"provider":page.origin,"service":service,"collection":collection,"provenance":"local","accessible":page.accessible,"observed_at":page.observed_at,"cursor":page.cursor,"freshness":"last observed, not live","calendar_collections_may_include_events_and_tasks":native_service == "calendar","coverage":"bounded first page; further objects may exist","results":results}).to_string())
                 } else {
-                    let scopes = store.provider_scopes(&self.account, origin, native_service).map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
+                    let scopes = store
+                        .provider_scopes(&self.account, origin, native_service)
+                        .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
                     let mut results = Vec::new();
                     for scope in scopes {
-                        if store.provider_accessible(&scope).map_err(|_| AgentError::Provider("provider access unavailable".into()))? == Some(true) {
+                        if store.provider_accessible(&scope).map_err(|_| {
+                            AgentError::Provider("provider access unavailable".into())
+                        })? == Some(true)
+                        {
                             results.push(serde_json::json!({"collection":scope.collection}));
-                            if results.len() >= limit.unwrap_or(20).clamp(1, 100) as usize { break; }
+                            if results.len() >= limit.unwrap_or(20).clamp(1, 100) as usize {
+                                break;
+                            }
                         }
                     }
                     Ok(serde_json::json!({"account":self.account,"provider":origin,"service":service,"provenance":"local","freshness":"last observed, not live","coverage":"bounded collection list; further collections may exist","results":results}).to_string())
                 }
             }
-            ToolAction::Read { service, id, max_bytes, .. } if matches!(service.as_str(), "calendar" | "contacts" | "todo") => {
-                let native_service = if service == "todo" { "calendar" } else { service.as_str() };
-                let scopes = store.provider_scopes(&self.account, origin, native_service).map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
-                if scopes.len() > 1000 { return Err(AgentError::Provider("provider collection lookup limit reached".into())); }
+            ToolAction::Read {
+                service,
+                id,
+                max_bytes,
+                ..
+            } if matches!(service.as_str(), "calendar" | "contacts" | "todo") => {
+                let native_service = if service == "todo" {
+                    "calendar"
+                } else {
+                    service.as_str()
+                };
+                let scopes = store
+                    .provider_scopes(&self.account, origin, native_service)
+                    .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
+                if scopes.len() > 1000 {
+                    return Err(AgentError::Provider(
+                        "provider collection lookup limit reached".into(),
+                    ));
+                }
                 let mut matches = Vec::new();
                 for scope in scopes {
-                    if store.provider_object(&scope, id).map_err(|_| AgentError::Provider("provider cache unavailable".into()))?.is_some() { matches.push(scope); }
+                    if store
+                        .provider_object(&scope, id)
+                        .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?
+                        .is_some()
+                    {
+                        matches.push(scope);
+                    }
                 }
-                let [scope] = matches.as_slice() else { return Err(AgentError::Provider("provider object missing or ambiguous".into())); };
-                let accessible = store.provider_accessible(scope).map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
-                if accessible != Some(true) { return Err(AgentError::Provider("provider collection access not established".into())); }
-                let observed_at = store.provider_observed_at(scope).map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
-                let object = store.provider_object(scope, id).map_err(|_| AgentError::Provider("provider cache unavailable".into()))?.ok_or_else(|| AgentError::Provider("provider object unavailable".into()))?;
+                let [scope] = matches.as_slice() else {
+                    return Err(AgentError::Provider(
+                        "provider object missing or ambiguous".into(),
+                    ));
+                };
+                let accessible = store
+                    .provider_accessible(scope)
+                    .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
+                if accessible != Some(true) {
+                    return Err(AgentError::Provider(
+                        "provider collection access not established".into(),
+                    ));
+                }
+                let observed_at = store
+                    .provider_observed_at(scope)
+                    .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
+                let object = store
+                    .provider_object(scope, id)
+                    .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?
+                    .ok_or_else(|| AgentError::Provider("provider object unavailable".into()))?;
                 let maximum = max_bytes.unwrap_or(65536).clamp(1, 1024 * 1024) as usize;
-                if object.raw.len() > maximum { return Err(AgentError::Provider("provider object exceeds requested limit".into())); }
-                let view = if native_service == "calendar" { isyncyou_connectors::dav::projection::calendar(&object.raw) } else { isyncyou_connectors::dav::projection::contact(&object.raw) }
-                    .map_err(|_| AgentError::Provider("provider projection unavailable".into()))?;
-                let cursor = store.provider_cursor(scope).map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
+                if object.raw.len() > maximum {
+                    return Err(AgentError::Provider(
+                        "provider object exceeds requested limit".into(),
+                    ));
+                }
+                let view = if native_service == "calendar" {
+                    isyncyou_connectors::dav::projection::calendar(&object.raw)
+                } else {
+                    isyncyou_connectors::dav::projection::contact(&object.raw)
+                }
+                .map_err(|_| AgentError::Provider("provider projection unavailable".into()))?;
+                let cursor = store
+                    .provider_cursor(scope)
+                    .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
                 Ok(serde_json::json!({"account":self.account,"provider":origin,"service":service,"collection":scope.collection,"id":object.remote_id,"etag":object.etag,"view":view,"provenance":"local","accessible":accessible,"observed_at":observed_at,"cursor":cursor,"freshness":"last observed, not live"}).to_string())
             }
-            ToolAction::Search { services, query, limit, .. } => {
-                if query.trim().is_empty() || query.len() > 1024 { return Err(AgentError::ToolArgs("invalid search query".into())); }
+            ToolAction::Search {
+                services,
+                query,
+                limit,
+                ..
+            } => {
+                if query.trim().is_empty() || query.len() > 1024 {
+                    return Err(AgentError::ToolArgs("invalid search query".into()));
+                }
                 let literal_query = format!("\"{}\"", query.replace('"', "\"\""));
-                if literal_query.len() > 1024 { return Err(AgentError::ToolArgs("search query exceeds indexed limit".into())); }
+                if literal_query.len() > 1024 {
+                    return Err(AgentError::ToolArgs(
+                        "search query exceeds indexed limit".into(),
+                    ));
+                }
                 let max = limit.unwrap_or(20).clamp(1, 100) as usize;
-                let wants = |service:&str| services.is_empty() || services.iter().any(|s| s == service);
-                let mut results = Vec::new(); let mut truncated = false;
-                let mut searched = Vec::new(); let mut incomplete = Vec::new();
+                let wants =
+                    |service: &str| services.is_empty() || services.iter().any(|s| s == service);
+                let mut results = Vec::new();
+                let mut truncated = false;
+                let mut searched = Vec::new();
+                let mut incomplete = Vec::new();
                 if wants("mail") {
-                    let mut rows = store.search_provider_mail(&self.account, origin, &literal_query, max).map_err(|_| AgentError::Provider("provider search unavailable".into()))?;
-                    let client = isyncyou_engine::self_hosted_mail::client(&self.cfg,&self.account).ok();
-                    let shared_discovery = client.as_ref().and_then(|client| isyncyou_engine::self_hosted_mail::shared_mail_accessible_accounts(&self.cfg,&self.account,client).ok());
-                    if shared_discovery.is_none() { incomplete.push(serde_json::json!({"service":"mail","reason":"shared_access_unknown"})); }
+                    let mut rows = store
+                        .search_provider_mail(&self.account, origin, &literal_query, max)
+                        .map_err(|_| AgentError::Provider("provider search unavailable".into()))?;
+                    let client =
+                        isyncyou_engine::self_hosted_mail::client(&self.cfg, &self.account).ok();
+                    let shared_discovery = client.as_ref().and_then(|client| {
+                        isyncyou_engine::self_hosted_mail::shared_mail_accessible_accounts(
+                            &self.cfg,
+                            &self.account,
+                            client,
+                        )
+                        .ok()
+                    });
+                    if shared_discovery.is_none() {
+                        incomplete.push(
+                            serde_json::json!({"service":"mail","reason":"shared_access_unknown"}),
+                        );
+                    }
                     let shared_accounts = shared_discovery.unwrap_or_default();
                     let mut live_mailboxes = std::collections::HashMap::new();
-                    for scope in store.provider_scopes(&self.account,origin,"mail-shared").map_err(|_| AgentError::Provider("provider cache unavailable".into()))? {
-                        if rows.len() >= max { break; }
-                        if !shared_accounts.contains(&scope.collection) || store.provider_accessible(&scope).ok().flatten() != Some(true) { continue; }
-                        let Some(ids) = client.as_ref().and_then(|client| isyncyou_engine::self_hosted_mail::shared_mail_readable_mailboxes(&self.cfg,&self.account,client,&scope.collection).ok()) else { incomplete.push(serde_json::json!({"service":"mail","reason":"shared_access_unknown"})); continue; };
-                        live_mailboxes.insert(scope.collection.clone(),ids);
-                        for item in store.search_provider_mail_in_scope(&scope,&literal_query,max - rows.len()).map_err(|_| AgentError::Provider("provider search unavailable".into()))? { rows.push((scope.clone(),item)); }
+                    for scope in store
+                        .provider_scopes(&self.account, origin, "mail-shared")
+                        .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?
+                    {
+                        if rows.len() >= max {
+                            break;
+                        }
+                        if !shared_accounts.contains(&scope.collection)
+                            || store.provider_accessible(&scope).ok().flatten() != Some(true)
+                        {
+                            continue;
+                        }
+                        let Some(ids) = client.as_ref().and_then(|client| {
+                            isyncyou_engine::self_hosted_mail::shared_mail_readable_mailboxes(
+                                &self.cfg,
+                                &self.account,
+                                client,
+                                &scope.collection,
+                            )
+                            .ok()
+                        }) else {
+                            incomplete.push(serde_json::json!({"service":"mail","reason":"shared_access_unknown"}));
+                            continue;
+                        };
+                        live_mailboxes.insert(scope.collection.clone(), ids);
+                        for item in store
+                            .search_provider_mail_in_scope(&scope, &literal_query, max - rows.len())
+                            .map_err(|_| {
+                                AgentError::Provider("provider search unavailable".into())
+                            })?
+                        {
+                            rows.push((scope.clone(), item));
+                        }
                     }
                     truncated |= rows.len() >= max;
                     for (scope, item) in rows {
-                        let metadata: serde_json::Value = serde_json::from_slice(&item.raw).map_err(|_| AgentError::Provider("provider cache invalid".into()))?;
+                        let metadata: serde_json::Value = serde_json::from_slice(&item.raw)
+                            .map_err(|_| AgentError::Provider("provider cache invalid".into()))?;
                         let shared = scope.service == "mail-shared";
                         if shared {
-                            if !shared_accounts.contains(&scope.collection) || store.provider_accessible(&scope).ok().flatten() != Some(true) { continue; }
-                            let mut folders = scope.clone(); folders.service = "mailboxes-shared".into();
-                            if store.provider_accessible(&folders).ok().flatten() != Some(true) { continue; }
-                            let readable = metadata["mailboxIds"].as_object().is_some_and(|ids| ids.iter().any(|(id, present)| {
-                                if present.as_bool() != Some(true) || !live_mailboxes.get(&scope.collection).is_some_and(|visible| visible.contains(id)) { return false; }
-                                store.provider_object(&folders,id).ok().flatten().and_then(|obj| serde_json::from_slice::<serde_json::Value>(&obj.raw).ok()).is_some_and(|folder| folder["myRights"]["mayReadItems"].as_bool() == Some(true))
-                            }));
-                            if !readable { continue; }
+                            if !shared_accounts.contains(&scope.collection)
+                                || store.provider_accessible(&scope).ok().flatten() != Some(true)
+                            {
+                                continue;
+                            }
+                            let mut folders = scope.clone();
+                            folders.service = "mailboxes-shared".into();
+                            if store.provider_accessible(&folders).ok().flatten() != Some(true) {
+                                continue;
+                            }
+                            let readable = metadata["mailboxIds"].as_object().is_some_and(|ids| {
+                                ids.iter().any(|(id, present)| {
+                                    if present.as_bool() != Some(true)
+                                        || !live_mailboxes
+                                            .get(&scope.collection)
+                                            .is_some_and(|visible| visible.contains(id))
+                                    {
+                                        return false;
+                                    }
+                                    store
+                                        .provider_object(&folders, id)
+                                        .ok()
+                                        .flatten()
+                                        .and_then(|obj| {
+                                            serde_json::from_slice::<serde_json::Value>(&obj.raw)
+                                                .ok()
+                                        })
+                                        .is_some_and(|folder| {
+                                            folder["myRights"]["mayReadItems"].as_bool()
+                                                == Some(true)
+                                        })
+                                })
+                            });
+                            if !readable {
+                                continue;
+                            }
                         }
-                        let result_id = if shared { shared_mail_ref(&scope.collection,&item.remote_id) } else { item.remote_id.clone() };
+                        let result_id = if shared {
+                            shared_mail_ref(&scope.collection, &item.remote_id)
+                        } else {
+                            item.remote_id.clone()
+                        };
                         results.push(serde_json::json!({"account":self.account,"provider":origin,"service":"mail","collection":scope.collection,"id":result_id,"blob_id":metadata["blobId"],"mailbox_ids":if shared { serde_json::Value::Null } else { metadata["mailboxIds"].clone() },"subject":metadata["subject"],"preview":metadata["preview"],"provenance":"local","observed_at":store.provider_observed_at(&scope).ok().flatten(),"cursor":store.provider_cursor(&scope).ok().flatten()}));
                     }
                     searched.push("mail");
                 }
-                for native in ["calendar","contacts"] {
-                    if !(wants(native) || (native == "calendar" && wants("todo"))) { continue; }
-                    let scopes = store.provider_scopes(&self.account,origin,native).map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
-                    if scopes.len() > 1000 { return Err(AgentError::Provider("provider collection lookup limit reached".into())); }
+                for native in ["calendar", "contacts"] {
+                    if !(wants(native) || (native == "calendar" && wants("todo"))) {
+                        continue;
+                    }
+                    let scopes = store
+                        .provider_scopes(&self.account, origin, native)
+                        .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
+                    if scopes.len() > 1000 {
+                        return Err(AgentError::Provider(
+                            "provider collection lookup limit reached".into(),
+                        ));
+                    }
                     for scope in scopes {
-                        if store.provider_accessible(&scope).ok().flatten() != Some(true) { incomplete.push(serde_json::json!({"service":native,"reason":"access_unknown_or_unavailable"})); continue; }
-                        let (items,covered) = match store.search_provider_dav(&scope,&literal_query,max) { Ok(value) => value, Err(_) => { incomplete.push(serde_json::json!({"service":native,"collection":scope.collection,"reason":"index_unavailable"})); continue; } };
-                        if !covered { incomplete.push(serde_json::json!({"service":native,"collection":scope.collection,"reason":"index_incomplete"})); }
+                        if store.provider_accessible(&scope).ok().flatten() != Some(true) {
+                            incomplete.push(serde_json::json!({"service":native,"reason":"access_unknown_or_unavailable"}));
+                            continue;
+                        }
+                        let (items, covered) = match store.search_provider_dav(
+                            &scope,
+                            &literal_query,
+                            max,
+                        ) {
+                            Ok(value) => value,
+                            Err(_) => {
+                                incomplete.push(serde_json::json!({"service":native,"collection":scope.collection,"reason":"index_unavailable"}));
+                                continue;
+                            }
+                        };
+                        if !covered {
+                            incomplete.push(serde_json::json!({"service":native,"collection":scope.collection,"reason":"index_incomplete"}));
+                        }
                         truncated |= items.len() >= max;
                         for item in items {
-                            let view = if native == "calendar" { isyncyou_connectors::dav::projection::calendar(&item.raw) } else { isyncyou_connectors::dav::projection::contact(&item.raw) };
-                            let Ok(view) = view else { continue; };
+                            let view = if native == "calendar" {
+                                isyncyou_connectors::dav::projection::calendar(&item.raw)
+                            } else {
+                                isyncyou_connectors::dav::projection::contact(&item.raw)
+                            };
+                            let Ok(view) = view else {
+                                continue;
+                            };
                             if native == "calendar" {
                                 let components = view["components"].as_array();
-                                let event = components.is_some_and(|items| items.iter().any(|v| v["kind"] == "VEVENT"));
-                                let task = components.is_some_and(|items| items.iter().any(|v| v["kind"] == "VTODO"));
-                                if (!wants("calendar") || !event) && (!wants("todo") || !task) { continue; }
-                                let service = if task && (!event || !wants("calendar")) { "todo" } else { "calendar" };
+                                let event = components.is_some_and(|items| {
+                                    items.iter().any(|v| v["kind"] == "VEVENT")
+                                });
+                                let task = components.is_some_and(|items| {
+                                    items.iter().any(|v| v["kind"] == "VTODO")
+                                });
+                                if (!wants("calendar") || !event) && (!wants("todo") || !task) {
+                                    continue;
+                                }
+                                let service = if task && (!event || !wants("calendar")) {
+                                    "todo"
+                                } else {
+                                    "calendar"
+                                };
                                 let selected: Vec<_> = components.into_iter().flatten().filter(|v| (v["kind"] == "VEVENT" && wants("calendar")) || (v["kind"] == "VTODO" && wants("todo"))).map(|v| serde_json::json!({"kind":v["kind"],"uid":v["uid"],"summary":v["properties"]["SUMMARY"],"start":v["properties"]["DTSTART"],"due":v["properties"]["DUE"]})).collect();
                                 results.push(serde_json::json!({"account":self.account,"provider":origin,"service":service,"collection":scope.collection,"id":item.remote_id,"etag":item.etag,"components":selected,"provenance":"local","observed_at":store.provider_observed_at(&scope).ok().flatten(),"cursor":store.provider_cursor(&scope).ok().flatten()}));
                             } else {
@@ -594,107 +1611,268 @@ impl isyncyou_agent::ToolExecutor for ProviderMailExecutor {
                             }
                         }
                     }
-                    searched.push(native); if native == "calendar" && wants("todo") { searched.push("todo"); }
+                    searched.push(native);
+                    if native == "calendar" && wants("todo") {
+                        searched.push("todo");
+                    }
                 }
-                let unsearched: Vec<&str> = services.iter().map(String::as_str).filter(|s| !matches!(*s,"mail" | "calendar" | "contacts" | "todo")).collect();
-                truncated |= results.len() > max; results.truncate(max);
+                let unsearched: Vec<&str> = services
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|s| !matches!(*s, "mail" | "calendar" | "contacts" | "todo"))
+                    .collect();
+                truncated |= results.len() > max;
+                results.truncate(max);
                 Ok(serde_json::json!({"results":results,"searched_services":searched,"unsearched_services":unsearched,"incomplete_collections":incomplete,"result_limit_reached":truncated,"coverage":"bounded literal search over selected indexed fields at resource level; a calendar resource can contain multiple components; missing index, inaccessible collections, photos and semantic matches are not covered", "provenance":"local","freshness":"last observed, not live"}).to_string())
             }
-            ToolAction::Read { service, id, max_bytes, .. } if service == "mail" => {
-                let client = isyncyou_engine::self_hosted_mail::client(&self.cfg, &self.account).map_err(|_| AgentError::Provider("provider unavailable".into()))?;
-                let shared = parse_shared_mail_ref(id).map_err(|_| AgentError::ToolArgs("invalid mail reference".into()))?;
+            ToolAction::Read {
+                service,
+                id,
+                max_bytes,
+                ..
+            } if service == "mail" => {
+                let client = isyncyou_engine::self_hosted_mail::client(&self.cfg, &self.account)
+                    .map_err(|_| AgentError::Provider("provider unavailable".into()))?;
+                let shared = parse_shared_mail_ref(id)
+                    .map_err(|_| AgentError::ToolArgs("invalid mail reference".into()))?;
                 let limit = max_bytes.unwrap_or(65536).clamp(1, 1024 * 1024) as usize;
-                let body = match shared { Some((scope,native_id)) => isyncyou_engine::self_hosted_mail::read_body_in_scope(&self.cfg,&self.account,&client,&scope,&native_id,limit), None => isyncyou_engine::self_hosted_mail::read_body(&self.cfg,&self.account,&client,id,limit) }
-                    .map_err(|_| AgentError::Provider("provider body unavailable".into()))?;
+                let body = match shared {
+                    Some((scope, native_id)) => {
+                        isyncyou_engine::self_hosted_mail::read_body_in_scope(
+                            &self.cfg,
+                            &self.account,
+                            &client,
+                            &scope,
+                            &native_id,
+                            limit,
+                        )
+                    }
+                    None => isyncyou_engine::self_hosted_mail::read_body(
+                        &self.cfg,
+                        &self.account,
+                        &client,
+                        id,
+                        limit,
+                    ),
+                }
+                .map_err(|_| AgentError::Provider("provider body unavailable".into()))?;
                 Ok(serde_json::json!({"account":self.account,"provider":origin,"service":"mail","id":id,"provenance":"live","observed_at":unix_now(),"content":body}).to_string())
             }
-            ToolAction::List { service, parent, limit, offset, .. } if service == "mail" && parent.as_deref() == Some("identities") => {
-                let client = isyncyou_engine::self_hosted_mail::client(&self.cfg, &self.account).map_err(|_| AgentError::Provider("provider unavailable".into()))?;
-                let identities = isyncyou_engine::self_hosted_mail::sending_identities(&self.cfg, &self.account, &client).map_err(|_| AgentError::Provider("provider identities unavailable".into()))?;
+            ToolAction::List {
+                service,
+                parent,
+                limit,
+                offset,
+                ..
+            } if service == "mail" && parent.as_deref() == Some("identities") => {
+                let client = isyncyou_engine::self_hosted_mail::client(&self.cfg, &self.account)
+                    .map_err(|_| AgentError::Provider("provider unavailable".into()))?;
+                let identities = isyncyou_engine::self_hosted_mail::sending_identities(
+                    &self.cfg,
+                    &self.account,
+                    &client,
+                )
+                .map_err(|_| AgentError::Provider("provider identities unavailable".into()))?;
                 let start = offset.unwrap_or(0) as usize;
                 let selected: Vec<_> = identities.into_iter().skip(start).take(limit.unwrap_or(20).clamp(1,100) as usize)
                     .map(|identity| serde_json::json!({"id":identity["id"], "email":identity["email"], "name":identity["name"]})).collect();
                 Ok(serde_json::json!({"account":self.account,"provider":origin,"service":"mail","kind":"identities","provenance":"live","observed_at":unix_now(),"results":selected}).to_string())
             }
-            ToolAction::List { service, parent, limit, offset, .. } if service == "mail" && parent.as_deref() == Some("mailboxes") => {
-                let scopes = store.provider_scopes(&self.account, origin, "mailboxes").map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
-                let [scope] = scopes.as_slice() else { return Err(AgentError::Provider("provider scope unavailable".into())); };
-                if offset.unwrap_or(0) != 0 { return Err(AgentError::ToolArgs("provider mailbox offset unavailable".into())); }
-                let page = store.provider_objects_page(scope, "", limit.unwrap_or(20).clamp(1,100) as usize).map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
+            ToolAction::List {
+                service,
+                parent,
+                limit,
+                offset,
+                ..
+            } if service == "mail" && parent.as_deref() == Some("mailboxes") => {
+                let scopes = store
+                    .provider_scopes(&self.account, origin, "mailboxes")
+                    .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
+                let [scope] = scopes.as_slice() else {
+                    return Err(AgentError::Provider("provider scope unavailable".into()));
+                };
+                if offset.unwrap_or(0) != 0 {
+                    return Err(AgentError::ToolArgs(
+                        "provider mailbox offset unavailable".into(),
+                    ));
+                }
+                let page = store
+                    .provider_objects_page(scope, "", limit.unwrap_or(20).clamp(1, 100) as usize)
+                    .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
                 let mut values: Vec<serde_json::Value> = page.iter().map(|o| {
                     let value: serde_json::Value = serde_json::from_slice(&o.raw)?;
                     Ok(serde_json::json!({"id":o.remote_id,"mail_scope":scope.collection,"shared":false,"name":value["name"],"role":value["role"],"myRights":value["myRights"]}))
                 }).collect::<Result<_, serde_json::Error>>().map_err(|_| AgentError::Provider("provider cache invalid".into()))?;
-                let max = limit.unwrap_or(20).clamp(1,100) as usize;
-                let client = isyncyou_engine::self_hosted_mail::client(&self.cfg,&self.account).ok();
-                let discovery = client.as_ref().and_then(|client| isyncyou_engine::self_hosted_mail::shared_mail_accessible_accounts(&self.cfg,&self.account,client).ok());
-                let mut shared_access_status = if discovery.is_some() { "observed" } else { "unknown" };
+                let max = limit.unwrap_or(20).clamp(1, 100) as usize;
+                let client =
+                    isyncyou_engine::self_hosted_mail::client(&self.cfg, &self.account).ok();
+                let discovery = client.as_ref().and_then(|client| {
+                    isyncyou_engine::self_hosted_mail::shared_mail_accessible_accounts(
+                        &self.cfg,
+                        &self.account,
+                        client,
+                    )
+                    .ok()
+                });
+                let mut shared_access_status = if discovery.is_some() {
+                    "observed"
+                } else {
+                    "unknown"
+                };
                 let discovered = discovery.unwrap_or_default();
-                for shared in store.provider_scopes(&self.account,origin,"mailboxes-shared").map_err(|_| AgentError::Provider("provider cache unavailable".into()))? {
-                    if values.len() >= max { break; }
-                     let mut messages = shared.clone(); messages.service = "mail-shared".into();
-                    if !discovered.contains(&shared.collection) || store.provider_accessible(&shared).ok().flatten() != Some(true) || store.provider_accessible(&messages).ok().flatten() != Some(true) { continue; }
-                    let Some(readable) = client.as_ref().and_then(|client| isyncyou_engine::self_hosted_mail::shared_mail_readable_mailboxes(&self.cfg,&self.account,client,&shared.collection).ok()) else { shared_access_status="unknown"; continue; };
-                    let page = store.provider_objects_page(&shared,"",max - values.len()).map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
+                for shared in store
+                    .provider_scopes(&self.account, origin, "mailboxes-shared")
+                    .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?
+                {
+                    if values.len() >= max {
+                        break;
+                    }
+                    let mut messages = shared.clone();
+                    messages.service = "mail-shared".into();
+                    if !discovered.contains(&shared.collection)
+                        || store.provider_accessible(&shared).ok().flatten() != Some(true)
+                        || store.provider_accessible(&messages).ok().flatten() != Some(true)
+                    {
+                        continue;
+                    }
+                    let Some(readable) = client.as_ref().and_then(|client| {
+                        isyncyou_engine::self_hosted_mail::shared_mail_readable_mailboxes(
+                            &self.cfg,
+                            &self.account,
+                            client,
+                            &shared.collection,
+                        )
+                        .ok()
+                    }) else {
+                        shared_access_status = "unknown";
+                        continue;
+                    };
+                    let page = store
+                        .provider_objects_page(&shared, "", max - values.len())
+                        .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
                     for object in page {
-                        let value:serde_json::Value = serde_json::from_slice(&object.raw).map_err(|_| AgentError::Provider("provider cache invalid".into()))?;
-                        if value["myRights"]["mayReadItems"].as_bool() != Some(true) || !readable.contains(&object.remote_id) { continue; }
+                        let value: serde_json::Value = serde_json::from_slice(&object.raw)
+                            .map_err(|_| AgentError::Provider("provider cache invalid".into()))?;
+                        if value["myRights"]["mayReadItems"].as_bool() != Some(true)
+                            || !readable.contains(&object.remote_id)
+                        {
+                            continue;
+                        }
                         values.push(serde_json::json!({"id":object.remote_id,"mail_scope":shared.collection,"shared":true,"name":value["name"],"role":value["role"],"myRights":value["myRights"]}));
                     }
                 }
                 Ok(serde_json::json!({"account":self.account,"provider":origin,"service":"mail","kind":"mailboxes","provenance":"local","shared_access_status":shared_access_status,"observed_at":store.provider_observed_at(scope).ok().flatten(),"results":values}).to_string())
             }
-            _ => Err(AgentError::Provider("provider operation unavailable".into())),
+            _ => Err(AgentError::Provider(
+                "provider operation unavailable".into(),
+            )),
         }
     }
-    fn execute_read_with_context(&self, action: &isyncyou_agent::ToolAction, context: isyncyou_agent::ReadExecutionContext<'_, '_>) -> Result<isyncyou_agent::ReadExecutionOutputV2, isyncyou_agent::AgentError> {
+    fn execute_read_with_context(
+        &self,
+        action: &isyncyou_agent::ToolAction,
+        context: isyncyou_agent::ReadExecutionContext<'_, '_>,
+    ) -> Result<isyncyou_agent::ReadExecutionOutputV2, isyncyou_agent::AgentError> {
         let content = self.execute_read(action)?;
         context.input_budget.charge(&content)?;
         if matches!(action, isyncyou_agent::ToolAction::Search { .. }) {
             use base64::Engine as _;
             use ring::rand::SecureRandom as _;
             let mut id = [0u8; 16];
-            ring::rand::SystemRandom::new().fill(&mut id).map_err(|_| isyncyou_agent::AgentError::Provider("search identity unavailable".into()))?;
-            let value: serde_json::Value = serde_json::from_str(&content).map_err(|_| isyncyou_agent::AgentError::Provider("provider search unavailable".into()))?;
-            let rows = value["results"].as_array().ok_or_else(|| isyncyou_agent::AgentError::Provider("provider search unavailable".into()))?;
+            ring::rand::SystemRandom::new().fill(&mut id).map_err(|_| {
+                isyncyou_agent::AgentError::Provider("search identity unavailable".into())
+            })?;
+            let value: serde_json::Value = serde_json::from_str(&content).map_err(|_| {
+                isyncyou_agent::AgentError::Provider("provider search unavailable".into())
+            })?;
+            let rows = value["results"].as_array().ok_or_else(|| {
+                isyncyou_agent::AgentError::Provider("provider search unavailable".into())
+            })?;
             let count = rows.len();
             let sources = provider_mail_sources(rows);
             let public_sources = sources.iter().take(3).cloned().collect();
-            Ok(isyncyou_agent::ReadExecutionOutputV2::Search(isyncyou_agent::SeparatedSearchOutputV2 {
-                provider_content: content,
-                public_projection: isyncyou_agent::PublicToolResultV1 {
-                    schema_version: isyncyou_agent::activity::ACTIVITY_SCHEMA_VERSION,
-                    operation: "search".into(), activity_id: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id),
-                    visible_hits: count as u32, coverage_complete: false, budget_reached: true,
-                    continuation_available: false, sources: public_sources,
+            Ok(isyncyou_agent::ReadExecutionOutputV2::Search(
+                isyncyou_agent::SeparatedSearchOutputV2 {
+                    provider_content: content,
+                    public_projection: isyncyou_agent::PublicToolResultV1 {
+                        schema_version: isyncyou_agent::activity::ACTIVITY_SCHEMA_VERSION,
+                        operation: "search".into(),
+                        activity_id: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id),
+                        visible_hits: count as u32,
+                        coverage_complete: false,
+                        budget_reached: true,
+                        continuation_available: false,
+                        sources: public_sources,
+                    },
+                    assistant_sources: sources,
                 },
-                assistant_sources: sources,
-            }))
+            ))
         } else {
-            let output = isyncyou_agent::ExistingSharedReadOutputV2 { content, untrusted: true, assistant_sources: Vec::new() };
-            if matches!(action, isyncyou_agent::ToolAction::List { .. }) { Ok(isyncyou_agent::ReadExecutionOutputV2::List(output)) }
-            else { Ok(isyncyou_agent::ReadExecutionOutputV2::Read(output)) }
+            let output = isyncyou_agent::ExistingSharedReadOutputV2 {
+                content,
+                untrusted: true,
+                assistant_sources: Vec::new(),
+            };
+            if matches!(action, isyncyou_agent::ToolAction::List { .. }) {
+                Ok(isyncyou_agent::ReadExecutionOutputV2::List(output))
+            } else {
+                Ok(isyncyou_agent::ReadExecutionOutputV2::Read(output))
+            }
         }
     }
 }
 
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-fn make_account_executor(account: &str, archive_root: PathBuf, cfg: &Config, config_path:Arc<std::sync::RwLock<Option<PathBuf>>>, control_store:Option<Arc<agent_control_store::AgentControlStore>>) -> Box<dyn isyncyou_agent::ToolExecutor + Send> {
-    if !cfg.accounts.iter().any(|a| a.id == account) { return Box::new(UnknownAccountExecutor); }
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn make_account_executor(
+    account: &str,
+    archive_root: PathBuf,
+    cfg: &Config,
+    config_path: Arc<std::sync::RwLock<Option<PathBuf>>>,
+    control_store: Option<Arc<agent_control_store::AgentControlStore>>,
+) -> Box<dyn isyncyou_agent::ToolExecutor + Send> {
+    if !cfg.accounts.iter().any(|a| a.id == account) {
+        return Box::new(UnknownAccountExecutor);
+    }
     if cfg.provider_accounts.contains_key(account) {
-        Box::new(ProviderMailExecutor { cfg: cfg.clone(), account: account.into(), config_path,control_store })
-    } else { make_executor(account, archive_root) }
+        Box::new(ProviderMailExecutor {
+            cfg: cfg.clone(),
+            account: account.into(),
+            config_path,
+            control_store,
+        })
+    } else {
+        make_executor(account, archive_root)
+    }
 }
-#[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-fn make_account_executor(account: &str, archive_root: PathBuf, _cfg: &Config, _config_path:Arc<std::sync::RwLock<Option<PathBuf>>>, _control_store:Option<()>) -> Box<dyn isyncyou_agent::ToolExecutor + Send> {
-    if !_cfg.accounts.iter().any(|a| a.id == account) { return Box::new(UnknownAccountExecutor); }
+#[cfg(not(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+)))]
+fn make_account_executor(
+    account: &str,
+    archive_root: PathBuf,
+    _cfg: &Config,
+    _config_path: Arc<std::sync::RwLock<Option<PathBuf>>>,
+    _control_store: Option<()>,
+) -> Box<dyn isyncyou_agent::ToolExecutor + Send> {
+    if !_cfg.accounts.iter().any(|a| a.id == account) {
+        return Box::new(UnknownAccountExecutor);
+    }
     make_executor(account, archive_root)
 }
 
 struct UnknownAccountExecutor;
 impl isyncyou_agent::ToolExecutor for UnknownAccountExecutor {
-    fn execute_read(&self, _action: &isyncyou_agent::ToolAction) -> Result<String, isyncyou_agent::AgentError> {
-        Err(isyncyou_agent::AgentError::Provider("account unavailable".into()))
+    fn execute_read(
+        &self,
+        _action: &isyncyou_agent::ToolAction,
+    ) -> Result<String, isyncyou_agent::AgentError> {
+        Err(isyncyou_agent::AgentError::Provider(
+            "account unavailable".into(),
+        ))
     }
 }
 #[cfg(not(any(
@@ -855,7 +2033,11 @@ pub trait AgentConfirmedActionExecutor: Send + Sync {
     ) -> Result<String, ClosedExecutionCode>;
 
     fn execute_confirmed(&self, action: &isyncyou_agent::ToolAction) -> ConfirmedExecutionOutcome;
-    fn execute_confirmed_bound(&self, action: &isyncyou_agent::ToolAction, _pending_id: &str) -> ConfirmedExecutionOutcome {
+    fn execute_confirmed_bound(
+        &self,
+        action: &isyncyou_agent::ToolAction,
+        _pending_id: &str,
+    ) -> ConfirmedExecutionOutcome {
         self.execute_confirmed(action)
     }
 }
@@ -949,13 +2131,22 @@ impl AgentAuditSink for StoreAgentAuditSink {
         event: &AgentAuthorizationAuditV1,
     ) -> Result<(), AgentAuditError> {
         let cfg = match &self.config_path {
-            Some(path) => Config::load(path).ok().filter(|cfg| cfg.validate().is_ok()).ok_or(AgentAuditError::Unavailable)?,
+            Some(path) => Config::load(path)
+                .ok()
+                .filter(|cfg| cfg.validate().is_ok())
+                .ok_or(AgentAuditError::Unavailable)?,
             None => self.cfg.clone(),
         };
         let store = if cfg.provider_accounts.contains_key(&routing.0) {
-            isyncyou_engine::provider_store::open(&cfg, &routing.0).map_err(|_| AgentAuditError::Unavailable)?
+            isyncyou_engine::provider_store::open(&cfg, &routing.0)
+                .map_err(|_| AgentAuditError::Unavailable)?
         } else {
-            let path = cfg.accounts.iter().find(|a| a.id == routing.0).map(|a| a.archive_root.join(".isyncyou-store.db")).ok_or(AgentAuditError::UnknownRoutingKey)?;
+            let path = cfg
+                .accounts
+                .iter()
+                .find(|a| a.id == routing.0)
+                .map(|a| a.archive_root.join(".isyncyou-store.db"))
+                .ok_or(AgentAuditError::UnknownRoutingKey)?;
             Store::open(path).map_err(|_| AgentAuditError::Unavailable)?
         };
         let now = unix_now();
@@ -2737,7 +3928,10 @@ struct LifecycleMaintenanceContext {
     session_maintenance_last_ms: Arc<AtomicU64>,
 }
 
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 impl LifecycleMaintenanceContext {
     fn current_config(&self) -> Config {
         match self.config_path.read().ok().and_then(|path| path.clone()) {
@@ -2985,7 +4179,8 @@ fn run_product_session_maintenance_once(context: &LifecycleMaintenanceContext) {
     let Ok(credential_store) = agent_credential_store(&context.oauth_dir) else {
         return;
     };
-    let registry = product_session::ProductSessionRegistry::new(&credential_store).with_config(&cfg);
+    let registry =
+        product_session::ProductSessionRegistry::new(&credential_store).with_config(&cfg);
     let maintenance_now_ms = unix_now_ms();
     if let Ok(repository) = account_lifecycle_repository(&context.oauth_dir) {
         if let Ok(Some(installation)) = repository.load_existing() {
@@ -3018,8 +4213,7 @@ fn run_product_session_maintenance_once(context: &LifecycleMaintenanceContext) {
         .skip(offset)
         .take(PRODUCT_SESSION_MAINTENANCE_BATCH.min(targets.len()))
     {
-        let Ok(token) = session_transport_token(&cfg, &target.local_account)
-        else {
+        let Ok(token) = session_transport_token(&cfg, &target.local_account) else {
             continue;
         };
         let _ = registry.maintain_remote_session(&token, target, PRODUCT_SESSION_COMPACTION_BATCH);
@@ -3322,12 +4516,14 @@ fn project_pending_cancel(
         .load_existing()
         .map_err(|_| "session_store_unavailable".to_string())?
         .ok_or_else(|| "session_store_unavailable".to_string())?;
-    product_session::ProductSessionRegistry::new(&credential_store).with_config(cfg).append_pending_cancelled(
-        &token,
-        &projection.owner,
-        installation.principal(),
-        projection.created_at_ms,
-    )
+    product_session::ProductSessionRegistry::new(&credential_store)
+        .with_config(cfg)
+        .append_pending_cancelled(
+            &token,
+            &projection.owner,
+            installation.principal(),
+            projection.created_at_ms,
+        )
 }
 
 #[cfg(any(
@@ -3350,13 +4546,15 @@ fn project_pending_confirm(
         .load_existing()
         .map_err(|_| "session_store_unavailable".to_string())?
         .ok_or_else(|| "session_store_unavailable".to_string())?;
-    product_session::ProductSessionRegistry::new(&credential_store).with_config(cfg).append_pending_operation_state(
-        &token,
-        &projection.owner,
-        installation.principal(),
-        &projection.code,
-        projection.created_at_ms,
-    )
+    product_session::ProductSessionRegistry::new(&credential_store)
+        .with_config(cfg)
+        .append_pending_operation_state(
+            &token,
+            &projection.owner,
+            installation.principal(),
+            &projection.code,
+            projection.created_at_ms,
+        )
 }
 
 #[cfg(any(
@@ -3966,157 +5164,766 @@ pub struct DaemonAgent {
     test_contact_photo_executor: Option<Arc<dyn AgentConfirmedActionExecutor>>,
 }
 
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-fn single_capture_preclaim_failure(error:&str)->Option<ClosedExecutionCode> {
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn single_capture_preclaim_failure(error: &str) -> Option<ClosedExecutionCode> {
     match error {
-        "capture_preflight_source"=>Some(ClosedExecutionCode::CaptureSourceUnavailable),
-        "capture_preflight_version_changed"=>Some(ClosedExecutionCode::CaptureVersionChanged),
-        "capture_preflight_challenge"=>Some(ClosedExecutionCode::CaptureChallengeUnavailable),
-        "capture_preflight_journal"=>Some(ClosedExecutionCode::CaptureJournalUnavailable),
-        _=>None,
+        "capture_preflight_source" => Some(ClosedExecutionCode::CaptureSourceUnavailable),
+        "capture_preflight_version_changed" => Some(ClosedExecutionCode::CaptureVersionChanged),
+        "capture_preflight_challenge" => Some(ClosedExecutionCode::CaptureChallengeUnavailable),
+        "capture_preflight_journal" => Some(ClosedExecutionCode::CaptureJournalUnavailable),
+        _ => None,
     }
 }
 
 impl DaemonAgent {
-    fn execute_confirmed_contact_photo(&self,action:&isyncyou_agent::ToolAction,pending_id:&str,action_hash:&str)->ConfirmedExecutionOutcome {
+    fn execute_confirmed_contact_photo(
+        &self,
+        action: &isyncyou_agent::ToolAction,
+        pending_id: &str,
+        action_hash: &str,
+    ) -> ConfirmedExecutionOutcome {
         #[cfg(test)]
-        if let Some(executor)=&self.test_contact_photo_executor {return executor.execute_confirmed_bound(action,pending_id);}
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        if let Some(executor) = &self.test_contact_photo_executor {
+            return executor.execute_confirmed_bound(action, pending_id);
+        }
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
         {
             use base64::Engine as _;
-            let isyncyou_agent::ToolAction::LiveWrite {account,service,target,change,..}=action else {return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)};
-            if service!="contacts" {return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)}
-            let Some(control)=self.control_store.as_ref() else {return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)};
-            let field=|name:&str| change.get(name).and_then(serde_json::Value::as_str).ok_or("photo_intent_invalid");
-            let (Ok(stage),Ok(digest),Ok(origin),Ok(collection),Ok(href),Ok(media),Ok(sha),Ok(uid),Ok(name),Ok(etag),Ok(raw_sha))=(field("stage_id"),field("request_sha256"),field("origin"),field("collection"),field("href"),field("media_type"),field("sha256"),field("uid"),field("name"),field("etag"),field("raw_sha256")) else {return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)};
-            if target.as_deref()!=Some(href) {return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)}
-            let path=match self.config_path.read() {Ok(path)=>path.clone(),Err(_)=>return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)};
-            let run=|cfg:&Config| -> Result<isyncyou_engine::dav_write::WriteOutcome,String> {
-                if !matches!(cfg.provider_accounts.get(account),Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin:current,..}) if current==origin) {return Err("provider_unavailable".into());}
-                let saved=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| control.claim_recovery_request(stage,account,origin,subject.ok_or("provider_login_required")?,digest,pending_id,action_hash,unix_now_ms()))?;
-                for key in ["collection","href","media_type","sha256","size"] {if saved.get(key)!=change.get(key) {return Err("photo_intent_invalid".into());}}
-                let bytes=base64::engine::general_purpose::STANDARD.decode(saved.get("photo_base64").and_then(serde_json::Value::as_str).ok_or("photo_intent_invalid")?).map_err(|_| "photo_intent_invalid")?;
-                let prepared=isyncyou_engine::dav_live::prepare_contact_photo(cfg,account,collection,href,media,&bytes)?;
-                let actual_raw=ring::digest::digest(&ring::digest::SHA256,&prepared.edit.raw).as_ref().iter().map(|b|format!("{b:02x}")).collect::<String>();
-                if prepared.origin!=origin || prepared.uid!=uid || prepared.name!=name || prepared.new_photo_sha256!=sha || prepared.size as u64!=change.get("size").and_then(serde_json::Value::as_u64).ok_or("photo_intent_invalid")? || prepared.edit.expected_etag!=etag || actual_raw!=raw_sha || serde_json::json!(prepared.old_photo_uri_sha256)!=change["old_photo_uri_sha256"] {return Ok(isyncyou_engine::dav_write::WriteOutcome::Conflict);}
-                let op=isyncyou_engine::dav_write::ApprovedDavWrite {operation_id:format!("agent:{pending_id}"),account_id:account.clone(),origin:origin.into(),collection:collection.into(),service:"contacts".into(),href:href.into(),expected_etag:Some(etag.into()),expected_collection_token:None,raw:Some(prepared.edit.raw)};
-                let result=isyncyou_engine::dav_write::execute_contact_photo(cfg,"/.well-known/carddav",&op,media,&bytes,None)?;
-                if matches!(&result,isyncyou_engine::dav_write::WriteOutcome::Confirmed(_)) {let _=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| control.release_confirmed_photo(stage,account,origin,subject.ok_or("provider_login_required")?));}
-                Ok(result)
+            let isyncyou_agent::ToolAction::LiveWrite {
+                account,
+                service,
+                target,
+                change,
+                ..
+            } = action
+            else {
+                return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
             };
-            let result=match path {Some(path)=>Config::with_config_lock(&path,|| {let cfg=load_host_runtime_config(&path)?;run(&cfg)}),None=>run(&self.cfg)};
-            return match result {Ok(isyncyou_engine::dav_write::WriteOutcome::Confirmed(_))=>ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new("Contact photo updated; local synchronization may be pending")),Ok(isyncyou_engine::dav_write::WriteOutcome::Conflict)=>ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderConflict),Ok(isyncyou_engine::dav_write::WriteOutcome::Rejected)=>ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderActionRejected),_=>ConfirmedExecutionOutcome::OutcomeUnknown};
-        }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        {let _=(action,pending_id,action_hash);ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)}
-    }
-    fn record_single_capture_validation_failure(&self,action:&isyncyou_agent::ToolAction) {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-        {
-            let isyncyou_agent::ToolAction::LiveWrite {account,change,..}=action else {return};
-            if change.get("verb").and_then(serde_json::Value::as_str)!=Some("single_capture") {return;}
-            let Some(operation)=change.get("operation_id").and_then(serde_json::Value::as_str) else {return};
-            let Some(control)=self.control_store.as_ref() else {return};
-            let path=match self.config_path.read() {Ok(path)=>path.clone(),Err(_)=>return};
-            let run=|cfg:&Config| -> Result<(),String> {
-                let origin=match cfg.provider_accounts.get(account) {Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin,..}) if cfg.accounts.iter().any(|a|a.id==*account)=>origin,_=>return Err("provider_unavailable".into())};
-                isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| control.set_single_capture_phase(operation,account,origin,subject.ok_or("provider_login_required")?,"validation_failed","capture_preflight_validation"))
+            if service != "contacts" {
+                return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
+            }
+            let Some(control) = self.control_store.as_ref() else {
+                return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
             };
-            let _=match path {Some(path)=>Config::with_config_lock(&path,|| {let cfg=load_host_runtime_config(&path)?;run(&cfg)}),None=>run(&self.cfg)};
-        }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        {let _=action;}
-    }
-    fn execute_confirmed_single_capture(&self,action:&isyncyou_agent::ToolAction,pending_id:&str,action_hash:&str)->ConfirmedExecutionOutcome {
-        #[cfg(test)]
-        if let Some(executor)=&self.test_single_capture_executor {return executor.execute_confirmed_bound(action,pending_id);}
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-        {
-            let isyncyou_agent::ToolAction::LiveWrite {account,change,..}=action else {return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)};
-            let Some(value)=change.get("intent") else {return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)};
-            let Some(digest)=change.get("request_sha256").and_then(serde_json::Value::as_str) else {return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)};
-            let Some(control)=self.control_store.as_ref() else {return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)};
-            let Ok(intent)=serde_json::from_value::<isyncyou_engine::self_hosted_mail_restore::ApprovedSingleCapture>(value.clone()) else {return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)};
-            if intent.account_id!=*account {return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)}
-            let path=match self.config_path.read() {Ok(path)=>path.clone(),Err(_)=>return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)};
-            let run=|cfg:&Config| -> Result<isyncyou_engine::self_hosted_mail_restore::SingleCaptureOutcome,String> {
-                let subject=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| Ok(subject.ok_or("provider_login_required")?.to_owned()))?;
-                let signer=match isyncyou_engine::self_hosted_mail_restore::load_registered_recovery_signer(cfg,account) {Ok(signer)=>signer,Err(error)=>{let _=control.set_single_capture_phase(&intent.operation_id,account,&intent.origin,&subject,"unknown","capture_unverified");return Err(error);}};
-                let stored=match isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|current| {let current=current.ok_or("provider_login_required")?;if current!=subject {return Err("provider_identity_changed".into());}control.claim_recovery_request(&intent.operation_id,account,&intent.origin,current,digest,pending_id,action_hash,unix_now_ms())}) {Ok(stored)=>stored,Err(error)=>{let _=control.set_single_capture_phase(&intent.operation_id,account,&intent.origin,&subject,"unknown","capture_unverified");return Err(error);}};
-                if stored.get("purpose").and_then(serde_json::Value::as_str)!=Some("single_capture") || stored.get("intent")!=Some(value) || stored.get("device").and_then(serde_json::Value::as_str)!=Some(signer.device_id()) {let _=control.set_single_capture_phase(&intent.operation_id,account,&intent.origin,&subject,"unknown","capture_unverified");return Err("capture_intent_mismatch".into());}
-                control.set_single_capture_phase(&intent.operation_id,account,&intent.origin,&subject,"host_claimed","")?;
-                let mut phase=|phase:&str| control.set_single_capture_phase(&intent.operation_id,account,&intent.origin,&subject,phase,"");
-                let result=isyncyou_engine::provider_auth::with_platform_credential_store(cfg,account,|credentials| isyncyou_engine::self_hosted_mail_restore::execute_single_capture_with_phase(cfg,&intent,&intent.approval_sha256,signer.as_ref(),credentials,&mut phase));
-                let (last_phase,last_error)=match &result {Ok(isyncyou_engine::self_hosted_mail_restore::SingleCaptureOutcome::Created(_))=>("requested",""),Err(error) if single_capture_preclaim_failure(error).is_some()=>("preflight_failed",error.as_str()),_=>("unknown","capture_unverified")};
-                let _=control.set_single_capture_phase(&intent.operation_id,account,&intent.origin,&subject,last_phase,last_error);
-                result
+            let field = |name: &str| {
+                change
+                    .get(name)
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("photo_intent_invalid")
             };
-            let outcome=match path {Some(path)=>Config::with_config_lock(&path,|| {let cfg=load_host_runtime_config(&path)?;run(&cfg)}),None=>run(&self.cfg)};
-            return match outcome {
-                Ok(isyncyou_engine::self_hosted_mail_restore::SingleCaptureOutcome::Created(_))=>ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new("Capture requested; off-node protection is not yet confirmed")),
-                Err(error)=>match single_capture_preclaim_failure(&error) {Some(code)=>ConfirmedExecutionOutcome::Failed(code),None=>ConfirmedExecutionOutcome::OutcomeUnknown},
-                _=>ConfirmedExecutionOutcome::OutcomeUnknown,
+            let (
+                Ok(stage),
+                Ok(digest),
+                Ok(origin),
+                Ok(collection),
+                Ok(href),
+                Ok(media),
+                Ok(sha),
+                Ok(uid),
+                Ok(name),
+                Ok(etag),
+                Ok(raw_sha),
+            ) = (
+                field("stage_id"),
+                field("request_sha256"),
+                field("origin"),
+                field("collection"),
+                field("href"),
+                field("media_type"),
+                field("sha256"),
+                field("uid"),
+                field("name"),
+                field("etag"),
+                field("raw_sha256"),
+            )
+            else {
+                return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
             };
-        }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        {let _=(action,pending_id,action_hash);ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)}
-    }
-    fn execute_confirmed_recovery_jobs(&self, action:&isyncyou_agent::ToolAction, pending_id:&str, action_hash:&str) -> ConfirmedExecutionOutcome {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-        {
-            let isyncyou_agent::ToolAction::LiveWrite { account,change,.. }=action else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
-            let (Some(batch),Some(digest))=(change.get("batch_id").and_then(serde_json::Value::as_str),change.get("request_sha256").and_then(serde_json::Value::as_str)) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
-            let Some(control)=self.control_store.as_ref() else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
-            let path=match self.config_path.read() { Ok(path)=>path.clone(),Err(_)=>return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) };
-            let run=|cfg:&Config| -> Result<bool,String> {
-                let origin=match cfg.provider_accounts.get(account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin,..}) if cfg.accounts.iter().any(|a| a.id==*account)=>origin, _=>return Err("provider_unavailable".into()) };
-                let stored=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| control.claim_recovery_request(batch,account,origin,subject.ok_or("provider_login_required")?,digest,pending_id,action_hash,unix_now_ms()))?;
-                if change.get("effect")!=stored.get("effect") { return Err("recovery_confirmation_mismatch".into()); }
-                let signer=isyncyou_engine::self_hosted_mail_restore::load_registered_recovery_signer(cfg,account)?;
-                if stored.get("device").and_then(serde_json::Value::as_str)!=Some(signer.device_id()) { return Err("recovery_device_changed".into()); }
-                let selections:Vec<isyncyou_engine::self_hosted_mail_restore::RecoverySelection>=serde_json::from_value(stored.get("selections").cloned().ok_or("recovery_request_invalid")?).map_err(|_| "recovery_request_invalid")?;
-                if selections.is_empty() || selections.len()>32 || selections.iter().any(|s| s.account_id!=*account || s.origin!=*origin) { return Err("recovery_request_invalid".into()); }
-                isyncyou_engine::provider_auth::with_platform_credential_store(cfg,account,|credentials| {
-                    for selection in &selections { match isyncyou_engine::self_hosted_mail_restore::create_bound_recovery_job(cfg,selection,signer.as_ref(),credentials)? { isyncyou_engine::self_hosted_mail_restore::RecoveryJobOutcome::Created(_)=>{}, isyncyou_engine::self_hosted_mail_restore::RecoveryJobOutcome::Unknown=>return Ok(false) } }
-                    Ok(true)
-                })
+            if target.as_deref() != Some(href) {
+                return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
+            }
+            let path = match self.config_path.read() {
+                Ok(path) => path.clone(),
+                Err(_) => {
+                    return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)
+                }
             };
-            let result=match path { Some(path)=>Config::with_config_lock(&path,|| { let cfg=load_host_runtime_config(&path)?; run(&cfg) }),None=>run(&self.cfg) };
-            return match result { Ok(true)=>ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new("Recovery retrieval requested; import requires a separate confirmation")), _=>ConfirmedExecutionOutcome::OutcomeUnknown };
-        }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _=(action,pending_id,action_hash); ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) }
-    }
-    fn execute_confirmed_recovery_batch(&self, action:&isyncyou_agent::ToolAction, pending_id:&str, action_hash:&str) -> ConfirmedExecutionOutcome {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-        {
-            let isyncyou_agent::ToolAction::LiveWrite { account,service,change,.. }=action else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
-            if service!="calendar" { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); }
-            let Some(batch_id)=change.get("batch_id").and_then(serde_json::Value::as_str) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
-            let Some(manifest_hash)=change.get("manifest_sha256").and_then(serde_json::Value::as_str) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
-            let Some(approval)=change.get("approval_sha256").and_then(serde_json::Value::as_str) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
-            let Some(control)=self.control_store.as_ref() else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
-            let path=match self.config_path.read() { Ok(path)=>path.clone(), Err(_)=>return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) };
-            let run=|cfg:&Config| -> Result<isyncyou_engine::self_hosted_mail_restore::CalendarBatchOutcome,String> {
-                let origin=match cfg.provider_accounts.get(account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin,..}) if cfg.accounts.iter().any(|a| a.id==*account)=>origin, _=>return Err("provider_unavailable".into()) };
-                let (manifest,originals)=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| control.load_recovery_batch(batch_id,account,origin,subject.ok_or("provider_login_required")?,manifest_hash,pending_id,action_hash,true,unix_now_ms()))?;
-                if manifest.approval_sha256!=approval || change.get("effect_sha256").and_then(serde_json::Value::as_str)!=Some(agent_control_store::recovery_batch_effect_sha256(&manifest).as_str()) { return Err("recovery_confirmation_mismatch".into()); }
-                let result=isyncyou_engine::provider_auth::with_platform_credential_store(cfg,account,|credentials| execute_staged_recovery_batch(cfg,account,origin,manifest,originals,credentials))?;
-                if matches!(&result,isyncyou_engine::self_hosted_mail_restore::CalendarBatchOutcome::Confirmed(_)) {
-                    let _=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| control.complete_recovery_batch(batch_id,account,origin,subject.ok_or("provider_login_required")?,manifest_hash));
+            let run = |cfg: &Config| -> Result<isyncyou_engine::dav_write::WriteOutcome, String> {
+                if !matches!(cfg.provider_accounts.get(account),Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin:current,..}) if current==origin)
+                {
+                    return Err("provider_unavailable".into());
+                }
+                let saved = isyncyou_engine::provider_auth::with_locked_provider_subject(
+                    cfg,
+                    account,
+                    |subject| {
+                        control.claim_recovery_request(
+                            stage,
+                            account,
+                            origin,
+                            subject.ok_or("provider_login_required")?,
+                            digest,
+                            pending_id,
+                            action_hash,
+                            unix_now_ms(),
+                        )
+                    },
+                )?;
+                for key in ["collection", "href", "media_type", "sha256", "size"] {
+                    if saved.get(key) != change.get(key) {
+                        return Err("photo_intent_invalid".into());
+                    }
+                }
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(
+                        saved
+                            .get("photo_base64")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or("photo_intent_invalid")?,
+                    )
+                    .map_err(|_| "photo_intent_invalid")?;
+                let prepared = isyncyou_engine::dav_live::prepare_contact_photo(
+                    cfg, account, collection, href, media, &bytes,
+                )?;
+                let actual_raw = ring::digest::digest(&ring::digest::SHA256, &prepared.edit.raw)
+                    .as_ref()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>();
+                if prepared.origin != origin
+                    || prepared.uid != uid
+                    || prepared.name != name
+                    || prepared.new_photo_sha256 != sha
+                    || prepared.size as u64
+                        != change
+                            .get("size")
+                            .and_then(serde_json::Value::as_u64)
+                            .ok_or("photo_intent_invalid")?
+                    || prepared.edit.expected_etag != etag
+                    || actual_raw != raw_sha
+                    || serde_json::json!(prepared.old_photo_uri_sha256)
+                        != change["old_photo_uri_sha256"]
+                {
+                    return Ok(isyncyou_engine::dav_write::WriteOutcome::Conflict);
+                }
+                let op = isyncyou_engine::dav_write::ApprovedDavWrite {
+                    operation_id: format!("agent:{pending_id}"),
+                    account_id: account.clone(),
+                    origin: origin.into(),
+                    collection: collection.into(),
+                    service: "contacts".into(),
+                    href: href.into(),
+                    expected_etag: Some(etag.into()),
+                    expected_collection_token: None,
+                    raw: Some(prepared.edit.raw),
+                };
+                let result = isyncyou_engine::dav_write::execute_contact_photo(
+                    cfg,
+                    "/.well-known/carddav",
+                    &op,
+                    media,
+                    &bytes,
+                    None,
+                )?;
+                if matches!(
+                    &result,
+                    isyncyou_engine::dav_write::WriteOutcome::Confirmed(_)
+                ) {
+                    let _ = isyncyou_engine::provider_auth::with_locked_provider_subject(
+                        cfg,
+                        account,
+                        |subject| {
+                            control.release_confirmed_photo(
+                                stage,
+                                account,
+                                origin,
+                                subject.ok_or("provider_login_required")?,
+                            )
+                        },
+                    );
                 }
                 Ok(result)
             };
-            let result=match path { Some(path)=>Config::with_config_lock(&path,|| { let cfg=load_host_runtime_config(&path)?; run(&cfg) }), None=>run(&self.cfg) };
+            let result = match path {
+                Some(path) => Config::with_config_lock(&path, || {
+                    let cfg = load_host_runtime_config(&path)?;
+                    run(&cfg)
+                }),
+                None => run(&self.cfg),
+            };
             return match result {
-                Ok(isyncyou_engine::self_hosted_mail_restore::CalendarBatchOutcome::Confirmed(_))=>ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new("Recovered copies created; local synchronization may be pending")),
-                Ok(isyncyou_engine::self_hosted_mail_restore::CalendarBatchOutcome::Stopped { reason:"conflict",.. })=>ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderConflict),
-                Ok(isyncyou_engine::self_hosted_mail_restore::CalendarBatchOutcome::Stopped { reason:"rejected",.. })=>ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderActionRejected),
-                _=>ConfirmedExecutionOutcome::OutcomeUnknown,
+                Ok(isyncyou_engine::dav_write::WriteOutcome::Confirmed(_)) => {
+                    ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new(
+                        "Contact photo updated; local synchronization may be pending",
+                    ))
+                }
+                Ok(isyncyou_engine::dav_write::WriteOutcome::Conflict) => {
+                    ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderConflict)
+                }
+                Ok(isyncyou_engine::dav_write::WriteOutcome::Rejected) => {
+                    ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderActionRejected)
+                }
+                _ => ConfirmedExecutionOutcome::OutcomeUnknown,
             };
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _=(action,pending_id,action_hash); ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) }
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
+        {
+            let _ = (action, pending_id, action_hash);
+            ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)
+        }
+    }
+    fn record_single_capture_validation_failure(&self, action: &isyncyou_agent::ToolAction) {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            let isyncyou_agent::ToolAction::LiveWrite {
+                account, change, ..
+            } = action
+            else {
+                return;
+            };
+            if change.get("verb").and_then(serde_json::Value::as_str) != Some("single_capture") {
+                return;
+            }
+            let Some(operation) = change
+                .get("operation_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return;
+            };
+            let Some(control) = self.control_store.as_ref() else {
+                return;
+            };
+            let path = match self.config_path.read() {
+                Ok(path) => path.clone(),
+                Err(_) => return,
+            };
+            let run = |cfg: &Config| -> Result<(), String> {
+                let origin =
+                    match cfg.provider_accounts.get(account) {
+                        Some(isyncyou_core::config::ProviderConfig::SelfHosted {
+                            origin, ..
+                        }) if cfg.accounts.iter().any(|a| a.id == *account) => origin,
+                        _ => return Err("provider_unavailable".into()),
+                    };
+                isyncyou_engine::provider_auth::with_locked_provider_subject(
+                    cfg,
+                    account,
+                    |subject| {
+                        control.set_single_capture_phase(
+                            operation,
+                            account,
+                            origin,
+                            subject.ok_or("provider_login_required")?,
+                            "validation_failed",
+                            "capture_preflight_validation",
+                        )
+                    },
+                )
+            };
+            let _ = match path {
+                Some(path) => Config::with_config_lock(&path, || {
+                    let cfg = load_host_runtime_config(&path)?;
+                    run(&cfg)
+                }),
+                None => run(&self.cfg),
+            };
+        }
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
+        {
+            let _ = action;
+        }
+    }
+    fn execute_confirmed_single_capture(
+        &self,
+        action: &isyncyou_agent::ToolAction,
+        pending_id: &str,
+        action_hash: &str,
+    ) -> ConfirmedExecutionOutcome {
+        #[cfg(test)]
+        if let Some(executor) = &self.test_single_capture_executor {
+            return executor.execute_confirmed_bound(action, pending_id);
+        }
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            let isyncyou_agent::ToolAction::LiveWrite {
+                account, change, ..
+            } = action
+            else {
+                return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
+            };
+            let Some(value) = change.get("intent") else {
+                return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
+            };
+            let Some(digest) = change
+                .get("request_sha256")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
+            };
+            let Some(control) = self.control_store.as_ref() else {
+                return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
+            };
+            let Ok(intent) = serde_json::from_value::<
+                isyncyou_engine::self_hosted_mail_restore::ApprovedSingleCapture,
+            >(value.clone()) else {
+                return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
+            };
+            if intent.account_id != *account {
+                return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
+            }
+            let path = match self.config_path.read() {
+                Ok(path) => path.clone(),
+                Err(_) => {
+                    return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)
+                }
+            };
+            let run = |cfg: &Config| -> Result<
+                isyncyou_engine::self_hosted_mail_restore::SingleCaptureOutcome,
+                String,
+            > {
+                let subject = isyncyou_engine::provider_auth::with_locked_provider_subject(
+                    cfg,
+                    account,
+                    |subject| Ok(subject.ok_or("provider_login_required")?.to_owned()),
+                )?;
+                let signer =
+                    match isyncyou_engine::self_hosted_mail_restore::load_registered_recovery_signer(
+                        cfg, account,
+                    ) {
+                        Ok(signer) => signer,
+                        Err(error) => {
+                            let _ = control.set_single_capture_phase(
+                                &intent.operation_id,
+                                account,
+                                &intent.origin,
+                                &subject,
+                                "unknown",
+                                "capture_unverified",
+                            );
+                            return Err(error);
+                        }
+                    };
+                let stored = match isyncyou_engine::provider_auth::with_locked_provider_subject(
+                    cfg,
+                    account,
+                    |current| {
+                        let current = current.ok_or("provider_login_required")?;
+                        if current != subject {
+                            return Err("provider_identity_changed".into());
+                        }
+                        control.claim_recovery_request(
+                            &intent.operation_id,
+                            account,
+                            &intent.origin,
+                            current,
+                            digest,
+                            pending_id,
+                            action_hash,
+                            unix_now_ms(),
+                        )
+                    },
+                ) {
+                    Ok(stored) => stored,
+                    Err(error) => {
+                        let _ = control.set_single_capture_phase(
+                            &intent.operation_id,
+                            account,
+                            &intent.origin,
+                            &subject,
+                            "unknown",
+                            "capture_unverified",
+                        );
+                        return Err(error);
+                    }
+                };
+                if stored.get("purpose").and_then(serde_json::Value::as_str)
+                    != Some("single_capture")
+                    || stored.get("intent") != Some(value)
+                    || stored.get("device").and_then(serde_json::Value::as_str)
+                        != Some(signer.device_id())
+                {
+                    let _ = control.set_single_capture_phase(
+                        &intent.operation_id,
+                        account,
+                        &intent.origin,
+                        &subject,
+                        "unknown",
+                        "capture_unverified",
+                    );
+                    return Err("capture_intent_mismatch".into());
+                }
+                control.set_single_capture_phase(
+                    &intent.operation_id,
+                    account,
+                    &intent.origin,
+                    &subject,
+                    "host_claimed",
+                    "",
+                )?;
+                let mut phase = |phase: &str| {
+                    control.set_single_capture_phase(
+                        &intent.operation_id,
+                        account,
+                        &intent.origin,
+                        &subject,
+                        phase,
+                        "",
+                    )
+                };
+                let result = isyncyou_engine::provider_auth::with_platform_credential_store(
+                    cfg,
+                    account,
+                    |credentials| {
+                        isyncyou_engine::self_hosted_mail_restore::execute_single_capture_with_phase(
+                            cfg,
+                            &intent,
+                            &intent.approval_sha256,
+                            signer.as_ref(),
+                            credentials,
+                            &mut phase,
+                        )
+                    },
+                );
+                let (last_phase, last_error) = match &result {
+                    Ok(
+                        isyncyou_engine::self_hosted_mail_restore::SingleCaptureOutcome::Created(_),
+                    ) => ("requested", ""),
+                    Err(error) if single_capture_preclaim_failure(error).is_some() => {
+                        ("preflight_failed", error.as_str())
+                    }
+                    _ => ("unknown", "capture_unverified"),
+                };
+                let _ = control.set_single_capture_phase(
+                    &intent.operation_id,
+                    account,
+                    &intent.origin,
+                    &subject,
+                    last_phase,
+                    last_error,
+                );
+                result
+            };
+            let outcome = match path {
+                Some(path) => Config::with_config_lock(&path, || {
+                    let cfg = load_host_runtime_config(&path)?;
+                    run(&cfg)
+                }),
+                None => run(&self.cfg),
+            };
+            return match outcome {
+                Ok(isyncyou_engine::self_hosted_mail_restore::SingleCaptureOutcome::Created(_)) => {
+                    ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new(
+                        "Capture requested; off-node protection is not yet confirmed",
+                    ))
+                }
+                Err(error) => match single_capture_preclaim_failure(&error) {
+                    Some(code) => ConfirmedExecutionOutcome::Failed(code),
+                    None => ConfirmedExecutionOutcome::OutcomeUnknown,
+                },
+                _ => ConfirmedExecutionOutcome::OutcomeUnknown,
+            };
+        }
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
+        {
+            let _ = (action, pending_id, action_hash);
+            ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)
+        }
+    }
+    fn execute_confirmed_recovery_jobs(
+        &self,
+        action: &isyncyou_agent::ToolAction,
+        pending_id: &str,
+        action_hash: &str,
+    ) -> ConfirmedExecutionOutcome {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            let isyncyou_agent::ToolAction::LiveWrite {
+                account, change, ..
+            } = action
+            else {
+                return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
+            };
+            let (Some(batch), Some(digest)) = (
+                change.get("batch_id").and_then(serde_json::Value::as_str),
+                change
+                    .get("request_sha256")
+                    .and_then(serde_json::Value::as_str),
+            ) else {
+                return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
+            };
+            let Some(control) = self.control_store.as_ref() else {
+                return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
+            };
+            let path = match self.config_path.read() {
+                Ok(path) => path.clone(),
+                Err(_) => {
+                    return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)
+                }
+            };
+            let run = |cfg: &Config| -> Result<bool, String> {
+                let origin =
+                    match cfg.provider_accounts.get(account) {
+                        Some(isyncyou_core::config::ProviderConfig::SelfHosted {
+                            origin, ..
+                        }) if cfg.accounts.iter().any(|a| a.id == *account) => origin,
+                        _ => return Err("provider_unavailable".into()),
+                    };
+                let stored = isyncyou_engine::provider_auth::with_locked_provider_subject(
+                    cfg,
+                    account,
+                    |subject| {
+                        control.claim_recovery_request(
+                            batch,
+                            account,
+                            origin,
+                            subject.ok_or("provider_login_required")?,
+                            digest,
+                            pending_id,
+                            action_hash,
+                            unix_now_ms(),
+                        )
+                    },
+                )?;
+                if change.get("effect") != stored.get("effect") {
+                    return Err("recovery_confirmation_mismatch".into());
+                }
+                let signer =
+                    isyncyou_engine::self_hosted_mail_restore::load_registered_recovery_signer(
+                        cfg, account,
+                    )?;
+                if stored.get("device").and_then(serde_json::Value::as_str)
+                    != Some(signer.device_id())
+                {
+                    return Err("recovery_device_changed".into());
+                }
+                let selections: Vec<isyncyou_engine::self_hosted_mail_restore::RecoverySelection> =
+                    serde_json::from_value(
+                        stored
+                            .get("selections")
+                            .cloned()
+                            .ok_or("recovery_request_invalid")?,
+                    )
+                    .map_err(|_| "recovery_request_invalid")?;
+                if selections.is_empty()
+                    || selections.len() > 32
+                    || selections
+                        .iter()
+                        .any(|s| s.account_id != *account || s.origin != *origin)
+                {
+                    return Err("recovery_request_invalid".into());
+                }
+                isyncyou_engine::provider_auth::with_platform_credential_store(
+                    cfg,
+                    account,
+                    |credentials| {
+                        for selection in &selections {
+                            match isyncyou_engine::self_hosted_mail_restore::create_bound_recovery_job(cfg,selection,signer.as_ref(),credentials)? { isyncyou_engine::self_hosted_mail_restore::RecoveryJobOutcome::Created(_)=>{}, isyncyou_engine::self_hosted_mail_restore::RecoveryJobOutcome::Unknown=>return Ok(false) }
+                        }
+                        Ok(true)
+                    },
+                )
+            };
+            let result = match path {
+                Some(path) => Config::with_config_lock(&path, || {
+                    let cfg = load_host_runtime_config(&path)?;
+                    run(&cfg)
+                }),
+                None => run(&self.cfg),
+            };
+            return match result {
+                Ok(true) => ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new(
+                    "Recovery retrieval requested; import requires a separate confirmation",
+                )),
+                _ => ConfirmedExecutionOutcome::OutcomeUnknown,
+            };
+        }
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
+        {
+            let _ = (action, pending_id, action_hash);
+            ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)
+        }
+    }
+    fn execute_confirmed_recovery_batch(
+        &self,
+        action: &isyncyou_agent::ToolAction,
+        pending_id: &str,
+        action_hash: &str,
+    ) -> ConfirmedExecutionOutcome {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            let isyncyou_agent::ToolAction::LiveWrite {
+                account,
+                service,
+                change,
+                ..
+            } = action
+            else {
+                return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
+            };
+            if service != "calendar" {
+                return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
+            }
+            let Some(batch_id) = change.get("batch_id").and_then(serde_json::Value::as_str) else {
+                return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
+            };
+            let Some(manifest_hash) = change
+                .get("manifest_sha256")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
+            };
+            let Some(approval) = change
+                .get("approval_sha256")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
+            };
+            let Some(control) = self.control_store.as_ref() else {
+                return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
+            };
+            let path = match self.config_path.read() {
+                Ok(path) => path.clone(),
+                Err(_) => {
+                    return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)
+                }
+            };
+            let run = |cfg: &Config| -> Result<
+                isyncyou_engine::self_hosted_mail_restore::CalendarBatchOutcome,
+                String,
+            > {
+                let origin =
+                    match cfg.provider_accounts.get(account) {
+                        Some(isyncyou_core::config::ProviderConfig::SelfHosted {
+                            origin, ..
+                        }) if cfg.accounts.iter().any(|a| a.id == *account) => origin,
+                        _ => return Err("provider_unavailable".into()),
+                    };
+                let (manifest, originals) =
+                    isyncyou_engine::provider_auth::with_locked_provider_subject(
+                        cfg,
+                        account,
+                        |subject| {
+                            control.load_recovery_batch(
+                                batch_id,
+                                account,
+                                origin,
+                                subject.ok_or("provider_login_required")?,
+                                manifest_hash,
+                                pending_id,
+                                action_hash,
+                                true,
+                                unix_now_ms(),
+                            )
+                        },
+                    )?;
+                if manifest.approval_sha256 != approval
+                    || change
+                        .get("effect_sha256")
+                        .and_then(serde_json::Value::as_str)
+                        != Some(
+                            agent_control_store::recovery_batch_effect_sha256(&manifest).as_str(),
+                        )
+                {
+                    return Err("recovery_confirmation_mismatch".into());
+                }
+                let result = isyncyou_engine::provider_auth::with_platform_credential_store(
+                    cfg,
+                    account,
+                    |credentials| {
+                        execute_staged_recovery_batch(
+                            cfg,
+                            account,
+                            origin,
+                            manifest,
+                            originals,
+                            credentials,
+                        )
+                    },
+                )?;
+                if matches!(
+                    &result,
+                    isyncyou_engine::self_hosted_mail_restore::CalendarBatchOutcome::Confirmed(_)
+                ) {
+                    let _ = isyncyou_engine::provider_auth::with_locked_provider_subject(
+                        cfg,
+                        account,
+                        |subject| {
+                            control.complete_recovery_batch(
+                                batch_id,
+                                account,
+                                origin,
+                                subject.ok_or("provider_login_required")?,
+                                manifest_hash,
+                            )
+                        },
+                    );
+                }
+                Ok(result)
+            };
+            let result = match path {
+                Some(path) => Config::with_config_lock(&path, || {
+                    let cfg = load_host_runtime_config(&path)?;
+                    run(&cfg)
+                }),
+                None => run(&self.cfg),
+            };
+            return match result {
+                Ok(isyncyou_engine::self_hosted_mail_restore::CalendarBatchOutcome::Confirmed(
+                    _,
+                )) => ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new(
+                    "Recovered copies created; local synchronization may be pending",
+                )),
+                Ok(isyncyou_engine::self_hosted_mail_restore::CalendarBatchOutcome::Stopped {
+                    reason: "conflict",
+                    ..
+                }) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderConflict),
+                Ok(isyncyou_engine::self_hosted_mail_restore::CalendarBatchOutcome::Stopped {
+                    reason: "rejected",
+                    ..
+                }) => {
+                    ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderActionRejected)
+                }
+                _ => ConfirmedExecutionOutcome::OutcomeUnknown,
+            };
+        }
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
+        {
+            let _ = (action, pending_id, action_hash);
+            ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected)
+        }
     }
     pub fn new(cfg: Config, oauth_dir: PathBuf) -> Self {
         Self::new_with_policy(
@@ -4138,7 +5945,10 @@ impl DaemonAgent {
             feature = "agent-subscription-experimental"
         ))]
         remove_legacy_codex_callback_diagnostics(&oauth_dir);
-        let audit_sink = Arc::new(StoreAgentAuditSink { cfg: cfg.clone(), config_path: None });
+        let audit_sink = Arc::new(StoreAgentAuditSink {
+            cfg: cfg.clone(),
+            config_path: None,
+        });
         let confirmed_executor =
             agent_ops::confirmed_executor_for_policy(operation_policy, cfg.clone(), gate);
         #[cfg(any(
@@ -10833,7 +12643,12 @@ impl DaemonAgent {
         let executor_config_path = Arc::clone(&self.config_path);
         let recovery_config_path = Arc::clone(&self.config_path);
         let recovery_control = self.control_store.clone();
-        let archive_root = executor_cfg.accounts.iter().find(|a| a.id == account_id).map(|a| a.archive_root.clone()).unwrap_or_default();
+        let archive_root = executor_cfg
+            .accounts
+            .iter()
+            .find(|a| a.id == account_id)
+            .map(|a| a.archive_root.clone())
+            .unwrap_or_default();
         let pending = self.pending.clone();
         let turns = Arc::clone(&self.turns);
         let hot_request_statuses = Arc::clone(&self.hot_request_statuses);
@@ -10864,7 +12679,13 @@ impl DaemonAgent {
                     feature = "agent-subscription-experimental"
                 ))]
                 let _operation_lease = operation_lease;
-                let exec = make_account_executor(&account_id, archive_root, &executor_cfg, executor_config_path, recovery_control.clone());
+                let exec = make_account_executor(
+                    &account_id,
+                    archive_root,
+                    &executor_cfg,
+                    executor_config_path,
+                    recovery_control.clone(),
+                );
                 let mut product_turn = thread_product_turn
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -10970,7 +12791,101 @@ impl DaemonAgent {
                         }
                     }
                     Ok(isyncyou_agent::TurnOutcome::PendingConfirmation { action, .. }) => {
-let (action, preview) = match (if action.account()!=account_id.as_str() { Err("account_mismatch".into()) } else { with_current_recovery_config(&recovery_config_path,&executor_cfg,|cfg| bind_model_recovery_jobs(cfg,recovery_control.as_deref(),*action)) }).and_then(|action| with_current_recovery_config(&recovery_config_path,&executor_cfg,|cfg| bind_model_contact_photo(cfg,recovery_control.as_deref(),action))).and_then(|action| agent_ops::bind_provider_contact_name(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_contact_field(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_contact_add(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_contact_remove(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_task_completion(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_task_parent(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_task_attributes(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_calendar_text(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_calendar_time(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_zoned_time(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_cancellation(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_exception(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_series_rule(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_alarm(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_task_occurrence(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_dav_acl(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_invitation_response(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_dav_delete(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_dav_create(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_mail_action(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_related_draft(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_draft(&executor_cfg, action)).and_then(|action| agent_ops::preview_for_pending_action_with_config(&executor_cfg, &action).map(|preview| (action, preview))) {
+                        let (action, preview) = match (if action.account() != account_id.as_str() {
+                            Err("account_mismatch".into())
+                        } else {
+                            with_current_recovery_config(
+                                &recovery_config_path,
+                                &executor_cfg,
+                                |cfg| {
+                                    bind_model_recovery_jobs(
+                                        cfg,
+                                        recovery_control.as_deref(),
+                                        *action,
+                                    )
+                                },
+                            )
+                        })
+                        .and_then(|action| {
+                            with_current_recovery_config(
+                                &recovery_config_path,
+                                &executor_cfg,
+                                |cfg| {
+                                    bind_model_contact_photo(
+                                        cfg,
+                                        recovery_control.as_deref(),
+                                        action,
+                                    )
+                                },
+                            )
+                        })
+                        .and_then(|action| {
+                            agent_ops::bind_provider_contact_name(&executor_cfg, action)
+                        })
+                        .and_then(|action| {
+                            agent_ops::bind_provider_contact_field(&executor_cfg, action)
+                        })
+                        .and_then(|action| {
+                            agent_ops::bind_provider_contact_add(&executor_cfg, action)
+                        })
+                        .and_then(|action| {
+                            agent_ops::bind_provider_contact_remove(&executor_cfg, action)
+                        })
+                        .and_then(|action| {
+                            agent_ops::bind_provider_task_completion(&executor_cfg, action)
+                        })
+                        .and_then(|action| {
+                            agent_ops::bind_provider_task_parent(&executor_cfg, action)
+                        })
+                        .and_then(|action| {
+                            agent_ops::bind_provider_task_attributes(&executor_cfg, action)
+                        })
+                        .and_then(|action| {
+                            agent_ops::bind_provider_calendar_text(&executor_cfg, action)
+                        })
+                        .and_then(|action| {
+                            agent_ops::bind_provider_calendar_time(&executor_cfg, action)
+                        })
+                        .and_then(|action| {
+                            agent_ops::bind_provider_zoned_time(&executor_cfg, action)
+                        })
+                        .and_then(|action| {
+                            agent_ops::bind_provider_cancellation(&executor_cfg, action)
+                        })
+                        .and_then(|action| {
+                            agent_ops::bind_provider_exception(&executor_cfg, action)
+                        })
+                        .and_then(|action| {
+                            agent_ops::bind_provider_series_rule(&executor_cfg, action)
+                        })
+                        .and_then(|action| agent_ops::bind_provider_alarm(&executor_cfg, action))
+                        .and_then(|action| {
+                            agent_ops::bind_provider_task_occurrence(&executor_cfg, action)
+                        })
+                        .and_then(|action| agent_ops::bind_provider_dav_acl(&executor_cfg, action))
+                        .and_then(|action| {
+                            agent_ops::bind_provider_invitation_response(&executor_cfg, action)
+                        })
+                        .and_then(|action| {
+                            agent_ops::bind_provider_dav_delete(&executor_cfg, action)
+                        })
+                        .and_then(|action| {
+                            agent_ops::bind_provider_dav_create(&executor_cfg, action)
+                        })
+                        .and_then(|action| {
+                            agent_ops::bind_provider_mail_action(&executor_cfg, action)
+                        })
+                        .and_then(|action| {
+                            agent_ops::bind_provider_related_draft(&executor_cfg, action)
+                        })
+                        .and_then(|action| agent_ops::bind_provider_draft(&executor_cfg, action))
+                        .and_then(|action| {
+                            agent_ops::preview_for_pending_action_with_config(
+                                &executor_cfg,
+                                &action,
+                            )
+                            .map(|preview| (action, preview))
+                        }) {
                             Ok(value) => value,
                             Err(error) => {
                                 agent_ops::log_pending_action_validation(&error);
@@ -11054,7 +12969,7 @@ let (action, preview) = match (if action.account()!=account_id.as_str() { Err("a
                                 turn_id: tid.clone(),
                             });
                         let transition = TurnRegistry::begin_pending(&turn_state, || {
-                            let bound_action=action.clone();
+                            let bound_action = action.clone();
                             let (pending_action, token) = pending
                                 .register_bound(
                                     action,
@@ -11067,8 +12982,24 @@ let (action, preview) = match (if action.account()!=account_id.as_str() { Err("a
                                     isyncyou_agent::AgentError::Provider(code) => code,
                                     _ => "pending_registration_unavailable".to_string(),
                                 })?;
-                            if let Err(error)=with_current_recovery_config(&recovery_config_path,&executor_cfg,|cfg| bind_model_recovery_pending(cfg,recovery_control.as_deref(),&bound_action,&pending_action.id,&pending_action.action_hash)) {
-                                let _=pending.cancel(&pending_action.id,&pending_action.action_hash,unix_now_ms());
+                            if let Err(error) = with_current_recovery_config(
+                                &recovery_config_path,
+                                &executor_cfg,
+                                |cfg| {
+                                    bind_model_recovery_pending(
+                                        cfg,
+                                        recovery_control.as_deref(),
+                                        &bound_action,
+                                        &pending_action.id,
+                                        &pending_action.action_hash,
+                                    )
+                                },
+                            ) {
+                                let _ = pending.cancel(
+                                    &pending_action.id,
+                                    &pending_action.action_hash,
+                                    unix_now_ms(),
+                                );
                                 return Err(error);
                             }
                             let persisted = product_turn.take().map_or(Ok(()), |runtime| {
@@ -11548,7 +13479,8 @@ let (action, preview) = match (if action.account()!=account_id.as_str() { Err("a
         code: &str,
         completed_at_ms: u64,
     ) -> Result<(), String> {
-        #[cfg(debug_assertions)] let phase_started=std::time::Instant::now();
+        #[cfg(debug_assertions)]
+        let phase_started = std::time::Instant::now();
         if !self.pending.is_persistent() {
             return Ok(());
         }
@@ -11562,8 +13494,17 @@ let (action, preview) = match (if action.account()!=account_id.as_str() { Err("a
                 .as_ref()
                 .ok_or_else(|| "confirmation_outcome_unknown".to_string())?;
             store.finish_pending_confirmation(pending_id, code, completed_at_ms)?;
-            reconcile_pending_confirm_projections(&self.runtime_config(), &self.oauth_dir, store, 1);
-            #[cfg(debug_assertions)] eprintln!("agent_confirm_phase=finish_projection duration_ms={}",phase_started.elapsed().as_millis());
+            reconcile_pending_confirm_projections(
+                &self.runtime_config(),
+                &self.oauth_dir,
+                store,
+                1,
+            );
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "agent_confirm_phase=finish_projection duration_ms={}",
+                phase_started.elapsed().as_millis()
+            );
             Ok(())
         }
         #[cfg(not(any(
@@ -11606,918 +13547,3175 @@ fn load_product_session_history_page(
         .map_err(product_session::map_session_error)
 }
 
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn session_transport_token(cfg: &Config, account: &str) -> Result<String, String> {
     if cfg.provider_accounts.contains_key(account) {
-        if !cfg.accounts.iter().any(|a| a.id == account) { return Err("session_account_unavailable".into()); }
+        if !cfg.accounts.iter().any(|a| a.id == account) {
+            return Err("session_account_unavailable".into());
+        }
         Ok(String::new())
     } else {
-        isyncyou_engine::auth::resolve_cached_sync_token(cfg, account).map_err(|_| "session_writer_reconnect_required".into())
+        isyncyou_engine::auth::resolve_cached_sync_token(cfg, account)
+            .map_err(|_| "session_writer_reconnect_required".into())
     }
 }
 
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-fn prepare_recovery_import_action(cfg:&Config,control:&agent_control_store::AgentControlStore,origin:&str,request:&isyncyou_webui::AgentRecoveryImportPrepareRequest)->Result<(isyncyou_agent::ToolAction,String),String> {
-    use isyncyou_engine::self_hosted_mail_restore::{RecoverySelection,bound_recovery_status,read_bound_recovery_result,prepare_staged_calendar_batch,load_registered_recovery_signer};
-                let saved=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.read_claimed_recovery_request(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?)).map_err(|_| "recovery_prepare_request_unavailable")?;
-                let signer=load_registered_recovery_signer(cfg,&request.account).map_err(|_| "recovery_prepare_device_unavailable")?;
-                if saved.get("device").and_then(serde_json::Value::as_str)!=Some(signer.device_id()) { return Err("recovery_device_changed".into()); }
-                let selections:Vec<RecoverySelection>=serde_json::from_value(saved.get("selections").cloned().ok_or("recovery_request_invalid")?).map_err(|_| "recovery_request_invalid")?;
-                if selections.is_empty() || selections.len()>32 || selections.iter().any(|s| s.account_id!=request.account || s.origin!=origin) { return Err("recovery_request_invalid".into()); }
-                let labels=saved.pointer("/effect/objects").and_then(serde_json::Value::as_array).ok_or("recovery_request_invalid")?;
-                if labels.len()!=selections.len() { return Err("recovery_request_invalid".into()); }
-                let existing=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.recovery_staging_info(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,unix_now_ms()))?;
-                if let Some((state,manifest_sha,manifest))=&existing {
-                    if !manifest.approval_sha256.is_empty() {
-                        if manifest.origin!=origin || (request.collection!="Recovered" && manifest.collection!=request.collection) || manifest.objects.len()!=selections.len() || manifest.objects.iter().zip(&selections).any(|(a,b)| a.operation_id!=b.operation_id || a.generation!=b.generation || a.object!=b.object || a.version!=b.version || a.confirmation!=b.confirmation) { return Err("recovery_batch_conflict".into()); }
-                        if state=="staging" { isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.ready_recovery_batch(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,unix_now_ms()))?; }
-                        let action=isyncyou_agent::ToolAction::LiveWrite {account:request.account.clone(),service:"calendar".into(),target:None,change:serde_json::json!({"verb":"recovery_batch_import","batch_id":request.batch_id,"manifest_sha256":manifest_sha,"approval_sha256":manifest.approval_sha256,"effect_sha256":agent_control_store::recovery_batch_effect_sha256(&manifest)})};
-                        return Ok((action,manifest_sha.clone()));
-                    }
-                }
-                let mut statuses=Vec::new();
-                isyncyou_engine::provider_auth::with_platform_credential_store(cfg,&request.account,|credentials| { for selection in &selections { statuses.push(bound_recovery_status(cfg,selection,signer.as_ref(),credentials).map_err(|_| "recovery_prepare_status_unavailable")?); } Ok(()) })?;
-                let objects=selections.iter().zip(&statuses).zip(labels).map(|((s,status),label)| agent_control_store::RecoveryStagedObject { generation:s.generation.clone(),object:s.object.clone(),version:s.version.clone(),operation_id:s.operation_id.clone(),confirmation:s.confirmation.clone(),size:status.size,sha256:status.sha256.clone(),selection_sha256:status.selection_sha256.clone(),kind:status.kind.clone(),encoding:status.encoding.clone(),state:status.state.clone(),label:label.get("label").and_then(serde_json::Value::as_str).unwrap_or("").into() }).collect();
-                let contact_batch=labels.iter().all(|item| item.get("kind").and_then(serde_json::Value::as_str)==Some("contact"));
-                let mail_batch=labels.iter().all(|item| item.get("kind").and_then(serde_json::Value::as_str)==Some("mail"));
-                if !contact_batch && !mail_batch && labels.iter().any(|item| !matches!(item.get("kind").and_then(serde_json::Value::as_str),Some("event" | "task"))) { return Err("recovery_service_mismatch".into()); }
-                let entry=if contact_batch {"/.well-known/carddav"} else if mail_batch {"mail"} else {"/.well-known/caldav"};
-                let collection_intent=if mail_batch { None } else if let Some((_,_,prior))=&existing { prior.collection_intent.clone() } else {
-                    let intent=isyncyou_engine::provider_auth::with_platform_credential_store(cfg,&request.account,|credentials| isyncyou_engine::self_hosted_mail_restore::prepare_recovery_collection_with_store(cfg,&request.account,entry,if contact_batch {"contacts"} else {"calendar"},credentials)).map_err(|_| "recovery_prepare_collection_unavailable")?;
-                    Some(serde_json::to_value(intent).map_err(|_| "recovery_batch_invalid")?)
-                };
-                let collection=if let Some(intent)=&collection_intent { intent.get("target").and_then(serde_json::Value::as_str).ok_or("recovery_batch_invalid")?.to_string() } else if let Some((_,_,prior))=&existing { prior.collection.clone() } else { request.collection.clone() };
-                if !mail_batch && collection_intent.is_none() && existing.is_none() && request.collection=="Recovered" { return Err("recovery_collection_unavailable".into()); }
-                let mut manifest=agent_control_store::RecoveryBatchManifest { approval_sha256:String::new(),origin:origin.to_string(),entry:entry.into(),collection,objects,uid_map:std::collections::BTreeMap::new(),execution_order:Vec::new(),projections:Vec::new(),collection_intent };
-                let expires=unix_now_ms().checked_add(24*60*60*1000).ok_or("recovery_batch_invalid")?;
-                isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.reserve_recovery_batch(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,&manifest,expires,unix_now_ms()).map(|_| ())).map_err(|_| "recovery_prepare_staging_unavailable")?;
-                for (index,selection) in selections.iter().enumerate() {
-                    let payload=isyncyou_engine::provider_auth::with_platform_credential_store(cfg,&request.account,|credentials| read_bound_recovery_result(cfg,selection,signer.as_ref(),credentials)).map_err(|error| if safe_recovery_result_diagnostic(&error) { error } else { "recovery_prepare_result_unavailable".into() })?;
-                    if payload.sha256!=statuses[index].sha256 || payload.bytes.len() as u64!=statuses[index].size || payload.kind!=statuses[index].kind || payload.encoding!=statuses[index].encoding { return Err("recovery_result_changed".into()); }
-                    for (chunk,bytes) in payload.bytes.chunks(agent_control_store::RECOVERY_CHUNK_BYTES).enumerate() {
-                        isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.put_recovery_batch_chunk(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,index,u32::try_from(chunk).map_err(|_| "recovery_batch_invalid")?,bytes,unix_now_ms()))?;
-                    }
-                }
-                let (_,originals)=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.inspect_staged_recovery_batch(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,unix_now_ms()))?;
-                if contact_batch || mail_batch {
-                    for ((selection,status),bytes) in selections.iter().zip(&statuses).zip(originals) {
-                        let summary=if contact_batch {
-                            let uid=format!("{}@recovered.invalid",uuid_v4()?);
-                            let (_,summary)=isyncyou_engine::self_hosted_mail_restore::prepare_staged_contact_restore(selection,status,signer.as_ref(),bytes,&manifest.entry,&manifest.collection,&uid)?;
-                            manifest.uid_map.insert(selection.operation_id.clone(),uid);
-                            serde_json::to_value(summary).map_err(|_| "recovery_batch_invalid")?
-                        } else {
-                            let (_,summary)=isyncyou_engine::self_hosted_mail_restore::prepare_staged_mail_restore(selection,status,signer.as_ref(),bytes,&manifest.collection)?;
-                            serde_json::to_value(summary).map_err(|_| "recovery_batch_invalid")?
-                        };
-                        manifest.execution_order.push(selection.operation_id.clone());
-                        manifest.projections.push(summary);
-                    }
-                    let bound=serde_json::to_vec(&manifest.projections).map_err(|_| "recovery_batch_invalid")?;
-                    manifest.approval_sha256=ring::digest::digest(&ring::digest::SHA256,&bound).as_ref().iter().map(|b|format!("{b:02x}")).collect();
-                } else {
-                    let (batch,summaries)=prepare_staged_calendar_batch(&selections,&statuses,signer.as_ref(),originals,&manifest.entry,&manifest.collection).map_err(|_| "recovery_prepare_projection_unavailable")?;
-                    manifest.approval_sha256=batch.approval_sha256.clone(); manifest.execution_order=batch.items.iter().map(|item| item.operation_id.clone()).collect();
-                    manifest.uid_map=batch.items.first().ok_or("recovery_batch_invalid")?.uid_map.iter().map(|(k,v)|(k.clone(),v.clone())).collect();
-                    manifest.projections=summaries.iter().map(serde_json::to_value).collect::<Result<Vec<_>,_>>().map_err(|_| "recovery_batch_invalid")?;
-                }
-                let manifest_sha=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.finalize_recovery_batch_manifest(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,&manifest,unix_now_ms()))?;
-                isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.ready_recovery_batch(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,unix_now_ms()))?;
-                let action=isyncyou_agent::ToolAction::LiveWrite {account:request.account.clone(),service:"calendar".into(),target:None,change:serde_json::json!({"verb":"recovery_batch_import","batch_id":request.batch_id,"manifest_sha256":manifest_sha,"approval_sha256":manifest.approval_sha256,"effect_sha256":agent_control_store::recovery_batch_effect_sha256(&manifest)})};
-                Ok((action,manifest_sha))
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn prepare_recovery_import_action(
+    cfg: &Config,
+    control: &agent_control_store::AgentControlStore,
+    origin: &str,
+    request: &isyncyou_webui::AgentRecoveryImportPrepareRequest,
+) -> Result<(isyncyou_agent::ToolAction, String), String> {
+    use isyncyou_engine::self_hosted_mail_restore::{
+        bound_recovery_status, load_registered_recovery_signer, prepare_staged_calendar_batch,
+        read_bound_recovery_result, RecoverySelection,
+    };
+    let saved = isyncyou_engine::provider_auth::with_locked_provider_subject(
+        cfg,
+        &request.account,
+        |subject| {
+            control.read_claimed_recovery_request(
+                &request.batch_id,
+                &request.account,
+                origin,
+                subject.ok_or("provider_login_required")?,
+            )
+        },
+    )
+    .map_err(|_| "recovery_prepare_request_unavailable")?;
+    let signer = load_registered_recovery_signer(cfg, &request.account)
+        .map_err(|_| "recovery_prepare_device_unavailable")?;
+    if saved.get("device").and_then(serde_json::Value::as_str) != Some(signer.device_id()) {
+        return Err("recovery_device_changed".into());
+    }
+    let selections: Vec<RecoverySelection> = serde_json::from_value(
+        saved
+            .get("selections")
+            .cloned()
+            .ok_or("recovery_request_invalid")?,
+    )
+    .map_err(|_| "recovery_request_invalid")?;
+    if selections.is_empty()
+        || selections.len() > 32
+        || selections
+            .iter()
+            .any(|s| s.account_id != request.account || s.origin != origin)
+    {
+        return Err("recovery_request_invalid".into());
+    }
+    let labels = saved
+        .pointer("/effect/objects")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("recovery_request_invalid")?;
+    if labels.len() != selections.len() {
+        return Err("recovery_request_invalid".into());
+    }
+    let existing = isyncyou_engine::provider_auth::with_locked_provider_subject(
+        cfg,
+        &request.account,
+        |subject| {
+            control.recovery_staging_info(
+                &request.batch_id,
+                &request.account,
+                origin,
+                subject.ok_or("provider_login_required")?,
+                unix_now_ms(),
+            )
+        },
+    )?;
+    if let Some((state, manifest_sha, manifest)) = &existing {
+        if !manifest.approval_sha256.is_empty() {
+            if manifest.origin != origin
+                || (request.collection != "Recovered" && manifest.collection != request.collection)
+                || manifest.objects.len() != selections.len()
+                || manifest.objects.iter().zip(&selections).any(|(a, b)| {
+                    a.operation_id != b.operation_id
+                        || a.generation != b.generation
+                        || a.object != b.object
+                        || a.version != b.version
+                        || a.confirmation != b.confirmation
+                })
+            {
+                return Err("recovery_batch_conflict".into());
+            }
+            if state == "staging" {
+                isyncyou_engine::provider_auth::with_locked_provider_subject(
+                    cfg,
+                    &request.account,
+                    |subject| {
+                        control.ready_recovery_batch(
+                            &request.batch_id,
+                            &request.account,
+                            origin,
+                            subject.ok_or("provider_login_required")?,
+                            unix_now_ms(),
+                        )
+                    },
+                )?;
+            }
+            let action = isyncyou_agent::ToolAction::LiveWrite {
+                account: request.account.clone(),
+                service: "calendar".into(),
+                target: None,
+                change: serde_json::json!({"verb":"recovery_batch_import","batch_id":request.batch_id,"manifest_sha256":manifest_sha,"approval_sha256":manifest.approval_sha256,"effect_sha256":agent_control_store::recovery_batch_effect_sha256(&manifest)}),
+            };
+            return Ok((action, manifest_sha.clone()));
+        }
+    }
+    let mut statuses = Vec::new();
+    isyncyou_engine::provider_auth::with_platform_credential_store(
+        cfg,
+        &request.account,
+        |credentials| {
+            for selection in &selections {
+                statuses.push(
+                    bound_recovery_status(cfg, selection, signer.as_ref(), credentials)
+                        .map_err(|_| "recovery_prepare_status_unavailable")?,
+                );
+            }
+            Ok(())
+        },
+    )?;
+    let objects = selections
+        .iter()
+        .zip(&statuses)
+        .zip(labels)
+        .map(
+            |((s, status), label)| agent_control_store::RecoveryStagedObject {
+                generation: s.generation.clone(),
+                object: s.object.clone(),
+                version: s.version.clone(),
+                operation_id: s.operation_id.clone(),
+                confirmation: s.confirmation.clone(),
+                size: status.size,
+                sha256: status.sha256.clone(),
+                selection_sha256: status.selection_sha256.clone(),
+                kind: status.kind.clone(),
+                encoding: status.encoding.clone(),
+                state: status.state.clone(),
+                label: label
+                    .get("label")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .into(),
+            },
+        )
+        .collect();
+    let contact_batch = labels
+        .iter()
+        .all(|item| item.get("kind").and_then(serde_json::Value::as_str) == Some("contact"));
+    let mail_batch = labels
+        .iter()
+        .all(|item| item.get("kind").and_then(serde_json::Value::as_str) == Some("mail"));
+    if !contact_batch
+        && !mail_batch
+        && labels.iter().any(|item| {
+            !matches!(
+                item.get("kind").and_then(serde_json::Value::as_str),
+                Some("event" | "task")
+            )
+        })
+    {
+        return Err("recovery_service_mismatch".into());
+    }
+    let entry = if contact_batch {
+        "/.well-known/carddav"
+    } else if mail_batch {
+        "mail"
+    } else {
+        "/.well-known/caldav"
+    };
+    let collection_intent = if mail_batch {
+        None
+    } else if let Some((_, _, prior)) = &existing {
+        prior.collection_intent.clone()
+    } else {
+        let intent = isyncyou_engine::provider_auth::with_platform_credential_store(
+            cfg,
+            &request.account,
+            |credentials| {
+                isyncyou_engine::self_hosted_mail_restore::prepare_recovery_collection_with_store(
+                    cfg,
+                    &request.account,
+                    entry,
+                    if contact_batch {
+                        "contacts"
+                    } else {
+                        "calendar"
+                    },
+                    credentials,
+                )
+            },
+        )
+        .map_err(|_| "recovery_prepare_collection_unavailable")?;
+        Some(serde_json::to_value(intent).map_err(|_| "recovery_batch_invalid")?)
+    };
+    let collection = if let Some(intent) = &collection_intent {
+        intent
+            .get("target")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("recovery_batch_invalid")?
+            .to_string()
+    } else if let Some((_, _, prior)) = &existing {
+        prior.collection.clone()
+    } else {
+        request.collection.clone()
+    };
+    if !mail_batch
+        && collection_intent.is_none()
+        && existing.is_none()
+        && request.collection == "Recovered"
+    {
+        return Err("recovery_collection_unavailable".into());
+    }
+    let mut manifest = agent_control_store::RecoveryBatchManifest {
+        approval_sha256: String::new(),
+        origin: origin.to_string(),
+        entry: entry.into(),
+        collection,
+        objects,
+        uid_map: std::collections::BTreeMap::new(),
+        execution_order: Vec::new(),
+        projections: Vec::new(),
+        collection_intent,
+    };
+    let expires = unix_now_ms()
+        .checked_add(24 * 60 * 60 * 1000)
+        .ok_or("recovery_batch_invalid")?;
+    isyncyou_engine::provider_auth::with_locked_provider_subject(
+        cfg,
+        &request.account,
+        |subject| {
+            control
+                .reserve_recovery_batch(
+                    &request.batch_id,
+                    &request.account,
+                    origin,
+                    subject.ok_or("provider_login_required")?,
+                    &manifest,
+                    expires,
+                    unix_now_ms(),
+                )
+                .map(|_| ())
+        },
+    )
+    .map_err(|_| "recovery_prepare_staging_unavailable")?;
+    for (index, selection) in selections.iter().enumerate() {
+        let payload = isyncyou_engine::provider_auth::with_platform_credential_store(
+            cfg,
+            &request.account,
+            |credentials| read_bound_recovery_result(cfg, selection, signer.as_ref(), credentials),
+        )
+        .map_err(|error| {
+            if safe_recovery_result_diagnostic(&error) {
+                error
+            } else {
+                "recovery_prepare_result_unavailable".into()
+            }
+        })?;
+        if payload.sha256 != statuses[index].sha256
+            || payload.bytes.len() as u64 != statuses[index].size
+            || payload.kind != statuses[index].kind
+            || payload.encoding != statuses[index].encoding
+        {
+            return Err("recovery_result_changed".into());
+        }
+        for (chunk, bytes) in payload
+            .bytes
+            .chunks(agent_control_store::RECOVERY_CHUNK_BYTES)
+            .enumerate()
+        {
+            isyncyou_engine::provider_auth::with_locked_provider_subject(
+                cfg,
+                &request.account,
+                |subject| {
+                    control.put_recovery_batch_chunk(
+                        &request.batch_id,
+                        &request.account,
+                        origin,
+                        subject.ok_or("provider_login_required")?,
+                        index,
+                        u32::try_from(chunk).map_err(|_| "recovery_batch_invalid")?,
+                        bytes,
+                        unix_now_ms(),
+                    )
+                },
+            )?;
+        }
+    }
+    let (_, originals) = isyncyou_engine::provider_auth::with_locked_provider_subject(
+        cfg,
+        &request.account,
+        |subject| {
+            control.inspect_staged_recovery_batch(
+                &request.batch_id,
+                &request.account,
+                origin,
+                subject.ok_or("provider_login_required")?,
+                unix_now_ms(),
+            )
+        },
+    )?;
+    if contact_batch || mail_batch {
+        for ((selection, status), bytes) in selections.iter().zip(&statuses).zip(originals) {
+            let summary = if contact_batch {
+                let uid = format!("{}@recovered.invalid", uuid_v4()?);
+                let (_, summary) =
+                    isyncyou_engine::self_hosted_mail_restore::prepare_staged_contact_restore(
+                        selection,
+                        status,
+                        signer.as_ref(),
+                        bytes,
+                        &manifest.entry,
+                        &manifest.collection,
+                        &uid,
+                    )?;
+                manifest.uid_map.insert(selection.operation_id.clone(), uid);
+                serde_json::to_value(summary).map_err(|_| "recovery_batch_invalid")?
+            } else {
+                let (_, summary) =
+                    isyncyou_engine::self_hosted_mail_restore::prepare_staged_mail_restore(
+                        selection,
+                        status,
+                        signer.as_ref(),
+                        bytes,
+                        &manifest.collection,
+                    )?;
+                serde_json::to_value(summary).map_err(|_| "recovery_batch_invalid")?
+            };
+            manifest
+                .execution_order
+                .push(selection.operation_id.clone());
+            manifest.projections.push(summary);
+        }
+        let bound =
+            serde_json::to_vec(&manifest.projections).map_err(|_| "recovery_batch_invalid")?;
+        manifest.approval_sha256 = ring::digest::digest(&ring::digest::SHA256, &bound)
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+    } else {
+        let (batch, summaries) = prepare_staged_calendar_batch(
+            &selections,
+            &statuses,
+            signer.as_ref(),
+            originals,
+            &manifest.entry,
+            &manifest.collection,
+        )
+        .map_err(|_| "recovery_prepare_projection_unavailable")?;
+        manifest.approval_sha256 = batch.approval_sha256.clone();
+        manifest.execution_order = batch
+            .items
+            .iter()
+            .map(|item| item.operation_id.clone())
+            .collect();
+        manifest.uid_map = batch
+            .items
+            .first()
+            .ok_or("recovery_batch_invalid")?
+            .uid_map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        manifest.projections = summaries
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "recovery_batch_invalid")?;
+    }
+    let manifest_sha = isyncyou_engine::provider_auth::with_locked_provider_subject(
+        cfg,
+        &request.account,
+        |subject| {
+            control.finalize_recovery_batch_manifest(
+                &request.batch_id,
+                &request.account,
+                origin,
+                subject.ok_or("provider_login_required")?,
+                &manifest,
+                unix_now_ms(),
+            )
+        },
+    )?;
+    isyncyou_engine::provider_auth::with_locked_provider_subject(
+        cfg,
+        &request.account,
+        |subject| {
+            control.ready_recovery_batch(
+                &request.batch_id,
+                &request.account,
+                origin,
+                subject.ok_or("provider_login_required")?,
+                unix_now_ms(),
+            )
+        },
+    )?;
+    let action = isyncyou_agent::ToolAction::LiveWrite {
+        account: request.account.clone(),
+        service: "calendar".into(),
+        target: None,
+        change: serde_json::json!({"verb":"recovery_batch_import","batch_id":request.batch_id,"manifest_sha256":manifest_sha,"approval_sha256":manifest.approval_sha256,"effect_sha256":agent_control_store::recovery_batch_effect_sha256(&manifest)}),
+    };
+    Ok((action, manifest_sha))
 }
 
 impl isyncyou_webui::AgentHandler for DaemonAgent {
-    fn recovery_requests(&self,account:&str,session:&str,after:&str)->Result<serde_json::Value,String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+    fn recovery_requests(
+        &self,
+        account: &str,
+        session: &str,
+        after: &str,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
         {
-            let path=self.config_path.read().map_err(|_| "account_config_unavailable")?.clone();
-            let run=|cfg:&Config| -> Result<serde_json::Value,String> {
-                let origin=match cfg.provider_accounts.get(account) {Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin,..}) if cfg.accounts.iter().any(|a| a.id==account)=>origin,_=>return Err("provider_unavailable".into())};
-                let credentials=agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-                let registry=product_session::ProductSessionRegistry::new(&credentials).with_config(cfg);
-                if registry.account_for(session)?!=account { return Err("session_account_mismatch".into()); }
-                let control=self.control_store.as_ref().ok_or("recovery_unavailable")?;
-                isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| control.list_recovery_requests_for_ui(account,origin,subject.ok_or("provider_login_required")?,after))
+            let path = self
+                .config_path
+                .read()
+                .map_err(|_| "account_config_unavailable")?
+                .clone();
+            let run = |cfg: &Config| -> Result<serde_json::Value, String> {
+                let origin =
+                    match cfg.provider_accounts.get(account) {
+                        Some(isyncyou_core::config::ProviderConfig::SelfHosted {
+                            origin, ..
+                        }) if cfg.accounts.iter().any(|a| a.id == account) => origin,
+                        _ => return Err("provider_unavailable".into()),
+                    };
+                let credentials = agent_credential_store(&self.oauth_dir)
+                    .map_err(|_| "session_store_unavailable")?;
+                let registry =
+                    product_session::ProductSessionRegistry::new(&credentials).with_config(cfg);
+                if registry.account_for(session)? != account {
+                    return Err("session_account_mismatch".into());
+                }
+                let control = self.control_store.as_ref().ok_or("recovery_unavailable")?;
+                isyncyou_engine::provider_auth::with_locked_provider_subject(
+                    cfg,
+                    account,
+                    |subject| {
+                        control.list_recovery_requests_for_ui(
+                            account,
+                            origin,
+                            subject.ok_or("provider_login_required")?,
+                            after,
+                        )
+                    },
+                )
             };
-            match path {Some(path)=>Config::with_config_lock(&path,|| {let cfg=load_host_runtime_config(&path)?;run(&cfg)}),None=>run(&self.cfg)}
+            match path {
+                Some(path) => Config::with_config_lock(&path, || {
+                    let cfg = load_host_runtime_config(&path)?;
+                    run(&cfg)
+                }),
+                None => run(&self.cfg),
+            }
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _=(account,session,after); Err("recovery_unavailable".into()) }
-    }
-    fn prepare_contact_photo(&self,request:&isyncyou_webui::AgentContactPhotoPrepareRequest)->Result<serde_json::Value,String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            if !self.pending.is_persistent() {return Err("confirmation_unavailable".into());}
-            let path=self.config_path.read().map_err(|_| "account_config_unavailable")?.clone();
-            let run=|cfg:&Config| -> Result<serde_json::Value,String> {
-                let credentials=agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-                let registry=product_session::ProductSessionRegistry::new(&credentials).with_config(cfg);
-                if registry.account_for(&request.session_id)?!=request.account {return Err("session_account_mismatch".into());}
-                let control=self.control_store.as_ref().ok_or("confirmation_unavailable")?;
-                let action=isyncyou_agent::ToolAction::LiveWrite {account:request.account.clone(),service:"contacts".into(),target:None,change:serde_json::json!({"verb":"contact_set_photo","stage_id":request.stage_id})};
-                let action=bind_contact_photo_action(cfg,control,action)?;
-                let preview=agent_ops::preview_for_pending_action_with_config(cfg,&action)?;
-                let turn_id=turn_id_from_request_id(&request.request_id)?;
-                let owner=isyncyou_agent::PendingOwnerBinding {account:request.account.clone(),session_id:request.session_id.clone(),request_id:request.request_id.clone(),turn_id:turn_id.clone()};
-                let (pending,token)=self.pending.register_bound(action.clone(),preview.text,unix_now_ms(),AGENT_CONFIRM_TTL_MS,owner.clone()).map_err(|_| "confirmation_unavailable")?;
-                let result=(|| {bind_model_recovery_pending(cfg,Some(control),&action,&pending.id,&pending.action_hash)?;let installation=account_lifecycle_repository(&self.oauth_dir)?.load_existing().map_err(|_| "lifecycle_unavailable")?.ok_or("lifecycle_unavailable")?;let transport=session_transport_token(cfg,&request.account)?;registry.append_user_pending(&transport,&owner,installation.principal(),unix_now_ms())})();
-                if let Err(error)=result {let _=self.pending.cancel(&pending.id,&pending.action_hash,unix_now_ms());return Err(error);}
-                Ok(serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}))
+            let _ = (account, session, after);
+            Err("recovery_unavailable".into())
+        }
+    }
+    fn prepare_contact_photo(
+        &self,
+        request: &isyncyou_webui::AgentContactPhotoPrepareRequest,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            if !self.pending.is_persistent() {
+                return Err("confirmation_unavailable".into());
+            }
+            let path = self
+                .config_path
+                .read()
+                .map_err(|_| "account_config_unavailable")?
+                .clone();
+            let run = |cfg: &Config| -> Result<serde_json::Value, String> {
+                let credentials = agent_credential_store(&self.oauth_dir)
+                    .map_err(|_| "session_store_unavailable")?;
+                let registry =
+                    product_session::ProductSessionRegistry::new(&credentials).with_config(cfg);
+                if registry.account_for(&request.session_id)? != request.account {
+                    return Err("session_account_mismatch".into());
+                }
+                let control = self
+                    .control_store
+                    .as_ref()
+                    .ok_or("confirmation_unavailable")?;
+                let action = isyncyou_agent::ToolAction::LiveWrite {
+                    account: request.account.clone(),
+                    service: "contacts".into(),
+                    target: None,
+                    change: serde_json::json!({"verb":"contact_set_photo","stage_id":request.stage_id}),
+                };
+                let action = bind_contact_photo_action(cfg, control, action)?;
+                let preview = agent_ops::preview_for_pending_action_with_config(cfg, &action)?;
+                let turn_id = turn_id_from_request_id(&request.request_id)?;
+                let owner = isyncyou_agent::PendingOwnerBinding {
+                    account: request.account.clone(),
+                    session_id: request.session_id.clone(),
+                    request_id: request.request_id.clone(),
+                    turn_id: turn_id.clone(),
+                };
+                let (pending, token) = self
+                    .pending
+                    .register_bound(
+                        action.clone(),
+                        preview.text,
+                        unix_now_ms(),
+                        AGENT_CONFIRM_TTL_MS,
+                        owner.clone(),
+                    )
+                    .map_err(|_| "confirmation_unavailable")?;
+                let result = (|| {
+                    bind_model_recovery_pending(
+                        cfg,
+                        Some(control),
+                        &action,
+                        &pending.id,
+                        &pending.action_hash,
+                    )?;
+                    let installation = account_lifecycle_repository(&self.oauth_dir)?
+                        .load_existing()
+                        .map_err(|_| "lifecycle_unavailable")?
+                        .ok_or("lifecycle_unavailable")?;
+                    let transport = session_transport_token(cfg, &request.account)?;
+                    registry.append_user_pending(
+                        &transport,
+                        &owner,
+                        installation.principal(),
+                        unix_now_ms(),
+                    )
+                })();
+                if let Err(error) = result {
+                    let _ = self
+                        .pending
+                        .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                    return Err(error);
+                }
+                Ok(
+                    serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}),
+                )
             };
-            match path {Some(path)=>Config::with_config_lock(&path,|| {let cfg=load_host_runtime_config(&path)?;run(&cfg)}),None=>run(&self.cfg)}
+            match path {
+                Some(path) => Config::with_config_lock(&path, || {
+                    let cfg = load_host_runtime_config(&path)?;
+                    run(&cfg)
+                }),
+                None => run(&self.cfg),
+            }
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        {let _=request;Err("confirmation_unavailable".into())}
-    }
-    fn single_capture_intent_phase(&self,account:&str,session:&str,operation:&str,pending:&str,action_hash:&str)->Result<serde_json::Value,String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            let path=self.config_path.read().map_err(|_| "account_config_unavailable")?.clone();
-            let run=|cfg:&Config| -> Result<serde_json::Value,String> {
-                let origin=match cfg.provider_accounts.get(account) {Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin,..}) if cfg.accounts.iter().any(|a| a.id==account)=>origin,_=>return Err("provider_unavailable".into())};
-                let credentials=agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-                if product_session::ProductSessionRegistry::new(&credentials).with_config(cfg).account_for(session)?!=account {return Err("session_account_mismatch".into());}
-                let control=self.control_store.as_ref().ok_or("capture_unavailable")?;
-                let mut result=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| {let subject=subject.ok_or("provider_login_required")?;let (_,matches)=control.single_capture_intent_phase(operation,account,origin,subject,pending,action_hash)?;if !matches {return Err("capture_intent_unavailable".into());}let mut status=control.single_capture_operational_status(operation,account,origin,subject)?;status["binding_matches"]=serde_json::json!(true);Ok(status)})?;
+            let _ = request;
+            Err("confirmation_unavailable".into())
+        }
+    }
+    fn single_capture_intent_phase(
+        &self,
+        account: &str,
+        session: &str,
+        operation: &str,
+        pending: &str,
+        action_hash: &str,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            let path = self
+                .config_path
+                .read()
+                .map_err(|_| "account_config_unavailable")?
+                .clone();
+            let run = |cfg: &Config| -> Result<serde_json::Value, String> {
+                let origin =
+                    match cfg.provider_accounts.get(account) {
+                        Some(isyncyou_core::config::ProviderConfig::SelfHosted {
+                            origin, ..
+                        }) if cfg.accounts.iter().any(|a| a.id == account) => origin,
+                        _ => return Err("provider_unavailable".into()),
+                    };
+                let credentials = agent_credential_store(&self.oauth_dir)
+                    .map_err(|_| "session_store_unavailable")?;
+                if product_session::ProductSessionRegistry::new(&credentials)
+                    .with_config(cfg)
+                    .account_for(session)?
+                    != account
+                {
+                    return Err("session_account_mismatch".into());
+                }
+                let control = self.control_store.as_ref().ok_or("capture_unavailable")?;
+                let mut result = isyncyou_engine::provider_auth::with_locked_provider_subject(
+                    cfg,
+                    account,
+                    |subject| {
+                        let subject = subject.ok_or("provider_login_required")?;
+                        let (_, matches) = control.single_capture_intent_phase(
+                            operation,
+                            account,
+                            origin,
+                            subject,
+                            pending,
+                            action_hash,
+                        )?;
+                        if !matches {
+                            return Err("capture_intent_unavailable".into());
+                        }
+                        let mut status = control.single_capture_operational_status(
+                            operation, account, origin, subject,
+                        )?;
+                        status["binding_matches"] = serde_json::json!(true);
+                        Ok(status)
+                    },
+                )?;
                 let claim=isyncyou_engine::provider_auth::with_platform_credential_store(cfg,account,|credentials| isyncyou_engine::self_hosted_mail_restore::has_any_single_capture_claim_with_store(cfg,account,operation,credentials)).ok();
-                result["provider_claim_present"]=serde_json::json!(claim);
-                if claim==Some(true) {
-                    let status=(|| {let signer=isyncyou_engine::self_hosted_mail_restore::load_registered_recovery_signer(cfg,account)?;isyncyou_engine::provider_auth::with_platform_credential_store(cfg,account,|credentials| isyncyou_engine::self_hosted_mail_restore::read_single_capture_status_with_store(cfg,account,operation,signer.as_ref(),credentials))})();
-                    if let Ok(status)=status {let state=status.get("state").and_then(serde_json::Value::as_str).filter(|s| matches!(*s,"unknown"|"queued"|"capturing"|"captured_locally"|"awaiting_pbs"|"protected_off_node"|"expired"|"failed"));let id=status.get("id").and_then(serde_json::Value::as_str).filter(|id| is_uuid_v4(id));result["broker_state"]=serde_json::json!(state);result["broker_job_id"]=serde_json::json!(id);}
+                result["provider_claim_present"] = serde_json::json!(claim);
+                if claim == Some(true) {
+                    let status = (|| {
+                        let signer=isyncyou_engine::self_hosted_mail_restore::load_registered_recovery_signer(cfg,account)?;
+                        isyncyou_engine::provider_auth::with_platform_credential_store(
+                            cfg,
+                            account,
+                            |credentials| {
+                                isyncyou_engine::self_hosted_mail_restore::read_single_capture_status_with_store(cfg,account,operation,signer.as_ref(),credentials)
+                            },
+                        )
+                    })();
+                    if let Ok(status) = status {
+                        let state = status
+                            .get("state")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|s| {
+                                matches!(
+                                    *s,
+                                    "unknown"
+                                        | "queued"
+                                        | "capturing"
+                                        | "captured_locally"
+                                        | "awaiting_pbs"
+                                        | "protected_off_node"
+                                        | "expired"
+                                        | "failed"
+                                )
+                            });
+                        let id = status
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|id| is_uuid_v4(id));
+                        result["broker_state"] = serde_json::json!(state);
+                        result["broker_job_id"] = serde_json::json!(id);
+                    }
                 }
                 Ok(result)
             };
-            match path {Some(path)=>Config::with_config_lock(&path,|| {let cfg=load_host_runtime_config(&path)?;run(&cfg)}),None=>run(&self.cfg)}
+            match path {
+                Some(path) => Config::with_config_lock(&path, || {
+                    let cfg = load_host_runtime_config(&path)?;
+                    run(&cfg)
+                }),
+                None => run(&self.cfg),
+            }
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        {let _=(account,session,operation,pending,action_hash);Err("capture_unavailable".into())}
-    }
-    fn single_capture_has_claim(&self,account:&str,session:&str,operation:&str)->Result<bool,String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            let path=self.config_path.read().map_err(|_| "account_config_unavailable")?.clone();
-            let run=|cfg:&Config| -> Result<bool,String> {
-                let credentials=agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-                if product_session::ProductSessionRegistry::new(&credentials).with_config(cfg).account_for(session)?!=account {return Err("session_account_mismatch".into());}
-                isyncyou_engine::provider_auth::with_platform_credential_store(cfg,account,|credentials| isyncyou_engine::self_hosted_mail_restore::has_any_single_capture_claim_with_store(cfg,account,operation,credentials))
+            let _ = (account, session, operation, pending, action_hash);
+            Err("capture_unavailable".into())
+        }
+    }
+    fn single_capture_has_claim(
+        &self,
+        account: &str,
+        session: &str,
+        operation: &str,
+    ) -> Result<bool, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            let path = self
+                .config_path
+                .read()
+                .map_err(|_| "account_config_unavailable")?
+                .clone();
+            let run = |cfg: &Config| -> Result<bool, String> {
+                let credentials = agent_credential_store(&self.oauth_dir)
+                    .map_err(|_| "session_store_unavailable")?;
+                if product_session::ProductSessionRegistry::new(&credentials)
+                    .with_config(cfg)
+                    .account_for(session)?
+                    != account
+                {
+                    return Err("session_account_mismatch".into());
+                }
+                isyncyou_engine::provider_auth::with_platform_credential_store(
+                    cfg,
+                    account,
+                    |credentials| {
+                        isyncyou_engine::self_hosted_mail_restore::has_any_single_capture_claim_with_store(cfg,account,operation,credentials)
+                    },
+                )
             };
-            match path {Some(path)=>Config::with_config_lock(&path,|| {let cfg=load_host_runtime_config(&path)?;run(&cfg)}),None=>run(&self.cfg)}
+            match path {
+                Some(path) => Config::with_config_lock(&path, || {
+                    let cfg = load_host_runtime_config(&path)?;
+                    run(&cfg)
+                }),
+                None => run(&self.cfg),
+            }
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        {let _=(account,session,operation);Err("capture_unavailable".into())}
-    }
-    fn single_capture_status(&self,account:&str,session:&str,operation:&str)->Result<serde_json::Value,String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            let path=self.config_path.read().map_err(|_| "account_config_unavailable")?.clone();
-            let run=|cfg:&Config| -> Result<serde_json::Value,String> {
-                let credentials=agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-                if product_session::ProductSessionRegistry::new(&credentials).with_config(cfg).account_for(session)?!=account {return Err("session_account_mismatch".into());}
-                let signer=isyncyou_engine::self_hosted_mail_restore::load_registered_recovery_signer(cfg,account)?;
+            let _ = (account, session, operation);
+            Err("capture_unavailable".into())
+        }
+    }
+    fn single_capture_status(
+        &self,
+        account: &str,
+        session: &str,
+        operation: &str,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            let path = self
+                .config_path
+                .read()
+                .map_err(|_| "account_config_unavailable")?
+                .clone();
+            let run = |cfg: &Config| -> Result<serde_json::Value, String> {
+                let credentials = agent_credential_store(&self.oauth_dir)
+                    .map_err(|_| "session_store_unavailable")?;
+                if product_session::ProductSessionRegistry::new(&credentials)
+                    .with_config(cfg)
+                    .account_for(session)?
+                    != account
+                {
+                    return Err("session_account_mismatch".into());
+                }
+                let signer =
+                    isyncyou_engine::self_hosted_mail_restore::load_registered_recovery_signer(
+                        cfg, account,
+                    )?;
                 isyncyou_engine::provider_auth::with_platform_credential_store(cfg,account,|credentials| isyncyou_engine::self_hosted_mail_restore::read_single_capture_status_with_store(cfg,account,operation,signer.as_ref(),credentials)).map_err(|error| if error=="Capture operation unavailable" {"capture_local_intent_missing".into()} else {"capture_status_unavailable".into()})
             };
-            match path {Some(path)=>Config::with_config_lock(&path,|| {let cfg=load_host_runtime_config(&path)?;run(&cfg)}),None=>run(&self.cfg)}
+            match path {
+                Some(path) => Config::with_config_lock(&path, || {
+                    let cfg = load_host_runtime_config(&path)?;
+                    run(&cfg)
+                }),
+                None => run(&self.cfg),
+            }
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        {let _=(account,session,operation);Err("capture_unavailable".into())}
-    }
-    fn prepare_single_capture(&self,request:&isyncyou_webui::AgentSingleCapturePrepareRequest)->Result<serde_json::Value,String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            if !self.pending.is_persistent() {return Err("confirmation_unavailable".into());}
-            let path=self.config_path.read().map_err(|_| "account_config_unavailable")?.clone();
-            let run=|cfg:&Config| -> Result<serde_json::Value,String> {
-                let credentials=agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-                let registry=product_session::ProductSessionRegistry::new(&credentials).with_config(cfg);
-                if registry.account_for(&request.session_id)?!=request.account {return Err("session_account_mismatch".into());}
-                let entry=match request.service.as_str() {"mail"=>"mail", "contacts"=>"/.well-known/carddav", _=>"/.well-known/caldav"};
-                let op_id=uuid_v4()?; let confirmation=uuid_v4()?;
-                let intent=isyncyou_engine::provider_auth::with_platform_credential_store(cfg,&request.account,|credentials| isyncyou_engine::self_hosted_mail_restore::prepare_single_capture_with_store(cfg,&request.account,entry,&request.collection,&request.service,&request.href,&op_id,&confirmation,credentials))?;
-                if intent.mode!="fresh" {return Err("capture_mode_unavailable".into());}
-                let signer=isyncyou_engine::self_hosted_mail_restore::load_registered_recovery_signer(cfg,&request.account)?;
-                let control=self.control_store.as_ref().ok_or("confirmation_unavailable")?;
-                let protected=serde_json::json!({"purpose":"single_capture","device":signer.device_id(),"intent":intent});
-                let expires=unix_now_ms().checked_add(AGENT_CONFIRM_TTL_MS).ok_or("confirmation_unavailable")?;
-                let digest=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.store_recovery_request(&op_id,&request.account,&intent.origin,subject.ok_or("provider_login_required")?,&protected,expires,unix_now_ms()))?;
-                let action=isyncyou_agent::ToolAction::LiveWrite {account:request.account.clone(),service:"calendar".into(),target:None,change:serde_json::json!({"verb":"single_capture","operation_id":op_id,"request_sha256":digest,"intent":intent})};
-                let preview=agent_ops::single_capture_preview(&action)?.text;
-                let turn_id=turn_id_from_request_id(&request.request_id)?;
-                let owner=isyncyou_agent::PendingOwnerBinding {account:request.account.clone(),session_id:request.session_id.clone(),request_id:request.request_id.clone(),turn_id:turn_id.clone()};
-                let (pending,token)=self.pending.register_bound(action,preview,unix_now_ms(),AGENT_CONFIRM_TTL_MS,owner.clone()).map_err(|_| "confirmation_unavailable")?;
-                let result=(|| {isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.bind_recovery_request(&op_id,&request.account,&intent.origin,subject.ok_or("provider_login_required")?,&digest,&pending.id,&pending.action_hash,unix_now_ms()))?; let installation=account_lifecycle_repository(&self.oauth_dir)?.load_existing().map_err(|_| "lifecycle_unavailable")?.ok_or("lifecycle_unavailable")?; let transport=session_transport_token(cfg,&request.account)?;registry.append_user_pending(&transport,&owner,installation.principal(),unix_now_ms())})();
-                if let Err(error)=result {let _=self.pending.cancel(&pending.id,&pending.action_hash,unix_now_ms()); return Err(error);}
-                Ok(serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id,"operation_id":op_id}))
+            let _ = (account, session, operation);
+            Err("capture_unavailable".into())
+        }
+    }
+    fn prepare_single_capture(
+        &self,
+        request: &isyncyou_webui::AgentSingleCapturePrepareRequest,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            if !self.pending.is_persistent() {
+                return Err("confirmation_unavailable".into());
+            }
+            let path = self
+                .config_path
+                .read()
+                .map_err(|_| "account_config_unavailable")?
+                .clone();
+            let run = |cfg: &Config| -> Result<serde_json::Value, String> {
+                let credentials = agent_credential_store(&self.oauth_dir)
+                    .map_err(|_| "session_store_unavailable")?;
+                let registry =
+                    product_session::ProductSessionRegistry::new(&credentials).with_config(cfg);
+                if registry.account_for(&request.session_id)? != request.account {
+                    return Err("session_account_mismatch".into());
+                }
+                let entry = match request.service.as_str() {
+                    "mail" => "mail",
+                    "contacts" => "/.well-known/carddav",
+                    _ => "/.well-known/caldav",
+                };
+                let op_id = uuid_v4()?;
+                let confirmation = uuid_v4()?;
+                let intent = isyncyou_engine::provider_auth::with_platform_credential_store(
+                    cfg,
+                    &request.account,
+                    |credentials| {
+                        isyncyou_engine::self_hosted_mail_restore::prepare_single_capture_with_store(
+                            cfg,
+                            &request.account,
+                            entry,
+                            &request.collection,
+                            &request.service,
+                            &request.href,
+                            &op_id,
+                            &confirmation,
+                            credentials,
+                        )
+                    },
+                )?;
+                if intent.mode != "fresh" {
+                    return Err("capture_mode_unavailable".into());
+                }
+                let signer =
+                    isyncyou_engine::self_hosted_mail_restore::load_registered_recovery_signer(
+                        cfg,
+                        &request.account,
+                    )?;
+                let control = self
+                    .control_store
+                    .as_ref()
+                    .ok_or("confirmation_unavailable")?;
+                let protected = serde_json::json!({"purpose":"single_capture","device":signer.device_id(),"intent":intent});
+                let expires = unix_now_ms()
+                    .checked_add(AGENT_CONFIRM_TTL_MS)
+                    .ok_or("confirmation_unavailable")?;
+                let digest = isyncyou_engine::provider_auth::with_locked_provider_subject(
+                    cfg,
+                    &request.account,
+                    |subject| {
+                        control.store_recovery_request(
+                            &op_id,
+                            &request.account,
+                            &intent.origin,
+                            subject.ok_or("provider_login_required")?,
+                            &protected,
+                            expires,
+                            unix_now_ms(),
+                        )
+                    },
+                )?;
+                let action = isyncyou_agent::ToolAction::LiveWrite {
+                    account: request.account.clone(),
+                    service: "calendar".into(),
+                    target: None,
+                    change: serde_json::json!({"verb":"single_capture","operation_id":op_id,"request_sha256":digest,"intent":intent}),
+                };
+                let preview = agent_ops::single_capture_preview(&action)?.text;
+                let turn_id = turn_id_from_request_id(&request.request_id)?;
+                let owner = isyncyou_agent::PendingOwnerBinding {
+                    account: request.account.clone(),
+                    session_id: request.session_id.clone(),
+                    request_id: request.request_id.clone(),
+                    turn_id: turn_id.clone(),
+                };
+                let (pending, token) = self
+                    .pending
+                    .register_bound(
+                        action,
+                        preview,
+                        unix_now_ms(),
+                        AGENT_CONFIRM_TTL_MS,
+                        owner.clone(),
+                    )
+                    .map_err(|_| "confirmation_unavailable")?;
+                let result = (|| {
+                    isyncyou_engine::provider_auth::with_locked_provider_subject(
+                        cfg,
+                        &request.account,
+                        |subject| {
+                            control.bind_recovery_request(
+                                &op_id,
+                                &request.account,
+                                &intent.origin,
+                                subject.ok_or("provider_login_required")?,
+                                &digest,
+                                &pending.id,
+                                &pending.action_hash,
+                                unix_now_ms(),
+                            )
+                        },
+                    )?;
+                    let installation = account_lifecycle_repository(&self.oauth_dir)?
+                        .load_existing()
+                        .map_err(|_| "lifecycle_unavailable")?
+                        .ok_or("lifecycle_unavailable")?;
+                    let transport = session_transport_token(cfg, &request.account)?;
+                    registry.append_user_pending(
+                        &transport,
+                        &owner,
+                        installation.principal(),
+                        unix_now_ms(),
+                    )
+                })();
+                if let Err(error) = result {
+                    let _ = self
+                        .pending
+                        .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                    return Err(error);
+                }
+                Ok(
+                    serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id,"operation_id":op_id}),
+                )
             };
-            match path {Some(path)=>Config::with_config_lock(&path,|| {let cfg=load_host_runtime_config(&path)?;run(&cfg)}),None=>run(&self.cfg)}
+            match path {
+                Some(path) => Config::with_config_lock(&path, || {
+                    let cfg = load_host_runtime_config(&path)?;
+                    run(&cfg)
+                }),
+                None => run(&self.cfg),
+            }
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        {let _=request;Err("confirmation_unavailable".into())}
-    }
-    fn recovery_receipt(&self,account:&str,session:&str,batch:&str)->Result<serde_json::Value,String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            let path=self.config_path.read().map_err(|_| "account_config_unavailable")?.clone();
-            let run=|cfg:&Config| -> Result<serde_json::Value,String> {
-                let origin=match cfg.provider_accounts.get(account) {Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin,..}) if cfg.accounts.iter().any(|a| a.id==account)=>origin,_=>return Err("provider_unavailable".into())};
-                let credentials=agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-                let registry=product_session::ProductSessionRegistry::new(&credentials).with_config(cfg);
-                if registry.account_for(session)?!=account {return Err("session_account_mismatch".into());}
-                let control=self.control_store.as_ref().ok_or("recovery_unavailable")?;
-                let initial=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| control.confirmed_recovery_manifest(batch,account,origin,subject.ok_or("provider_login_required")?))?;
-                if !initial.objects.is_empty() && initial.objects.iter().all(|o| o.kind=="mail") {
-                    let native=isyncyou_engine::provider_auth::with_platform_credential_store(cfg,account,|credentials| isyncyou_engine::self_hosted_mail_restore::recovery_native_mail_account_with_store(cfg,account,credentials))?;
-                    return isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| {
-                        let manifest=control.confirmed_recovery_manifest(batch,account,origin,subject.ok_or("provider_login_required")?)?;
-                        if manifest.objects.is_empty() || manifest.objects.len()!=manifest.projections.len() || !manifest.objects.iter().all(|o| o.kind=="mail") {return Err("recovery_receipt_unavailable".into());}
-                        let store=isyncyou_engine::provider_store::open_readonly(cfg,account)?;
-                        let mut items=Vec::with_capacity(manifest.objects.len());
-                        for item in &manifest.objects {
-                            let projection=agent_control_store::recovery_projection_for_operation(&manifest,&item.operation_id)?;
-                            let (scope,state,id)=store.provider_mail_recovery_result(account,origin,&item.operation_id).map_err(|_| "recovery_receipt_unavailable")?.ok_or("recovery_receipt_unavailable")?;
-                            if scope.collection!=native || state!="confirmed" {return Err("recovery_receipt_unavailable".into());}
-                            items.push(serde_json::json!({"generation":item.generation,"object":item.object,"version":item.version,"operation_id":item.operation_id,"source_sha256":item.sha256,"mime_sha256":projection.get("mime_sha256"),"native_id":id.ok_or("recovery_receipt_unavailable")?}));
+            let _ = request;
+            Err("confirmation_unavailable".into())
+        }
+    }
+    fn recovery_receipt(
+        &self,
+        account: &str,
+        session: &str,
+        batch: &str,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            let path = self
+                .config_path
+                .read()
+                .map_err(|_| "account_config_unavailable")?
+                .clone();
+            let run = |cfg: &Config| -> Result<serde_json::Value, String> {
+                let origin =
+                    match cfg.provider_accounts.get(account) {
+                        Some(isyncyou_core::config::ProviderConfig::SelfHosted {
+                            origin, ..
+                        }) if cfg.accounts.iter().any(|a| a.id == account) => origin,
+                        _ => return Err("provider_unavailable".into()),
+                    };
+                let credentials = agent_credential_store(&self.oauth_dir)
+                    .map_err(|_| "session_store_unavailable")?;
+                let registry =
+                    product_session::ProductSessionRegistry::new(&credentials).with_config(cfg);
+                if registry.account_for(session)? != account {
+                    return Err("session_account_mismatch".into());
+                }
+                let control = self.control_store.as_ref().ok_or("recovery_unavailable")?;
+                let initial = isyncyou_engine::provider_auth::with_locked_provider_subject(
+                    cfg,
+                    account,
+                    |subject| {
+                        control.confirmed_recovery_manifest(
+                            batch,
+                            account,
+                            origin,
+                            subject.ok_or("provider_login_required")?,
+                        )
+                    },
+                )?;
+                if !initial.objects.is_empty() && initial.objects.iter().all(|o| o.kind == "mail") {
+                    let native = isyncyou_engine::provider_auth::with_platform_credential_store(
+                        cfg,
+                        account,
+                        |credentials| {
+                            isyncyou_engine::self_hosted_mail_restore::recovery_native_mail_account_with_store(cfg,account,credentials)
+                        },
+                    )?;
+                    return isyncyou_engine::provider_auth::with_locked_provider_subject(
+                        cfg,
+                        account,
+                        |subject| {
+                            let manifest = control.confirmed_recovery_manifest(
+                                batch,
+                                account,
+                                origin,
+                                subject.ok_or("provider_login_required")?,
+                            )?;
+                            if manifest.objects.is_empty()
+                                || manifest.objects.len() != manifest.projections.len()
+                                || !manifest.objects.iter().all(|o| o.kind == "mail")
+                            {
+                                return Err("recovery_receipt_unavailable".into());
+                            }
+                            let store =
+                                isyncyou_engine::provider_store::open_readonly(cfg, account)?;
+                            let mut items = Vec::with_capacity(manifest.objects.len());
+                            for item in &manifest.objects {
+                                let projection =
+                                    agent_control_store::recovery_projection_for_operation(
+                                        &manifest,
+                                        &item.operation_id,
+                                    )?;
+                                let (scope, state, id) = store
+                                    .provider_mail_recovery_result(
+                                        account,
+                                        origin,
+                                        &item.operation_id,
+                                    )
+                                    .map_err(|_| "recovery_receipt_unavailable")?
+                                    .ok_or("recovery_receipt_unavailable")?;
+                                if scope.collection != native || state != "confirmed" {
+                                    return Err("recovery_receipt_unavailable".into());
+                                }
+                                items.push(serde_json::json!({"generation":item.generation,"object":item.object,"version":item.version,"operation_id":item.operation_id,"source_sha256":item.sha256,"mime_sha256":projection.get("mime_sha256"),"native_id":id.ok_or("recovery_receipt_unavailable")?}));
+                            }
+                            Ok(
+                                serde_json::json!({"batch_id":batch,"origin":origin,"collection":manifest.collection,"approval_sha256":manifest.approval_sha256,"effect_sha256":agent_control_store::recovery_batch_effect_sha256(&manifest),"items":items}),
+                            )
+                        },
+                    );
+                }
+                isyncyou_engine::provider_auth::with_locked_provider_subject(
+                    cfg,
+                    account,
+                    |subject| {
+                        let manifest = control.confirmed_recovery_manifest(
+                            batch,
+                            account,
+                            origin,
+                            subject.ok_or("provider_login_required")?,
+                        )?;
+                        if manifest.objects.is_empty()
+                            || manifest.objects.len() != manifest.projections.len()
+                            || !manifest
+                                .objects
+                                .iter()
+                                .all(|o| matches!(o.kind.as_str(), "event" | "task" | "contact"))
+                        {
+                            return Err("recovery_receipt_unavailable".into());
                         }
-                        Ok(serde_json::json!({"batch_id":batch,"origin":origin,"collection":manifest.collection,"approval_sha256":manifest.approval_sha256,"effect_sha256":agent_control_store::recovery_batch_effect_sha256(&manifest),"items":items}))
-                    });
-                }
-                isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| {
-                let manifest=control.confirmed_recovery_manifest(batch,account,origin,subject.ok_or("provider_login_required")?)?;
-                if manifest.objects.is_empty() || manifest.objects.len()!=manifest.projections.len() || !manifest.objects.iter().all(|o| matches!(o.kind.as_str(),"event"|"task"|"contact")) {return Err("recovery_receipt_unavailable".into());}
-                let service=if manifest.objects.iter().all(|o| o.kind=="contact") {"contacts"} else if manifest.objects.iter().all(|o| matches!(o.kind.as_str(),"event"|"task")) {"calendar"} else {return Err("recovery_receipt_unavailable".into());};
-                let scope=isyncyou_store::ProviderScope {account_id:account.into(),origin:origin.clone(),service:service.into(),collection:manifest.collection.clone()};
-                let store=isyncyou_engine::provider_store::open_readonly(cfg,account)?;
-                let mut items=Vec::with_capacity(manifest.objects.len());
-                for item in &manifest.objects {
-                    let projection=agent_control_store::recovery_projection_for_operation(&manifest,&item.operation_id)?;
-                    let (_,state,href)=store.provider_mutation(&scope,&item.operation_id).map_err(|_| "recovery_receipt_unavailable")?.ok_or("recovery_receipt_unavailable")?;
-                    if state!="confirmed" {return Err("recovery_receipt_unavailable".into());}
-                    let href=href.ok_or("recovery_receipt_unavailable")?;
-                    let uids=if service=="calendar" {projection.get("components").and_then(serde_json::Value::as_array).ok_or("recovery_receipt_unavailable")?.iter().map(|c| c.get("uid").and_then(serde_json::Value::as_str).map(str::to_owned).ok_or("recovery_receipt_unavailable")).collect::<Result<Vec<_>,_>>()?} else {vec![manifest.uid_map.get(&item.operation_id).ok_or("recovery_receipt_unavailable")?.clone()]};
-                    items.push(serde_json::json!({"generation":item.generation,"object":item.object,"version":item.version,"operation_id":item.operation_id,"source_sha256":item.sha256,"projected_sha256":projection.get("projected_sha256"),"href":href,"uids":uids}));
-                }
-                Ok(serde_json::json!({"batch_id":batch,"origin":origin,"collection":manifest.collection,"approval_sha256":manifest.approval_sha256,"effect_sha256":agent_control_store::recovery_batch_effect_sha256(&manifest),"items":items}))
-                })
+                        let service = if manifest.objects.iter().all(|o| o.kind == "contact") {
+                            "contacts"
+                        } else if manifest
+                            .objects
+                            .iter()
+                            .all(|o| matches!(o.kind.as_str(), "event" | "task"))
+                        {
+                            "calendar"
+                        } else {
+                            return Err("recovery_receipt_unavailable".into());
+                        };
+                        let scope = isyncyou_store::ProviderScope {
+                            account_id: account.into(),
+                            origin: origin.clone(),
+                            service: service.into(),
+                            collection: manifest.collection.clone(),
+                        };
+                        let store = isyncyou_engine::provider_store::open_readonly(cfg, account)?;
+                        let mut items = Vec::with_capacity(manifest.objects.len());
+                        for item in &manifest.objects {
+                            let projection =
+                                agent_control_store::recovery_projection_for_operation(
+                                    &manifest,
+                                    &item.operation_id,
+                                )?;
+                            let (_, state, href) = store
+                                .provider_mutation(&scope, &item.operation_id)
+                                .map_err(|_| "recovery_receipt_unavailable")?
+                                .ok_or("recovery_receipt_unavailable")?;
+                            if state != "confirmed" {
+                                return Err("recovery_receipt_unavailable".into());
+                            }
+                            let href = href.ok_or("recovery_receipt_unavailable")?;
+                            let uids = if service == "calendar" {
+                                projection
+                                    .get("components")
+                                    .and_then(serde_json::Value::as_array)
+                                    .ok_or("recovery_receipt_unavailable")?
+                                    .iter()
+                                    .map(|c| {
+                                        c.get("uid")
+                                            .and_then(serde_json::Value::as_str)
+                                            .map(str::to_owned)
+                                            .ok_or("recovery_receipt_unavailable")
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?
+                            } else {
+                                vec![manifest
+                                    .uid_map
+                                    .get(&item.operation_id)
+                                    .ok_or("recovery_receipt_unavailable")?
+                                    .clone()]
+                            };
+                            items.push(serde_json::json!({"generation":item.generation,"object":item.object,"version":item.version,"operation_id":item.operation_id,"source_sha256":item.sha256,"projected_sha256":projection.get("projected_sha256"),"href":href,"uids":uids}));
+                        }
+                        Ok(
+                            serde_json::json!({"batch_id":batch,"origin":origin,"collection":manifest.collection,"approval_sha256":manifest.approval_sha256,"effect_sha256":agent_control_store::recovery_batch_effect_sha256(&manifest),"items":items}),
+                        )
+                    },
+                )
             };
-            match path {Some(path)=>Config::with_config_lock(&path,|| {let cfg=load_host_runtime_config(&path)?;run(&cfg)}),None=>run(&self.cfg)}
+            match path {
+                Some(path) => Config::with_config_lock(&path, || {
+                    let cfg = load_host_runtime_config(&path)?;
+                    run(&cfg)
+                }),
+                None => run(&self.cfg),
+            }
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        {let _=(account,session,batch);Err("recovery_unavailable".into())}
-    }
-    fn recovery_review(&self, command:&isyncyou_webui::AgentPendingBindingCommand)->Result<serde_json::Value,String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            let proof=isyncyou_agent::PendingOwnerProof {session_id:command.owner.session_id.clone(),turn_request_id:command.owner.turn_request_id.clone(),turn_id:command.owner.turn_id.clone()};
-            let binding=match self.pending.binding(&command.pending,&command.action_hash,&proof,unix_now_ms()) { isyncyou_agent::PendingBindingOutcome::Ready(binding)=>binding, _=>return Err("recovery_confirmation_required".into()) };
-            let path=self.config_path.read().map_err(|_| "account_config_unavailable")?.clone();
-            let run=|cfg:&Config| -> Result<serde_json::Value,String> {
-                let origin=match cfg.provider_accounts.get(&binding.account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin,..}) if cfg.accounts.iter().any(|a| a.id==binding.account)=>origin, _=>return Err("provider_unavailable".into()) };
-                let control=self.control_store.as_ref().ok_or("recovery_unavailable")?;
-                isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&binding.account,|subject| control.pending_recovery_effect(&command.pending,&command.action_hash,&binding.account,origin,subject.ok_or("provider_login_required")?,unix_now_ms()))
+            let _ = (account, session, batch);
+            Err("recovery_unavailable".into())
+        }
+    }
+    fn recovery_review(
+        &self,
+        command: &isyncyou_webui::AgentPendingBindingCommand,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            let proof = isyncyou_agent::PendingOwnerProof {
+                session_id: command.owner.session_id.clone(),
+                turn_request_id: command.owner.turn_request_id.clone(),
+                turn_id: command.owner.turn_id.clone(),
             };
-            match path { Some(path)=>Config::with_config_lock(&path,|| {let cfg=load_host_runtime_config(&path)?;run(&cfg)}),None=>run(&self.cfg) }
+            let binding = match self.pending.binding(
+                &command.pending,
+                &command.action_hash,
+                &proof,
+                unix_now_ms(),
+            ) {
+                isyncyou_agent::PendingBindingOutcome::Ready(binding) => binding,
+                _ => return Err("recovery_confirmation_required".into()),
+            };
+            let path = self
+                .config_path
+                .read()
+                .map_err(|_| "account_config_unavailable")?
+                .clone();
+            let run = |cfg: &Config| -> Result<serde_json::Value, String> {
+                let origin =
+                    match cfg.provider_accounts.get(&binding.account) {
+                        Some(isyncyou_core::config::ProviderConfig::SelfHosted {
+                            origin, ..
+                        }) if cfg.accounts.iter().any(|a| a.id == binding.account) => origin,
+                        _ => return Err("provider_unavailable".into()),
+                    };
+                let control = self.control_store.as_ref().ok_or("recovery_unavailable")?;
+                isyncyou_engine::provider_auth::with_locked_provider_subject(
+                    cfg,
+                    &binding.account,
+                    |subject| {
+                        control.pending_recovery_effect(
+                            &command.pending,
+                            &command.action_hash,
+                            &binding.account,
+                            origin,
+                            subject.ok_or("provider_login_required")?,
+                            unix_now_ms(),
+                        )
+                    },
+                )
+            };
+            match path {
+                Some(path) => Config::with_config_lock(&path, || {
+                    let cfg = load_host_runtime_config(&path)?;
+                    run(&cfg)
+                }),
+                None => run(&self.cfg),
+            }
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _=command; Err("recovery_unavailable".into()) }
-    }
-    fn reconcile_recovery(&self, request:&isyncyou_webui::AgentRecoveryReconcileRequest) -> Result<serde_json::Value,String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            let path=self.config_path.read().map_err(|_| "account_config_unavailable")?.clone();
-            let run=|cfg:&Config| -> Result<serde_json::Value,String> {
-                let origin=match cfg.provider_accounts.get(&request.account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin,..}) if cfg.accounts.iter().any(|a| a.id==request.account)=>origin, _=>return Err("provider_unavailable".into()) };
-                let credentials=agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-                let registry=product_session::ProductSessionRegistry::new(&credentials).with_config(cfg);
-                if registry.account_for(&request.session_id)?!=request.account { return Err("session_account_mismatch".into()); }
-                let control=self.control_store.as_ref().ok_or("recovery_unavailable")?;
-                let refs=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.recovery_batch_refs(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?));
-                let (state,digest,pending,action_hash)=match refs {
-                    Ok(refs)=>refs,
-                    Err(_)=>{
-                        let (state,digest,pending,action_hash)=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.recovery_request_refs(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?))?;
-                        let saved=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| {
-                            let subject=subject.ok_or("provider_login_required")?;
-                            if state=="approved" { control.claim_recovery_request(&request.batch_id,&request.account,origin,subject,&digest,&pending,&action_hash,unix_now_ms()) } else { control.read_claimed_recovery_request(&request.batch_id,&request.account,origin,subject) }
-                        })?;
+            let _ = command;
+            Err("recovery_unavailable".into())
+        }
+    }
+    fn reconcile_recovery(
+        &self,
+        request: &isyncyou_webui::AgentRecoveryReconcileRequest,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            let path = self
+                .config_path
+                .read()
+                .map_err(|_| "account_config_unavailable")?
+                .clone();
+            let run = |cfg: &Config| -> Result<serde_json::Value, String> {
+                let origin =
+                    match cfg.provider_accounts.get(&request.account) {
+                        Some(isyncyou_core::config::ProviderConfig::SelfHosted {
+                            origin, ..
+                        }) if cfg.accounts.iter().any(|a| a.id == request.account) => origin,
+                        _ => return Err("provider_unavailable".into()),
+                    };
+                let credentials = agent_credential_store(&self.oauth_dir)
+                    .map_err(|_| "session_store_unavailable")?;
+                let registry =
+                    product_session::ProductSessionRegistry::new(&credentials).with_config(cfg);
+                if registry.account_for(&request.session_id)? != request.account {
+                    return Err("session_account_mismatch".into());
+                }
+                let control = self.control_store.as_ref().ok_or("recovery_unavailable")?;
+                let refs = isyncyou_engine::provider_auth::with_locked_provider_subject(
+                    cfg,
+                    &request.account,
+                    |subject| {
+                        control.recovery_batch_refs(
+                            &request.batch_id,
+                            &request.account,
+                            origin,
+                            subject.ok_or("provider_login_required")?,
+                        )
+                    },
+                );
+                let (state, digest, pending, action_hash) = match refs {
+                    Ok(refs) => refs,
+                    Err(_) => {
+                        let (state, digest, pending, action_hash) =
+                            isyncyou_engine::provider_auth::with_locked_provider_subject(
+                                cfg,
+                                &request.account,
+                                |subject| {
+                                    control.recovery_request_refs(
+                                        &request.batch_id,
+                                        &request.account,
+                                        origin,
+                                        subject.ok_or("provider_login_required")?,
+                                    )
+                                },
+                            )?;
+                        let saved = isyncyou_engine::provider_auth::with_locked_provider_subject(
+                            cfg,
+                            &request.account,
+                            |subject| {
+                                let subject = subject.ok_or("provider_login_required")?;
+                                if state == "approved" {
+                                    control.claim_recovery_request(
+                                        &request.batch_id,
+                                        &request.account,
+                                        origin,
+                                        subject,
+                                        &digest,
+                                        &pending,
+                                        &action_hash,
+                                        unix_now_ms(),
+                                    )
+                                } else {
+                                    control.read_claimed_recovery_request(
+                                        &request.batch_id,
+                                        &request.account,
+                                        origin,
+                                        subject,
+                                    )
+                                }
+                            },
+                        )?;
                         let signer=isyncyou_engine::self_hosted_mail_restore::load_registered_recovery_signer(cfg,&request.account)?;
-                        if saved.get("device").and_then(serde_json::Value::as_str)!=Some(signer.device_id()) { return Err("recovery_device_changed".into()); }
-                        let selections:Vec<isyncyou_engine::self_hosted_mail_restore::RecoverySelection>=serde_json::from_value(saved.get("selections").cloned().ok_or("recovery_request_invalid")?).map_err(|_| "recovery_request_invalid")?;
-                        if selections.is_empty() || selections.len()>32 || selections.iter().any(|s| s.account_id!=request.account || s.origin!=*origin) { return Err("recovery_request_invalid".into()); }
-                        let complete=isyncyou_engine::provider_auth::with_platform_credential_store(cfg,&request.account,|credentials| {
-                            for selection in &selections { match isyncyou_engine::self_hosted_mail_restore::create_bound_recovery_job(cfg,selection,signer.as_ref(),credentials)? { isyncyou_engine::self_hosted_mail_restore::RecoveryJobOutcome::Created(_)=>{}, isyncyou_engine::self_hosted_mail_restore::RecoveryJobOutcome::Unknown=>return Ok(false) } }
-                            Ok(true)
-                        })?;
-                        return Ok(serde_json::json!({"state":if complete {"retrieval_requested"} else {"unknown"}}));
+                        if saved.get("device").and_then(serde_json::Value::as_str)
+                            != Some(signer.device_id())
+                        {
+                            return Err("recovery_device_changed".into());
+                        }
+                        let selections: Vec<
+                            isyncyou_engine::self_hosted_mail_restore::RecoverySelection,
+                        > = serde_json::from_value(
+                            saved
+                                .get("selections")
+                                .cloned()
+                                .ok_or("recovery_request_invalid")?,
+                        )
+                        .map_err(|_| "recovery_request_invalid")?;
+                        if selections.is_empty()
+                            || selections.len() > 32
+                            || selections
+                                .iter()
+                                .any(|s| s.account_id != request.account || s.origin != *origin)
+                        {
+                            return Err("recovery_request_invalid".into());
+                        }
+                        let complete =
+                            isyncyou_engine::provider_auth::with_platform_credential_store(
+                                cfg,
+                                &request.account,
+                                |credentials| {
+                                    for selection in &selections {
+                                        match isyncyou_engine::self_hosted_mail_restore::create_bound_recovery_job(cfg,selection,signer.as_ref(),credentials)? { isyncyou_engine::self_hosted_mail_restore::RecoveryJobOutcome::Created(_)=>{}, isyncyou_engine::self_hosted_mail_restore::RecoveryJobOutcome::Unknown=>return Ok(false) }
+                                    }
+                                    Ok(true)
+                                },
+                            )?;
+                        return Ok(
+                            serde_json::json!({"state":if complete {"retrieval_requested"} else {"unknown"}}),
+                        );
                     }
                 };
-                if state=="confirmed" { return Ok(serde_json::json!({"state":"confirmed"})); }
-                let (manifest,originals)=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.load_recovery_batch(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,&digest,&pending,&action_hash,state=="approved",unix_now_ms()))?;
-                let outcome=isyncyou_engine::provider_auth::with_platform_credential_store(cfg,&request.account,|credentials| execute_staged_recovery_batch(cfg,&request.account,origin,manifest,originals,credentials))?;
-                match outcome {
-                    isyncyou_engine::self_hosted_mail_restore::CalendarBatchOutcome::Confirmed(items)=>{
-                        let _=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.complete_recovery_batch(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,&digest));
-                        Ok(serde_json::json!({"state":"confirmed","completed":items.len()}))
+                if state == "confirmed" {
+                    return Ok(serde_json::json!({"state":"confirmed"}));
+                }
+                let (manifest, originals) =
+                    isyncyou_engine::provider_auth::with_locked_provider_subject(
+                        cfg,
+                        &request.account,
+                        |subject| {
+                            control.load_recovery_batch(
+                                &request.batch_id,
+                                &request.account,
+                                origin,
+                                subject.ok_or("provider_login_required")?,
+                                &digest,
+                                &pending,
+                                &action_hash,
+                                state == "approved",
+                                unix_now_ms(),
+                            )
+                        },
+                    )?;
+                let outcome = isyncyou_engine::provider_auth::with_platform_credential_store(
+                    cfg,
+                    &request.account,
+                    |credentials| {
+                        execute_staged_recovery_batch(
+                            cfg,
+                            &request.account,
+                            origin,
+                            manifest,
+                            originals,
+                            credentials,
+                        )
                     },
-                    isyncyou_engine::self_hosted_mail_restore::CalendarBatchOutcome::Stopped {completed,next_index,reason}=>Ok(serde_json::json!({"state":reason,"completed":completed.len(),"next_index":next_index})),
+                )?;
+                match outcome {
+                    isyncyou_engine::self_hosted_mail_restore::CalendarBatchOutcome::Confirmed(
+                        items,
+                    ) => {
+                        let _ = isyncyou_engine::provider_auth::with_locked_provider_subject(
+                            cfg,
+                            &request.account,
+                            |subject| {
+                                control.complete_recovery_batch(
+                                    &request.batch_id,
+                                    &request.account,
+                                    origin,
+                                    subject.ok_or("provider_login_required")?,
+                                    &digest,
+                                )
+                            },
+                        );
+                        Ok(serde_json::json!({"state":"confirmed","completed":items.len()}))
+                    }
+                    isyncyou_engine::self_hosted_mail_restore::CalendarBatchOutcome::Stopped {
+                        completed,
+                        next_index,
+                        reason,
+                    } => Ok(
+                        serde_json::json!({"state":reason,"completed":completed.len(),"next_index":next_index}),
+                    ),
                 }
             };
-            match path { Some(path)=>Config::with_config_lock(&path,|| { let cfg=load_host_runtime_config(&path)?; run(&cfg) }),None=>run(&self.cfg) }
+            match path {
+                Some(path) => Config::with_config_lock(&path, || {
+                    let cfg = load_host_runtime_config(&path)?;
+                    run(&cfg)
+                }),
+                None => run(&self.cfg),
+            }
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _=request; Err("recovery_unavailable".into()) }
-    }
-    fn prepare_recovery_import(&self, request:&isyncyou_webui::AgentRecoveryImportPrepareRequest) -> Result<serde_json::Value,String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            if !self.pending.is_persistent() { return Err("confirmation_unavailable".into()); }
-            let path=self.config_path.read().map_err(|_| "account_config_unavailable")?.clone();
-            let run=|cfg:&Config| -> Result<serde_json::Value,String> {
-                let origin=match cfg.provider_accounts.get(&request.account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin,..}) if cfg.accounts.iter().any(|a| a.id==request.account)=>origin, _=>return Err("provider_unavailable".into()) };
-                let credentials=agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-                let registry=product_session::ProductSessionRegistry::new(&credentials).with_config(cfg);
-                if registry.account_for(&request.session_id)?!=request.account { return Err("session_account_mismatch".into()); }
-                let control=self.control_store.as_ref().ok_or("confirmation_unavailable")?;
-                let (action,manifest_sha)=prepare_recovery_import_action(cfg,control,origin,request)?;
-                let preview=agent_ops::preview_for_pending_action_with_config(cfg,&action)?; let turn_id=turn_id_from_request_id(&request.request_id)?;
-                let owner=isyncyou_agent::PendingOwnerBinding {account:request.account.clone(),session_id:request.session_id.clone(),request_id:request.request_id.clone(),turn_id:turn_id.clone()};
-                let (pending,token)=self.pending.register_bound(action,preview.text,unix_now_ms(),AGENT_CONFIRM_TTL_MS,owner.clone()).map_err(|_| "confirmation_unavailable")?;
-                if let Err(error)=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.bind_recovery_batch_confirmation(&request.batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,&manifest_sha,&pending.id,&pending.action_hash,unix_now_ms())) { let _=self.pending.cancel(&pending.id,&pending.action_hash,unix_now_ms()); return Err(error); }
-                let installation=account_lifecycle_repository(&self.oauth_dir)?.load_existing().map_err(|_| "lifecycle_unavailable")?.ok_or("lifecycle_unavailable")?;
-                let transport=session_transport_token(cfg,&request.account)?;
-                if let Err(error)=registry.append_user_pending(&transport,&owner,installation.principal(),unix_now_ms()) { let _=self.pending.cancel(&pending.id,&pending.action_hash,unix_now_ms()); return Err(error); }
-                Ok(serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id,"batch_id":request.batch_id}))
+            let _ = request;
+            Err("recovery_unavailable".into())
+        }
+    }
+    fn prepare_recovery_import(
+        &self,
+        request: &isyncyou_webui::AgentRecoveryImportPrepareRequest,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            if !self.pending.is_persistent() {
+                return Err("confirmation_unavailable".into());
+            }
+            let path = self
+                .config_path
+                .read()
+                .map_err(|_| "account_config_unavailable")?
+                .clone();
+            let run = |cfg: &Config| -> Result<serde_json::Value, String> {
+                let origin =
+                    match cfg.provider_accounts.get(&request.account) {
+                        Some(isyncyou_core::config::ProviderConfig::SelfHosted {
+                            origin, ..
+                        }) if cfg.accounts.iter().any(|a| a.id == request.account) => origin,
+                        _ => return Err("provider_unavailable".into()),
+                    };
+                let credentials = agent_credential_store(&self.oauth_dir)
+                    .map_err(|_| "session_store_unavailable")?;
+                let registry =
+                    product_session::ProductSessionRegistry::new(&credentials).with_config(cfg);
+                if registry.account_for(&request.session_id)? != request.account {
+                    return Err("session_account_mismatch".into());
+                }
+                let control = self
+                    .control_store
+                    .as_ref()
+                    .ok_or("confirmation_unavailable")?;
+                let (action, manifest_sha) =
+                    prepare_recovery_import_action(cfg, control, origin, request)?;
+                let preview = agent_ops::preview_for_pending_action_with_config(cfg, &action)?;
+                let turn_id = turn_id_from_request_id(&request.request_id)?;
+                let owner = isyncyou_agent::PendingOwnerBinding {
+                    account: request.account.clone(),
+                    session_id: request.session_id.clone(),
+                    request_id: request.request_id.clone(),
+                    turn_id: turn_id.clone(),
+                };
+                let (pending, token) = self
+                    .pending
+                    .register_bound(
+                        action,
+                        preview.text,
+                        unix_now_ms(),
+                        AGENT_CONFIRM_TTL_MS,
+                        owner.clone(),
+                    )
+                    .map_err(|_| "confirmation_unavailable")?;
+                if let Err(error) = isyncyou_engine::provider_auth::with_locked_provider_subject(
+                    cfg,
+                    &request.account,
+                    |subject| {
+                        control.bind_recovery_batch_confirmation(
+                            &request.batch_id,
+                            &request.account,
+                            origin,
+                            subject.ok_or("provider_login_required")?,
+                            &manifest_sha,
+                            &pending.id,
+                            &pending.action_hash,
+                            unix_now_ms(),
+                        )
+                    },
+                ) {
+                    let _ = self
+                        .pending
+                        .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                    return Err(error);
+                }
+                let installation = account_lifecycle_repository(&self.oauth_dir)?
+                    .load_existing()
+                    .map_err(|_| "lifecycle_unavailable")?
+                    .ok_or("lifecycle_unavailable")?;
+                let transport = session_transport_token(cfg, &request.account)?;
+                if let Err(error) = registry.append_user_pending(
+                    &transport,
+                    &owner,
+                    installation.principal(),
+                    unix_now_ms(),
+                ) {
+                    let _ = self
+                        .pending
+                        .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                    return Err(error);
+                }
+                Ok(
+                    serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id,"batch_id":request.batch_id}),
+                )
             };
-            match path { Some(path)=>Config::with_config_lock(&path,|| { let cfg=load_host_runtime_config(&path)?; run(&cfg) }),None=>run(&self.cfg) }
+            match path {
+                Some(path) => Config::with_config_lock(&path, || {
+                    let cfg = load_host_runtime_config(&path)?;
+                    run(&cfg)
+                }),
+                None => run(&self.cfg),
+            }
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _=request; Err("confirmation_unavailable".into()) }
-    }
-    fn prepare_recovery_jobs(&self, request:&isyncyou_webui::AgentRecoveryJobsPrepareRequest) -> Result<serde_json::Value,String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            if !self.pending.is_persistent() || request.items.is_empty() || request.items.len()>32 { return Err("confirmation_unavailable".into()); }
-            let path=self.config_path.read().map_err(|_| "account_config_unavailable")?.clone();
-            let run=|cfg:&Config| -> Result<serde_json::Value,String> {
-                let origin=match cfg.provider_accounts.get(&request.account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin,..}) if cfg.accounts.iter().any(|a| a.id==request.account)=>origin, _=>return Err("provider_unavailable".into()) };
-                let credentials=agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-                let registry=product_session::ProductSessionRegistry::new(&credentials).with_config(cfg);
-                if registry.account_for(&request.session_id)?!=request.account { return Err("session_account_mismatch".into()); }
-                let control=self.control_store.as_ref().ok_or("confirmation_unavailable")?;
-                let (action,batch_id,digest)=prepare_recovery_job_action(cfg,control,&request.account,&request.items)?;
-                let preview=agent_ops::preview_for_pending_action_with_config(cfg,&action)?;
-                let turn_id=turn_id_from_request_id(&request.request_id)?;
-                let owner=isyncyou_agent::PendingOwnerBinding {account:request.account.clone(),session_id:request.session_id.clone(),request_id:request.request_id.clone(),turn_id:turn_id.clone()};
-                let (pending,token)=self.pending.register_bound(action,preview.text,unix_now_ms(),AGENT_CONFIRM_TTL_MS,owner.clone()).map_err(|_| "confirmation_unavailable")?;
-                if let Err(error)=isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,&request.account,|subject| control.bind_recovery_request(&batch_id,&request.account,origin,subject.ok_or("provider_login_required")?,&digest,&pending.id,&pending.action_hash,unix_now_ms())) { let _=self.pending.cancel(&pending.id,&pending.action_hash,unix_now_ms()); return Err(error); }
-                let installation=account_lifecycle_repository(&self.oauth_dir)?.load_existing().map_err(|_| "lifecycle_unavailable")?.ok_or("lifecycle_unavailable")?;
-                let transport=session_transport_token(cfg,&request.account)?;
-                if let Err(error)=registry.append_user_pending(&transport,&owner,installation.principal(),unix_now_ms()) { let _=self.pending.cancel(&pending.id,&pending.action_hash,unix_now_ms()); return Err(error); }
-                Ok(serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id,"batch_id":batch_id}))
+            let _ = request;
+            Err("confirmation_unavailable".into())
+        }
+    }
+    fn prepare_recovery_jobs(
+        &self,
+        request: &isyncyou_webui::AgentRecoveryJobsPrepareRequest,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            if !self.pending.is_persistent() || request.items.is_empty() || request.items.len() > 32
+            {
+                return Err("confirmation_unavailable".into());
+            }
+            let path = self
+                .config_path
+                .read()
+                .map_err(|_| "account_config_unavailable")?
+                .clone();
+            let run = |cfg: &Config| -> Result<serde_json::Value, String> {
+                let origin =
+                    match cfg.provider_accounts.get(&request.account) {
+                        Some(isyncyou_core::config::ProviderConfig::SelfHosted {
+                            origin, ..
+                        }) if cfg.accounts.iter().any(|a| a.id == request.account) => origin,
+                        _ => return Err("provider_unavailable".into()),
+                    };
+                let credentials = agent_credential_store(&self.oauth_dir)
+                    .map_err(|_| "session_store_unavailable")?;
+                let registry =
+                    product_session::ProductSessionRegistry::new(&credentials).with_config(cfg);
+                if registry.account_for(&request.session_id)? != request.account {
+                    return Err("session_account_mismatch".into());
+                }
+                let control = self
+                    .control_store
+                    .as_ref()
+                    .ok_or("confirmation_unavailable")?;
+                let (action, batch_id, digest) =
+                    prepare_recovery_job_action(cfg, control, &request.account, &request.items)?;
+                let preview = agent_ops::preview_for_pending_action_with_config(cfg, &action)?;
+                let turn_id = turn_id_from_request_id(&request.request_id)?;
+                let owner = isyncyou_agent::PendingOwnerBinding {
+                    account: request.account.clone(),
+                    session_id: request.session_id.clone(),
+                    request_id: request.request_id.clone(),
+                    turn_id: turn_id.clone(),
+                };
+                let (pending, token) = self
+                    .pending
+                    .register_bound(
+                        action,
+                        preview.text,
+                        unix_now_ms(),
+                        AGENT_CONFIRM_TTL_MS,
+                        owner.clone(),
+                    )
+                    .map_err(|_| "confirmation_unavailable")?;
+                if let Err(error) = isyncyou_engine::provider_auth::with_locked_provider_subject(
+                    cfg,
+                    &request.account,
+                    |subject| {
+                        control.bind_recovery_request(
+                            &batch_id,
+                            &request.account,
+                            origin,
+                            subject.ok_or("provider_login_required")?,
+                            &digest,
+                            &pending.id,
+                            &pending.action_hash,
+                            unix_now_ms(),
+                        )
+                    },
+                ) {
+                    let _ = self
+                        .pending
+                        .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                    return Err(error);
+                }
+                let installation = account_lifecycle_repository(&self.oauth_dir)?
+                    .load_existing()
+                    .map_err(|_| "lifecycle_unavailable")?
+                    .ok_or("lifecycle_unavailable")?;
+                let transport = session_transport_token(cfg, &request.account)?;
+                if let Err(error) = registry.append_user_pending(
+                    &transport,
+                    &owner,
+                    installation.principal(),
+                    unix_now_ms(),
+                ) {
+                    let _ = self
+                        .pending
+                        .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                    return Err(error);
+                }
+                Ok(
+                    serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id,"batch_id":batch_id}),
+                )
             };
-            match path { Some(path)=>Config::with_config_lock(&path,|| { let cfg=load_host_runtime_config(&path)?; run(&cfg) }), None=>run(&self.cfg) }
+            match path {
+                Some(path) => Config::with_config_lock(&path, || {
+                    let cfg = load_host_runtime_config(&path)?;
+                    run(&cfg)
+                }),
+                None => run(&self.cfg),
+            }
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _=request; Err("confirmation_unavailable".into()) }
-    }
-    fn recovery_catalog(&self, account:&str, session:&str, service:&str, after:u64) -> Result<serde_json::Value,String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            let path = self.config_path.read().map_err(|_| "account_config_unavailable")?.clone();
-            let run = |cfg:&Config| -> Result<serde_json::Value,String> {
-            if !cfg.accounts.iter().any(|a| a.id == account) || !matches!(cfg.provider_accounts.get(account),Some(isyncyou_core::config::ProviderConfig::SelfHosted { .. })) { return Err("provider_unavailable".into()); }
-            let credentials = agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-            let registry = product_session::ProductSessionRegistry::new(&credentials).with_config(cfg);
-            if registry.account_for(session)? != account { return Err("session_account_mismatch".into()); }
-            let signer = isyncyou_engine::self_hosted_mail_restore::load_registered_recovery_signer(cfg,account)?;
-            isyncyou_engine::provider_auth::with_platform_credential_store(cfg,account,|credentials| {
-                recovery_calendar_catalog(isyncyou_engine::self_hosted_mail_restore::recovery_catalog_with_store(cfg,account,signer.as_ref(),credentials,after)?,service)
-            })
+            let _ = request;
+            Err("confirmation_unavailable".into())
+        }
+    }
+    fn recovery_catalog(
+        &self,
+        account: &str,
+        session: &str,
+        service: &str,
+        after: u64,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            let path = self
+                .config_path
+                .read()
+                .map_err(|_| "account_config_unavailable")?
+                .clone();
+            let run = |cfg: &Config| -> Result<serde_json::Value, String> {
+                if !cfg.accounts.iter().any(|a| a.id == account)
+                    || !matches!(
+                        cfg.provider_accounts.get(account),
+                        Some(isyncyou_core::config::ProviderConfig::SelfHosted { .. })
+                    )
+                {
+                    return Err("provider_unavailable".into());
+                }
+                let credentials = agent_credential_store(&self.oauth_dir)
+                    .map_err(|_| "session_store_unavailable")?;
+                let registry =
+                    product_session::ProductSessionRegistry::new(&credentials).with_config(cfg);
+                if registry.account_for(session)? != account {
+                    return Err("session_account_mismatch".into());
+                }
+                let signer =
+                    isyncyou_engine::self_hosted_mail_restore::load_registered_recovery_signer(
+                        cfg, account,
+                    )?;
+                isyncyou_engine::provider_auth::with_platform_credential_store(
+                    cfg,
+                    account,
+                    |credentials| {
+                        recovery_calendar_catalog(
+                            isyncyou_engine::self_hosted_mail_restore::recovery_catalog_with_store(
+                                cfg,
+                                account,
+                                signer.as_ref(),
+                                credentials,
+                                after,
+                            )?,
+                            service,
+                        )
+                    },
+                )
             };
-            match path { Some(path) => Config::with_config_lock(&path,|| { let cfg=load_host_runtime_config(&path)?; run(&cfg) }), None => run(&self.cfg) }
+            match path {
+                Some(path) => Config::with_config_lock(&path, || {
+                    let cfg = load_host_runtime_config(&path)?;
+                    run(&cfg)
+                }),
+                None => run(&self.cfg),
+            }
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _ = (account,session,service,after); Err("recovery_unavailable".into()) }
-    }
-    fn prepare_cancellation(&self, request:&isyncyou_webui::AgentCancellationPrepareRequest) -> Result<serde_json::Value, String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            if !self.pending.is_persistent() { return Err("confirmation_unavailable".into()); }
+            let _ = (account, session, service, after);
+            Err("recovery_unavailable".into())
+        }
+    }
+    fn prepare_cancellation(
+        &self,
+        request: &isyncyou_webui::AgentCancellationPrepareRequest,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            if !self.pending.is_persistent() {
+                return Err("confirmation_unavailable".into());
+            }
             let cfg = self.runtime_config();
-            if !cfg.provider_accounts.contains_key(&request.account) { return Err("provider_unavailable".into()); }
-            let credentials = agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-            let registry = product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
-            if registry.account_for(&request.session_id)? != request.account { return Err("session_account_mismatch".into()); }
+            if !cfg.provider_accounts.contains_key(&request.account) {
+                return Err("provider_unavailable".into());
+            }
+            let credentials =
+                agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
+            let registry =
+                product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
+            if registry.account_for(&request.session_id)? != request.account {
+                return Err("session_account_mismatch".into());
+            }
             let proposed = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":"calendar", "target":request.href,
                 "change":{"verb":"calendar_cancel", "collection":request.collection, "uid":request.uid, "recurrence_id":request.recurrence_id, "sequence":request.sequence}})).map_err(|_| "confirmation_unavailable")?;
             let action = agent_ops::bind_provider_cancellation(&cfg, proposed)?;
             let preview = agent_ops::preview_for_pending_action_with_config(&cfg, &action)?;
             let turn_id = turn_id_from_request_id(&request.request_id)?;
-            let owner = isyncyou_agent::PendingOwnerBinding { account:request.account.clone(), session_id:request.session_id.clone(), request_id:request.request_id.clone(), turn_id:turn_id.clone() };
-            let (pending, token) = self.pending.register_bound(action, preview.text, unix_now_ms(), AGENT_CONFIRM_TTL_MS, owner.clone()).map_err(|_| "confirmation_unavailable")?;
+            let owner = isyncyou_agent::PendingOwnerBinding {
+                account: request.account.clone(),
+                session_id: request.session_id.clone(),
+                request_id: request.request_id.clone(),
+                turn_id: turn_id.clone(),
+            };
+            let (pending, token) = self
+                .pending
+                .register_bound(
+                    action,
+                    preview.text,
+                    unix_now_ms(),
+                    AGENT_CONFIRM_TTL_MS,
+                    owner.clone(),
+                )
+                .map_err(|_| "confirmation_unavailable")?;
             let result = (|| {
-                let installation = account_lifecycle_repository(&self.oauth_dir)?.load_existing().map_err(|_| "lifecycle_unavailable")?.ok_or("lifecycle_unavailable")?;
+                let installation = account_lifecycle_repository(&self.oauth_dir)?
+                    .load_existing()
+                    .map_err(|_| "lifecycle_unavailable")?
+                    .ok_or("lifecycle_unavailable")?;
                 let transport_token = session_transport_token(&cfg, &request.account)?;
-                registry.append_user_pending(&transport_token, &owner, installation.principal(), unix_now_ms())
+                registry.append_user_pending(
+                    &transport_token,
+                    &owner,
+                    installation.principal(),
+                    unix_now_ms(),
+                )
             })();
             if let Err(error) = result {
-                let _ = self.pending.cancel(&pending.id, &pending.action_hash, unix_now_ms());
-                if let (Ok(repository), Ok(transport_token)) = (account_lifecycle_repository(&self.oauth_dir), session_transport_token(&cfg, &request.account)) {
-                    if let Ok(Some(installation)) = repository.load_existing() { let _ = registry.append_pending_cancelled(&transport_token, &owner, installation.principal(), unix_now_ms()); }
+                let _ = self
+                    .pending
+                    .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                if let (Ok(repository), Ok(transport_token)) = (
+                    account_lifecycle_repository(&self.oauth_dir),
+                    session_transport_token(&cfg, &request.account),
+                ) {
+                    if let Ok(Some(installation)) = repository.load_existing() {
+                        let _ = registry.append_pending_cancelled(
+                            &transport_token,
+                            &owner,
+                            installation.principal(),
+                            unix_now_ms(),
+                        );
+                    }
                 }
                 return Err(error);
             }
-            Ok(serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}))
+            Ok(
+                serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}),
+            )
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _ = request; Err("confirmation_unavailable".into()) }
-    }
-    fn prepare_task_parent(&self, request:&isyncyou_webui::AgentTaskParentPrepareRequest) -> Result<serde_json::Value, String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            if !self.pending.is_persistent() { return Err("confirmation_unavailable".into()); }
+            let _ = request;
+            Err("confirmation_unavailable".into())
+        }
+    }
+    fn prepare_task_parent(
+        &self,
+        request: &isyncyou_webui::AgentTaskParentPrepareRequest,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            if !self.pending.is_persistent() {
+                return Err("confirmation_unavailable".into());
+            }
             let cfg = self.runtime_config();
-            if !cfg.provider_accounts.contains_key(&request.account) { return Err("provider_unavailable".into()); }
-            let credentials = agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-            let registry = product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
-            if registry.account_for(&request.session_id)? != request.account { return Err("session_account_mismatch".into()); }
+            if !cfg.provider_accounts.contains_key(&request.account) {
+                return Err("provider_unavailable".into());
+            }
+            let credentials =
+                agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
+            let registry =
+                product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
+            if registry.account_for(&request.session_id)? != request.account {
+                return Err("session_account_mismatch".into());
+            }
             let proposed = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":"calendar", "target":request.href,
                 "change":{"verb":"task_parent", "collection":request.collection, "uid":request.uid, "new_parent":request.new_parent}})).map_err(|_| "confirmation_unavailable")?;
             let action = agent_ops::bind_provider_task_parent(&cfg, proposed)?;
             let preview = agent_ops::preview_for_pending_action_with_config(&cfg, &action)?;
             let turn_id = turn_id_from_request_id(&request.request_id)?;
-            let owner = isyncyou_agent::PendingOwnerBinding { account:request.account.clone(), session_id:request.session_id.clone(), request_id:request.request_id.clone(), turn_id:turn_id.clone() };
-            let (pending, token) = self.pending.register_bound(action, preview.text, unix_now_ms(), AGENT_CONFIRM_TTL_MS, owner.clone()).map_err(|_| "confirmation_unavailable")?;
+            let owner = isyncyou_agent::PendingOwnerBinding {
+                account: request.account.clone(),
+                session_id: request.session_id.clone(),
+                request_id: request.request_id.clone(),
+                turn_id: turn_id.clone(),
+            };
+            let (pending, token) = self
+                .pending
+                .register_bound(
+                    action,
+                    preview.text,
+                    unix_now_ms(),
+                    AGENT_CONFIRM_TTL_MS,
+                    owner.clone(),
+                )
+                .map_err(|_| "confirmation_unavailable")?;
             let result = (|| {
-                let installation = account_lifecycle_repository(&self.oauth_dir)?.load_existing().map_err(|_| "lifecycle_unavailable")?.ok_or("lifecycle_unavailable")?;
+                let installation = account_lifecycle_repository(&self.oauth_dir)?
+                    .load_existing()
+                    .map_err(|_| "lifecycle_unavailable")?
+                    .ok_or("lifecycle_unavailable")?;
                 let transport_token = session_transport_token(&cfg, &request.account)?;
-                registry.append_user_pending(&transport_token, &owner, installation.principal(), unix_now_ms())
+                registry.append_user_pending(
+                    &transport_token,
+                    &owner,
+                    installation.principal(),
+                    unix_now_ms(),
+                )
             })();
             if let Err(error) = result {
-                let _ = self.pending.cancel(&pending.id, &pending.action_hash, unix_now_ms());
-                if let (Ok(repository), Ok(transport_token)) = (account_lifecycle_repository(&self.oauth_dir), session_transport_token(&cfg, &request.account)) {
-                    if let Ok(Some(installation)) = repository.load_existing() { let _ = registry.append_pending_cancelled(&transport_token, &owner, installation.principal(), unix_now_ms()); }
+                let _ = self
+                    .pending
+                    .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                if let (Ok(repository), Ok(transport_token)) = (
+                    account_lifecycle_repository(&self.oauth_dir),
+                    session_transport_token(&cfg, &request.account),
+                ) {
+                    if let Ok(Some(installation)) = repository.load_existing() {
+                        let _ = registry.append_pending_cancelled(
+                            &transport_token,
+                            &owner,
+                            installation.principal(),
+                            unix_now_ms(),
+                        );
+                    }
                 }
                 return Err(error);
             }
-            Ok(serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}))
+            Ok(
+                serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}),
+            )
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _ = request; Err("confirmation_unavailable".into()) }
-    }
-    fn prepare_task_attributes(&self, request:&isyncyou_webui::AgentTaskAttributesPrepareRequest) -> Result<serde_json::Value, String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            if !self.pending.is_persistent() { return Err("confirmation_unavailable".into()); }
+            let _ = request;
+            Err("confirmation_unavailable".into())
+        }
+    }
+    fn prepare_task_attributes(
+        &self,
+        request: &isyncyou_webui::AgentTaskAttributesPrepareRequest,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            if !self.pending.is_persistent() {
+                return Err("confirmation_unavailable".into());
+            }
             let cfg = self.runtime_config();
-            if !cfg.provider_accounts.contains_key(&request.account) { return Err("provider_unavailable".into()); }
-            let credentials = agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-            let registry = product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
-            if registry.account_for(&request.session_id)? != request.account { return Err("session_account_mismatch".into()); }
+            if !cfg.provider_accounts.contains_key(&request.account) {
+                return Err("provider_unavailable".into());
+            }
+            let credentials =
+                agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
+            let registry =
+                product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
+            if registry.account_for(&request.session_id)? != request.account {
+                return Err("session_account_mismatch".into());
+            }
             let proposed = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":"calendar", "target":request.href,
                 "change":{"verb":"task_attributes", "collection":request.collection, "uid":request.uid, "priority":request.priority, "due":request.due, "due_date":request.due_date, "start":request.start}})).map_err(|_| "confirmation_unavailable")?;
             let action = agent_ops::bind_provider_task_attributes(&cfg, proposed)?;
             let preview = agent_ops::preview_for_pending_action_with_config(&cfg, &action)?;
             let turn_id = turn_id_from_request_id(&request.request_id)?;
-            let owner = isyncyou_agent::PendingOwnerBinding { account:request.account.clone(), session_id:request.session_id.clone(), request_id:request.request_id.clone(), turn_id:turn_id.clone() };
-            let (pending, token) = self.pending.register_bound(action, preview.text, unix_now_ms(), AGENT_CONFIRM_TTL_MS, owner.clone()).map_err(|_| "confirmation_unavailable")?;
+            let owner = isyncyou_agent::PendingOwnerBinding {
+                account: request.account.clone(),
+                session_id: request.session_id.clone(),
+                request_id: request.request_id.clone(),
+                turn_id: turn_id.clone(),
+            };
+            let (pending, token) = self
+                .pending
+                .register_bound(
+                    action,
+                    preview.text,
+                    unix_now_ms(),
+                    AGENT_CONFIRM_TTL_MS,
+                    owner.clone(),
+                )
+                .map_err(|_| "confirmation_unavailable")?;
             let result = (|| {
-                let installation = account_lifecycle_repository(&self.oauth_dir)?.load_existing().map_err(|_| "lifecycle_unavailable")?.ok_or("lifecycle_unavailable")?;
+                let installation = account_lifecycle_repository(&self.oauth_dir)?
+                    .load_existing()
+                    .map_err(|_| "lifecycle_unavailable")?
+                    .ok_or("lifecycle_unavailable")?;
                 let transport_token = session_transport_token(&cfg, &request.account)?;
-                registry.append_user_pending(&transport_token, &owner, installation.principal(), unix_now_ms())
+                registry.append_user_pending(
+                    &transport_token,
+                    &owner,
+                    installation.principal(),
+                    unix_now_ms(),
+                )
             })();
             if let Err(error) = result {
-                let _ = self.pending.cancel(&pending.id, &pending.action_hash, unix_now_ms());
-                if let (Ok(repository), Ok(transport_token)) = (account_lifecycle_repository(&self.oauth_dir), session_transport_token(&cfg, &request.account)) {
-                    if let Ok(Some(installation)) = repository.load_existing() { let _ = registry.append_pending_cancelled(&transport_token, &owner, installation.principal(), unix_now_ms()); }
+                let _ = self
+                    .pending
+                    .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                if let (Ok(repository), Ok(transport_token)) = (
+                    account_lifecycle_repository(&self.oauth_dir),
+                    session_transport_token(&cfg, &request.account),
+                ) {
+                    if let Ok(Some(installation)) = repository.load_existing() {
+                        let _ = registry.append_pending_cancelled(
+                            &transport_token,
+                            &owner,
+                            installation.principal(),
+                            unix_now_ms(),
+                        );
+                    }
                 }
                 return Err(error);
             }
-            Ok(serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}))
+            Ok(
+                serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}),
+            )
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _ = request; Err("confirmation_unavailable".into()) }
-    }
-    fn prepare_mail_action(&self, request:&isyncyou_webui::AgentMailActionPrepareRequest) -> Result<serde_json::Value, String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            if !self.pending.is_persistent() { return Err("confirmation_unavailable".into()); }
+            let _ = request;
+            Err("confirmation_unavailable".into())
+        }
+    }
+    fn prepare_mail_action(
+        &self,
+        request: &isyncyou_webui::AgentMailActionPrepareRequest,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            if !self.pending.is_persistent() {
+                return Err("confirmation_unavailable".into());
+            }
             let cfg = self.runtime_config();
-            if !cfg.provider_accounts.contains_key(&request.account) { return Err("provider_unavailable".into()); }
-            let credentials = agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-            let registry = product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
-            if registry.account_for(&request.session_id)? != request.account { return Err("session_account_mismatch".into()); }
-            let change = if request.action.get("kind").and_then(serde_json::Value::as_str) == Some("new_draft") {
-                let mut value = request.action.clone(); value.as_object_mut().ok_or("invalid_mail_action")?.insert("verb".into(), serde_json::json!("provider_create_draft")); value
-            } else if request.action.get("kind").and_then(serde_json::Value::as_str).is_some_and(|k| matches!(k,"reply" | "forward")) {
+            if !cfg.provider_accounts.contains_key(&request.account) {
+                return Err("provider_unavailable".into());
+            }
+            let credentials =
+                agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
+            let registry =
+                product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
+            if registry.account_for(&request.session_id)? != request.account {
+                return Err("session_account_mismatch".into());
+            }
+            let change = if request
+                .action
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("new_draft")
+            {
                 let mut value = request.action.clone();
-                value.as_object_mut().ok_or("invalid_mail_action")?.insert("verb".into(), serde_json::json!("provider_related_draft")); value
-            } else { serde_json::json!({"verb":"provider_mail_action", "action":request.action}) };
+                value
+                    .as_object_mut()
+                    .ok_or("invalid_mail_action")?
+                    .insert("verb".into(), serde_json::json!("provider_create_draft"));
+                value
+            } else if request
+                .action
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|k| matches!(k, "reply" | "forward"))
+            {
+                let mut value = request.action.clone();
+                value
+                    .as_object_mut()
+                    .ok_or("invalid_mail_action")?
+                    .insert("verb".into(), serde_json::json!("provider_related_draft"));
+                value
+            } else {
+                serde_json::json!({"verb":"provider_mail_action", "action":request.action})
+            };
             let proposed = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":"mail", "target":request.email_id,"change":change})).map_err(|_| "confirmation_unavailable")?;
-            let action = agent_ops::bind_provider_draft(&cfg, agent_ops::bind_provider_related_draft(&cfg, agent_ops::bind_provider_mail_action(&cfg, proposed)?)?)?;
+            let action = agent_ops::bind_provider_draft(
+                &cfg,
+                agent_ops::bind_provider_related_draft(
+                    &cfg,
+                    agent_ops::bind_provider_mail_action(&cfg, proposed)?,
+                )?,
+            )?;
             let preview = agent_ops::preview_for_pending_action_with_config(&cfg, &action)?;
             let turn_id = turn_id_from_request_id(&request.request_id)?;
-            let owner = isyncyou_agent::PendingOwnerBinding { account:request.account.clone(), session_id:request.session_id.clone(), request_id:request.request_id.clone(), turn_id:turn_id.clone() };
-            let (pending, token) = self.pending.register_bound(action, preview.text, unix_now_ms(), AGENT_CONFIRM_TTL_MS, owner.clone()).map_err(|_| "confirmation_unavailable")?;
+            let owner = isyncyou_agent::PendingOwnerBinding {
+                account: request.account.clone(),
+                session_id: request.session_id.clone(),
+                request_id: request.request_id.clone(),
+                turn_id: turn_id.clone(),
+            };
+            let (pending, token) = self
+                .pending
+                .register_bound(
+                    action,
+                    preview.text,
+                    unix_now_ms(),
+                    AGENT_CONFIRM_TTL_MS,
+                    owner.clone(),
+                )
+                .map_err(|_| "confirmation_unavailable")?;
             let result = (|| {
-                let installation = account_lifecycle_repository(&self.oauth_dir)?.load_existing().map_err(|_| "lifecycle_unavailable")?.ok_or("lifecycle_unavailable")?;
+                let installation = account_lifecycle_repository(&self.oauth_dir)?
+                    .load_existing()
+                    .map_err(|_| "lifecycle_unavailable")?
+                    .ok_or("lifecycle_unavailable")?;
                 let transport_token = session_transport_token(&cfg, &request.account)?;
-                registry.append_user_pending(&transport_token, &owner, installation.principal(), unix_now_ms())
+                registry.append_user_pending(
+                    &transport_token,
+                    &owner,
+                    installation.principal(),
+                    unix_now_ms(),
+                )
             })();
             if let Err(error) = result {
-                let _ = self.pending.cancel(&pending.id, &pending.action_hash, unix_now_ms());
-                if let (Ok(repository), Ok(transport_token)) = (account_lifecycle_repository(&self.oauth_dir), session_transport_token(&cfg, &request.account)) {
-                    if let Ok(Some(installation)) = repository.load_existing() { let _ = registry.append_pending_cancelled(&transport_token, &owner, installation.principal(), unix_now_ms()); }
+                let _ = self
+                    .pending
+                    .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                if let (Ok(repository), Ok(transport_token)) = (
+                    account_lifecycle_repository(&self.oauth_dir),
+                    session_transport_token(&cfg, &request.account),
+                ) {
+                    if let Ok(Some(installation)) = repository.load_existing() {
+                        let _ = registry.append_pending_cancelled(
+                            &transport_token,
+                            &owner,
+                            installation.principal(),
+                            unix_now_ms(),
+                        );
+                    }
                 }
                 return Err(error);
             }
-            Ok(serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}))
+            Ok(
+                serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}),
+            )
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _ = request; Err("confirmation_unavailable".into()) }
-    }
-    fn prepare_contact_field(&self, request:&isyncyou_webui::AgentContactFieldPrepareRequest) -> Result<serde_json::Value, String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            if !self.pending.is_persistent() { return Err("confirmation_unavailable".into()); }
+            let _ = request;
+            Err("confirmation_unavailable".into())
+        }
+    }
+    fn prepare_contact_field(
+        &self,
+        request: &isyncyou_webui::AgentContactFieldPrepareRequest,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            if !self.pending.is_persistent() {
+                return Err("confirmation_unavailable".into());
+            }
             let cfg = self.runtime_config();
-            if !cfg.provider_accounts.contains_key(&request.account) { return Err("provider_unavailable".into()); }
-            let credentials = agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-            let registry = product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
-            if registry.account_for(&request.session_id)? != request.account { return Err("session_account_mismatch".into()); }
+            if !cfg.provider_accounts.contains_key(&request.account) {
+                return Err("provider_unavailable".into());
+            }
+            let credentials =
+                agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
+            let registry =
+                product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
+            if registry.account_for(&request.session_id)? != request.account {
+                return Err("session_account_mismatch".into());
+            }
             let proposed = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":"contacts", "target":request.href,
                 "change":{"verb":if request.remove { "contact_remove_field" } else if request.index.is_some() { "contact_set_field" } else { "contact_add_field" }, "collection":request.collection, "key":request.key, "index":request.index, "value_type":request.value_type.as_deref().unwrap_or("text"), "new_value":request.new_value}})).map_err(|_| "confirmation_unavailable")?;
-            let action = agent_ops::bind_provider_contact_remove(&cfg, agent_ops::bind_provider_contact_add(&cfg, agent_ops::bind_provider_contact_field(&cfg, proposed)?)?)?;
+            let action = agent_ops::bind_provider_contact_remove(
+                &cfg,
+                agent_ops::bind_provider_contact_add(
+                    &cfg,
+                    agent_ops::bind_provider_contact_field(&cfg, proposed)?,
+                )?,
+            )?;
             let preview = agent_ops::preview_for_pending_action_with_config(&cfg, &action)?;
             let turn_id = turn_id_from_request_id(&request.request_id)?;
-            let owner = isyncyou_agent::PendingOwnerBinding { account:request.account.clone(), session_id:request.session_id.clone(), request_id:request.request_id.clone(), turn_id:turn_id.clone() };
-            let (pending, token) = self.pending.register_bound(action, preview.text, unix_now_ms(), AGENT_CONFIRM_TTL_MS, owner.clone()).map_err(|_| "confirmation_unavailable")?;
+            let owner = isyncyou_agent::PendingOwnerBinding {
+                account: request.account.clone(),
+                session_id: request.session_id.clone(),
+                request_id: request.request_id.clone(),
+                turn_id: turn_id.clone(),
+            };
+            let (pending, token) = self
+                .pending
+                .register_bound(
+                    action,
+                    preview.text,
+                    unix_now_ms(),
+                    AGENT_CONFIRM_TTL_MS,
+                    owner.clone(),
+                )
+                .map_err(|_| "confirmation_unavailable")?;
             let result = (|| {
-                let installation = account_lifecycle_repository(&self.oauth_dir)?.load_existing().map_err(|_| "lifecycle_unavailable")?.ok_or("lifecycle_unavailable")?;
+                let installation = account_lifecycle_repository(&self.oauth_dir)?
+                    .load_existing()
+                    .map_err(|_| "lifecycle_unavailable")?
+                    .ok_or("lifecycle_unavailable")?;
                 let transport_token = session_transport_token(&cfg, &request.account)?;
-                registry.append_user_pending(&transport_token, &owner, installation.principal(), unix_now_ms())
+                registry.append_user_pending(
+                    &transport_token,
+                    &owner,
+                    installation.principal(),
+                    unix_now_ms(),
+                )
             })();
             if let Err(error) = result {
-                let _ = self.pending.cancel(&pending.id, &pending.action_hash, unix_now_ms());
-                if let (Ok(repository), Ok(transport_token)) = (account_lifecycle_repository(&self.oauth_dir), session_transport_token(&cfg, &request.account)) {
-                    if let Ok(Some(installation)) = repository.load_existing() { let _ = registry.append_pending_cancelled(&transport_token, &owner, installation.principal(), unix_now_ms()); }
+                let _ = self
+                    .pending
+                    .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                if let (Ok(repository), Ok(transport_token)) = (
+                    account_lifecycle_repository(&self.oauth_dir),
+                    session_transport_token(&cfg, &request.account),
+                ) {
+                    if let Ok(Some(installation)) = repository.load_existing() {
+                        let _ = registry.append_pending_cancelled(
+                            &transport_token,
+                            &owner,
+                            installation.principal(),
+                            unix_now_ms(),
+                        );
+                    }
                 }
                 return Err(error);
             }
-            Ok(serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}))
+            Ok(
+                serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}),
+            )
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _ = request; Err("confirmation_unavailable".into()) }
-    }
-    fn prepare_dav_create(&self, request:&isyncyou_webui::AgentDavCreatePrepareRequest) -> Result<serde_json::Value, String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            if !self.pending.is_persistent() { return Err("confirmation_unavailable".into()); }
+            let _ = request;
+            Err("confirmation_unavailable".into())
+        }
+    }
+    fn prepare_dav_create(
+        &self,
+        request: &isyncyou_webui::AgentDavCreatePrepareRequest,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            if !self.pending.is_persistent() {
+                return Err("confirmation_unavailable".into());
+            }
             let cfg = self.runtime_config();
-            if !cfg.provider_accounts.contains_key(&request.account) { return Err("provider_unavailable".into()); }
-            let credentials = agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-            let registry = product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
-            if registry.account_for(&request.session_id)? != request.account { return Err("session_account_mismatch".into()); }
-            let service = if request.kind == "contact" { "contacts" } else { "calendar" };
+            if !cfg.provider_accounts.contains_key(&request.account) {
+                return Err("provider_unavailable".into());
+            }
+            let credentials =
+                agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
+            let registry =
+                product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
+            if registry.account_for(&request.session_id)? != request.account {
+                return Err("session_account_mismatch".into());
+            }
+            let service = if request.kind == "contact" {
+                "contacts"
+            } else {
+                "calendar"
+            };
             let proposed = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":service,
                 "change":{"verb":"dav_create", "collection":request.collection, "kind":request.kind, "name":request.name, "start":request.start, "end":request.end, "rule":request.rule, "organizer":request.organizer, "attendees":request.attendees}})).map_err(|_| "confirmation_unavailable")?;
             let action = agent_ops::bind_provider_dav_create(&cfg, proposed)?;
             let preview = agent_ops::preview_for_pending_action_with_config(&cfg, &action)?;
             let turn_id = turn_id_from_request_id(&request.request_id)?;
-            let owner = isyncyou_agent::PendingOwnerBinding { account:request.account.clone(), session_id:request.session_id.clone(), request_id:request.request_id.clone(), turn_id:turn_id.clone() };
-            let (pending, token) = self.pending.register_bound(action, preview.text, unix_now_ms(), AGENT_CONFIRM_TTL_MS, owner.clone()).map_err(|_| "confirmation_unavailable")?;
+            let owner = isyncyou_agent::PendingOwnerBinding {
+                account: request.account.clone(),
+                session_id: request.session_id.clone(),
+                request_id: request.request_id.clone(),
+                turn_id: turn_id.clone(),
+            };
+            let (pending, token) = self
+                .pending
+                .register_bound(
+                    action,
+                    preview.text,
+                    unix_now_ms(),
+                    AGENT_CONFIRM_TTL_MS,
+                    owner.clone(),
+                )
+                .map_err(|_| "confirmation_unavailable")?;
             let result = (|| {
-                let installation = account_lifecycle_repository(&self.oauth_dir)?.load_existing().map_err(|_| "lifecycle_unavailable")?.ok_or("lifecycle_unavailable")?;
+                let installation = account_lifecycle_repository(&self.oauth_dir)?
+                    .load_existing()
+                    .map_err(|_| "lifecycle_unavailable")?
+                    .ok_or("lifecycle_unavailable")?;
                 let transport_token = session_transport_token(&cfg, &request.account)?;
-                registry.append_user_pending(&transport_token, &owner, installation.principal(), unix_now_ms())
+                registry.append_user_pending(
+                    &transport_token,
+                    &owner,
+                    installation.principal(),
+                    unix_now_ms(),
+                )
             })();
             if let Err(error) = result {
-                let _ = self.pending.cancel(&pending.id, &pending.action_hash, unix_now_ms());
-                if let (Ok(repository), Ok(transport_token)) = (account_lifecycle_repository(&self.oauth_dir), session_transport_token(&cfg, &request.account)) {
-                    if let Ok(Some(installation)) = repository.load_existing() { let _ = registry.append_pending_cancelled(&transport_token, &owner, installation.principal(), unix_now_ms()); }
+                let _ = self
+                    .pending
+                    .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                if let (Ok(repository), Ok(transport_token)) = (
+                    account_lifecycle_repository(&self.oauth_dir),
+                    session_transport_token(&cfg, &request.account),
+                ) {
+                    if let Ok(Some(installation)) = repository.load_existing() {
+                        let _ = registry.append_pending_cancelled(
+                            &transport_token,
+                            &owner,
+                            installation.principal(),
+                            unix_now_ms(),
+                        );
+                    }
                 }
                 return Err(error);
             }
-            Ok(serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}))
+            Ok(
+                serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}),
+            )
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _ = request; Err("confirmation_unavailable".into()) }
-    }
-    fn prepare_dav_delete(&self, request:&isyncyou_webui::AgentDavDeletePrepareRequest) -> Result<serde_json::Value, String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            if !self.pending.is_persistent() { return Err("confirmation_unavailable".into()); }
+            let _ = request;
+            Err("confirmation_unavailable".into())
+        }
+    }
+    fn prepare_dav_delete(
+        &self,
+        request: &isyncyou_webui::AgentDavDeletePrepareRequest,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            if !self.pending.is_persistent() {
+                return Err("confirmation_unavailable".into());
+            }
             let cfg = self.runtime_config();
-            if !cfg.provider_accounts.contains_key(&request.account) { return Err("provider_unavailable".into()); }
-            let credentials = agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-            let registry = product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
-            if registry.account_for(&request.session_id)? != request.account { return Err("session_account_mismatch".into()); }
+            if !cfg.provider_accounts.contains_key(&request.account) {
+                return Err("provider_unavailable".into());
+            }
+            let credentials =
+                agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
+            let registry =
+                product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
+            if registry.account_for(&request.session_id)? != request.account {
+                return Err("session_account_mismatch".into());
+            }
             let proposed = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":request.service, "target":request.href,
                 "change":{"verb":"dav_delete", "collection":request.collection}})).map_err(|_| "confirmation_unavailable")?;
             let action = agent_ops::bind_provider_dav_delete(&cfg, proposed)?;
             let preview = agent_ops::preview_for_pending_action_with_config(&cfg, &action)?;
             let turn_id = turn_id_from_request_id(&request.request_id)?;
-            let owner = isyncyou_agent::PendingOwnerBinding { account:request.account.clone(), session_id:request.session_id.clone(), request_id:request.request_id.clone(), turn_id:turn_id.clone() };
-            let (pending, token) = self.pending.register_bound(action, preview.text, unix_now_ms(), AGENT_CONFIRM_TTL_MS, owner.clone()).map_err(|_| "confirmation_unavailable")?;
+            let owner = isyncyou_agent::PendingOwnerBinding {
+                account: request.account.clone(),
+                session_id: request.session_id.clone(),
+                request_id: request.request_id.clone(),
+                turn_id: turn_id.clone(),
+            };
+            let (pending, token) = self
+                .pending
+                .register_bound(
+                    action,
+                    preview.text,
+                    unix_now_ms(),
+                    AGENT_CONFIRM_TTL_MS,
+                    owner.clone(),
+                )
+                .map_err(|_| "confirmation_unavailable")?;
             let result = (|| {
-                let installation = account_lifecycle_repository(&self.oauth_dir)?.load_existing().map_err(|_| "lifecycle_unavailable")?.ok_or("lifecycle_unavailable")?;
+                let installation = account_lifecycle_repository(&self.oauth_dir)?
+                    .load_existing()
+                    .map_err(|_| "lifecycle_unavailable")?
+                    .ok_or("lifecycle_unavailable")?;
                 let transport_token = session_transport_token(&cfg, &request.account)?;
-                registry.append_user_pending(&transport_token, &owner, installation.principal(), unix_now_ms())
+                registry.append_user_pending(
+                    &transport_token,
+                    &owner,
+                    installation.principal(),
+                    unix_now_ms(),
+                )
             })();
             if let Err(error) = result {
-                let _ = self.pending.cancel(&pending.id, &pending.action_hash, unix_now_ms());
-                if let (Ok(repository), Ok(transport_token)) = (account_lifecycle_repository(&self.oauth_dir), session_transport_token(&cfg, &request.account)) {
-                    if let Ok(Some(installation)) = repository.load_existing() { let _ = registry.append_pending_cancelled(&transport_token, &owner, installation.principal(), unix_now_ms()); }
+                let _ = self
+                    .pending
+                    .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                if let (Ok(repository), Ok(transport_token)) = (
+                    account_lifecycle_repository(&self.oauth_dir),
+                    session_transport_token(&cfg, &request.account),
+                ) {
+                    if let Ok(Some(installation)) = repository.load_existing() {
+                        let _ = registry.append_pending_cancelled(
+                            &transport_token,
+                            &owner,
+                            installation.principal(),
+                            unix_now_ms(),
+                        );
+                    }
                 }
                 return Err(error);
             }
-            Ok(serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}))
+            Ok(
+                serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}),
+            )
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _ = request; Err("confirmation_unavailable".into()) }
-    }
-    fn prepare_invitation_response(&self, request:&isyncyou_webui::AgentInvitationResponsePrepareRequest) -> Result<serde_json::Value, String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            if !self.pending.is_persistent() { return Err("confirmation_unavailable".into()); }
+            let _ = request;
+            Err("confirmation_unavailable".into())
+        }
+    }
+    fn prepare_invitation_response(
+        &self,
+        request: &isyncyou_webui::AgentInvitationResponsePrepareRequest,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            if !self.pending.is_persistent() {
+                return Err("confirmation_unavailable".into());
+            }
             let cfg = self.runtime_config();
-            if !cfg.provider_accounts.contains_key(&request.account) { return Err("provider_unavailable".into()); }
-            let credentials = agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-            let registry = product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
-            if registry.account_for(&request.session_id)? != request.account { return Err("session_account_mismatch".into()); }
+            if !cfg.provider_accounts.contains_key(&request.account) {
+                return Err("provider_unavailable".into());
+            }
+            let credentials =
+                agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
+            let registry =
+                product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
+            if registry.account_for(&request.session_id)? != request.account {
+                return Err("session_account_mismatch".into());
+            }
             let proposed = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":"calendar", "target":request.href,
                 "change":{"verb":"invitation_response", "collection":request.collection, "uid":request.uid, "recurrence_id":request.recurrence_id, "attendee":request.attendee, "response":request.response}})).map_err(|_| "confirmation_unavailable")?;
             let action = agent_ops::bind_provider_invitation_response(&cfg, proposed)?;
             let preview = agent_ops::preview_for_pending_action_with_config(&cfg, &action)?;
             let turn_id = turn_id_from_request_id(&request.request_id)?;
-            let owner = isyncyou_agent::PendingOwnerBinding { account:request.account.clone(), session_id:request.session_id.clone(), request_id:request.request_id.clone(), turn_id:turn_id.clone() };
-            let (pending, token) = self.pending.register_bound(action, preview.text, unix_now_ms(), AGENT_CONFIRM_TTL_MS, owner.clone()).map_err(|_| "confirmation_unavailable")?;
+            let owner = isyncyou_agent::PendingOwnerBinding {
+                account: request.account.clone(),
+                session_id: request.session_id.clone(),
+                request_id: request.request_id.clone(),
+                turn_id: turn_id.clone(),
+            };
+            let (pending, token) = self
+                .pending
+                .register_bound(
+                    action,
+                    preview.text,
+                    unix_now_ms(),
+                    AGENT_CONFIRM_TTL_MS,
+                    owner.clone(),
+                )
+                .map_err(|_| "confirmation_unavailable")?;
             let result = (|| {
-                let installation = account_lifecycle_repository(&self.oauth_dir)?.load_existing().map_err(|_| "lifecycle_unavailable")?.ok_or("lifecycle_unavailable")?;
+                let installation = account_lifecycle_repository(&self.oauth_dir)?
+                    .load_existing()
+                    .map_err(|_| "lifecycle_unavailable")?
+                    .ok_or("lifecycle_unavailable")?;
                 let transport_token = session_transport_token(&cfg, &request.account)?;
-                registry.append_user_pending(&transport_token, &owner, installation.principal(), unix_now_ms())
+                registry.append_user_pending(
+                    &transport_token,
+                    &owner,
+                    installation.principal(),
+                    unix_now_ms(),
+                )
             })();
             if let Err(error) = result {
-                let _ = self.pending.cancel(&pending.id, &pending.action_hash, unix_now_ms());
-                if let (Ok(repository), Ok(transport_token)) = (account_lifecycle_repository(&self.oauth_dir), session_transport_token(&cfg, &request.account)) {
-                    if let Ok(Some(installation)) = repository.load_existing() { let _ = registry.append_pending_cancelled(&transport_token, &owner, installation.principal(), unix_now_ms()); }
+                let _ = self
+                    .pending
+                    .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                if let (Ok(repository), Ok(transport_token)) = (
+                    account_lifecycle_repository(&self.oauth_dir),
+                    session_transport_token(&cfg, &request.account),
+                ) {
+                    if let Ok(Some(installation)) = repository.load_existing() {
+                        let _ = registry.append_pending_cancelled(
+                            &transport_token,
+                            &owner,
+                            installation.principal(),
+                            unix_now_ms(),
+                        );
+                    }
                 }
                 return Err(error);
             }
-            Ok(serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}))
+            Ok(
+                serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}),
+            )
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _ = request; Err("confirmation_unavailable".into()) }
-    }
-    fn prepare_dav_acl(&self, request:&isyncyou_webui::AgentDavAclPrepareRequest) -> Result<serde_json::Value, String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            if !self.pending.is_persistent() { return Err("confirmation_unavailable".into()); }
+            let _ = request;
+            Err("confirmation_unavailable".into())
+        }
+    }
+    fn prepare_dav_acl(
+        &self,
+        request: &isyncyou_webui::AgentDavAclPrepareRequest,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            if !self.pending.is_persistent() {
+                return Err("confirmation_unavailable".into());
+            }
             let cfg = self.runtime_config();
-            if !cfg.provider_accounts.contains_key(&request.account) { return Err("provider_unavailable".into()); }
-            let credentials = agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-            let registry = product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
-            if registry.account_for(&request.session_id)? != request.account { return Err("session_account_mismatch".into()); }
+            if !cfg.provider_accounts.contains_key(&request.account) {
+                return Err("provider_unavailable".into());
+            }
+            let credentials =
+                agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
+            let registry =
+                product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
+            if registry.account_for(&request.session_id)? != request.account {
+                return Err("session_account_mismatch".into());
+            }
             let proposed = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":request.service, "target":request.collection,
                 "change":{"verb":"dav_acl", "collection":request.collection, "principal":request.principal, "privilege":request.privilege}})).map_err(|_| "confirmation_unavailable")?;
             let action = agent_ops::bind_provider_dav_acl(&cfg, proposed)?;
             let preview = agent_ops::preview_for_pending_action_with_config(&cfg, &action)?;
             let turn_id = turn_id_from_request_id(&request.request_id)?;
-            let owner = isyncyou_agent::PendingOwnerBinding { account:request.account.clone(), session_id:request.session_id.clone(), request_id:request.request_id.clone(), turn_id:turn_id.clone() };
-            let (pending, token) = self.pending.register_bound(action, preview.text, unix_now_ms(), AGENT_CONFIRM_TTL_MS, owner.clone()).map_err(|_| "confirmation_unavailable")?;
+            let owner = isyncyou_agent::PendingOwnerBinding {
+                account: request.account.clone(),
+                session_id: request.session_id.clone(),
+                request_id: request.request_id.clone(),
+                turn_id: turn_id.clone(),
+            };
+            let (pending, token) = self
+                .pending
+                .register_bound(
+                    action,
+                    preview.text,
+                    unix_now_ms(),
+                    AGENT_CONFIRM_TTL_MS,
+                    owner.clone(),
+                )
+                .map_err(|_| "confirmation_unavailable")?;
             let result = (|| {
-                let installation = account_lifecycle_repository(&self.oauth_dir)?.load_existing().map_err(|_| "lifecycle_unavailable")?.ok_or("lifecycle_unavailable")?;
+                let installation = account_lifecycle_repository(&self.oauth_dir)?
+                    .load_existing()
+                    .map_err(|_| "lifecycle_unavailable")?
+                    .ok_or("lifecycle_unavailable")?;
                 let transport_token = session_transport_token(&cfg, &request.account)?;
-                registry.append_user_pending(&transport_token, &owner, installation.principal(), unix_now_ms())
+                registry.append_user_pending(
+                    &transport_token,
+                    &owner,
+                    installation.principal(),
+                    unix_now_ms(),
+                )
             })();
             if let Err(error) = result {
-                let _ = self.pending.cancel(&pending.id, &pending.action_hash, unix_now_ms());
-                if let (Ok(repository), Ok(transport_token)) = (account_lifecycle_repository(&self.oauth_dir), session_transport_token(&cfg, &request.account)) {
-                    if let Ok(Some(installation)) = repository.load_existing() { let _ = registry.append_pending_cancelled(&transport_token, &owner, installation.principal(), unix_now_ms()); }
+                let _ = self
+                    .pending
+                    .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                if let (Ok(repository), Ok(transport_token)) = (
+                    account_lifecycle_repository(&self.oauth_dir),
+                    session_transport_token(&cfg, &request.account),
+                ) {
+                    if let Ok(Some(installation)) = repository.load_existing() {
+                        let _ = registry.append_pending_cancelled(
+                            &transport_token,
+                            &owner,
+                            installation.principal(),
+                            unix_now_ms(),
+                        );
+                    }
                 }
                 return Err(error);
             }
-            Ok(serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}))
+            Ok(
+                serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}),
+            )
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _ = request; Err("confirmation_unavailable".into()) }
-    }
-    fn prepare_calendar_alarm(&self, request:&isyncyou_webui::AgentCalendarAlarmPrepareRequest) -> Result<serde_json::Value, String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            if !self.pending.is_persistent() { return Err("confirmation_unavailable".into()); }
+            let _ = request;
+            Err("confirmation_unavailable".into())
+        }
+    }
+    fn prepare_calendar_alarm(
+        &self,
+        request: &isyncyou_webui::AgentCalendarAlarmPrepareRequest,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            if !self.pending.is_persistent() {
+                return Err("confirmation_unavailable".into());
+            }
             let cfg = self.runtime_config();
-            if !cfg.provider_accounts.contains_key(&request.account) { return Err("provider_unavailable".into()); }
-            let credentials = agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-            let registry = product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
-            if registry.account_for(&request.session_id)? != request.account { return Err("session_account_mismatch".into()); }
+            if !cfg.provider_accounts.contains_key(&request.account) {
+                return Err("provider_unavailable".into());
+            }
+            let credentials =
+                agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
+            let registry =
+                product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
+            if registry.account_for(&request.session_id)? != request.account {
+                return Err("session_account_mismatch".into());
+            }
             let proposed = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":"calendar", "target":request.href,
                 "change":{"verb":"calendar_alarm", "collection":request.collection, "uid":request.uid, "recurrence_id":request.recurrence_id, "alarm_index":request.alarm_index, "trigger":request.trigger, "description":request.description}})).map_err(|_| "confirmation_unavailable")?;
             let action = agent_ops::bind_provider_alarm(&cfg, proposed)?;
             let preview = agent_ops::preview_for_pending_action_with_config(&cfg, &action)?;
             let turn_id = turn_id_from_request_id(&request.request_id)?;
-            let owner = isyncyou_agent::PendingOwnerBinding { account:request.account.clone(), session_id:request.session_id.clone(), request_id:request.request_id.clone(), turn_id:turn_id.clone() };
-            let (pending, token) = self.pending.register_bound(action, preview.text, unix_now_ms(), AGENT_CONFIRM_TTL_MS, owner.clone()).map_err(|_| "confirmation_unavailable")?;
+            let owner = isyncyou_agent::PendingOwnerBinding {
+                account: request.account.clone(),
+                session_id: request.session_id.clone(),
+                request_id: request.request_id.clone(),
+                turn_id: turn_id.clone(),
+            };
+            let (pending, token) = self
+                .pending
+                .register_bound(
+                    action,
+                    preview.text,
+                    unix_now_ms(),
+                    AGENT_CONFIRM_TTL_MS,
+                    owner.clone(),
+                )
+                .map_err(|_| "confirmation_unavailable")?;
             let result = (|| {
-                let installation = account_lifecycle_repository(&self.oauth_dir)?.load_existing().map_err(|_| "lifecycle_unavailable")?.ok_or("lifecycle_unavailable")?;
+                let installation = account_lifecycle_repository(&self.oauth_dir)?
+                    .load_existing()
+                    .map_err(|_| "lifecycle_unavailable")?
+                    .ok_or("lifecycle_unavailable")?;
                 let transport_token = session_transport_token(&cfg, &request.account)?;
-                registry.append_user_pending(&transport_token, &owner, installation.principal(), unix_now_ms())
+                registry.append_user_pending(
+                    &transport_token,
+                    &owner,
+                    installation.principal(),
+                    unix_now_ms(),
+                )
             })();
             if let Err(error) = result {
-                let _ = self.pending.cancel(&pending.id, &pending.action_hash, unix_now_ms());
-                if let (Ok(repository), Ok(transport_token)) = (account_lifecycle_repository(&self.oauth_dir), session_transport_token(&cfg, &request.account)) {
-                    if let Ok(Some(installation)) = repository.load_existing() { let _ = registry.append_pending_cancelled(&transport_token, &owner, installation.principal(), unix_now_ms()); }
+                let _ = self
+                    .pending
+                    .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                if let (Ok(repository), Ok(transport_token)) = (
+                    account_lifecycle_repository(&self.oauth_dir),
+                    session_transport_token(&cfg, &request.account),
+                ) {
+                    if let Ok(Some(installation)) = repository.load_existing() {
+                        let _ = registry.append_pending_cancelled(
+                            &transport_token,
+                            &owner,
+                            installation.principal(),
+                            unix_now_ms(),
+                        );
+                    }
                 }
                 return Err(error);
             }
-            Ok(serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}))
+            Ok(
+                serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}),
+            )
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _ = request; Err("confirmation_unavailable".into()) }
-    }
-    fn prepare_task_occurrence(&self, request:&isyncyou_webui::AgentTaskOccurrencePrepareRequest) -> Result<serde_json::Value, String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            if !self.pending.is_persistent() { return Err("confirmation_unavailable".into()); }
+            let _ = request;
+            Err("confirmation_unavailable".into())
+        }
+    }
+    fn prepare_task_occurrence(
+        &self,
+        request: &isyncyou_webui::AgentTaskOccurrencePrepareRequest,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            if !self.pending.is_persistent() {
+                return Err("confirmation_unavailable".into());
+            }
             let cfg = self.runtime_config();
-            if !cfg.provider_accounts.contains_key(&request.account) { return Err("provider_unavailable".into()); }
-            let credentials = agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-            let registry = product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
-            if registry.account_for(&request.session_id)? != request.account { return Err("session_account_mismatch".into()); }
+            if !cfg.provider_accounts.contains_key(&request.account) {
+                return Err("provider_unavailable".into());
+            }
+            let credentials =
+                agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
+            let registry =
+                product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
+            if registry.account_for(&request.session_id)? != request.account {
+                return Err("session_account_mismatch".into());
+            }
             let proposed = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":"calendar", "target":request.href,
                 "change":{"verb":"task_occurrence_completion", "collection":request.collection, "uid":request.uid, "recurrence_id":request.recurrence_id, "complete":request.complete, "window_start":request.window_start, "window_end":request.window_end}})).map_err(|_| "confirmation_unavailable")?;
             let action = agent_ops::bind_provider_task_occurrence(&cfg, proposed)?;
             let preview = agent_ops::preview_for_pending_action_with_config(&cfg, &action)?;
             let turn_id = turn_id_from_request_id(&request.request_id)?;
-            let owner = isyncyou_agent::PendingOwnerBinding { account:request.account.clone(), session_id:request.session_id.clone(), request_id:request.request_id.clone(), turn_id:turn_id.clone() };
-            let (pending, token) = self.pending.register_bound(action, preview.text, unix_now_ms(), AGENT_CONFIRM_TTL_MS, owner.clone()).map_err(|_| "confirmation_unavailable")?;
+            let owner = isyncyou_agent::PendingOwnerBinding {
+                account: request.account.clone(),
+                session_id: request.session_id.clone(),
+                request_id: request.request_id.clone(),
+                turn_id: turn_id.clone(),
+            };
+            let (pending, token) = self
+                .pending
+                .register_bound(
+                    action,
+                    preview.text,
+                    unix_now_ms(),
+                    AGENT_CONFIRM_TTL_MS,
+                    owner.clone(),
+                )
+                .map_err(|_| "confirmation_unavailable")?;
             let result = (|| {
-                let installation = account_lifecycle_repository(&self.oauth_dir)?.load_existing().map_err(|_| "lifecycle_unavailable")?.ok_or("lifecycle_unavailable")?;
+                let installation = account_lifecycle_repository(&self.oauth_dir)?
+                    .load_existing()
+                    .map_err(|_| "lifecycle_unavailable")?
+                    .ok_or("lifecycle_unavailable")?;
                 let transport_token = session_transport_token(&cfg, &request.account)?;
-                registry.append_user_pending(&transport_token, &owner, installation.principal(), unix_now_ms())
+                registry.append_user_pending(
+                    &transport_token,
+                    &owner,
+                    installation.principal(),
+                    unix_now_ms(),
+                )
             })();
             if let Err(error) = result {
-                let _ = self.pending.cancel(&pending.id, &pending.action_hash, unix_now_ms());
-                if let (Ok(repository), Ok(transport_token)) = (account_lifecycle_repository(&self.oauth_dir), session_transport_token(&cfg, &request.account)) {
-                    if let Ok(Some(installation)) = repository.load_existing() { let _ = registry.append_pending_cancelled(&transport_token, &owner, installation.principal(), unix_now_ms()); }
+                let _ = self
+                    .pending
+                    .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                if let (Ok(repository), Ok(transport_token)) = (
+                    account_lifecycle_repository(&self.oauth_dir),
+                    session_transport_token(&cfg, &request.account),
+                ) {
+                    if let Ok(Some(installation)) = repository.load_existing() {
+                        let _ = registry.append_pending_cancelled(
+                            &transport_token,
+                            &owner,
+                            installation.principal(),
+                            unix_now_ms(),
+                        );
+                    }
                 }
                 return Err(error);
             }
-            Ok(serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}))
+            Ok(
+                serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}),
+            )
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _ = request; Err("confirmation_unavailable".into()) }
-    }
-    fn prepare_calendar_time(&self, request:&isyncyou_webui::AgentCalendarTimePrepareRequest) -> Result<serde_json::Value, String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            if !self.pending.is_persistent() { return Err("confirmation_unavailable".into()); }
+            let _ = request;
+            Err("confirmation_unavailable".into())
+        }
+    }
+    fn prepare_calendar_time(
+        &self,
+        request: &isyncyou_webui::AgentCalendarTimePrepareRequest,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            if !self.pending.is_persistent() {
+                return Err("confirmation_unavailable".into());
+            }
             let cfg = self.runtime_config();
-            if !cfg.provider_accounts.contains_key(&request.account) { return Err("provider_unavailable".into()); }
-            let credentials = agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-            let registry = product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
-            if registry.account_for(&request.session_id)? != request.account { return Err("session_account_mismatch".into()); }
+            if !cfg.provider_accounts.contains_key(&request.account) {
+                return Err("provider_unavailable".into());
+            }
+            let credentials =
+                agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
+            let registry =
+                product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
+            if registry.account_for(&request.session_id)? != request.account {
+                return Err("session_account_mismatch".into());
+            }
             let proposed = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":"calendar", "target":request.href,
                 "change":{"verb":if request.rule.is_some() { "calendar_series_rule" } else if request.recurrence_id.is_some() { "calendar_exception" } else if request.tzid.is_some() { "calendar_set_zoned_time" } else { "calendar_set_time" }, "collection":request.collection, "uid":request.uid, "start":request.start, "end":request.end, "date_only":request.date_only, "tzid":request.tzid, "recurrence_id":request.recurrence_id, "window_start":request.window_start, "window_end":request.window_end, "rule":request.rule}})).map_err(|_| "confirmation_unavailable")?;
-            let action = agent_ops::bind_provider_series_rule(&cfg, agent_ops::bind_provider_exception(&cfg, agent_ops::bind_provider_zoned_time(&cfg, agent_ops::bind_provider_calendar_time(&cfg, proposed)?)?)?)?;
+            let action = agent_ops::bind_provider_series_rule(
+                &cfg,
+                agent_ops::bind_provider_exception(
+                    &cfg,
+                    agent_ops::bind_provider_zoned_time(
+                        &cfg,
+                        agent_ops::bind_provider_calendar_time(&cfg, proposed)?,
+                    )?,
+                )?,
+            )?;
             let preview = agent_ops::preview_for_pending_action_with_config(&cfg, &action)?;
             let turn_id = turn_id_from_request_id(&request.request_id)?;
-            let owner = isyncyou_agent::PendingOwnerBinding { account:request.account.clone(), session_id:request.session_id.clone(), request_id:request.request_id.clone(), turn_id:turn_id.clone() };
-            let (pending, token) = self.pending.register_bound(action, preview.text, unix_now_ms(), AGENT_CONFIRM_TTL_MS, owner.clone()).map_err(|_| "confirmation_unavailable")?;
+            let owner = isyncyou_agent::PendingOwnerBinding {
+                account: request.account.clone(),
+                session_id: request.session_id.clone(),
+                request_id: request.request_id.clone(),
+                turn_id: turn_id.clone(),
+            };
+            let (pending, token) = self
+                .pending
+                .register_bound(
+                    action,
+                    preview.text,
+                    unix_now_ms(),
+                    AGENT_CONFIRM_TTL_MS,
+                    owner.clone(),
+                )
+                .map_err(|_| "confirmation_unavailable")?;
             let result = (|| {
-                let installation = account_lifecycle_repository(&self.oauth_dir)?.load_existing().map_err(|_| "lifecycle_unavailable")?.ok_or("lifecycle_unavailable")?;
+                let installation = account_lifecycle_repository(&self.oauth_dir)?
+                    .load_existing()
+                    .map_err(|_| "lifecycle_unavailable")?
+                    .ok_or("lifecycle_unavailable")?;
                 let transport_token = session_transport_token(&cfg, &request.account)?;
-                registry.append_user_pending(&transport_token, &owner, installation.principal(), unix_now_ms())
+                registry.append_user_pending(
+                    &transport_token,
+                    &owner,
+                    installation.principal(),
+                    unix_now_ms(),
+                )
             })();
             if let Err(error) = result {
-                let _ = self.pending.cancel(&pending.id, &pending.action_hash, unix_now_ms());
-                if let (Ok(repository), Ok(transport_token)) = (account_lifecycle_repository(&self.oauth_dir), session_transport_token(&cfg, &request.account)) {
-                    if let Ok(Some(installation)) = repository.load_existing() { let _ = registry.append_pending_cancelled(&transport_token, &owner, installation.principal(), unix_now_ms()); }
+                let _ = self
+                    .pending
+                    .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                if let (Ok(repository), Ok(transport_token)) = (
+                    account_lifecycle_repository(&self.oauth_dir),
+                    session_transport_token(&cfg, &request.account),
+                ) {
+                    if let Ok(Some(installation)) = repository.load_existing() {
+                        let _ = registry.append_pending_cancelled(
+                            &transport_token,
+                            &owner,
+                            installation.principal(),
+                            unix_now_ms(),
+                        );
+                    }
                 }
                 return Err(error);
             }
-            Ok(serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}))
+            Ok(
+                serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}),
+            )
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _ = request; Err("confirmation_unavailable".into()) }
-    }
-    fn prepare_calendar_text(&self, request:&isyncyou_webui::AgentCalendarTextPrepareRequest) -> Result<serde_json::Value, String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            if !self.pending.is_persistent() { return Err("confirmation_unavailable".into()); }
+            let _ = request;
+            Err("confirmation_unavailable".into())
+        }
+    }
+    fn prepare_calendar_text(
+        &self,
+        request: &isyncyou_webui::AgentCalendarTextPrepareRequest,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            if !self.pending.is_persistent() {
+                return Err("confirmation_unavailable".into());
+            }
             let cfg = self.runtime_config();
-            if !cfg.provider_accounts.contains_key(&request.account) { return Err("provider_unavailable".into()); }
-            let credentials = agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-            let registry = product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
-            if registry.account_for(&request.session_id)? != request.account { return Err("session_account_mismatch".into()); }
+            if !cfg.provider_accounts.contains_key(&request.account) {
+                return Err("provider_unavailable".into());
+            }
+            let credentials =
+                agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
+            let registry =
+                product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
+            if registry.account_for(&request.session_id)? != request.account {
+                return Err("session_account_mismatch".into());
+            }
             let proposed = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":"calendar", "target":request.href,
                 "change":{"verb":"calendar_set_text", "collection":request.collection, "uid":request.uid, "recurrence_id":request.recurrence_id, "field":request.field, "new_value":request.new_value}})).map_err(|_| "confirmation_unavailable")?;
             let action = agent_ops::bind_provider_calendar_text(&cfg, proposed)?;
             let preview = agent_ops::preview_for_pending_action_with_config(&cfg, &action)?;
             let turn_id = turn_id_from_request_id(&request.request_id)?;
-            let owner = isyncyou_agent::PendingOwnerBinding { account:request.account.clone(), session_id:request.session_id.clone(), request_id:request.request_id.clone(), turn_id:turn_id.clone() };
-            let (pending, token) = self.pending.register_bound(action, preview.text, unix_now_ms(), AGENT_CONFIRM_TTL_MS, owner.clone()).map_err(|_| "confirmation_unavailable")?;
+            let owner = isyncyou_agent::PendingOwnerBinding {
+                account: request.account.clone(),
+                session_id: request.session_id.clone(),
+                request_id: request.request_id.clone(),
+                turn_id: turn_id.clone(),
+            };
+            let (pending, token) = self
+                .pending
+                .register_bound(
+                    action,
+                    preview.text,
+                    unix_now_ms(),
+                    AGENT_CONFIRM_TTL_MS,
+                    owner.clone(),
+                )
+                .map_err(|_| "confirmation_unavailable")?;
             let result = (|| {
-                let installation = account_lifecycle_repository(&self.oauth_dir)?.load_existing().map_err(|_| "lifecycle_unavailable")?.ok_or("lifecycle_unavailable")?;
+                let installation = account_lifecycle_repository(&self.oauth_dir)?
+                    .load_existing()
+                    .map_err(|_| "lifecycle_unavailable")?
+                    .ok_or("lifecycle_unavailable")?;
                 let transport_token = session_transport_token(&cfg, &request.account)?;
-                registry.append_user_pending(&transport_token, &owner, installation.principal(), unix_now_ms())
+                registry.append_user_pending(
+                    &transport_token,
+                    &owner,
+                    installation.principal(),
+                    unix_now_ms(),
+                )
             })();
             if let Err(error) = result {
-                let _ = self.pending.cancel(&pending.id, &pending.action_hash, unix_now_ms());
-                if let (Ok(repository), Ok(transport_token)) = (account_lifecycle_repository(&self.oauth_dir), session_transport_token(&cfg, &request.account)) {
-                    if let Ok(Some(installation)) = repository.load_existing() { let _ = registry.append_pending_cancelled(&transport_token, &owner, installation.principal(), unix_now_ms()); }
+                let _ = self
+                    .pending
+                    .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                if let (Ok(repository), Ok(transport_token)) = (
+                    account_lifecycle_repository(&self.oauth_dir),
+                    session_transport_token(&cfg, &request.account),
+                ) {
+                    if let Ok(Some(installation)) = repository.load_existing() {
+                        let _ = registry.append_pending_cancelled(
+                            &transport_token,
+                            &owner,
+                            installation.principal(),
+                            unix_now_ms(),
+                        );
+                    }
                 }
                 return Err(error);
             }
-            Ok(serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}))
+            Ok(
+                serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}),
+            )
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _ = request; Err("confirmation_unavailable".into()) }
-    }
-    fn prepare_task_completion(&self, request:&isyncyou_webui::AgentTaskCompletionPrepareRequest) -> Result<serde_json::Value, String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            if !self.pending.is_persistent() { return Err("confirmation_unavailable".into()); }
+            let _ = request;
+            Err("confirmation_unavailable".into())
+        }
+    }
+    fn prepare_task_completion(
+        &self,
+        request: &isyncyou_webui::AgentTaskCompletionPrepareRequest,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            if !self.pending.is_persistent() {
+                return Err("confirmation_unavailable".into());
+            }
             let cfg = self.runtime_config();
-            if !cfg.provider_accounts.contains_key(&request.account) { return Err("provider_unavailable".into()); }
-            let credentials = agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-            let registry = product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
-            if registry.account_for(&request.session_id)? != request.account { return Err("session_account_mismatch".into()); }
+            if !cfg.provider_accounts.contains_key(&request.account) {
+                return Err("provider_unavailable".into());
+            }
+            let credentials =
+                agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
+            let registry =
+                product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
+            if registry.account_for(&request.session_id)? != request.account {
+                return Err("session_account_mismatch".into());
+            }
             let proposed = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":"calendar", "target":request.href,
                 "change":{"verb":"task_set_completion", "collection":request.collection, "uid":request.uid, "recurrence_id":request.recurrence_id, "complete":request.complete}})).map_err(|_| "confirmation_unavailable")?;
             let action = agent_ops::bind_provider_task_completion(&cfg, proposed)?;
             let preview = agent_ops::preview_for_pending_action_with_config(&cfg, &action)?;
             let turn_id = turn_id_from_request_id(&request.request_id)?;
-            let owner = isyncyou_agent::PendingOwnerBinding { account:request.account.clone(), session_id:request.session_id.clone(), request_id:request.request_id.clone(), turn_id:turn_id.clone() };
-            let (pending, token) = self.pending.register_bound(action, preview.text, unix_now_ms(), AGENT_CONFIRM_TTL_MS, owner.clone()).map_err(|_| "confirmation_unavailable")?;
+            let owner = isyncyou_agent::PendingOwnerBinding {
+                account: request.account.clone(),
+                session_id: request.session_id.clone(),
+                request_id: request.request_id.clone(),
+                turn_id: turn_id.clone(),
+            };
+            let (pending, token) = self
+                .pending
+                .register_bound(
+                    action,
+                    preview.text,
+                    unix_now_ms(),
+                    AGENT_CONFIRM_TTL_MS,
+                    owner.clone(),
+                )
+                .map_err(|_| "confirmation_unavailable")?;
             let result = (|| {
-                let installation = account_lifecycle_repository(&self.oauth_dir)?.load_existing().map_err(|_| "lifecycle_unavailable")?.ok_or("lifecycle_unavailable")?;
+                let installation = account_lifecycle_repository(&self.oauth_dir)?
+                    .load_existing()
+                    .map_err(|_| "lifecycle_unavailable")?
+                    .ok_or("lifecycle_unavailable")?;
                 let transport_token = session_transport_token(&cfg, &request.account)?;
-                registry.append_user_pending(&transport_token, &owner, installation.principal(), unix_now_ms())
+                registry.append_user_pending(
+                    &transport_token,
+                    &owner,
+                    installation.principal(),
+                    unix_now_ms(),
+                )
             })();
             if let Err(error) = result {
-                let _ = self.pending.cancel(&pending.id, &pending.action_hash, unix_now_ms());
-                if let (Ok(repository), Ok(transport_token)) = (account_lifecycle_repository(&self.oauth_dir), session_transport_token(&cfg, &request.account)) {
-                    if let Ok(Some(installation)) = repository.load_existing() { let _ = registry.append_pending_cancelled(&transport_token, &owner, installation.principal(), unix_now_ms()); }
+                let _ = self
+                    .pending
+                    .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                if let (Ok(repository), Ok(transport_token)) = (
+                    account_lifecycle_repository(&self.oauth_dir),
+                    session_transport_token(&cfg, &request.account),
+                ) {
+                    if let Ok(Some(installation)) = repository.load_existing() {
+                        let _ = registry.append_pending_cancelled(
+                            &transport_token,
+                            &owner,
+                            installation.principal(),
+                            unix_now_ms(),
+                        );
+                    }
                 }
                 return Err(error);
             }
-            Ok(serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}))
+            Ok(
+                serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}),
+            )
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _ = request; Err("confirmation_unavailable".into()) }
-    }
-    fn prepare_contact_name(&self, request:&isyncyou_webui::AgentContactNamePrepareRequest) -> Result<serde_json::Value, String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         {
-            if !self.pending.is_persistent() { return Err("confirmation_unavailable".into()); }
+            let _ = request;
+            Err("confirmation_unavailable".into())
+        }
+    }
+    fn prepare_contact_name(
+        &self,
+        request: &isyncyou_webui::AgentContactNamePrepareRequest,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            if !self.pending.is_persistent() {
+                return Err("confirmation_unavailable".into());
+            }
             let cfg = self.runtime_config();
-            if !cfg.provider_accounts.contains_key(&request.account) { return Err("provider_unavailable".into()); }
-            let credentials = agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-            let registry = product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
-            if registry.account_for(&request.session_id)? != request.account { return Err("session_account_mismatch".into()); }
+            if !cfg.provider_accounts.contains_key(&request.account) {
+                return Err("provider_unavailable".into());
+            }
+            let credentials =
+                agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
+            let registry =
+                product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
+            if registry.account_for(&request.session_id)? != request.account {
+                return Err("session_account_mismatch".into());
+            }
             let proposed = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":"contacts", "target":request.href,
                 "change":{"verb":"contact_set_name", "collection":request.collection, "new_name":request.new_name}})).map_err(|_| "confirmation_unavailable")?;
             let action = agent_ops::bind_provider_contact_name(&cfg, proposed)?;
             let preview = agent_ops::preview_for_pending_action(&action)?;
             let turn_id = turn_id_from_request_id(&request.request_id)?;
-            let owner = isyncyou_agent::PendingOwnerBinding { account:request.account.clone(), session_id:request.session_id.clone(), request_id:request.request_id.clone(), turn_id:turn_id.clone() };
-            let (pending, token) = self.pending.register_bound(action, preview.text, unix_now_ms(), AGENT_CONFIRM_TTL_MS, owner.clone()).map_err(|_| "confirmation_unavailable")?;
+            let owner = isyncyou_agent::PendingOwnerBinding {
+                account: request.account.clone(),
+                session_id: request.session_id.clone(),
+                request_id: request.request_id.clone(),
+                turn_id: turn_id.clone(),
+            };
+            let (pending, token) = self
+                .pending
+                .register_bound(
+                    action,
+                    preview.text,
+                    unix_now_ms(),
+                    AGENT_CONFIRM_TTL_MS,
+                    owner.clone(),
+                )
+                .map_err(|_| "confirmation_unavailable")?;
             let result = (|| {
-                let installation = account_lifecycle_repository(&self.oauth_dir)?.load_existing().map_err(|_| "lifecycle_unavailable")?.ok_or("lifecycle_unavailable")?;
+                let installation = account_lifecycle_repository(&self.oauth_dir)?
+                    .load_existing()
+                    .map_err(|_| "lifecycle_unavailable")?
+                    .ok_or("lifecycle_unavailable")?;
                 let transport_token = session_transport_token(&cfg, &request.account)?;
-                registry.append_user_pending(&transport_token, &owner, installation.principal(), unix_now_ms())
+                registry.append_user_pending(
+                    &transport_token,
+                    &owner,
+                    installation.principal(),
+                    unix_now_ms(),
+                )
             })();
             if let Err(error) = result {
-                let _ = self.pending.cancel(&pending.id, &pending.action_hash, unix_now_ms());
-                if let (Ok(repository), Ok(transport_token)) = (account_lifecycle_repository(&self.oauth_dir), session_transport_token(&cfg, &request.account)) {
-                    if let Ok(Some(installation)) = repository.load_existing() { let _ = registry.append_pending_cancelled(&transport_token, &owner, installation.principal(), unix_now_ms()); }
+                let _ = self
+                    .pending
+                    .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                if let (Ok(repository), Ok(transport_token)) = (
+                    account_lifecycle_repository(&self.oauth_dir),
+                    session_transport_token(&cfg, &request.account),
+                ) {
+                    if let Ok(Some(installation)) = repository.load_existing() {
+                        let _ = registry.append_pending_cancelled(
+                            &transport_token,
+                            &owner,
+                            installation.principal(),
+                            unix_now_ms(),
+                        );
+                    }
                 }
                 return Err(error);
             }
-            Ok(serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}))
+            Ok(
+                serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}),
+            )
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _ = request; Err("confirmation_unavailable".into()) }
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
+        {
+            let _ = request;
+            Err("confirmation_unavailable".into())
+        }
     }
     fn composer_identities(&self, account: &str) -> Result<serde_json::Value, String> {
         let cfg = self.runtime_config();
         let client = isyncyou_engine::self_hosted_mail::client(&cfg, account)?;
-        let identities = isyncyou_engine::self_hosted_mail::selectable_sending_identities(&cfg, account, &client)?;
+        let identities = isyncyou_engine::self_hosted_mail::selectable_sending_identities(
+            &cfg, account, &client,
+        )?;
         Ok(serde_json::json!({"identities":identities}))
     }
-    fn prepare_composer_send(&self, request: &isyncyou_webui::AgentComposerPrepareRequest) -> Result<serde_json::Value, String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+    fn prepare_composer_send(
+        &self,
+        request: &isyncyou_webui::AgentComposerPrepareRequest,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
         {
-            if !self.pending.is_persistent() { return Err("confirmation_unavailable".into()); }
+            if !self.pending.is_persistent() {
+                return Err("confirmation_unavailable".into());
+            }
             let cfg = self.runtime_config();
-            cfg.accounts.iter().find(|account| account.id == request.account).ok_or("session_account_unavailable")?;
-            if !cfg.provider_accounts.contains_key(&request.account) { return Err("provider_unavailable".into()); }
-            let credentials = agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
-            let registry = product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
-            if registry.account_for(&request.session_id)? != request.account { return Err("session_account_mismatch".into()); }
+            cfg.accounts
+                .iter()
+                .find(|account| account.id == request.account)
+                .ok_or("session_account_unavailable")?;
+            if !cfg.provider_accounts.contains_key(&request.account) {
+                return Err("provider_unavailable".into());
+            }
+            let credentials =
+                agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
+            let registry =
+                product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
+            if registry.account_for(&request.session_id)? != request.account {
+                return Err("session_account_mismatch".into());
+            }
             let client = isyncyou_engine::self_hosted_mail::client(&cfg, &request.account)?;
-            let prepared = isyncyou_engine::self_hosted_mail::prepare_submission(&cfg, &request.account, &client, &request.email_id, &request.identity_id)?;
-            if ["from", "sender", "replyTo", "to", "cc", "bcc", "header:Importance:asText", "header:Disposition-Notification-To:asAddresses"].iter().any(|key| prepared.email.get(key).is_none()) {
+            let prepared = isyncyou_engine::self_hosted_mail::prepare_submission(
+                &cfg,
+                &request.account,
+                &client,
+                &request.email_id,
+                &request.identity_id,
+            )?;
+            if [
+                "from",
+                "sender",
+                "replyTo",
+                "to",
+                "cc",
+                "bcc",
+                "header:Importance:asText",
+                "header:Disposition-Notification-To:asAddresses",
+            ]
+            .iter()
+            .any(|key| prepared.email.get(key).is_none())
+            {
                 return Err("provider_preview_unavailable".into());
             }
             let action = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":"mail", "change":{
@@ -12526,31 +16724,85 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 "draft_mailbox_id":prepared.draft_mailbox_id, "sent_mailbox_id":prepared.sent_mailbox_id
             }})).map_err(|_| "confirmation_unavailable")?;
             let mut preview = agent_ops::preview_for_pending_action(&action)?;
-            agent_ops::append_verified_submission_preview(&mut preview, &request.account, &prepared.email_id, &prepared.blob_id, &serde_json::json!({"list":[prepared.email]}))?;
+            agent_ops::append_verified_submission_preview(
+                &mut preview,
+                &request.account,
+                &prepared.email_id,
+                &prepared.blob_id,
+                &serde_json::json!({"list":[prepared.email]}),
+            )?;
             let turn_id = turn_id_from_request_id(&request.request_id)?;
-            let owner = isyncyou_agent::PendingOwnerBinding { account:request.account.clone(), session_id:request.session_id.clone(), request_id:request.request_id.clone(), turn_id:turn_id.clone() };
-            let (pending, token) = self.pending.register_bound(action, preview.text, unix_now_ms(), AGENT_CONFIRM_TTL_MS, owner.clone()).map_err(|_| "confirmation_unavailable")?;
+            let owner = isyncyou_agent::PendingOwnerBinding {
+                account: request.account.clone(),
+                session_id: request.session_id.clone(),
+                request_id: request.request_id.clone(),
+                turn_id: turn_id.clone(),
+            };
+            let (pending, token) = self
+                .pending
+                .register_bound(
+                    action,
+                    preview.text,
+                    unix_now_ms(),
+                    AGENT_CONFIRM_TTL_MS,
+                    owner.clone(),
+                )
+                .map_err(|_| "confirmation_unavailable")?;
             let result = (|| {
-                let installation = account_lifecycle_repository(&self.oauth_dir)?.load_existing().map_err(|_| "lifecycle_unavailable")?.ok_or("lifecycle_unavailable")?;
+                let installation = account_lifecycle_repository(&self.oauth_dir)?
+                    .load_existing()
+                    .map_err(|_| "lifecycle_unavailable")?
+                    .ok_or("lifecycle_unavailable")?;
                 let transport_token = session_transport_token(&cfg, &request.account)?;
-                registry.append_user_pending(&transport_token, &owner, installation.principal(), unix_now_ms())
+                registry.append_user_pending(
+                    &transport_token,
+                    &owner,
+                    installation.principal(),
+                    unix_now_ms(),
+                )
             })();
             if let Err(error) = result {
-                let _ = self.pending.cancel(&pending.id, &pending.action_hash, unix_now_ms());
-                if let (Ok(repository), Ok(transport_token)) = (account_lifecycle_repository(&self.oauth_dir), session_transport_token(&cfg, &request.account)) {
+                let _ = self
+                    .pending
+                    .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                if let (Ok(repository), Ok(transport_token)) = (
+                    account_lifecycle_repository(&self.oauth_dir),
+                    session_transport_token(&cfg, &request.account),
+                ) {
                     if let Ok(Some(installation)) = repository.load_existing() {
-                        let _ = registry.append_pending_cancelled(&transport_token, &owner, installation.principal(), unix_now_ms());
+                        let _ = registry.append_pending_cancelled(
+                            &transport_token,
+                            &owner,
+                            installation.principal(),
+                            unix_now_ms(),
+                        );
                     }
                 }
                 return Err(error);
             }
-            Ok(serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}))
+            Ok(
+                serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}),
+            )
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _ = request; Err("confirmation_unavailable".into()) }
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
+        {
+            let _ = request;
+            Err("confirmation_unavailable".into())
+        }
     }
-    fn session_create_for_account(&self, request_id: &str, account: Option<&str>, display_name: Option<&str>) -> Result<serde_json::Value, String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+    fn session_create_for_account(
+        &self,
+        request_id: &str,
+        account: Option<&str>,
+        display_name: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
         {
             let cfg = self.runtime_config();
             let account = match account {
@@ -12558,16 +16810,33 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 None => Self::product_session_account(&cfg)?,
                 _ => return Err("session_account_unavailable".into()),
             };
-            let store = agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable".to_string())?;
-            let session = product_session::ProductSessionRegistry::new(&store).with_config(&cfg).create(account, request_id, display_name, unix_now_ms())?;
+            let store = agent_credential_store(&self.oauth_dir)
+                .map_err(|_| "session_store_unavailable".to_string())?;
+            let session = product_session::ProductSessionRegistry::new(&store)
+                .with_config(&cfg)
+                .create(account, request_id, display_name, unix_now_ms())?;
             Ok(serde_json::json!({"selected_session_id":session.session_id,"session":session}))
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _ = (request_id, account, display_name); Err("product_sessions_unavailable".into()) }
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
+        {
+            let _ = (request_id, account, display_name);
+            Err("product_sessions_unavailable".into())
+        }
     }
 
-    fn session_list_for_account(&self, account: Option<&str>, cursor: Option<&str>, limit: Option<usize>) -> Result<serde_json::Value, String> {
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+    fn session_list_for_account(
+        &self,
+        account: Option<&str>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
         {
             let cfg = self.runtime_config();
             let account = match account {
@@ -12575,11 +16844,23 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 None => Self::product_session_account(&cfg)?,
                 _ => return Err("session_account_unavailable".into()),
             };
-            let store = agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable".to_string())?;
-            serde_json::to_value(product_session::ProductSessionRegistry::new(&store).with_config(&cfg).list_page(account, cursor, limit)?).map_err(|_| "session_store_unavailable".into())
+            let store = agent_credential_store(&self.oauth_dir)
+                .map_err(|_| "session_store_unavailable".to_string())?;
+            serde_json::to_value(
+                product_session::ProductSessionRegistry::new(&store)
+                    .with_config(&cfg)
+                    .list_page(account, cursor, limit)?,
+            )
+            .map_err(|_| "session_store_unavailable".into())
         }
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
-        { let _ = (account, cursor, limit); Err("product_sessions_unavailable".into()) }
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
+        {
+            let _ = (account, cursor, limit);
+            Err("product_sessions_unavailable".into())
+        }
     }
 
     fn session_create(
@@ -12596,12 +16877,9 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             let account = Self::product_session_account(&cfg)?;
             let store = agent_credential_store(&self.oauth_dir)
                 .map_err(|_| "session_store_unavailable".to_string())?;
-            let session = product_session::ProductSessionRegistry::new(&store).with_config(&cfg).create(
-                account,
-                request_id,
-                display_name,
-                unix_now_ms(),
-            )?;
+            let session = product_session::ProductSessionRegistry::new(&store)
+                .with_config(&cfg)
+                .create(account, request_id, display_name, unix_now_ms())?;
             Ok(serde_json::json!({
                 "session": session,
                 "selected_session_id": session.session_id,
@@ -12631,7 +16909,8 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             let account = Self::product_session_account(&cfg)?;
             let store = agent_credential_store(&self.oauth_dir)
                 .map_err(|_| "session_store_unavailable".to_string())?;
-            let page = product_session::ProductSessionRegistry::new(&store).with_config(&cfg)
+            let page = product_session::ProductSessionRegistry::new(&store)
+                .with_config(&cfg)
                 .list_page(account, cursor, limit)?;
             serde_json::to_value(page).map_err(|_| "session_store_unavailable".into())
         }
@@ -12806,7 +17085,8 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 let store = agent_credential_store(&self.oauth_dir)
                     .map_err(|_| "session_store_unavailable".to_string())?;
                 let cfg = self.runtime_config();
-                let registry = product_session::ProductSessionRegistry::new(&store).with_config(&cfg);
+                let registry =
+                    product_session::ProductSessionRegistry::new(&store).with_config(&cfg);
                 let account = registry.account_for(session_id)?;
                 let token = session_transport_token(&cfg, &account)?;
                 registry
@@ -12921,7 +17201,8 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             let credential_store = agent_credential_store(&self.oauth_dir)
                 .map_err(|_| "session_store_unavailable".to_string())?;
             let cfg = self.runtime_config();
-            let registry = product_session::ProductSessionRegistry::new(&credential_store).with_config(&cfg);
+            let registry =
+                product_session::ProductSessionRegistry::new(&credential_store).with_config(&cfg);
             let account = registry.account_for(&session_id)?;
             let token = session_transport_token(&cfg, &account)?;
             let archived = registry.archive(&token, &request.request_id, &session_id)?;
@@ -13055,7 +17336,11 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 let _ = control_store.reap_expired(maintenance_now_ms, 256);
             }
             let account = registry.account_for(&request.session_id)?;
-            if self.runtime_config().provider_accounts.contains_key(&account) {
+            if self
+                .runtime_config()
+                .provider_accounts
+                .contains_key(&account)
+            {
                 return Err("pairing_unavailable".into());
             }
             let payload = registry.pairing_payload(&request.session_id)?;
@@ -13607,11 +17892,22 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         let account_id = account.to_string();
         let executor_cfg = self.runtime_config();
         let executor_config_path = Arc::clone(&self.config_path);
-        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
         let executor_control = self.control_store.clone();
-        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
         let executor_control = None;
-        let archive_root = executor_cfg.accounts.iter().find(|a| a.id == account_id).map(|a| a.archive_root.clone()).unwrap_or_default();
+        let archive_root = executor_cfg
+            .accounts
+            .iter()
+            .find(|a| a.id == account_id)
+            .map(|a| a.archive_root.clone())
+            .unwrap_or_default();
         let pending = self.pending.clone();
         #[cfg(any(
             feature = "agent-oauth-providers",
@@ -13626,7 +17922,13 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     feature = "agent-subscription-experimental"
                 ))]
                 let _operation_lease = operation_lease;
-                let exec = make_account_executor(&account_id, archive_root, &executor_cfg, executor_config_path, executor_control);
+                let exec = make_account_executor(
+                    &account_id,
+                    archive_root,
+                    &executor_cfg,
+                    executor_config_path,
+                    executor_control,
+                );
                 let mut history = vec![isyncyou_agent::Message::user(prompt)];
                 let mut events = isyncyou_agent::FallibleTurnEventSink::new(|event| {
                     hub.emit(&tid, event)
@@ -13659,25 +17961,99 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                         );
                     }
                     Ok(isyncyou_agent::TurnOutcome::PendingConfirmation { action, .. }) => {
-                        let (action, preview) = match agent_ops::bind_provider_contact_name(&executor_cfg, *action).and_then(|action| agent_ops::bind_provider_contact_field(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_contact_add(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_contact_remove(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_task_completion(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_task_parent(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_task_attributes(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_calendar_text(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_calendar_time(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_zoned_time(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_cancellation(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_exception(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_series_rule(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_alarm(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_task_occurrence(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_dav_acl(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_invitation_response(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_dav_delete(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_dav_create(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_mail_action(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_related_draft(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_draft(&executor_cfg, action)).and_then(|action| agent_ops::preview_for_pending_action_with_config(&executor_cfg, &action).map(|preview| (action, preview))) {
-                            Ok(value) => value,
-                            Err(e) => {
-                                let _ = hub.emit(
-                                    &tid,
-                                    isyncyou_agent::StreamEvent::Error(
-                                        agent_ops::redact_agent_operation_text(&e),
-                                    ),
-                                );
-                                let _ = hub.emit(
-                                    &tid,
-                                    isyncyou_agent::StreamEvent::done(
-                                        isyncyou_agent::DoneReason::Error,
-                                    ),
-                                );
-                                hub.close(&tid);
-                                return;
-                            }
-                        };
+                        let (action, preview) =
+                            match agent_ops::bind_provider_contact_name(&executor_cfg, *action)
+                                .and_then(|action| {
+                                    agent_ops::bind_provider_contact_field(&executor_cfg, action)
+                                })
+                                .and_then(|action| {
+                                    agent_ops::bind_provider_contact_add(&executor_cfg, action)
+                                })
+                                .and_then(|action| {
+                                    agent_ops::bind_provider_contact_remove(&executor_cfg, action)
+                                })
+                                .and_then(|action| {
+                                    agent_ops::bind_provider_task_completion(&executor_cfg, action)
+                                })
+                                .and_then(|action| {
+                                    agent_ops::bind_provider_task_parent(&executor_cfg, action)
+                                })
+                                .and_then(|action| {
+                                    agent_ops::bind_provider_task_attributes(&executor_cfg, action)
+                                })
+                                .and_then(|action| {
+                                    agent_ops::bind_provider_calendar_text(&executor_cfg, action)
+                                })
+                                .and_then(|action| {
+                                    agent_ops::bind_provider_calendar_time(&executor_cfg, action)
+                                })
+                                .and_then(|action| {
+                                    agent_ops::bind_provider_zoned_time(&executor_cfg, action)
+                                })
+                                .and_then(|action| {
+                                    agent_ops::bind_provider_cancellation(&executor_cfg, action)
+                                })
+                                .and_then(|action| {
+                                    agent_ops::bind_provider_exception(&executor_cfg, action)
+                                })
+                                .and_then(|action| {
+                                    agent_ops::bind_provider_series_rule(&executor_cfg, action)
+                                })
+                                .and_then(|action| {
+                                    agent_ops::bind_provider_alarm(&executor_cfg, action)
+                                })
+                                .and_then(|action| {
+                                    agent_ops::bind_provider_task_occurrence(&executor_cfg, action)
+                                })
+                                .and_then(|action| {
+                                    agent_ops::bind_provider_dav_acl(&executor_cfg, action)
+                                })
+                                .and_then(|action| {
+                                    agent_ops::bind_provider_invitation_response(
+                                        &executor_cfg,
+                                        action,
+                                    )
+                                })
+                                .and_then(|action| {
+                                    agent_ops::bind_provider_dav_delete(&executor_cfg, action)
+                                })
+                                .and_then(|action| {
+                                    agent_ops::bind_provider_dav_create(&executor_cfg, action)
+                                })
+                                .and_then(|action| {
+                                    agent_ops::bind_provider_mail_action(&executor_cfg, action)
+                                })
+                                .and_then(|action| {
+                                    agent_ops::bind_provider_related_draft(&executor_cfg, action)
+                                })
+                                .and_then(|action| {
+                                    agent_ops::bind_provider_draft(&executor_cfg, action)
+                                })
+                                .and_then(|action| {
+                                    agent_ops::preview_for_pending_action_with_config(
+                                        &executor_cfg,
+                                        &action,
+                                    )
+                                    .map(|preview| (action, preview))
+                                }) {
+                                Ok(value) => value,
+                                Err(e) => {
+                                    let _ = hub.emit(
+                                        &tid,
+                                        isyncyou_agent::StreamEvent::Error(
+                                            agent_ops::redact_agent_operation_text(&e),
+                                        ),
+                                    );
+                                    let _ = hub.emit(
+                                        &tid,
+                                        isyncyou_agent::StreamEvent::done(
+                                            isyncyou_agent::DoneReason::Error,
+                                        ),
+                                    );
+                                    hub.close(&tid);
+                                    return;
+                                }
+                            };
                         let _risk = preview.risk.as_str();
                         match pending.register_bound(
                             action,
@@ -13906,7 +18282,8 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                         }
                         let store = agent_credential_store(&worker.oauth_dir)
                             .map_err(|_| "session_store_unavailable".to_string())?;
-                        let registry = product_session::ProductSessionRegistry::new(&store).with_config(&cfg);
+                        let registry =
+                            product_session::ProductSessionRegistry::new(&store).with_config(&cfg);
                         let product_turn =
                             registry.begin_turn(product_session::ProductTurnRequest {
                                 graph_token: &token,
@@ -14182,7 +18559,8 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             turn_request_id: command.owner.turn_request_id.clone(),
             turn_id: command.owner.turn_id.clone(),
         };
-        #[cfg(debug_assertions)] let consume_started=std::time::Instant::now();
+        #[cfg(debug_assertions)]
+        let consume_started = std::time::Instant::now();
         let action = match self.pending.confirm(
             &command.pending,
             &command.token,
@@ -14215,7 +18593,11 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 return isyncyou_webui::AgentConfirmOutcome::OutcomeUnknown;
             }
         };
-        #[cfg(debug_assertions)] eprintln!("agent_confirm_phase=pending_consume duration_ms={}",consume_started.elapsed().as_millis());
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "agent_confirm_phase=pending_consume duration_ms={}",
+            consume_started.elapsed().as_millis()
+        );
         self.turns.remove_pending(&command.pending);
         if action.policy() != isyncyou_agent::ToolPolicy::ConfirmedEffectNeverRepeat
             || agent_ops::preview_for_pending_action(&action).is_err()
@@ -14287,17 +18669,29 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 isyncyou_webui::AgentConfirmOutcome::OutcomeUnknown
             };
         }
-        #[cfg(debug_assertions)] let executor_started=std::time::Instant::now();
-        let execution = if matches!(&*action, isyncyou_agent::ToolAction::LiveWrite { service,change,.. } if service=="contacts" && change.get("verb").and_then(serde_json::Value::as_str)==Some("contact_set_photo")) {
-            self.execute_confirmed_contact_photo(&action,&command.pending,&command.action_hash)
-        } else if matches!(&*action, isyncyou_agent::ToolAction::LiveWrite { service,change,.. } if service=="calendar" && change.get("verb").and_then(serde_json::Value::as_str)==Some("single_capture")) {
-            self.execute_confirmed_single_capture(&action,&command.pending,&command.action_hash)
-        } else if matches!(&*action, isyncyou_agent::ToolAction::LiveWrite { service,change,.. } if service=="calendar" && change.get("verb").and_then(serde_json::Value::as_str)==Some("recovery_jobs")) {
-            self.execute_confirmed_recovery_jobs(&action,&command.pending,&command.action_hash)
-        } else if matches!(&*action, isyncyou_agent::ToolAction::LiveWrite { service,change,.. } if service=="calendar" && change.get("verb").and_then(serde_json::Value::as_str)==Some("recovery_batch_import")) {
-            self.execute_confirmed_recovery_batch(&action,&command.pending,&command.action_hash)
-        } else { self.confirmed_executor.execute_confirmed_bound(&action, &command.pending) };
-        #[cfg(debug_assertions)] eprintln!("agent_confirm_phase=executor duration_ms={}",executor_started.elapsed().as_millis());
+        #[cfg(debug_assertions)]
+        let executor_started = std::time::Instant::now();
+        let execution = if matches!(&*action, isyncyou_agent::ToolAction::LiveWrite { service,change,.. } if service=="contacts" && change.get("verb").and_then(serde_json::Value::as_str)==Some("contact_set_photo"))
+        {
+            self.execute_confirmed_contact_photo(&action, &command.pending, &command.action_hash)
+        } else if matches!(&*action, isyncyou_agent::ToolAction::LiveWrite { service,change,.. } if service=="calendar" && change.get("verb").and_then(serde_json::Value::as_str)==Some("single_capture"))
+        {
+            self.execute_confirmed_single_capture(&action, &command.pending, &command.action_hash)
+        } else if matches!(&*action, isyncyou_agent::ToolAction::LiveWrite { service,change,.. } if service=="calendar" && change.get("verb").and_then(serde_json::Value::as_str)==Some("recovery_jobs"))
+        {
+            self.execute_confirmed_recovery_jobs(&action, &command.pending, &command.action_hash)
+        } else if matches!(&*action, isyncyou_agent::ToolAction::LiveWrite { service,change,.. } if service=="calendar" && change.get("verb").and_then(serde_json::Value::as_str)==Some("recovery_batch_import"))
+        {
+            self.execute_confirmed_recovery_batch(&action, &command.pending, &command.action_hash)
+        } else {
+            self.confirmed_executor
+                .execute_confirmed_bound(&action, &command.pending)
+        };
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "agent_confirm_phase=executor duration_ms={}",
+            executor_started.elapsed().as_millis()
+        );
         match execution {
             ConfirmedExecutionOutcome::Completed(_internal_result) => {
                 if self
@@ -14339,9 +18733,18 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 isyncyou_webui::AgentConfirmOutcome::Completed
             }
             ConfirmedExecutionOutcome::Failed(code) => {
-                let outcome_code = match code { ClosedExecutionCode::ProviderRejected | ClosedExecutionCode::ProviderActionRejected => "provider_rejected", ClosedExecutionCode::ProviderConflict => "provider_conflict", _ => "failed" };
+                let outcome_code = match code {
+                    ClosedExecutionCode::ProviderRejected
+                    | ClosedExecutionCode::ProviderActionRejected => "provider_rejected",
+                    ClosedExecutionCode::ProviderConflict => "provider_conflict",
+                    _ => "failed",
+                };
                 if self
-                    .finish_pending_confirmation_state(&command.pending, outcome_code, unix_now_ms())
+                    .finish_pending_confirmation_state(
+                        &command.pending,
+                        outcome_code,
+                        unix_now_ms(),
+                    )
                     .is_err()
                 {
                     agent_authorization_diagnostics().record_projection_failure();
@@ -14369,7 +18772,16 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                         ClosedAuthorizationCode::ExecutorRejected
                     }
                     ClosedExecutionCode::ExecutorFailed => ClosedAuthorizationCode::ExecutorFailed,
-                    ClosedExecutionCode::ProviderRejected | ClosedExecutionCode::ProviderActionRejected | ClosedExecutionCode::ProviderConflict | ClosedExecutionCode::DavPreDispatch(_) | ClosedExecutionCode::CaptureSourceUnavailable | ClosedExecutionCode::CaptureVersionChanged | ClosedExecutionCode::CaptureChallengeUnavailable | ClosedExecutionCode::CaptureJournalUnavailable => ClosedAuthorizationCode::ExecutorRejected,
+                    ClosedExecutionCode::ProviderRejected
+                    | ClosedExecutionCode::ProviderActionRejected
+                    | ClosedExecutionCode::ProviderConflict
+                    | ClosedExecutionCode::DavPreDispatch(_)
+                    | ClosedExecutionCode::CaptureSourceUnavailable
+                    | ClosedExecutionCode::CaptureVersionChanged
+                    | ClosedExecutionCode::CaptureChallengeUnavailable
+                    | ClosedExecutionCode::CaptureJournalUnavailable => {
+                        ClosedAuthorizationCode::ExecutorRejected
+                    }
                 };
                 let event = AgentAuthorizationAuditV1 {
                     state: AuthorizationAuditState::Failed,
@@ -14390,15 +18802,33 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     ClosedExecutionCode::ExecutorFailed => {
                         isyncyou_webui::ClosedConfirmationFailure::ExecutorFailed
                     }
-                    ClosedExecutionCode::ProviderRejected => isyncyou_webui::ClosedConfirmationFailure::ProviderRejected,
-                    ClosedExecutionCode::ProviderActionRejected => isyncyou_webui::ClosedConfirmationFailure::ProviderActionRejected,
-                    ClosedExecutionCode::ProviderConflict => isyncyou_webui::ClosedConfirmationFailure::ProviderConflict,
-                    ClosedExecutionCode::DavPreDispatch(isyncyou_engine::dav_write::DavPreDispatchStage::Discovery) => isyncyou_webui::ClosedConfirmationFailure::DavDiscoveryUnavailable,
-                    ClosedExecutionCode::DavPreDispatch(_) => isyncyou_webui::ClosedConfirmationFailure::DavPreDispatchFailed,
-                    ClosedExecutionCode::CaptureSourceUnavailable => isyncyou_webui::ClosedConfirmationFailure::CaptureSourceUnavailable,
-                    ClosedExecutionCode::CaptureVersionChanged => isyncyou_webui::ClosedConfirmationFailure::CaptureVersionChanged,
-                    ClosedExecutionCode::CaptureChallengeUnavailable => isyncyou_webui::ClosedConfirmationFailure::CaptureChallengeUnavailable,
-                    ClosedExecutionCode::CaptureJournalUnavailable => isyncyou_webui::ClosedConfirmationFailure::CaptureJournalUnavailable,
+                    ClosedExecutionCode::ProviderRejected => {
+                        isyncyou_webui::ClosedConfirmationFailure::ProviderRejected
+                    }
+                    ClosedExecutionCode::ProviderActionRejected => {
+                        isyncyou_webui::ClosedConfirmationFailure::ProviderActionRejected
+                    }
+                    ClosedExecutionCode::ProviderConflict => {
+                        isyncyou_webui::ClosedConfirmationFailure::ProviderConflict
+                    }
+                    ClosedExecutionCode::DavPreDispatch(
+                        isyncyou_engine::dav_write::DavPreDispatchStage::Discovery,
+                    ) => isyncyou_webui::ClosedConfirmationFailure::DavDiscoveryUnavailable,
+                    ClosedExecutionCode::DavPreDispatch(_) => {
+                        isyncyou_webui::ClosedConfirmationFailure::DavPreDispatchFailed
+                    }
+                    ClosedExecutionCode::CaptureSourceUnavailable => {
+                        isyncyou_webui::ClosedConfirmationFailure::CaptureSourceUnavailable
+                    }
+                    ClosedExecutionCode::CaptureVersionChanged => {
+                        isyncyou_webui::ClosedConfirmationFailure::CaptureVersionChanged
+                    }
+                    ClosedExecutionCode::CaptureChallengeUnavailable => {
+                        isyncyou_webui::ClosedConfirmationFailure::CaptureChallengeUnavailable
+                    }
+                    ClosedExecutionCode::CaptureJournalUnavailable => {
+                        isyncyou_webui::ClosedConfirmationFailure::CaptureJournalUnavailable
+                    }
                 })
             }
             ConfirmedExecutionOutcome::OutcomeUnknown => {
@@ -15383,7 +19813,10 @@ pub struct DaemonSettings {
 impl isyncyou_webui::SettingsHandler for DaemonSettings {
     fn set_poll_interval_secs(&self, secs: u64) -> Result<(), String> {
         let secs = secs.clamp(1, 3600);
-        Config::update_atomically(&self.config_path, |cfg| { cfg.sync.poll_interval_secs = secs; Ok(()) })?;
+        Config::update_atomically(&self.config_path, |cfg| {
+            cfg.sync.poll_interval_secs = secs;
+            Ok(())
+        })?;
         self.live_interval.store(secs, Ordering::Relaxed);
         Ok(())
     }
@@ -15413,8 +19846,12 @@ impl isyncyou_webui::OneDriveModeHandler for DaemonOneDriveMode {
         Config::update_atomically(&self.config_path, |cfg| {
             let modes = cfg.onedrive_modes.entry(account.to_string()).or_default();
             match mode {
-                Some(m) => { modes.folder_modes.insert(folder_id.to_string(), m); }
-                None => { modes.folder_modes.remove(folder_id); }
+                Some(m) => {
+                    modes.folder_modes.insert(folder_id.to_string(), m);
+                }
+                None => {
+                    modes.folder_modes.remove(folder_id);
+                }
             }
             Ok(())
         })
@@ -15440,16 +19877,22 @@ thread_local! {
 }
 
 impl DaemonMailWrite {
-    fn with_locked_runtime_config<T>(&self, action:impl FnOnce(&Config)->Result<T,String>) -> Result<T,String> {
+    fn with_locked_runtime_config<T>(
+        &self,
+        action: impl FnOnce(&Config) -> Result<T, String>,
+    ) -> Result<T, String> {
         match &self.config_path {
-            Some(path) => Config::with_config_lock(path,|| { let cfg = self.runtime_config()?; action(&cfg) }),
+            Some(path) => Config::with_config_lock(path, || {
+                let cfg = self.runtime_config()?;
+                action(&cfg)
+            }),
             None => action(&self.cfg),
         }
     }
     fn runtime_config(&self) -> Result<Config, String> {
         match &self.config_path {
             None => Ok(self.cfg.clone()),
-            Some(path) => load_host_runtime_config(path)
+            Some(path) => load_host_runtime_config(path),
         }
     }
     fn confirmed_mail_client(&self, account: &str) -> Result<isyncyou_graph::GraphClient, String> {
@@ -15478,7 +19921,20 @@ impl isyncyou_webui::MailWriteHandler for DaemonMailWrite {
     fn provider_store(&self, account: &str) -> Result<isyncyou_store::Store, String> {
         isyncyou_engine::provider_store::open_readonly(&self.runtime_config()?, account)
     }
-    fn provider_create_draft(&self, account: &str, request_id: &str, subject: &str, body: &str, to: &[String], cc: &[String], bcc: &[String], importance: Option<&str>, read_receipt: bool, identity_id: Option<&str>, expected_draft_mailbox: Option<&str>) -> Result<serde_json::Value, String> {
+    fn provider_create_draft(
+        &self,
+        account: &str,
+        request_id: &str,
+        subject: &str,
+        body: &str,
+        to: &[String],
+        cc: &[String],
+        bcc: &[String],
+        importance: Option<&str>,
+        read_receipt: bool,
+        identity_id: Option<&str>,
+        expected_draft_mailbox: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
         let cfg = self.runtime_config()?;
         let store = isyncyou_engine::provider_store::open(&cfg, account)?;
         let client = isyncyou_engine::self_hosted_mail::client(&cfg, account)?;
@@ -15487,125 +19943,266 @@ impl isyncyou_webui::MailWriteHandler for DaemonMailWrite {
         let mut draft = None;
         let mut count = 0usize;
         loop {
-            let page = store.provider_objects_page(&scope, &after, 200).map_err(|_| "provider_mailboxes_unavailable")?;
-            if page.is_empty() { break; }
+            let page = store
+                .provider_objects_page(&scope, &after, 200)
+                .map_err(|_| "provider_mailboxes_unavailable")?;
+            if page.is_empty() {
+                break;
+            }
             for object in page {
-                after = object.remote_id.clone(); count += 1;
-                if count > 1000 { return Err("provider_mailboxes_limit".into()); }
-                let value: serde_json::Value = serde_json::from_slice(&object.raw).map_err(|_| "provider_mailbox_invalid")?;
+                after = object.remote_id.clone();
+                count += 1;
+                if count > 1000 {
+                    return Err("provider_mailboxes_limit".into());
+                }
+                let value: serde_json::Value =
+                    serde_json::from_slice(&object.raw).map_err(|_| "provider_mailbox_invalid")?;
                 if value["role"].as_str() == Some("drafts") {
-                    if draft.replace(object.remote_id).is_some() { return Err("provider_drafts_ambiguous".into()); }
+                    if draft.replace(object.remote_id).is_some() {
+                        return Err("provider_drafts_ambiguous".into());
+                    }
                 }
             }
         }
         let draft = draft.ok_or("provider_drafts_unavailable")?;
-        if expected_draft_mailbox.is_some_and(|expected| expected != draft) { return Err("provider_drafts_changed".into()); }
-        let recipients: Vec<serde_json::Value> = to.iter().map(|email| serde_json::json!({"email":email})).collect();
+        if expected_draft_mailbox.is_some_and(|expected| expected != draft) {
+            return Err("provider_drafts_changed".into());
+        }
+        let recipients: Vec<serde_json::Value> = to
+            .iter()
+            .map(|email| serde_json::json!({"email":email}))
+            .collect();
         let mut email = serde_json::json!({"mailboxIds":{draft:true}, "keywords":{"$draft":true}, "subject":subject, "to":recipients,
             "cc":cc.iter().map(|address| serde_json::json!({"email":address})).collect::<Vec<_>>(),
             "bcc":bcc.iter().map(|address| serde_json::json!({"email":address})).collect::<Vec<_>>(),
             "bodyValues":{"body":{"value":body}}, "htmlBody":[{"partId":"body","type":"text/html"}]});
-        if let Some(value) = importance { email["header:Importance:asText"] = serde_json::json!(value); }
-        if read_receipt {
-            let identity = isyncyou_engine::self_hosted_mail::selected_sending_identity(&cfg, account, &client, identity_id.ok_or("provider_receipt_identity_unavailable")?)?;
-            email["header:Disposition-Notification-To:asAddresses"] = serde_json::json!([{"email":identity.email}]);
+        if let Some(value) = importance {
+            email["header:Importance:asText"] = serde_json::json!(value);
         }
-        match isyncyou_engine::self_hosted_mail::create_draft(&cfg, account, &store, &client, request_id, &email)? {
+        if read_receipt {
+            let identity = isyncyou_engine::self_hosted_mail::selected_sending_identity(
+                &cfg,
+                account,
+                &client,
+                identity_id.ok_or("provider_receipt_identity_unavailable")?,
+            )?;
+            email["header:Disposition-Notification-To:asAddresses"] =
+                serde_json::json!([{"email":identity.email}]);
+        }
+        match isyncyou_engine::self_hosted_mail::create_draft(
+            &cfg, account, &store, &client, request_id, &email,
+        )? {
             isyncyou_engine::self_hosted_mail::SendOutcome::Confirmed(id) => {
-                let synced = isyncyou_engine::self_hosted_mail::sync(&cfg, account, &store, &client).is_ok();
-                Ok(serde_json::json!({"draft_id":id, "sync_state":if synced {"synced"} else {"pending"}}))
+                let synced =
+                    isyncyou_engine::self_hosted_mail::sync(&cfg, account, &store, &client).is_ok();
+                Ok(
+                    serde_json::json!({"draft_id":id, "sync_state":if synced {"synced"} else {"pending"}}),
+                )
             }
-            isyncyou_engine::self_hosted_mail::SendOutcome::Rejected => Err("provider_draft_rejected".into()),
+            isyncyou_engine::self_hosted_mail::SendOutcome::Rejected => {
+                Err("provider_draft_rejected".into())
+            }
             _ => Err("provider_draft_outcome_unknown".into()),
         }
     }
-    fn provider_shared_mail_accounts(&self, account:&str) -> Result<Vec<String>,String> {
-        let cfg = self.runtime_config()?;
-        let client = isyncyou_engine::self_hosted_mail::client(&cfg,account)?;
-        isyncyou_engine::self_hosted_mail::shared_mail_accessible_accounts(&cfg,account,&client)
-    }
-    fn provider_shared_mailbox_ids(&self, account:&str, scope:&str) -> Result<Vec<String>,String> {
-        let cfg = self.runtime_config()?;
-        let client = isyncyou_engine::self_hosted_mail::client(&cfg,account)?;
-        isyncyou_engine::self_hosted_mail::shared_mail_readable_mailboxes(&cfg,account,&client,scope)
-    }
-    fn provider_attachment_list(&self, account:&str, message_id:&str) -> Result<serde_json::Value, String> {
+    fn provider_shared_mail_accounts(&self, account: &str) -> Result<Vec<String>, String> {
         let cfg = self.runtime_config()?;
         let client = isyncyou_engine::self_hosted_mail::client(&cfg, account)?;
-        let attachments = isyncyou_engine::self_hosted_mail::list_attachments(&cfg, account, &client, message_id)?;
+        isyncyou_engine::self_hosted_mail::shared_mail_accessible_accounts(&cfg, account, &client)
+    }
+    fn provider_shared_mailbox_ids(
+        &self,
+        account: &str,
+        scope: &str,
+    ) -> Result<Vec<String>, String> {
+        let cfg = self.runtime_config()?;
+        let client = isyncyou_engine::self_hosted_mail::client(&cfg, account)?;
+        isyncyou_engine::self_hosted_mail::shared_mail_readable_mailboxes(
+            &cfg, account, &client, scope,
+        )
+    }
+    fn provider_attachment_list(
+        &self,
+        account: &str,
+        message_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        let cfg = self.runtime_config()?;
+        let client = isyncyou_engine::self_hosted_mail::client(&cfg, account)?;
+        let attachments = isyncyou_engine::self_hosted_mail::list_attachments(
+            &cfg, account, &client, message_id,
+        )?;
         Ok(serde_json::json!({"attachments":attachments, "provenance":"live"}))
     }
-    fn provider_attachment_download(&self, account:&str, message_id:&str, blob_id:&str) -> Result<isyncyou_webui::ProviderAttachmentDownload, String> {
+    fn provider_attachment_download(
+        &self,
+        account: &str,
+        message_id: &str,
+        blob_id: &str,
+    ) -> Result<isyncyou_webui::ProviderAttachmentDownload, String> {
         let cfg = self.runtime_config()?;
         let client = isyncyou_engine::self_hosted_mail::client(&cfg, account)?;
-        let file = isyncyou_engine::self_hosted_mail::download_attachment(&cfg, account, &client, message_id, blob_id)?;
-        Ok(isyncyou_webui::ProviderAttachmentDownload { filename:file.filename, bytes:file.bytes })
+        let file = isyncyou_engine::self_hosted_mail::download_attachment(
+            &cfg, account, &client, message_id, blob_id,
+        )?;
+        Ok(isyncyou_webui::ProviderAttachmentDownload {
+            filename: file.filename,
+            bytes: file.bytes,
+        })
     }
     fn provider_read_body(&self, account: &str, message_id: &str) -> Result<String, String> {
         let body = self.provider_read_view(account, message_id)?;
-        Ok(if body.incomplete { format!("{}\n\n[Message body is incomplete or has an encoding problem.]", body.content) } else { body.content })
+        Ok(if body.incomplete {
+            format!(
+                "{}\n\n[Message body is incomplete or has an encoding problem.]",
+                body.content
+            )
+        } else {
+            body.content
+        })
     }
-    fn provider_attachment_list_scoped(&self, account:&str, scope:Option<&str>, message_id:&str) -> Result<serde_json::Value,String> {
-        let Some(scope) = scope else { return self.provider_attachment_list(account,message_id); };
+    fn provider_attachment_list_scoped(
+        &self,
+        account: &str,
+        scope: Option<&str>,
+        message_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        let Some(scope) = scope else {
+            return self.provider_attachment_list(account, message_id);
+        };
         let cfg = self.runtime_config()?;
-        let client = isyncyou_engine::self_hosted_mail::client(&cfg,account)?;
-        let attachments = isyncyou_engine::self_hosted_mail::list_attachments_in_scope(&cfg,account,&client,scope,message_id)?;
+        let client = isyncyou_engine::self_hosted_mail::client(&cfg, account)?;
+        let attachments = isyncyou_engine::self_hosted_mail::list_attachments_in_scope(
+            &cfg, account, &client, scope, message_id,
+        )?;
         Ok(serde_json::json!({"attachments":attachments,"provenance":"live"}))
     }
-    fn provider_attachment_download_scoped(&self, account:&str, scope:Option<&str>, message_id:&str, blob_id:&str) -> Result<isyncyou_webui::ProviderAttachmentDownload,String> {
-        let Some(scope) = scope else { return self.provider_attachment_download(account,message_id,blob_id); };
+    fn provider_attachment_download_scoped(
+        &self,
+        account: &str,
+        scope: Option<&str>,
+        message_id: &str,
+        blob_id: &str,
+    ) -> Result<isyncyou_webui::ProviderAttachmentDownload, String> {
+        let Some(scope) = scope else {
+            return self.provider_attachment_download(account, message_id, blob_id);
+        };
         let cfg = self.runtime_config()?;
-        let client = isyncyou_engine::self_hosted_mail::client(&cfg,account)?;
-        let file = isyncyou_engine::self_hosted_mail::download_attachment_in_scope(&cfg,account,&client,scope,message_id,blob_id)?;
-        Ok(isyncyou_webui::ProviderAttachmentDownload { filename:file.filename, bytes:file.bytes })
+        let client = isyncyou_engine::self_hosted_mail::client(&cfg, account)?;
+        let file = isyncyou_engine::self_hosted_mail::download_attachment_in_scope(
+            &cfg, account, &client, scope, message_id, blob_id,
+        )?;
+        Ok(isyncyou_webui::ProviderAttachmentDownload {
+            filename: file.filename,
+            bytes: file.bytes,
+        })
     }
-    fn provider_read_view(&self, account: &str, message_id: &str) -> Result<isyncyou_webui::ProviderMailView, String> {
-        self.provider_read_view_scoped(account,None,message_id)
+    fn provider_read_view(
+        &self,
+        account: &str,
+        message_id: &str,
+    ) -> Result<isyncyou_webui::ProviderMailView, String> {
+        self.provider_read_view_scoped(account, None, message_id)
     }
-    fn provider_read_view_scoped(&self, account:&str, scope:Option<&str>, message_id:&str) -> Result<isyncyou_webui::ProviderMailView,String> {
+    fn provider_read_view_scoped(
+        &self,
+        account: &str,
+        scope: Option<&str>,
+        message_id: &str,
+    ) -> Result<isyncyou_webui::ProviderMailView, String> {
         let cfg = self.runtime_config()?;
         let client = isyncyou_engine::self_hosted_mail::client(&cfg, account)?;
         let reference = parse_shared_mail_ref(message_id)?;
-        if reference.is_some() && scope.is_some() { return Err("provider_scope_unavailable".into()); }
-        let (scope,native_id) = match reference.as_ref() { Some((scope,id)) => (Some(scope.as_str()),id.as_str()), None => (scope,message_id) };
+        if reference.is_some() && scope.is_some() {
+            return Err("provider_scope_unavailable".into());
+        }
+        let (scope, native_id) = match reference.as_ref() {
+            Some((scope, id)) => (Some(scope.as_str()), id.as_str()),
+            None => (scope, message_id),
+        };
         let response = match scope {
-            Some(scope) => isyncyou_engine::self_hosted_mail::read_body_in_scope(&cfg, account, &client, scope, native_id, 1024 * 1024)?,
-            None => isyncyou_engine::self_hosted_mail::read_body(&cfg, account, &client, native_id, 1024 * 1024)?,
+            Some(scope) => isyncyou_engine::self_hosted_mail::read_body_in_scope(
+                &cfg,
+                account,
+                &client,
+                scope,
+                native_id,
+                1024 * 1024,
+            )?,
+            None => isyncyou_engine::self_hosted_mail::read_body(
+                &cfg,
+                account,
+                &client,
+                native_id,
+                1024 * 1024,
+            )?,
         };
         let rows = response["list"].as_array().ok_or("provider_body_invalid")?;
-        if rows.len() != 1 || rows[0]["id"].as_str() != Some(native_id) { return Err("provider_body_unavailable".into()); }
+        if rows.len() != 1 || rows[0]["id"].as_str() != Some(native_id) {
+            return Err("provider_body_unavailable".into());
+        }
         let item = &rows[0];
-        let text_parts = item["textBody"].as_array().filter(|parts| !parts.is_empty());
+        let text_parts = item["textBody"]
+            .as_array()
+            .filter(|parts| !parts.is_empty());
         let is_html = text_parts.is_none();
-        let parts = match text_parts.or_else(|| item["htmlBody"].as_array().filter(|parts| !parts.is_empty())) {
+        let parts = match text_parts.or_else(|| {
+            item["htmlBody"]
+                .as_array()
+                .filter(|parts| !parts.is_empty())
+        }) {
             Some(parts) => parts,
-            None if item["textBody"].is_array() && item["htmlBody"].is_array() => return Ok(isyncyou_webui::ProviderMailView { content:String::new(), is_html:false, incomplete:false }),
+            None if item["textBody"].is_array() && item["htmlBody"].is_array() => {
+                return Ok(isyncyou_webui::ProviderMailView {
+                    content: String::new(),
+                    is_html: false,
+                    incomplete: false,
+                })
+            }
             None => return Err("provider_body_unavailable".into()),
         };
         let mut out = String::new();
         let mut incomplete = false;
         let mut saw_body = false;
         for part in parts {
-            let Some(id) = part["partId"].as_str() else { incomplete = true; continue; };
+            let Some(id) = part["partId"].as_str() else {
+                incomplete = true;
+                continue;
+            };
             let value = &item["bodyValues"][id];
             if let Some(text) = value["value"].as_str() {
                 saw_body = true;
-                if !out.is_empty() && out.len() < 1024 * 1024 { out.push('\n'); }
+                if !out.is_empty() && out.len() < 1024 * 1024 {
+                    out.push('\n');
+                }
                 let available = (1024 * 1024usize).saturating_sub(out.len());
                 let mut take = text.len().min(available);
-                while !text.is_char_boundary(take) { take -= 1; }
+                while !text.is_char_boundary(take) {
+                    take -= 1;
+                }
                 out.push_str(&text[..take]);
-                incomplete |= take != text.len() || value["isTruncated"].as_bool() != Some(false) || value["isEncodingProblem"].as_bool() != Some(false);
-            } else { incomplete = true; }
+                incomplete |= take != text.len()
+                    || value["isTruncated"].as_bool() != Some(false)
+                    || value["isEncodingProblem"].as_bool() != Some(false);
+            } else {
+                incomplete = true;
+            }
         }
-        if !saw_body { return Err("provider_body_unavailable".into()); }
-        Ok(isyncyou_webui::ProviderMailView { content:out, is_html, incomplete })
+        if !saw_body {
+            return Err("provider_body_unavailable".into());
+        }
+        Ok(isyncyou_webui::ProviderMailView {
+            content: out,
+            is_html,
+            incomplete,
+        })
     }
     fn read_state(&self, account: &str, message_id: &str) -> Result<bool, String> {
         let cfg = self.runtime_config()?;
         if cfg.provider_accounts.contains_key(account) {
             let client = isyncyou_engine::self_hosted_mail::client(&cfg, account)?;
-            return isyncyou_engine::self_hosted_mail::read_state(&cfg, account, &client, message_id);
+            return isyncyou_engine::self_hosted_mail::read_state(
+                &cfg, account, &client, message_id,
+            );
         }
         let graph = isyncyou_engine::mail_writer(&cfg, account)?;
         let value = graph
@@ -15737,48 +20334,172 @@ pub struct DaemonCalendarWrite {
     config_path: Option<PathBuf>,
 }
 impl isyncyou_webui::CalendarWriteHandler for DaemonCalendarWrite {
-    fn provider_contact_photo(&self, account:&str, collection:&str, href:&str) -> Result<Option<(String,Vec<u8>)>,String> {
-        let cfg = match &self.config_path { Some(path)=>load_host_runtime_config(path)?, None=>self.cfg.clone() };
-        isyncyou_engine::dav_live::read_contact_photo(&cfg,account,"/.well-known/carddav",collection,href,None)
+    fn provider_contact_photo(
+        &self,
+        account: &str,
+        collection: &str,
+        href: &str,
+    ) -> Result<Option<(String, Vec<u8>)>, String> {
+        let cfg = match &self.config_path {
+            Some(path) => load_host_runtime_config(path)?,
+            None => self.cfg.clone(),
+        };
+        isyncyou_engine::dav_live::read_contact_photo(
+            &cfg,
+            account,
+            "/.well-known/carddav",
+            collection,
+            href,
+            None,
+        )
     }
-    fn provider_freebusy_month(&self, account:&str, collection:&str, year:u32, month:u32) -> Result<serde_json::Value, String> {
-        let (start,end) = calendar_month_bounds(year,month).ok_or("invalid_calendar_window")?;
-        let cfg = match &self.config_path { Some(path) => { let cfg = Config::load(path)?; cfg.validate().map_err(|_| "account_config_unavailable")?; cfg }, None => self.cfg.clone() };
-        let bytes = isyncyou_engine::dav_live::free_busy(&cfg,account,"/.well-known/caldav",collection,&start,&end,None).map_err(|e| if e == "Http(403)" { "freebusy_access_denied" } else { "freebusy_unavailable" })?;
+    fn provider_freebusy_month(
+        &self,
+        account: &str,
+        collection: &str,
+        year: u32,
+        month: u32,
+    ) -> Result<serde_json::Value, String> {
+        let (start, end) = calendar_month_bounds(year, month).ok_or("invalid_calendar_window")?;
+        let cfg = match &self.config_path {
+            Some(path) => {
+                let cfg = Config::load(path)?;
+                cfg.validate().map_err(|_| "account_config_unavailable")?;
+                cfg
+            }
+            None => self.cfg.clone(),
+        };
+        let bytes = isyncyou_engine::dav_live::free_busy(
+            &cfg,
+            account,
+            "/.well-known/caldav",
+            collection,
+            &start,
+            &end,
+            None,
+        )
+        .map_err(|e| {
+            if e == "Http(403)" {
+                "freebusy_access_denied"
+            } else {
+                "freebusy_unavailable"
+            }
+        })?;
         let content = String::from_utf8(bytes).map_err(|_| "invalid_freebusy_response")?;
-        if content.len() > 1024 * 1024 { return Err("freebusy_response_too_large".into()); }
-        Ok(serde_json::json!({"account":account,"collection":collection,"start":start,"end":end,"provenance":"live","content":content}))
+        if content.len() > 1024 * 1024 {
+            return Err("freebusy_response_too_large".into());
+        }
+        Ok(
+            serde_json::json!({"account":account,"collection":collection,"start":start,"end":end,"provenance":"live","content":content}),
+        )
     }
-    fn provider_expanded_tasks_month(&self, account:&str, collection:&str, year:u32, month:u32) -> Result<serde_json::Value, String> {
-        let (start,end) = calendar_month_bounds(year,month).ok_or("invalid_calendar_window")?;
-        let cfg = match &self.config_path { Some(path) => { let cfg = Config::load(path)?; cfg.validate().map_err(|_| "account_config_unavailable")?; cfg }, None => self.cfg.clone() };
-        let items = isyncyou_engine::dav_live::expanded_task_views(&cfg,account,"/.well-known/caldav",collection,&start,&end,None)?;
+    fn provider_expanded_tasks_month(
+        &self,
+        account: &str,
+        collection: &str,
+        year: u32,
+        month: u32,
+    ) -> Result<serde_json::Value, String> {
+        let (start, end) = calendar_month_bounds(year, month).ok_or("invalid_calendar_window")?;
+        let cfg = match &self.config_path {
+            Some(path) => {
+                let cfg = Config::load(path)?;
+                cfg.validate().map_err(|_| "account_config_unavailable")?;
+                cfg
+            }
+            None => self.cfg.clone(),
+        };
+        let items = isyncyou_engine::dav_live::expanded_task_views(
+            &cfg,
+            account,
+            "/.well-known/caldav",
+            collection,
+            &start,
+            &end,
+            None,
+        )?;
         let values:Vec<_> = items.into_iter().map(|item| match item.view { Ok(view) => serde_json::json!({"href":item.remote_id,"etag":item.etag,"view":view}), Err(_) => serde_json::json!({"href":item.remote_id,"etag":item.etag,"error":"projection_unavailable"}) }).collect();
-        Ok(serde_json::json!({"account":account,"collection":collection,"start":start,"end":end,"provenance":"live","items":values}))
+        Ok(
+            serde_json::json!({"account":account,"collection":collection,"start":start,"end":end,"provenance":"live","items":values}),
+        )
     }
-    fn provider_expanded_month(&self, account:&str, collection:&str, year:u32, month:u32) -> Result<serde_json::Value, String> {
-        let (start,end) = calendar_month_bounds(year,month).ok_or("invalid_calendar_window")?;
-        let cfg = match &self.config_path { Some(path) => { let cfg = Config::load(path)?; cfg.validate().map_err(|_| "account_config_unavailable")?; cfg }, None => self.cfg.clone() };
-        let items = isyncyou_engine::dav_live::expanded_event_views(&cfg,account,"/.well-known/caldav",collection,&start,&end,None)?;
+    fn provider_expanded_month(
+        &self,
+        account: &str,
+        collection: &str,
+        year: u32,
+        month: u32,
+    ) -> Result<serde_json::Value, String> {
+        let (start, end) = calendar_month_bounds(year, month).ok_or("invalid_calendar_window")?;
+        let cfg = match &self.config_path {
+            Some(path) => {
+                let cfg = Config::load(path)?;
+                cfg.validate().map_err(|_| "account_config_unavailable")?;
+                cfg
+            }
+            None => self.cfg.clone(),
+        };
+        let items = isyncyou_engine::dav_live::expanded_event_views(
+            &cfg,
+            account,
+            "/.well-known/caldav",
+            collection,
+            &start,
+            &end,
+            None,
+        )?;
         let values:Vec<_> = items.into_iter().map(|item| match item.view { Ok(view) => serde_json::json!({"href":item.remote_id,"etag":item.etag,"view":view}), Err(_) => serde_json::json!({"href":item.remote_id,"etag":item.etag,"error":"projection_unavailable"}) }).collect();
-        Ok(serde_json::json!({"account":account,"collection":collection,"start":start,"end":end,"provenance":"live","items":values}))
+        Ok(
+            serde_json::json!({"account":account,"collection":collection,"start":start,"end":end,"provenance":"live","items":values}),
+        )
     }
-    fn provider_calendar(&self, account:&str, collection:Option<&str>, after:&str) -> Result<serde_json::Value, String> {
-        let cfg = match &self.config_path { Some(path) => { let cfg = Config::load(path)?; cfg.validate().map_err(|_| "account_config_unavailable")?; cfg }, None => self.cfg.clone() };
-        let origin = match cfg.provider_accounts.get(account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) => origin, None => return Err("provider_unavailable".into()) };
+    fn provider_calendar(
+        &self,
+        account: &str,
+        collection: Option<&str>,
+        after: &str,
+    ) -> Result<serde_json::Value, String> {
+        let cfg = match &self.config_path {
+            Some(path) => {
+                let cfg = Config::load(path)?;
+                cfg.validate().map_err(|_| "account_config_unavailable")?;
+                cfg
+            }
+            None => self.cfg.clone(),
+        };
+        let origin = match cfg.provider_accounts.get(account) {
+            Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) => origin,
+            None => return Err("provider_unavailable".into()),
+        };
         if let Some(collection) = collection {
-            let page = isyncyou_engine::dav_live::calendar_page(&cfg, account, collection, after, 200)?;
+            let page =
+                isyncyou_engine::dav_live::calendar_page(&cfg, account, collection, after, 200)?;
             let items:Vec<_> = page.items.into_iter().map(|item| match item.view {
                 Ok(view) => serde_json::json!({"href":item.href,"collection":item.collection,"etag":item.etag,"view":view}),
                 Err(_) => serde_json::json!({"href":item.href,"collection":item.collection,"etag":item.etag,"error":"projection_unavailable"}),
             }).collect();
-            let cursor_digest = page.cursor.as_ref().map(|cursor| ring::digest::digest(&ring::digest::SHA256, cursor.as_bytes()).as_ref().iter().map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().concat());
-            Ok(serde_json::json!({"account":page.account_id,"origin":page.origin,"collection":page.collection,"accessible":page.accessible,"observed_at":page.observed_at,"cursor_digest":cursor_digest,"items":items,"next_after":page.next_after,"provenance":"local"}))
+            let cursor_digest = page.cursor.as_ref().map(|cursor| {
+                ring::digest::digest(&ring::digest::SHA256, cursor.as_bytes())
+                    .as_ref()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<Vec<_>>()
+                    .concat()
+            });
+            Ok(
+                serde_json::json!({"account":page.account_id,"origin":page.origin,"collection":page.collection,"accessible":page.accessible,"observed_at":page.observed_at,"cursor_digest":cursor_digest,"items":items,"next_after":page.next_after,"provenance":"local"}),
+            )
         } else {
             let store = isyncyou_engine::provider_store::open_readonly(&cfg, account)?;
-            let scopes = store.provider_scopes(account, origin, "calendar").map_err(|_| "provider_cache_unavailable")?;
-            if scopes.len() > 1000 { return Err("provider_collections_limit".into()); }
-            Ok(serde_json::json!({"account":account,"origin":origin,"collections":scopes.into_iter().map(|scope| scope.collection).collect::<Vec<_>>(),"provenance":"local"}))
+            let scopes = store
+                .provider_scopes(account, origin, "calendar")
+                .map_err(|_| "provider_cache_unavailable")?;
+            if scopes.len() > 1000 {
+                return Err("provider_collections_limit".into());
+            }
+            Ok(
+                serde_json::json!({"account":account,"origin":origin,"collections":scopes.into_iter().map(|scope| scope.collection).collect::<Vec<_>>(),"provenance":"local"}),
+            )
         }
     }
     fn create(&self, account: &str, event: &serde_json::Value) -> Result<String, String> {
@@ -15818,25 +20539,58 @@ pub struct DaemonContactWrite {
     config_path: Option<PathBuf>,
 }
 impl isyncyou_webui::ContactWriteHandler for DaemonContactWrite {
-    fn provider_contacts(&self, account:&str, collection:Option<&str>, after:&str) -> Result<serde_json::Value, String> {
-        let cfg = match &self.config_path { Some(path) => { let cfg = Config::load(path)?; cfg.validate().map_err(|_| "account_config_unavailable")?; cfg }, None => self.cfg.clone() };
-        let origin = match cfg.provider_accounts.get(account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) => origin, None => return Err("provider_unavailable".into()) };
+    fn provider_contacts(
+        &self,
+        account: &str,
+        collection: Option<&str>,
+        after: &str,
+    ) -> Result<serde_json::Value, String> {
+        let cfg = match &self.config_path {
+            Some(path) => {
+                let cfg = Config::load(path)?;
+                cfg.validate().map_err(|_| "account_config_unavailable")?;
+                cfg
+            }
+            None => self.cfg.clone(),
+        };
+        let origin = match cfg.provider_accounts.get(account) {
+            Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) => origin,
+            None => return Err("provider_unavailable".into()),
+        };
         if let Some(collection) = collection {
-            let page = isyncyou_engine::dav_live::contact_page(&cfg, account, collection, after, 200)?;
-            let fields = |values:Vec<isyncyou_engine::dav_live::ContactField>| values.into_iter().map(|field| serde_json::json!({"value_type":field.value_type,"parameters":field.parameters,"values":field.values})).collect::<Vec<_>>();
+            let page =
+                isyncyou_engine::dav_live::contact_page(&cfg, account, collection, after, 200)?;
+            let fields = |values: Vec<isyncyou_engine::dav_live::ContactField>| {
+                values.into_iter().map(|field| serde_json::json!({"value_type":field.value_type,"parameters":field.parameters,"values":field.values})).collect::<Vec<_>>()
+            };
             let items:Vec<_> = page.items.into_iter().map(|item| {
                 match item.summary {
                     Ok(summary) => serde_json::json!({"href":item.href,"collection":item.collection,"etag":item.etag,"names":fields(summary.names),"emails":fields(summary.emails),"phones":fields(summary.phones),"organizations":fields(summary.organizations)}),
                     Err(_) => serde_json::json!({"href":item.href,"collection":item.collection,"etag":item.etag,"error":"projection_unavailable"}),
                 }
             }).collect();
-            let cursor_digest = page.cursor.as_ref().map(|cursor| ring::digest::digest(&ring::digest::SHA256, cursor.as_bytes()).as_ref().iter().map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().concat());
-            Ok(serde_json::json!({"account":page.account_id,"origin":page.origin,"collection":page.collection,"accessible":page.accessible,"observed_at":page.observed_at,"cursor_digest":cursor_digest,"items":items,"next_after":page.next_after,"provenance":"local"}))
+            let cursor_digest = page.cursor.as_ref().map(|cursor| {
+                ring::digest::digest(&ring::digest::SHA256, cursor.as_bytes())
+                    .as_ref()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<Vec<_>>()
+                    .concat()
+            });
+            Ok(
+                serde_json::json!({"account":page.account_id,"origin":page.origin,"collection":page.collection,"accessible":page.accessible,"observed_at":page.observed_at,"cursor_digest":cursor_digest,"items":items,"next_after":page.next_after,"provenance":"local"}),
+            )
         } else {
             let store = isyncyou_engine::provider_store::open_readonly(&cfg, account)?;
-            let scopes = store.provider_scopes(account, origin, "contacts").map_err(|_| "provider_cache_unavailable")?;
-            if scopes.len() > 1000 { return Err("provider_collections_limit".into()); }
-            Ok(serde_json::json!({"account":account,"origin":origin,"collections":scopes.into_iter().map(|scope| scope.collection).collect::<Vec<_>>(),"provenance":"local"}))
+            let scopes = store
+                .provider_scopes(account, origin, "contacts")
+                .map_err(|_| "provider_cache_unavailable")?;
+            if scopes.len() > 1000 {
+                return Err("provider_collections_limit".into());
+            }
+            Ok(
+                serde_json::json!({"account":account,"origin":origin,"collections":scopes.into_iter().map(|scope| scope.collection).collect::<Vec<_>>(),"provenance":"local"}),
+            )
         }
     }
     fn create(&self, account: &str, contact: &serde_json::Value) -> Result<String, String> {
@@ -16032,11 +20786,23 @@ fn microsoft_role_config(
     })
 }
 
-fn provider_mail_role_state(has_grant:bool, observation:isyncyou_engine::self_hosted_mail::MailAccessObservation) -> isyncyou_webui::AccountAuthState {
+fn provider_mail_role_state(
+    has_grant: bool,
+    observation: isyncyou_engine::self_hosted_mail::MailAccessObservation,
+) -> isyncyou_webui::AccountAuthState {
     use isyncyou_engine::self_hosted_mail::MailAccessObservation as O;
     use isyncyou_webui::AccountAuthState as S;
-    if !has_grant { return S::Disconnected; }
-    match observation { O::Available=>S::Connected, O::AuthenticationRejected=>S::ReconnectRequired, O::PermissionDenied=>S::PermissionDenied, O::Unknown=>S::AccessUnknown, O::TransportUnavailable=>S::ServiceUnreachable, O::InvalidResponse=>S::ProviderResponseInvalid }
+    if !has_grant {
+        return S::Disconnected;
+    }
+    match observation {
+        O::Available => S::Connected,
+        O::AuthenticationRejected => S::ReconnectRequired,
+        O::PermissionDenied => S::PermissionDenied,
+        O::Unknown => S::AccessUnknown,
+        O::TransportUnavailable => S::ServiceUnreachable,
+        O::InvalidResponse => S::ProviderResponseInvalid,
+    }
 }
 
 fn microsoft_role_status(path: Option<PathBuf>) -> isyncyou_webui::AccountRoleStatus {
@@ -16141,10 +20907,22 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
         let cfg = self.current_config().ok_or("account_config_unavailable")?;
         isyncyou_engine::provider_auth::revoke_quarantined_grant(&cfg, account, id)
     }
-    fn create_provider_account(&self, account: &str, username: &str, origin: &str, client_id: &str) -> Result<(), String> {
-        let path = self.config_path.as_ref().ok_or("account_setup_unavailable")?;
+    fn create_provider_account(
+        &self,
+        account: &str,
+        username: &str,
+        origin: &str,
+        client_id: &str,
+    ) -> Result<(), String> {
+        let path = self
+            .config_path
+            .as_ref()
+            .ok_or("account_setup_unavailable")?;
         let root = path.parent().ok_or("account_setup_unavailable")?;
-        isyncyou_engine::provider_setup::create_self_hosted_account(path, account, username, origin, client_id, root).map(|_| ())
+        isyncyou_engine::provider_setup::create_self_hosted_account(
+            path, account, username, origin, client_id, root,
+        )
+        .map(|_| ())
     }
     fn start_login(
         &self,
@@ -16300,7 +21078,9 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
         if cfg.provider_accounts.contains_key(account) {
             isyncyou_engine::provider_auth::logout_self_hosted(&cfg, account)
                 .map_err(|_| "provider_sign_out_unavailable".to_string())?;
-            return Ok(serde_json::json!({"removed": 1, "role": role.as_str(), "message": "Provider account disconnected"}));
+            return Ok(
+                serde_json::json!({"removed": 1, "role": role.as_str(), "message": "Provider account disconnected"}),
+            );
         }
         let removed = match role {
             isyncyou_webui::AccountAuthRole::Reader => {
@@ -16320,9 +21100,13 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
     fn status(&self, account: &str) -> isyncyou_webui::AccountAuthStatus {
         let cfg = self.current_config().unwrap_or_else(|| self.cfg.clone());
         if cfg.provider_accounts.contains_key(account) {
-            let connected = isyncyou_engine::provider_auth::self_hosted_auth_status(&cfg, account).unwrap_or(false);
+            let connected = isyncyou_engine::provider_auth::self_hosted_auth_status(&cfg, account)
+                .unwrap_or(false);
             let status = isyncyou_webui::AccountRoleStatus {
-                state: provider_mail_role_state(connected,isyncyou_engine::self_hosted_mail::mail_access_observation(&cfg,account)),
+                state: provider_mail_role_state(
+                    connected,
+                    isyncyou_engine::self_hosted_mail::mail_access_observation(&cfg, account),
+                ),
                 // A locally available refresh grant is not proof of current server identity.
                 identity_verified: false,
             };
@@ -16343,75 +21127,139 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
 }
 
 impl DaemonAccountAuth {
-    fn start_provider_login(&self, cfg: &Config, account: &str, role: isyncyou_webui::AccountAuthRole) -> Result<serde_json::Value, String> {
+    fn start_provider_login(
+        &self,
+        cfg: &Config,
+        account: &str,
+        role: isyncyou_webui::AccountAuthRole,
+    ) -> Result<serde_json::Value, String> {
         const CALLBACK: &str = "http://127.0.0.1:53682/oauth/callback";
         let listener = std::net::TcpListener::bind(("127.0.0.1", 53682))
             .map_err(|_| "account_callback_unavailable".to_string())?;
-        let attempt = isyncyou_engine::provider_auth::start_self_hosted_auth(cfg, account, CALLBACK)
-            .map_err(|_| "provider_sign_in_unavailable".to_string())?;
+        let attempt =
+            isyncyou_engine::provider_auth::start_self_hosted_auth(cfg, account, CALLBACK)
+                .map_err(|_| "provider_sign_in_unavailable".to_string())?;
         let authorization_uri = attempt.authorization_uri.clone();
         let id = LOGIN_SEQ.fetch_add(1, Ordering::SeqCst);
         let state = Arc::new(Mutex::new(LoginState {
-            account: account.to_string(), role, started_at: std::time::Instant::now(),
-            exchange_in_flight: false, done: false, error_code: None,
+            account: account.to_string(),
+            role,
+            started_at: std::time::Instant::now(),
+            exchange_in_flight: false,
+            done: false,
+            error_code: None,
         }));
         {
-            let mut logins = self.logins.lock().map_err(|_| "account_login_unavailable".to_string())?;
-            logins.retain(|_, login| login.lock().is_ok_and(|state| !state.done && state.error_code.is_none() && state.started_at.elapsed() < MICROSOFT_LOGIN_TTL));
-            if logins.len() >= MICROSOFT_LOGIN_LIMIT { return Err("account_login_busy".into()); }
+            let mut logins = self
+                .logins
+                .lock()
+                .map_err(|_| "account_login_unavailable".to_string())?;
+            logins.retain(|_, login| {
+                login.lock().is_ok_and(|state| {
+                    !state.done
+                        && state.error_code.is_none()
+                        && state.started_at.elapsed() < MICROSOFT_LOGIN_TTL
+                })
+            });
+            if logins.len() >= MICROSOFT_LOGIN_LIMIT {
+                return Err("account_login_busy".into());
+            }
             logins.insert(id, Arc::clone(&state));
         }
-        if std::thread::Builder::new().name("provider-account-callback".into())
-            .spawn(move || provider_callback_serve(listener, state, attempt)).is_err() {
-            if let Ok(mut logins) = self.logins.lock() { logins.remove(&id); }
+        if std::thread::Builder::new()
+            .name("provider-account-callback".into())
+            .spawn(move || provider_callback_serve(listener, state, attempt))
+            .is_err()
+        {
+            if let Ok(mut logins) = self.logins.lock() {
+                logins.remove(&id);
+            }
             return Err("account_callback_unavailable".into());
         }
-        Ok(serde_json::json!({"flow":"authorization_code_pkce", "role":role.as_str(), "login_id":id.to_string(), "authorization_uri":authorization_uri}))
+        Ok(
+            serde_json::json!({"flow":"authorization_code_pkce", "role":role.as_str(), "login_id":id.to_string(), "authorization_uri":authorization_uri}),
+        )
     }
 }
 
-fn provider_callback_serve(listener: std::net::TcpListener, state: Arc<Mutex<LoginState>>, attempt: isyncyou_engine::provider_auth::AuthAttempt) {
+fn provider_callback_serve(
+    listener: std::net::TcpListener,
+    state: Arc<Mutex<LoginState>>,
+    attempt: isyncyou_engine::provider_auth::AuthAttempt,
+) {
     use std::io::Read;
     let deadline = std::time::Instant::now() + MICROSOFT_LOGIN_TTL;
     if listener.set_nonblocking(true).is_err() {
-        if let Ok(mut state) = state.lock() { state.error_code = Some("account_callback_unavailable"); }
+        if let Ok(mut state) = state.lock() {
+            state.error_code = Some("account_callback_unavailable");
+        }
         return;
     }
     while std::time::Instant::now() < deadline {
-        if state.lock().map_or(true, |state| state.done || state.error_code.is_some()) { return; }
+        if state
+            .lock()
+            .map_or(true, |state| state.done || state.error_code.is_some())
+        {
+            return;
+        }
         let mut stream = match listener.accept() {
             Ok((stream, peer)) if peer.ip().is_loopback() => stream,
             Ok(_) => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => { std::thread::sleep(Duration::from_millis(50)); continue; }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
             Err(_) => break,
         };
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
         let mut head = Vec::with_capacity(1024);
         let mut chunk = [0u8; 1024];
         while head.len() <= MICROSOFT_CALLBACK_HEAD_LIMIT && !head.ends_with(b"\r\n\r\n") {
-            match stream.read(&mut chunk) { Ok(0) | Err(_) => break, Ok(n) => head.extend_from_slice(&chunk[..n]) }
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => head.extend_from_slice(&chunk[..n]),
+            }
         }
-        let request = if head.len() <= MICROSOFT_CALLBACK_HEAD_LIMIT && head.ends_with(b"\r\n\r\n") { std::str::from_utf8(&head).ok() } else { None };
-        let Some(request) = request else { write_microsoft_callback_page(&mut stream, MICROSOFT_ERROR_HTML); continue; };
+        let request = if head.len() <= MICROSOFT_CALLBACK_HEAD_LIMIT && head.ends_with(b"\r\n\r\n")
+        {
+            std::str::from_utf8(&head).ok()
+        } else {
+            None
+        };
+        let Some(request) = request else {
+            write_microsoft_callback_page(&mut stream, MICROSOFT_ERROR_HTML);
+            continue;
+        };
         let mut lines = request.split("\r\n");
         let mut line = lines.next().unwrap_or("").split_whitespace();
         let method = line.next().unwrap_or("");
         let target = line.next().unwrap_or("");
         let version = line.next().unwrap_or("");
-        let valid = method == "GET" && version == "HTTP/1.1" && line.next().is_none()
+        let valid = method == "GET"
+            && version == "HTTP/1.1"
+            && line.next().is_none()
             && target.starts_with("/oauth/callback?")
             && microsoft_callback_headers_valid(lines, "127.0.0.1:53682");
         let callback = format!("http://127.0.0.1:53682{target}");
-        if !valid || isyncyou_engine::provider_auth::validate_callback(&attempt, &callback).is_err() {
+        if !valid || isyncyou_engine::provider_auth::validate_callback(&attempt, &callback).is_err()
+        {
             write_microsoft_callback_page(&mut stream, MICROSOFT_ERROR_HTML);
             continue;
         }
         let allowed = state.lock().is_ok_and(|mut state| {
-            if state.done || state.error_code.is_some() || state.exchange_in_flight { false }
-            else { state.exchange_in_flight = true; true }
+            if state.done || state.error_code.is_some() || state.exchange_in_flight {
+                false
+            } else {
+                state.exchange_in_flight = true;
+                true
+            }
         });
-        if !allowed { write_microsoft_callback_page(&mut stream, MICROSOFT_ERROR_HTML); return; }
-        let result = isyncyou_engine::provider_auth::finish_self_hosted_auth_detailed(attempt, &callback);
+        if !allowed {
+            write_microsoft_callback_page(&mut stream, MICROSOFT_ERROR_HTML);
+            return;
+        }
+        let result =
+            isyncyou_engine::provider_auth::finish_self_hosted_auth_detailed(attempt, &callback);
         let success = result.is_ok();
         if let Ok(mut state) = state.lock() {
             state.exchange_in_flight = false;
@@ -16419,20 +21267,51 @@ fn provider_callback_serve(listener: std::net::TcpListener, state: Arc<Mutex<Log
                 state.done = true;
             } else {
                 state.error_code = Some(match result.as_ref().err() {
-                    Some(isyncyou_engine::provider_auth::AuthFinishError::RevocationPending) => "account_revocation_pending",
-                    Some(isyncyou_engine::provider_auth::AuthFinishError::RevocationUnrecoverable) => "account_revocation_unrecoverable",
-                    Some(isyncyou_engine::provider_auth::AuthFinishError::Failed(message)) if message == "System keyring unavailable" => "account_keyring_unavailable",
-                    Some(isyncyou_engine::provider_auth::AuthFinishError::Failed(message)) if message == "Provider identity verification failed" => "account_provider_identity_verification_failed",
-                    Some(isyncyou_engine::provider_auth::AuthFinishError::Failed(message)) if message == "Provider identity binding failed" => "account_provider_identity_binding_failed",
-                    Some(isyncyou_engine::provider_auth::AuthFinishError::Failed(message)) if message == "Provider credential storage failed" => "account_provider_credential_storage_failed",
+                    Some(isyncyou_engine::provider_auth::AuthFinishError::RevocationPending) => {
+                        "account_revocation_pending"
+                    }
+                    Some(
+                        isyncyou_engine::provider_auth::AuthFinishError::RevocationUnrecoverable,
+                    ) => "account_revocation_unrecoverable",
+                    Some(isyncyou_engine::provider_auth::AuthFinishError::Failed(message))
+                        if message == "System keyring unavailable" =>
+                    {
+                        "account_keyring_unavailable"
+                    }
+                    Some(isyncyou_engine::provider_auth::AuthFinishError::Failed(message))
+                        if message == "Provider identity verification failed" =>
+                    {
+                        "account_provider_identity_verification_failed"
+                    }
+                    Some(isyncyou_engine::provider_auth::AuthFinishError::Failed(message))
+                        if message == "Provider identity binding failed" =>
+                    {
+                        "account_provider_identity_binding_failed"
+                    }
+                    Some(isyncyou_engine::provider_auth::AuthFinishError::Failed(message))
+                        if message == "Provider credential storage failed" =>
+                    {
+                        "account_provider_credential_storage_failed"
+                    }
                     _ => "account_authorization_failed",
                 });
             }
         }
-        write_microsoft_callback_page(&mut stream, if success { MICROSOFT_SUCCESS_HTML } else { MICROSOFT_ERROR_HTML });
+        write_microsoft_callback_page(
+            &mut stream,
+            if success {
+                MICROSOFT_SUCCESS_HTML
+            } else {
+                MICROSOFT_ERROR_HTML
+            },
+        );
         return;
     }
-    if let Ok(mut state) = state.lock() { if !state.done && state.error_code.is_none() { state.error_code = Some("account_login_expired"); } }
+    if let Ok(mut state) = state.lock() {
+        if !state.done && state.error_code.is_none() {
+            state.error_code = Some("account_login_expired");
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -17271,30 +22150,70 @@ mod todo_delete_batch_tests {
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
-fn control_upload_release(cfg:&Config, control:&agent_control_store::AgentControlStore, account:&str, origin:&str, subject:&str, request_id:&str, intent_id:&str)->Result<(),String> {
-    control.stable_upload_state(intent_id,account,origin,subject)?.ok_or("mutation_intent_not_found")?;
-    let store=isyncyou_engine::provider_store::open_readonly(cfg,account)?;
-    let status=isyncyou_engine::self_hosted_mail::draft_attachment_upload_status(cfg,account,&store,intent_id)?.ok_or("mutation_intent_not_found")?;
-    if !upload_receipt_can_be_released(&status.state,status.blob_id.as_deref()) { return Err("mutation_intent_conflict".into()); }
-    control.release_confirmed_upload_binding(request_id,intent_id,account,origin,subject,unix_now_ms())
+fn control_upload_release(
+    cfg: &Config,
+    control: &agent_control_store::AgentControlStore,
+    account: &str,
+    origin: &str,
+    subject: &str,
+    request_id: &str,
+    intent_id: &str,
+) -> Result<(), String> {
+    control
+        .stable_upload_state(intent_id, account, origin, subject)?
+        .ok_or("mutation_intent_not_found")?;
+    let store = isyncyou_engine::provider_store::open_readonly(cfg, account)?;
+    let status = isyncyou_engine::self_hosted_mail::draft_attachment_upload_status(
+        cfg, account, &store, intent_id,
+    )?
+    .ok_or("mutation_intent_not_found")?;
+    if !upload_receipt_can_be_released(&status.state, status.blob_id.as_deref()) {
+        return Err("mutation_intent_conflict".into());
+    }
+    control.release_confirmed_upload_binding(
+        request_id,
+        intent_id,
+        account,
+        origin,
+        subject,
+        unix_now_ms(),
+    )
 }
 
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-fn upload_receipt_can_be_released(state:&str, blob:Option<&str>) -> bool { state=="confirmed" && blob.is_some_and(|id| !id.is_empty()) }
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn upload_receipt_can_be_released(state: &str, blob: Option<&str>) -> bool {
+    state == "confirmed" && blob.is_some_and(|id| !id.is_empty())
+}
 
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-fn collect_confirmed_attachment_records<I>(entries:I)->(Vec<serde_json::Value>,usize)
-where I:IntoIterator<Item=(String,Result<Option<isyncyou_engine::self_hosted_mail::AttachmentUploadStatus>,String>)> {
-    let mut items=Vec::new(); let mut unavailable=0;
-    for (id,result) in entries {
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn collect_confirmed_attachment_records<I>(entries: I) -> (Vec<serde_json::Value>, usize)
+where
+    I: IntoIterator<
+        Item = (
+            String,
+            Result<Option<isyncyou_engine::self_hosted_mail::AttachmentUploadStatus>, String>,
+        ),
+    >,
+{
+    let mut items = Vec::new();
+    let mut unavailable = 0;
+    for (id, result) in entries {
         match result {
             Ok(Some(status)) if upload_receipt_can_be_released(&status.state,status.blob_id.as_deref()) => items.push(serde_json::json!({"intent_id":id,"filename":status.filename,"size":status.size,"sha256":status.sha256})),
             Ok(_) => {},
             Err(_) => unavailable+=1,
         }
-        if items.len()>=100 { break; }
+        if items.len() >= 100 {
+            break;
+        }
     }
-    (items,unavailable)
+    (items, unavailable)
 }
 
 #[cfg(any(
@@ -17302,29 +22221,62 @@ where I:IntoIterator<Item=(String,Result<Option<isyncyou_engine::self_hosted_mai
     feature = "agent-subscription-experimental"
 ))]
 impl isyncyou_webui::MutationIntentHandler for DaemonMutationIntents {
-    fn recover_mail_status(&self, _owner:&str, account:&str, subject_sha256:&str) -> Result<serde_json::Value,String> {
+    fn recover_mail_status(
+        &self,
+        _owner: &str,
+        account: &str,
+        subject_sha256: &str,
+    ) -> Result<serde_json::Value, String> {
         self.mail.with_locked_runtime_config(|cfg| {
-            let origin = match cfg.provider_accounts.get(account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) if cfg.accounts.iter().any(|a| a.id == account) => origin, _ => return Err("provider_unavailable".into()) };
-            isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| {
+            let origin = match cfg.provider_accounts.get(account) {
+                Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. })
+                    if cfg.accounts.iter().any(|a| a.id == account) =>
+                {
+                    origin
+                }
+                _ => return Err("provider_unavailable".into()),
+            };
+            isyncyou_engine::provider_auth::with_locked_provider_subject(cfg, account, |subject| {
                 let subject = subject.ok_or("provider_login_required")?;
-                let (ids,opaque) = self.store.find_bound_mail_intent_by_subject_digest(account,origin,subject,subject_sha256)?;
-                if ids.is_empty() { return Ok(serde_json::json!({"state":"unknown"})); }
-                if ids.len()!=1 || opaque { return Ok(serde_json::json!({"state":"ambiguous"})); }
-                let id=&ids[0];
-                let state=self.store.bound_mail_intent_state(id,account,origin,subject)?.ok_or("mutation_intent_not_found")?;
-                let (state,native_id) = if state=="active" { ("staged",None) } else if matches!(state.as_str(),"cancelled"|"expired") { ("not_dispatched",None) } else {
-                    let store=isyncyou_engine::provider_store::open_readonly(cfg,account)?;
-                    match store.provider_mail_draft_result(account,origin,id).map_err(|_| "mutation_intent_unavailable")? {
-                        Some((state,Some(id))) if state=="confirmed" && !id.is_empty() => ("completed",Some(id)),
-                        Some((state,_)) if state=="rejected" => ("rejected",None),
-                        _ => ("unknown",None),
+                let (ids, opaque) = self.store.find_bound_mail_intent_by_subject_digest(
+                    account,
+                    origin,
+                    subject,
+                    subject_sha256,
+                )?;
+                if ids.is_empty() {
+                    return Ok(serde_json::json!({"state":"unknown"}));
+                }
+                if ids.len() != 1 || opaque {
+                    return Ok(serde_json::json!({"state":"ambiguous"}));
+                }
+                let id = &ids[0];
+                let state = self
+                    .store
+                    .bound_mail_intent_state(id, account, origin, subject)?
+                    .ok_or("mutation_intent_not_found")?;
+                let (state, native_id) = if state == "active" {
+                    ("staged", None)
+                } else if matches!(state.as_str(), "cancelled" | "expired") {
+                    ("not_dispatched", None)
+                } else {
+                    let store = isyncyou_engine::provider_store::open_readonly(cfg, account)?;
+                    match store
+                        .provider_mail_draft_result(account, origin, id)
+                        .map_err(|_| "mutation_intent_unavailable")?
+                    {
+                        Some((state, Some(id))) if state == "confirmed" && !id.is_empty() => {
+                            ("completed", Some(id))
+                        }
+                        Some((state, _)) if state == "rejected" => ("rejected", None),
+                        _ => ("unknown", None),
                     }
                 };
                 Ok(serde_json::json!({"state":state,"intent_id":id,"native_id":native_id}))
             })
         })
     }
-    fn legacy_mail_status(&self, _owner:&str, account:&str) -> Result<serde_json::Value,String> {
+    fn legacy_mail_status(&self, _owner: &str, account: &str) -> Result<serde_json::Value, String> {
         self.mail.with_locked_runtime_config(|cfg| {
             if !cfg.provider_accounts.contains_key(account) || !cfg.accounts.iter().any(|a| a.id == account) { return Err("provider_unavailable".into()); }
             isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| {
@@ -17334,52 +22286,143 @@ impl isyncyou_webui::MutationIntentHandler for DaemonMutationIntents {
             })
         })
     }
-    fn mail_status(&self, _owner:&str, account:&str, intent_id:&str) -> Result<serde_json::Value,String> {
+    fn mail_status(
+        &self,
+        _owner: &str,
+        account: &str,
+        intent_id: &str,
+    ) -> Result<serde_json::Value, String> {
         self.mail.with_locked_runtime_config(|cfg| {
-            let origin = match cfg.provider_accounts.get(account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) if cfg.accounts.iter().any(|a| a.id == account) => origin, _ => return Err("provider_unavailable".into()) };
-            isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| {
+            let origin = match cfg.provider_accounts.get(account) {
+                Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. })
+                    if cfg.accounts.iter().any(|a| a.id == account) =>
+                {
+                    origin
+                }
+                _ => return Err("provider_unavailable".into()),
+            };
+            isyncyou_engine::provider_auth::with_locked_provider_subject(cfg, account, |subject| {
                 let subject = subject.ok_or("provider_login_required")?;
-                let state = self.store.bound_mail_intent_state(intent_id,account,origin,subject)?.ok_or("mutation_intent_not_found")?;
-                if state == "active" { return Ok(serde_json::json!({"state":"staged"})); }
-                if matches!(state.as_str(),"cancelled" | "expired") { return Ok(serde_json::json!({"state":"not_dispatched"})); }
-                let store = isyncyou_engine::provider_store::open_readonly(cfg,account)?;
-                let native = store.provider_mail_draft_result(account,origin,intent_id).map_err(|_| "mutation_intent_unavailable")?;
+                let state = self
+                    .store
+                    .bound_mail_intent_state(intent_id, account, origin, subject)?
+                    .ok_or("mutation_intent_not_found")?;
+                if state == "active" {
+                    return Ok(serde_json::json!({"state":"staged"}));
+                }
+                if matches!(state.as_str(), "cancelled" | "expired") {
+                    return Ok(serde_json::json!({"state":"not_dispatched"}));
+                }
+                let store = isyncyou_engine::provider_store::open_readonly(cfg, account)?;
+                let native = store
+                    .provider_mail_draft_result(account, origin, intent_id)
+                    .map_err(|_| "mutation_intent_unavailable")?;
                 match native {
-                    Some((state,Some(id))) if state == "confirmed" && !id.is_empty() => Ok(serde_json::json!({"state":"completed", "native_id":id})),
-                    Some((state,_)) if state == "rejected" => Ok(serde_json::json!({"state":"rejected"})),
+                    Some((state, Some(id))) if state == "confirmed" && !id.is_empty() => {
+                        Ok(serde_json::json!({"state":"completed", "native_id":id}))
+                    }
+                    Some((state, _)) if state == "rejected" => {
+                        Ok(serde_json::json!({"state":"rejected"}))
+                    }
                     _ => Ok(serde_json::json!({"state":"unknown"})),
                 }
             })
         })
     }
-    fn confirmed_attachments(&self, _owner:&str, account:&str)->Result<serde_json::Value,String> {
+    fn confirmed_attachments(
+        &self,
+        _owner: &str,
+        account: &str,
+    ) -> Result<serde_json::Value, String> {
         self.mail.with_locked_runtime_config(|cfg| {
-            let origin=match cfg.provider_accounts.get(account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin,..}) if cfg.accounts.iter().any(|a| a.id==account)=>origin, _=>return Err("provider_unavailable".into()) };
-            isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| {
-                let subject=subject.ok_or("provider_login_required")?;
-                let ids=self.store.stable_upload_ids(account,origin,subject)?;
-                let store=isyncyou_engine::provider_store::open_readonly(cfg,account)?;
-                let (items,unavailable)=collect_confirmed_attachment_records(ids.into_iter().map(|id| { let status=isyncyou_engine::self_hosted_mail::draft_attachment_upload_status(cfg,account,&store,&id); (id,status) }));
+            let origin = match cfg.provider_accounts.get(account) {
+                Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. })
+                    if cfg.accounts.iter().any(|a| a.id == account) =>
+                {
+                    origin
+                }
+                _ => return Err("provider_unavailable".into()),
+            };
+            isyncyou_engine::provider_auth::with_locked_provider_subject(cfg, account, |subject| {
+                let subject = subject.ok_or("provider_login_required")?;
+                let ids = self.store.stable_upload_ids(account, origin, subject)?;
+                let store = isyncyou_engine::provider_store::open_readonly(cfg, account)?;
+                let (items, unavailable) =
+                    collect_confirmed_attachment_records(ids.into_iter().map(|id| {
+                        let status =
+                            isyncyou_engine::self_hosted_mail::draft_attachment_upload_status(
+                                cfg, account, &store, &id,
+                            );
+                        (id, status)
+                    }));
                 Ok(serde_json::json!({"items":items,"unavailable":unavailable}))
             })
         })
     }
-    fn release_confirmed_attachment(&self, _owner:&str, request_id:&str, intent_id:&str, account:&str) -> Result<(),String> {
+    fn release_confirmed_attachment(
+        &self,
+        _owner: &str,
+        request_id: &str,
+        intent_id: &str,
+        account: &str,
+    ) -> Result<(), String> {
         self.mail.with_locked_runtime_config(|cfg| {
-            let origin=match cfg.provider_accounts.get(account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin,..}) if cfg.accounts.iter().any(|a| a.id==account)=>origin, _=>return Err("provider_unavailable".into()) };
-            isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| {
-                let subject=subject.ok_or("provider_login_required")?;
-                control_upload_release(cfg,&self.store,account,origin,subject,request_id,intent_id)
+            let origin = match cfg.provider_accounts.get(account) {
+                Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. })
+                    if cfg.accounts.iter().any(|a| a.id == account) =>
+                {
+                    origin
+                }
+                _ => return Err("provider_unavailable".into()),
+            };
+            isyncyou_engine::provider_auth::with_locked_provider_subject(cfg, account, |subject| {
+                let subject = subject.ok_or("provider_login_required")?;
+                control_upload_release(
+                    cfg,
+                    &self.store,
+                    account,
+                    origin,
+                    subject,
+                    request_id,
+                    intent_id,
+                )
             })
         })
     }
-    fn cancel_attachment_staging(&self, _owner:&str, request_id:&str, intent_id:&str, account:&str) -> Result<(),String> {
+    fn cancel_attachment_staging(
+        &self,
+        _owner: &str,
+        request_id: &str,
+        intent_id: &str,
+        account: &str,
+    ) -> Result<(), String> {
         self.mail.with_locked_runtime_config(|cfg| {
-        let origin = match cfg.provider_accounts.get(account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) if cfg.accounts.iter().any(|a| a.id == account) => origin, _ => return Err("provider_unavailable".into()) };
-        isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| self.store.cancel_stable_upload_staging(request_id,intent_id,account,origin,subject.ok_or("provider_login_required")?,unix_now_ms()))
+            let origin = match cfg.provider_accounts.get(account) {
+                Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. })
+                    if cfg.accounts.iter().any(|a| a.id == account) =>
+                {
+                    origin
+                }
+                _ => return Err("provider_unavailable".into()),
+            };
+            isyncyou_engine::provider_auth::with_locked_provider_subject(cfg, account, |subject| {
+                self.store.cancel_stable_upload_staging(
+                    request_id,
+                    intent_id,
+                    account,
+                    origin,
+                    subject.ok_or("provider_login_required")?,
+                    unix_now_ms(),
+                )
+            })
         })
     }
-    fn attachment_status(&self, owner:&str, account:&str, intent_id:&str) -> Result<serde_json::Value,String> {
+    fn attachment_status(
+        &self,
+        owner: &str,
+        account: &str,
+        intent_id: &str,
+    ) -> Result<serde_json::Value, String> {
         self.mail.with_locked_runtime_config(|cfg| {
         let origin = match cfg.provider_accounts.get(account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) if cfg.accounts.iter().any(|a| a.id == account) => origin, _ => return Err("provider_unavailable".into()) };
         isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| {
@@ -17396,28 +22439,66 @@ impl isyncyou_webui::MutationIntentHandler for DaemonMutationIntents {
         request: isyncyou_webui::MutationIntentCreate,
     ) -> Result<isyncyou_webui::MutationIntentInfo, String> {
         if let isyncyou_webui::MutationPurpose::MailBody { account, .. } = &request.purpose {
-            let own = self.mail.with_locked_runtime_config(|cfg| Ok(cfg.provider_accounts.contains_key(account)))?;
+            let own = self.mail.with_locked_runtime_config(|cfg| {
+                Ok(cfg.provider_accounts.contains_key(account))
+            })?;
             if own {
                 return self.mail.with_locked_runtime_config(|cfg| {
-                    let origin = match cfg.provider_accounts.get(account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) if cfg.accounts.iter().any(|a| a.id == account.as_str()) => origin, _ => return Err("provider_unavailable".into()) };
-                    isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| {
-                        let subject = subject.ok_or("provider_login_required")?;
-                        let info = self.store.create_mutation_intent(&request,unix_now_ms())?;
-                        self.store.bind_mail_installation(&request.owner,&info.intent_id,account,origin,subject)?;
-                        Ok(info)
-                    })
+                    let origin = match cfg.provider_accounts.get(account) {
+                        Some(isyncyou_core::config::ProviderConfig::SelfHosted {
+                            origin, ..
+                        }) if cfg.accounts.iter().any(|a| a.id == account.as_str()) => origin,
+                        _ => return Err("provider_unavailable".into()),
+                    };
+                    isyncyou_engine::provider_auth::with_locked_provider_subject(
+                        cfg,
+                        account,
+                        |subject| {
+                            let subject = subject.ok_or("provider_login_required")?;
+                            let info =
+                                self.store.create_mutation_intent(&request, unix_now_ms())?;
+                            self.store.bind_mail_installation(
+                                &request.owner,
+                                &info.intent_id,
+                                account,
+                                origin,
+                                subject,
+                            )?;
+                            Ok(info)
+                        },
+                    )
                 });
             }
         }
-        if let isyncyou_webui::MutationPurpose::MailAttachment { account, .. } | isyncyou_webui::MutationPurpose::ContactPhoto { account, .. } = &request.purpose {
+        if let isyncyou_webui::MutationPurpose::MailAttachment { account, .. }
+        | isyncyou_webui::MutationPurpose::ContactPhoto { account, .. } = &request.purpose
+        {
             return self.mail.with_locked_runtime_config(|cfg| {
-            let origin = match cfg.provider_accounts.get(account) { Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) if cfg.accounts.iter().any(|a| a.id == account.as_str()) => origin.clone(), _ => return Err("provider_unavailable".into()) };
-            isyncyou_engine::provider_auth::with_locked_provider_subject(cfg,account,|subject| {
-                let subject = subject.ok_or("provider_login_required")?;
-                let info = self.store.create_mutation_intent(&request, unix_now_ms())?;
-                self.store.bind_upload_installation(&request.owner,&info.intent_id,account,&origin,subject)?;
-                Ok(info)
-            }) });
+                let origin = match cfg.provider_accounts.get(account) {
+                    Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. })
+                        if cfg.accounts.iter().any(|a| a.id == account.as_str()) =>
+                    {
+                        origin.clone()
+                    }
+                    _ => return Err("provider_unavailable".into()),
+                };
+                isyncyou_engine::provider_auth::with_locked_provider_subject(
+                    cfg,
+                    account,
+                    |subject| {
+                        let subject = subject.ok_or("provider_login_required")?;
+                        let info = self.store.create_mutation_intent(&request, unix_now_ms())?;
+                        self.store.bind_upload_installation(
+                            &request.owner,
+                            &info.intent_id,
+                            account,
+                            &origin,
+                            subject,
+                        )?;
+                        Ok(info)
+                    },
+                )
+            });
         }
         self.store.create_mutation_intent(&request, unix_now_ms())
     }
@@ -18248,19 +23329,34 @@ pub fn build_live_router(
     .with_session_token(mint_cap_token());
     let dynamic_policy = agent_policy.clone();
     let dynamic_gate = agent_gate.clone();
-    let mut agent = DaemonAgent::new_with_policy(
-        cfg.clone(),
-        oauth_dir,
-        agent_policy,
-        agent_gate,
-    );
-    if let Ok(mut path) = agent.config_path.write() { *path = Some(config_path.clone()); }
-    match dynamic_policy {
-        AgentOperationPolicy::DesktopEnabled => agent.confirmed_executor = Arc::new(agent_ops::DesktopAgentOperations::with_config_path(cfg.clone(), dynamic_gate, config_path.clone())),
-        AgentOperationPolicy::MobileFullNode { mobile_jobs } => agent.confirmed_executor = Arc::new(agent_ops::MobileFullNodeAgentOperations::with_config_path(cfg.clone(), dynamic_gate, mobile_jobs, config_path.clone())),
-        AgentOperationPolicy::MobileDisabled => {},
+    let mut agent = DaemonAgent::new_with_policy(cfg.clone(), oauth_dir, agent_policy, agent_gate);
+    if let Ok(mut path) = agent.config_path.write() {
+        *path = Some(config_path.clone());
     }
-    agent.audit_sink = Arc::new(StoreAgentAuditSink { cfg: cfg.clone(), config_path: Some(config_path.clone()) });
+    match dynamic_policy {
+        AgentOperationPolicy::DesktopEnabled => {
+            agent.confirmed_executor =
+                Arc::new(agent_ops::DesktopAgentOperations::with_config_path(
+                    cfg.clone(),
+                    dynamic_gate,
+                    config_path.clone(),
+                ))
+        }
+        AgentOperationPolicy::MobileFullNode { mobile_jobs } => {
+            agent.confirmed_executor =
+                Arc::new(agent_ops::MobileFullNodeAgentOperations::with_config_path(
+                    cfg.clone(),
+                    dynamic_gate,
+                    mobile_jobs,
+                    config_path.clone(),
+                ))
+        }
+        AgentOperationPolicy::MobileDisabled => {}
+    }
+    agent.audit_sink = Arc::new(StoreAgentAuditSink {
+        cfg: cfg.clone(),
+        config_path: Some(config_path.clone()),
+    });
     let agent = Arc::new(agent);
     #[cfg(any(
         feature = "agent-oauth-providers",
@@ -18303,15 +23399,24 @@ pub fn build_live_router(
             config_path: config_path.clone(),
         }) as Arc<dyn isyncyou_webui::OneDriveRiskHandler>)
         .with_mail_write(
-            Arc::new(DaemonMailWrite { cfg: cfg.clone(), config_path: Some(config_path.clone()) }),
+            Arc::new(DaemonMailWrite {
+                cfg: cfg.clone(),
+                config_path: Some(config_path.clone()),
+            }),
             mint_cap_token(),
         )
         .with_calendar_write(
-            Arc::new(DaemonCalendarWrite { cfg: cfg.clone(), config_path:Some(config_path.clone()) }),
+            Arc::new(DaemonCalendarWrite {
+                cfg: cfg.clone(),
+                config_path: Some(config_path.clone()),
+            }),
             mint_cap_token(),
         )
         .with_contact_write(
-            Arc::new(DaemonContactWrite { cfg: cfg.clone(), config_path:Some(config_path.clone()) }),
+            Arc::new(DaemonContactWrite {
+                cfg: cfg.clone(),
+                config_path: Some(config_path.clone()),
+            }),
             mint_cap_token(),
         )
         .with_task_write(
@@ -18388,7 +23493,10 @@ fn with_mutation_intents_if_available(
                 Arc::new(DaemonMutationIntents {
                     store,
                     onedrive: DaemonOneDriveWrite::new(cfg.clone()),
-                    mail: DaemonMailWrite { cfg: cfg.clone(), config_path: Some(config_path.clone()) },
+                    mail: DaemonMailWrite {
+                        cfg: cfg.clone(),
+                        config_path: Some(config_path.clone()),
+                    },
                     onenote: DaemonOneNoteWrite { cfg: cfg.clone() },
                     todo: DaemonTaskWrite { cfg },
                 }),
@@ -18515,41 +23623,72 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     #[test]
     fn shared_mail_reference_binds_scope_and_identifier() {
         let a = shared_mail_ref("native-a", "same-id");
         let b = shared_mail_ref("native-b", "same-id");
-        assert_ne!(a,b);
-        assert_eq!(parse_shared_mail_ref(&a).unwrap(),Some(("native-a".into(),"same-id".into())));
+        assert_ne!(a, b);
+        assert_eq!(
+            parse_shared_mail_ref(&a).unwrap(),
+            Some(("native-a".into(), "same-id".into()))
+        );
         assert!(parse_shared_mail_ref("shared-mail:bad").is_err());
-        assert_eq!(parse_shared_mail_ref("ordinary-id").unwrap(),None);
+        assert_eq!(parse_shared_mail_ref("ordinary-id").unwrap(), None);
     }
 
     #[test]
     fn provider_mail_role_state_distinguishes_denial_from_authentication() {
         use isyncyou_engine::self_hosted_mail::MailAccessObservation as O;
         use isyncyou_webui::AccountAuthState as S;
-        assert_eq!(provider_mail_role_state(false,O::PermissionDenied),S::Disconnected);
-        assert_eq!(provider_mail_role_state(true,O::PermissionDenied),S::PermissionDenied);
-        assert_eq!(provider_mail_role_state(true,O::AuthenticationRejected),S::ReconnectRequired);
-        assert_eq!(provider_mail_role_state(true,O::Unknown),S::AccessUnknown);
-        assert_eq!(provider_mail_role_state(true,O::TransportUnavailable),S::ServiceUnreachable);
-        assert_eq!(provider_mail_role_state(true,O::InvalidResponse),S::ProviderResponseInvalid);
-        assert_eq!(provider_mail_role_state(true,O::Available),S::Connected);
+        assert_eq!(
+            provider_mail_role_state(false, O::PermissionDenied),
+            S::Disconnected
+        );
+        assert_eq!(
+            provider_mail_role_state(true, O::PermissionDenied),
+            S::PermissionDenied
+        );
+        assert_eq!(
+            provider_mail_role_state(true, O::AuthenticationRejected),
+            S::ReconnectRequired
+        );
+        assert_eq!(provider_mail_role_state(true, O::Unknown), S::AccessUnknown);
+        assert_eq!(
+            provider_mail_role_state(true, O::TransportUnavailable),
+            S::ServiceUnreachable
+        );
+        assert_eq!(
+            provider_mail_role_state(true, O::InvalidResponse),
+            S::ProviderResponseInvalid
+        );
+        assert_eq!(provider_mail_role_state(true, O::Available), S::Connected);
     }
 
     #[test]
-    #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     fn provider_mail_sources_reject_invalid_identifiers_and_labels() {
-        let rows = vec![serde_json::json!({"service":"mail", "id":"valid", "subject":"Hello"}), serde_json::json!({"service":"mail", "id":"bad\u{0000}id", "subject":"Unsafe"}), serde_json::json!({"service":"mail", "id":"other", "subject":"bad\u{0000}subject"})];
+        let rows = vec![
+            serde_json::json!({"service":"mail", "id":"valid", "subject":"Hello"}),
+            serde_json::json!({"service":"mail", "id":"bad\u{0000}id", "subject":"Unsafe"}),
+            serde_json::json!({"service":"mail", "id":"other", "subject":"bad\u{0000}subject"}),
+        ];
         let sources = provider_mail_sources(&rows);
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].item_id, "valid");
         assert_eq!(sources[0].label.as_deref(), Some("Hello"));
     }
 
-    #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     #[test]
     fn recovery_catalog_excludes_other_domains_and_untrusted_fields() {
         let id = "a".repeat(64);
@@ -18558,62 +23697,119 @@ mod tests {
             {"generation":id,"object":id,"version":id,"kind":"task","label":"private task"},
             {"generation":id,"object":id,"version":id,"kind":"event","label":"Meeting","extra":"hidden"}
         ],"next":100}),"calendar").unwrap();
-        assert_eq!(result["items"].as_array().unwrap().len(),1);
-        assert_eq!(result["items"][0]["kind"],"event");
+        assert_eq!(result["items"].as_array().unwrap().len(), 1);
+        assert_eq!(result["items"][0]["kind"], "event");
         assert!(result["items"][0].get("extra").is_none());
-        assert_eq!(result["next"],100);
+        assert_eq!(result["next"], 100);
         for (service, kind) in [("mail", "mail"), ("contacts", "contact")] {
             let item = serde_json::json!({"generation":id,"object":id,"version":id,"kind":kind,"label":"Recovered"});
-            let selected = recovery_calendar_catalog(serde_json::json!({"items":[item],"next":null}),service).unwrap();
-            assert_eq!(selected["items"][0]["kind"],kind);
-            assert!(recovery_calendar_catalog(serde_json::json!({"items":[selected["items"][0]],"next":null}),"calendar").unwrap()["items"].as_array().unwrap().is_empty());
+            let selected =
+                recovery_calendar_catalog(serde_json::json!({"items":[item],"next":null}), service)
+                    .unwrap();
+            assert_eq!(selected["items"][0]["kind"], kind);
+            assert!(recovery_calendar_catalog(
+                serde_json::json!({"items":[selected["items"][0]],"next":null}),
+                "calendar"
+            )
+            .unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .is_empty());
         }
     }
 
-    #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     #[test]
     fn upload_receipt_release_keeps_unknown_and_unconfirmed_operations() {
-        assert!(upload_receipt_can_be_released("confirmed",Some("blob")));
-        assert!(!upload_receipt_can_be_released("unknown",Some("blob")));
-        assert!(!upload_receipt_can_be_released("confirmed",None));
-        assert!(!upload_receipt_can_be_released("confirmed",Some("")));
+        assert!(upload_receipt_can_be_released("confirmed", Some("blob")));
+        assert!(!upload_receipt_can_be_released("unknown", Some("blob")));
+        assert!(!upload_receipt_can_be_released("confirmed", None));
+        assert!(!upload_receipt_can_be_released("confirmed", Some("")));
     }
 
-    #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     #[test]
     fn confirmed_upload_list_isolates_ambiguous_and_unknown_entries() {
         use isyncyou_engine::self_hosted_mail::AttachmentUploadStatus;
-        let status=|state:&str,blob:Option<&str>| AttachmentUploadStatus {remote_account:"native".into(),filename:"file.txt".into(),content_type:"text/plain".into(),size:3,sha256:"a".repeat(64),state:state.into(),blob_id:blob.map(str::to_owned)};
-        let (items,unavailable)=collect_confirmed_attachment_records(vec![
-            ("ambiguous".into(),Err("scope ambiguous".into())),
-            ("unknown".into(),Ok(Some(status("unknown",None)))),
-            ("confirmed".into(),Ok(Some(status("confirmed",Some("blob"))))),
+        let status = |state: &str, blob: Option<&str>| AttachmentUploadStatus {
+            remote_account: "native".into(),
+            filename: "file.txt".into(),
+            content_type: "text/plain".into(),
+            size: 3,
+            sha256: "a".repeat(64),
+            state: state.into(),
+            blob_id: blob.map(str::to_owned),
+        };
+        let (items, unavailable) = collect_confirmed_attachment_records(vec![
+            ("ambiguous".into(), Err("scope ambiguous".into())),
+            ("unknown".into(), Ok(Some(status("unknown", None)))),
+            (
+                "confirmed".into(),
+                Ok(Some(status("confirmed", Some("blob")))),
+            ),
         ]);
-        assert_eq!(unavailable,1); assert_eq!(items.len(),1); assert_eq!(items[0]["intent_id"],"confirmed");
+        assert_eq!(unavailable, 1);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["intent_id"], "confirmed");
     }
 
-    #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     #[test]
     fn provider_search_sources_keep_domain_identity() {
-        let rows = vec![serde_json::json!({"service":"calendar", "id":"event-1"}), serde_json::json!({"service":"todo", "id":"task-1"}), serde_json::json!({"service":"contacts", "id":"contact-1"})];
+        let rows = vec![
+            serde_json::json!({"service":"calendar", "id":"event-1"}),
+            serde_json::json!({"service":"todo", "id":"task-1"}),
+            serde_json::json!({"service":"contacts", "id":"contact-1"}),
+        ];
         let sources = provider_mail_sources(&rows);
-        assert_eq!(sources.iter().map(|s| s.service.as_str()).collect::<Vec<_>>(), vec!["calendar", "todo", "contacts"]);
+        assert_eq!(
+            sources
+                .iter()
+                .map(|s| s.service.as_str())
+                .collect::<Vec<_>>(),
+            vec!["calendar", "todo", "contacts"]
+        );
     }
 
-    #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     #[test]
     fn contact_search_projection_excludes_photos_and_unselected_fields() {
-        let view = serde_json::json!(["vcard",[["fn",{},"text","Example"],["photo",{},"uri","data:image/png;base64,private"],["email",{},"text","private@example.test"]]]);
+        let view = serde_json::json!([
+            "vcard",
+            [
+                ["fn", {}, "text", "Example"],
+                ["photo", {}, "uri", "data:image/png;base64,private"],
+                ["email", {}, "text", "private@example.test"]
+            ]
+        ]);
         let names = provider_contact_search_names(&view);
-        assert_eq!(names, vec![serde_json::json!(["fn",{},"text","Example"])]);
+        assert_eq!(
+            names,
+            vec![serde_json::json!(["fn", {}, "text", "Example"])]
+        );
         assert!(!serde_json::to_string(&names).unwrap().contains("private"));
     }
 
     #[test]
     fn calendar_month_window_is_bounded_and_rolls_over() {
-        assert_eq!(calendar_month_bounds(2026,12), Some(("20261201T000000Z".into(),"20270101T000000Z".into())));
-        assert!(calendar_month_bounds(2026,13).is_none());
-        assert!(calendar_month_bounds(9999,12).is_none());
+        assert_eq!(
+            calendar_month_bounds(2026, 12),
+            Some(("20261201T000000Z".into(), "20270101T000000Z".into()))
+        );
+        assert!(calendar_month_bounds(2026, 13).is_none());
+        assert!(calendar_month_bounds(9999, 12).is_none());
     }
 
     #[test]
@@ -19542,38 +24738,108 @@ mod tests {
         assert!(isyncyou_webui::AgentHandler::open_stream(agent, "turn-0-0").is_none());
     }
 
-    #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     #[test]
     fn contact_photo_confirm_routes_once_after_real_pending_revalidation() {
-        let order=Arc::new(StdMutex::new(Vec::new()));let executor=RecordingConfirmedExecutor::ok("photo updated",order.clone());let audit=RecordingAuditSink::new(order);
-        let root=temp_agent_root("contact-photo-confirm");let mut agent=DaemonAgent::with_test_confirm_components(Config::default(),root,Arc::new(executor.clone()),Arc::new(audit));agent.test_contact_photo_executor=Some(Arc::new(executor.clone()));
-        let action=isyncyou_agent::ToolAction::LiveWrite {account:"acct".into(),service:"contacts".into(),target:Some("/book/a.vcf".into()),change:serde_json::json!({"verb":"contact_set_photo","stage_id":"photo-1","request_sha256":"a".repeat(64),"origin":"https://example.test/","collection":"/book/","href":"/book/a.vcf","media_type":"image/png","sha256":"b".repeat(64),"size":128,"uid":"uid-1","name":"Example","old_photo_uri_sha256":null,"etag":"\"v1\"","raw_sha256":"c".repeat(64)})};
-        let preview=agent_ops::contact_photo_preview(&action).unwrap().text;let (pending,token)=register_test_pending(&agent,action,&preview,unix_now_ms(),AGENT_CONFIRM_TTL_MS);
-        assert_eq!(confirm_test_pending(&agent,&pending,&token),isyncyou_webui::AgentConfirmOutcome::Completed);assert_eq!(executor.call_count(),1);
-        assert_ne!(confirm_test_pending(&agent,&pending,&token),isyncyou_webui::AgentConfirmOutcome::Completed);assert_eq!(executor.call_count(),1);
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("photo updated", order.clone());
+        let audit = RecordingAuditSink::new(order);
+        let root = temp_agent_root("contact-photo-confirm");
+        let mut agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root,
+            Arc::new(executor.clone()),
+            Arc::new(audit),
+        );
+        agent.test_contact_photo_executor = Some(Arc::new(executor.clone()));
+        let action = isyncyou_agent::ToolAction::LiveWrite {
+            account: "acct".into(),
+            service: "contacts".into(),
+            target: Some("/book/a.vcf".into()),
+            change: serde_json::json!({"verb":"contact_set_photo","stage_id":"photo-1","request_sha256":"a".repeat(64),"origin":"https://example.test/","collection":"/book/","href":"/book/a.vcf","media_type":"image/png","sha256":"b".repeat(64),"size":128,"uid":"uid-1","name":"Example","old_photo_uri_sha256":null,"etag":"\"v1\"","raw_sha256":"c".repeat(64)}),
+        };
+        let preview = agent_ops::contact_photo_preview(&action).unwrap().text;
+        let (pending, token) = register_test_pending(
+            &agent,
+            action,
+            &preview,
+            unix_now_ms(),
+            AGENT_CONFIRM_TTL_MS,
+        );
+        assert_eq!(
+            confirm_test_pending(&agent, &pending, &token),
+            isyncyou_webui::AgentConfirmOutcome::Completed
+        );
+        assert_eq!(executor.call_count(), 1);
+        assert_ne!(
+            confirm_test_pending(&agent, &pending, &token),
+            isyncyou_webui::AgentConfirmOutcome::Completed
+        );
+        assert_eq!(executor.call_count(), 1);
     }
 
-    #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     #[test]
     fn single_capture_confirm_routes_once_after_real_pending_revalidation() {
-        let order=Arc::new(StdMutex::new(Vec::new()));
-        let executor=RecordingConfirmedExecutor::ok("capture requested",order.clone());
-        let audit=RecordingAuditSink::new(order.clone());
-        let root=temp_agent_root("single-capture-confirm");
-        let mut agent=DaemonAgent::with_test_confirm_components(Config::default(),root,Arc::new(executor.clone()),Arc::new(audit));
-        agent.test_single_capture_executor=Some(Arc::new(executor.clone()));
-        let fields=serde_json::json!(["acct","https://example.test/","/.well-known/caldav","calendar","/cal/","/cal/object.ics","native","a".repeat(64),"b".repeat(64),"op-1","event","Appointment","fresh","confirmation"]);
-        let approval=ring::digest::digest(&ring::digest::SHA256,fields.to_string().as_bytes()).as_ref().iter().map(|b|format!("{b:02x}")).collect::<String>();
-        let intent=serde_json::json!({"account_id":"acct","origin":"https://example.test/","entry":"/.well-known/caldav","service":"calendar","collection":"/cal/","href":"/cal/object.ics","native_account":"native","object":"a".repeat(64),"version":"b".repeat(64),"operation_id":"op-1","kind":"event","title":"Appointment","mode":"fresh","confirmation":"confirmation","approval_sha256":approval});
-        let action=isyncyou_agent::ToolAction::LiveWrite {account:"acct".into(),service:"calendar".into(),target:None,change:serde_json::json!({"verb":"single_capture","operation_id":"op-1","request_sha256":"c".repeat(64),"intent":intent})};
-        let preview=agent_ops::single_capture_preview(&action).unwrap().text;
-        let (pending,token)=register_test_pending(&agent,action,&preview,unix_now_ms(),AGENT_CONFIRM_TTL_MS);
-        let result=confirm_test_pending(&agent,&pending,&token);
-        assert_eq!(result,isyncyou_webui::AgentConfirmOutcome::Completed);
-        assert_eq!(executor.call_count(),1);
-        let repeated=confirm_test_pending(&agent,&pending,&token);
-        assert_ne!(repeated,isyncyou_webui::AgentConfirmOutcome::Completed);
-        assert_eq!(executor.call_count(),1);
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingConfirmedExecutor::ok("capture requested", order.clone());
+        let audit = RecordingAuditSink::new(order.clone());
+        let root = temp_agent_root("single-capture-confirm");
+        let mut agent = DaemonAgent::with_test_confirm_components(
+            Config::default(),
+            root,
+            Arc::new(executor.clone()),
+            Arc::new(audit),
+        );
+        agent.test_single_capture_executor = Some(Arc::new(executor.clone()));
+        let fields = serde_json::json!([
+            "acct",
+            "https://example.test/",
+            "/.well-known/caldav",
+            "calendar",
+            "/cal/",
+            "/cal/object.ics",
+            "native",
+            "a".repeat(64),
+            "b".repeat(64),
+            "op-1",
+            "event",
+            "Appointment",
+            "fresh",
+            "confirmation"
+        ]);
+        let approval = ring::digest::digest(&ring::digest::SHA256, fields.to_string().as_bytes())
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let intent = serde_json::json!({"account_id":"acct","origin":"https://example.test/","entry":"/.well-known/caldav","service":"calendar","collection":"/cal/","href":"/cal/object.ics","native_account":"native","object":"a".repeat(64),"version":"b".repeat(64),"operation_id":"op-1","kind":"event","title":"Appointment","mode":"fresh","confirmation":"confirmation","approval_sha256":approval});
+        let action = isyncyou_agent::ToolAction::LiveWrite {
+            account: "acct".into(),
+            service: "calendar".into(),
+            target: None,
+            change: serde_json::json!({"verb":"single_capture","operation_id":"op-1","request_sha256":"c".repeat(64),"intent":intent}),
+        };
+        let preview = agent_ops::single_capture_preview(&action).unwrap().text;
+        let (pending, token) = register_test_pending(
+            &agent,
+            action,
+            &preview,
+            unix_now_ms(),
+            AGENT_CONFIRM_TTL_MS,
+        );
+        let result = confirm_test_pending(&agent, &pending, &token);
+        assert_eq!(result, isyncyou_webui::AgentConfirmOutcome::Completed);
+        assert_eq!(executor.call_count(), 1);
+        let repeated = confirm_test_pending(&agent, &pending, &token);
+        assert_ne!(repeated, isyncyou_webui::AgentConfirmOutcome::Completed);
+        assert_eq!(executor.call_count(), 1);
     }
 
     #[test]
@@ -20429,7 +25695,10 @@ mod tests {
             }],
             ..Default::default()
         };
-        let sink = StoreAgentAuditSink { cfg, config_path: None };
+        let sink = StoreAgentAuditSink {
+            cfg,
+            config_path: None,
+        };
         let event = AgentAuthorizationAuditV1 {
             schema_version: 1,
             op: isyncyou_core::pending::ConfirmationOperation::Backup,
@@ -21071,7 +26340,10 @@ mod tests {
             cfg.clone(),
             gate,
         );
-        let audit = Arc::new(StoreAgentAuditSink { cfg: cfg.clone(), config_path: None });
+        let audit = Arc::new(StoreAgentAuditSink {
+            cfg: cfg.clone(),
+            config_path: None,
+        });
         let subject = format!("isyncyou issue 624 live confirm {}", unix_now());
         let recipient = std::env::var("ISY624_M365_DRAFT_TO")
             .unwrap_or_else(|_| "recipient@example.invalid".to_string());
@@ -21233,7 +26505,10 @@ mod tests {
             cfg.clone(),
             gate,
         );
-        let audit = Arc::new(StoreAgentAuditSink { cfg: cfg.clone(), config_path: None });
+        let audit = Arc::new(StoreAgentAuditSink {
+            cfg: cfg.clone(),
+            config_path: None,
+        });
         let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
             id: "tool-1".into(),
             input: serde_json::json!({
@@ -21317,7 +26592,10 @@ mod tests {
             cfg.clone(),
             gate,
         );
-        let audit = Arc::new(StoreAgentAuditSink { cfg: cfg.clone(), config_path: None });
+        let audit = Arc::new(StoreAgentAuditSink {
+            cfg: cfg.clone(),
+            config_path: None,
+        });
         let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
             id: "tool-1".into(),
             input: serde_json::json!({
@@ -21394,7 +26672,10 @@ mod tests {
             cfg.clone(),
             gate,
         );
-        let audit = Arc::new(StoreAgentAuditSink { cfg: cfg.clone(), config_path: None });
+        let audit = Arc::new(StoreAgentAuditSink {
+            cfg: cfg.clone(),
+            config_path: None,
+        });
         let script = vec![vec![isyncyou_agent::AssistantBlock::ToolUse {
             id: "tool-1".into(),
             input: serde_json::json!({
@@ -23070,14 +28351,36 @@ mod tests {
         feature = "agent-oauth-providers",
         feature = "agent-subscription-experimental"
     ))]
-    #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+    #[cfg(any(
+        feature = "agent-oauth-providers",
+        feature = "agent-subscription-experimental"
+    ))]
     #[test]
     fn capture_preclaim_failures_do_not_reclassify_unverified_or_unknown() {
-        assert_eq!(single_capture_preclaim_failure("capture_preflight_source"),Some(ClosedExecutionCode::CaptureSourceUnavailable));
-        assert_eq!(single_capture_preclaim_failure("capture_preflight_version_changed"),Some(ClosedExecutionCode::CaptureVersionChanged));
-        assert_eq!(single_capture_preclaim_failure("capture_preflight_challenge"),Some(ClosedExecutionCode::CaptureChallengeUnavailable));
-        assert_eq!(single_capture_preclaim_failure("capture_preflight_journal"),Some(ClosedExecutionCode::CaptureJournalUnavailable));
-        for error in ["capture_preflight_unverified","capture_local_intent_missing","arbitrary remote error",""] {assert_eq!(single_capture_preclaim_failure(error),None);}
+        assert_eq!(
+            single_capture_preclaim_failure("capture_preflight_source"),
+            Some(ClosedExecutionCode::CaptureSourceUnavailable)
+        );
+        assert_eq!(
+            single_capture_preclaim_failure("capture_preflight_version_changed"),
+            Some(ClosedExecutionCode::CaptureVersionChanged)
+        );
+        assert_eq!(
+            single_capture_preclaim_failure("capture_preflight_challenge"),
+            Some(ClosedExecutionCode::CaptureChallengeUnavailable)
+        );
+        assert_eq!(
+            single_capture_preclaim_failure("capture_preflight_journal"),
+            Some(ClosedExecutionCode::CaptureJournalUnavailable)
+        );
+        for error in [
+            "capture_preflight_unverified",
+            "capture_local_intent_missing",
+            "arbitrary remote error",
+            "",
+        ] {
+            assert_eq!(single_capture_preclaim_failure(error), None);
+        }
     }
 
     #[test]
@@ -32830,14 +38133,30 @@ fn provider_setup_reloads_account_without_cross_account_fallback() {
     let config_path = root.path().join("config.toml");
     let initial = Config::default();
     initial.save(&config_path).unwrap();
-    let auth = DaemonAccountAuth { cfg: initial.clone(), config_path: Some(config_path.clone()), logins: Mutex::new(std::collections::HashMap::new()) };
-    auth.create_provider_account("team", "Team", "https://example.invalid", "client").unwrap();
+    let auth = DaemonAccountAuth {
+        cfg: initial.clone(),
+        config_path: Some(config_path.clone()),
+        logins: Mutex::new(std::collections::HashMap::new()),
+    };
+    auth.create_provider_account("team", "Team", "https://example.invalid", "client")
+        .unwrap();
     let updated = auth.current_config().unwrap();
     assert!(updated.provider_accounts.contains_key("team"));
     assert!(updated.accounts.iter().any(|a| a.id == "team"));
     assert!(!initial.accounts.iter().any(|a| a.id == "team"));
-    let executor = make_account_executor("unknown", PathBuf::new(), &updated, Arc::new(std::sync::RwLock::new(None)), None);
-    let action = isyncyou_agent::ToolAction::Read { account:"unknown".into(), service:"mail".into(), id:"id".into(), max_bytes:None };
+    let executor = make_account_executor(
+        "unknown",
+        PathBuf::new(),
+        &updated,
+        Arc::new(std::sync::RwLock::new(None)),
+        None,
+    );
+    let action = isyncyou_agent::ToolAction::Read {
+        account: "unknown".into(),
+        service: "mail".into(),
+        id: "id".into(),
+        max_bytes: None,
+    };
     assert!(executor.execute_read(&action).is_err());
 }
 

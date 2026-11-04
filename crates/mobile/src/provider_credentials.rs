@@ -18,7 +18,8 @@ impl AndroidProviderCredentialStore {
     #[cfg(test)]
     pub(crate) fn for_test(base: &Path) -> Self {
         Self {
-            resolver: CredentialStoreResolver::new(CredentialStoreConfig::new(base)).with_provided_key([23; 32]),
+            resolver: CredentialStoreResolver::new(CredentialStoreConfig::new(base))
+                .with_provided_key([23; 32]),
             allow_test_key: true,
         }
     }
@@ -53,25 +54,40 @@ impl AndroidProviderCredentialStore {
     }
 
     pub(crate) fn read_auth_journal(&self) -> Result<Option<Vec<u8>>, String> {
-        self.store()?.get_bounded(SecretClass::OAuthExchangeIntent, Self::AUTH_JOURNAL_ID, 131072, 65536)
+        self.store()?
+            .get_bounded(
+                SecretClass::OAuthExchangeIntent,
+                Self::AUTH_JOURNAL_ID,
+                131072,
+                65536,
+            )
             .map(|value| value.map(|secret| secret.expose().to_vec()))
             .map_err(|_| "Android authorization journal unavailable".into())
     }
 
     pub(crate) fn write_auth_journal(&self, value: &[u8]) -> Result<(), String> {
-        if value.is_empty() || value.len() > 65536 { return Err("Invalid authorization journal".into()); }
+        if value.is_empty() || value.len() > 65536 {
+            return Err("Invalid authorization journal".into());
+        }
         let store = self.store()?;
-        store.put_bounded(SecretClass::OAuthExchangeIntent, Self::AUTH_JOURNAL_ID,
-            &Secret::new(value.to_vec()), 131072)
+        store
+            .put_bounded(
+                SecretClass::OAuthExchangeIntent,
+                Self::AUTH_JOURNAL_ID,
+                &Secret::new(value.to_vec()),
+                131072,
+            )
             .map_err(|_| "Android authorization journal write failed")?;
         // The shared writer syncs file contents but treats directory sync as best effort.
         // Exchange dispatch requires a checked rename durability barrier.
-        std::fs::File::open(store.store_dir()).and_then(|dir| dir.sync_all())
+        std::fs::File::open(store.store_dir())
+            .and_then(|dir| dir.sync_all())
             .map_err(|_| "Android authorization journal sync failed".into())
     }
 
     pub(crate) fn delete_auth_journal(&self) -> Result<(), String> {
-        self.store()?.delete_durable(SecretClass::OAuthExchangeIntent, Self::AUTH_JOURNAL_ID)
+        self.store()?
+            .delete_durable(SecretClass::OAuthExchangeIntent, Self::AUTH_JOURNAL_ID)
             .map_err(|_| "Android authorization journal deletion failed".into())
     }
 
@@ -162,7 +178,10 @@ impl ProviderCredentialStore for AndroidProviderCredentialStore {
         credential: &ProviderCredential,
     ) -> Result<(), String> {
         let id = Self::id(account, origin)?;
-        if credential.access_token.is_empty() || credential.refresh_token.as_deref() == Some("") || credential.subject.as_deref() == Some("") {
+        if credential.access_token.is_empty()
+            || credential.refresh_token.as_deref() == Some("")
+            || credential.subject.as_deref() == Some("")
+        {
             return Err("Invalid Android credential".into());
         }
         let value = serde_json::json!({"v":1,"access_token":credential.access_token,
@@ -172,7 +191,8 @@ impl ProviderCredentialStore for AndroidProviderCredentialStore {
             return Err("Android credential too large".into());
         }
         let store = self.store()?;
-        store.put_bounded(
+        store
+            .put_bounded(
                 SecretClass::ProviderOAuthRefresh,
                 &id,
                 &Secret::new(bytes),
@@ -181,7 +201,8 @@ impl ProviderCredentialStore for AndroidProviderCredentialStore {
             .map_err(|_| "Android credential write failed")?;
         // Provider refresh and revocation rely on this record surviving a crash.
         // The common writer already syncs the file; require directory sync too.
-        std::fs::File::open(store.store_dir()).and_then(|dir| dir.sync_all())
+        std::fs::File::open(store.store_dir())
+            .and_then(|dir| dir.sync_all())
             .map_err(|_| "Android credential directory sync failed".into())
     }
 
@@ -217,12 +238,19 @@ mod tests {
         };
         let record = b"pending-pkce-sentinel";
         make().write_auth_journal(record).unwrap();
-        assert_eq!(make().read_auth_journal().unwrap().as_deref(), Some(record.as_slice()));
+        assert_eq!(
+            make().read_auth_journal().unwrap().as_deref(),
+            Some(record.as_slice())
+        );
         let files = std::fs::read_dir(dir.path().join("agent-credentials")).unwrap();
-        assert!(files.map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
+        assert!(files
+            .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
             .all(|bytes| !bytes.windows(record.len()).any(|part| part == record)));
         make().write_auth_journal(b"exchange_started").unwrap();
-        assert_eq!(make().read_auth_journal().unwrap().as_deref(), Some(b"exchange_started".as_slice()));
+        assert_eq!(
+            make().read_auth_journal().unwrap().as_deref(),
+            Some(b"exchange_started".as_slice())
+        );
         make().delete_auth_journal().unwrap();
         assert!(make().read_auth_journal().unwrap().is_none());
     }
@@ -255,14 +283,38 @@ mod tests {
                 .as_deref(),
             Some("refresh-sentinel")
         );
-        assert_eq!(reopened.load("one", "https://example.test").unwrap().unwrap().subject.as_deref(), Some("subject-sentinel"));
+        assert_eq!(
+            reopened
+                .load("one", "https://example.test")
+                .unwrap()
+                .unwrap()
+                .subject
+                .as_deref(),
+            Some("subject-sentinel")
+        );
         assert!(reopened
             .load("other", "https://example.test")
             .unwrap()
             .is_none());
-        let internal = ProviderCredential { access_token: "database-key".into(), refresh_token: None, expires_at: 0, subject: None };
-        reopened.replace("isyncyou-internal:store:a", "https://example.test", &internal).unwrap();
-        assert!(reopened.load("isyncyou-internal:store:a", "https://example.test").unwrap().unwrap().subject.is_none());
+        let internal = ProviderCredential {
+            access_token: "database-key".into(),
+            refresh_token: None,
+            expires_at: 0,
+            subject: None,
+        };
+        reopened
+            .replace(
+                "isyncyou-internal:store:a",
+                "https://example.test",
+                &internal,
+            )
+            .unwrap();
+        assert!(reopened
+            .load("isyncyou-internal:store:a", "https://example.test")
+            .unwrap()
+            .unwrap()
+            .subject
+            .is_none());
         let raw = std::fs::read_dir(dir.path().join("agent-credentials"))
             .unwrap()
             .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
@@ -274,7 +326,9 @@ mod tests {
             .windows(b"subject-sentinel".len())
             .any(|w| w == b"subject-sentinel")));
         reopened.delete("one", "https://example.test").unwrap();
-        reopened.delete("isyncyou-internal:store:a", "https://example.test").unwrap();
+        reopened
+            .delete("isyncyou-internal:store:a", "https://example.test")
+            .unwrap();
         assert!(reopened
             .load("one", "https://example.test")
             .unwrap()

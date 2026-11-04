@@ -85,12 +85,22 @@ fn run(config: Config, stage: &Cell<&'static str>) -> Result<()> {
     }
     let identity = Url::parse(&config.identity_origin)?;
     let public = Url::parse(&config.trusted_public_origin)?;
-    if identity.scheme() != "https" || identity.host_str().is_none() || identity.path() != "/" ||
-        !identity.username().is_empty() || identity.password().is_some() || identity.query().is_some() || identity.fragment().is_some() ||
-        identity != public {
+    if identity.scheme() != "https"
+        || identity.host_str().is_none()
+        || identity.path() != "/"
+        || !identity.username().is_empty()
+        || identity.password().is_some()
+        || identity.query().is_some()
+        || identity.fragment().is_some()
+        || identity != public
+    {
         return Err("invalid enrolled identity origin".into());
     }
-    if config.archive.symlink_metadata().is_ok_and(|meta| meta.file_type().is_symlink()) {
+    if config
+        .archive
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.file_type().is_symlink())
+    {
         return Err("archive path is a symlink".into());
     }
     fs::create_dir_all(&config.archive)?;
@@ -125,19 +135,20 @@ fn run(config: Config, stage: &Cell<&'static str>) -> Result<()> {
     // staged versions before releasing an interrupted source enumeration.
     store.recover_abandoned_provider_staging()?;
     stage.set("jmap-discovery");
-    let jmap = LoopbackJmapReader::discover(&config.origin, token.clone(), &config.trusted_public_origin)
-        .map_err(|error| {
-            use isyncyou_connectors::jmap::JmapError;
-            stage.set(match &error {
-                JmapError::InvalidUrl => "jmap-invalid-url",
-                JmapError::InvalidResponse => "jmap-invalid-response",
-                JmapError::Unsupported => "jmap-unsupported",
-                JmapError::Http(_) => "jmap-http",
-                JmapError::Transport => "jmap-transport",
-                _ => "jmap-other",
-            });
-            error
-        })?;
+    let jmap =
+        LoopbackJmapReader::discover(&config.origin, token.clone(), &config.trusted_public_origin)
+            .map_err(|error| {
+                use isyncyou_connectors::jmap::JmapError;
+                stage.set(match &error {
+                    JmapError::InvalidUrl => "jmap-invalid-url",
+                    JmapError::InvalidResponse => "jmap-invalid-response",
+                    JmapError::Unsupported => "jmap-unsupported",
+                    JmapError::Http(_) => "jmap-http",
+                    JmapError::Transport => "jmap-transport",
+                    _ => "jmap-other",
+                });
+                error
+            })?;
     let account = jmap.account_id().to_owned();
     let mail_scope = ProviderScope {
         account_id: account.clone(),
@@ -159,7 +170,11 @@ fn run(config: Config, stage: &Cell<&'static str>) -> Result<()> {
     stage.set("mailbox-capture");
     mail::sync_mailboxes(&jmap, &store, &mailbox_scope)?;
     stage.set("dav-discovery");
-    let dav = LoopbackDavReader::new_with_public_origin(&config.origin, token, &config.trusted_public_origin)?;
+    let dav = LoopbackDavReader::new_with_public_origin(
+        &config.origin,
+        token,
+        &config.trusted_public_origin,
+    )?;
     let collections = dav.discover(&config.dav_entry)?;
     if !collections.iter().any(|x| x.calendar) || !collections.iter().any(|x| x.addressbook) {
         return Err("required DAV collections unavailable".into());
@@ -169,7 +184,7 @@ fn run(config: Config, stage: &Cell<&'static str>) -> Result<()> {
         // Historical ownership follows native DAV owner/principal evidence,
         // never mere read or shared-calendar access.
         match collection.owned_by_current_principal {
-            Some(true) => {},
+            Some(true) => {}
             Some(false) => continue,
             None => return Err("DAV collection ownership not verified".into()),
         }
@@ -200,8 +215,9 @@ fn run(config: Config, stage: &Cell<&'static str>) -> Result<()> {
             expected.push(scope);
         }
     }
-    if !expected.iter().any(|scope| scope.service == "calendar") ||
-       !expected.iter().any(|scope| scope.service == "contacts") {
+    if !expected.iter().any(|scope| scope.service == "calendar")
+        || !expected.iter().any(|scope| scope.service == "contacts")
+    {
         return Err("required owned DAV collections unavailable".into());
     }
     stage.set("source-completeness");
@@ -247,10 +263,11 @@ fn run(config: Config, stage: &Cell<&'static str>) -> Result<()> {
         }
         let previous: Manifest = serde_json::from_slice(&data)?;
         if previous.schema != 1
-            || previous
-                .collections
-                .iter()
-                .any(|x| x.account != account || (x.origin != config.origin && x.origin != identity.origin().ascii_serialization()))
+            || previous.collections.iter().any(|x| {
+                x.account != account
+                    || (x.origin != config.origin
+                        && x.origin != identity.origin().ascii_serialization())
+            })
             || previous.capture_highwater > snapshot.capture_highwater
             || previous.event_highwater > snapshot.event_highwater
         {
@@ -291,7 +308,9 @@ fn run(config: Config, stage: &Cell<&'static str>) -> Result<()> {
             }
             let related_blobs = if item.scope.service == "mail" {
                 isyncyou_exporter::mail_dependencies(&item.object.raw)?
-            } else { Vec::new() };
+            } else {
+                Vec::new()
+            };
             capture = item.sequence;
             objects.push(Object {
                 account: item.scope.account_id,
@@ -351,7 +370,11 @@ fn run(config: Config, stage: &Cell<&'static str>) -> Result<()> {
         events,
     };
     stage.set("identity-canonicalization");
-    isyncyou_exporter::canonicalize_manifest_identity(&mut manifest, &config.origin, &config.identity_origin)?;
+    isyncyou_exporter::canonicalize_manifest_identity(
+        &mut manifest,
+        &config.origin,
+        &config.identity_origin,
+    )?;
     stage.set("generation-publication");
     let generation = isyncyou_exporter::publish(&config.archive, &manifest)?;
     println!("{{\"state\":\"captured_locally\",\"generation\":\"{generation}\"}}");
@@ -374,7 +397,8 @@ fn main() {
             .is_some_and(|directory| path == directory.join("exporter-config"));
         let private_file = mode & 0o077 == 0;
         let systemd_file = systemd_credential && metadata.uid() == 0 && mode == 0o440;
-        if !path.is_absolute() || !metadata.file_type().is_file() || !(private_file || systemd_file) {
+        if !path.is_absolute() || !metadata.file_type().is_file() || !(private_file || systemd_file)
+        {
             return Err("private config required".into());
         }
         run(serde_json::from_slice(&fs::read(path)?)?, &stage)
