@@ -9761,9 +9761,12 @@ function renderAccountMenu(body) {
       const providerStatus = accountRoleStatus(a, "reader");
       const connected = ["connected", "permission_denied", "access_unknown", "service_unreachable", "provider_response_invalid"].includes(providerStatus.state);
       const controls = el("div", { class: "acct-acts" });
-      const connectButton = el("button", { class: "btn sm", disabled: providerActionsUnknown.has(a.id) ? "disabled" : null, onclick: () => providerAccountAction(a, body, connected) }, connected ? "Disconnect" : "Connect");
+      const connectButton = el("button", { class: "btn sm", disabled: providerActionsUnknown.has(a.id) || (BRIDGE && !connected) ? "disabled" : null, onclick: () => providerAccountAction(a, body, connected) }, connected ? "Disconnect" : "Connect");
       controls.append(connectButton);
       if (BRIDGE && !connected) {
+        const logoutRecovery = el("button", { class:"btn sm", type:"button", style:"display:none", onclick:() => providerAccountAction(a, body, true) }, "Continue disconnect");
+        const logoutNotice = el("span", { class:"dim", style:"display:none" });
+        controls.append(logoutRecovery, logoutNotice);
         const resolveButton = el("button", { class:"btn sm", type:"button", style:providerActionsUnknown.has(a.id) ? "" : "display:none", onclick:async () => {
         try {
           const result = await nativeCall("providerAuthResolve", { account:a.id }, PROVIDER_NATIVE_TIMEOUT_MS);
@@ -9783,8 +9786,14 @@ function renderAccountMenu(body) {
         controls.append(cancelPendingButton);
         void nativeCall("providerStatus", { account:a.id }, NATIVE_TIMEOUT_MS).then(status => {
           if (!controls.isConnected) return;
-          if (status && status.auth_state === "outcome_unknown") { providerActionsUnknown.add(a.id); connectButton.disabled = true; resolveButton.style.display = ""; }
-          else if (status && status.auth_state === "pending" && !providerActionsUnknown.has(a.id)) { connectButton.disabled=true; cancelPendingButton.style.display=""; }
+          if (!status || status.logout_recovery !== "none") {
+            connectButton.disabled = true;
+            if (status && status.logout_recovery === "resume") { logoutRecovery.style.display = ""; logoutNotice.textContent = "Disconnect needs completion."; }
+            else { logoutNotice.textContent = "Disconnect needs manual recovery."; }
+            logoutNotice.style.display = "";
+          } else if (status.auth_state === "outcome_unknown") { providerActionsUnknown.add(a.id); connectButton.disabled = true; resolveButton.style.display = ""; }
+          else if (status.auth_state === "pending" && !providerActionsUnknown.has(a.id)) { connectButton.disabled=true; cancelPendingButton.style.display=""; }
+          else if (status.auth_state === "idle" && !providerActionsUnknown.has(a.id)) connectButton.disabled = false;
         }).catch(() => {});
       }
       row.append(el("div", { class: "acct-role acct-provider-status" },

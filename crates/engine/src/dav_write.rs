@@ -420,6 +420,16 @@ pub fn execute(cfg: &Config, entry: &str, op: &ApprovedDavWrite) -> Result<Write
     execute_inner(cfg, entry, op, None)
 }
 
+/// Preserve dispatch certainty while inspecting any prior operation before writing.
+pub fn execute_classified(
+    cfg: &Config,
+    entry: &str,
+    op: &ApprovedDavWrite,
+) -> Result<WriteOutcome, DavWriteExecutionError> {
+    ensure_no_prior_dispatch(cfg, op)?;
+    execute_inner_classified(cfg, entry, op, None)
+}
+
 /// Android or another native platform supplies its secure credential owner.
 pub fn execute_with_store(
     cfg: &Config,
@@ -506,6 +516,14 @@ pub fn execute_create_simple(
     preview: &crate::dav_live::PreparedCreatePreview,
     credentials: Option<&dyn ProviderCredentialStore>,
 ) -> Result<WriteOutcome, String> {
+    validate_create_simple(op, preview)?;
+    execute_inner(cfg, entry, op, credentials)
+}
+
+fn validate_create_simple(
+    op: &ApprovedDavWrite,
+    preview: &crate::dav_live::PreparedCreatePreview,
+) -> Result<(), String> {
     if op.expected_etag.is_some()
         || op.expected_collection_token.is_some()
         || op.origin != preview.origin
@@ -547,7 +565,47 @@ pub fn execute_create_simple(
     if expected_href != op.href || raw != preview.raw || op.raw.as_deref() != Some(raw.as_slice()) {
         return Err("Create effect differs from approval".into());
     }
-    execute_inner(cfg, entry, op, credentials)
+    Ok(())
+}
+
+/// Revalidate the complete create preview and retain the original dispatch boundary.
+pub fn execute_create_simple_classified(
+    cfg: &Config,
+    entry: &str,
+    op: &ApprovedDavWrite,
+    preview: &crate::dav_live::PreparedCreatePreview,
+    credentials: Option<&dyn ProviderCredentialStore>,
+) -> Result<WriteOutcome, DavWriteExecutionError> {
+    ensure_no_prior_dispatch(cfg, op)?;
+    validate_create_simple(op, preview)
+        .map_err(|_| DavWriteExecutionError::PreDispatch(DavPreDispatchStage::Validation))?;
+    execute_inner_classified(cfg, entry, op, credentials)
+}
+
+fn ensure_no_prior_dispatch(
+    cfg: &Config,
+    op: &ApprovedDavWrite,
+) -> Result<(), DavWriteExecutionError> {
+    if !matches!(cfg.provider_accounts.get(&op.account_id), Some(ProviderConfig::SelfHosted {origin,..}) if origin == &op.origin)
+    {
+        return Err(DavWriteExecutionError::DispatchUncertain);
+    }
+    let store = crate::provider_store::open(cfg, &op.account_id)
+        .map_err(|_| DavWriteExecutionError::DispatchUncertain)?;
+    let scope = ProviderScope {
+        account_id: op.account_id.clone(),
+        origin: op.origin.clone(),
+        service: op.service.clone(),
+        collection: op.collection.clone(),
+    };
+    if store
+        .provider_mutation(&scope, &op.operation_id)
+        .map_err(|_| DavWriteExecutionError::DispatchUncertain)?
+        .is_some()
+    {
+        return Err(DavWriteExecutionError::DispatchUncertain);
+    }
+    Ok(())
 }
 
 pub fn execute_create_task_series(

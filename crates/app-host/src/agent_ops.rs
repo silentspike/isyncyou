@@ -918,7 +918,7 @@ fn execute_bound_provider_contact_name(
         expected_collection_token: None,
         raw: Some(prepared.edit.raw),
     };
-    match isyncyou_engine::dav_write::execute(cfg, "/.well-known/carddav", &approved) {
+    match isyncyou_engine::dav_write::execute_classified(cfg, "/.well-known/carddav", &approved) {
         Ok(isyncyou_engine::dav_write::WriteOutcome::Confirmed(_)) => {
             ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new(
                 "Contact name updated; local synchronization pending".to_string(),
@@ -929,6 +929,9 @@ fn execute_bound_provider_contact_name(
         }
         Ok(isyncyou_engine::dav_write::WriteOutcome::Rejected) => {
             ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderActionRejected)
+        }
+        Err(isyncyou_engine::dav_write::DavWriteExecutionError::PreDispatch(stage)) => {
+            ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::DavPreDispatch(stage))
         }
         _ => ConfirmedExecutionOutcome::OutcomeUnknown,
     }
@@ -1450,7 +1453,7 @@ fn execute_bound_task_completion(
         expected_collection_token: None,
         raw: Some(prepared.edit.raw),
     };
-    match isyncyou_engine::dav_write::execute(cfg, "/.well-known/caldav", &approved) {
+    match isyncyou_engine::dav_write::execute_classified(cfg, "/.well-known/caldav", &approved) {
         Ok(isyncyou_engine::dav_write::WriteOutcome::Confirmed(_)) => {
             ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new(
                 "Task completion updated; local synchronization pending".to_string(),
@@ -1461,6 +1464,9 @@ fn execute_bound_task_completion(
         }
         Ok(isyncyou_engine::dav_write::WriteOutcome::Rejected) => {
             ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderActionRejected)
+        }
+        Err(isyncyou_engine::dav_write::DavWriteExecutionError::PreDispatch(stage)) => {
+            ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::DavPreDispatch(stage))
         }
         _ => ConfirmedExecutionOutcome::OutcomeUnknown,
     }
@@ -1664,7 +1670,7 @@ fn execute_bound_calendar_text(
         expected_collection_token: None,
         raw: Some(prepared.edit.raw),
     };
-    match isyncyou_engine::dav_write::execute(cfg, "/.well-known/caldav", &approved) {
+    match isyncyou_engine::dav_write::execute_classified(cfg, "/.well-known/caldav", &approved) {
         Ok(isyncyou_engine::dav_write::WriteOutcome::Confirmed(_)) => {
             ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new(
                 "Calendar text updated; local synchronization pending".to_string(),
@@ -1675,6 +1681,9 @@ fn execute_bound_calendar_text(
         }
         Ok(isyncyou_engine::dav_write::WriteOutcome::Rejected) => {
             ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderActionRejected)
+        }
+        Err(isyncyou_engine::dav_write::DavWriteExecutionError::PreDispatch(stage)) => {
+            ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::DavPreDispatch(stage))
         }
         _ => ConfirmedExecutionOutcome::OutcomeUnknown,
     }
@@ -1745,7 +1754,7 @@ fn execute_bound_calendar_time(
         expected_collection_token: None,
         raw: Some(prepared.edit.raw),
     };
-    match isyncyou_engine::dav_write::execute(cfg, "/.well-known/caldav", &approved) {
+    match isyncyou_engine::dav_write::execute_classified(cfg, "/.well-known/caldav", &approved) {
         Ok(isyncyou_engine::dav_write::WriteOutcome::Confirmed(_)) => {
             ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new(
                 "Event time updated; local synchronization pending",
@@ -1756,6 +1765,9 @@ fn execute_bound_calendar_time(
         }
         Ok(isyncyou_engine::dav_write::WriteOutcome::Rejected) => {
             ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderActionRejected)
+        }
+        Err(isyncyou_engine::dav_write::DavWriteExecutionError::PreDispatch(stage)) => {
+            ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::DavPreDispatch(stage))
         }
         _ => ConfirmedExecutionOutcome::OutcomeUnknown,
     }
@@ -2130,6 +2142,7 @@ fn execute_bound_dav_create(
             occurrences,
             None,
         )
+        .map_err(|_| isyncyou_engine::dav_write::DavWriteExecutionError::DispatchUncertain)
     } else {
         match organizer {
             Some(organizer) => isyncyou_engine::dav_write::execute_invitation_create(
@@ -2142,8 +2155,9 @@ fn execute_bound_dav_create(
                     attendees,
                 },
                 None,
-            ),
-            None => isyncyou_engine::dav_write::execute_create_simple(
+            )
+            .map_err(|_| isyncyou_engine::dav_write::DavWriteExecutionError::DispatchUncertain),
+            None => isyncyou_engine::dav_write::execute_create_simple_classified(
                 cfg,
                 if service == "calendar" {
                     "/.well-known/caldav"
@@ -2156,6 +2170,16 @@ fn execute_bound_dav_create(
             ),
         }
     };
+    classify_dav_create_result(result, scheduled)
+}
+
+fn classify_dav_create_result(
+    result: Result<
+        isyncyou_engine::dav_write::WriteOutcome,
+        isyncyou_engine::dav_write::DavWriteExecutionError,
+    >,
+    scheduled: bool,
+) -> ConfirmedExecutionOutcome {
     match result {
         Ok(isyncyou_engine::dav_write::WriteOutcome::Confirmed(_)) => {
             ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new(if scheduled {
@@ -2169,6 +2193,9 @@ fn execute_bound_dav_create(
         }
         Ok(isyncyou_engine::dav_write::WriteOutcome::Rejected) => {
             ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderActionRejected)
+        }
+        Err(isyncyou_engine::dav_write::DavWriteExecutionError::PreDispatch(stage)) => {
+            ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::DavPreDispatch(stage))
         }
         _ => ConfirmedExecutionOutcome::OutcomeUnknown,
     }
@@ -8279,6 +8306,32 @@ mod tests {
         );
         assert_eq!(
             classify_task_attribute_result(Ok(WriteOutcome::Unknown)),
+            ConfirmedExecutionOutcome::OutcomeUnknown
+        );
+    }
+
+    #[test]
+    fn dav_create_discovery_failure_and_uncertain_dispatch_are_distinct() {
+        use isyncyou_engine::dav_write::{
+            DavPreDispatchStage, DavWriteExecutionError, WriteOutcome,
+        };
+        assert_eq!(
+            classify_dav_create_result(
+                Err(DavWriteExecutionError::PreDispatch(
+                    DavPreDispatchStage::Discovery
+                )),
+                false
+            ),
+            ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::DavPreDispatch(
+                DavPreDispatchStage::Discovery
+            ))
+        );
+        assert_eq!(
+            classify_dav_create_result(Err(DavWriteExecutionError::DispatchUncertain), false),
+            ConfirmedExecutionOutcome::OutcomeUnknown
+        );
+        assert_eq!(
+            classify_dav_create_result(Ok(WriteOutcome::Unknown), false),
             ConfirmedExecutionOutcome::OutcomeUnknown
         );
     }

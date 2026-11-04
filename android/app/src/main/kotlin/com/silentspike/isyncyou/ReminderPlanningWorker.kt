@@ -16,6 +16,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -56,9 +57,46 @@ internal fun invalidReminderScope(record: JSONObject, key: String, account: Stri
     return collection.isNotEmpty() && collection !in completed
 }
 
+internal object ReminderPlanningGate {
+    private val planning = AtomicBoolean(false)
+    fun tryEnter(): Boolean = planning.compareAndSet(false, true)
+    fun leave() = planning.set(false)
+}
+
+internal object ReminderForegroundPolicy {
+    const val MIN_INTERVAL_MS = 60_000L
+    fun due(now: Long, lastAttempt: Long): Boolean =
+        lastAttempt <= 0 || now < lastAttempt || now - lastAttempt >= MIN_INTERVAL_MS
+    fun canUsePrevious(now: Long, lastAttempt: Long, lastSucceeded: Boolean): Boolean =
+        lastSucceeded && !due(now, lastAttempt)
+}
+
 /** Reconciles bounded native plans without persisting calendar content in WorkManager. */
 class ReminderPlanningWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
+        val foreground = inputData.getBoolean(FOREGROUND_INPUT, false)
+        // Coalesce with an already running periodic or foreground pass without
+        // changing the last observed planner status or starting a second pass.
+        if (!ReminderPlanningGate.tryEnter()) {
+            return@withContext Result.retry()
+        }
+        try {
+            val prefs = applicationContext.getSharedPreferences(ATTEMPT_PREFS, Context.MODE_PRIVATE)
+            val now = System.currentTimeMillis()
+            val lastAttempt = prefs.getLong(LAST_ATTEMPT, 0)
+            if (foreground && !ReminderForegroundPolicy.due(now, lastAttempt)) {
+                return@withContext if (ReminderForegroundPolicy.canUsePrevious(now, lastAttempt, prefs.getBoolean(LAST_SUCCEEDED, false))) Result.success() else Result.retry()
+            }
+            if (!prefs.edit().putLong(LAST_ATTEMPT, now).putBoolean(LAST_SUCCEEDED, false).commit()) return@withContext Result.retry()
+            val result = plan()
+            if (result is Result.Success && !prefs.edit().putBoolean(LAST_SUCCEEDED, true).commit()) return@withContext Result.retry()
+            result
+        } finally {
+            ReminderPlanningGate.leave()
+        }
+    }
+
+    private suspend fun plan(): Result = withContext(Dispatchers.IO) {
         ReminderStatus.record(applicationContext, "planning")
         try {
             if (EngineBootstrap.ensureStarted(applicationContext.filesDir).isEmpty()) {
@@ -137,6 +175,20 @@ class ReminderPlanningWorker(context: Context, params: WorkerParameters) : Corou
 
     companion object {
         private const val NAME = "calendar-reminder-planning"
+        private const val FOREGROUND_NAME = "calendar-reminder-foreground"
+        private const val FOREGROUND_INPUT = "foreground"
+        private const val ATTEMPT_PREFS = "reminder_planning_attempt_v1"
+        private const val LAST_ATTEMPT = "last_attempt_ms"
+        private const val LAST_SUCCEEDED = "last_succeeded"
+
+        fun scheduleForeground(context: Context) {
+            val work = OneTimeWorkRequestBuilder<ReminderPlanningWorker>()
+                .setInputData(workDataOf(FOREGROUND_INPUT to true))
+                .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+                .build()
+            WorkManager.getInstance(context).enqueueUniqueWork(FOREGROUND_NAME, ExistingWorkPolicy.KEEP, work)
+        }
+
         fun schedule(context: Context) {
             val work = PeriodicWorkRequestBuilder<ReminderPlanningWorker>(15, TimeUnit.MINUTES)
                 .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()).build()

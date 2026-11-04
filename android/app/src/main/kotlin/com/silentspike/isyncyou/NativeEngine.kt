@@ -88,6 +88,7 @@ object NativeEngine {
     external fun nativeProviderQuarantineList(filesDir: String, account: String): String
     external fun nativeProviderQuarantineRevoke(filesDir: String, account: String, id: String): Int
     external fun nativeProviderStatus(filesDir: String, account: String): Int
+    external fun nativeProviderLogoutRecovery(filesDir: String, account: String): Int
     external fun nativeProviderLogout(filesDir: String, account: String): Int
     external fun nativeProviderCancel()
     external fun nativeProviderCancelPending(base: String, account: String): Int

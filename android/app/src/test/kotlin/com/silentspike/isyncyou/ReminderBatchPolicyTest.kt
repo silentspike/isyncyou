@@ -78,6 +78,24 @@ class ReminderBatchPolicyTest {
         assertFalse(invalidReminderScope(record("a", "revoked"), "r_" + "b".repeat(64), "a", setOf("good")))
     }
 
+    @Test fun periodicAndForegroundPassesCannotOverlap() {
+        assertTrue(ReminderPlanningGate.tryEnter())
+        try { assertFalse(ReminderPlanningGate.tryEnter()) }
+        finally { ReminderPlanningGate.leave() }
+        assertTrue(ReminderPlanningGate.tryEnter())
+        ReminderPlanningGate.leave()
+    }
+
+    @Test fun foregroundAttemptsAreBoundedAndClockRollbackRecovers() {
+        assertTrue(ReminderForegroundPolicy.due(100_000, 0))
+        assertFalse(ReminderForegroundPolicy.due(159_999, 100_000))
+        assertTrue(ReminderForegroundPolicy.due(160_000, 100_000))
+        assertTrue(ReminderForegroundPolicy.due(99_999, 100_000))
+        assertTrue(ReminderForegroundPolicy.canUsePrevious(159_999, 100_000, true))
+        assertFalse(ReminderForegroundPolicy.canUsePrevious(159_999, 100_000, false))
+        assertFalse(ReminderForegroundPolicy.canUsePrevious(160_000, 100_000, true))
+    }
+
     @Test(expected = kotlinx.coroutines.CancellationException::class)
     fun cancellationStopsRatherThanBecomingPartialFailure() {
         ReminderBatchPolicy.run(listOf("first", "second")) { throw kotlinx.coroutines.CancellationException("stopped") }

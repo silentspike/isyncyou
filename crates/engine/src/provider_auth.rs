@@ -316,6 +316,18 @@ pub fn start_self_hosted_auth(
         return Err("Previous grant revocation requires recovery before signing in again".into());
     }
     let (origin, client_id, cache_path) = account(cfg, id)?;
+    #[cfg(target_os = "android")]
+    ensure_no_logout_marker(id, &origin, crate::provider_credential::platform_store()?)?;
+    #[cfg(not(target_os = "android"))]
+    ensure_no_logout_marker(
+        id,
+        &origin,
+        &DesktopCredentialStore {
+            path: cache_path.clone(),
+            account: id.into(),
+            origin: origin.clone(),
+        },
+    )?;
     let expected_username = cfg
         .accounts
         .iter()
@@ -395,6 +407,10 @@ pub fn finish_self_hosted_auth_detailed_with_store(
     callback: &str,
     store: &dyn ProviderCredentialStore,
 ) -> Result<(), AuthFinishError> {
+    {
+        let _lock = lock(&attempt.cache_path)?;
+        ensure_no_logout_marker(&attempt.account_id, &attempt.origin, store)?;
+    }
     let code = callback_code(&attempt, callback)?.ok_or("Authorization rejected")?;
     let response = client()?
         .post(&attempt.token_endpoint)
@@ -421,6 +437,14 @@ pub fn finish_self_hosted_auth_detailed_with_store(
     )
     .map_err(|_| "Provider identity verification failed".to_string());
     let _lock = lock(&attempt.cache_path)?;
+    if ensure_no_logout_marker(&attempt.account_id, &attempt.origin, store).is_err() {
+        return match revoke_unaccepted_grant(&attempt, store, &token) {
+            Ok(()) => Err(AuthFinishError::Failed(
+                "Provider logout requires recovery".into(),
+            )),
+            Err(recovery) => Err(recovery),
+        };
+    }
     let subject = match subject.and_then(|subject| {
         bind_subject(&attempt, store, &subject)
             .map_err(|_| "Provider identity binding failed".to_string())?;
@@ -446,13 +470,7 @@ pub fn finish_self_hosted_auth_detailed_with_store(
         },
     );
     match saved {
-        Ok(()) => {
-            let marker = revocation_pending_key(&attempt.account_id);
-            if store.load(&marker, &attempt.origin)?.is_some() {
-                store.delete(&marker, &attempt.origin)?;
-            }
-            Ok(())
-        }
+        Ok(()) => Ok(()),
         Err(_) => match revoke_unaccepted_grant(&attempt, store, &token) {
             Ok(()) => Err(AuthFinishError::Failed(
                 "Provider credential storage failed".into(),
@@ -473,6 +491,31 @@ fn revocation_pending_key(account: &str) -> String {
         "isyncyou-internal:revocation-pending:{:x}",
         Sha256::digest(account.as_bytes())
     )
+}
+
+fn ensure_no_logout_marker(
+    account: &str,
+    origin: &str,
+    store: &dyn ProviderCredentialStore,
+) -> Result<(), String> {
+    if store
+        .load(&revocation_pending_key(account), origin)?
+        .is_some()
+    {
+        return Err("Provider logout requires recovery before sign-in".into());
+    }
+    Ok(())
+}
+
+/// Check the platform-owned logout state before a caller claims an OAuth exchange.
+pub fn ensure_auth_allowed_with_store(
+    cfg: &Config,
+    account_id: &str,
+    store: &dyn ProviderCredentialStore,
+) -> Result<(), String> {
+    let (origin, _, path) = account(cfg, account_id)?;
+    let _lock = lock(&path)?;
+    ensure_no_logout_marker(account_id, &origin, store)
 }
 
 fn load_quarantine(
@@ -1320,66 +1363,171 @@ pub fn logout_self_hosted_with_store(
 ) -> Result<(), String> {
     let (origin, client_id, path) = account(cfg, id)?;
     let _lock = lock(&path)?;
-    if let Some(marker) = store.load(&revocation_pending_key(id), &origin)? {
-        return Err(match marker.access_token.as_str() {
-            "revoked" => "Grant already revoked; local cleanup may be required",
-            "rejected" => "Provider rejected revocation; recovery required",
-            _ => "Revocation outcome unknown; recovery required",
-        }
-        .into());
-    }
-    let cache = store.load(id, &origin)?.ok_or("Provider login required")?;
-    let refresh = cache
-        .refresh_token
-        .as_deref()
-        .ok_or("Provider login required")?;
-    store.replace(
-        &revocation_pending_key(id),
+    logout_bound(
+        id,
         &origin,
+        &client_id,
+        store,
+        || Ok(metadata(&origin)?.2),
+        |endpoint, refresh| {
+            let response = client()?
+                .post(endpoint)
+                .form(&[
+                    ("token", refresh),
+                    ("token_type_hint", "refresh_token"),
+                    ("client_id", &client_id),
+                ])
+                .budgeted_send_auto()
+                .map_err(|_| "Revocation outcome unknown")?;
+            if response.status().is_success() {
+                Ok(())
+            } else {
+                Err("Revocation outcome unknown".into())
+            }
+        },
+    )
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LogoutMarker {
+    version: u8,
+    state: String,
+    account: String,
+    origin: String,
+    client_id: String,
+    endpoint: String,
+    credential_digest: String,
+}
+
+/// Report whether an explicitly requested logout can safely be continued.
+/// This never exposes the marker, endpoint, token, or credential digest.
+pub fn logout_recovery_state_with_store(
+    cfg: &Config,
+    id: &str,
+    store: &dyn ProviderCredentialStore,
+) -> Result<&'static str, String> {
+    let (origin, client_id, path) = account(cfg, id)?;
+    let _lock = lock(&path)?;
+    let Some(value) = store.load(&revocation_pending_key(id), &origin)? else {
+        return Ok("none");
+    };
+    let Ok(marker) = serde_json::from_str::<LogoutMarker>(&value.access_token) else {
+        return Ok("unbound");
+    };
+    let cache = store.load(id, &origin)?;
+    if marker.version != 1
+        || marker.account != id
+        || marker.origin != origin
+        || marker.client_id != client_id
+        || !matches!(marker.state.as_str(), "pending" | "revoked")
+        || cache
+            .as_ref()
+            .is_some_and(|c| credential_digest(c) != marker.credential_digest)
+        || (cache.is_none() && marker.state != "revoked")
+    {
+        return Ok("unbound");
+    }
+    let base = reqwest::Url::parse(&origin).map_err(|_| "Invalid provider origin")?;
+    if same_origin(&base, &marker.endpoint).is_err() {
+        return Ok("unbound");
+    }
+    Ok("resume")
+}
+
+fn credential_digest(c: &ProviderCredential) -> String {
+    let data = serde_json::json!({"access": c.access_token, "refresh": c.refresh_token,
+        "expires": c.expires_at, "subject": c.subject});
+    format!("{:x}", Sha256::digest(data.to_string().as_bytes()))
+}
+
+fn logout_bound(
+    id: &str,
+    origin: &str,
+    client_id: &str,
+    store: &dyn ProviderCredentialStore,
+    discover: impl FnOnce() -> Result<String, String>,
+    revoke: impl FnOnce(&str, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    let key = revocation_pending_key(id);
+    let existing = store.load(&key, origin)?;
+    let cache = store.load(id, origin)?;
+    let mut marker = if let Some(value) = existing {
+        let marker: LogoutMarker = serde_json::from_str(&value.access_token)
+            .map_err(|_| "Unbound legacy revocation requires recovery")?;
+        if marker.version != 1
+            || marker.account != id
+            || marker.origin != origin
+            || marker.client_id != client_id
+            || !matches!(marker.state.as_str(), "pending" | "revoked")
+            || cache
+                .as_ref()
+                .is_some_and(|c| credential_digest(c) != marker.credential_digest)
+            || (cache.is_none() && marker.state != "revoked")
+        {
+            return Err("Revocation binding changed; recovery required".into());
+        }
+        marker
+    } else {
+        let cache = cache.as_ref().ok_or("Provider login required")?;
+        if cache.refresh_token.as_deref().is_none_or(str::is_empty) {
+            return Err("Provider login required".into());
+        }
+        // Discovery precedes the durable dispatch marker: a discovery failure
+        // cannot strand a grant as if revocation had already been sent.
+        let endpoint = discover()?;
+        let base = reqwest::Url::parse(origin).map_err(|_| "Invalid provider origin")?;
+        same_origin(&base, &endpoint)?;
+        let marker = LogoutMarker {
+            version: 1,
+            state: "pending".into(),
+            account: id.into(),
+            origin: origin.into(),
+            client_id: client_id.into(),
+            endpoint,
+            credential_digest: credential_digest(cache),
+        };
+        save_logout_marker(store, &key, origin, &marker)?;
+        marker
+    };
+    if marker.state == "pending" {
+        let cache = cache.as_ref().ok_or("Provider login required")?;
+        // A new discovery is not needed for a fresh marker. For a resumed one,
+        // the previously validated endpoint remains bound inside encrypted state.
+        let base = reqwest::Url::parse(origin).map_err(|_| "Invalid provider origin")?;
+        same_origin(&base, &marker.endpoint)?;
+        revoke(
+            &marker.endpoint,
+            cache
+                .refresh_token
+                .as_deref()
+                .ok_or("Provider login required")?,
+        )?;
+        marker.state = "revoked".into();
+        save_logout_marker(store, &key, origin, &marker)?;
+    }
+    if cache.is_some() {
+        store.delete(id, origin)?;
+    }
+    store.delete(&key, origin)
+}
+
+fn save_logout_marker(
+    store: &dyn ProviderCredentialStore,
+    key: &str,
+    origin: &str,
+    marker: &LogoutMarker,
+) -> Result<(), String> {
+    store.replace(
+        key,
+        origin,
         &ProviderCredential {
-            access_token: "pending".into(),
+            access_token: serde_json::to_string(marker).map_err(|_| "Invalid revocation state")?,
             refresh_token: None,
             expires_at: 0,
             subject: None,
         },
-    )?;
-    let (_, _, endpoint) = metadata(&origin)?;
-    let response = client()?
-        .post(endpoint)
-        .form(&[
-            ("token", refresh),
-            ("token_type_hint", "refresh_token"),
-            ("client_id", &client_id),
-        ])
-        .budgeted_send_auto()
-        .map_err(|_| "Revocation outcome unknown")?;
-    if !response.status().is_success() {
-        if response.status().is_client_error() {
-            store.replace(
-                &revocation_pending_key(id),
-                &origin,
-                &ProviderCredential {
-                    access_token: "rejected".into(),
-                    refresh_token: None,
-                    expires_at: 0,
-                    subject: None,
-                },
-            )?;
-            return Err("Provider rejected revocation".into());
-        }
-        return Err("Revocation outcome unknown".into());
-    }
-    store.replace(
-        &revocation_pending_key(id),
-        &origin,
-        &ProviderCredential {
-            access_token: "revoked".into(),
-            refresh_token: None,
-            expires_at: 0,
-            subject: None,
-        },
-    )?;
-    store.delete(id, &origin)
+    )
 }
 
 /// Obtain a distinct provider database key from the platform secret owner.
@@ -1569,7 +1717,166 @@ mod tests {
         assert!(!self_hosted_auth_status_with_store(&cfg, "a", &keys).unwrap());
         assert!(logout_self_hosted_with_store(&cfg, "a", &keys)
             .unwrap_err()
-            .contains("outcome unknown"));
+            .contains("legacy revocation"));
+    }
+
+    #[test]
+    fn bound_logout_resumes_only_the_original_grant_and_finishes_cleanup() {
+        #[derive(Default)]
+        struct Keys(
+            std::sync::Mutex<std::collections::HashMap<(String, String), ProviderCredential>>,
+        );
+        impl ProviderCredentialStore for Keys {
+            fn load(&self, a: &str, o: &str) -> Result<Option<ProviderCredential>, String> {
+                Ok(self.0.lock().unwrap().get(&(a.into(), o.into())).cloned())
+            }
+            fn replace(&self, a: &str, o: &str, c: &ProviderCredential) -> Result<(), String> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .insert((a.into(), o.into()), c.clone());
+                Ok(())
+            }
+            fn delete(&self, a: &str, o: &str) -> Result<(), String> {
+                self.0.lock().unwrap().remove(&(a.into(), o.into()));
+                Ok(())
+            }
+        }
+        let keys = Keys::default();
+        let original = ProviderCredential {
+            access_token: "access".into(),
+            refresh_token: Some("refresh".into()),
+            expires_at: 1,
+            subject: Some("subject".into()),
+        };
+        keys.replace("a", "https://example.test", &original)
+            .unwrap();
+        let discover = || Ok("https://example.test/auth/revoke".to_string());
+        // A discovery failure is before dispatch and must leave no marker.
+        assert!(logout_bound(
+            "a",
+            "https://example.test",
+            "client",
+            &keys,
+            || Err("discovery failed".into()),
+            |_, _| panic!("must not send")
+        )
+        .is_err());
+        assert!(ensure_no_logout_marker("a", "https://example.test", &keys).is_ok());
+        // An unknown result retains the original and a bound marker.
+        assert!(logout_bound(
+            "a",
+            "https://example.test",
+            "client",
+            &keys,
+            discover,
+            |_, _| Err("lost response".into())
+        )
+        .is_err());
+        assert!(ensure_no_logout_marker("a", "https://example.test", &keys).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.accounts.push(isyncyou_core::AccountConfig {
+            id: "a".into(),
+            username: "user".into(),
+            sync_root: PathBuf::new(),
+            archive_root: dir.path().into(),
+            cache_root: PathBuf::new(),
+            mount_point: None,
+        });
+        cfg.provider_accounts.insert(
+            "a".into(),
+            ProviderConfig::SelfHosted {
+                origin: "https://example.test".into(),
+                client_id: "client".into(),
+            },
+        );
+        assert_eq!(
+            logout_recovery_state_with_store(&cfg, "a", &keys).unwrap(),
+            "resume"
+        );
+        let attempt = AuthAttempt {
+            authorization_uri: String::new(),
+            origin: "https://example.test".into(),
+            client_id: "client".into(),
+            token_endpoint: "https://example.test/token".into(),
+            revocation_endpoint: "https://example.test/auth/revoke".into(),
+            redirect_uri: "http://127.0.0.1:53682/oauth/callback".into(),
+            verifier: "verifier".into(),
+            state: "state".into(),
+            cache_path: dir.path().join("token"),
+            account_id: "a".into(),
+            expected_username: "user".into(),
+            account_config: Config::default(),
+            started_at: now(),
+        };
+        let result = finish_self_hosted_auth_detailed_with_store(
+            attempt,
+            "http://127.0.0.1:53682/oauth/callback?code=code&state=state",
+            &keys,
+        );
+        assert!(matches!(result, Err(AuthFinishError::Failed(_))));
+        let mut changed = original.clone();
+        changed.refresh_token = Some("different".into());
+        keys.replace("a", "https://example.test", &changed).unwrap();
+        assert_eq!(
+            logout_recovery_state_with_store(&cfg, "a", &keys).unwrap(),
+            "unbound"
+        );
+        assert!(logout_bound(
+            "a",
+            "https://example.test",
+            "client",
+            &keys,
+            || panic!("must not discover"),
+            |_, _| panic!("must not revoke replacement")
+        )
+        .is_err());
+        keys.replace("a", "https://example.test", &original)
+            .unwrap();
+        logout_bound(
+            "a",
+            "https://example.test",
+            "client",
+            &keys,
+            || panic!("bound endpoint is retained"),
+            |endpoint, token| {
+                assert_eq!(endpoint, "https://example.test/auth/revoke");
+                assert_eq!(token, "refresh");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(keys.load("a", "https://example.test").unwrap().is_none());
+        assert!(ensure_no_logout_marker("a", "https://example.test", &keys).is_ok());
+        // A crash after credential deletion still permits marker cleanup, but
+        // must never send the token again once revocation is confirmed.
+        let marker = LogoutMarker {
+            version: 1,
+            state: "revoked".into(),
+            account: "a".into(),
+            origin: "https://example.test".into(),
+            client_id: "client".into(),
+            endpoint: "https://example.test/auth/revoke".into(),
+            credential_digest: credential_digest(&original),
+        };
+        save_logout_marker(
+            &keys,
+            &revocation_pending_key("a"),
+            "https://example.test",
+            &marker,
+        )
+        .unwrap();
+        logout_bound(
+            "a",
+            "https://example.test",
+            "client",
+            &keys,
+            || panic!("already revoked"),
+            |_, _| panic!("must not send"),
+        )
+        .unwrap();
+        assert!(ensure_no_logout_marker("a", "https://example.test", &keys).is_ok());
     }
 
     #[test]

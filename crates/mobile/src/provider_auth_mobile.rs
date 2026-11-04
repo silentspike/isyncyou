@@ -407,6 +407,7 @@ fn finish(base: &Path, callback: &str) -> Result<(), provider_auth::AuthFinishEr
         *guard = None;
         return Err("Authorization rejected".into());
     }
+    provider_auth::ensure_auth_allowed_with_store(&cfg, account, &store)?;
     journal["stage"] = serde_json::Value::String("exchange_started".into());
     store.write_auth_journal(
         &serde_json::to_vec(&journal).map_err(|_| "Authorization unavailable")?,
@@ -679,6 +680,33 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeProvider
             Err(_) => -1,
         }
     }))
+    .unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeProviderLogoutRecovery<
+    'a,
+>(
+    mut env: jni::EnvUnowned<'a>,
+    _class: jni::objects::JClass<'a>,
+    base: jni::objects::JString<'a>,
+    account: jni::objects::JString<'a>,
+) -> jni::sys::jint {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let base = jni_get_string(&mut env, &base).ok_or(())?;
+        let account = jni_get_string(&mut env, &account).ok_or(())?;
+        let cfg = config(Path::new(&base)).map_err(|_| ())?;
+        let store = AndroidProviderCredentialStore::new(Path::new(&base)).map_err(|_| ())?;
+        match provider_auth::logout_recovery_state_with_store(&cfg, &account, &store)
+            .map_err(|_| ())?
+        {
+            "none" => Ok::<i32, ()>(0),
+            "resume" => Ok(1),
+            _ => Ok(2),
+        }
+    }))
+    .ok()
+    .and_then(Result::ok)
     .unwrap_or(-1)
 }
 

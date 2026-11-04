@@ -331,6 +331,7 @@ class MainActivity : FragmentActivity() {
         sessionToken = token
         NativeEngine.nativeWakeProviderRefresh()
         dispatchBridge { reconcileProviderCatchUp() }
+        ReminderPlanningWorker.scheduleForeground(this)
         // The WebView loads from the stable app origin. GET assets/subresources are served
         // in-process with the trusted Activity session, and API/stream/native-control
         // traffic rides the preflighted origin-bound WebMessage bridge.
@@ -375,6 +376,7 @@ class MainActivity : FragmentActivity() {
         }
         if (sessionToken.isNotEmpty()) dispatchBridge { MobileJobScheduler.reconcile(this) }
         if (sessionToken.isNotEmpty()) NativeEngine.nativeWakeProviderRefresh()
+        if (sessionToken.isNotEmpty()) ReminderPlanningWorker.scheduleForeground(this)
     }
 
     override fun onRequestPermissionsResult(
@@ -711,6 +713,13 @@ class MainActivity : FragmentActivity() {
                             else -> "unavailable"
                         }
                         body.put("auth_state", authState)
+                        val logoutRecovery = when (NativeEngine.nativeProviderLogoutRecovery(filesDir.absolutePath, account)) {
+                            0 -> "none"
+                            1 -> "resume"
+                            2 -> "unbound"
+                            else -> "unavailable"
+                        }
+                        body.put("logout_recovery", logoutRecovery)
                     }
                     postBridgeResponse(reply, id, 200, body)
                 }

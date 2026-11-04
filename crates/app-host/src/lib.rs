@@ -14253,6 +14253,25 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     return Err("session_account_mismatch".into());
                 }
                 let control = self.control_store.as_ref().ok_or("capture_unavailable")?;
+                let operation = if operation.is_empty() {
+                    isyncyou_engine::provider_auth::with_locked_provider_subject(
+                        cfg,
+                        account,
+                        |subject| {
+                            control.single_capture_operation_for_pending(
+                                account,
+                                origin,
+                                subject.ok_or("provider_login_required")?,
+                                session,
+                                pending,
+                                action_hash,
+                            )
+                        },
+                    )?
+                } else {
+                    operation.to_owned()
+                };
+                let operation = operation.as_str();
                 let mut result = isyncyou_engine::provider_auth::with_locked_provider_subject(
                     cfg,
                     account,
@@ -14273,6 +14292,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                             operation, account, origin, subject,
                         )?;
                         status["binding_matches"] = serde_json::json!(true);
+                        status["operation_id"] = serde_json::json!(operation);
                         Ok(status)
                     },
                 )?;

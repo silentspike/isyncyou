@@ -2322,6 +2322,54 @@ impl AgentControlStore {
         )
     }
 
+    /// Resolve a previously bound capture operation without creating an effect.
+    pub(crate) fn single_capture_operation_for_pending(
+        &self,
+        account: &str,
+        origin: &str,
+        subject: &str,
+        session: &str,
+        pending: &str,
+        action_hash: &str,
+    ) -> Result<String, String> {
+        let ids: Vec<String> = {
+            let connection = self
+                .connection
+                .lock()
+                .map_err(|_| "control_store_unavailable")?;
+            let mut statement = connection.prepare("SELECT batch_id FROM recovery_requests WHERE pending_id=?1 AND action_hash=?2 LIMIT 2").map_err(|_| "control_store_unavailable")?;
+            let rows = statement
+                .query_map(params![pending, action_hash], |row| row.get(0))
+                .map_err(|_| "control_store_unavailable")?;
+            rows.collect::<Result<Vec<String>, _>>()
+                .map_err(|_| "control_store_unavailable")?
+        };
+        if ids.len() != 1 {
+            return Err("capture_intent_unavailable".into());
+        }
+        let operation = &ids[0];
+        let (_, matches) = self.single_capture_intent_phase(
+            operation,
+            account,
+            origin,
+            subject,
+            pending,
+            action_hash,
+        )?;
+        if !matches {
+            return Err("capture_intent_unavailable".into());
+        }
+        let status = self.single_capture_operational_status(operation, account, origin, subject)?;
+        if status
+            .get("original_session_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(session)
+        {
+            return Err("capture_intent_unavailable".into());
+        }
+        Ok(operation.clone())
+    }
+
     pub(crate) fn single_capture_intent_phase(
         &self,
         operation: &str,
@@ -11391,6 +11439,88 @@ mod tests {
                 1_002,
             )
             .unwrap();
+        assert_eq!(
+            control
+                .single_capture_operation_for_pending(
+                    &account,
+                    "https://example.test",
+                    "subject-a",
+                    &owner().session_id,
+                    &pending.id,
+                    &pending.action_hash
+                )
+                .unwrap(),
+            "capture-1"
+        );
+        let original_owner = owner();
+        for (
+            wrong_account,
+            wrong_origin,
+            wrong_subject,
+            wrong_session,
+            wrong_pending,
+            wrong_hash,
+        ) in [
+            (
+                "other",
+                "https://example.test",
+                "subject-a",
+                original_owner.session_id.as_str(),
+                pending.id.as_str(),
+                pending.action_hash.as_str(),
+            ),
+            (
+                account.as_str(),
+                "https://other.test",
+                "subject-a",
+                original_owner.session_id.as_str(),
+                pending.id.as_str(),
+                pending.action_hash.as_str(),
+            ),
+            (
+                account.as_str(),
+                "https://example.test",
+                "other-subject",
+                original_owner.session_id.as_str(),
+                pending.id.as_str(),
+                pending.action_hash.as_str(),
+            ),
+            (
+                account.as_str(),
+                "https://example.test",
+                "subject-a",
+                "other-session",
+                pending.id.as_str(),
+                pending.action_hash.as_str(),
+            ),
+            (
+                account.as_str(),
+                "https://example.test",
+                "subject-a",
+                original_owner.session_id.as_str(),
+                "other-pending",
+                pending.action_hash.as_str(),
+            ),
+            (
+                account.as_str(),
+                "https://example.test",
+                "subject-a",
+                original_owner.session_id.as_str(),
+                pending.id.as_str(),
+                "other-hash",
+            ),
+        ] {
+            assert!(control
+                .single_capture_operation_for_pending(
+                    wrong_account,
+                    wrong_origin,
+                    wrong_subject,
+                    wrong_session,
+                    wrong_pending,
+                    wrong_hash
+                )
+                .is_err());
+        }
         assert_eq!(
             control
                 .single_capture_intent_phase(

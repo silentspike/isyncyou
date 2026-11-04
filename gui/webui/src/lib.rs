@@ -9929,18 +9929,17 @@ impl Router {
             Ok(handler) => handler,
             Err(error) => return with_no_store(error),
         };
-        let (Some(account), Some(session), Some(operation), Some(pending), Some(hash)) = (
+        let (Some(account), Some(session), Some(pending), Some(hash)) = (
             req.q("account"),
             req.q("session_id"),
-            req.q("operation_id"),
             req.q("pending"),
             req.q("action_hash"),
         ) else {
             return no_store_json_error(400, "invalid capture request");
         };
+        let operation = req.q("operation_id").unwrap_or("");
         if account.is_empty()
             || !valid_opaque_agent_id(session)
-            || operation.is_empty()
             || operation.len() > 128
             || !operation
                 .bytes()
