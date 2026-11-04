@@ -590,12 +590,24 @@ impl Store {
                     if valid { Ok(ProviderDavIndex::Valid { uid:r.get(1)?,kind:r.get(2)?,parent_uid:r.get(3)? }) } else { Ok(ProviderDavIndex::Invalid) }
                 })?)
             } else { None };
-            apply_changes(&tx,scope,&[ProviderChange::Upsert(object)],cursor)?;
-            if let Some(index) = index { write_dav_index(&tx,scope,&after,&index)?; }
+            let unchanged: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_objects WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND remote_id=?5 AND etag IS ?6 AND raw=?7)",params![scope.account_id,scope.origin,scope.service,scope.collection,after,object.etag,object.raw],|r| r.get(0))?;
+            if !unchanged { apply_changes(&tx,scope,&[ProviderChange::Upsert(object)],cursor)?; }
+            if let Some(index) = index {
+                let (valid,uid,kind,parent) = dav_index_fields(&index)?;
+                let same: bool = unchanged && tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_dav_index WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND remote_id=?5 AND valid=?6 AND uid IS ?7 AND kind IS ?8 AND parent_uid IS ?9)",params![scope.account_id,scope.origin,scope.service,scope.collection,after,valid,uid,kind,parent],|r| r.get(0))?;
+                if !same {
+                    if unchanged { tx.execute("DELETE FROM provider_dav_index WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND remote_id=?5",params![scope.account_id,scope.origin,scope.service,scope.collection,after])?; }
+                    write_dav_index(&tx,scope,&after,&index)?;
+                }
+            }
             if scope.service == "calendar" {
                 let (valid,has_alarm):(bool,bool)=tx.query_row("SELECT valid,has_alarm FROM provider_stage_alarm_index WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND generation=?5 AND remote_id=?6",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,after],|r| Ok((r.get(0)?,r.get(1)?)))?;
                 let alarm=if valid { ProviderAlarmIndex::Valid {has_alarm} } else { ProviderAlarmIndex::Invalid };
-                write_alarm_index(&tx,scope,&after,&alarm)?;
+                let same: bool = unchanged && tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_alarm_index WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND remote_id=?5 AND valid=?6 AND has_alarm=?7)",params![scope.account_id,scope.origin,scope.service,scope.collection,after,valid,has_alarm],|r| r.get(0))?;
+                if !same {
+                    if unchanged { tx.execute("DELETE FROM provider_alarm_index WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND remote_id=?5",params![scope.account_id,scope.origin,scope.service,scope.collection,after])?; }
+                    write_alarm_index(&tx,scope,&after,&alarm)?;
+                }
             }
         }
         apply_changes(&tx,scope,&[],cursor)?;
@@ -1233,6 +1245,46 @@ fn capture_observation(tx: &rusqlite::Transaction<'_>, scope: &ProviderScope, ob
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn full_reconcile_reuses_unchanged_objects_and_repairs_missing_indexes() {
+        use super::*;
+        let store = Store::open_in_memory().unwrap();
+        let scope = ProviderScope {account_id:"a".into(),origin:"https://example.test/".into(),service:"calendar".into(),collection:"/cal/".into()};
+        let item = ProviderObject {remote_id:"/cal/a.ics".into(),etag:Some("v1".into()),raw:b"BEGIN:VCALENDAR\r\nSUMMARY:Alpha\r\nEND:VCALENDAR\r\n".to_vec()};
+        let index = ProviderDavIndex::Valid {uid:"a".into(),kind:"event".into(),parent_uid:None};
+        let alarm = ProviderAlarmIndex::Valid {has_alarm:false};
+        store.apply_provider_dav_page_indexed(&scope,&[(ProviderChange::Upsert(item.clone()),Some(index.clone()),Some(alarm.clone()))],"one").unwrap();
+        let events = store.provider_events(0,100).unwrap().len();
+        let fts_row: i64 = store.conn.query_row("SELECT rowid FROM provider_dav_search_fts WHERE remote_id=?1",[&item.remote_id],|r| r.get(0)).unwrap();
+        store.conn.execute_batch("CREATE TEMP TABLE object_writes(n INTEGER); CREATE TEMP TRIGGER track_object_update AFTER UPDATE ON provider_objects BEGIN INSERT INTO object_writes VALUES(1); END;").unwrap();
+        store.begin_provider_staging(&scope,"unchanged").unwrap();
+        store.stage_provider_objects(&scope,"unchanged",std::slice::from_ref(&item)).unwrap();
+        store.stage_provider_dav_index(&scope,"unchanged",&item.remote_id,&index).unwrap();
+        store.stage_provider_alarm_index(&scope,"unchanged",&item.remote_id,&alarm).unwrap();
+        store.finish_provider_staging(&scope,"unchanged","two").unwrap();
+        assert_eq!(store.provider_events(0,100).unwrap().len(),events);
+        assert_eq!(store.conn.query_row("SELECT COUNT(*) FROM object_writes",[],|r| r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(store.conn.query_row("SELECT rowid FROM provider_dav_search_fts WHERE remote_id=?1",[&item.remote_id],|r| r.get::<_,i64>(0)).unwrap(),fts_row);
+        store.conn.execute("DELETE FROM provider_dav_index WHERE remote_id=?1",[&item.remote_id]).unwrap();
+        store.conn.execute("DELETE FROM provider_alarm_index WHERE remote_id=?1",[&item.remote_id]).unwrap();
+        store.begin_provider_staging(&scope,"repair").unwrap();
+        store.stage_provider_objects(&scope,"repair",std::slice::from_ref(&item)).unwrap();
+        store.stage_provider_dav_index(&scope,"repair",&item.remote_id,&index).unwrap();
+        store.stage_provider_alarm_index(&scope,"repair",&item.remote_id,&alarm).unwrap();
+        store.finish_provider_staging(&scope,"repair","three").unwrap();
+        assert_eq!(store.provider_dav_index_incomplete_count(&scope).unwrap(),0);
+        assert_eq!(store.provider_alarm_index_incomplete_count(&scope).unwrap(),0);
+        assert_eq!(store.provider_events(0,100).unwrap().len(),events);
+        let changed = ProviderObject {etag:Some("v2".into()),raw:b"BEGIN:VCALENDAR\r\nSUMMARY:Beta\r\nEND:VCALENDAR\r\n".to_vec(),..item};
+        store.begin_provider_staging(&scope,"changed").unwrap();
+        store.stage_provider_objects(&scope,"changed",std::slice::from_ref(&changed)).unwrap();
+        store.stage_provider_dav_index(&scope,"changed",&changed.remote_id,&index).unwrap();
+        store.stage_provider_alarm_index(&scope,"changed",&changed.remote_id,&alarm).unwrap();
+        store.finish_provider_staging(&scope,"changed","four").unwrap();
+        assert_eq!(store.provider_events(0,100).unwrap().len(),events+1);
+        assert_eq!(store.conn.query_row("SELECT COUNT(*) FROM object_writes",[],|r| r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(store.search_provider_dav(&scope,"Beta",10).unwrap().0.len(),1);
+    }
     #[test]
     fn denied_dav_access_does_not_override_newer_collection_state() {
         use super::*;

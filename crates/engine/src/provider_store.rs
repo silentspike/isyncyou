@@ -71,9 +71,8 @@ fn staging_lock(cfg: &Config, account: &str) -> Result<std::fs::File, String> {
 /// Shared lease prevents ordinary opens from reclaiming an active generation.
 #[cfg(feature = "encrypted-store")]
 pub(crate) fn sync_staging_lease(cfg: &Config, account: &str) -> Result<std::fs::File, String> {
-    use fs2::FileExt;
     let guard = staging_lock(cfg, account)?;
-    guard.lock_shared().map_err(|_| "Provider staging lease unavailable")?;
+    fs2::FileExt::lock_shared(&guard).map_err(|_| "Provider staging lease unavailable")?;
     Ok(guard)
 }
 
