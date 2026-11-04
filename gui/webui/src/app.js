@@ -1925,7 +1925,8 @@ async function loadMoreProviderMail(button) {
 function updateMailCacheProvenance(data) {
   const label = $("#mail-cache-provenance");
   if (!label) return;
-  const base = data.provenance === "local" ? (data.observed_at ? `Cached index · last local update ${new Date(Number(data.observed_at) * 1000).toLocaleString()} · live status unknown` : "Cached index · update time and live status unknown") : "";
+  let base = data.provenance === "local" ? (data.observed_at ? `Cached index · last local update ${new Date(Number(data.observed_at) * 1000).toLocaleString()} · live status unknown` : "Cached index · update time and live status unknown") : "";
+  if (data.shared_access_status === "unknown") base += (base ? " · " : "") + "Shared mail access could not be verified";
   label.textContent = base + (base && (data.next_cursor || Mail.nextCursor) ? " · more cached messages available" : "") + (base && Mail.expanded ? " · pages may reflect different cache updates; refresh to reload" : "");
 }
 
@@ -2664,8 +2665,13 @@ function renderMailReader(it, remoteImages = false) {
     const account = App.account, messageId = it.remote_id;
     const attachments = el("div", { class:"mr-attachments" }, el("span", { class:"dim", text:"Loading attachments…" }));
     box.append(attachments);
-    void request("GET", "/api/v1/attachment?" + qs({ account, service:"mail", id:messageId, ...(it.shared ? {mail_scope:it.mail_scope} : {}) }), { timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS }).then(result => {
+    void request("GET", "/api/v1/attachment?" + qs({ account, service:"mail", id:messageId, ...(it.shared ? {mail_scope:it.mail_scope} : {}) }), { timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS }).then(async result => {
       if (App.account !== account || !attachments.isConnected) return;
+      let scopedDownload = false;
+      if (BRIDGE && it.shared) {
+        try { scopedDownload = (await nativeCall("bridgeCapabilities", {}, NATIVE_TIMEOUT_MS))?.scoped_attachment_download === true; } catch (_) { scopedDownload = false; }
+        if (App.account !== account || !attachments.isConnected) return;
+      }
       clear(attachments);
       const entries = Array.isArray(result.attachments) ? result.attachments : [];
       if (!entries.length) { attachments.remove(); return; }
@@ -2674,13 +2680,13 @@ function renderMailReader(it, remoteImages = false) {
         const tooLarge = Number(attachment.size) > 64 * 1024 * 1024;
         if (tooLarge) { attachments.append(el("span", { class:"dim", text:`${attachment.filename || "attachment"} · exceeds the 64 MiB download limit` })); return; }
         const children = [icon("paperclip", "icon-sm"), el("span", { class:"truncate", text:attachment.filename || "attachment" }), el("span", { class:"dim mr-att-size", text:fmtSize(attachment.size) })];
-        if (BRIDGE && it.shared) {
+        if (BRIDGE && it.shared && !scopedDownload) {
           attachments.append(el("span", {class:"dim", text:`${attachment.filename || "Attachment"} · shared attachment download unavailable on this device`}));
         } else if (BRIDGE) {
           attachments.append(el("button", { class:"mr-att", type:"button", onclick:async event => {
             const button = event.currentTarget; button.disabled = true;
             try {
-              const result = await nativeCall("downloadProviderAttachment", { account, id:messageId, blob_id:attachment.blob_id, filename:attachment.filename || "attachment" }, PROVIDER_NATIVE_TIMEOUT_MS);
+              const result = await nativeCall("downloadProviderAttachment", { account, id:messageId, blob_id:attachment.blob_id, filename:attachment.filename || "attachment", ...(it.shared ? {mail_scope:it.mail_scope} : {}) }, PROVIDER_NATIVE_TIMEOUT_MS);
               if (!result || result.opened !== true) throw new Error("Download picker unavailable");
               toast("Choose where to save the attachment; Android will report completion.");
               button.disabled = false;

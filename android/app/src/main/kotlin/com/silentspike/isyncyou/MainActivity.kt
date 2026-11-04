@@ -554,6 +554,7 @@ class MainActivity : FragmentActivity() {
         val op = obj.optString("op")
         val payload = obj.optJSONObject("payload") ?: JSONObject()
         when (op) {
+            "bridgeCapabilities" -> postBridgeResponse(reply, id, 200, JSONObject().put("scoped_attachment_download", true))
             "downloadProviderAttachment" -> {
                 if (sessionToken.isBlank()) {
                     postBridgeError(reply, id, 503, "unavailable", "session_not_ready")

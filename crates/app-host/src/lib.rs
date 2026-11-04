@@ -538,12 +538,14 @@ impl isyncyou_agent::ToolExecutor for ProviderMailExecutor {
                 if wants("mail") {
                     let mut rows = store.search_provider_mail(&self.account, origin, &literal_query, max).map_err(|_| AgentError::Provider("provider search unavailable".into()))?;
                     let client = isyncyou_engine::self_hosted_mail::client(&self.cfg,&self.account).ok();
-                    let shared_accounts = client.as_ref().and_then(|client| isyncyou_engine::self_hosted_mail::shared_mail_accessible_accounts(&self.cfg,&self.account,client).ok()).unwrap_or_default();
+                    let shared_discovery = client.as_ref().and_then(|client| isyncyou_engine::self_hosted_mail::shared_mail_accessible_accounts(&self.cfg,&self.account,client).ok());
+                    if shared_discovery.is_none() { incomplete.push(serde_json::json!({"service":"mail","reason":"shared_access_unknown"})); }
+                    let shared_accounts = shared_discovery.unwrap_or_default();
                     let mut live_mailboxes = std::collections::HashMap::new();
                     for scope in store.provider_scopes(&self.account,origin,"mail-shared").map_err(|_| AgentError::Provider("provider cache unavailable".into()))? {
                         if rows.len() >= max { break; }
                         if !shared_accounts.contains(&scope.collection) || store.provider_accessible(&scope).ok().flatten() != Some(true) { continue; }
-                        let Some(ids) = client.as_ref().and_then(|client| isyncyou_engine::self_hosted_mail::shared_mail_readable_mailboxes(&self.cfg,&self.account,client,&scope.collection).ok()) else { continue; };
+                        let Some(ids) = client.as_ref().and_then(|client| isyncyou_engine::self_hosted_mail::shared_mail_readable_mailboxes(&self.cfg,&self.account,client,&scope.collection).ok()) else { incomplete.push(serde_json::json!({"service":"mail","reason":"shared_access_unknown"})); continue; };
                         live_mailboxes.insert(scope.collection.clone(),ids);
                         for item in store.search_provider_mail_in_scope(&scope,&literal_query,max - rows.len()).map_err(|_| AgentError::Provider("provider search unavailable".into()))? { rows.push((scope.clone(),item)); }
                     }
@@ -625,12 +627,14 @@ impl isyncyou_agent::ToolExecutor for ProviderMailExecutor {
                 }).collect::<Result<_, serde_json::Error>>().map_err(|_| AgentError::Provider("provider cache invalid".into()))?;
                 let max = limit.unwrap_or(20).clamp(1,100) as usize;
                 let client = isyncyou_engine::self_hosted_mail::client(&self.cfg,&self.account).ok();
-                let discovered = client.as_ref().and_then(|client| isyncyou_engine::self_hosted_mail::shared_mail_accessible_accounts(&self.cfg,&self.account,client).ok()).unwrap_or_default();
+                let discovery = client.as_ref().and_then(|client| isyncyou_engine::self_hosted_mail::shared_mail_accessible_accounts(&self.cfg,&self.account,client).ok());
+                let mut shared_access_status = if discovery.is_some() { "observed" } else { "unknown" };
+                let discovered = discovery.unwrap_or_default();
                 for shared in store.provider_scopes(&self.account,origin,"mailboxes-shared").map_err(|_| AgentError::Provider("provider cache unavailable".into()))? {
                     if values.len() >= max { break; }
                      let mut messages = shared.clone(); messages.service = "mail-shared".into();
                     if !discovered.contains(&shared.collection) || store.provider_accessible(&shared).ok().flatten() != Some(true) || store.provider_accessible(&messages).ok().flatten() != Some(true) { continue; }
-                    let Some(readable) = client.as_ref().and_then(|client| isyncyou_engine::self_hosted_mail::shared_mail_readable_mailboxes(&self.cfg,&self.account,client,&shared.collection).ok()) else { continue; };
+                    let Some(readable) = client.as_ref().and_then(|client| isyncyou_engine::self_hosted_mail::shared_mail_readable_mailboxes(&self.cfg,&self.account,client,&shared.collection).ok()) else { shared_access_status="unknown"; continue; };
                     let page = store.provider_objects_page(&shared,"",max - values.len()).map_err(|_| AgentError::Provider("provider cache unavailable".into()))?;
                     for object in page {
                         let value:serde_json::Value = serde_json::from_slice(&object.raw).map_err(|_| AgentError::Provider("provider cache invalid".into()))?;
@@ -638,7 +642,7 @@ impl isyncyou_agent::ToolExecutor for ProviderMailExecutor {
                         values.push(serde_json::json!({"id":object.remote_id,"mail_scope":shared.collection,"shared":true,"name":value["name"],"role":value["role"],"myRights":value["myRights"]}));
                     }
                 }
-                Ok(serde_json::json!({"account":self.account,"provider":origin,"service":"mail","kind":"mailboxes","provenance":"local","observed_at":store.provider_observed_at(scope).ok().flatten(),"results":values}).to_string())
+                Ok(serde_json::json!({"account":self.account,"provider":origin,"service":"mail","kind":"mailboxes","provenance":"local","shared_access_status":shared_access_status,"observed_at":store.provider_observed_at(scope).ok().flatten(),"results":values}).to_string())
             }
             _ => Err(AgentError::Provider("provider operation unavailable".into())),
         }

@@ -377,6 +377,9 @@ object BridgeMessagePolicy {
             }
         }
         when (op) {
+            "bridgeCapabilities" -> if (!hasOnlyKeys(payload, emptySet())) {
+                return BridgeValidation(false, type, id, "invalid_capabilities_request")
+            }
             "downloadProviderAttachment" -> {
                 if (!hasOnlyKeys(payload, setOf("account", "id", "blob_id", "filename", "mail_scope")) ||
                     (payload.has("mail_scope") && exactString(payload, "mail_scope").let { it.isNullOrBlank() || it.length > 512 || it.any(Char::isISOControl) }) ||

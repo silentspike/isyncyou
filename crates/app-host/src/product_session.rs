@@ -2033,7 +2033,9 @@ impl<'a> ProductSessionRegistry<'a> {
         ) {
             return Err("session_state_invalid".into());
         }
-        let store = self.open(graph_token, &owner.session_id)?;
+        let transport = self.transport(graph_token, &owner.session_id)?;
+        let store = self.open_with_transport(&owner.session_id, transport.clone())?;
+        transport.with_projection_writer(|| {
         let lease_id = new_ulid().map_err(|_| "session_store_unavailable")?;
         let holder_binding = self
             .store
@@ -2098,6 +2100,7 @@ impl<'a> ProductSessionRegistry<'a> {
             .map_err(map_session_error)?;
         guard.release().map_err(map_session_error)?;
         Ok(())
+        })
     }
 
     pub fn begin_turn(&self, request: ProductTurnRequest<'_>) -> Result<ProductTurnStart, String> {

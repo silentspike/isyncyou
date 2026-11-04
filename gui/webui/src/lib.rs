@@ -9539,16 +9539,24 @@ impl Router {
             _ => return ApiResponse::error(503, "provider_scope_unavailable"),
         };
         if scopes.first().is_some_and(|primary| shared.iter().any(|candidate| candidate.collection == primary.collection)) { return ApiResponse::error(503, "provider_scope_unavailable"); }
-        let discovered = self.mail_write.as_ref().and_then(|handler| handler.provider_shared_mail_accounts(account).ok()).unwrap_or_default();
+        let discovery = self.mail_write.as_ref().ok_or("unavailable").and_then(|handler| handler.provider_shared_mail_accounts(account).map_err(|_| "unavailable"));
+        let mut shared_access_status = if discovery.is_ok() { "observed" } else { "unknown" };
+        let mut rights = std::collections::HashMap::new();
         let mut available = Vec::new();
-        if let Some(primary) = scopes.first() {
-            available.push(json!({"mail_scope":primary.collection,"primary":true}));
-        }
-        for candidate in &shared {
-            match store.provider_accessible(candidate) {
-                Ok(Some(true)) if discovered.contains(&candidate.collection) && self.mail_write.as_ref().and_then(|handler| handler.provider_shared_mailbox_ids(account,&candidate.collection).ok()).is_some_and(|ids| !ids.is_empty()) => available.push(json!({"mail_scope":candidate.collection,"primary":false})),
-                Ok(_) => (),
-                Err(_) => return ApiResponse::error(503, "provider_scope_unavailable"),
+        if let Some(primary) = scopes.first() { available.push(json!({"mail_scope":primary.collection,"primary":true})); }
+        if let Ok(discovered) = &discovery {
+            for candidate in &shared {
+                match store.provider_accessible(candidate) {
+                    Ok(Some(true)) if discovered.contains(&candidate.collection) => {
+                        let current = self.mail_write.as_ref().expect("discovery requires handler").provider_shared_mailbox_ids(account,&candidate.collection);
+                        match current {
+                            Ok(ids) => { if !ids.is_empty() { available.push(json!({"mail_scope":candidate.collection,"primary":false})); } rights.insert(candidate.collection.clone(),ids); },
+                            Err(_) => shared_access_status = "unknown",
+                        }
+                    }
+                    Ok(_) => (),
+                    Err(_) => return ApiResponse::error(503,"provider_scope_unavailable"),
+                }
             }
         }
         let requested = req.q("mail_scope");
@@ -9557,16 +9565,13 @@ impl Router {
             Some(id) => scopes.iter().chain(shared.iter()).find(|scope| scope.collection == id),
         };
         let Some(scope) = scope else {
-            if requested.is_some() { return ApiResponse::error(404, "provider_scope_unavailable"); }
-            return ApiResponse::ok_json(&json!({"items": [], "scopes":available, "count": 0, "total": null, "provenance": "local", "observed_at": null}));
+            if requested.is_some() { return ApiResponse::error(if discovery.is_err() {503} else {404}, "provider_scope_unavailable"); }
+            return ApiResponse::ok_json(&json!({"items":[],"scopes":available,"shared_access_status":shared_access_status,"count":0,"total":null,"provenance":"local","observed_at":null}));
         };
         let is_shared = scope.service == "mail-shared";
-        if is_shared && (!discovered.contains(&scope.collection) || store.provider_accessible(scope).ok().flatten() != Some(true)) { return ApiResponse::error(404, "provider_scope_unavailable"); }
         let current_mailboxes = if is_shared {
-            match self.mail_write.as_ref().and_then(|handler| handler.provider_shared_mailbox_ids(account,&scope.collection).ok()) {
-                Some(ids) => ids,
-                None => return ApiResponse::error(404,"provider_scope_unavailable"),
-            }
+            if discovery.is_err() || (shared_access_status == "unknown" && !rights.contains_key(&scope.collection)) { return ApiResponse::error(503,"provider_scope_unavailable"); }
+            match rights.get(&scope.collection) { Some(ids) if !ids.is_empty()=>ids.clone(), _=>return ApiResponse::error(404,"provider_scope_unavailable") }
         } else { Vec::new() };
         let cursor = req.q("after").unwrap_or("");
         if cursor.len() > 1024 || cursor.chars().any(char::is_control) { return ApiResponse::error(400, "invalid_provider_cursor"); }
@@ -9617,7 +9622,7 @@ impl Router {
             match store.provider_objects_page(scope, &after, 1) { Ok(page) if !page.is_empty() => Some(after), Ok(_) => None, Err(_) => return ApiResponse::error(503, "provider_cache_unavailable") }
         } else { None };
         let observed_at = store.provider_observed_at(scope).ok().flatten();
-        ApiResponse::ok_json(&json!({"count":items.len(), "items":items, "scopes":available, "mail_scope":scope.collection, "shared":is_shared, "total":null, "offset":offset, "limit":limit, "next_cursor":next_cursor, "provenance":"local", "observed_at":observed_at}))
+        ApiResponse::ok_json(&json!({"count":items.len(), "items":items, "scopes":available, "shared_access_status":shared_access_status, "mail_scope":scope.collection, "shared":is_shared, "total":null, "offset":offset, "limit":limit, "next_cursor":next_cursor, "provenance":"local", "observed_at":observed_at}))
     }
 
     fn calendar_expanded(&self, req: &ApiRequest) -> ApiResponse {
@@ -11303,15 +11308,36 @@ mod tests {
         ], "messages").unwrap();
         store.set_provider_accessible(&scope,true).unwrap();
         store.set_provider_accessible(&folders,true).unwrap();
+        let handler = std::sync::Arc::new(RecordMailWrite(std::sync::Mutex::new(Vec::new())));
         let mut router = Router::new(Config::default());
-        router.mail_write = Some(std::sync::Arc::new(RecordMailWrite(std::sync::Mutex::new(Vec::new()))));
+        router.mail_write = Some(handler.clone());
         let req = ApiRequest::get("/api/v1/items?account=a&service=mail&mail_scope=shared");
         let result = body_json(&router.provider_mail_items(&store,"a","https://example.invalid",&req));
         let rows = result["items"].as_array().unwrap();
         assert_eq!(rows.len(),2);
         assert_eq!(rows[1]["mailbox_ids"],json!(["visible"]));
+        assert_eq!(result["shared_access_status"],"observed");
+        assert_eq!(handler.0.lock().unwrap().iter().filter(|entry| entry.as_str()=="shared-rights").count(),1);
         store.set_provider_accessible(&scope,false).unwrap();
         assert_eq!(router.provider_mail_items(&store,"a","https://example.invalid",&req).status,404);
+    }
+
+    #[test]
+    #[cfg(feature = "encrypted-store")]
+    fn shared_mail_discovery_failure_is_explicitly_unknown() {
+        use isyncyou_store::{ProviderChange,ProviderObject,ProviderScope};
+        let dir=tempfile::tempdir().unwrap();
+        let store=Store::open_encrypted(dir.path().join("store.db"),b"test-only-provider-key").unwrap();
+        let scope=ProviderScope {account_id:"unknown".into(),origin:"https://example.invalid".into(),service:"mail-shared".into(),collection:"shared".into()};
+        let item=ProviderObject {remote_id:"x".into(),etag:None,raw:serde_json::to_vec(&json!({"mailboxIds":{"visible":true}})).unwrap()};
+        store.apply_provider_page(&scope,&[ProviderChange::Upsert(item)],"state").unwrap();
+        store.set_provider_accessible(&scope,true).unwrap();
+        let mut router=Router::new(Config::default());
+        router.mail_write=Some(std::sync::Arc::new(RecordMailWrite(std::sync::Mutex::new(Vec::new()))));
+        let primary=body_json(&router.provider_mail_items(&store,"unknown","https://example.invalid",&ApiRequest::get("/api/v1/items?account=unknown&service=mail")));
+        assert_eq!(primary["shared_access_status"],"unknown");
+        assert!(primary["scopes"].as_array().unwrap().is_empty());
+        assert_eq!(router.provider_mail_items(&store,"unknown","https://example.invalid",&ApiRequest::get("/api/v1/items?account=unknown&service=mail&mail_scope=shared")).status,503);
     }
 
     #[test]
@@ -15162,10 +15188,12 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         }
     }
     impl MailWriteHandler for RecordMailWrite {
-        fn provider_shared_mail_accounts(&self, _account:&str) -> Result<Vec<String>,String> {
+        fn provider_shared_mail_accounts(&self, account:&str) -> Result<Vec<String>,String> {
+            if account=="unknown" { return Err("offline".into()); }
             Ok(vec!["shared".into()])
         }
         fn provider_shared_mailbox_ids(&self, _account:&str, _scope:&str) -> Result<Vec<String>,String> {
+            self.0.lock().unwrap().push("shared-rights".into());
             Ok(vec!["visible".into()])
         }
         fn read_state(&self, _a: &str, id: &str) -> Result<bool, String> {

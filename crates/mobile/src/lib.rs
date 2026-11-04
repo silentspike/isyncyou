@@ -937,17 +937,30 @@ fn refresh_self_hosted_data(cfg: &Config, base: &Path) -> (bool, HashMap<String,
         let mut successful = true;
         let protected = isyncyou_engine::provider_store::open(cfg, &account.id)
             .map(|store| store.protected_provider_storage()).unwrap_or(false);
-        if !protected { outcomes.insert(account.id.clone(), false); continue; }
-        let result = (|| -> Result<usize, String> {
+        if !protected {
+            android_info("provider_refresh_failed phase=store");
+            outcomes.insert(account.id.clone(), false);
+            continue;
+        }
+        let result = (|| -> Result<usize, &'static str> {
             let store = isyncyou_engine::provider_store::open(cfg, &account.id)
-                .map_err(|_| "Protected provider store unavailable")?;
-            if !store.protected_provider_storage() { return Err("Protected provider store unavailable".into()); }
-            let client = isyncyou_engine::self_hosted_mail::client(cfg, &account.id)?;
+                .map_err(|_| "store")?;
+            if !store.protected_provider_storage() { return Err("store"); }
+            let client = isyncyou_engine::self_hosted_mail::client(cfg, &account.id)
+                .map_err(|_| "jmap_discovery")?;
             isyncyou_engine::self_hosted_mail::sync(cfg, &account.id, &store, &client)
+                .map_err(|_| "jmap_sync")
         })();
         match result {
             Ok(count) => changed |= count > 0,
-            Err(_) => successful = false,
+            Err(phase) => {
+                match phase {
+                    "store" => android_info("provider_refresh_failed phase=store"),
+                    "jmap_discovery" => android_info("provider_refresh_failed phase=jmap_discovery"),
+                    _ => android_info("provider_refresh_failed phase=jmap_sync"),
+                }
+                successful = false;
+            }
         }
         // DAV opens the same encrypted store itself, so the mail store above must
         // have been dropped before starting this independent protocol pass.
@@ -955,10 +968,16 @@ fn refresh_self_hosted_data(cfg: &Config, base: &Path) -> (bool, HashMap<String,
             match isyncyou_engine::dav_live::sync_all_with_store(
                 cfg, &account.id, "/.well-known/caldav", &credentials,
             ) {
-                Ok(report) => { changed |= report.changes > 0; successful &= report.failed == 0; }
-                Err(_) => successful = false,
+                Ok(report) => {
+                    changed |= report.changes > 0;
+                    if report.failed != 0 {
+                        android_info("provider_refresh_failed phase=dav_partial");
+                        successful = false;
+                    }
+                }
+                Err(_) => { android_info("provider_refresh_failed phase=dav_sync"); successful = false; }
             }
-        } else { successful = false; }
+        } else { android_info("provider_refresh_failed phase=dav_credentials"); successful = false; }
         outcomes.insert(account.id.clone(), successful);
     }
     (changed, outcomes)

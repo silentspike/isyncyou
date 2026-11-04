@@ -19,11 +19,15 @@ pub(crate) struct LocalSessionTransport {
     session_id: String,
     crypto: Arc<Mutex<Option<SessionObjectCrypto>>>,
     reader: Arc<Mutex<Option<((u64, u64, u32, u32, u32, i64, i64, [u8; 32]), isyncyou_store::Store)>>>,
+    projection_writer: Arc<Mutex<Option<((u64, u64, u32, u32, u32, i64, i64, [u8; 32]), isyncyou_store::Store)>>>,
+    projection_gate: Arc<Mutex<()>>,
     _exclusive_session_lock: Arc<isyncyou_agent::FileLock>,
     #[cfg(all(test, feature = "encrypted-store"))]
     test_store: Option<(std::path::PathBuf, Vec<u8>)>,
     #[cfg(all(test, feature = "encrypted-store"))]
     test_read_opens: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(all(test, feature = "encrypted-store"))]
+    test_write_opens: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ProductSessionTransport {
@@ -37,9 +41,10 @@ impl ProductSessionTransport {
                 let lock = isyncyou_agent::FileLock::try_acquire_exclusive(&lock_path).map_err(|_| SessionV2Error::TransportUnavailable)?.ok_or(SessionV2Error::LeaseLost)?;
                 return Ok(Self::Local(LocalSessionTransport {
                     cfg: cfg.clone(), scope: ProviderScope { account_id:account.into(), origin:origin.clone(), service:"agent-session".into(), collection:"local".into() },
-                    session_id:session_id.into(), crypto:Arc::new(Mutex::new(None)), reader:Arc::new(Mutex::new(None)), _exclusive_session_lock:Arc::new(lock),
+                    session_id:session_id.into(), crypto:Arc::new(Mutex::new(None)), reader:Arc::new(Mutex::new(None)), projection_writer:Arc::new(Mutex::new(None)), projection_gate:Arc::new(Mutex::new(())), _exclusive_session_lock:Arc::new(lock),
                     #[cfg(all(test, feature = "encrypted-store"))] test_store: None,
                     #[cfg(all(test, feature = "encrypted-store"))] test_read_opens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    #[cfg(all(test, feature = "encrypted-store"))] test_write_opens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 }));
             }
         }
@@ -49,6 +54,17 @@ impl ProductSessionTransport {
         match self {
             Self::OneDrive(t) => t.bind_manifest_crypto(crypto),
             Self::Local(t) => { *t.crypto.lock().map_err(|_| SessionV2Error::TransportUnavailable)? = Some(crypto); Ok(()) }
+        }
+    }
+    /// Reuse a writer only during one synchronous local projection. Other
+    /// transports retain their existing behavior and there is no idle cache.
+    pub(crate) fn with_projection_writer<T>(&self, run: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        #[cfg(not(unix))]
+        { return run(); }
+        #[cfg(unix)]
+        match self {
+            Self::OneDrive(_) => run(),
+            Self::Local(local) => local.with_projection_writer(run),
         }
     }
     pub(crate) fn create_session(&self) -> Result<VersionedManifest, SessionV2Error> {
@@ -70,9 +86,42 @@ impl ProductSessionTransport {
 }
 
 impl LocalSessionTransport {
+    fn with_projection_writer<T>(&self, run: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let _gate = self.projection_gate.lock().map_err(|_| "session_store_unavailable")?;
+        let before = self.reader_identity().map_err(|_| "session_store_unavailable")?;
+        let store = self.store().map_err(|_| "session_store_unavailable")?;
+        let opened = self.reader_identity().map_err(|_| "session_store_unavailable")?;
+        if (opened.0,opened.1,opened.2,opened.3,opened.4,opened.7) != (before.0,before.1,before.2,before.3,before.4,before.7) { return Err("session_store_unavailable".into()); }
+        *self.projection_writer.lock().map_err(|_| "session_store_unavailable")? = Some((opened, store));
+        struct Cleanup<'a> {
+            writer: &'a Mutex<Option<((u64, u64, u32, u32, u32, i64, i64, [u8; 32]), isyncyou_store::Store)>>,
+            reader: &'a Mutex<Option<((u64, u64, u32, u32, u32, i64, i64, [u8; 32]), isyncyou_store::Store)>>,
+        }
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                *self.writer.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *self.reader.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
+        let _cleanup = Cleanup { writer: &self.projection_writer, reader: &self.reader };
+        run()
+    }
+    fn with_writer<T>(&self, f: impl FnOnce(&isyncyou_store::Store) -> Result<T, SessionV2Error>) -> Result<T, SessionV2Error> {
+        let mut writer = self.projection_writer.lock().map_err(|_| SessionV2Error::TransportUnavailable)?;
+        if let Some((expected, store)) = writer.as_mut() {
+            if &self.reader_identity()? != expected { return Err(SessionV2Error::TransportUnavailable); }
+            let value = f(store)?;
+            let after = self.reader_identity()?;
+            if (after.0,after.1,after.2,after.3,after.4,after.7) != (expected.0,expected.1,expected.2,expected.3,expected.4,expected.7) { return Err(SessionV2Error::TransportUnavailable); }
+            *expected = after;
+            return Ok(value);
+        }
+        drop(writer);
+        f(&self.store()?)
+    }
     fn store(&self) -> Result<isyncyou_store::Store, SessionV2Error> {
         #[cfg(all(test, feature = "encrypted-store"))]
-        if let Some((path, key)) = &self.test_store { return isyncyou_store::Store::open_encrypted(path, key).map_err(|_| SessionV2Error::TransportUnavailable); }
+        if let Some((path, key)) = &self.test_store { self.test_write_opens.fetch_add(1, std::sync::atomic::Ordering::Relaxed); return isyncyou_store::Store::open_encrypted(path, key).map_err(|_| SessionV2Error::TransportUnavailable); }
         isyncyou_engine::provider_store::open_for_session(&self.cfg, &self.scope.account_id).map_err(|_| SessionV2Error::TransportUnavailable)
     }
     fn read_store(&self) -> Result<isyncyou_store::Store, SessionV2Error> {
@@ -148,7 +197,7 @@ impl SessionV2Transport for LocalSessionTransport {
     }
     fn stage_immutable(&self, class: SessionObjectClass, id: &str, bytes: &[u8]) -> Result<(), SessionV2Error> {
         if class == SessionObjectClass::Manifest || bytes.len() > 5 * 1024 * 1024 { return Err(SessionV2Error::SessionLimit); }
-        self.store()?.local_session_stage(&self.scope, &self.session_id, class_name(class), id, bytes).map_err(|_| SessionV2Error::ManifestConflict)
+        self.with_writer(|store| store.local_session_stage(&self.scope, &self.session_id, class_name(class), id, bytes).map_err(|_| SessionV2Error::ManifestConflict))
     }
     fn load_immutable(&self, class: SessionObjectClass, id: &str) -> Result<Vec<u8>, SessionV2Error> {
         self.load_immutable_optional(class,id)?.ok_or(SessionV2Error::InvalidJournal)
@@ -168,7 +217,7 @@ impl SessionV2Transport for LocalSessionTransport {
     fn compare_and_swap_manifest(&self, current: &VersionedManifest, next: &SessionManifestV1) -> Result<Option<VersionedManifest>, SessionV2Error> {
         if next.session_id != self.session_id || current.manifest.session_id != self.session_id || next.generation != current.manifest.generation.checked_add(1).ok_or(SessionV2Error::SessionLimit)? { return Err(SessionV2Error::InvalidRecord); }
         let sealed = self.seal(next)?;
-        let etag = self.store()?.local_session_cas(&self.scope, &self.session_id, &current.etag, &sealed).map_err(|_| SessionV2Error::TransportUnavailable)?;
+        let etag = self.with_writer(|store| store.local_session_cas(&self.scope, &self.session_id, &current.etag, &sealed).map_err(|_| SessionV2Error::TransportUnavailable))?;
         Ok(etag.map(|etag| VersionedManifest { etag, storage_id:None, manifest:next.clone() }))
     }
 }
@@ -223,6 +272,39 @@ mod tests {
         if let ProductSessionTransport::Local(local) = &mut first { local.test_store = Some((db.clone(), b"test-only-sqlcipher-key".to_vec())); }
         first.bind_manifest_crypto(crypto.clone()).unwrap();
         first.create_session().unwrap();
+        let before = if let ProductSessionTransport::Local(local) = &first { local.test_write_opens.load(std::sync::atomic::Ordering::Relaxed) } else { panic!("local fixture required") };
+        first.with_projection_writer(|| {
+            first.stage_immutable(SessionObjectClass::VisibleRecord, "scoped-1", b"first").map_err(|_| "stage")?;
+            first.stage_immutable(SessionObjectClass::VisibleRecord, "scoped-2", b"second").map_err(|_| "stage")?;
+            Ok(())
+        }).unwrap();
+        if let ProductSessionTransport::Local(local) = &first {
+            assert_eq!(local.test_write_opens.load(std::sync::atomic::Ordering::Relaxed) - before, 1);
+            assert!(local.projection_writer.lock().unwrap().is_none());
+        }
+        let before = if let ProductSessionTransport::Local(local) = &first { local.test_write_opens.load(std::sync::atomic::Ordering::Relaxed) } else { unreachable!() };
+        first.with_projection_writer(|| {
+            let session = isyncyou_agent::SessionV2Store::new(first.clone(), &[9; 32], crypto.clone());
+            let mut lease = session.acquire_lease(id, "scoped-lease", "holder").map_err(|_| "lease")?;
+            lease.release().map_err(|_| "release")?;
+            Ok(())
+        }).unwrap();
+        if let ProductSessionTransport::Local(local) = &first {
+            assert_eq!(local.test_write_opens.load(std::sync::atomic::Ordering::Relaxed) - before, 1);
+            assert!(local.projection_writer.lock().unwrap().is_none());
+        }
+        assert!(first.with_projection_writer::<()>(|| Err("fixture".into())).is_err());
+        if let ProductSessionTransport::Local(local) = &first { assert!(local.projection_writer.lock().unwrap().is_none()); }
+        #[cfg(unix)]
+        first.with_projection_writer(|| {
+            use std::os::unix::fs::PermissionsExt;
+            let original=std::fs::metadata(&db).unwrap().permissions();
+            std::fs::set_permissions(&db,std::fs::Permissions::from_mode(original.mode() ^ 0o040)).unwrap();
+            let result=first.stage_immutable(SessionObjectClass::VisibleRecord, "identity-change", b"denied");
+            std::fs::set_permissions(&db,original).unwrap();
+            assert!(result.is_err());
+            Ok(())
+        }).unwrap();
         let session = isyncyou_agent::SessionV2Store::new(first.clone(), &[9; 32], crypto.clone());
         let mut lease = session.acquire_lease(id, "lease-a", "holder-a").unwrap();
         assert!(!lease.is_lost());

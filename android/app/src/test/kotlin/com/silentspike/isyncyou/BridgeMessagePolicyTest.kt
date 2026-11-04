@@ -8,6 +8,14 @@ import org.junit.Test
 
 class BridgeMessagePolicyTest {
     @Test
+    fun bridgeCapabilitiesRequiresEmptyPayload() {
+        fun envelope(payload: JSONObject): String = JSONObject().put("t", "native").put("id", "d1")
+            .put("op", "bridgeCapabilities").put("payload", payload).toString()
+        assertValid(BridgeMessagePolicy.validateEnvelope(envelope(JSONObject())), "native", "d1")
+        assertInvalid(BridgeMessagePolicy.validateEnvelope(envelope(JSONObject().put("unexpected", true))), "invalid_capabilities_request")
+    }
+
+    @Test
     fun providerDownloadAcceptsOnlyValidOptionalMailScope() {
         fun envelope(scope: Any): String = JSONObject().put("t", "native").put("id", "d1")
             .put("op", "downloadProviderAttachment").put("payload", JSONObject().put("account", "me")
