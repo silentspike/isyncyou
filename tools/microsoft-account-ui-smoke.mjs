@@ -190,6 +190,79 @@ async function main() {
       failedEvents.filter((event) => event === "request:start:reader").length === beforeGuardFailure.starts
       && failedEvents.filter((event) => event.startsWith("native:open:")).length === beforeGuardFailure.opens,
       failedEvents);
+
+    // Exercise the actual view with an intentionally held metadata response.
+    // The fixture contains no provider data or live account operations.
+    const snapshot = await page.evaluate(async () => {
+      App.accounts = [{ id: "fixture", provider: "microsoft", auth: { reader: { state: "connected" } } }];
+      App.account = "fixture";
+      let calls = 0, release, held = false;
+      const originalApi = api;
+      const item = { service: "mail", item_type: "message", remote_id: "one", name: "Snapshot fixture", body: "body sentinel", preview: { subject: "Snapshot fixture", snippet: "snippet sentinel" } };
+      api = async (url) => {
+        if (url.startsWith("/api/v1/items?") && url.includes("service=mail")) {
+          calls++;
+          if (held) await new Promise(resolve => { release = resolve; });
+          return { items: [item] };
+        }
+        return { items: [], runs: [] };
+      };
+      const wait = () => new Promise(resolve => setTimeout(resolve, 20));
+      try {
+        go("mail");
+        for (let i = 0; i < 100 && !MailSnapshot.entries.size; i++) await wait();
+        const stored = cachedMailSnapshot("fixture");
+        go("overview"); held = true; go("mail");
+        for (let i = 0; i < 100 && !release; i++) await wait();
+        const before = { rows: document.querySelectorAll("#mail-list .mail-item:not(.skel-row)").length,
+          label: document.querySelector("#mail-cache-provenance")?.textContent,
+          searchDisabled: document.querySelector("#mail-search")?.disabled, calls };
+        release();
+        for (let i = 0; i < 100 && document.querySelector("#mail-search")?.disabled; i++) await wait();
+        const after = { rows: document.querySelectorAll("#mail-list .mail-item:not(.skel-row)").length,
+          searchDisabled: document.querySelector("#mail-search")?.disabled };
+        go("overview"); release = null; held = true; go("mail");
+        for (let i = 0; i < 100 && !release; i++) await wait();
+        Mail.selected = { remote_id: "one" }; Mail.pendingSelect = "one";
+        document.querySelector("#mail-reader").textContent = "private sentinel";
+        document.querySelector("#mail-search").value = "query sentinel";
+        api = async () => ({ accounts: [{ id: "fixture", provider: "microsoft", auth: { reader: { state: "disconnected" } } }] });
+        await reloadAccounts();
+        release(); await wait();
+        const revoked = { rows: document.querySelectorAll("#mail-list .mail-item").length,
+          readerCleared: !document.querySelector("#mail-reader").textContent.includes("private sentinel"),
+          query: document.querySelector("#mail-search").value, selected: Mail.selected, pending: Mail.pendingSelect,
+          entries: MailSnapshot.entries.size };
+        rememberMailSnapshot("a", { items: [item] });
+        rememberMailSnapshot("b", { items: [item] });
+        rememberMailSnapshot("c", { items: [item] });
+        const bounded = !cachedMailSnapshot("a") && MailSnapshot.entries.size === 2;
+        rememberMailSnapshot("c", { items: [{ name: "x".repeat(1000001) }] });
+        const oversizeCleared = !cachedMailSnapshot("c");
+        rememberMailSnapshot("b", { items: [item] });
+        MailSnapshot.entries.get("b").expires = Date.now() - 1;
+        const expired = !cachedMailSnapshot("b");
+        const finishes = [];
+        api = () => new Promise(resolve => { finishes.push(resolve); });
+        const first = fetchMailSnapshot("fixture", "/one"), second = fetchMailSnapshot("fixture", "/two");
+        clearMailSnapshots();
+        const third = fetchMailSnapshot("fixture", "/three");
+        finishes[0]({ items: [] }); await first;
+        const staleSafe = MailSnapshot.inflight.get("fixture") === third && MailSnapshot.entries.size === 0;
+        finishes[1]({ items: [] }); await third;
+        return { before, after, revoked, bounded, oversizeCleared, expired,
+          deduplicated: first === second && first !== third, staleSafe,
+          noBody: stored && stored.items[0].body === undefined && stored.items[0].preview.snippet === undefined };
+      } finally { api = originalApi; clearMailSnapshots(); }
+    });
+    assert(report, "cached metadata renders before held refresh and search returns after it",
+      snapshot.before.rows === 1 && snapshot.before.calls === 2 && snapshot.before.searchDisabled
+      && snapshot.before.label === "Cached metadata · refreshing" && snapshot.after.rows === 1 && !snapshot.after.searchDisabled, snapshot);
+    assert(report, "reader loss clears visible and retained mail state",
+      snapshot.revoked.rows === 0 && snapshot.revoked.readerCleared && snapshot.revoked.query === ""
+      && snapshot.revoked.selected === null && snapshot.revoked.pending === null && snapshot.revoked.entries === 0, snapshot.revoked);
+    assert(report, "metadata snapshots are bounded, expire, omit bodies and deduplicate in-flight requests",
+      snapshot.bounded && snapshot.oversizeCleared && snapshot.expired && snapshot.deduplicated && snapshot.staleSafe && snapshot.noBody, snapshot);
     report.ok = true;
   } catch (error) {
     report.error = String(error && error.stack ? error.stack : error);

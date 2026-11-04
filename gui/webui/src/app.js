@@ -1861,6 +1861,50 @@ async function doServiceSearch(service) {
 // `folders` accumulates the folder items we skip so the displayed count reflects
 // real messages (folders sort before messages, so the message total is exact).
 const Mail = { all: [], filter: "all", sort: "newest", q: "", selected: null, nextCursor: null, expanded: false };
+// Short-lived, bounded metadata only. Self-hosted/shared mail is excluded because
+// its visibility depends on live ACL checks. Never persist this snapshot.
+const MailSnapshot = { entries: new Map(), inflight: new Map(), epoch: 0 };
+function clearMailSnapshots() {
+  MailSnapshot.epoch++;
+  MailSnapshot.entries.clear();
+  MailSnapshot.inflight.clear();
+  const active = (App.accounts || []).find(a => a.id === App.account);
+  if (active && active.provider !== "self_hosted") {
+    Mail.all = []; Mail.folders = []; Mail.cats = []; Mail.selected = null; Mail.pendingSelect = null;
+    Mail.q = ""; Mail.viewGeneration = (Mail.viewGeneration || 0) + 1; Mail._renderGen = (Mail._renderGen || 0) + 1;
+    const list = $("#mail-list"); if (list) clear(list);
+    const search = $("#mail-search"); if (search) { search.value = ""; search.disabled = true; }
+    const label = $("#mail-cache-provenance"); if (label) label.textContent = "Mail unavailable · reload to refresh";
+    for (const id of ["#mail-page-prev", "#mail-load-more"]) { const button = $(id); if (button) button.disabled = true; }
+    if ($("#mail-reader")) renderMailReader(null);
+  }
+}
+function rememberMailSnapshot(account, data) {
+  MailSnapshot.entries.delete(account);
+  if (!Array.isArray(data.items) || data.items.length > 1000) return;
+  const copy = { ...data, items: data.items.map(item => {
+    const { body, content, ...metadata } = item;
+    if (metadata.preview) { const { snippet, body: previewBody, ...preview } = metadata.preview; metadata.preview = preview; }
+    return metadata;
+  }) };
+  const json = JSON.stringify(copy);
+  if (json.length > 1000000) return;
+  MailSnapshot.entries.set(account, { json, expires: Date.now() + 30000 });
+  while (MailSnapshot.entries.size > 2) MailSnapshot.entries.delete(MailSnapshot.entries.keys().next().value);
+}
+function cachedMailSnapshot(account) {
+  const entry = MailSnapshot.entries.get(account);
+  if (!entry) return null;
+  if (entry.expires <= Date.now()) { MailSnapshot.entries.delete(account); return null; }
+  return JSON.parse(entry.json);
+}
+function fetchMailSnapshot(account, url) {
+  const existing = MailSnapshot.inflight.get(account);
+  if (existing) return existing;
+  const request = api(url).finally(() => { if (MailSnapshot.inflight.get(account) === request) MailSnapshot.inflight.delete(account); });
+  MailSnapshot.inflight.set(account, request);
+  return request;
+}
 // Real Outlook categories (#563): the master-category colour map (preset0..24)
 // is built on load from the backed-up `category` items (#562) — no keyword
 // heuristic. Each message carries its real `categories` list in the preview.
@@ -1944,6 +1988,21 @@ async function renderMailView(view) {
   renderMailReader(null);
   const list = $("#mail-list");
   for (let i = 0; i < 9; i++) list.append(el("div", { class: "mail-item skel-row" }, el("div", { class: "skel grow", style: "height:46px" })));
+  const snapshotEpoch = MailSnapshot.epoch;
+  const snapshotEligible = !providerMail && !scope && accountRoleStatus((App.accounts || []).find(a => a.id === account), "reader").state === "connected";
+  const snapshot = snapshotEligible ? cachedMailSnapshot(account) : null;
+  if (snapshot) {
+    Mail.all = snapshot.items.filter(it => it.item_type === "message");
+    Mail.cats = snapshot.items.filter(it => it.item_type === "category");
+    Mail.folders = snapshot.items.filter(it => it.item_type === "folder");
+    Mail.catColor = new Map(Mail.cats.map(c => [c.name, presetColor((c.preview || {}).color)]));
+    Mail.nextCursor = snapshot.next_cursor || null; Mail.pageCursor = ""; Mail.cursorStack = [];
+    App.counts.mail = Mail.all.length; updateNavCounts(); refreshMailSubnav(); fillSubnavCounts("mail", Mail.all);
+    updateMailLoadMore(); mailRenderMetrics(); mailRender();
+    const label = $("#mail-cache-provenance"); if (label) label.textContent = "Cached metadata · refreshing";
+    const search = $("#mail-search"); if (search) { search.disabled = true; search.placeholder = "Search available after refresh…"; }
+    for (const id of ["#mail-page-prev", "#mail-load-more"]) { const button = $(id); if (button) button.disabled = true; }
+  }
   const liveRequest = providerMail ? api("/api/v1/items?" + qs({account,service:"mail",live_metadata:"1",limit:50,...(scope ? {mail_scope:scope} : {})})).catch(() => null) : null;
   const initialPageRequest = Mail.pageRequest;
   const applyLive = page => {
@@ -1964,8 +2023,12 @@ async function renderMailView(view) {
   if (liveRequest) void liveRequest.then(applyLive);
   try {
     const activity = api("/api/v1/activity?" + qs({ account, limit: 30 })).catch(() => ({ runs: [] }));
-    const d = await api("/api/v1/items?" + qs({ account, service: "mail", limit: providerMail ? 50 : 1000, ...(scope ? {mail_scope:scope} : {}), ...(primaryCacheOnly ? {primary_cache_only:"1"} : {}), ...(!providerMail ? {metadata_only:"1"} : {}) }));
-    if (!current()) return;
+    const url = "/api/v1/items?" + qs({ account, service: "mail", limit: providerMail ? 50 : 1000, ...(scope ? {mail_scope:scope} : {}), ...(primaryCacheOnly ? {primary_cache_only:"1"} : {}), ...(!providerMail ? {metadata_only:"1"} : {}) });
+    const d = await (snapshotEligible ? fetchMailSnapshot(account, url) : api(url));
+    if (!current() || Mail.pageRequest !== initialPageRequest || MailSnapshot.epoch !== snapshotEpoch) return;
+    if (snapshotEligible && accountRoleStatus((App.accounts || []).find(a => a.id === account), "reader").state === "connected") rememberMailSnapshot(account, d);
+    const search = $("#mail-search"); if (search) { search.disabled = false; search.placeholder = providerMail ? "Filter this page…" : "Search this mailbox…"; }
+    for (const id of ["#mail-page-prev", "#mail-load-more"]) { const button = $(id); if (button) button.disabled = false; }
     const liveAlready = Mail.livePage;
     const scopeSelect = $("#mail-scope");
     if (scopeSelect && Array.isArray(d.scopes) && (d.scopes.length > 1 || d.scopes.some(scope => !scope.primary))) {
@@ -2016,6 +2079,7 @@ async function renderMailView(view) {
     }
   } catch (e) {
     if (!current()) return;
+    if (!providerMail && !scope) { clearMailSnapshots(); Mail.all = []; Mail.folders = []; Mail.cats = []; }
     if (liveRequest && applyLive(await liveRequest)) return;
     if (current()) clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Could not load mail" }), el("p", { text: e.message })));
   }
@@ -9740,7 +9804,18 @@ function accountRoleStateLabel(status) {
 async function reloadAccounts() {
   const current = App.account;
   const data = await api("/api/v1/accounts");
-  App.accounts = data.accounts || [];
+  const nextAccounts = data.accounts || [];
+  const previously = (App.accounts || []).find(account => account.id === current);
+  const next = nextAccounts.find(account => account.id === current);
+  const lostReader = previously && previously.provider !== "self_hosted" &&
+    accountRoleStatus(previously, "reader").state === "connected" &&
+    (!next || accountRoleStatus(next, "reader").state !== "connected");
+  const cachedReaderLost = [...MailSnapshot.entries.keys(), ...MailSnapshot.inflight.keys()].some(id => {
+    const account = nextAccounts.find(item => item.id === id);
+    return !account || account.provider === "self_hosted" || accountRoleStatus(account, "reader").state !== "connected";
+  });
+  if (lostReader || cachedReaderLost) clearMailSnapshots();
+  App.accounts = nextAccounts;
   App.account = App.accounts.some((account) => account.id === current)
     ? current : (App.accounts[0] && App.accounts[0].id) || null;
 }
@@ -9949,6 +10024,7 @@ function openProviderAccountSetup() {
   openSheet("Add self-hosted account", form);
 }
 async function providerAccountAction(a, body, connected) {
+  clearMailSnapshots();
   if (!BRIDGE) {
     if (connected) return accountSignOut(a, "reader", body);
     return startAccountLogin(a, "reader", body);
@@ -9983,6 +10059,7 @@ if (typeof window !== "undefined") window.addEventListener("isy-provider-auth", 
   else if (event.detail === "failed") toast("Provider sign-in failed.", "err");
 });
 async function accountSignOut(a, role, body) {
+  clearMailSnapshots();
   try {
     const d = await postJson("/api/v1/account/signout", CAP.account, { request_id: crypto.randomUUID(), account: a.id, role });
     await reloadAccounts();
@@ -9997,6 +10074,7 @@ async function accountSignOut(a, role, body) {
   renderAccountMenu(body);
 }
 async function startAccountLogin(a, role, body) {
+  clearMailSnapshots();
   const ownProvider = a.provider === "self_hosted";
   const roleMeta = ownProvider ? { label: "Self-hosted account" } : ACCOUNT_ROLE_META[role];
   if (!roleMeta) return;
