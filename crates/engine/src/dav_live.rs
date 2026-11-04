@@ -645,6 +645,7 @@ pub fn read_current(
 /// Read a personal DAV resource with the caller's already locked account token.
 /// The caller opens its store before acquiring the authorization lock; this
 /// read does not reopen it or acquire the lock recursively.
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub(crate) fn read_current_with_token(
     cfg: &Config,
     account: &str,
@@ -740,7 +741,7 @@ fn decode_embedded_contact_photo(uri: &str) -> Result<(String, Vec<u8>), String>
     } else {
         return Err("Unsupported contact photo URI".into());
     };
-    if encoded.len() > ((2 * 1024 * 1024 + 2) / 3) * 4 {
+    if encoded.len() > (2usize * 1024 * 1024).div_ceil(3) * 4 {
         return Err("Contact photo exceeds limit".into());
     }
     let bytes = STANDARD
@@ -853,6 +854,7 @@ fn reminder_resource_coverage(raw: &[u8]) -> ReminderResourceCoverage {
 /// calendar. Synchronization, access and consistency errors abort the pass;
 /// unsupported individual resources are counted without exposing content.
 /// This does not establish coverage outside the occurrence window.
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn plan_account_reminders_with_store(
     cfg: &Config,
     account: &str,
@@ -1107,6 +1109,7 @@ pub enum ReminderClaim {
 
 /// Re-read one event, enforce current read permission, and generate a bounded
 /// plan only when the expanded data and original carry the same native ETag.
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn plan_event_reminders(
     cfg: &Config,
     account: &str,
@@ -1207,6 +1210,7 @@ pub fn plan_event_reminders(
 
 /// Re-plan immediately before dispatch, then persist one due alarm claim. The
 /// caller must use the returned tag as an idempotent native notification ID.
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn claim_event_reminder(
     cfg: &Config,
     account: &str,
@@ -1804,6 +1808,7 @@ pub struct PreparedInvitationCreate {
 }
 
 /// Construct one invitation only for an address owned by this principal.
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn prepare_invitation_create(
     cfg: &Config,
     account: &str,
@@ -2273,6 +2278,7 @@ pub fn prepare_text_edit(
 
 /// Prepare one event's UTC or all-day time change against its cached ETag.
 /// Callers must display the series and scheduling implications before approval.
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn prepare_event_time(
     cfg: &Config,
     account: &str,
@@ -2324,6 +2330,7 @@ pub fn prepare_event_time(
 
 /// Prepare a zone-aware edit; callers must bind the zone and both civil times
 /// into any explicit scheduling/series approval.
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn prepare_event_time_zoned(
     cfg: &Config,
     account: &str,
@@ -2375,6 +2382,7 @@ pub fn prepare_event_time_zoned(
 
 /// Create one UTC override from an occurrence confirmed by the server's
 /// expansion of the same cached resource version.
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn prepare_event_exception(
     cfg: &Config,
     account: &str,
@@ -2463,6 +2471,7 @@ pub struct PreparedExceptionPreview {
     pub edit: PreparedEdit,
 }
 
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn prepare_exception_preview(
     cfg: &Config,
     account: &str,
@@ -2573,6 +2582,7 @@ pub struct PreparedZonedTimePreview {
     pub edit: PreparedEdit,
 }
 
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn prepare_zoned_time_preview(
     cfg: &Config,
     account: &str,
@@ -2633,6 +2643,7 @@ pub fn prepare_zoned_time_preview(
 }
 
 /// Human confirmation preview for a single event without scheduling recipients.
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn prepare_event_time_preview(
     cfg: &Config,
     account: &str,
@@ -2694,6 +2705,7 @@ pub struct PreparedTextPreview {
 
 /// Preview is restricted to unscheduled single occurrences; dispatch must
 /// separately recheck live privileges and condition the PUT on expected_etag.
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn prepare_text_preview(
     cfg: &Config,
     account: &str,
@@ -2853,6 +2865,7 @@ pub struct PreparedTaskOccurrenceCompletion {
     pub edit: PreparedEdit,
 }
 
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn prepare_task_occurrence_completion_preview(
     cfg: &Config,
     account: &str,
@@ -3014,6 +3027,7 @@ pub fn prepare_task_completion_preview(
 }
 
 /// Prepare priority and/or all-day or UTC due-date changes for one task.
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn prepare_task_attributes(
     cfg: &Config,
     account: &str,
@@ -3088,6 +3102,7 @@ pub fn prepare_task_attributes_preview(
     )
 }
 
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn prepare_task_attributes_with_start_preview(
     cfg: &Config,
     account: &str,
@@ -3388,6 +3403,7 @@ pub fn prepare_task_parent_preview(
 
 /// Prepare an explicit attendee response; server scheduling effects require
 /// separate effect-bound confirmation and real provider verification.
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn prepare_attendee_response(
     cfg: &Config,
     account: &str,
@@ -3446,6 +3462,7 @@ pub struct PreparedInvitationResponse {
 
 /// Bind the preview to an address currently advertised by the authenticated
 /// principal. Dispatch must repeat this check immediately before the write.
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn prepare_invitation_response(
     cfg: &Config,
     account: &str,
@@ -3577,6 +3594,7 @@ pub struct PreparedCancellation {
     pub edit: PreparedEdit,
 }
 
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn prepare_cancellation_preview(
     cfg: &Config,
     account: &str,
@@ -3719,6 +3737,7 @@ pub struct PreparedAlarm {
     pub edit: PreparedEdit,
 }
 
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn prepare_alarm_preview(
     cfg: &Config,
     account: &str,
@@ -3846,6 +3865,7 @@ pub enum RecoveryImportOutcome {
 /// personal Recovered collection. Callers must persist the approved operation
 /// ID and UID mapping before invoking this seam. A previously claimed operation
 /// is reconciled by readback only, never re-sent after an unknown outcome.
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn import_recovered_with_store(
     cfg: &Config,
     account: &str,
@@ -3887,6 +3907,7 @@ pub fn import_recovered_with_store(
 
 /// Engine-only variant for a caller already holding the account authorization
 /// lock. The token must come from that lock and never cross a platform/UI API.
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub(crate) fn import_recovered_with_token(
     cfg: &Config,
     account: &str,
@@ -3992,13 +4013,16 @@ pub(crate) fn import_recovered_with_token(
     {
         return Err("Recovered collection is not writable".into());
     }
+    client
+        .require_private_parent_atomic(&scope)
+        .map_err(|_| "Atomic private recovery is unavailable".to_string())?;
     if !store
         .claim_provider_mutation(&scope, operation_id, "dav_recovery", &intent, &digest)
         .map_err(|e| e.to_string())?
     {
         return Ok(RecoveryImportOutcome::Unknown);
     }
-    let result = client.put(&scope, &href, projected.clone(), None);
+    let result = client.put_private_recovery(&scope, &href, projected.clone());
     finish_recovery_dispatch(store, &scope, operation_id, result, || {
         reconcile_recovery(store, &client, &scope, operation_id, &href, &projected)
     })

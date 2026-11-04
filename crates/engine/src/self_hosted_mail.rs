@@ -186,9 +186,8 @@ pub fn client(cfg: &Config, account: &str) -> Result<SelfHostedClient, String> {
         Some(ProviderConfig::SelfHosted { origin, .. }) => origin,
         None => return Err("Not a self-hosted account".into()),
     };
-    let token = crate::provider_auth::self_hosted_access_token(cfg, account).map_err(|e| {
+    let token = crate::provider_auth::self_hosted_access_token(cfg, account).inspect_err(|_| {
         observe_unknown(account, origin);
-        e
     })?;
     let discovery = JmapClient::discover(origin, token);
     observe_discovery(account, origin, &discovery);
@@ -256,9 +255,8 @@ pub fn client_with_store(
     };
     let token =
         crate::provider_auth::self_hosted_access_token_with_store(cfg, account, credentials)
-            .map_err(|e| {
+            .inspect_err(|_| {
                 observe_unknown(account, origin);
-                e
             })?;
     let discovery = JmapClient::discover(origin, token);
     observe_discovery(account, origin, &discovery);
@@ -799,6 +797,7 @@ fn upload_draft_attachment(
 
 /// Persist the exact upload intent before dispatch. A lost response is never
 /// replayed automatically because JMAP blob upload has no client operation ID.
+#[allow(clippy::too_many_arguments)] // Preserve the existing account-bound upload API.
 pub fn upload_draft_attachment_once(
     cfg: &Config,
     account: &str,

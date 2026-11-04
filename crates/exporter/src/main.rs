@@ -137,9 +137,9 @@ fn run(config: Config, stage: &Cell<&'static str>) -> Result<()> {
     stage.set("jmap-discovery");
     let jmap =
         LoopbackJmapReader::discover(&config.origin, token.clone(), &config.trusted_public_origin)
-            .map_err(|error| {
+            .inspect_err(|error| {
                 use isyncyou_connectors::jmap::JmapError;
-                stage.set(match &error {
+                stage.set(match error {
                     JmapError::InvalidUrl => "jmap-invalid-url",
                     JmapError::InvalidResponse => "jmap-invalid-response",
                     JmapError::Unsupported => "jmap-unsupported",
@@ -147,7 +147,6 @@ fn run(config: Config, stage: &Cell<&'static str>) -> Result<()> {
                     JmapError::Transport => "jmap-transport",
                     _ => "jmap-other",
                 });
-                error
             })?;
     let account = jmap.account_id().to_owned();
     let mail_scope = ProviderScope {

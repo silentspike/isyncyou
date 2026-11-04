@@ -2408,6 +2408,69 @@ impl DavClient {
         self.put_with_collection_precondition(scope, href, raw, etag, None)
     }
 
+    /// Require the server's atomic private-parent create contract for this collection.
+    pub fn require_private_parent_atomic(&self, scope: &ProviderScope) -> Result<(), DavError> {
+        let target = self.collection(scope)?;
+        let response = self
+            .http
+            .request(reqwest::Method::OPTIONS, target)
+            .bearer_auth(&self.token)
+            .header("Cache-Control", "no-cache")
+            .budgeted_send(&self.origin)
+            .map_err(|_| DavError::Transport("DAV capability unavailable".into()))?;
+        if !response.status().is_success() {
+            return Err(DavError::Http(response.status().as_u16()));
+        }
+        let supported = response.headers().get_all("DAV").iter().any(|value| {
+            value.to_str().ok().is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|part| part.trim() == "<urn:stalwart:private-parent-atomic-v1>")
+            })
+        });
+        if !supported {
+            return Err(DavError::InvalidResponse);
+        }
+        Ok(())
+    }
+
+    /// Create a recovered resource only under the server's atomic privacy guard.
+    pub fn put_private_recovery(
+        &self,
+        scope: &ProviderScope,
+        href: &str,
+        raw: Vec<u8>,
+    ) -> Result<Option<String>, DavError> {
+        let url = self.resource(&self.collection(scope)?, href)?;
+        let media = match scope.service.as_str() {
+            "calendar" => "text/calendar; charset=utf-8",
+            "contacts" => "text/vcard; charset=utf-8",
+            _ => return Err(DavError::InvalidUrl),
+        };
+        // Do not add If-None-Match: older servers evaluate it independently of If.
+        let response = self
+            .http
+            .put(url)
+            .bearer_auth(&self.token)
+            .header(CONTENT_TYPE, media)
+            .header("If", "(<urn:stalwart:private-parent-atomic-v1>)")
+            .header("Cache-Control", "no-cache")
+            .body(raw)
+            .budgeted_send(&self.origin)
+            .map_err(|_| DavError::Transport("DAV write outcome unknown".into()))?;
+        if matches!(response.status().as_u16(), 409 | 412) {
+            return Err(DavError::Conflict);
+        }
+        if !response.status().is_success() {
+            return Err(DavError::Http(response.status().as_u16()));
+        }
+        Ok(response
+            .headers()
+            .get(ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned))
+    }
+
     /// Execute an operation while the server holds an exclusive depth-infinity
     /// lock on the collection. Lock lifetime is bounded if the client crashes.
     pub fn with_locked_collection<T>(
@@ -2607,6 +2670,83 @@ impl DavClient {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn private_recovery_requires_capability_and_sends_only_atomic_guard() {
+        use isyncyou_store::ProviderScope;
+        use std::io::{Read, Write};
+        for supported in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let origin = format!("http://{}/", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let count = if supported { 2 } else { 1 };
+                for index in 0..count {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0; 4096];
+                    loop {
+                        let n = socket.read(&mut buffer).unwrap();
+                        assert_ne!(n, 0);
+                        bytes.extend_from_slice(&buffer[..n]);
+                        if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                            let header = String::from_utf8_lossy(&bytes[..end]);
+                            let len = header
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .and_then(|v| v.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            if bytes.len() >= end + 4 + len {
+                                break;
+                            }
+                        }
+                    }
+                    let header = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+                    if index == 0 {
+                        assert!(header.starts_with("options /book/ "));
+                        let dav = if supported {
+                            "DAV: 1, <urn:stalwart:private-parent-atomic-v1>\r\n"
+                        } else {
+                            "DAV: 1\r\n"
+                        };
+                        write!(socket, "HTTP/1.1 200 OK\r\n{dav}Content-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    } else {
+                        assert!(header.starts_with("put /book/recovered.vcf "));
+                        assert!(header
+                            .contains("\r\nif: (<urn:stalwart:private-parent-atomic-v1>)\r\n"));
+                        assert!(!header.contains("\r\nif-none-match:"));
+                        write!(socket, "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    }
+                }
+            });
+            let client = super::DavClient {
+                http: reqwest::blocking::Client::builder()
+                    .no_proxy()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .unwrap(),
+                origin: url::Url::parse(&origin).unwrap(),
+                token: "fixture".into(),
+                trusted_public_origin: None,
+            };
+            let scope = ProviderScope {
+                account_id: "fixture".into(),
+                origin: origin.clone(),
+                service: "contacts".into(),
+                collection: format!("{origin}book/"),
+            };
+            let capability = client.require_private_parent_atomic(&scope);
+            assert_eq!(capability.is_ok(), supported);
+            if capability.is_ok() {
+                assert!(matches!(
+                    client.put_private_recovery(&scope, "recovered.vcf", b"fixture".to_vec()),
+                    Err(super::DavError::Conflict)
+                ));
+            }
+            server.join().unwrap();
+        }
+    }
     #[cfg(feature = "encrypted-store")]
     #[test]
     fn detached_staging_streams_large_collection_and_reuses_unchanged_bodies() {

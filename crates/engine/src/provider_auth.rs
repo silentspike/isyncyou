@@ -869,10 +869,10 @@ fn access_token_locked(
     client_id: &str,
     store: &dyn ProviderCredentialStore,
 ) -> Result<String, String> {
-    if store.load(&revocation_pending_key(id), &origin)?.is_some() {
+    if store.load(&revocation_pending_key(id), origin)?.is_some() {
         return Err("Provider revocation pending; sign in again after recovery".into());
     }
-    let mut cached = store.load(id, &origin)?.ok_or("Provider login required")?;
+    let mut cached = store.load(id, origin)?.ok_or("Provider login required")?;
     if cached.subject.as_deref().is_none_or(str::is_empty) {
         return Err("Provider account identity must be verified by signing in again".into());
     }
@@ -881,7 +881,7 @@ fn access_token_locked(
         Sha256::digest(id.as_bytes())
     );
     let binding = store
-        .load(&binding_id, &origin)?
+        .load(&binding_id, origin)?
         .ok_or("Provider account identity binding missing")?;
     if binding.subject != cached.subject {
         return Err("Provider account identity binding mismatch".into());
@@ -893,12 +893,12 @@ fn access_token_locked(
         .refresh_token
         .as_deref()
         .ok_or("Provider login required")?;
-    let (_, endpoint, _) = metadata(&origin)?;
+    let (_, endpoint, _) = metadata(origin)?;
     let response = client()?
         .post(endpoint)
         .form(&[
             ("grant_type", "refresh_token"),
-            ("client_id", &client_id),
+            ("client_id", client_id),
             ("refresh_token", refresh),
         ])
         .budgeted_send_auto()
@@ -916,7 +916,7 @@ fn access_token_locked(
         expires_at: cache.expires_at,
         subject: cached.subject,
     };
-    store.replace(id, &origin, &cached)?;
+    store.replace(id, origin, &cached)?;
     Ok(cached.access_token)
 }
 
@@ -1212,7 +1212,7 @@ fn verified_subject_locked(
     if store.load(&revocation_pending_key(id), origin)?.is_some() {
         return Ok(None);
     }
-    let Some(credential) = store.load(id, &origin)? else {
+    let Some(credential) = store.load(id, origin)? else {
         return Ok(None);
     };
     if credential
@@ -1232,7 +1232,7 @@ fn verified_subject_locked(
         "isyncyou-internal:subject:{:x}",
         Sha256::digest(id.as_bytes())
     );
-    let binding = store.load(&binding_id, &origin)?;
+    let binding = store.load(&binding_id, origin)?;
     Ok(
         if binding.and_then(|value| value.subject).as_deref() == Some(subject.as_str()) {
             Some(subject)

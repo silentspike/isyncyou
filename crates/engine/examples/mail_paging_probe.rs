@@ -16,7 +16,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if args.len() != 4 {
         return Err("expected config path, account ID and synthetic state".into());
     }
-    let cfg = Config::load(&PathBuf::from(&args[1]))?;
+    let cfg = Config::load(PathBuf::from(&args[1]))?;
     cfg.validate().map_err(|_| "invalid configuration")?;
     let store = Store::open_in_memory()?;
     let client = self_hosted_mail::client(&cfg, &args[2])?;

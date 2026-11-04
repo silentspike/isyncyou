@@ -13,10 +13,13 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+type StoreIdentity = (u64, u64, u32, u32, u32, i64, i64, [u8; 32]);
+type CachedStore = Mutex<Option<(StoreIdentity, isyncyou_store::Store)>>;
+
 #[derive(Clone)]
 pub(crate) enum ProductSessionTransport {
     OneDrive(OneDriveSessionV2Transport),
-    Local(LocalSessionTransport),
+    Local(Box<LocalSessionTransport>),
 }
 
 #[derive(Clone)]
@@ -25,22 +28,8 @@ pub(crate) struct LocalSessionTransport {
     scope: ProviderScope,
     session_id: String,
     crypto: Arc<Mutex<Option<SessionObjectCrypto>>>,
-    reader: Arc<
-        Mutex<
-            Option<(
-                (u64, u64, u32, u32, u32, i64, i64, [u8; 32]),
-                isyncyou_store::Store,
-            )>,
-        >,
-    >,
-    projection_writer: Arc<
-        Mutex<
-            Option<(
-                (u64, u64, u32, u32, u32, i64, i64, [u8; 32]),
-                isyncyou_store::Store,
-            )>,
-        >,
-    >,
+    reader: Arc<CachedStore>,
+    projection_writer: Arc<CachedStore>,
     projection_gate: Arc<Mutex<()>>,
     _exclusive_session_lock: Arc<isyncyou_agent::FileLock>,
     #[cfg(all(test, feature = "encrypted-store"))]
@@ -78,7 +67,7 @@ impl ProductSessionTransport {
                 let lock = isyncyou_agent::FileLock::try_acquire_exclusive(&lock_path)
                     .map_err(|_| SessionV2Error::TransportUnavailable)?
                     .ok_or(SessionV2Error::LeaseLost)?;
-                return Ok(Self::Local(LocalSessionTransport {
+                return Ok(Self::Local(Box::new(LocalSessionTransport {
                     cfg: cfg.clone(),
                     scope: ProviderScope {
                         account_id: account.into(),
@@ -98,7 +87,7 @@ impl ProductSessionTransport {
                     test_read_opens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                     #[cfg(all(test, feature = "encrypted-store"))]
                     test_write_opens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                }));
+                })));
             }
         }
         Ok(Self::OneDrive(OneDriveSessionV2Transport::new(
@@ -182,18 +171,8 @@ impl LocalSessionTransport {
             .lock()
             .map_err(|_| "session_store_unavailable")? = Some((opened, store));
         struct Cleanup<'a> {
-            writer: &'a Mutex<
-                Option<(
-                    (u64, u64, u32, u32, u32, i64, i64, [u8; 32]),
-                    isyncyou_store::Store,
-                )>,
-            >,
-            reader: &'a Mutex<
-                Option<(
-                    (u64, u64, u32, u32, u32, i64, i64, [u8; 32]),
-                    isyncyou_store::Store,
-                )>,
-            >,
+            writer: &'a CachedStore,
+            reader: &'a CachedStore,
         }
         impl Drop for Cleanup<'_> {
             fn drop(&mut self) {
@@ -256,9 +235,7 @@ impl LocalSessionTransport {
         isyncyou_engine::provider_store::open_readonly(&self.cfg, &self.scope.account_id)
             .map_err(|_| SessionV2Error::TransportUnavailable)
     }
-    fn reader_identity(
-        &self,
-    ) -> Result<(u64, u64, u32, u32, u32, i64, i64, [u8; 32]), SessionV2Error> {
+    fn reader_identity(&self) -> Result<StoreIdentity, SessionV2Error> {
         #[cfg(all(test, feature = "encrypted-store", unix))]
         if let Some((path, _)) = &self.test_store {
             use std::os::unix::fs::MetadataExt;

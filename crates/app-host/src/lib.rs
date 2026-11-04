@@ -5357,7 +5357,7 @@ impl DaemonAgent {
                 }),
                 None => run(&self.cfg),
             };
-            return match result {
+            match result {
                 Ok(isyncyou_engine::dav_write::WriteOutcome::Confirmed(_)) => {
                     ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new(
                         "Contact photo updated; local synchronization may be pending",
@@ -5370,7 +5370,7 @@ impl DaemonAgent {
                     ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderActionRejected)
                 }
                 _ => ConfirmedExecutionOutcome::OutcomeUnknown,
-            };
+            }
         }
         #[cfg(not(any(
             feature = "agent-oauth-providers",
@@ -5628,7 +5628,7 @@ impl DaemonAgent {
                 }),
                 None => run(&self.cfg),
             };
-            return match outcome {
+            match outcome {
                 Ok(isyncyou_engine::self_hosted_mail_restore::SingleCaptureOutcome::Created(_)) => {
                     ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new(
                         "Capture requested; off-node protection is not yet confirmed",
@@ -5639,7 +5639,7 @@ impl DaemonAgent {
                     None => ConfirmedExecutionOutcome::OutcomeUnknown,
                 },
                 _ => ConfirmedExecutionOutcome::OutcomeUnknown,
-            };
+            }
         }
         #[cfg(not(any(
             feature = "agent-oauth-providers",
@@ -5754,12 +5754,12 @@ impl DaemonAgent {
                 }),
                 None => run(&self.cfg),
             };
-            return match result {
+            match result {
                 Ok(true) => ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new(
                     "Recovery retrieval requested; import requires a separate confirmation",
                 )),
                 _ => ConfirmedExecutionOutcome::OutcomeUnknown,
-            };
+            }
         }
         #[cfg(not(any(
             feature = "agent-oauth-providers",
@@ -5897,7 +5897,7 @@ impl DaemonAgent {
                 }),
                 None => run(&self.cfg),
             };
-            return match result {
+            match result {
                 Ok(isyncyou_engine::self_hosted_mail_restore::CalendarBatchOutcome::Confirmed(
                     _,
                 )) => ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new(
@@ -5914,7 +5914,7 @@ impl DaemonAgent {
                     ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderActionRejected)
                 }
                 _ => ConfirmedExecutionOutcome::OutcomeUnknown,
-            };
+            }
         }
         #[cfg(not(any(
             feature = "agent-oauth-providers",
@@ -13664,7 +13664,7 @@ fn prepare_recovery_import_action(
                 account: request.account.clone(),
                 service: "calendar".into(),
                 target: None,
-                change: serde_json::json!({"verb":"recovery_batch_import","batch_id":request.batch_id,"manifest_sha256":manifest_sha,"approval_sha256":manifest.approval_sha256,"effect_sha256":agent_control_store::recovery_batch_effect_sha256(&manifest)}),
+                change: serde_json::json!({"verb":"recovery_batch_import","batch_id":request.batch_id,"manifest_sha256":manifest_sha,"approval_sha256":manifest.approval_sha256,"effect_sha256":agent_control_store::recovery_batch_effect_sha256(manifest)}),
             };
             return Ok((action, manifest_sha.clone()));
         }
@@ -19957,10 +19957,10 @@ impl isyncyou_webui::MailWriteHandler for DaemonMailWrite {
                 }
                 let value: serde_json::Value =
                     serde_json::from_slice(&object.raw).map_err(|_| "provider_mailbox_invalid")?;
-                if value["role"].as_str() == Some("drafts") {
-                    if draft.replace(object.remote_id).is_some() {
-                        return Err("provider_drafts_ambiguous".into());
-                    }
+                if value["role"].as_str() == Some("drafts")
+                    && draft.replace(object.remote_id).is_some()
+                {
+                    return Err("provider_drafts_ambiguous".into());
                 }
             }
         }

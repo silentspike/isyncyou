@@ -3238,7 +3238,7 @@ mod tests {
         };
         let object = ProviderObject { remote_id:"one".into(), etag:None, raw:b"BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Alice Example\r\nitem1.EMAIL:uniquebox@example.test\r\nPHOTO:data:secretphoto\r\nEND:VCARD\r\n".to_vec() };
         store
-            .reconcile_provider_snapshot(&scope, &[object.clone()], "one")
+            .reconcile_provider_snapshot(&scope, std::slice::from_ref(&object), "one")
             .unwrap();
         let (found, complete) = store.search_provider_dav(&scope, "Alice", 10).unwrap();
         assert!(complete);

@@ -329,7 +329,7 @@ fn dispatch<T: WriteTransport>(
             || tag.len() < 2
             || tag[1..tag.len() - 1]
                 .bytes()
-                .any(|b| b < 0x21 || b > 0x7e || b == b'"')
+                .any(|b| !(0x21..=0x7e).contains(&b) || b == b'"')
         {
             return Err("A strong resource ETag is required".into());
         }
@@ -432,6 +432,7 @@ pub fn execute_with_store(
 
 /// Revalidate the authenticated attendee and exact preview before dispatching
 /// an invitation response. Never use the generic raw PUT for this flow.
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn execute_invitation_response(
     cfg: &Config,
     entry: &str,
@@ -788,6 +789,7 @@ pub fn execute_task_attributes(
     execute_task_attributes_with_start(cfg, entry, op, uid, priority, due, None, credentials)
 }
 
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn execute_task_attributes_with_start(
     cfg: &Config,
     entry: &str,
@@ -821,6 +823,7 @@ pub fn execute_task_attributes_with_start(
     execute_inner(cfg, entry, op, credentials)
 }
 
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn execute_task_attributes_with_start_classified(
     cfg: &Config,
     entry: &str,
@@ -878,6 +881,7 @@ pub fn execute_task_attributes_with_start_classified(
     execute_inner_classified(cfg, entry, op, credentials)
 }
 
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn execute_alarm(
     cfg: &Config,
     entry: &str,
@@ -913,6 +917,7 @@ pub fn execute_alarm(
     execute_inner(cfg, entry, op, credentials)
 }
 
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn execute_task_occurrence_completion(
     cfg: &Config,
     entry: &str,
@@ -950,6 +955,7 @@ pub fn execute_task_occurrence_completion(
     execute_inner(cfg, entry, op, credentials)
 }
 
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn execute_zoned_time(
     cfg: &Config,
     entry: &str,
@@ -1016,6 +1022,7 @@ pub fn execute_cancellation(
     execute_inner(cfg, entry, op, credentials)
 }
 
+#[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn execute_exception(
     cfg: &Config,
     entry: &str,

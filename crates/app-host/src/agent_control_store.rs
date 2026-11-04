@@ -1918,6 +1918,8 @@ impl AgentControlStore {
         Ok(ids)
     }
 
+    // The scoped recovery protocol binds each field independently.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn store_recovery_request(
         &self,
         batch_id: &str,
@@ -2052,6 +2054,8 @@ impl AgentControlStore {
         Ok((value, digest))
     }
 
+    // The scoped recovery protocol binds each field independently.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn bind_recovery_request(
         &self,
         batch_id: &str,
@@ -2138,6 +2142,8 @@ impl AgentControlStore {
         tx.commit().map_err(|_| "control_store_unavailable".into())
     }
 
+    // The scoped recovery protocol binds each field independently.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn claim_recovery_request(
         &self,
         batch_id: &str,
@@ -2531,6 +2537,8 @@ impl AgentControlStore {
 
     /// Internal-only broker staging. No web mutation purpose can create these rows.
     /// The manifest contains references and effects, never original bytes.
+    // The scoped recovery protocol binds each field independently.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn reserve_recovery_batch(
         &self,
         batch_id: &str,
@@ -2657,6 +2665,8 @@ impl AgentControlStore {
         Ok(digest)
     }
 
+    // The scoped recovery protocol binds each field independently.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn put_recovery_batch_chunk(
         &self,
         batch_id: &str,
@@ -2777,8 +2787,7 @@ impl AgentControlStore {
             let mut bytes = Vec::with_capacity(
                 usize::try_from(item.size).map_err(|_| "recovery_batch_invalid")?,
             );
-            let expected_chunks =
-                (item.size + (RECOVERY_CHUNK_BYTES as u64) - 1) / (RECOVERY_CHUNK_BYTES as u64);
+            let expected_chunks = item.size.div_ceil(RECOVERY_CHUNK_BYTES as u64);
             for chunk_index in 0..expected_chunks {
                 let (length,digest):(i64,String)=tx.query_row("SELECT chunk_bytes,chunk_sha256 FROM recovery_batch_chunks WHERE batch_id=?1 AND object_index=?2 AND chunk_index=?3",params![batch_id,object_index as i64,chunk_index as i64],|r| Ok((r.get(0)?,r.get(1)?))).map_err(|_| "recovery_batch_unavailable")?;
                 let path = batch_dir.join(format!("{object_index}-{chunk_index}.chunk"));
@@ -3014,6 +3023,8 @@ impl AgentControlStore {
         tx.commit().map_err(|_| "control_store_unavailable".into())
     }
 
+    // The scoped recovery protocol binds each field independently.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn bind_recovery_batch_confirmation(
         &self,
         batch_id: &str,
@@ -3106,6 +3117,8 @@ impl AgentControlStore {
     /// A first claim requires the consumed approval. Reconciliation may read a
     /// claimed batch under the same installation/subject; it must use engine
     /// journal readback and never resend an unknown native write.
+    // The scoped recovery protocol binds each field independently.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn load_recovery_batch(
         &self,
         batch_id: &str,

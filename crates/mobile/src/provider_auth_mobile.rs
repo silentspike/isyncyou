@@ -36,51 +36,6 @@ fn same_credential(a: &Option<ProviderCredential>, b: &Option<ProviderCredential
     }
 }
 
-#[cfg(test)]
-mod recovery_tests {
-    use super::*;
-    fn credential() -> ProviderCredential {
-        ProviderCredential {
-            access_token: "a".into(),
-            refresh_token: Some("r".into()),
-            expires_at: 1,
-            subject: Some("s".into()),
-        }
-    }
-    #[test]
-    fn recovery_snapshot_rejects_changed_grant() {
-        assert!(same_credential(&None, &None));
-        assert!(same_credential(&Some(credential()), &Some(credential())));
-        let mut changed = credential();
-        changed.refresh_token = Some("other".into());
-        assert!(!same_credential(&Some(credential()), &Some(changed)));
-        assert!(!same_credential(&Some(credential()), &None));
-    }
-    #[test]
-    fn pending_cancel_is_account_and_stage_bound_and_durable() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = AndroidProviderCredentialStore::for_test(dir.path());
-        let pending = br#"{"stage":"pending","account":"one"}"#;
-        store.write_auth_journal(pending).unwrap();
-        assert!(cancel_pending_in_store(&store, "other").is_err());
-        assert_eq!(
-            store.read_auth_journal().unwrap().as_deref(),
-            Some(pending.as_slice())
-        );
-        store
-            .write_auth_journal(br#"{"stage":"exchange_started","account":"one"}"#)
-            .unwrap();
-        assert!(cancel_pending_in_store(&store, "one").is_err());
-        assert!(store.read_auth_journal().unwrap().is_some());
-        store.write_auth_journal(pending).unwrap();
-        cancel_pending_in_store(&store, "one").unwrap();
-        assert!(AndroidProviderCredentialStore::for_test(dir.path())
-            .read_auth_journal()
-            .unwrap()
-            .is_none());
-    }
-}
-
 fn prepare_unknown_recovery(base: &Path, account: &str) -> Result<bool, String> {
     let _guard = attempts().lock().map_err(|_| "Authorization unavailable")?;
     *unknown_recovery()
@@ -824,4 +779,49 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeProvider
         Err(reason) => serde_json::json!({"ok":false,"reason":reason}).to_string(),
     };
     jni_new_string(&mut env, response)
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    fn credential() -> ProviderCredential {
+        ProviderCredential {
+            access_token: "a".into(),
+            refresh_token: Some("r".into()),
+            expires_at: 1,
+            subject: Some("s".into()),
+        }
+    }
+    #[test]
+    fn recovery_snapshot_rejects_changed_grant() {
+        assert!(same_credential(&None, &None));
+        assert!(same_credential(&Some(credential()), &Some(credential())));
+        let mut changed = credential();
+        changed.refresh_token = Some("other".into());
+        assert!(!same_credential(&Some(credential()), &Some(changed)));
+        assert!(!same_credential(&Some(credential()), &None));
+    }
+    #[test]
+    fn pending_cancel_is_account_and_stage_bound_and_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AndroidProviderCredentialStore::for_test(dir.path());
+        let pending = br#"{"stage":"pending","account":"one"}"#;
+        store.write_auth_journal(pending).unwrap();
+        assert!(cancel_pending_in_store(&store, "other").is_err());
+        assert_eq!(
+            store.read_auth_journal().unwrap().as_deref(),
+            Some(pending.as_slice())
+        );
+        store
+            .write_auth_journal(br#"{"stage":"exchange_started","account":"one"}"#)
+            .unwrap();
+        assert!(cancel_pending_in_store(&store, "one").is_err());
+        assert!(store.read_auth_journal().unwrap().is_some());
+        store.write_auth_journal(pending).unwrap();
+        cancel_pending_in_store(&store, "one").unwrap();
+        assert!(AndroidProviderCredentialStore::for_test(dir.path())
+            .read_auth_journal()
+            .unwrap()
+            .is_none());
+    }
 }

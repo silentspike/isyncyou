@@ -135,11 +135,13 @@ pub fn open_readonly(cfg: &Config, account: &str) -> Result<Store, String> {
 }
 
 /// Identity used to invalidate an idle session reader on replacement, permissions or key changes.
+pub type ReadonlyCacheIdentity = (u64, u64, u32, u32, u32, i64, i64, [u8; 32]);
+
 #[cfg(all(feature = "encrypted-store", unix))]
 pub fn readonly_cache_identity(
     cfg: &Config,
     account: &str,
-) -> Result<(u64, u64, u32, u32, u32, i64, i64, [u8; 32]), String> {
+) -> Result<ReadonlyCacheIdentity, String> {
     use std::os::unix::fs::MetadataExt;
     let path = location(cfg, account)?;
     let metadata = std::fs::symlink_metadata(&path).map_err(|_| "Provider cache unavailable")?;
@@ -163,7 +165,7 @@ pub fn readonly_cache_identity(
 pub fn readonly_cache_identity(
     _cfg: &Config,
     _account: &str,
-) -> Result<(u64, u64, u32, u32, u32, i64, i64, [u8; 32]), String> {
+) -> Result<ReadonlyCacheIdentity, String> {
     Err("Encrypted provider storage is unavailable".into())
 }
 

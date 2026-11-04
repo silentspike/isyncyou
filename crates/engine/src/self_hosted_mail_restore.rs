@@ -177,7 +177,7 @@ pub fn prove_linux_recovery_device(
                             .join("/recovery/enrollment/challenge")
                             .map_err(|_| "Invalid recovery route")?,
                     )
-                    .bearer_auth(&token)
+                    .bearer_auth(token)
                     .json(&json!({"device":signer.installation,"public_key":signer.public_key}))
                     .budgeted_send_auto()
                 {
@@ -241,7 +241,7 @@ pub fn prove_linux_recovery_device(
                             .join("/recovery/enrollment/prove")
                             .map_err(|_| "Invalid recovery route")?,
                     )
-                    .bearer_auth(&token)
+                    .bearer_auth(token)
                     .json(&json!({"challenge_id":id,"signature":signer.sign(&bytes)?}))
                     .budgeted_send_auto()
                 {
@@ -1248,6 +1248,8 @@ fn current_single_capture(
     Ok((broker, object, version, kind.into(), titles[0].into()))
 }
 
+// This public seam binds the confirmed provider resource and credential store.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_single_capture_with_store(
     cfg: &Config,
     account: &str,
@@ -2520,10 +2522,9 @@ fn recovery_preview_multiline(value: &Value, max: usize) -> Result<String, Strin
     Ok(value.replace("\r\n", "\n").replace('\r', "\n"))
 }
 
-fn calendar_preview(
-    original: &[u8],
-    projected: &[u8],
-) -> Result<(Vec<CalendarRestorePreview>, bool, bool, bool, Vec<String>), String> {
+type CalendarPreview = (Vec<CalendarRestorePreview>, bool, bool, bool, Vec<String>);
+
+fn calendar_preview(original: &[u8], projected: &[u8]) -> Result<CalendarPreview, String> {
     fn text(value: &Value, max: usize) -> Result<String, String> {
         let value = value.as_str().ok_or("Invalid recovery preview")?;
         if value.len() > max || value.chars().any(char::is_control) {

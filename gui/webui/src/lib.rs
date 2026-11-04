@@ -4121,6 +4121,8 @@ pub trait MailWriteHandler: Send + Sync {
     fn provider_store(&self, _account: &str) -> Result<Store, String> {
         Err("provider_store_unavailable".into())
     }
+    // This boundary mirrors the provider draft request fields.
+    #[allow(clippy::too_many_arguments)]
     fn provider_create_draft(
         &self,
         _account: &str,
@@ -9115,12 +9117,9 @@ impl Router {
             .as_ref()
             .and_then(|h| h.current_config())
             .unwrap_or_else(|| self.config.clone());
-        match cfg.provider_accounts.get(account) {
-            Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) => {
-                Some(origin.clone())
-            }
-            None => None,
-        }
+        cfg.provider_accounts
+            .get(account)
+            .map(|isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }| origin.clone())
     }
 
     fn account_quarantine(&self, req: &ApiRequest, revoke: bool) -> ApiResponse {

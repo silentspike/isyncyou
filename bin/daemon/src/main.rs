@@ -726,20 +726,26 @@ struct ProviderWatchIdentity {
     archive_root: PathBuf,
 }
 
+struct ProviderDomain {
+    dirty: Arc<(Mutex<(bool, bool)>, Condvar)>,
+    mail: bool,
+}
+
 fn provider_watch_identities(cfg: &Config) -> Vec<ProviderWatchIdentity> {
     cfg.accounts
         .iter()
-        .filter_map(|account| match cfg.provider_accounts.get(&account.id) {
-            Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, client_id }) => {
-                Some(ProviderWatchIdentity {
-                    account: account.id.clone(),
-                    origin: origin.clone(),
-                    client_id: client_id.clone(),
-                    username: account.username.clone(),
-                    archive_root: account.archive_root.clone(),
-                })
-            }
-            None => None,
+        .filter_map(|account| {
+            cfg.provider_accounts.get(&account.id).map(
+                |isyncyou_core::config::ProviderConfig::SelfHosted { origin, client_id }| {
+                    ProviderWatchIdentity {
+                        account: account.id.clone(),
+                        origin: origin.clone(),
+                        client_id: client_id.clone(),
+                        username: account.username.clone(),
+                        archive_root: account.archive_root.clone(),
+                    }
+                },
+            )
         })
         .collect()
 }
@@ -837,8 +843,10 @@ fn provider_event_worker(
                 domain_events,
                 domain_stop,
                 domain_id,
-                domain_dirty,
-                mail,
+                ProviderDomain {
+                    dirty: domain_dirty,
+                    mail,
+                },
             )
         }));
     }
@@ -910,9 +918,9 @@ fn provider_domain_worker(
     events: Arc<isyncyou_webui::EventBus>,
     stop: Arc<AtomicBool>,
     identity: ProviderWatchIdentity,
-    dirty: Arc<(Mutex<(bool, bool)>, Condvar)>,
-    mail: bool,
+    domain: ProviderDomain,
 ) {
+    let ProviderDomain { dirty, mail } = domain;
     let mut last: Option<std::time::Instant> = None;
     let mut retry_secs = 5u64;
     while !stop.load(Ordering::Relaxed) {
