@@ -2544,6 +2544,8 @@ function renderMailReader(it, remoteImages = false) {
   }
   if (CAP.agent && selfHosted) {
     const account = App.account, flagged = p.flag === "flagged";
+    actions.append(el("button",{class:"btn sm",type:"button",onclick:event=>prepareSingleCapture(account,"mail","",it.remote_id,event.currentTarget)},"Back up message"));
+    actions.append(el("button",{class:"btn sm",type:"button",onclick:()=>openSingleCaptureStatus(account)},"Backup status"));
     actions.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderRelatedDraft(account, it, "reply") }, "Reply"));
     actions.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderRelatedDraft(account, it, "forward") }, "Forward"));
     actions.append(el("button", { class:"btn ghost sm", type:"button", onclick:event => prepareProviderMailAction(account, it.remote_id, { kind:"set_read", is_read:p.isRead === false }, event.currentTarget) }, p.isRead === false ? "Mark read" : "Mark unread"));
@@ -3547,12 +3549,45 @@ const startOfDay = (d) => { const x = new Date(d); x.setHours(0, 0, 0, 0); retur
 function startOfWeek(d) { const x = startOfDay(d); const dow = (x.getDay() + 6) % 7; x.setDate(x.getDate() - dow); return x; } // Monday
 const hhmm = (d) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
 
+function captureOperations(account) {
+  try { const value=JSON.parse(localStorage.getItem("capture-operations:"+account) || "[]"); return Array.isArray(value) ? value.filter(x => typeof x==="string").slice(0,256) : []; } catch (_) { return []; }
+}
+async function prepareSingleCapture(account,service,collection,href,button) {
+  if (App.account!==account) return;
+  button.disabled=true;
+  try {
+    const session_id=await ensureAgentSession();
+    if (App.account!==account) throw new Error("account changed");
+    const operations=captureOperations(account); if (operations.length>=256) throw new Error("capture status list full");
+    const pending=await postJson("/api/v1/agent/recovery/capture/prepare",CAP.agent,{request_id:crypto.randomUUID(),session_id,account,service,collection,href},PROVIDER_NATIVE_TIMEOUT_MS);
+    if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.operation_id) throw new Error("confirmation unavailable");
+    operations.push(pending.operation_id); localStorage.setItem("capture-operations:"+account,JSON.stringify(operations));
+    const record={...pending,status:"pending",success_result:"Capture requested. Off-node protection is not confirmed until its status says protected.",cancelled_result:"Capture was not requested."};
+    AssistantState.pendingCardsById.set(record.pending_id,record);
+    openSheet("Review fresh backup capture",renderAgentPendingCard(record));
+  } catch (_) {toast("Capture could not be prepared. Check the source and account.","err");}
+  finally {button.disabled=false;}
+}
+function openSingleCaptureStatus(account) {
+  const rows=el("div",{class:"pick-list"});
+  for (const operation_id of captureOperations(account)) {
+    const status=el("span",{class:"dim",text:"Not checked"});
+    rows.append(el("div",{class:"pick-row"},el("span",{class:"grow",text:operation_id}),status,el("button",{class:"btn sm",type:"button",onclick:async event=>{
+      event.currentTarget.disabled=true;
+      try {const session_id=await ensureAgentSession();if(App.account!==account) throw new Error("account changed");const result=await request("GET","/api/v1/agent/recovery/capture/status?"+qs({account,session_id,operation_id}),{capToken:CAP.agent,timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS});const labels={queued:"Queued",capturing:"Capturing",captured_locally:"Captured locally",awaiting_pbs:"Awaiting off-node backup",protected_off_node:"Protected off-node",failed:"Capture failed; the selected version was unavailable or changed",unknown:"Outcome unknown; do not repeat",expired:"Expired before capture"};status.textContent=labels[result.state] || "Status unavailable";}
+      catch (_) {status.textContent="Status unavailable; no retry was sent";}
+      finally {event.currentTarget.disabled=false;}
+    }},"Check")));
+  }
+  openSheet("Backup capture status",rows.childElementCount ? rows : el("p",{text:"No locally recorded capture requests."}));
+}
 function openProviderRecovery(account, collection, domain = "calendar") {
   if (App.account !== account) return;
   const list = el("div", { class:"list" });
   const status = el("p", { class:"dim", text:"Loading the recovery catalog…" });
   const choices = [];
   const recoveryServices = domain === "contacts" ? ["contacts"] : domain === "mail" ? ["mail"] : ["calendar", "todo"];
+  // Existing recovery sheet offers status for independently approved capture requests.
   const nextPages = Object.fromEntries(recoveryServices.map(service => [service, 0]));
   const more = el("button",{class:"btn sm",type:"button",text:"Load more",style:"display:none",onclick:()=>void load()});
   const saved = el("div", { class:"list" });
@@ -3827,6 +3862,7 @@ function openProviderCreate(account, collection, kind) {
 async function renderProviderCalendarView(view, service) {
   const account = App.account, wanted = service === "todo" ? "VTODO" : "VEVENT";
   clear(view);
+  view.append(el("button",{class:"btn sm",type:"button",onclick:()=>openSingleCaptureStatus(account)},"Backup status"));
   const select = el("select", { class:"input" }, el("option", { value:"", text:"Choose a calendar", selected:"selected", disabled:"disabled" }));
   const status = el("p", { class:"dim", text:"Loading cached calendars…" });
   const note = el("p", { class:"dim", text:"Native cached resources are shown; repeating events are not expanded into occurrences here." });
@@ -3895,6 +3931,7 @@ async function renderProviderCalendarView(view, service) {
           if (properties.RRULE || properties.RDATE) parts.push("Repeating series (not expanded)");
           if (properties["RECURRENCE-ID"]) parts.push(`Exception: ${values(properties, "RECURRENCE-ID")}`);
           const row = el("div", { class:"pick-row" }, el("span", { class:"grow" }, el("b", { text:title }), parts.length ? el("span", { class:"dim", text:` · ${parts.join(" · ")}` }) : null));
+          if (CAP.agent && page.accessible === true && typeof item.href === "string" && !properties["RECURRENCE-ID"]) row.append(el("button",{class:"btn sm",type:"button",onclick:event=>prepareSingleCapture(account,"calendar",collection,item.href,event.currentTarget)},"Back up resource"));
           const recurrence = properties["RECURRENCE-ID"];
           const recurrenceId = Array.isArray(recurrence) && recurrence.length === 1 ? recurrence[0].value : null;
           if (service === "calendar" && CAP.agent && page.accessible === true && component.uid && typeof item.href === "string" && !recurrence && !properties.ORGANIZER && !properties.ATTENDEE) {
@@ -4437,6 +4474,7 @@ async function prepareProviderContactRemove(account, collection, href, key, inde
 async function renderProviderContactsView(view) {
   const account = App.account;
   clear(view);
+  view.append(el("button",{class:"btn sm",type:"button",onclick:()=>openSingleCaptureStatus(account)},"Backup status"));
   const select = el("select", { class:"input" }, el("option", { value:"", text:"Choose an address book", selected:"selected", disabled:"disabled" }));
   const status = el("p", { class:"dim", text:"Loading cached address books…" });
   const list = el("div", { class:"pick-list" });
@@ -4462,6 +4500,7 @@ async function renderProviderContactsView(view) {
         const detail = [textValues(item.emails), textValues(item.phones), textValues(item.organizations)].filter(Boolean).join(" · ");
         const row = el("div", { class:"pick-row" }, el("span", { class:"grow" }, el("b", { text:name }), detail ? el("span", { class:"dim", text:` · ${detail}` }) : null));
         if (CAP.agent && page.accessible === true && !item.error && typeof item.href === "string" && typeof item.collection === "string") {
+          row.append(el("button",{class:"btn sm",type:"button",onclick:event=>prepareSingleCapture(account,"contacts",item.collection,item.href,event.currentTarget)},"Back up contact"));
           row.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderContactName(account, item.collection, item.href, name) }, "Change name"));
           for (const [key, fields] of [["EMAIL", item.emails], ["TEL", item.phones], ["ORG", item.organizations]]) {
             row.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderContactField(account, item.collection, item.href, key, null, "") }, `Add ${key}`));
@@ -9418,21 +9457,55 @@ function renderAccountMenu(body) {
       }
       if (BRIDGE && connected) {
         const pushStatus = el("span", { class: "dim", text: "Checking push setup…" });
+        const setup = el("button", {class:"btn sm",type:"button"}, "Set up");
+        const reconcile = el("button", {class:"btn sm",type:"button",style:"display:none"}, "Resolve uncertain setup");
+        const detach = el("button", {class:"btn sm",type:"button",style:"display:none"}, "Remove local connector");
+        const replacement = el("button", {class:"btn sm",type:"button",style:"display:none"}, "Register replacement");
         const showPush = result => {
-          const labels = { not_registered: "Not configured", configuration_required: "Configuration required", registering: "Registering", endpoint_received: "Endpoint received", credentials_ready: "Configure distributor", awaiting_proof: "Awaiting verification", verification_pending: "Verification pending", active: "Registered; delivery not yet observed", degraded: "Delayed", account_changed: "Push configuration must be reviewed", create_unknown: "Enrollment outcome unknown", delivery_unknown: "Verification outcome unknown", unavailable: "Unavailable" };
-          const status = labels[result && result.status] || "Status unavailable";
+          const state = result && result.status;
+          const labels = { not_registered: "Not configured", configuration_required: "Configuration required", registering: "Registering", endpoint_received: "Endpoint received", credentials_ready: "Configure distributor", awaiting_proof: "Awaiting verification", verification_pending: "Verification pending", active: "Registered; delivery not yet observed", degraded: "Delayed", account_changed: "Push configuration must be reviewed", create_unknown: "Enrollment outcome unknown", delivery_unknown: "Verification outcome unknown", prepare_unknown: "Push setup outcome unknown", prepare_cancel_unknown: "Setup cancellation outcome unknown", prepare_cancelled: "Uncertain preparation cancelled", prepare_cancel_conflict: "A server binding remains; review required", distributor_detached: "Local connector removed; distributor acknowledgement unknown", distributor_unregister_unknown: "Local connector removal outcome unknown", unavailable: "Unavailable" };
+          const uncertain = state === "prepare_unknown" || state === "prepare_cancel_unknown";
+          setup.disabled = !state || uncertain || ["prepare_cancel_conflict","prepare_cancelled","distributor_detached","distributor_unregister_unknown"].includes(state);
+          reconcile.style.display = uncertain ? "" : "none";
+          detach.style.display = state === "prepare_cancelled" ? "" : "none";
+          replacement.style.display = state === "distributor_detached" ? "" : "none";
           const lastSync = result && Number(result.last_sync_at) > 0 ? ` · Last account sync ${new Date(Number(result.last_sync_at) * 1000).toLocaleString()}` : " · No successful account sync observed";
-          pushStatus.textContent = status + (result && result.catch_up_pending ? " · Catch-up pending" : "") + lastSync;
+          pushStatus.textContent = (labels[state] || "Status unavailable") + (result && result.catch_up_pending ? " · Catch-up pending" : "") + lastSync;
         };
-        void nativeCall("providerPushStatus", { account: a.id }, NATIVE_TIMEOUT_MS).then(showPush).catch(() => showPush(null));
-        row.append(el("div", { class: "acct-role" }, el("span", { class: "acct-role-copy" }, el("b", { text: "Push updates" }), pushStatus),
-          el("button", { class: "btn sm", onclick: async e => {
-            const button = e.currentTarget;
-            try { showPush(await nativeCall("providerPushSetup", { account: a.id }, PROVIDER_NATIVE_TIMEOUT_MS)); }
-            catch (error) { if (error.message === "Bridge timeout") button.disabled = true; toast(error.message === "Bridge timeout" ? "Push setup outcome is unknown. Check its status before taking further action." : "Push setup is unavailable.", "err"); }
-          } }, "Set up")));
-      }
-    } else if (CAP.account) {
+        const refreshPush = () => nativeCall("providerPushStatus", { account: a.id }, NATIVE_TIMEOUT_MS).then(showPush).catch(() => showPush(null));
+        setup.addEventListener("click",async () => {
+          setup.disabled=true;
+          try { showPush(await nativeCall("providerPushSetup", { account: a.id }, PROVIDER_NATIVE_TIMEOUT_MS)); }
+          catch (_) { toast("Push setup outcome could not be confirmed. Check its status before taking further action.", "err"); await refreshPush(); }
+        });
+        reconcile.addEventListener("click",() => {
+          const explanation=el("div",{class:"compose"},el("p",{text:"The server outcome of push setup is unknown. This action asks the server to cancel the uncertain preparation and checks whether a binding remains. It does not remove an existing binding or sign you out."}));
+          explanation.append(el("button",{class:"btn sm",type:"button",onclick:async event=>{
+            const button=event.currentTarget;button.disabled=true;reconcile.disabled=true;
+            try {
+              const outcome=await nativeCall("providerPushCancelPrepare",{account:a.id},PROVIDER_NATIVE_TIMEOUT_MS);
+              if (outcome && outcome.status==="cancelled") toast("Uncertain setup cancelled; no server binding remains.");
+              else if (outcome && outcome.status==="binding_present") toast("A server binding remains. Review it before setting up push again.","err");
+              else throw new Error("unconfirmed");
+              closeSheet();await refreshPush();
+            } catch (_) {toast("The result remains unknown. No automatic retry was sent; check status before deciding what to do.","err");await refreshPush();}
+            finally {reconcile.disabled=false;}
+          }},"Confirm cancellation and check"));
+          openSheet("Resolve uncertain push setup",explanation);
+        });
+        detach.addEventListener("click",()=>{
+          const content=el("div",{class:"compose"},el("p",{text:"Remove this local connector and send an unregister broadcast. This does not prove the distributor or server acknowledged removal."}));
+          content.append(el("button",{class:"btn sm",type:"button",onclick:async event=>{event.currentTarget.disabled=true;detach.disabled=true;try {const result=await nativeCall("providerPushDetachCancelled",{account:a.id},PROVIDER_NATIVE_TIMEOUT_MS);if(!result || result.status!=="detached") throw new Error("unconfirmed");toast("Local connector removed; distributor acknowledgement is not known.");closeSheet();await refreshPush();} catch (_) {toast("Connector removal outcome is unknown. No automatic retry was sent.","err");await refreshPush();} finally {detach.disabled=false;}}},"Confirm local removal"));
+          openSheet("Remove local connector",content);
+        });
+        replacement.addEventListener("click",()=>{
+          const content=el("div",{class:"compose"},el("p",{text:"After configuring the distributor, explicitly request a replacement connector. Registration starts now; a new endpoint must be received and verified separately."}));
+          content.append(el("button",{class:"btn sm",type:"button",onclick:async event=>{event.currentTarget.disabled=true;replacement.disabled=true;try {const result=await nativeCall("providerPushRegisterReplacement",{account:a.id},PROVIDER_NATIVE_TIMEOUT_MS);if(!result || result.status!=="registering") throw new Error("unconfirmed");toast("Replacement registration requested; endpoint not yet received.");closeSheet();await refreshPush();} catch (_) {toast("Registration result is unknown. No automatic retry was sent.","err");await refreshPush();} finally {replacement.disabled=false;}}},"Confirm replacement registration"));
+          openSheet("Register replacement",content);
+        });
+        void refreshPush();
+        row.append(el("div", { class: "acct-role" }, el("span", { class: "acct-role-copy" }, el("b", { text: "Push updates" }), pushStatus), setup, reconcile, detach, replacement));
+      }    } else if (CAP.account) {
       const roles = el("div", { class: "acct-roles" });
       for (const role of ["reader", "writer"]) {
         const meta = ACCOUNT_ROLE_META[role], status = accountRoleStatus(a, role);

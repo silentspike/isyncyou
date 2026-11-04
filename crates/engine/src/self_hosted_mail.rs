@@ -165,6 +165,33 @@ pub fn scope(
     })
 }
 
+/// Read one export-compatible version while the caller holds the provider account lock.
+/// The token must belong to that lock; this function never acquires it again.
+pub(crate) fn selected_capture_with_token(cfg: &Config, account: &str, email_id: &str, token: &str) -> Result<(ProviderScope, ProviderObject, String), String> {
+    if email_id.is_empty() || email_id.len() > 4096 || email_id.chars().any(char::is_control) || token.is_empty() { return Err("Invalid capture identity".into()); }
+    let origin = match cfg.provider_accounts.get(account) { Some(ProviderConfig::SelfHosted { origin, .. }) => origin.clone(), None => return Err("Not a self-hosted account".into()) };
+    let native = JmapClient::discover(&origin, token.to_owned()).map_err(|_| "JMAP discovery failed")?;
+    let provider = SelfHostedClient { client:native, account:account.into(), origin };
+    let scope = scope(cfg, account, &provider)?;
+    let ids = vec![email_id.to_owned()];
+    let read = || -> Result<(String, Value), String> {
+        let result = provider.client.get("Email", Some(&ids), None).map_err(|_| "Mail capture unavailable")?;
+        if !list(&result, "notFound")?.is_empty() { return Err("Mail capture unavailable".into()); }
+        let values = result.get("list").and_then(Value::as_array).ok_or("Invalid mail capture")?;
+        if values.len() != 1 || field(&values[0], "id")? != email_id { return Err("Invalid mail capture identity".into()); }
+        Ok((field(&result, "state")?.to_owned(), values[0].clone()))
+    };
+    let (state, item) = read()?;
+    let blob = field(&item, "blobId")?;
+    let mime = provider.client.download(blob, "message.eml", "message/rfc822").map_err(|_| "Mail capture MIME unavailable")?;
+    let digest = format!("{:x}", Sha256::digest(&mime));
+    let (after_state, after_item) = read()?;
+    if state != after_state || item != after_item { return Err("Mail changed during capture".into()); }
+    let object = isyncyou_store::mail_capture_object(&item, &digest, mime.len() as u64).map_err(str::to_owned)?;
+    let version = isyncyou_store::capture_version(object.etag.as_deref(), &object.raw);
+    Ok((scope, object, version))
+}
+
 /// Fetch a bounded native text/HTML body after checking account and origin.
 pub fn read_body(
     cfg: &Config,
@@ -594,16 +621,34 @@ pub fn sync(
     store: &Store,
     client: &SelfHostedClient,
 ) -> Result<usize, String> {
+    sync_with_page_limit(cfg,account,store,client,100)
+}
+
+/// Run the normal sync with a smaller bounded page size. This permits callers
+/// to exercise pagination without modifying server-wide limits.
+pub fn sync_with_page_limit(
+    cfg: &Config,
+    account: &str,
+    store: &Store,
+    client: &SelfHostedClient,
+    page_limit: usize,
+) -> Result<usize, String> {
+    if page_limit == 0 || page_limit > 100 { return Err("Invalid mail page limit".into()); }
     let before = client.client.sync_metrics();
     let folders = sync_mailboxes_inner(cfg, account, store, client, false)?;
-    let messages = sync_inner(cfg, account, store, client, false)?;
+    let messages = sync_inner(cfg, account, store, client, false, page_limit)?;
     let after = client.client.sync_metrics();
-    eprintln!("isyncyou_provider_mail_cycle email_get={} email_changes={} created={} updated={} body_fetch={} blob_download={} response_bytes={} blob_bytes={}",
-        after.email_get.saturating_sub(before.email_get), after.email_changes.saturating_sub(before.email_changes),
+    eprintln!("isyncyou_provider_mail_cycle email_query={} email_get={} email_changes={} created={} updated={} body_fetch={} blob_download={} response_bytes={} blob_bytes={}",
+        after.email_query.saturating_sub(before.email_query), after.email_get.saturating_sub(before.email_get), after.email_changes.saturating_sub(before.email_changes),
         after.created.saturating_sub(before.created), after.updated.saturating_sub(before.updated),
         after.body_fetch.saturating_sub(before.body_fetch), after.blob_download.saturating_sub(before.blob_download),
         after.response_bytes.saturating_sub(before.response_bytes), after.blob_bytes.saturating_sub(before.blob_bytes));
     Ok(folders + messages)
+}
+
+/// Aggregate transport counters without exposing account data or credentials.
+pub fn sync_metrics(client: &SelfHostedClient) -> isyncyou_connectors::jmap::JmapSyncMetrics {
+    client.client.sync_metrics()
 }
 
 /// Mailbox identity and state are distinct from Email identity and state.
@@ -720,7 +765,6 @@ fn sync_mailboxes_inner(
         let next = field(&page, "newState")?.to_owned();
         let mut ids = list(&page, "created")?;
         let updated = list(&page, "updated")?;
-        client.record_email_changes(ids.len(), updated.len());
         ids.extend(updated);
         let mut changes = Vec::new();
         if !ids.is_empty() {
@@ -775,10 +819,11 @@ fn sync_inner(
     store: &Store,
     provider: &SelfHostedClient,
     reconcile: bool,
+    page_limit: usize,
 ) -> Result<usize, String> {
     let scope = scope(cfg, account, provider)?;
     let client = &provider.client;
-    let page_size = client.max_objects_in_get().min(100);
+    let page_size = client.max_objects_in_get().min(page_limit);
     if page_size == 0 {
         return Err("JMAP server has no usable batch size".into());
     }
@@ -862,7 +907,8 @@ fn sync_inner(
         let page = match client.changes("Email", &cursor, page_size) {
             Ok(page) => page,
             Err(JmapError::Method(kind)) if kind == "cannotCalculateChanges" && !reconcile => {
-                return sync_inner(cfg, account, store, provider, true)
+                client.record_email_reconciliation();
+                return sync_inner(cfg, account, store, provider, true, page_limit)
             }
             Err(_) => return Err("JMAP delta unavailable".into()),
         };
@@ -871,7 +917,9 @@ fn sync_inner(
         }
         let next = field(&page, "newState")?.to_owned();
         let mut ids = list(&page, "created")?;
-        ids.extend(list(&page, "updated")?);
+        let updated = list(&page, "updated")?;
+        client.record_email_changes(ids.len(), updated.len());
+        ids.extend(updated);
         let mut changes = Vec::new();
         if !ids.is_empty() {
             let fetched = client

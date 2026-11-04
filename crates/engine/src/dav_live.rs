@@ -179,7 +179,7 @@ fn sync_collection_inner(cfg: &Config, account: &str, entry: &str, collection: &
 /// Query one currently discoverable calendar's free/busy, not an aggregate
 /// availability calculation for the calendar owner.
 pub fn free_busy(cfg: &Config, account: &str, entry: &str, collection: &str, start: &str, end: &str, credentials: Option<&dyn ProviderCredentialStore>) -> Result<Vec<u8>, String> {
-    let (origin, _) = configured(cfg, account)?;
+    let origin = configured_origin(cfg, account)?;
     let client = match credentials {
         Some(credentials) => client_with_store(cfg, account, &origin, credentials)?,
         None => client(cfg, account, &origin)?,
@@ -194,7 +194,7 @@ pub fn free_busy(cfg: &Config, account: &str, entry: &str, collection: &str, sta
 /// Read native collection sharing entries when the account has DAV read-acl.
 pub fn read_acl(cfg: &Config, account: &str, entry: &str, collection: &str, service: &str, credentials: Option<&dyn ProviderCredentialStore>) -> Result<Vec<AclEntry>, String> {
     if !matches!(service, "calendar" | "contacts") { return Err("Unsupported DAV service".into()); }
-    let (origin, _) = configured(cfg, account)?;
+    let origin = configured_origin(cfg, account)?;
     let client = match credentials {
         Some(credentials) => client_with_store(cfg, account, &origin, credentials)?,
         None => client(cfg, account, &origin)?,
@@ -206,7 +206,7 @@ pub fn read_acl(cfg: &Config, account: &str, entry: &str, collection: &str, serv
 
 /// A live server-expanded event view; original ICS resources stay untouched.
 pub fn expanded_events(cfg: &Config, account: &str, entry: &str, collection: &str, start: &str, end: &str, credentials: Option<&dyn ProviderCredentialStore>) -> Result<Vec<ExpandedCalendar>, String> {
-    let (origin, _) = configured(cfg, account)?;
+    let origin = configured_origin(cfg, account)?;
     let client = match credentials {
         Some(credentials) => client_with_store(cfg, account, &origin, credentials)?,
         None => client(cfg, account, &origin)?,
@@ -233,7 +233,7 @@ pub fn expanded_event_views(cfg: &Config, account: &str, entry: &str, collection
 /// conflict inspection and restore verification, without changing the cache.
 pub fn read_current(cfg: &Config, account: &str, entry: &str, collection: &str, service: &str, href: &str, credentials: Option<&dyn ProviderCredentialStore>) -> Result<ProviderObject, String> {
     if !matches!(service, "calendar" | "contacts") { return Err("Unsupported DAV service".into()); }
-    let (origin, _) = configured(cfg, account)?;
+    let origin = configured_origin(cfg, account)?;
     let client = match credentials {
         Some(credentials) => client_with_store(cfg, account, &origin, credentials)?,
         None => client(cfg, account, &origin)?,
@@ -243,6 +243,23 @@ pub fn read_current(cfg: &Config, account: &str, entry: &str, collection: &str, 
     }
     let scope = ProviderScope { account_id: account.into(), origin, service: service.into(), collection: collection.into() };
     client.read_resource(&scope, href).map_err(|e| e.to_string())
+}
+
+/// Read a personal DAV resource with the caller's already locked account token.
+/// The caller opens its store before acquiring the authorization lock; this
+/// read does not reopen it or acquire the lock recursively.
+pub(crate) fn read_current_with_token(cfg: &Config, account: &str, origin: &str, _store: &Store, entry: &str, collection: &str, service: &str, href: &str, token: &str) -> Result<ProviderObject, String> {
+    if !matches!(service, "calendar" | "contacts") { return Err("Unsupported DAV service".into()); }
+    if !matches!(cfg.provider_accounts.get(account), Some(ProviderConfig::SelfHosted { origin: configured, .. }) if configured.as_str() == origin) { return Err("Account or provider changed".into()); }
+    let client = DavClient::new(origin, token.to_owned()).map_err(|e| e.to_string())?;
+    if !client.discover(entry).map_err(|e| e.to_string())?.iter().any(|c| c.url == collection && c.owned_by_current_principal == Some(true) && if service == "calendar" { c.calendar } else { c.addressbook }) {
+        return Err("Personal collection is not currently accessible".into());
+    }
+    let scope = ProviderScope { account_id: account.into(), origin: origin.into(), service: service.into(), collection: collection.into() };
+    if !client.permits(&scope, Some(href), "read").map_err(|e| e.to_string())? { return Err("DAV resource is not readable".into()); }
+    let object = client.read_resource(&scope, href).map_err(|e| e.to_string())?;
+    if object.etag.as_deref().filter(|etag| !etag.is_empty() && !etag.starts_with("W/")).is_none() { return Err("Strong ETag required".into()); }
+    Ok(object)
 }
 
 pub struct ReminderPlanItem {
@@ -351,7 +368,7 @@ pub enum ReminderClaim {
 /// Re-read one event, enforce current read permission, and generate a bounded
 /// plan only when the expanded data and original carry the same native ETag.
 pub fn plan_event_reminders(cfg: &Config, account: &str, entry: &str, collection: &str, href: &str, occurrence_start: &str, occurrence_end: &str, window_start: i64, window_end: i64, floating_tzid: Option<&str>, credentials: Option<&dyn ProviderCredentialStore>) -> Result<ReminderPlan, String> {
-    let (origin, _) = configured(cfg, account)?;
+    let origin = configured_origin(cfg, account)?;
     let client = match credentials {
         Some(credentials) => client_with_store(cfg, account, &origin, credentials)?,
         None => client(cfg, account, &origin)?,
@@ -856,12 +873,15 @@ pub struct PreparedExceptionPreview {
 }
 
 pub fn prepare_exception_preview(cfg: &Config, account: &str, entry: &str, collection: &str, href: &str, uid: &str, recurrence_id: &str, start: &str, end: &str, window_start: &str, window_end: &str, credentials: Option<&dyn ProviderCredentialStore>) -> Result<PreparedExceptionPreview, String> {
-    let (origin,store) = configured(cfg,account)?;
+    let origin = configured_origin(cfg, account)?;
     let client = match credentials {Some(c) => client_with_store(cfg,account,&origin,c)?,None => client(cfg,account,&origin)?};
     if !client.discover(entry).map_err(|e| e.to_string())?.iter().any(|c| c.calendar && c.url == collection) { return Err("Calendar is not currently accessible".into()); }
     let scope = ProviderScope {account_id:account.into(),origin:origin.clone(),service:"calendar".into(),collection:collection.into()};
-    if store.provider_accessible(&scope).map_err(|e| e.to_string())? != Some(true) { return Err("Calendar access is unknown or unavailable".into()); }
-    let object = store.provider_object(&scope,href).map_err(|e| e.to_string())?.ok_or("Cached event missing")?;
+    let object = {
+        let store = crate::provider_store::open_readonly(cfg, account)?;
+        if store.provider_accessible(&scope).map_err(|e| e.to_string())? != Some(true) { return Err("Calendar access is unknown or unavailable".into()); }
+        store.provider_object(&scope, href).map_err(|e| e.to_string())?.ok_or("Cached event missing")?
+    };
     let expected_etag = object.etag.filter(|tag| !tag.is_empty() && !tag.starts_with("W/")).ok_or("Strong ETag required")?;
     let expansions = client.expanded_events(&scope,window_start,window_end).map_err(|e| e.to_string())?;
     let mut matches = expansions.iter().filter(|item| item.href == object.remote_id);

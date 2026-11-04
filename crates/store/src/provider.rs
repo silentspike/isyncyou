@@ -770,6 +770,19 @@ impl Store {
         Ok(Some((state,result)))
     }
 
+    /// Read a mail recovery result only for one unambiguous native account.
+    pub fn provider_mail_recovery_result(&self, account:&str, origin:&str, operation:&str) -> Result<Option<(ProviderScope,String,Option<String>)>> {
+        if !self.protected_provider_storage() { return Err(StoreError::MissingStoreKey); }
+        let mut stmt = self.conn.prepare("SELECT remote_account,state,result_id FROM provider_mutations WHERE account_id=?1 AND origin=?2 AND service='mail' AND operation_id=?3 AND kind='jmap-mail-recovery' ORDER BY remote_account LIMIT 2")?;
+        let mut rows = stmt.query(params![account,origin,operation])?;
+        let Some(row) = rows.next()? else { return Ok(None); };
+        let scope = ProviderScope {account_id:account.into(),origin:origin.into(),service:"mail".into(),collection:row.get(0)?};
+        let state:String = row.get(1)?; let result:Option<String> = row.get(2)?;
+        if rows.next()?.is_some() { return Err(StoreError::InvalidProgressiveSearch("ambiguous native recovery account".into())); }
+        let confirmed_id = if state == "confirmed" { result.filter(|id| !id.is_empty()) } else { None };
+        Ok(Some((scope,state,confirmed_id)))
+    }
+
     pub fn conflict_provider_mutation(&self, scope: &ProviderScope, operation: &str) -> Result<bool> {
         Ok(self.conn.execute("UPDATE provider_mutations SET state='conflict' WHERE account_id=?1 AND origin=?2 AND service=?3 AND remote_account=?4 AND operation_id=?5 AND state='unknown'", params![scope.account_id,scope.origin,scope.service,scope.collection,operation])? == 1)
     }
@@ -1076,7 +1089,8 @@ fn write_alarm_index(tx:&rusqlite::Transaction<'_>, scope:&ProviderScope, remote
     Ok(())
 }
 
-fn capture_version(etag: Option<&str>, raw: &[u8]) -> String {
+/// Compute the exact version key used by the provider capture outbox.
+pub fn capture_version(etag: Option<&str>, raw: &[u8]) -> String {
     let mut hash = Sha256::new();
     match etag {
         Some(value) => { hash.update([1]); hash.update((value.len() as u64).to_be_bytes()); hash.update(value.as_bytes()); }
@@ -1084,6 +1098,16 @@ fn capture_version(etag: Option<&str>, raw: &[u8]) -> String {
     }
     hash.update(raw);
     format!("{:x}", hash.finalize())
+}
+
+/// Build the canonical metadata object used by native mail capture.
+pub fn mail_capture_object(native: &serde_json::Value, mime_digest: &str, mime_size: u64) -> std::result::Result<ProviderObject, &'static str> {
+    let id = native.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).ok_or("invalid mail identity")?;
+    let blob = native.get("blobId").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).ok_or("invalid mail blob")?;
+    if mime_size > 64 * 1024 * 1024 || mime_digest.len() != 64 || !mime_digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) { return Err("invalid MIME identity"); }
+    let raw = serde_json::to_vec(&serde_json::json!({"schema":"isyncyou.mail-metadata.v1", "native":native, "mime_digest":mime_digest, "mime_size":mime_size})).map_err(|_| "invalid metadata")?;
+    if raw.len() > 1024 * 1024 { return Err("mail metadata too large"); }
+    Ok(ProviderObject { remote_id:id.into(), etag:Some(blob.into()), raw })
 }
 
 fn capture_observation(tx: &rusqlite::Transaction<'_>, scope: &ProviderScope, object: &ProviderObject) -> Result<()> {
@@ -1095,6 +1119,18 @@ fn capture_observation(tx: &rusqlite::Transaction<'_>, scope: &ProviderScope, ob
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mail_capture_uses_exact_exporter_envelope_and_rejects_invalid_digest() {
+        let native = serde_json::json!({"id":"id1","blobId":"blob1","keywords":{"$seen":true}});
+        let digest = "a".repeat(64);
+        let object = super::mail_capture_object(&native, &digest, 17).unwrap();
+        let expected = serde_json::to_vec(&serde_json::json!({"schema":"isyncyou.mail-metadata.v1", "native":native, "mime_digest":digest, "mime_size":17})).unwrap();
+        assert_eq!(object.raw, expected);
+        assert_eq!(object.etag.as_deref(), Some("blob1"));
+        assert_eq!(object.remote_id, "id1");
+        assert!(super::mail_capture_object(&native, &"A".repeat(64), 17).is_err());
+        assert!(super::mail_capture_object(&native, &digest, 64 * 1024 * 1024 + 1).is_err());
+    }
     use super::*;
 
     #[test]
@@ -1134,6 +1170,24 @@ mod tests {
         store.set_provider_accessible(&contacts,false).unwrap();
         assert!(!store.apply_provider_page_if_accessible_cursor(&contacts,"one",&[],"two").unwrap());
         assert_eq!(store.provider_cursor(&contacts).unwrap().as_deref(),Some("one"));
+    }
+
+    #[test]
+    fn offline_mail_recovery_result_is_bound_and_never_exposes_unknown_id() {
+        let store = Store::open_in_memory().unwrap();
+        let scope = ProviderScope {account_id:"a".into(),origin:"https://example.test".into(),service:"mail".into(),collection:"native-one".into()};
+        assert!(store.claim_provider_mutation(&scope,"other-op","draft","{}","digest").unwrap());
+        assert!(store.provider_mail_recovery_result("a","https://example.test","other-op").unwrap().is_none());
+        assert!(store.claim_provider_mutation(&scope,"op","jmap-mail-recovery","{}","digest").unwrap());
+        assert!(store.checkpoint_provider_mutation(&scope,"op","digest","native-id").unwrap());
+        assert_eq!(store.provider_mail_recovery_result("a","https://example.test","op").unwrap(),Some((scope.clone(),"unknown".into(),None)));
+        assert!(store.finish_provider_mutation(&scope,"op",Some("native-id")).unwrap());
+        assert_eq!(store.provider_mail_recovery_result("a","https://example.test","op").unwrap(),Some((scope.clone(),"confirmed".into(),Some("native-id".into()))));
+        assert!(store.provider_mail_recovery_result("other","https://example.test","op").unwrap().is_none());
+        assert!(store.provider_mail_recovery_result("a","https://other.test","op").unwrap().is_none());
+        let second = ProviderScope {collection:"native-two".into(),..scope};
+        assert!(store.claim_provider_mutation(&second,"op","jmap-mail-recovery","{}","digest").unwrap());
+        assert!(store.provider_mail_recovery_result("a","https://example.test","op").is_err());
     }
 
     #[test]

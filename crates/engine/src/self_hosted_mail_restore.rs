@@ -452,6 +452,16 @@ pub fn recovery_catalog_with_store(cfg: &Config, account: &str, signer: &dyn Rec
     })
 }
 
+/// Resolve the current authenticated native mail account inside the provider
+/// lock. The host may compare this identity to its confirmed ledger scope;
+/// the access token itself never leaves the engine.
+pub fn recovery_native_mail_account_with_store(cfg: &Config, account: &str,
+    credentials: &dyn ProviderCredentialStore) -> Result<String, String> {
+    crate::provider_auth::with_locked_provider_access_token(cfg, account, credentials, |token| {
+        Ok(RecoveryBroker::connect_with_token(cfg, account, token)?.native_account)
+    })
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct RecoverySelection {
     pub operation_id: String,
@@ -464,6 +474,154 @@ pub struct RecoverySelection {
 }
 
 pub enum RecoveryJobOutcome { Created(String), Unknown }
+
+/// Authenticated, personal live DAV selection for a fresh backup capture.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct ApprovedSingleCapture {
+    pub account_id: String, pub origin: String, pub entry: String, pub service: String,
+    pub collection: String, pub href: String, pub native_account: String,
+    pub object: String, pub version: String, pub operation_id: String,
+    pub kind: String, pub title: String, pub mode: String, pub confirmation: String, pub approval_sha256: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SingleCaptureOutcome { Created(String), Unknown }
+
+fn single_capture_approval(op: &ApprovedSingleCapture) -> String {
+    let v = json!([op.account_id,op.origin,op.entry,op.service,op.collection,op.href,
+        op.native_account,op.object,op.version,op.operation_id,op.kind,op.title,op.mode,op.confirmation]);
+    format!("{:x}", Sha256::digest(v.to_string().as_bytes()))
+}
+
+fn current_single_capture(cfg:&Config, op:&ApprovedSingleCapture, store:&Store, token:&str)
+    -> Result<(RecoveryBroker, String, String, String, String),String> {
+    let broker = RecoveryBroker::connect_with_token(cfg, &op.account_id, token)?;
+    if op.service == "mail" {
+        let (scope, item, version) = crate::self_hosted_mail::selected_capture_with_token(cfg, &op.account_id, &op.href, token)?;
+        if scope.origin != op.origin || scope.collection != broker.native_account || (!op.collection.is_empty() && op.collection != scope.collection) {
+            return Err("Capture mail account changed".into());
+        }
+        let metadata:Value = serde_json::from_slice(&item.raw).map_err(|_| "Capture mail metadata unavailable")?;
+        let title = metadata.get("native").and_then(|v| v.get("subject")).and_then(Value::as_str).unwrap_or("");
+        if title.len()>512 || title.chars().any(char::is_control) { return Err("Capture title unavailable".into()); }
+        let object = format!("{:x}", Sha256::digest(serde_json::to_vec(&[
+            broker.native_account.as_str(), op.origin.as_str(), "mail", scope.collection.as_str(), item.remote_id.as_str()]).map_err(|_| "Invalid capture identity")?));
+        return Ok((broker, object, version, "mail".into(), title.into()));
+    }
+    let item = crate::dav_live::read_current_with_token(cfg, &op.account_id, &op.origin, store,
+        &op.entry, &op.collection, &op.service, &op.href, token)?;
+    let object = format!("{:x}", Sha256::digest(serde_json::to_vec(&[
+        broker.native_account.as_str(), op.origin.as_str(), op.service.as_str(),
+        op.collection.as_str(), item.remote_id.as_str()]).map_err(|_| "Invalid capture identity")?));
+    let version = isyncyou_store::capture_version(item.etag.as_deref(), &item.raw);
+    let text = std::str::from_utf8(&item.raw).map_err(|_| "Capture preview unavailable")?
+        .replace("\r\n ", "").replace("\r\n\t", "");
+    let lines:Vec<&str> = text.lines().collect();
+    let kind = if op.service == "contacts" && lines.iter().any(|v| v.trim_end_matches('\r').eq_ignore_ascii_case("BEGIN:VCARD")) { "contact" }
+        else if op.service == "calendar" && lines.iter().any(|v| v.trim_end_matches('\r').eq_ignore_ascii_case("BEGIN:VEVENT")) && !lines.iter().any(|v| v.trim_end_matches('\r').eq_ignore_ascii_case("BEGIN:VTODO")) { "event" }
+        else if op.service == "calendar" && lines.iter().any(|v| v.trim_end_matches('\r').eq_ignore_ascii_case("BEGIN:VTODO")) && !lines.iter().any(|v| v.trim_end_matches('\r').eq_ignore_ascii_case("BEGIN:VEVENT")) { "task" }
+        else { return Err("Capture type unavailable".into()); };
+    let key = if kind == "contact" { "FN" } else { "SUMMARY" };
+    let titles:Vec<&str> = lines.iter().filter_map(|line| {
+        let (head,value)=line.trim_end_matches('\r').split_once(':')?;
+        if head.split(';').next().is_some_and(|h| h.eq_ignore_ascii_case(key)) { Some(value) } else { None }
+    }).collect();
+    if titles.len()!=1 || titles[0].is_empty() || titles[0].len()>512 || titles[0].chars().any(char::is_control) { return Err("Capture title unavailable".into()); }
+    Ok((broker, object, version, kind.into(), titles[0].into()))
+}
+
+pub fn prepare_single_capture_with_store(cfg:&Config, account:&str, entry:&str, collection:&str,
+    service:&str, href:&str, operation_id:&str, confirmation:&str,
+    credentials:&dyn ProviderCredentialStore) -> Result<ApprovedSingleCapture,String> {
+    if !matches!(service, "calendar" | "contacts" | "mail") || operation_id.is_empty() || operation_id.len()>128 ||
+        !operation_id.bytes().all(|b| b.is_ascii_alphanumeric() || b==b'-' || b==b'_') ||
+        confirmation.is_empty() || confirmation.len()>512 || confirmation.chars().any(char::is_control) {
+        return Err("Invalid capture selection".into());
+    }
+    let origin = match cfg.provider_accounts.get(account) {
+        Some(ProviderConfig::SelfHosted { origin, .. }) => origin.clone(),
+        _ => return Err("Capture account unavailable".into()),
+    };
+    let store = crate::provider_store::open(cfg, account)?;
+    crate::provider_auth::with_locked_provider_access_token(cfg, account, credentials, |token| {
+        let mut op = ApprovedSingleCapture { account_id:account.into(), origin, entry:entry.into(),
+            service:service.into(), collection:if service == "mail" { String::new() } else { collection.into() }, href:href.into(), native_account:String::new(),
+            object:String::new(), version:String::new(), operation_id:operation_id.into(),
+            kind:String::new(), title:String::new(), mode:"fresh".into(), confirmation:confirmation.into(), approval_sha256:String::new() };
+        let (broker, object, version, kind, title) = current_single_capture(cfg,&op,&store,token)?;
+        if service == "mail" { op.collection=broker.native_account.clone(); }
+        op.native_account=broker.native_account; op.object=object; op.version=version; op.kind=kind; op.title=title;
+        op.approval_sha256=single_capture_approval(&op); Ok(op)
+    })
+}
+
+pub fn execute_single_capture_with_store(cfg:&Config, op:&ApprovedSingleCapture, approved_digest:&str,
+    signer:&dyn RecoveryDeviceSigner, credentials:&dyn ProviderCredentialStore) -> Result<SingleCaptureOutcome,String> {
+    if approved_digest != op.approval_sha256 || single_capture_approval(op) != op.approval_sha256 ||
+       (!matches!(op.service.as_str(), "calendar" | "contacts" | "mail") || op.mode != "fresh") { return Err("Capture approval mismatch".into()); }
+    match cfg.provider_accounts.get(&op.account_id) {
+        Some(ProviderConfig::SelfHosted { origin, .. }) if origin == &op.origin => {},
+        _ => return Err("Capture account changed".into()),
+    }
+    let store = crate::provider_store::open(cfg, &op.account_id)?;
+    crate::provider_auth::with_locked_provider_access_token(cfg, &op.account_id, credentials, |token| {
+        let (broker, object, version, kind, title) = current_single_capture(cfg,op,&store,token)?;
+        if broker.native_account != op.native_account || object != op.object || version != op.version || kind != op.kind || title != op.title {
+            return Err("Capture source changed".into());
+        }
+        let scope = ProviderScope { account_id:op.account_id.clone(), origin:op.origin.clone(),
+            service:"recovery-capture".into(), collection:broker.native_account.clone() };
+        let intent = json!({"capture":op,"device":signer.device_id()}).to_string();
+        let digest = format!("{:x}", Sha256::digest(intent.as_bytes()));
+        if let Some((previous,_,id)) = store.provider_mutation(&scope,&op.operation_id).map_err(|e| e.to_string())? {
+            if previous != digest { return Err("Capture intent changed".into()); }
+            return Ok(match id { Some(id) => SingleCaptureOutcome::Created(id), None => SingleCaptureOutcome::Unknown });
+        }
+        let effect = json!({"object":op.object,"version":op.version,"confirmation":op.confirmation,"mode":op.mode});
+        let (challenge,signature) = broker.signed(signer,"capture",&effect)?;
+        if !store.claim_provider_mutation(&scope,&op.operation_id,"recovery-capture",&intent,&digest).map_err(|e| e.to_string())? { return Ok(SingleCaptureOutcome::Unknown); }
+        let response = match broker.http.post(broker.origin.join("/recovery/captures").map_err(|_| "Invalid capture route")?)
+            .bearer_auth(&broker.token).header("X-Recovery-Device",signer.device_id())
+            .header("X-Recovery-Challenge",challenge).header("X-Recovery-Signature",signature).json(&effect).send() {
+            Ok(response) => response, Err(_) => return Ok(SingleCaptureOutcome::Unknown),
+        };
+        let data = match RecoveryBroker::bounded(response,16384) { Ok(data)=>data, Err(_)=>return Ok(SingleCaptureOutcome::Unknown) };
+        let value:Value = match serde_json::from_slice(&data) { Ok(v)=>v, Err(_)=>return Ok(SingleCaptureOutcome::Unknown) };
+        let Some(id) = value.get("id").and_then(Value::as_str) else { return Ok(SingleCaptureOutcome::Unknown); };
+        if id.len()!=36 || id.bytes().enumerate().any(|(i,b)| if [8,13,18,23].contains(&i) { b!=b'-' } else { !(b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) }) { return Ok(SingleCaptureOutcome::Unknown); }
+        if !store.checkpoint_provider_mutation(&scope,&op.operation_id,&digest,id).map_err(|e| e.to_string())? { return Ok(SingleCaptureOutcome::Unknown); }
+        Ok(SingleCaptureOutcome::Created(id.into()))
+    })
+}
+
+/// Read only the broker request already bound to the protected native ledger.
+pub fn read_single_capture_status_with_store(cfg:&Config, account:&str, operation_id:&str,
+    signer:&dyn RecoveryDeviceSigner, credentials:&dyn ProviderCredentialStore) -> Result<Value,String> {
+    let origin = match cfg.provider_accounts.get(account) {
+        Some(ProviderConfig::SelfHosted { origin, .. }) => origin.clone(),
+        _ => return Err("Capture account unavailable".into()),
+    };
+    let store = crate::provider_store::open_readonly(cfg,account)?;
+    crate::provider_auth::with_locked_provider_access_token(cfg,account,credentials,|token| {
+        let broker = RecoveryBroker::connect_with_token(cfg,account,token)?;
+        let scope = ProviderScope { account_id:account.into(), origin, service:"recovery-capture".into(), collection:broker.native_account.clone() };
+        let (kind,intent,digest,_,id) = store.provider_mutation_intent(&scope,operation_id).map_err(|e| e.to_string())?.ok_or("Capture operation unavailable")?;
+        if kind != "recovery-capture" || format!("{:x}",Sha256::digest(intent.as_bytes())) != digest { return Err("Capture ledger mismatch".into()); }
+        let recorded:Value = serde_json::from_str(&intent).map_err(|_| "Capture ledger invalid")?;
+        if recorded.get("device").and_then(Value::as_str) != Some(signer.device_id()) { return Err("Capture device changed".into()); }
+        let op:ApprovedSingleCapture = serde_json::from_value(recorded.get("capture").cloned().ok_or("Capture ledger invalid")?).map_err(|_| "Capture ledger invalid")?;
+        if op.operation_id != operation_id || op.account_id != account || op.native_account != broker.native_account || single_capture_approval(&op) != op.approval_sha256 { return Err("Capture ledger mismatch".into()); }
+        let Some(id) = id else { return Ok(json!({"state":"unknown"})); };
+        if id.len()!=36 || id.bytes().enumerate().any(|(i,b)| if [8,13,18,23].contains(&i) { b!=b'-' } else { !(b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) }) { return Err("Invalid capture id".into()); }
+        let (challenge,signature)=broker.signed(signer,"read",&json!({"capture_id":id}))?;
+        let response=broker.http.get(broker.origin.join(&format!("/recovery/captures/{id}")).map_err(|_| "Invalid capture route")?)
+            .bearer_auth(&broker.token).header("X-Recovery-Device",signer.device_id())
+            .header("X-Recovery-Challenge",challenge).header("X-Recovery-Signature",signature).send().map_err(|_| "Capture status unavailable")?;
+        let value:Value=serde_json::from_slice(&RecoveryBroker::bounded(response,16384)?).map_err(|_| "Invalid capture status")?;
+        if value.get("id").and_then(Value::as_str)!=Some(id.as_str()) || !value.get("state").and_then(Value::as_str).is_some_and(|x| matches!(x,"queued"|"capturing"|"captured_locally"|"awaiting_pbs"|"protected_off_node"|"expired"|"failed")) { return Err("Invalid capture status".into()); }
+        Ok(value)
+    })
+}
 
 /// Persist this exact discovery and operation identity in the encrypted host
 /// intent before asking the user to approve creating the personal collection.
@@ -1743,6 +1901,17 @@ fn execute_inner(cfg: &Config, op: &ApprovedMailRestore, credentials: Option<&dy
 mod tests {
     use super::*;
     use std::cell::Cell;
+    #[test]
+    fn selected_capture_approval_binds_visible_effect_and_version() {
+        let mut op = ApprovedSingleCapture { account_id:"a".into(), origin:"https://example.invalid/".into(),
+            entry:"/dav/".into(), service:"calendar".into(), collection:"/c/".into(), href:"/c/1.ics".into(),
+            native_account:"native".into(), object:"a".repeat(64), version:"b".repeat(64), operation_id:"op".into(),
+            kind:"task".into(), title:"Example".into(), mode:"fresh".into(), confirmation:"confirm".into(), approval_sha256:String::new() };
+        let digest = single_capture_approval(&op);
+        op.title="changed".into(); assert_ne!(single_capture_approval(&op),digest);
+        op.title="Example".into(); op.version="c".repeat(64); assert_ne!(single_capture_approval(&op),digest);
+    }
+
     #[test]
     fn recovery_collection_approval_binds_identity_and_target() {
         let mut op = ApprovedRecoveryCollection { account_id:"account".into(), origin:"https://example.test/".into(),

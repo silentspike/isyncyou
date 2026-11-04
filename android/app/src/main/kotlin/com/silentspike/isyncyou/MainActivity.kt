@@ -605,6 +605,9 @@ class MainActivity : FragmentActivity() {
                 else postBridgeError(reply, id, 409, "unavailable", "provider_pending_changed")
             }
             "providerPushSetup" -> providerPushSetup(payload.optString("account"), id, reply)
+            "providerPushCancelPrepare" -> cancelUncertainPushPrepare(payload.getString("account"), id, reply)
+            "providerPushDetachCancelled" -> detachCancelledPush(payload.getString("account"), id, reply)
+            "providerPushRegisterReplacement" -> registerReplacementPush(payload.getString("account"), id, reply)
             "providerPushStatus" -> dispatchBridge {
                 val account = payload.optString("account")
                 val result = runCatching {
@@ -615,6 +618,7 @@ class MainActivity : FragmentActivity() {
                     val origin = NativeEngine.nativeProviderOrigin(filesDir.absolutePath, account)
                     val status = when {
                         state != null && (origin.isEmpty() || state.optString("origin") != origin) -> "account_changed"
+                        PushStatusPolicy.retainStage(stage) -> stage
                         state?.optBoolean("degraded", false) == true -> "degraded"
                         stage == "active" && expiry == null -> "expiry_unknown"
                         stage == "active" && expiry != null && expiry <= System.currentTimeMillis() -> "expired"
@@ -835,6 +839,108 @@ class MainActivity : FragmentActivity() {
                     NativeEngine.nativeProviderCancel()
                     postBridgeError(reply, id, 503, "unavailable", "browser_unavailable")
                 }
+            }
+        }
+    }
+
+    private fun detachCancelledPush(account: String, id: String, reply: JavaScriptReplyProxy) {
+        dispatchBridge {
+            val identity = runCatching { PushInstallationKey.existing(this, account) }.getOrNull()
+            val state = identity?.let { runCatching { PushEnrollmentStore.get(this, it.installation) }.getOrNull() }
+            val origin = NativeEngine.nativeProviderOrigin(filesDir.absolutePath, account)
+            if (identity == null || state == null || origin.isEmpty() || state.optString("account") != account ||
+                state.optString("origin") != origin || !PushCancelPolicy.canDetach(state.optString("stage"))) {
+                postBridgeError(reply, id, 409, "unavailable", "push_reconcile_changed"); return@dispatchBridge
+            }
+            val endpoint = state.optString("endpoint")
+            val claimed = PushEnrollmentStore.update(this, identity.installation) {
+                if (it.optString("account") != account || it.optString("origin") != origin ||
+                    it.optString("endpoint") != endpoint || !PushCancelPolicy.canDetach(it.optString("stage"))) return@update false
+                it.put("stage", "distributor_unregister_unknown"); true
+            }
+            if (!claimed) { postBridgeError(reply, id, 409, "unavailable", "push_reconcile_changed"); return@dispatchBridge }
+            try {
+                // Connector removes only this local registration and sends the
+                // old token's unregister broadcast; it does not acknowledge it.
+                org.unifiedpush.android.connector.UnifiedPush.unregister(this, identity.installation, WebPushKeyManager(this))
+                val saved = PushEnrollmentStore.update(this, identity.installation) {
+                    if (it.optString("account") != account || it.optString("origin") != origin ||
+                        it.optString("endpoint") != endpoint || it.optString("stage") != "distributor_unregister_unknown") return@update false
+                    it.put("stage", "distributor_detached"); true
+                }
+                check(saved)
+                postBridgeResponse(reply, id, 200, JSONObject().put("status", "detached"))
+            } catch (_: Exception) { postBridgeError(reply, id, 503, "unavailable", "push_detach_unconfirmed") }
+        }
+    }
+
+    private fun registerReplacementPush(account: String, id: String, reply: JavaScriptReplyProxy) {
+        dispatchBridge {
+            val identity = runCatching { PushInstallationKey.existing(this, account) }.getOrNull()
+            val state = identity?.let { runCatching { PushEnrollmentStore.get(this, it.installation) }.getOrNull() }
+            val origin = NativeEngine.nativeProviderOrigin(filesDir.absolutePath, account)
+            if (identity == null || state == null || origin.isEmpty() || state.optString("account") != account ||
+                state.optString("origin") != origin || !PushCancelPolicy.canRegisterReplacement(state.optString("stage"))) {
+                postBridgeError(reply, id, 409, "unavailable", "push_reconcile_changed"); return@dispatchBridge
+            }
+            val endpoint = state.optString("endpoint")
+            val vapid = if (state.isNull("vapid")) null else state.optString("vapid")
+            if (vapid != null && !vapid.matches(Regex("[A-Za-z0-9_-]{87}"))) {
+                postBridgeError(reply, id, 503, "unavailable", "push_provider_unavailable"); return@dispatchBridge
+            }
+            runOnUiThread {
+                org.unifiedpush.android.connector.UnifiedPush.tryUseCurrentOrDefaultDistributor(this) { selected ->
+                    if (!selected) { postBridgeError(reply, id, 503, "unavailable", "push_distributor_unavailable"); return@tryUseCurrentOrDefaultDistributor }
+                    try {
+                        val claimed = PushEnrollmentStore.update(this, identity.installation) {
+                            if (it.optString("account") != account || it.optString("origin") != origin ||
+                                it.optString("endpoint") != endpoint || !PushCancelPolicy.canRegisterReplacement(it.optString("stage"))) return@update false
+                            it.remove("endpoint"); it.remove("public_key"); it.remove("auth"); it.remove("degraded")
+                            it.put("stage", "registering"); true
+                        }
+                        check(claimed)
+                        org.unifiedpush.android.connector.UnifiedPush.register(this, identity.installation, "iSyncYou", vapid, WebPushKeyManager(this))
+                        postBridgeResponse(reply, id, 200, JSONObject().put("status", "registering"))
+                    } catch (_: Exception) { postBridgeError(reply, id, 503, "unavailable", "push_registration_unconfirmed") }
+                }
+            }
+        }
+    }
+
+    private fun cancelUncertainPushPrepare(account: String, id: String, reply: JavaScriptReplyProxy) {
+        dispatchBridge {
+            val identity = runCatching { PushInstallationKey.existing(this, account) }.getOrNull()
+            val state = identity?.let { runCatching { PushEnrollmentStore.get(this, it.installation) }.getOrNull() }
+            val origin = NativeEngine.nativeProviderOrigin(filesDir.absolutePath, account)
+            if (identity == null || state == null || origin.isEmpty() || state.optString("account") != account ||
+                state.optString("origin") != origin || !PushCancelPolicy.canClaim(state.optString("stage"))) {
+                postBridgeError(reply, id, 409, "unavailable", "push_reconcile_changed")
+                return@dispatchBridge
+            }
+            val endpoint = state.optString("endpoint")
+            try {
+                val result = PushBroker.operation(this, account, endpoint, "cancel", beforeDispatch = {
+                    if (PushInstallationKey.existing(this, account) != identity) return@operation false
+                    PushEnrollmentStore.update(this, identity.installation) {
+                        if (it.optString("account") != account || it.optString("origin") != origin ||
+                            it.optString("endpoint") != endpoint || !PushCancelPolicy.canClaim(it.optString("stage"))) return@update false
+                        it.put("stage", "prepare_cancel_unknown"); true
+                    }
+                })
+                check(result.optString("status") == "cancelled")
+                val binding = result.optString("binding")
+                val nextStage = checkNotNull(PushCancelPolicy.confirmedStage(binding))
+                check(PushInstallationKey.existing(this, account) == identity)
+                val saved = PushEnrollmentStore.update(this, identity.installation) {
+                    if (it.optString("account") != account || it.optString("origin") != origin ||
+                        it.optString("endpoint") != endpoint || it.optString("stage") != "prepare_cancel_unknown") return@update false
+                    it.put("stage", nextStage)
+                    true
+                }
+                if (!saved) throw IllegalStateException("Push reconciliation changed")
+                postBridgeResponse(reply, id, 200, JSONObject().put("status", if (binding == "absent") "cancelled" else "binding_present"))
+            } catch (_: Exception) {
+                postBridgeError(reply, id, 503, "unavailable", "push_reconcile_unconfirmed")
             }
         }
     }

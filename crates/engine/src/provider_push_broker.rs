@@ -26,7 +26,7 @@ pub(crate) fn post_with_token(cfg: &Config, account: &str, operation: &str, requ
 fn post_inner(cfg: &Config, account: &str, operation: &str, request: &Value, supplied_token: Option<&str>) -> Result<Value, &'static str> {
     if !matches!(
         operation,
-        "challenge" | "prepare" | "deliver" | "confirm" | "revoke"
+        "challenge" | "prepare" | "deliver" | "confirm" | "revoke" | "cancel"
     ) || !request.is_object()
     {
         return Err("invalid_request");
@@ -96,4 +96,21 @@ fn post_inner(cfg: &Config, account: &str, operation: &str, request: &Value, sup
         return Err("outcome_unknown");
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn cancel_is_allowed_but_arbitrary_routes_remain_rejected() {
+        let cfg = Config::default();
+        // A valid operation reaches account validation without making a request.
+        assert_eq!(post(&cfg, "missing", "cancel", &json!({})), Err("invalid_account"));
+        for operation in ["", "../cancel", "cancel/other", "CANCEL", "delete"] {
+            assert_eq!(post(&cfg, "missing", operation, &json!({})), Err("invalid_request"));
+        }
+        assert_eq!(post(&cfg, "missing", "cancel", &json!([])), Err("invalid_request"));
+    }
 }

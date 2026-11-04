@@ -314,8 +314,10 @@ pub struct JmapClient {
 /// Per-client aggregate counters; never contains account identifiers or payloads.
 #[derive(Clone, Copy, Default)]
 pub struct JmapSyncMetrics {
+    pub email_query: u64,
     pub email_get: u64,
     pub email_changes: u64,
+    pub email_reconciliations: u64,
     pub body_fetch: u64,
     pub blob_download: u64,
     pub response_bytes: u64,
@@ -454,6 +456,9 @@ impl JmapClient {
         metrics.created += created as u64;
         metrics.updated += updated as u64;
     }
+    pub fn record_email_reconciliation(&self) {
+        self.metrics.lock().unwrap_or_else(|error| error.into_inner()).email_reconciliations += 1;
+    }
     pub fn account_id(&self) -> &str {
         &self.account
     }
@@ -498,7 +503,9 @@ impl JmapClient {
         let _permit = self.gate.acquire(false);
         {
             let mut metrics = self.metrics.lock().unwrap_or_else(|error| error.into_inner());
-            if method == "Email/get" {
+            if method == "Email/query" {
+                metrics.email_query += 1;
+            } else if method == "Email/get" {
                 metrics.email_get += 1;
                 if args["fetchTextBodyValues"].as_bool() == Some(true) || args["fetchHTMLBodyValues"].as_bool() == Some(true) {
                     metrics.body_fetch += 1;

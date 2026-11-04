@@ -393,7 +393,7 @@ object BridgeMessagePolicy {
                         value.isNullOrBlank() || value.length > 2048 || value.any(Char::isISOControl)
                     }) return BridgeValidation(false, type, id, "invalid_account_setup")
             }
-            "providerSignIn", "providerSignOut", "providerStatus", "providerPushSetup", "providerPushStatus", "providerQuarantineList", "providerAuthResolve", "providerAuthCancelPending" -> {
+            "providerSignIn", "providerSignOut", "providerStatus", "providerPushSetup", "providerPushStatus", "providerPushCancelPrepare", "providerPushDetachCancelled", "providerPushRegisterReplacement", "providerQuarantineList", "providerAuthResolve", "providerAuthCancelPending" -> {
                 val account = exactString(payload, "account")
                 if (!hasOnlyKeys(payload, setOf("account")) || account == null ||
                     !account.matches(Regex("[A-Za-z0-9._-]{1,128}"))) {

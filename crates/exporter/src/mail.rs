@@ -135,15 +135,9 @@ fn capture_objects(
                 (digest, mime.len() as u64)
             }
         };
-        let raw = serde_json::to_vec(&serde_json::json!({"schema":"isyncyou.mail-metadata.v1",
-            "native":object, "mime_digest":mime_digest, "mime_size":mime_size}))?;
-        if raw.len() > 1024 * 1024 { return Err(invalid()); }
-        budget.admit(raw.len())?;
-        changes.push(ProviderChange::Upsert(ProviderObject {
-            remote_id: id.to_owned(),
-            etag: Some(blob.to_owned()),
-            raw,
-        }));
+        let captured = isyncyou_store::mail_capture_object(object, &mime_digest, mime_size).map_err(|_| invalid())?;
+        budget.admit(captured.raw.len())?;
+        changes.push(ProviderChange::Upsert(captured));
     }
     Ok(changes)
 }

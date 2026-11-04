@@ -70,12 +70,15 @@ class PushEnrollmentWorker(context: Context, params: WorkerParameters) : Corouti
                     PushScheduler.enqueue(applicationContext, instance)
                 }
                 "endpoint_received" -> {
-                    // Record intent before the remote mutation. A lost reply is never resent blindly.
-                    if (!PushEnrollmentStore.update(applicationContext, instance) {
-                            if (it.optString("stage") != "endpoint_received") return@update false
+                    // Challenge validation does not create a binding. Claim only
+                    // after it succeeds, immediately before the mutating dispatch.
+                    val result = PushBroker.operation(applicationContext, account, endpoint, "prepare", beforeDispatch = {
+                        PushEnrollmentStore.update(applicationContext, instance) {
+                            if (it.optString("stage") != "endpoint_received" || it.optString("account") != account ||
+                                it.optString("origin") != origin || it.optString("endpoint") != endpoint) return@update false
                             it.put("stage", "prepare_unknown"); true
-                        }) return@withContext Result.success()
-                    val result = PushBroker.operation(applicationContext, account, endpoint, "prepare")
+                        }
+                    })
                     PushEnrollmentStore.update(applicationContext, instance) {
                         if (it.optString("stage") != "prepare_unknown") return@update false
                         it.put("username", result.getString("username"))

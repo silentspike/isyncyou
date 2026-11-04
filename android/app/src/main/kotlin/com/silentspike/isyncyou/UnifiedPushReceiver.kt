@@ -39,6 +39,7 @@ class UnifiedPushReceiver : MessagingReceiver() {
             } else if (old.isEmpty()) {
                 state.put("endpoint", endpoint.url).put("public_key", keys.pubKey).put("auth", keys.auth)
                     .put("stage", "endpoint_received")
+                state.remove("degraded")
             } else if (state.optBoolean("degraded", false)) {
                 // NEW_ENDPOINT also signals that a temporarily unavailable
                 // distributor is reachable again, even if its URL is unchanged.

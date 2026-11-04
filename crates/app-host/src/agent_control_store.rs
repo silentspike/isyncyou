@@ -1886,6 +1886,17 @@ impl AgentControlStore {
         connection.query_row("SELECT state,manifest_sha256,pending_id,action_hash FROM recovery_batches WHERE batch_id=?1 AND identity_binding=?2 AND state IN ('approved','claimed','confirmed')",params![batch_id,binding],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(|_| "recovery_batch_unavailable".into())
     }
 
+    pub(crate) fn confirmed_recovery_manifest(&self,batch_id:&str,account:&str,origin:&str,subject:&str)->Result<RecoveryBatchManifest,String> {
+        let binding=self.upload_installation_binding(&format!("recovery-batch:{batch_id}"),account,origin,subject)?;
+        let connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
+        let (digest,sealed):(String,Vec<u8>)=connection.query_row("SELECT manifest_sha256,sealed_manifest FROM recovery_batches WHERE batch_id=?1 AND identity_binding=?2 AND state='confirmed'",params![batch_id,binding],|r| Ok((r.get(0)?,r.get(1)?))).map_err(|_| "recovery_batch_unavailable")?;
+        let plain=open_row(&self.row_wrap_key,"recovery-batch-manifest",batch_id,&sealed)?;
+        if sha256_hex(&plain)!=digest { return Err("recovery_batch_invalid".into()); }
+        let manifest:RecoveryBatchManifest=serde_json::from_slice(&plain).map_err(|_| "recovery_batch_invalid")?;
+        if manifest.origin!=origin || manifest.approval_sha256.is_empty() { return Err("recovery_batch_invalid".into()); }
+        Ok(manifest)
+    }
+
     pub(crate) fn pending_recovery_effect(&self,pending_id:&str,action_hash:&str,account:&str,origin:&str,subject:&str,now_ms:u64)->Result<serde_json::Value,String> {
         let connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
         let sealed:Vec<u8>=connection.query_row("SELECT sealed_payload FROM confirmation_intents WHERE intent_id=?1 AND account_id=?2 AND owner_binding=?3 AND action_hash=?4 AND state='pending' AND expires_at_ms>?5",params![pending_id,account,self.installation_binding,action_hash,u64_to_i64(now_ms)?],|r| r.get(0)).map_err(|_| "recovery_confirmation_required")?;
@@ -9328,7 +9339,13 @@ mod tests {
         assert!(reopened.load_recovery_batch("batch-1",&account,"https://example.test","other-subject",&digest,&pending.id,&pending.action_hash,false,1_009).is_err());
         assert_eq!(reopened.load_recovery_batch("batch-1",&account,"https://example.test","subject-a",&digest,&pending.id,&pending.action_hash,false,1_010).unwrap().1,vec![b"abc".to_vec()]);
         reopened.reap_expired(60_000,256).unwrap(); assert!(reopened.root.join("recovery-staging/batch-1").exists());
+        assert!(reopened.confirmed_recovery_manifest("batch-1",&account,"https://example.test","subject-a").is_err());
         reopened.complete_recovery_batch("batch-1",&account,"https://example.test","subject-a",&digest).unwrap();
+        assert!(reopened.confirmed_recovery_manifest("batch-1",&account,"https://example.test","other-subject").is_err());
+        assert!(reopened.confirmed_recovery_manifest("batch-1",&account,"https://other.test","subject-a").is_err());
+        let receipt=reopened.confirmed_recovery_manifest("batch-1",&account,"https://example.test","subject-a").unwrap();
+        assert_eq!(receipt.objects[0].operation_id,"operation-1");
+        assert_eq!(recovery_batch_effect_sha256(&receipt),recovery_batch_effect_sha256(&manifest));
         assert!(!reopened.root.join("recovery-staging/batch-1").exists());
         drop(reopened); std::fs::remove_dir_all(root).unwrap();
     }
