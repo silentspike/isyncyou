@@ -6506,11 +6506,19 @@ async function startAiLogin(provider, lifecycleOperationId) {
     if (!d || !d.authorize_url || !d.attempt_id) {
       throw new Error("oauth_start_invalid_response");
     }
+    const authorizationUrl = new URL(d.authorize_url);
+    if (authorizationUrl.protocol !== "https:" || authorizationUrl.username || authorizationUrl.password) {
+      throw new Error("oauth_start_invalid_url");
+    }
     clearLifecycleRequestId(requestKey);
     if (manualCodeFlow) showCodeStep();
     else showWaitingStep(provider);  // waiting UI + poll; completes when /callback fires
     toast("Opening sign-in in your browser…");
-    await openExternalAuth(d.authorize_url, "agent_authorize");
+    await openExternalAuth(d.authorize_url, "agent_authorize", { newTab:true });
+    if (!BRIDGE) {
+      const card = document.getElementById("asst-connect-card");
+      if (card) card.append(el("a", { class:"btn primary", href:d.authorize_url, target:"_blank", rel:"noopener noreferrer", text:"Open provider sign-in" }));
+    }
   } catch (e) {
     await cancelOAuthAttempt(provider);
     if (guardId) await endNetworkGuard(guardId);
