@@ -26,9 +26,9 @@ class PushEnrollmentWorker(context: Context, params: WorkerParameters) : Corouti
         if (origin.isEmpty() || state.optString("origin") != origin) return@withContext Result.failure()
         try {
             val prior = state.optString("stage")
-            if (state.has("replacement") && (prior == "prepare_unknown" ||
+            if ((state.has("replacement") && prior == "prepare_unknown") ||
                 (prior in setOf("credentials_ready", "awaiting_proof", "delivery_unknown", "proof_received") &&
-                    state.optLong("expires", 0) > 0 && System.currentTimeMillis() / 1000 >= state.optLong("expires", 0) + 180))) {
+                    state.optLong("expires", 0) > 0 && System.currentTimeMillis() / 1000 >= state.optLong("expires", 0) + 180)) {
                 val observed = PushBroker.operation(applicationContext, account, endpoint, "status").optString("binding")
                 val changed = PushEnrollmentStore.update(applicationContext, instance) {
                     PushEndpointTransition.reconcileStatus(it, prior, account, origin, endpoint, observed)

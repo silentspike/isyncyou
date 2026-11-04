@@ -76,8 +76,8 @@ internal object PushEndpointTransition {
             (previous == "replacement_revoke_unknown" || previous == "prepare_unknown" ||
                 (previous in setOf("credentials_ready", "awaiting_proof", "delivery_unknown", "proof_received", "confirm_unknown") &&
                     state.optLong("expires", 0) > 0 && System.currentTimeMillis() / 1000 >= state.optLong("expires", 0) + 180)) && observed == "retired" -> {
-                val replacement = state.optJSONObject("replacement") ?: return false
-                if (replacement.optString("endpoint") == endpoint) {
+                val replacement = state.optJSONObject("replacement")
+                if (replacement == null || replacement.optString("endpoint") == endpoint) {
                     // A retired topic cannot be prepared again. Require a fresh
                     // distributor registration rather than replaying this URL.
                     listOf("replacement", "replacement_from", "subscription_id", "expires", "verify_id", "verify_code", "username", "password", "proof_nonce", "revoke_operation_id").forEach { state.remove(it) }

@@ -94,6 +94,24 @@ class PushEndpointTransitionTest {
         }
     }
 
+    @Test fun expiredProofWithoutReplacementRequiresExactRetirement() {
+        for (stage in listOf("credentials_ready", "awaiting_proof", "delivery_unknown", "proof_received")) {
+            val s = state(stage).put("expires", System.currentTimeMillis() / 1000 - 181).put("password", "fixture")
+            val before = s.toString()
+            assertFalse(PushEndpointTransition.reconcileStatus(s, stage, "fixture", "https://provider.example", "https://old.example/topic", "absent"))
+            assertEquals(before, s.toString())
+            assertFalse(PushEndpointTransition.reconcileStatus(s, stage, "other", "https://provider.example", "https://old.example/topic", "retired"))
+            assertEquals(before, s.toString())
+            assertTrue(PushEndpointTransition.reconcileStatus(s, stage, "fixture", "https://provider.example", "https://old.example/topic", "retired"))
+            assertEquals("prepare_cancelled", s.getString("stage"))
+            assertFalse(s.has("password"))
+        }
+        val notExpired = state("awaiting_proof").put("expires", System.currentTimeMillis() / 1000 + 60)
+        val before = notExpired.toString()
+        assertFalse(PushEndpointTransition.reconcileStatus(notExpired, "awaiting_proof", "fixture", "https://provider.example", "https://old.example/topic", "retired"))
+        assertEquals(before, notExpired.toString())
+    }
+
     @Test fun retiredSameUrlRequiresFreshDistributorRegistration() {
         val s = state("delivery_unknown").put("expires", System.currentTimeMillis() / 1000 - 181)
         s.put("replacement", JSONObject().put("endpoint", "https://old.example/topic").put("public_key", "new").put("auth", "auth"))
