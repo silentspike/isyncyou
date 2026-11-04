@@ -8,6 +8,10 @@ use sha2::{Digest, Sha256};
 // rebuilt incrementally before coverage can become complete again.
 const DAV_SEARCH_INDEX_VERSION: i64 = 1;
 
+pub type ProviderMutationIntentRecord = (String, String, String, String, Option<String>);
+pub type ProviderMailUploadIntentRecord = (ProviderScope, String, String, Option<String>);
+type DavIndexFields<'a> = (bool, Option<&'a str>, Option<&'a str>, Option<&'a str>);
+
 pub(super) const MIGRATION: &str = r#"
 CREATE TABLE provider_collections (
  account_id TEXT NOT NULL, origin TEXT NOT NULL, service TEXT NOT NULL,
@@ -816,13 +820,13 @@ impl Store {
         Ok(self.conn.execute("UPDATE provider_mutations SET result_id=?7 WHERE account_id=?1 AND origin=?2 AND service=?3 AND remote_account=?4 AND operation_id=?5 AND intent_digest=?6 AND state='unknown' AND (result_id IS NULL OR result_id=?7)",params![scope.account_id,scope.origin,scope.service,scope.collection,operation,expected_digest,native_id])? == 1)
     }
 
-    pub fn provider_mutation_intent(&self, scope: &ProviderScope, operation: &str) -> Result<Option<(String,String,String,String,Option<String>)>> {
+    pub fn provider_mutation_intent(&self, scope: &ProviderScope, operation: &str) -> Result<Option<ProviderMutationIntentRecord>> {
         Ok(self.conn.query_row("SELECT kind,intent_json,intent_digest,state,result_id FROM provider_mutations WHERE account_id=?1 AND origin=?2 AND service=?3 AND remote_account=?4 AND operation_id=?5", params![scope.account_id,scope.origin,scope.service,scope.collection,operation], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?)
     }
 
     /// Resolve an upload journal entry offline, refusing a reused operation ID
     /// that occurs in more than one native account at the same origin.
-    pub fn provider_mail_upload_intent(&self, account: &str, origin: &str, operation: &str) -> Result<Option<(ProviderScope,String,String,Option<String>)>> {
+    pub fn provider_mail_upload_intent(&self, account: &str, origin: &str, operation: &str) -> Result<Option<ProviderMailUploadIntentRecord>> {
         let mut stmt = self.conn.prepare("SELECT remote_account,intent_json,state,result_id FROM provider_mutations WHERE account_id=?1 AND origin=?2 AND service='mail' AND operation_id=?3 AND kind='mail_attachment_upload' ORDER BY remote_account LIMIT 2")?;
         let mut rows = stmt.query(params![account,origin,operation])?;
         let Some(row) = rows.next()? else { return Ok(None); };
@@ -1156,7 +1160,7 @@ fn write_dav_search_index(tx: &rusqlite::Transaction<'_>, scope: &ProviderScope,
     Ok(())
 }
 
-fn dav_index_fields(index:&ProviderDavIndex) -> Result<(bool,Option<&str>,Option<&str>,Option<&str>)> {
+fn dav_index_fields(index:&ProviderDavIndex) -> Result<DavIndexFields<'_>> {
     match index {
         ProviderDavIndex::Invalid => Ok((false,None,None,None)),
         ProviderDavIndex::Valid { uid,kind,parent_uid } => {

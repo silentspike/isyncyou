@@ -102,6 +102,7 @@ fn bounded_fts_snippet(value: String) -> String {
 pub const SCHEMA_VERSION: i64 = 21;
 
 mod provider;
+pub use provider::{ProviderMailUploadIntentRecord, ProviderMutationIntentRecord};
 pub use provider::{capture_identity, capture_version, mail_capture_object, ProviderAlarmIdentity, ProviderAlarmIndex, ProviderCapture, ProviderChange, ProviderCollectionSnapshot, ProviderDavIndex, ProviderDavIndexEntry, ProviderEvent, ProviderExportSnapshot, ProviderObject, ProviderScope, ProviderSubmission};
 
 pub const STORE_KEY_ENV: &str = "ISYNCYOU_STORE_KEY";
