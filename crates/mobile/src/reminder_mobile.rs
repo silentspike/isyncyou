@@ -15,6 +15,38 @@ fn record(raw: &str) -> Result<(serde_json::Value, String), ()> {
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeReminderPlan<'a>(
+    mut env: jni::EnvUnowned<'a>, _class: jni::objects::JClass<'a>,
+    base: jni::objects::JString<'a>, raw: jni::objects::JString<'a>,
+) -> jni::sys::jstring {
+    let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<serde_json::Value, ()> {
+        let base = jni_get_string(&mut env, &base).ok_or(())?;
+        let raw = jni_get_string(&mut env, &raw).ok_or(())?;
+        if raw.len() > 4096 { return Err(()); }
+        let request: serde_json::Value = serde_json::from_str(&raw).map_err(|_| ())?;
+        let text = |key| request.get(key).and_then(serde_json::Value::as_str).filter(|v| !v.is_empty() && v.len() <= 128).ok_or(());
+        let account = text("account")?;
+        let start = text("occurrence_start")?;
+        let end = text("occurrence_end")?;
+        let timezone = text("timezone")?;
+        let window_start = request.get("window_start").and_then(serde_json::Value::as_i64).ok_or(())?;
+        let window_end = request.get("window_end").and_then(serde_json::Value::as_i64).ok_or(())?;
+        let cfg = config(Path::new(&base)).map_err(|_| ())?;
+        let credentials = AndroidProviderCredentialStore::new(Path::new(&base)).map_err(|_| ())?;
+        let records = match isyncyou_engine::dav_live::plan_account_reminders_with_store(
+            &cfg, account, "/.well-known/caldav", start, end, window_start, window_end,
+            Some(timezone), &credentials,
+        ) {
+            Ok(records) => records,
+            Err(error) if error == "unsupported_alarm_coverage" => return Ok(serde_json::json!({"ok":false,"reason":"unsupported_alarm_coverage"})),
+            Err(_) => return Err(()),
+        };
+        Ok(serde_json::json!({"ok":true,"records":records}))
+    })).ok().and_then(Result::ok).unwrap_or_else(|| serde_json::json!({"ok":false}));
+    jni_new_string(&mut env, output.to_string())
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeReminderClaim<'a>(
     mut env: jni::EnvUnowned<'a>, _class: jni::objects::JClass<'a>,
     base: jni::objects::JString<'a>, raw: jni::objects::JString<'a>,

@@ -816,6 +816,54 @@ pub fn preview_task_completion(raw: &[u8], uid: &str, recurrence_id: Option<&str
     Ok((summary,status,completed,percent,edited))
 }
 
+/// Create a single completion exception only for an occurrence that the DAV
+/// server expanded from the exact approved ETag. The series master and every
+/// unrelated native property remain intact.
+pub fn preview_task_occurrence_completion(raw: &[u8], expanded: &[u8], uid: &str, recurrence_id: &str, completed_at: Option<&str>) -> Result<(String,String,String,Vec<u8>), String> {
+    let utc = |v: &str| v.len() == 16 && v.ends_with('Z') && ical::recur::IcalRecurDateTime::parse(v).is_ok();
+    if !utc(recurrence_id) || completed_at.is_some_and(|v| !utc(v)) { return Err("Invalid occurrence identity or completion time".into()); }
+    let expansion = parse(expanded)?;
+    let mut occurrence = None;
+    for entry in &expansion.items { if let IcalItem::Component(child) = entry {
+        if name(child).as_deref() == Some("VTODO") && values(child,"UID") == [uid] && values(child,"RECURRENCE-ID") == [recurrence_id] {
+            if occurrence.replace(child).is_some() { return Err("Expanded task occurrence is ambiguous".into()); }
+        }
+    } }
+    let occurrence = occurrence.ok_or("Expanded task occurrence missing")?;
+    for entry in &occurrence.items { if let IcalItem::Prop(line) = entry {
+        if ["DTSTART","DUE","RECURRENCE-ID"].iter().any(|key| line.name.get().eq_ignore_ascii_case(key)) && !line.params.is_empty() { return Err("Parameterized expanded occurrence is unsupported".into()); }
+    } }
+    let single = |node: &IcalCst<'_>, key: &str| -> Result<String,String> {
+        let v = values(node,key);
+        if v.len() != 1 || v[0].is_empty() || v[0].len() > 4096 || v[0].chars().any(char::is_control) { return Err("Occurrence field missing or ambiguous".into()); }
+        Ok(v[0].clone())
+    };
+    let start = single(occurrence,"DTSTART")?; let due = single(occurrence,"DUE")?;
+    if !utc(&start) || !utc(&due) || start > due { return Err("Only UTC task occurrences are supported".into()); }
+    let mut tree = parse(raw)?;
+    if !values(&tree,"METHOD").is_empty() { return Err("Scheduled task requires explicit approval".into()); }
+    let mut master = None;
+    for entry in &tree.items { if let IcalItem::Component(child) = entry {
+        if name(child).as_deref() != Some("VTODO") || values(child,"UID") != [uid] { continue; }
+        if child.items.iter().any(|item| matches!(item,IcalItem::Prop(line) if line.name.get().eq_ignore_ascii_case("RECURRENCE-ID") && line.params.iter().any(|p| p.name.get().eq_ignore_ascii_case("RANGE")))) { return Err("Range override requires series approval".into()); }
+        let rid = values(child,"RECURRENCE-ID");
+        if rid.len() > 1 || rid.first().is_some_and(|v| v == recurrence_id) { return Err("Task occurrence already exists or is ambiguous".into()); }
+        if rid.is_empty() && master.replace(child.clone()).is_some() { return Err("Task series master is ambiguous".into()); }
+    } }
+    let mut child = master.ok_or("Task series master missing")?;
+    if values(&child,"RRULE").is_empty() && values(&child,"RDATE").is_empty() { return Err("Task is not recurring".into()); }
+    if ["ORGANIZER","ATTENDEE","DURATION"].iter().any(|k| !values(&child,k).is_empty()) || child.items.iter().any(|v| matches!(v,IcalItem::Component(_) | IcalItem::Opaque(_))) { return Err("Scheduled or alarmed task requires expanded approval".into()); }
+    for entry in &child.items { if let IcalItem::Prop(line) = entry {
+        if ["DTSTART","DUE","RECURRENCE-ID"].iter().any(|key| line.name.get().eq_ignore_ascii_case(key)) && !line.params.is_empty() { return Err("Parameterized task occurrence requires zone-aware approval".into()); }
+    } }
+    let summary = single(&child,"SUMMARY")?;
+    child.items.retain(|entry| !matches!(entry,IcalItem::Prop(line) if ["RRULE","RDATE","EXDATE","EXRULE","DTSTART","DUE","RECURRENCE-ID"].iter().any(|key| line.name.get().eq_ignore_ascii_case(key))));
+    for (key,value) in [("RECURRENCE-ID",recurrence_id),("DTSTART",start.as_str()),("DUE",due.as_str())] { child.items.push(IcalItem::Prop(IcalLine::text(key,value.to_owned()))); }
+    tree.items.push(IcalItem::Component(child));
+    let result = task_completion(&tree.to_bytes(),uid,Some(recurrence_id),completed_at)?;
+    Ok((summary,start,due,result))
+}
+
 /// Prepare one attendee's explicit RSVP. Other attendee parameters and unknown
 /// properties remain intact; callers must confirm scheduling side effects.
 pub fn respond_attendee(raw: &[u8], uid: &str, recurrence_id: Option<&str>, attendee: &str, response: &str) -> Result<Vec<u8>, String> {
@@ -949,7 +997,12 @@ pub fn preview_event_cancellation(raw: &[u8], uid: &str, recurrence_id: Option<&
 /// Local time and custom-zone changes are intentionally rejected here rather
 /// than silently converting them; they need an explicit zone-aware editor.
 pub fn task_attributes(raw: &[u8], uid: &str, recurrence_id: Option<&str>, priority: Option<u8>, due: Option<(&str, bool)>) -> Result<Vec<u8>, String> {
-    if uid.is_empty() || priority.is_none() && due.is_none() || priority.is_some_and(|v| v > 9) { return Err("Invalid task attributes".into()); }
+    task_attributes_with_start(raw,uid,recurrence_id,priority,due,None)
+}
+
+pub fn task_attributes_with_start(raw: &[u8], uid: &str, recurrence_id: Option<&str>, priority: Option<u8>, due: Option<(&str, bool)>, start: Option<&str>) -> Result<Vec<u8>, String> {
+    if uid.is_empty() || priority.is_none() && due.is_none() && start.is_none() || priority.is_some_and(|v| v > 9) { return Err("Invalid task attributes".into()); }
+    if start.is_some_and(|v| v.len() != 16 || !v.ends_with('Z') || ical::recur::IcalRecurDateTime::parse(v).is_err()) { return Err("Task start must be UTC".into()); }
     if let Some((value, date_only)) = due {
         let b = value.as_bytes();
         let valid = (if date_only { b.len() == 8 } else { b.len() == 16 && b[8] == b'T' && b[15] == b'Z' }) && ical::recur::IcalRecurDateTime::parse(value).is_ok();
@@ -962,9 +1015,10 @@ pub fn task_attributes(raw: &[u8], uid: &str, recurrence_id: Option<&str>, prior
         let ids = values(child,"UID"); let occurrence = values(child,"RECURRENCE-ID");
         if ids.len() != 1 || ids[0] != uid || occurrence.len() > 1 || occurrence.first().map(String::as_str) != recurrence_id { continue; }
         matches += 1;
-        if priority.is_some() && values(child,"PRIORITY").len() > 1 || due.is_some() && values(child,"DUE").len() > 1 { return Err("Ambiguous duplicate task property".into()); }
-        child.items.retain(|entry| !matches!(entry, IcalItem::Prop(line) if priority.is_some() && line.name.get().eq_ignore_ascii_case("PRIORITY") || due.is_some() && line.name.get().eq_ignore_ascii_case("DUE")));
+        if priority.is_some() && values(child,"PRIORITY").len() > 1 || due.is_some() && values(child,"DUE").len() > 1 || start.is_some() && values(child,"DTSTART").len() > 1 { return Err("Ambiguous duplicate task property".into()); }
+        child.items.retain(|entry| !matches!(entry, IcalItem::Prop(line) if priority.is_some() && line.name.get().eq_ignore_ascii_case("PRIORITY") || due.is_some() && line.name.get().eq_ignore_ascii_case("DUE") || start.is_some() && line.name.get().eq_ignore_ascii_case("DTSTART")));
         if let Some(value) = priority { child.items.push(IcalItem::Prop(IcalLine::text("PRIORITY", value.to_string()))); }
+        if let Some(value) = start { child.items.push(IcalItem::Prop(IcalLine::text("DTSTART", value.to_owned()))); }
         if let Some((value, date_only)) = due {
             let mut line = IcalLine::text("DUE", value.to_owned());
             if date_only { line.params.push(ical::tree::param::node::IcalParamNode::parse("VALUE=DATE")); }
@@ -978,6 +1032,11 @@ pub fn task_attributes(raw: &[u8], uid: &str, recurrence_id: Option<&str>, prior
 /// Preview task priority/due changes only when no scheduling or series-wide
 /// side effect is present. Existing due parameters are exposed separately.
 pub fn preview_task_attributes(raw: &[u8], uid: &str, priority: Option<u8>, due: Option<(&str, bool)>) -> Result<(String, Option<String>, Option<String>, Vec<u8>), String> {
+    let (name,priority,due,_,raw) = preview_task_attributes_with_start(raw,uid,priority,due,None)?;
+    Ok((name,priority,due,raw))
+}
+
+pub fn preview_task_attributes_with_start(raw: &[u8], uid: &str, priority: Option<u8>, due: Option<(&str, bool)>, start: Option<&str>) -> Result<(String, Option<String>, Option<String>, Option<String>, Vec<u8>), String> {
     let tree = parse(raw)?;
     if !values(&tree,"METHOD").is_empty() || tree.items.iter().any(|item| matches!(item,IcalItem::Opaque(_))) { return Err("Task effect cannot be previewed safely".into()); }
     let mut target = None;
@@ -992,7 +1051,7 @@ pub fn preview_task_attributes(raw: &[u8], uid: &str, priority: Option<u8>, due:
     let target = target.ok_or("Task missing")?;
     if ["RECURRENCE-ID","RRULE","RDATE","EXDATE","EXRULE"].iter().any(|key| !values(target,key).is_empty()) || target.items.iter().any(|item| matches!(item,IcalItem::Opaque(_) | IcalItem::Component(_))) { return Err("Recurring or alarmed task requires expanded approval".into()); }
     for item in &target.items { if let IcalItem::Prop(line) = item {
-        if ["SUMMARY","PRIORITY","DUE"].iter().any(|key| line.name.get().eq_ignore_ascii_case(key)) && !line.params.is_empty() { return Err("Parameterized task fields require a richer preview".into()); }
+        if ["SUMMARY","PRIORITY","DUE","DTSTART"].iter().any(|key| line.name.get().eq_ignore_ascii_case(key)) && !line.params.is_empty() { return Err("Parameterized task fields require a richer preview".into()); }
     } }
     let one = |key: &str| -> Result<Option<String>, String> {
         let found = values(target,key);
@@ -1000,7 +1059,10 @@ pub fn preview_task_attributes(raw: &[u8], uid: &str, priority: Option<u8>, due:
         Ok(found.into_iter().next())
     };
     let name = one("SUMMARY")?.filter(|value| !value.is_empty()).ok_or("Task summary missing")?;
-    Ok((name,one("PRIORITY")?,one("DUE")?,task_attributes(raw,uid,None,priority,due)?))
+    let old_start = one("DTSTART")?; let old_due = one("DUE")?;
+    let effective_start = start.or(old_start.as_deref()); let effective_due = due.map(|v| v.0).or(old_due.as_deref());
+    if let (Some(s),Some(d)) = (effective_start,effective_due) { if s.len() != d.len() || s > d { return Err("Task start and due must use matching ordered dates".into()); } }
+    Ok((name,one("PRIORITY")?,old_due,old_start,task_attributes_with_start(raw,uid,None,priority,due,start)?))
 }
 
 /// Set or remove a native VTODO parent UID. Caller must validate that the
@@ -1106,6 +1168,65 @@ pub struct SeriesRulePreview {
     pub raw: Vec<u8>,
 }
 
+/// An explicitly selected simple DISPLAY alarm. Existing non-selected alarms
+/// and all unrelated native properties remain byte-for-byte intact.
+pub struct AlarmPreview {
+    pub summary: String,
+    pub old_trigger: Option<String>,
+    pub old_description: Option<String>,
+    pub new_trigger: Option<String>,
+    pub new_description: Option<String>,
+    pub raw: Vec<u8>,
+}
+
+pub fn preview_alarm(raw: &[u8], uid: &str, recurrence_id: Option<&str>, index: Option<usize>, trigger: Option<&str>, description: Option<&str>) -> Result<AlarmPreview, String> {
+    if uid.is_empty() || index.is_none() && trigger.is_none() || trigger.is_some() != description.is_some() { return Err("Invalid alarm operation".into()); }
+    if let Some(value) = trigger {
+        let relative = value.starts_with('-') && super::reminders::seconds(value).is_ok();
+        if value.len() > 128 || value.contains(['\r','\n']) || !relative { return Err("Only relative start reminders are currently deliverable".into()); }
+        if description.is_some_and(|v| v.is_empty() || v.len() > 4096 || v.chars().any(char::is_control)) { return Err("Invalid alarm description".into()); }
+    }
+    let mut tree = parse(raw)?;
+    if !values(&tree,"METHOD").is_empty() { return Err("Scheduled calendar requires explicit scheduling approval".into()); }
+    let mut found = 0;
+    let mut result = None;
+    for item in &mut tree.items {
+        let IcalItem::Component(child) = item else { continue; };
+        if !matches!(name(child).as_deref(),Some("VEVENT" | "VTODO")) { continue; }
+        let ids = values(child,"UID"); let occurrence = values(child,"RECURRENCE-ID");
+        if ids.len() != 1 || ids[0] != uid || occurrence.len() > 1 || occurrence.first().map(String::as_str) != recurrence_id { continue; }
+        found += 1;
+        if !values(child,"ORGANIZER").is_empty() || !values(child,"ATTENDEE").is_empty() { return Err("Scheduled calendar requires explicit scheduling approval".into()); }
+        if trigger.is_some() && values(child,"DTSTART").len() != 1 { return Err("Reminder requires a start time".into()); }
+        let titles = values(child,"SUMMARY");
+        if titles.len() != 1 || titles[0].is_empty() || titles[0].len() > 4096 || titles[0].chars().any(char::is_control) { return Err("Alarm summary unavailable".into()); }
+        let alarm_positions: Vec<usize> = child.items.iter().enumerate().filter_map(|(i,v)| match v { IcalItem::Component(c) if name(c).as_deref() == Some("VALARM") => Some(i), _ => None }).collect();
+        let mut old_trigger = None; let mut old_description = None; let mut insert_at = child.items.len();
+        if let Some(index) = index {
+            let position = *alarm_positions.get(index).ok_or("Alarm index missing")?;
+            let IcalItem::Component(alarm) = &child.items[position] else { unreachable!() };
+            if alarm.items.iter().any(|v| match v { IcalItem::Prop(line) => !matches!(line.name.get().to_ascii_uppercase().as_str(),"ACTION" | "TRIGGER" | "DESCRIPTION") || (!line.params.is_empty() && !line.name.get().eq_ignore_ascii_case("TRIGGER")), _ => true }) { return Err("Complex alarm requires expanded approval".into()); }
+            let action = values(alarm,"ACTION"); let triggers = values(alarm,"TRIGGER"); let descriptions = values(alarm,"DESCRIPTION");
+            if action != ["DISPLAY"] || triggers.len() != 1 || descriptions.len() != 1 { return Err("Ambiguous or unsupported alarm".into()); }
+            for v in &alarm.items { if let IcalItem::Prop(line) = v { if line.name.get().eq_ignore_ascii_case("TRIGGER") && (line.params.len() > 1 || line.params.iter().any(|p| !p.name.get().eq_ignore_ascii_case("VALUE") || p.values.len() != 1 || !p.values[0].get().eq_ignore_ascii_case("DATE-TIME"))) { return Err("Complex alarm trigger requires expanded approval".into()); } } }
+            old_trigger = triggers.into_iter().next(); old_description = descriptions.into_iter().next();
+            insert_at = position;
+            child.items.remove(position);
+        }
+        if let (Some(trigger),Some(description)) = (trigger,description) {
+            let mut alarm = IcalCst::parse(b"BEGIN:VALARM\r\nACTION:DISPLAY\r\nEND:VALARM\r\n").map_err(|_| "Invalid alarm")?;
+            let line = IcalLine::text("TRIGGER",trigger.to_owned());
+            alarm.items.push(IcalItem::Prop(line));
+            let mut line = IcalLine::text("DESCRIPTION", ""); line.value.set(&[description]); alarm.items.push(IcalItem::Prop(line));
+            child.items.insert(insert_at,IcalItem::Component(Box::new(alarm)));
+        }
+        result = Some((titles[0].clone(),old_trigger,old_description));
+    }
+    if found != 1 { return Err("Alarm target missing or ambiguous".into()); }
+    let (summary,old_trigger,old_description) = result.ok_or("Alarm target missing")?;
+    Ok(AlarmPreview {summary,old_trigger,old_description,new_trigger:trigger.map(str::to_owned),new_description:description.map(str::to_owned),raw:tree.to_bytes()})
+}
+
 /// Preview the complete old and new occurrence sets for a bounded UTC series.
 /// Exceptions, additional recurrence sets, scheduling and alarms require a
 /// broader preview and therefore are not accepted by this operation.
@@ -1115,26 +1236,27 @@ pub fn preview_series_rule(raw: &[u8], uid: &str, rule: &str) -> Result<SeriesRu
     let mut target = None;
     for item in &tree.items { if let IcalItem::Component(child) = item {
         if name(child).as_deref() == Some("VTIMEZONE") { continue; }
-        if name(child).as_deref() != Some("VEVENT") || target.replace(child).is_some() { return Err("Series exceptions require an expanded preview".into()); }
+        if !matches!(name(child).as_deref(), Some("VEVENT" | "VTODO")) || target.replace(child).is_some() { return Err("Series exceptions require an expanded preview".into()); }
     } }
     let target = target.ok_or("Series missing")?;
     let ids = values(target,"UID");
     if ids.len() != 1 || ids[0] != uid { return Err("Series identity mismatch".into()); }
     if ["ORGANIZER","ATTENDEE","RECURRENCE-ID","RDATE","EXDATE","EXRULE","DURATION"].iter().any(|key| !values(target,key).is_empty()) || target.items.iter().any(|item| matches!(item,IcalItem::Component(_) | IcalItem::Opaque(_))) { return Err("Complex or scheduled series needs expanded approval".into()); }
     for item in &target.items { if let IcalItem::Prop(line) = item {
-        if ["DTSTART","DTEND","RRULE"].iter().any(|key| line.name.get().eq_ignore_ascii_case(key)) && !line.params.is_empty() { return Err("Parameterized series needs zone-aware preview".into()); }
+        if ["DTSTART","DTEND","DUE","RRULE"].iter().any(|key| line.name.get().eq_ignore_ascii_case(key)) && !line.params.is_empty() { return Err("Parameterized series needs zone-aware preview".into()); }
     } }
     let one = |key: &str| -> Result<String,String> {
         let found = values(target,key);
         if found.len() != 1 || found[0].is_empty() || found[0].len() > 4096 || found[0].chars().any(char::is_control) { return Err("Series property is missing or ambiguous".into()); }
         Ok(found[0].clone())
     };
-    let summary = one("SUMMARY")?; let start = one("DTSTART")?; let end = one("DTEND")?;
+    let summary = one("SUMMARY")?; let start = one("DTSTART")?;
+    let end = one(if name(target).as_deref() == Some("VTODO") { "DUE" } else { "DTEND" })?;
     let old_rules = values(target,"RRULE");
     if old_rules.len() > 1 || old_rules.first().is_some_and(|value| value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control)) { return Err("Series rule is ambiguous".into()); }
     let old_rule = old_rules.into_iter().next().unwrap_or_default();
     let utc = |value: &str| value.len() == 16 && value.as_bytes()[8] == b'T' && value.ends_with('Z') && ical::recur::IcalRecurDateTime::parse(value).is_ok();
-    if !utc(&start) || !utc(&end) || start >= end { return Err("Series times must be UTC".into()); }
+    if !utc(&start) || !utc(&end) || start > end || (start == end && name(target).as_deref() == Some("VEVENT")) { return Err("Series times must be UTC".into()); }
     let expand = |rule: &str| -> Result<Vec<String>,String> {
         if rule.contains(['\r','\n']) { return Err("Invalid recurrence rule".into()); }
         let set: icalendar::RRuleSet = format!("DTSTART:{start}\nRRULE:{rule}").parse().map_err(|_| "Invalid recurrence rule")?;
@@ -1152,6 +1274,42 @@ pub fn preview_series_rule(raw: &[u8], uid: &str, rule: &str) -> Result<SeriesRu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alarm_edit_preserves_other_native_data_and_rejects_complex_alarm() {
+        let raw = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:task\r\nSUMMARY:Work\r\nDTSTART:20270101T100000Z\r\nDUE:20270101T110000Z\r\nX-KEEP:yes\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nDESCRIPTION:Old\r\nEND:VALARM\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let changed = preview_alarm(raw,"task",None,Some(0),Some("-PT10M"),Some("New")).unwrap();
+        assert_eq!(changed.old_trigger.as_deref(),Some("-PT15M"));
+        let output = String::from_utf8(changed.raw.clone()).unwrap();
+        assert!(output.contains("X-KEEP:yes\r\n")); assert!(output.contains("TRIGGER:-PT10M\r\n"));
+        let removed = preview_alarm(&changed.raw,"task",None,Some(0),None,None).unwrap();
+        assert!(!String::from_utf8(removed.raw).unwrap().contains("BEGIN:VALARM"));
+        let complex = String::from_utf8(raw.to_vec()).unwrap().replace("DESCRIPTION:Old", "DESCRIPTION:Old\r\nX-KEEP-ALARM:yes");
+        assert!(preview_alarm(complex.as_bytes(),"task",None,Some(0),None,None).is_err());
+        assert!(preview_alarm(raw,"task",None,None,Some("20270101T094500Z"),Some("Reminder")).is_err());
+    }
+
+    #[test]
+    fn bounded_task_series_preserves_foreign_data() {
+        let raw = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:task\r\nSUMMARY:Work\r\nDTSTART:20270101T100000Z\r\nDUE:20270101T110000Z\r\nX-KEEP:yes\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let p = preview_series_rule(raw,"task","FREQ=DAILY;COUNT=3").unwrap();
+        assert_eq!(p.new_occurrences.len(),3);
+        let output = String::from_utf8(p.raw).unwrap();
+        assert!(output.contains("X-KEEP:yes\r\n")); assert!(output.contains("RRULE:FREQ=DAILY;COUNT=3\r\n"));
+    }
+
+    #[test]
+    fn task_occurrence_completion_uses_confirmed_expansion_and_preserves_master() {
+        let raw = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:task\r\nSUMMARY:Work\r\nDTSTART:20270101T100000Z\r\nDUE:20270101T110000Z\r\nRRULE:FREQ=DAILY;COUNT=3\r\nX-KEEP:yes\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let expanded = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:task\r\nRECURRENCE-ID:20270102T100000Z\r\nDTSTART:20270102T100000Z\r\nDUE:20270102T110000Z\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let (_,start,due,out) = preview_task_occurrence_completion(raw,expanded,"task","20270102T100000Z",Some("20270102T120000Z")).unwrap();
+        assert_eq!(start,"20270102T100000Z"); assert_eq!(due,"20270102T110000Z");
+        let result = String::from_utf8(out).unwrap();
+        assert_eq!(result.matches("RRULE:FREQ=DAILY;COUNT=3").count(),1);
+        assert_eq!(result.matches("X-KEEP:yes").count(),2);
+        assert!(result.contains("RECURRENCE-ID:20270102T100000Z")); assert!(result.contains("STATUS:COMPLETED"));
+        assert!(preview_task_occurrence_completion(raw,expanded,"task","20270103T100000Z",None).is_err());
+    }
 
     #[test]
     fn event_time_edits_only_selected_occurrence_and_rejects_unsafe_conversions() {

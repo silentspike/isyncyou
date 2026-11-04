@@ -611,6 +611,11 @@ class MainActivity : FragmentActivity() {
             "providerPushCancelPrepare" -> cancelUncertainPushPrepare(payload.getString("account"), id, reply)
             "providerPushDetachCancelled" -> detachCancelledPush(payload.getString("account"), id, reply)
             "providerPushRegisterReplacement" -> registerReplacementPush(payload.getString("account"), id, reply)
+            "providerReminderStatus" -> dispatchBridge {
+                val status = runCatching { ReminderStatus.snapshot(this) }
+                    .getOrElse { JSONObject().put("planning", "unavailable") }
+                postBridgeResponse(reply, id, 200, status)
+            }
             "providerPushStatus" -> dispatchBridge {
                 val account = payload.optString("account")
                 val result = runCatching {

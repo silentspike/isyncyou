@@ -10969,7 +10969,7 @@ impl DaemonAgent {
                         }
                     }
                     Ok(isyncyou_agent::TurnOutcome::PendingConfirmation { action, .. }) => {
-                        let (action, preview) = match (if action.account()!=account_id.as_str() { Err("account_mismatch".into()) } else { with_current_recovery_config(&recovery_config_path,&executor_cfg,|cfg| bind_model_recovery_jobs(cfg,recovery_control.as_deref(),*action)) }).and_then(|action| with_current_recovery_config(&recovery_config_path,&executor_cfg,|cfg| bind_model_contact_photo(cfg,recovery_control.as_deref(),action))).and_then(|action| agent_ops::bind_provider_contact_name(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_contact_field(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_contact_add(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_contact_remove(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_task_completion(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_task_parent(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_task_attributes(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_calendar_text(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_calendar_time(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_zoned_time(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_cancellation(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_exception(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_series_rule(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_dav_acl(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_invitation_response(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_dav_delete(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_dav_create(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_mail_action(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_related_draft(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_draft(&executor_cfg, action)).and_then(|action| agent_ops::preview_for_pending_action_with_config(&executor_cfg, &action).map(|preview| (action, preview))) {
+let (action, preview) = match (if action.account()!=account_id.as_str() { Err("account_mismatch".into()) } else { with_current_recovery_config(&recovery_config_path,&executor_cfg,|cfg| bind_model_recovery_jobs(cfg,recovery_control.as_deref(),*action)) }).and_then(|action| with_current_recovery_config(&recovery_config_path,&executor_cfg,|cfg| bind_model_contact_photo(cfg,recovery_control.as_deref(),action))).and_then(|action| agent_ops::bind_provider_contact_name(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_contact_field(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_contact_add(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_contact_remove(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_task_completion(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_task_parent(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_task_attributes(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_calendar_text(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_calendar_time(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_zoned_time(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_cancellation(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_exception(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_series_rule(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_alarm(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_task_occurrence(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_dav_acl(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_invitation_response(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_dav_delete(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_dav_create(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_mail_action(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_related_draft(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_draft(&executor_cfg, action)).and_then(|action| agent_ops::preview_for_pending_action_with_config(&executor_cfg, &action).map(|preview| (action, preview))) {
                             Ok(value) => value,
                             Err(error) => {
                                 agent_ops::log_pending_action_validation(&error);
@@ -12073,7 +12073,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             let registry = product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
             if registry.account_for(&request.session_id)? != request.account { return Err("session_account_mismatch".into()); }
             let proposed = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":"calendar", "target":request.href,
-                "change":{"verb":"task_attributes", "collection":request.collection, "uid":request.uid, "priority":request.priority, "due":request.due, "due_date":request.due_date}})).map_err(|_| "confirmation_unavailable")?;
+                "change":{"verb":"task_attributes", "collection":request.collection, "uid":request.uid, "priority":request.priority, "due":request.due, "due_date":request.due_date, "start":request.start}})).map_err(|_| "confirmation_unavailable")?;
             let action = agent_ops::bind_provider_task_attributes(&cfg, proposed)?;
             let preview = agent_ops::preview_for_pending_action_with_config(&cfg, &action)?;
             let turn_id = turn_id_from_request_id(&request.request_id)?;
@@ -12279,6 +12279,72 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             let proposed = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":request.service, "target":request.collection,
                 "change":{"verb":"dav_acl", "collection":request.collection, "principal":request.principal, "privilege":request.privilege}})).map_err(|_| "confirmation_unavailable")?;
             let action = agent_ops::bind_provider_dav_acl(&cfg, proposed)?;
+            let preview = agent_ops::preview_for_pending_action_with_config(&cfg, &action)?;
+            let turn_id = turn_id_from_request_id(&request.request_id)?;
+            let owner = isyncyou_agent::PendingOwnerBinding { account:request.account.clone(), session_id:request.session_id.clone(), request_id:request.request_id.clone(), turn_id:turn_id.clone() };
+            let (pending, token) = self.pending.register_bound(action, preview.text, unix_now_ms(), AGENT_CONFIRM_TTL_MS, owner.clone()).map_err(|_| "confirmation_unavailable")?;
+            let result = (|| {
+                let installation = account_lifecycle_repository(&self.oauth_dir)?.load_existing().map_err(|_| "lifecycle_unavailable")?.ok_or("lifecycle_unavailable")?;
+                let transport_token = session_transport_token(&cfg, &request.account)?;
+                registry.append_user_pending(&transport_token, &owner, installation.principal(), unix_now_ms())
+            })();
+            if let Err(error) = result {
+                let _ = self.pending.cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                if let (Ok(repository), Ok(transport_token)) = (account_lifecycle_repository(&self.oauth_dir), session_transport_token(&cfg, &request.account)) {
+                    if let Ok(Some(installation)) = repository.load_existing() { let _ = registry.append_pending_cancelled(&transport_token, &owner, installation.principal(), unix_now_ms()); }
+                }
+                return Err(error);
+            }
+            Ok(serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}))
+        }
+        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
+        { let _ = request; Err("confirmation_unavailable".into()) }
+    }
+    fn prepare_calendar_alarm(&self, request:&isyncyou_webui::AgentCalendarAlarmPrepareRequest) -> Result<serde_json::Value, String> {
+        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        {
+            if !self.pending.is_persistent() { return Err("confirmation_unavailable".into()); }
+            let cfg = self.runtime_config();
+            if !cfg.provider_accounts.contains_key(&request.account) { return Err("provider_unavailable".into()); }
+            let credentials = agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
+            let registry = product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
+            if registry.account_for(&request.session_id)? != request.account { return Err("session_account_mismatch".into()); }
+            let proposed = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":"calendar", "target":request.href,
+                "change":{"verb":"calendar_alarm", "collection":request.collection, "uid":request.uid, "recurrence_id":request.recurrence_id, "alarm_index":request.alarm_index, "trigger":request.trigger, "description":request.description}})).map_err(|_| "confirmation_unavailable")?;
+            let action = agent_ops::bind_provider_alarm(&cfg, proposed)?;
+            let preview = agent_ops::preview_for_pending_action_with_config(&cfg, &action)?;
+            let turn_id = turn_id_from_request_id(&request.request_id)?;
+            let owner = isyncyou_agent::PendingOwnerBinding { account:request.account.clone(), session_id:request.session_id.clone(), request_id:request.request_id.clone(), turn_id:turn_id.clone() };
+            let (pending, token) = self.pending.register_bound(action, preview.text, unix_now_ms(), AGENT_CONFIRM_TTL_MS, owner.clone()).map_err(|_| "confirmation_unavailable")?;
+            let result = (|| {
+                let installation = account_lifecycle_repository(&self.oauth_dir)?.load_existing().map_err(|_| "lifecycle_unavailable")?.ok_or("lifecycle_unavailable")?;
+                let transport_token = session_transport_token(&cfg, &request.account)?;
+                registry.append_user_pending(&transport_token, &owner, installation.principal(), unix_now_ms())
+            })();
+            if let Err(error) = result {
+                let _ = self.pending.cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                if let (Ok(repository), Ok(transport_token)) = (account_lifecycle_repository(&self.oauth_dir), session_transport_token(&cfg, &request.account)) {
+                    if let Ok(Some(installation)) = repository.load_existing() { let _ = registry.append_pending_cancelled(&transport_token, &owner, installation.principal(), unix_now_ms()); }
+                }
+                return Err(error);
+            }
+            Ok(serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}))
+        }
+        #[cfg(not(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental")))]
+        { let _ = request; Err("confirmation_unavailable".into()) }
+    }
+    fn prepare_task_occurrence(&self, request:&isyncyou_webui::AgentTaskOccurrencePrepareRequest) -> Result<serde_json::Value, String> {
+        #[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+        {
+            if !self.pending.is_persistent() { return Err("confirmation_unavailable".into()); }
+            let cfg = self.runtime_config();
+            if !cfg.provider_accounts.contains_key(&request.account) { return Err("provider_unavailable".into()); }
+            let credentials = agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
+            let registry = product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
+            if registry.account_for(&request.session_id)? != request.account { return Err("session_account_mismatch".into()); }
+            let proposed = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":"calendar", "target":request.href,
+                "change":{"verb":"task_occurrence_completion", "collection":request.collection, "uid":request.uid, "recurrence_id":request.recurrence_id, "complete":request.complete, "window_start":request.window_start, "window_end":request.window_end}})).map_err(|_| "confirmation_unavailable")?;
+            let action = agent_ops::bind_provider_task_occurrence(&cfg, proposed)?;
             let preview = agent_ops::preview_for_pending_action_with_config(&cfg, &action)?;
             let turn_id = turn_id_from_request_id(&request.request_id)?;
             let owner = isyncyou_agent::PendingOwnerBinding { account:request.account.clone(), session_id:request.session_id.clone(), request_id:request.request_id.clone(), turn_id:turn_id.clone() };
@@ -13592,7 +13658,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                         );
                     }
                     Ok(isyncyou_agent::TurnOutcome::PendingConfirmation { action, .. }) => {
-                        let (action, preview) = match agent_ops::bind_provider_contact_name(&executor_cfg, *action).and_then(|action| agent_ops::bind_provider_contact_field(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_contact_add(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_contact_remove(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_task_completion(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_task_parent(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_task_attributes(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_calendar_text(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_calendar_time(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_zoned_time(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_cancellation(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_exception(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_series_rule(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_dav_acl(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_invitation_response(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_dav_delete(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_dav_create(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_mail_action(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_related_draft(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_draft(&executor_cfg, action)).and_then(|action| agent_ops::preview_for_pending_action_with_config(&executor_cfg, &action).map(|preview| (action, preview))) {
+                        let (action, preview) = match agent_ops::bind_provider_contact_name(&executor_cfg, *action).and_then(|action| agent_ops::bind_provider_contact_field(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_contact_add(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_contact_remove(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_task_completion(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_task_parent(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_task_attributes(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_calendar_text(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_calendar_time(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_zoned_time(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_cancellation(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_exception(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_series_rule(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_alarm(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_task_occurrence(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_dav_acl(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_invitation_response(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_dav_delete(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_dav_create(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_mail_action(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_related_draft(&executor_cfg, action)).and_then(|action| agent_ops::bind_provider_draft(&executor_cfg, action)).and_then(|action| agent_ops::preview_for_pending_action_with_config(&executor_cfg, &action).map(|preview| (action, preview))) {
                             Ok(value) => value,
                             Err(e) => {
                                 let _ = hub.emit(
@@ -15679,6 +15745,13 @@ impl isyncyou_webui::CalendarWriteHandler for DaemonCalendarWrite {
         let content = String::from_utf8(bytes).map_err(|_| "invalid_freebusy_response")?;
         if content.len() > 1024 * 1024 { return Err("freebusy_response_too_large".into()); }
         Ok(serde_json::json!({"account":account,"collection":collection,"start":start,"end":end,"provenance":"live","content":content}))
+    }
+    fn provider_expanded_tasks_month(&self, account:&str, collection:&str, year:u32, month:u32) -> Result<serde_json::Value, String> {
+        let (start,end) = calendar_month_bounds(year,month).ok_or("invalid_calendar_window")?;
+        let cfg = match &self.config_path { Some(path) => { let cfg = Config::load(path)?; cfg.validate().map_err(|_| "account_config_unavailable")?; cfg }, None => self.cfg.clone() };
+        let items = isyncyou_engine::dav_live::expanded_task_views(&cfg,account,"/.well-known/caldav",collection,&start,&end,None)?;
+        let values:Vec<_> = items.into_iter().map(|item| match item.view { Ok(view) => serde_json::json!({"href":item.remote_id,"etag":item.etag,"view":view}), Err(_) => serde_json::json!({"href":item.remote_id,"etag":item.etag,"error":"projection_unavailable"}) }).collect();
+        Ok(serde_json::json!({"account":account,"collection":collection,"start":start,"end":end,"provenance":"live","items":values}))
     }
     fn provider_expanded_month(&self, account:&str, collection:&str, year:u32, month:u32) -> Result<serde_json::Value, String> {
         let (start,end) = calendar_month_bounds(year,month).ok_or("invalid_calendar_window")?;

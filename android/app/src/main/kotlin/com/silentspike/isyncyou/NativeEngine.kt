@@ -107,7 +107,8 @@ object NativeEngine {
     external fun nativeProviderBroker(filesDir: String, account: String, operation: String, request: String): String
     external fun nativeProviderPush(filesDir: String, account: String, operation: String, request: String): String
 
-    /** Native-only reminder claims; no Android worker is scheduled until coverage is qualified. */
+    /** Native-only planning and dispatch; records never cross the WebView boundary. */
+    external fun nativeReminderPlan(filesDir: String, request: String): String
     external fun nativeReminderClaim(filesDir: String, record: String): String
     external fun nativeReminderAcknowledge(filesDir: String, record: String, tag: String): Int
 

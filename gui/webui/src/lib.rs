@@ -402,8 +402,10 @@ product_post_routes! {
     AgentComposerIdentities => ("/api/v1/agent/composer/identities", 8 * 1024, Agent),
     AgentContactNamePrepare => ("/api/v1/agent/contact/name/prepare", 8 * 1024, Agent),
     AgentTaskCompletionPrepare => ("/api/v1/agent/task/completion/prepare", 8 * 1024, Agent),
+    AgentTaskOccurrencePrepare => ("/api/v1/agent/task/occurrence/prepare", 8 * 1024, Agent),
     AgentCalendarTextPrepare => ("/api/v1/agent/calendar/text/prepare", 8 * 1024, Agent),
     AgentCalendarTimePrepare => ("/api/v1/agent/calendar/time/prepare", 8 * 1024, Agent),
+    AgentCalendarAlarmPrepare => ("/api/v1/agent/calendar/alarm/prepare", 8 * 1024, Agent),
     AgentDavAclPrepare => ("/api/v1/agent/dav/acl/prepare", 8 * 1024, Agent),
     AgentInvitationResponsePrepare => ("/api/v1/agent/calendar/invitation/prepare", 8 * 1024, Agent),
     AgentDavDeletePrepare => ("/api/v1/agent/dav/delete/prepare", 8 * 1024, Agent),
@@ -453,7 +455,7 @@ impl ProductPostRoute {
         use ProductPostRoute::*;
         match self {
             AgentTurn => ProductReplayPolicy::AtomicTurnAdmission,
-            AccountLoginStart | AccountQuarantineList | AgentUserPresenceStart | AgentComposerPrepare | AgentComposerIdentities | AgentContactNamePrepare | AgentTaskCompletionPrepare | AgentCalendarTextPrepare | AgentCalendarTimePrepare | AgentDavAclPrepare | AgentInvitationResponsePrepare | AgentDavDeletePrepare | AgentDavCreatePrepare | AgentContactFieldPrepare | AgentMailActionPrepare | AgentTaskAttributesPrepare | AgentTaskParentPrepare | AgentCancellationPrepare | AgentContactPhotoPrepare | AgentSingleCapturePrepare | AgentRecoveryJobsPrepare | AgentRecoveryImportPrepare | AgentRecoveryReconcile => ProductReplayPolicy::EphemeralResponse,
+            AccountLoginStart | AccountQuarantineList | AgentUserPresenceStart | AgentComposerPrepare | AgentComposerIdentities | AgentContactNamePrepare | AgentTaskCompletionPrepare | AgentTaskOccurrencePrepare | AgentCalendarTextPrepare | AgentCalendarTimePrepare | AgentCalendarAlarmPrepare | AgentDavAclPrepare | AgentInvitationResponsePrepare | AgentDavDeletePrepare | AgentDavCreatePrepare | AgentContactFieldPrepare | AgentMailActionPrepare | AgentTaskAttributesPrepare | AgentTaskParentPrepare | AgentCancellationPrepare | AgentContactPhotoPrepare | AgentSingleCapturePrepare | AgentRecoveryJobsPrepare | AgentRecoveryImportPrepare | AgentRecoveryReconcile => ProductReplayPolicy::EphemeralResponse,
             AccountLoginPoll
             | AccountLoginCancel
             | MutationIntentCreate
@@ -1347,8 +1349,10 @@ fn scalar_product_fields(route: ProductPostRoute) -> Option<&'static [&'static s
         | AgentComposerIdentities
         | AgentContactNamePrepare
         | AgentTaskCompletionPrepare
+        | AgentTaskOccurrencePrepare
         | AgentCalendarTextPrepare
         | AgentCalendarTimePrepare
+        | AgentCalendarAlarmPrepare
         | AgentDavAclPrepare
         | AgentInvitationResponsePrepare
         | AgentDavDeletePrepare
@@ -1784,8 +1788,10 @@ fn canonicalize_scalar_product_payload(
         | AgentComposerIdentities
         | AgentContactNamePrepare
         | AgentTaskCompletionPrepare
+        | AgentTaskOccurrencePrepare
         | AgentCalendarTextPrepare
         | AgentCalendarTimePrepare
+        | AgentCalendarAlarmPrepare
         | AgentDavAclPrepare
         | AgentInvitationResponsePrepare
         | AgentDavDeletePrepare
@@ -1887,8 +1893,10 @@ fn canonicalize_product_payload(
         AgentComposerIdentities => canonical_typed!(AgentComposerIdentitiesRequest),
         AgentContactNamePrepare => canonical_typed!(AgentContactNamePrepareRequest),
         AgentTaskCompletionPrepare => canonical_typed!(AgentTaskCompletionPrepareRequest),
+        AgentTaskOccurrencePrepare => canonical_typed!(AgentTaskOccurrencePrepareRequest),
         AgentCalendarTextPrepare => canonical_typed!(AgentCalendarTextPrepareRequest),
         AgentCalendarTimePrepare => canonical_typed!(AgentCalendarTimePrepareRequest),
+        AgentCalendarAlarmPrepare => canonical_typed!(AgentCalendarAlarmPrepareRequest),
         AgentDavAclPrepare => canonical_typed!(AgentDavAclPrepareRequest),
         AgentInvitationResponsePrepare => canonical_typed!(AgentInvitationResponsePrepareRequest),
         AgentDavDeletePrepare => canonical_typed!(AgentDavDeletePrepareRequest),
@@ -2079,6 +2087,10 @@ fn validate_typed_product_request(
             let request = serde_json::from_value::<AgentTaskCompletionPrepareRequest>(value.clone()).map_err(|_| no_store_json_error(400, "invalid product request"))?;
             (valid_opaque_agent_id(&request.session_id) && !request.account.is_empty() && !request.collection.is_empty() && !request.href.is_empty() && !request.uid.is_empty()).then_some(()).ok_or_else(|| no_store_json_error(400, "invalid product request"))
         }
+        AgentTaskOccurrencePrepare => {
+            let r = serde_json::from_value::<AgentTaskOccurrencePrepareRequest>(value.clone()).map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&r.session_id) && !r.account.is_empty() && !r.collection.is_empty() && !r.href.is_empty() && !r.uid.is_empty() && !r.recurrence_id.is_empty() && r.complete && !r.window_start.is_empty() && !r.window_end.is_empty()).then_some(()).ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
         AgentCalendarTextPrepare => {
             let request = serde_json::from_value::<AgentCalendarTextPrepareRequest>(value.clone()).map_err(|_| no_store_json_error(400, "invalid product request"))?;
             (valid_opaque_agent_id(&request.session_id) && !request.account.is_empty() && !request.collection.is_empty() && !request.href.is_empty() && !request.uid.is_empty() && matches!(request.field.as_str(), "SUMMARY" | "DESCRIPTION") && !request.new_value.is_empty()).then_some(()).ok_or_else(|| no_store_json_error(400, "invalid product request"))
@@ -2086,6 +2098,10 @@ fn validate_typed_product_request(
         AgentCalendarTimePrepare => {
             let request = serde_json::from_value::<AgentCalendarTimePrepareRequest>(value.clone()).map_err(|_| no_store_json_error(400, "invalid product request"))?;
             (valid_opaque_agent_id(&request.session_id) && !request.account.is_empty() && !request.collection.is_empty() && !request.href.is_empty() && !request.uid.is_empty() && !request.start.is_empty() && !request.end.is_empty()).then_some(()).ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentCalendarAlarmPrepare => {
+            let r = serde_json::from_value::<AgentCalendarAlarmPrepareRequest>(value.clone()).map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&r.session_id) && !r.account.is_empty() && !r.collection.is_empty() && !r.href.is_empty() && !r.uid.is_empty() && (r.alarm_index.is_some() || r.trigger.is_some())).then_some(()).ok_or_else(|| no_store_json_error(400, "invalid product request"))
         }
         AgentDavAclPrepare => {
             let request = serde_json::from_value::<AgentDavAclPrepareRequest>(value.clone()).map_err(|_| no_store_json_error(400, "invalid product request"))?;
@@ -2113,7 +2129,7 @@ fn validate_typed_product_request(
         }
         AgentTaskAttributesPrepare => {
             let r = serde_json::from_value::<AgentTaskAttributesPrepareRequest>(value.clone()).map_err(|_| no_store_json_error(400, "invalid product request"))?;
-            (valid_opaque_agent_id(&r.session_id) && !r.account.is_empty() && !r.collection.is_empty() && !r.href.is_empty() && !r.uid.is_empty() && (r.priority.is_some() || r.due.is_some())).then_some(()).ok_or_else(|| no_store_json_error(400, "invalid product request"))
+            (valid_opaque_agent_id(&r.session_id) && !r.account.is_empty() && !r.collection.is_empty() && !r.href.is_empty() && !r.uid.is_empty() && (r.priority.is_some() || r.due.is_some() || r.start.is_some())).then_some(()).ok_or_else(|| no_store_json_error(400, "invalid product request"))
         }
         AgentTaskParentPrepare => {
             let r = serde_json::from_value::<AgentTaskParentPrepareRequest>(value.clone()).map_err(|_| no_store_json_error(400, "invalid product request"))?;
@@ -2943,10 +2959,16 @@ pub struct AgentContactNamePrepareRequest { pub request_id:String, pub session_i
 pub struct AgentTaskCompletionPrepareRequest { pub request_id:String, pub session_id:String, pub account:String, pub collection:String, pub href:String, pub uid:String, pub recurrence_id:Option<String>, pub complete:bool }
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct AgentTaskOccurrencePrepareRequest { pub request_id:String, pub session_id:String, pub account:String, pub collection:String, pub href:String, pub uid:String, pub recurrence_id:String, pub complete:bool, pub window_start:String, pub window_end:String }
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentCalendarTextPrepareRequest { pub request_id:String, pub session_id:String, pub account:String, pub collection:String, pub href:String, pub uid:String, pub recurrence_id:Option<String>, pub field:String, pub new_value:String }
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentCalendarTimePrepareRequest { pub request_id:String, pub session_id:String, pub account:String, pub collection:String, pub href:String, pub uid:String, pub start:String, pub end:String, pub date_only:bool, pub tzid:Option<String>, pub recurrence_id:Option<String>, pub window_start:Option<String>, pub window_end:Option<String>, pub rule:Option<String> }
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCalendarAlarmPrepareRequest { pub request_id:String, pub session_id:String, pub account:String, pub collection:String, pub href:String, pub uid:String, pub recurrence_id:Option<String>, pub alarm_index:Option<usize>, pub trigger:Option<String>, pub description:Option<String> }
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentDavAclPrepareRequest { pub request_id:String, pub session_id:String, pub account:String, pub service:String, pub collection:String, pub principal:String, pub privilege:Option<String> }
@@ -2967,7 +2989,7 @@ pub struct AgentContactFieldPrepareRequest { pub request_id:String, pub session_
 pub struct AgentMailActionPrepareRequest { pub request_id:String, pub session_id:String, pub account:String, pub email_id:String, pub action:Value }
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgentTaskAttributesPrepareRequest { pub request_id:String, pub session_id:String, pub account:String, pub collection:String, pub href:String, pub uid:String, pub priority:Option<u8>, pub due:Option<String>, pub due_date:bool }
+pub struct AgentTaskAttributesPrepareRequest { pub request_id:String, pub session_id:String, pub account:String, pub collection:String, pub href:String, pub uid:String, pub priority:Option<u8>, pub due:Option<String>, pub due_date:bool, pub start:Option<String> }
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentTaskParentPrepareRequest { pub request_id:String, pub session_id:String, pub account:String, pub collection:String, pub href:String, pub uid:String, pub new_parent:Option<String> }
@@ -3002,8 +3024,10 @@ pub trait AgentHandler: Send + Sync {
     fn start_turn(&self, account: &str, prompt: &str) -> Result<String, String>;
     fn prepare_contact_name(&self, _request:&AgentContactNamePrepareRequest) -> Result<Value, String> { Err("confirmation_unavailable".into()) }
     fn prepare_task_completion(&self, _request:&AgentTaskCompletionPrepareRequest) -> Result<Value, String> { Err("confirmation_unavailable".into()) }
+    fn prepare_task_occurrence(&self, _request:&AgentTaskOccurrencePrepareRequest) -> Result<Value, String> { Err("confirmation_unavailable".into()) }
     fn prepare_calendar_text(&self, _request:&AgentCalendarTextPrepareRequest) -> Result<Value, String> { Err("confirmation_unavailable".into()) }
     fn prepare_calendar_time(&self, _request:&AgentCalendarTimePrepareRequest) -> Result<Value, String> { Err("confirmation_unavailable".into()) }
+    fn prepare_calendar_alarm(&self, _request:&AgentCalendarAlarmPrepareRequest) -> Result<Value, String> { Err("confirmation_unavailable".into()) }
     fn prepare_dav_acl(&self, _request:&AgentDavAclPrepareRequest) -> Result<Value, String> { Err("confirmation_unavailable".into()) }
     fn prepare_invitation_response(&self, _request:&AgentInvitationResponsePrepareRequest) -> Result<Value, String> { Err("confirmation_unavailable".into()) }
     fn prepare_dav_delete(&self, _request:&AgentDavDeletePrepareRequest) -> Result<Value, String> { Err("confirmation_unavailable".into()) }
@@ -3593,6 +3617,7 @@ pub trait CalendarWriteHandler: Send + Sync {
     fn provider_contact_photo(&self, _account:&str, _collection:&str, _href:&str) -> Result<Option<(String,Vec<u8>)>,String> { Err("provider_photo_unavailable".into()) }
     fn provider_calendar(&self, _account:&str, _collection:Option<&str>, _after:&str) -> Result<Value, String> { Err("provider_calendar_unavailable".into()) }
     fn provider_expanded_month(&self, _account:&str, _collection:&str, _year:u32, _month:u32) -> Result<Value, String> { Err("provider_calendar_unavailable".into()) }
+    fn provider_expanded_tasks_month(&self, _account:&str, _collection:&str, _year:u32, _month:u32) -> Result<Value, String> { Err("provider_calendar_unavailable".into()) }
     fn provider_freebusy_month(&self, _account:&str, _collection:&str, _year:u32, _month:u32) -> Result<Value, String> { Err("provider_freebusy_unavailable".into()) }
     /// Create an event; returns the new cloud id.
     fn create(&self, account: &str, event: &Value) -> Result<String, String>;
@@ -5195,8 +5220,10 @@ impl Router {
                 ProductPostRoute::AgentComposerIdentities => self.agent_composer_identities(req),
                 ProductPostRoute::AgentContactNamePrepare => self.agent_contact_name_prepare(req),
                 ProductPostRoute::AgentTaskCompletionPrepare => self.agent_task_completion_prepare(req),
+                ProductPostRoute::AgentTaskOccurrencePrepare => self.agent_task_occurrence_prepare(req),
                 ProductPostRoute::AgentCalendarTextPrepare => self.agent_calendar_text_prepare(req),
                 ProductPostRoute::AgentCalendarTimePrepare => self.agent_calendar_time_prepare(req),
+                ProductPostRoute::AgentCalendarAlarmPrepare => self.agent_calendar_alarm_prepare(req),
                 ProductPostRoute::AgentDavAclPrepare => self.agent_dav_acl_prepare(req),
                 ProductPostRoute::AgentInvitationResponsePrepare => self.agent_invitation_response_prepare(req),
                 ProductPostRoute::AgentDavDeletePrepare => self.agent_dav_delete_prepare(req),
@@ -8387,6 +8414,13 @@ impl Router {
         match handler.prepare_contact_name(&request) { Ok(value) => with_no_store(ApiResponse::ok_json(&value)), Err(_) => no_store_json_error(409, "contact_prepare_unavailable") }
     }
 
+    fn agent_task_occurrence_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) { Ok(handler) => handler, Err(error) => return with_no_store(error) };
+        let r: AgentTaskOccurrencePrepareRequest = match parse_agent_strict_json(req, "task occurrence prepare") { Ok(request) => request, Err(error) => return error };
+        if !valid_client_request_id(&r.request_id) || !valid_opaque_agent_id(&r.session_id) || r.account.is_empty() || r.collection.is_empty() || r.href.is_empty() || r.uid.is_empty() || r.recurrence_id.is_empty() || !r.complete || r.window_start.is_empty() || r.window_end.is_empty() { return no_store_json_error(400, "invalid task request"); }
+        match handler.prepare_task_occurrence(&r) { Ok(value) => with_no_store(ApiResponse::ok_json(&value)), Err(_) => no_store_json_error(409, "task_prepare_unavailable") }
+    }
+
     fn agent_task_completion_prepare(&self, req: &ApiRequest) -> ApiResponse {
         let handler = match self.agent_gate(req) { Ok(handler) => handler, Err(error) => return with_no_store(error) };
         let request: AgentTaskCompletionPrepareRequest = match parse_agent_strict_json(req, "task completion prepare") { Ok(request) => request, Err(error) => return error };
@@ -8399,6 +8433,13 @@ impl Router {
         let request: AgentCalendarTextPrepareRequest = match parse_agent_strict_json(req, "calendar text prepare") { Ok(request) => request, Err(error) => return error };
         if !valid_client_request_id(&request.request_id) || !valid_opaque_agent_id(&request.session_id) || request.account.is_empty() || request.collection.is_empty() || request.href.is_empty() || request.uid.is_empty() || !matches!(request.field.as_str(), "SUMMARY" | "DESCRIPTION") || request.new_value.is_empty() { return no_store_json_error(400, "invalid calendar request"); }
         match handler.prepare_calendar_text(&request) { Ok(value) => with_no_store(ApiResponse::ok_json(&value)), Err(_) => no_store_json_error(409, "calendar_prepare_unavailable") }
+    }
+
+    fn agent_calendar_alarm_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) { Ok(handler) => handler, Err(error) => return with_no_store(error) };
+        let request: AgentCalendarAlarmPrepareRequest = match parse_agent_strict_json(req, "calendar alarm prepare") { Ok(request) => request, Err(error) => return error };
+        if !valid_client_request_id(&request.request_id) || !valid_opaque_agent_id(&request.session_id) || request.account.is_empty() || request.collection.is_empty() || request.href.is_empty() || request.uid.is_empty() || (request.alarm_index.is_none() && request.trigger.is_none()) { return no_store_json_error(400, "invalid calendar request"); }
+        match handler.prepare_calendar_alarm(&request) { Ok(value) => with_no_store(ApiResponse::ok_json(&value)), Err(_) => no_store_json_error(409, "calendar_alarm_prepare_unavailable") }
     }
 
     fn agent_calendar_time_prepare(&self, req: &ApiRequest) -> ApiResponse {
@@ -8475,7 +8516,7 @@ impl Router {
     fn agent_task_attributes_prepare(&self, req: &ApiRequest) -> ApiResponse {
         let handler = match self.agent_gate(req) { Ok(handler) => handler, Err(error) => return with_no_store(error) };
         let r: AgentTaskAttributesPrepareRequest = match parse_agent_strict_json(req, "task attributes prepare") { Ok(request) => request, Err(error) => return error };
-        if !valid_client_request_id(&r.request_id) || !valid_opaque_agent_id(&r.session_id) || r.account.is_empty() || r.collection.is_empty() || r.href.is_empty() || r.uid.is_empty() || (r.priority.is_none() && r.due.is_none()) { return no_store_json_error(400, "invalid task request"); }
+        if !valid_client_request_id(&r.request_id) || !valid_opaque_agent_id(&r.session_id) || r.account.is_empty() || r.collection.is_empty() || r.href.is_empty() || r.uid.is_empty() || (r.priority.is_none() && r.due.is_none() && r.start.is_none()) { return no_store_json_error(400, "invalid task request"); }
         match handler.prepare_task_attributes(&r) { Ok(value) => with_no_store(ApiResponse::ok_json(&value)), Err(_) => no_store_json_error(409, "task_prepare_unavailable") }
     }
 
@@ -9635,7 +9676,7 @@ impl Router {
         let (Some(account), Some(collection), Some(year), Some(month)) = (req.q("account"),req.q("collection"),req.q("year").and_then(|v| v.parse::<u32>().ok()),req.q("month").and_then(|v| v.parse::<u32>().ok())) else { return ApiResponse::error(400,"invalid_calendar_window"); };
         if !(1900..=9998).contains(&year) || !(1..=12).contains(&month) || self.provider_origin(account).is_none() { return ApiResponse::error(400,"invalid_calendar_window"); }
         let Some(handler) = self.calendar_write.as_ref() else { return ApiResponse::error(503,"provider_calendar_unavailable"); };
-        let value = if req.q("freebusy") == Some("1") { handler.provider_freebusy_month(account,collection,year,month) } else { handler.provider_expanded_month(account,collection,year,month) };
+        let value = if req.q("freebusy") == Some("1") { handler.provider_freebusy_month(account,collection,year,month) } else if req.q("tasks") == Some("1") { handler.provider_expanded_tasks_month(account,collection,year,month) } else { handler.provider_expanded_month(account,collection,year,month) };
         match value { Ok(value) => with_no_store(ApiResponse::ok_json(&value)), Err(error) if error == "freebusy_access_denied" => with_no_store(ApiResponse::error(403,"freebusy_access_denied")), Err(_) => with_no_store(ApiResponse::error(503,"provider_calendar_unavailable")) }
     }
 

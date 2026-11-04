@@ -229,6 +229,15 @@ pub fn expanded_event_views(cfg: &Config, account: &str, entry: &str, collection
     }).collect())
 }
 
+pub fn expanded_task_views(cfg: &Config, account: &str, entry: &str, collection: &str, start: &str, end: &str, credentials: Option<&dyn ProviderCredentialStore>) -> Result<Vec<ProjectedObject>, String> {
+    let origin = configured_origin(cfg,account)?;
+    let client = match credentials { Some(c) => client_with_store(cfg,account,&origin,c)?, None => client(cfg,account,&origin)? };
+    if !client.discover(entry).map_err(|e| e.to_string())?.iter().any(|c| c.url == collection && c.calendar) { return Err("Collection is not currently accessible".into()); }
+    let scope = ProviderScope {account_id:account.into(),origin,service:"calendar".into(),collection:collection.into()};
+    let tasks = client.expanded_tasks(&scope,start,end).map_err(|e| e.to_string())?;
+    Ok(tasks.into_iter().map(|task| ProjectedObject {remote_id:task.href,etag:Some(task.etag),view:isyncyou_connectors::dav::projection::calendar(task.calendar_data.as_bytes())}).collect())
+}
+
 /// Read a single currently accessible native object; useful for explicit
 /// conflict inspection and restore verification, without changing the cache.
 pub fn read_current(cfg: &Config, account: &str, entry: &str, collection: &str, service: &str, href: &str, credentials: Option<&dyn ProviderCredentialStore>) -> Result<ProviderObject, String> {
@@ -328,6 +337,8 @@ impl ReminderPlan {
 /// occurrences outside that window cannot fire inside the trigger window.
 pub fn plan_account_reminders_with_store(cfg: &Config, account: &str, entry: &str, occurrence_start: &str, occurrence_end: &str, window_start: i64, window_end: i64, floating_tzid: Option<&str>, credentials: &dyn ProviderCredentialStore) -> Result<Vec<serde_json::Value>, String> {
     if window_end <= window_start || window_end.saturating_sub(window_start) > 31 * 86400 || occurrence_start >= occurrence_end { return Err("Invalid reminder planning window".into()); }
+    let start = isyncyou_connectors::dav::reminders::utc_window_bound(occurrence_start)?; let end = isyncyou_connectors::dav::reminders::utc_window_bound(occurrence_end)?;
+    if start > window_start.saturating_sub(368 * 86400) || end < window_end.saturating_add(368 * 86400) { return Err("Occurrence window cannot cover bounded alarms".into()); }
     let origin = configured_origin(cfg, account)?;
     let client = client_with_store(cfg, account, &origin, credentials)?;
     let collections = client.discover(entry).map_err(|e| e.to_string())?;
@@ -352,6 +363,7 @@ pub fn plan_account_reminders_with_store(cfg: &Config, account: &str, entry: &st
             for object in &page {
                 objects_seen += 1;
                 if objects_seen > 10000 { return Err("Reminder account resource limit exceeded".into()); }
+                isyncyou_connectors::dav::reminders::require_bounded_relative_alarms(&object.raw).map_err(|_| "unsupported_alarm_coverage")?;
                 let expansion = by_href.remove(&object.remote_id);
                 let Some(expansion) = expansion else { continue; };
                 if object.etag.as_deref() != Some(expansion.etag.as_str()) { return Err("Calendar changed during reminder enumeration".into()); }
@@ -371,6 +383,28 @@ pub fn plan_account_reminders_with_store(cfg: &Config, account: &str, entry: &st
         if store.provider_cursor(&scope).map_err(|e| e.to_string())? != initial_cursor || store.provider_accessible(&scope).map_err(|e| e.to_string())? != initial_access { return Err("Calendar changed during reminder enumeration".into()); }
     }
     Ok(records)
+}
+
+/// A content-free revision for deciding whether a previously complete account
+/// plan can be reused. A changed collection set, access state or sync cursor
+/// changes the digest. Discovery and every incremental sync must succeed.
+pub fn reminder_account_revision_with_store(cfg: &Config, account: &str, entry: &str, credentials: &dyn ProviderCredentialStore) -> Result<String, String> {
+    let origin = configured_origin(cfg,account)?;
+    let client = client_with_store(cfg,account,&origin,credentials)?;
+    let mut collections: Vec<_> = client.discover(entry).map_err(|e| e.to_string())?.into_iter().filter(|c| c.calendar).map(|c| c.url).collect();
+    collections.sort();
+    if collections.len() > 1000 || collections.windows(2).any(|v| v[0] == v[1]) { return Err("Reminder collection set is invalid".into()); }
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    for value in [account,&origin] { digest.update(&(value.len() as u64).to_be_bytes()); digest.update(value.as_bytes()); }
+    for collection in collections {
+        let scope = ProviderScope {account_id:account.into(),origin:origin.clone(),service:"calendar".into(),collection};
+        sync_detached(cfg,&client,&scope)?;
+        let store = crate::provider_store::open_readonly(cfg,account)?;
+        if store.provider_accessible(&scope).map_err(|e| e.to_string())? != Some(true) { return Err("Reminder calendar access unavailable".into()); }
+        let cursor = store.provider_cursor(&scope).map_err(|e| e.to_string())?.filter(|v| !v.is_empty()).ok_or("Reminder calendar cursor unavailable")?;
+        for value in [&scope.collection,&cursor] { digest.update(&(value.len() as u64).to_be_bytes()); digest.update(value.as_bytes()); }
+    }
+    Ok(digest.finish().as_ref().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 pub enum ReminderClaim {
@@ -1002,6 +1036,39 @@ pub struct PreparedTaskCompletion {
     pub edit: PreparedEdit,
 }
 
+pub struct PreparedTaskOccurrenceCompletion {
+    pub origin: String,
+    pub uid: String,
+    pub recurrence_id: String,
+    pub summary: String,
+    pub start: String,
+    pub due: String,
+    pub completed_at: Option<String>,
+    pub edit: PreparedEdit,
+}
+
+pub fn prepare_task_occurrence_completion_preview(cfg: &Config, account: &str, entry: &str, collection: &str, href: &str, uid: &str, recurrence_id: &str, completed_at: Option<&str>, window_start: &str, window_end: &str, credentials: Option<&dyn ProviderCredentialStore>) -> Result<PreparedTaskOccurrenceCompletion, String> {
+    let parse = isyncyou_connectors::dav::reminders::utc_window_bound;
+    let (begin,end,occurrence) = (parse(window_start)?,parse(window_end)?,parse(recurrence_id)?);
+    if end <= begin || end.saturating_sub(begin) > 31 * 86400 || occurrence < begin || occurrence >= end { return Err("Invalid occurrence expansion window".into()); }
+    let origin = configured_origin(cfg, account)?;
+    let client = match credentials {Some(c) => client_with_store(cfg,account,&origin,c)?,None => client(cfg,account,&origin)?};
+    if !client.discover(entry).map_err(|e| e.to_string())?.iter().any(|c| c.calendar && c.url == collection) { return Err("Calendar is not currently accessible".into()); }
+    let scope = ProviderScope {account_id:account.into(),origin:origin.clone(),service:"calendar".into(),collection:collection.into()};
+    let object = {
+        let store = crate::provider_store::open_readonly(cfg,account)?;
+        if store.provider_accessible(&scope).map_err(|e| e.to_string())? != Some(true) { return Err("Calendar access is unknown or unavailable".into()); }
+        store.provider_object(&scope,href).map_err(|e| e.to_string())?.ok_or("Cached task missing")?
+    };
+    let expected_etag = object.etag.filter(|tag| !tag.is_empty() && !tag.starts_with("W/")).ok_or("Strong ETag required")?;
+    let expansions = client.expanded_tasks(&scope,window_start,window_end).map_err(|e| e.to_string())?;
+    let mut matches = expansions.iter().filter(|item| item.href == object.remote_id);
+    let expansion = matches.next().ok_or("Task occurrence is not in server expansion")?;
+    if matches.next().is_some() || expansion.etag != expected_etag { return Err("Task changed during expansion".into()); }
+    let (summary,start,due,raw) = isyncyou_connectors::dav::edit::preview_task_occurrence_completion(&object.raw,expansion.calendar_data.as_bytes(),uid,recurrence_id,completed_at)?;
+    Ok(PreparedTaskOccurrenceCompletion {origin,uid:uid.into(),recurrence_id:recurrence_id.into(),summary,start,due,completed_at:completed_at.map(str::to_owned),edit:PreparedEdit {href:object.remote_id,expected_etag,expected_collection_token:None,raw}})
+}
+
 /// Capture once before confirmation and reuse unchanged for re-preparation.
 pub fn current_task_completion_time() -> Result<String, String> {
     isyncyou_connectors::dav::edit::current_task_completion_time()
@@ -1036,19 +1103,25 @@ pub struct PreparedTaskAttributes {
     pub name: String,
     pub old_priority: Option<String>,
     pub old_due: Option<String>,
+    pub old_start: Option<String>,
     pub new_priority: Option<u8>,
     pub new_due: Option<(String, bool)>,
+    pub new_start: Option<String>,
     pub edit: PreparedEdit,
 }
 
 pub fn prepare_task_attributes_preview(cfg: &Config, account: &str, collection: &str, href: &str, uid: &str, priority: Option<u8>, due: Option<(&str, bool)>) -> Result<PreparedTaskAttributes, String> {
+    prepare_task_attributes_with_start_preview(cfg,account,collection,href,uid,priority,due,None)
+}
+
+pub fn prepare_task_attributes_with_start_preview(cfg: &Config, account: &str, collection: &str, href: &str, uid: &str, priority: Option<u8>, due: Option<(&str, bool)>, start: Option<&str>) -> Result<PreparedTaskAttributes, String> {
     let (origin,store) = configured(cfg,account)?;
     let scope = ProviderScope {account_id:account.into(),origin:origin.clone(),service:"calendar".into(),collection:collection.into()};
     if store.provider_accessible(&scope).map_err(|e| e.to_string())? != Some(true) { return Err("Task collection access is unknown or unavailable".into()); }
     let object = store.provider_object(&scope,href).map_err(|e| e.to_string())?.ok_or("Cached task resource missing")?;
     let expected_etag = object.etag.filter(|tag| !tag.is_empty() && !tag.starts_with("W/")).ok_or("Strong ETag required")?;
-    let (name,old_priority,old_due,raw) = isyncyou_connectors::dav::edit::preview_task_attributes(&object.raw,uid,priority,due)?;
-    Ok(PreparedTaskAttributes {origin,uid:uid.into(),name,old_priority,old_due,new_priority:priority,new_due:due.map(|(value,date)| (value.into(),date)),edit:PreparedEdit {href:object.remote_id,expected_etag,expected_collection_token:None,raw}})
+    let (name,old_priority,old_due,old_start,raw) = isyncyou_connectors::dav::edit::preview_task_attributes_with_start(&object.raw,uid,priority,due,start)?;
+    Ok(PreparedTaskAttributes {origin,uid:uid.into(),name,old_priority,old_due,old_start,new_priority:priority,new_due:due.map(|(value,date)| (value.into(),date)),new_start:start.map(str::to_owned),edit:PreparedEdit {href:object.remote_id,expected_etag,expected_collection_token:None,raw}})
 }
 
 pub(crate) fn prepare_task_parent_in_store(store: &Store, scope: &ProviderScope, href: &str, uid: &str, parent: Option<&str>) -> Result<PreparedEdit, String> {
@@ -1235,6 +1308,26 @@ pub struct PreparedSeriesRule {
     pub old_occurrences: Vec<String>,
     pub new_occurrences: Vec<String>,
     pub edit: PreparedEdit,
+}
+
+pub struct PreparedAlarm {
+    pub origin: String,
+    pub summary: String,
+    pub old_trigger: Option<String>,
+    pub old_description: Option<String>,
+    pub new_trigger: Option<String>,
+    pub new_description: Option<String>,
+    pub edit: PreparedEdit,
+}
+
+pub fn prepare_alarm_preview(cfg: &Config, account: &str, collection: &str, href: &str, uid: &str, recurrence_id: Option<&str>, index: Option<usize>, trigger: Option<&str>, description: Option<&str>) -> Result<PreparedAlarm, String> {
+    let (origin,store) = configured(cfg,account)?;
+    let scope = ProviderScope {account_id:account.into(),origin:origin.clone(),service:"calendar".into(),collection:collection.into()};
+    if store.provider_accessible(&scope).map_err(|e| e.to_string())? != Some(true) { return Err("Calendar access is unknown or unavailable".into()); }
+    let object = store.provider_object(&scope,href).map_err(|e| e.to_string())?.ok_or("Cached calendar resource missing")?;
+    let expected_etag = object.etag.filter(|tag| !tag.is_empty() && !tag.starts_with("W/")).ok_or("Strong ETag required")?;
+    let p = isyncyou_connectors::dav::edit::preview_alarm(&object.raw,uid,recurrence_id,index,trigger,description)?;
+    Ok(PreparedAlarm {origin,summary:p.summary,old_trigger:p.old_trigger,old_description:p.old_description,new_trigger:p.new_trigger,new_description:p.new_description,edit:PreparedEdit {href:object.remote_id,expected_etag,expected_collection_token:None,raw:p.raw}})
 }
 
 pub fn prepare_series_rule_preview(cfg: &Config, account: &str, collection: &str, href: &str, uid: &str, rule: &str) -> Result<PreparedSeriesRule, String> {

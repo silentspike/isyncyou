@@ -139,12 +139,12 @@ fn execute_bound_task_parent(cfg:&Config, action:&isyncyou_agent::ToolAction, pe
 
 fn execute_bound_task_attributes(cfg: &Config, action: &isyncyou_agent::ToolAction, pending_id: &str, gate: &Arc<Mutex<()>>) -> ConfirmedExecutionOutcome {
     let Some(operation_id) = bound_submission_operation_id(pending_id) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
-    let Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskAttributes { target, origin, collection, uid, name, priority, due, due_date, old_priority, old_due, etag, raw_sha256 })) = validate_live_write_action(action) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
+    let Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskAttributes { target, origin, collection, uid, name, priority, due, due_date, start, old_start, new_start, old_priority, old_due, etag, raw_sha256 })) = validate_live_write_action(action) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
     let account = action.account(); let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
-    let prepared = match isyncyou_engine::dav_live::prepare_task_attributes_preview(cfg,account,&collection,&target,&uid,priority,due.as_deref().map(|d| (d,due_date))) { Ok(value) => value, Err(_) => return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) };
-    if prepared.origin != origin || prepared.name != name || prepared.old_priority != old_priority || prepared.old_due != old_due || prepared.edit.href != target || prepared.edit.expected_etag != etag || prepared.edit.expected_collection_token.is_some() || sha256_hex(&prepared.edit.raw) != raw_sha256 { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderConflict); }
+    let prepared = match isyncyou_engine::dav_live::prepare_task_attributes_with_start_preview(cfg,account,&collection,&target,&uid,priority,due.as_deref().map(|d| (d,due_date)),start.as_deref()) { Ok(value) => value, Err(_) => return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) };
+    if prepared.origin != origin || prepared.name != name || prepared.old_priority != old_priority || prepared.old_due != old_due || prepared.old_start != old_start || prepared.new_start != new_start || prepared.edit.href != target || prepared.edit.expected_etag != etag || prepared.edit.expected_collection_token.is_some() || sha256_hex(&prepared.edit.raw) != raw_sha256 { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderConflict); }
     let op = isyncyou_engine::dav_write::ApprovedDavWrite { operation_id, account_id:account.into(), origin, collection, service:"calendar".into(), href:target, expected_etag:Some(etag), expected_collection_token:None, raw:Some(prepared.edit.raw) };
-    match isyncyou_engine::dav_write::execute_task_attributes(cfg,"/.well-known/caldav",&op,&uid,priority,due.as_deref().map(|d| (d,due_date)),None) {
+    match isyncyou_engine::dav_write::execute_task_attributes_with_start(cfg,"/.well-known/caldav",&op,&uid,priority,due.as_deref().map(|d| (d,due_date)),start.as_deref(),None) {
         Ok(isyncyou_engine::dav_write::WriteOutcome::Confirmed(_)) => ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new("Task updated; local synchronization pending")),
         Ok(isyncyou_engine::dav_write::WriteOutcome::Conflict) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderConflict),
         Ok(isyncyou_engine::dav_write::WriteOutcome::Rejected) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderActionRejected),
@@ -284,6 +284,43 @@ fn execute_bound_contact_remove(cfg: &Config, action: &isyncyou_agent::ToolActio
     let op = isyncyou_engine::dav_write::ApprovedDavWrite { operation_id, account_id:account.into(), origin, collection, service:"contacts".into(), href:target, expected_etag:Some(etag), expected_collection_token:None, raw:Some(prepared.edit.raw) };
     match isyncyou_engine::dav_write::execute_contact_remove(cfg,"/.well-known/carddav",&op,&key,index,None) {
         Ok(isyncyou_engine::dav_write::WriteOutcome::Confirmed(_)) => ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new("Contact field removed; local synchronization pending")),
+        Ok(isyncyou_engine::dav_write::WriteOutcome::Conflict) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderConflict),
+        Ok(isyncyou_engine::dav_write::WriteOutcome::Rejected) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderActionRejected),
+        _ => ConfirmedExecutionOutcome::OutcomeUnknown,
+    }
+}
+
+fn execute_bound_task_occurrence(cfg: &Config, action: &isyncyou_agent::ToolAction, pending_id: &str, gate: &Arc<Mutex<()>>) -> ConfirmedExecutionOutcome {
+    let Some(operation_id) = bound_submission_operation_id(pending_id) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
+    let Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskOccurrence { target, collection, uid, recurrence_id, completed_at, window_start, window_end, effect, etag, raw_sha256 })) = validate_live_write_action(action) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
+    let account = action.account(); let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+    let p = match isyncyou_engine::dav_live::prepare_task_occurrence_completion_preview(cfg,account,"/.well-known/caldav",&collection,&target,&uid,&recurrence_id,Some(&completed_at),&window_start,&window_end,None) { Ok(p) => p, Err(_) => return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) };
+    let current = serde_json::json!({"origin":p.origin,"summary":p.summary,"start":p.start,"due":p.due,"completed_at":p.completed_at});
+    if current != effect || p.edit.href != target || p.edit.expected_etag != etag || p.edit.expected_collection_token.is_some() || sha256_hex(&p.edit.raw) != raw_sha256 { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderConflict); }
+    let Some(origin) = current.get("origin").and_then(serde_json::Value::as_str) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
+    if !matches!(cfg.provider_accounts.get(account), Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin: configured, .. }) if configured == origin) { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); }
+    let op = isyncyou_engine::dav_write::ApprovedDavWrite { operation_id, account_id:account.into(), origin:origin.into(), collection, service:"calendar".into(), href:target, expected_etag:Some(etag), expected_collection_token:None, raw:Some(p.edit.raw) };
+    match isyncyou_engine::dav_write::execute_task_occurrence_completion(cfg,"/.well-known/caldav",&op,&uid,&recurrence_id,Some(&completed_at),&window_start,&window_end,None) {
+        Ok(isyncyou_engine::dav_write::WriteOutcome::Confirmed(_)) => ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new("Task occurrence completed; local synchronization pending")),
+        Ok(isyncyou_engine::dav_write::WriteOutcome::Conflict) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderConflict),
+        Ok(isyncyou_engine::dav_write::WriteOutcome::Rejected) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderActionRejected),
+        _ => ConfirmedExecutionOutcome::OutcomeUnknown,
+    }
+}
+
+fn execute_bound_alarm(cfg: &Config, action: &isyncyou_agent::ToolAction, pending_id: &str, gate: &Arc<Mutex<()>>) -> ConfirmedExecutionOutcome {
+    let Some(operation_id) = bound_submission_operation_id(pending_id) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
+    let Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::Alarm { target, collection, uid, recurrence_id, index, trigger, description, effect, etag, raw_sha256 })) = validate_live_write_action(action) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
+    let account = action.account();
+    let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+    let p = match isyncyou_engine::dav_live::prepare_alarm_preview(cfg,account,&collection,&target,&uid,recurrence_id.as_deref(),index,trigger.as_deref(),description.as_deref()) { Ok(p) => p, Err(_) => return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) };
+    let current = serde_json::json!({"origin":p.origin,"summary":p.summary,"old_trigger":p.old_trigger,"old_description":p.old_description,"new_trigger":p.new_trigger,"new_description":p.new_description});
+    if current != effect || p.edit.href != target || p.edit.expected_etag != etag || p.edit.expected_collection_token.is_some() || sha256_hex(&p.edit.raw) != raw_sha256 { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderConflict); }
+    let Some(origin) = current.get("origin").and_then(serde_json::Value::as_str) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
+    if !matches!(cfg.provider_accounts.get(account), Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin: configured, .. }) if configured == origin) { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); }
+    let approved = isyncyou_engine::dav_write::ApprovedDavWrite { operation_id, account_id:account.into(), origin:origin.into(), collection, service:"calendar".into(), href:target, expected_etag:Some(etag), expected_collection_token:None, raw:Some(p.edit.raw) };
+    match isyncyou_engine::dav_write::execute_alarm(cfg,"/.well-known/caldav",&approved,&uid,recurrence_id.as_deref(),index,trigger.as_deref(),description.as_deref(),None) {
+        Ok(isyncyou_engine::dav_write::WriteOutcome::Confirmed(_)) => ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new("Reminder updated; local synchronization pending")),
         Ok(isyncyou_engine::dav_write::WriteOutcome::Conflict) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderConflict),
         Ok(isyncyou_engine::dav_write::WriteOutcome::Rejected) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderActionRejected),
         _ => ConfirmedExecutionOutcome::OutcomeUnknown,
@@ -998,12 +1035,14 @@ enum MailLiveWrite {
 
 #[derive(Debug, Clone, PartialEq)]
 enum CalendarLiveWrite {
+    TaskOccurrence { target:String, collection:String, uid:String, recurrence_id:String, completed_at:String, window_start:String, window_end:String, effect:serde_json::Value, etag:String, raw_sha256:String },
+    Alarm { target:String, collection:String, uid:String, recurrence_id:Option<String>, index:Option<usize>, trigger:Option<String>, description:Option<String>, effect:serde_json::Value, etag:String, raw_sha256:String },
     SeriesRule { target:String, collection:String, uid:String, rule:String, effect:serde_json::Value, etag:String, raw_sha256:String },
     Exception { target:String, origin:String, collection:String, uid:String, recurrence_id:String, summary:String, old_start:String, old_end:String, start:String, end:String, window_start:String, window_end:String, etag:String, raw_sha256:String },
     Cancellation { target:String, collection:String, uid:String, recurrence_id:Option<String>, sequence:u32, effect:serde_json::Value, etag:String, raw_sha256:String },
     ZonedTime { target:String, origin:String, collection:String, uid:String, start:String, end:String, tzid:String, old_start:String, old_start_zone:Option<String>, old_end:String, old_end_zone:Option<String>, etag:String, raw_sha256:String },
     TaskParent { target:String, origin:String, collection:String, uid:String, summary:String, old_parent:Option<String>, new_parent:Option<String>, etag:String, checkpoint:String, raw_sha256:String },
-    TaskAttributes { target:String, origin:String, collection:String, uid:String, name:String, priority:Option<u8>, due:Option<String>, due_date:bool, old_priority:Option<String>, old_due:Option<String>, etag:String, raw_sha256:String },
+    TaskAttributes { target:String, origin:String, collection:String, uid:String, name:String, priority:Option<u8>, due:Option<String>, due_date:bool, start:Option<String>, old_start:Option<String>, new_start:Option<String>, old_priority:Option<String>, old_due:Option<String>, etag:String, raw_sha256:String },
     InvitationResponse { target:String, origin:String, collection:String, uid:String, recurrence_id:Option<String>, attendee:String, organizer:String, old_response:String, response:String, etag:String, raw_sha256:String },
     SetTime { target:String, origin:String, collection:String, uid:String, start:String, end:String, date_only:bool, old_start:String, old_end:String, etag:String, raw_sha256:String },
     SetText { target:String, origin:String, collection:String, uid:String, recurrence_id:Option<String>, field:String, new_value:String, old_value:Option<String>, etag:String, raw_sha256:String },
@@ -1132,6 +1171,8 @@ impl AgentLiveWriteIntent {
             Self::Calendar(CalendarLiveWrite::Cancellation { .. }) => "calendar_cancel",
             Self::Calendar(CalendarLiveWrite::Exception { .. }) => "calendar_exception",
             Self::Calendar(CalendarLiveWrite::SeriesRule { .. }) => "calendar_series_rule",
+            Self::Calendar(CalendarLiveWrite::Alarm { .. }) => "calendar_alarm",
+            Self::Calendar(CalendarLiveWrite::TaskOccurrence { .. }) => "task_occurrence_completion",
             Self::Calendar(CalendarLiveWrite::Create { .. }) => "create",
             Self::Calendar(CalendarLiveWrite::Update { .. }) => "update",
             Self::Calendar(CalendarLiveWrite::Delete { .. }) => "delete",
@@ -1203,6 +1244,8 @@ impl AgentLiveWriteIntent {
             Self::Calendar(CalendarLiveWrite::Cancellation { .. }) => "Cancel event",
             Self::Calendar(CalendarLiveWrite::Exception { .. }) => "Change one occurrence",
             Self::Calendar(CalendarLiveWrite::SeriesRule { .. }) => "Change event series",
+            Self::Calendar(CalendarLiveWrite::Alarm { .. }) => "Change reminder",
+            Self::Calendar(CalendarLiveWrite::TaskOccurrence { .. }) => "Complete one task occurrence",
             Self::Calendar(CalendarLiveWrite::Create { .. }) => "Create a calendar event",
             Self::Calendar(CalendarLiveWrite::Update { .. }) => "Update this calendar event",
             Self::Calendar(CalendarLiveWrite::Delete { .. }) => "Delete this calendar event",
@@ -1345,6 +1388,8 @@ impl LiveWriteRuntime for LiveLiveWriteRuntime {
                     CalendarLiveWrite::Cancellation { .. } => Err("bound_confirmation_required".into()),
                     CalendarLiveWrite::Exception { .. } => Err("bound_confirmation_required".into()),
                     CalendarLiveWrite::SeriesRule { .. } => Err("bound_confirmation_required".into()),
+                    CalendarLiveWrite::Alarm { .. } => Err("bound_confirmation_required".into()),
+                    CalendarLiveWrite::TaskOccurrence { .. } => Err("bound_confirmation_required".into()),
                     CalendarLiveWrite::Create { event } => {
                         isyncyou_webui::CalendarWriteHandler::create(&writer, account, event)
                             .map(Some)
@@ -1625,11 +1670,13 @@ fn validate_live_write_action(
             target:required_target(target,change)?, origin:required_change_str(change,"origin")?, collection:required_change_str(change,"collection")?, uid:required_change_str(change,"uid")?, recurrence_id:optional_change_str(change,"recurrence_id")?, attendee:required_change_str(change,"attendee")?, organizer:required_change_str(change,"organizer")?, old_response:required_change_str(change,"old_response")?, response:required_change_str(change,"response")?, etag:required_change_str(change,"etag")?, raw_sha256:required_change_str(change,"raw_sha256")?,
         })),
         ("calendar", "task_parent") => Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskParent { target:required_target(target,change)?, origin:required_change_str(change,"origin")?, collection:required_change_str(change,"collection")?, uid:required_change_str(change,"uid")?, summary:required_change_str(change,"summary")?, old_parent:optional_change_str(change,"old_parent")?, new_parent:optional_change_str(change,"new_parent")?, etag:required_change_str(change,"etag")?, checkpoint:required_change_str(change,"checkpoint")?, raw_sha256:required_change_str(change,"raw_sha256")? })),
-        ("calendar", "task_attributes") => Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskAttributes { target:required_target(target,change)?, origin:required_change_str(change,"origin")?, collection:required_change_str(change,"collection")?, uid:required_change_str(change,"uid")?, name:required_change_str(change,"name")?, priority:match change.get("priority") { None | Some(serde_json::Value::Null) => None, Some(v) => Some(v.as_u64().and_then(|n| u8::try_from(n).ok()).ok_or("invalid_priority")?) }, due:optional_change_str(change,"due")?, due_date:required_change_bool(change,"due_date")?, old_priority:optional_change_str(change,"old_priority")?, old_due:optional_change_str(change,"old_due")?, etag:required_change_str(change,"etag")?, raw_sha256:required_change_str(change,"raw_sha256")? })),
+        ("calendar", "task_attributes") => Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskAttributes { target:required_target(target,change)?, origin:required_change_str(change,"origin")?, collection:required_change_str(change,"collection")?, uid:required_change_str(change,"uid")?, name:required_change_str(change,"name")?, priority:match change.get("priority") { None | Some(serde_json::Value::Null) => None, Some(v) => Some(v.as_u64().and_then(|n| u8::try_from(n).ok()).ok_or("invalid_priority")?) }, due:optional_change_str(change,"due")?, due_date:required_change_bool(change,"due_date")?, start:optional_change_str(change,"start")?, old_start:optional_change_str(change,"old_start")?, new_start:optional_change_str(change,"new_start")?, old_priority:optional_change_str(change,"old_priority")?, old_due:optional_change_str(change,"old_due")?, etag:required_change_str(change,"etag")?, raw_sha256:required_change_str(change,"raw_sha256")? })),
         ("calendar", "calendar_set_zoned_time") => Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::ZonedTime { target:required_target(target,change)?, origin:required_change_str(change,"origin")?, collection:required_change_str(change,"collection")?, uid:required_change_str(change,"uid")?, start:required_change_str(change,"start")?, end:required_change_str(change,"end")?, tzid:required_change_str(change,"tzid")?, old_start:required_change_str(change,"old_start")?, old_start_zone:optional_change_str(change,"old_start_zone")?, old_end:required_change_str(change,"old_end")?, old_end_zone:optional_change_str(change,"old_end_zone")?, etag:required_change_str(change,"etag")?, raw_sha256:required_change_str(change,"raw_sha256")? })),
         ("calendar", "calendar_cancel") => Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::Cancellation { target:required_target(target,change)?, collection:required_change_str(change,"collection")?, uid:required_change_str(change,"uid")?, recurrence_id:optional_change_str(change,"recurrence_id")?, sequence:change.get("sequence").and_then(serde_json::Value::as_u64).and_then(|n| u32::try_from(n).ok()).ok_or("invalid_sequence")?, effect:change.get("effect").filter(|v| v.is_object()).cloned().ok_or("invalid_cancellation_effect")?, etag:required_change_str(change,"etag")?, raw_sha256:required_change_str(change,"raw_sha256")? })),
         ("calendar", "calendar_exception") => Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::Exception { target:required_target(target,change)?, origin:required_change_str(change,"origin")?, collection:required_change_str(change,"collection")?, uid:required_change_str(change,"uid")?, recurrence_id:required_change_str(change,"recurrence_id")?, summary:required_change_str(change,"summary")?, old_start:required_change_str(change,"old_start")?, old_end:required_change_str(change,"old_end")?, start:required_change_str(change,"start")?, end:required_change_str(change,"end")?, window_start:required_change_str(change,"window_start")?, window_end:required_change_str(change,"window_end")?, etag:required_change_str(change,"etag")?, raw_sha256:required_change_str(change,"raw_sha256")? })),
         ("calendar", "calendar_series_rule") => Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::SeriesRule { target:required_target(target,change)?, collection:required_change_str(change,"collection")?, uid:required_change_str(change,"uid")?, rule:required_change_str(change,"rule")?, effect:change.get("effect").filter(|v| v.is_object()).cloned().ok_or("invalid_series_effect")?, etag:required_change_str(change,"etag")?, raw_sha256:required_change_str(change,"raw_sha256")? })),
+        ("calendar", "calendar_alarm") => Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::Alarm { target:required_target(target,change)?, collection:required_change_str(change,"collection")?, uid:required_change_str(change,"uid")?, recurrence_id:optional_change_str(change,"recurrence_id")?, index:optional_alarm_index(change)?, trigger:optional_change_str(change,"trigger")?, description:optional_change_str(change,"description")?, effect:change.get("effect").filter(|v| v.is_object()).cloned().ok_or("invalid_alarm_effect")?, etag:required_change_str(change,"etag")?, raw_sha256:required_change_str(change,"raw_sha256")? })),
+        ("calendar", "task_occurrence_completion") => Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskOccurrence { target:required_target(target,change)?, collection:required_change_str(change,"collection")?, uid:required_change_str(change,"uid")?, recurrence_id:required_change_str(change,"recurrence_id")?, completed_at:required_change_str(change,"completed_at")?, window_start:required_change_str(change,"window_start")?, window_end:required_change_str(change,"window_end")?, effect:change.get("effect").filter(|v| v.is_object()).cloned().ok_or("invalid_task_occurrence_effect")?, etag:required_change_str(change,"etag")?, raw_sha256:required_change_str(change,"raw_sha256")? })),
         ("calendar", "create") => Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::Create {
             event: required_object(change, "event")?,
         })),
@@ -1761,6 +1808,8 @@ fn ensure_mobile_live_write_allowlisted(action: &isyncyou_agent::ToolAction) -> 
             | AgentLiveWriteIntent::Calendar(CalendarLiveWrite::Cancellation { .. })
             | AgentLiveWriteIntent::Calendar(CalendarLiveWrite::Exception { .. })
             | AgentLiveWriteIntent::Calendar(CalendarLiveWrite::SeriesRule { .. })
+            | AgentLiveWriteIntent::Calendar(CalendarLiveWrite::Alarm { .. })
+            | AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskOccurrence { .. })
             | AgentLiveWriteIntent::Todo(TodoLiveWrite::Complete { .. })
             | AgentLiveWriteIntent::Todo(TodoLiveWrite::ChecklistToggle { .. })
     );
@@ -2381,10 +2430,10 @@ pub(crate) fn bind_provider_task_attributes(cfg: &Config, mut action: isyncyou_a
     if service != "calendar" || change.get("verb").and_then(serde_json::Value::as_str) != Some("task_attributes") { return Ok(action); }
     let collection = required_change_str(change,"collection")?; let uid = required_change_str(change,"uid")?; let href = required_target(target,change)?;
     let priority = match change.get("priority") { None | Some(serde_json::Value::Null) => None, Some(v) => Some(v.as_u64().and_then(|n| u8::try_from(n).ok()).ok_or("invalid_priority")?) };
-    let due = optional_change_str(change,"due")?; let due_date = change.get("due_date").and_then(serde_json::Value::as_bool).unwrap_or(false);
-    let prepared = isyncyou_engine::dav_live::prepare_task_attributes_preview(cfg,account,&collection,&href,&uid,priority,due.as_deref().map(|d| (d,due_date)))?;
+    let due = optional_change_str(change,"due")?; let due_date = change.get("due_date").and_then(serde_json::Value::as_bool).unwrap_or(false); let start = optional_change_str(change,"start")?;
+    let prepared = isyncyou_engine::dav_live::prepare_task_attributes_with_start_preview(cfg,account,&collection,&href,&uid,priority,due.as_deref().map(|d| (d,due_date)),start.as_deref())?;
     if prepared.edit.href != href || prepared.edit.expected_collection_token.is_some() { return Err("provider_task_prepare_invalid".into()); }
-    *target = Some(href); *change = serde_json::json!({"verb":"task_attributes","origin":prepared.origin,"collection":collection,"uid":uid,"name":prepared.name,"priority":priority,"due":due,"due_date":due_date,"old_priority":prepared.old_priority,"old_due":prepared.old_due,"etag":prepared.edit.expected_etag,"raw_sha256":sha256_hex(&prepared.edit.raw)});
+    *target = Some(href); *change = serde_json::json!({"verb":"task_attributes","origin":prepared.origin,"collection":collection,"uid":uid,"name":prepared.name,"priority":priority,"due":due,"due_date":due_date,"start":start,"old_start":prepared.old_start,"new_start":prepared.new_start,"old_priority":prepared.old_priority,"old_due":prepared.old_due,"etag":prepared.edit.expected_etag,"raw_sha256":sha256_hex(&prepared.edit.raw)});
     Ok(action)
 }
 
@@ -2421,6 +2470,40 @@ pub(crate) fn bind_provider_exception(cfg: &Config, mut action: isyncyou_agent::
     let p = isyncyou_engine::dav_live::prepare_exception_preview(cfg,account,"/.well-known/caldav",&collection,&href,&uid,&recurrence_id,&start,&end,&window_start,&window_end,None)?;
     if p.edit.href != href || p.edit.expected_collection_token.is_some() { return Err("provider_exception_prepare_invalid".into()); }
     *target = Some(href); *change = serde_json::json!({"verb":"calendar_exception","origin":p.origin,"collection":collection,"uid":uid,"recurrence_id":recurrence_id,"summary":p.summary,"old_start":p.old_start,"old_end":p.old_end,"start":start,"end":end,"window_start":window_start,"window_end":window_end,"etag":p.edit.expected_etag,"raw_sha256":sha256_hex(&p.edit.raw)});
+    Ok(action)
+}
+
+pub(crate) fn bind_provider_task_occurrence(cfg: &Config, mut action: isyncyou_agent::ToolAction) -> Result<isyncyou_agent::ToolAction, String> {
+    let isyncyou_agent::ToolAction::LiveWrite { account, service, target, change, .. } = &mut action else { return Ok(action); };
+    if service != "calendar" || change.get("verb").and_then(serde_json::Value::as_str) != Some("task_occurrence_completion") { return Ok(action); }
+    if !required_change_bool(change,"complete")? { return Err("task_occurrence_reopen_unsupported".into()); }
+    let collection = required_change_str(change,"collection")?; let uid = required_change_str(change,"uid")?; let href = required_target(target,change)?;
+    let recurrence_id = required_change_str(change,"recurrence_id")?; let window_start = required_change_str(change,"window_start")?; let window_end = required_change_str(change,"window_end")?;
+    let completed_at = isyncyou_engine::dav_live::current_task_completion_time()?;
+    let p = isyncyou_engine::dav_live::prepare_task_occurrence_completion_preview(cfg,account,"/.well-known/caldav",&collection,&href,&uid,&recurrence_id,Some(&completed_at),&window_start,&window_end,None)?;
+    if p.edit.href != href || p.edit.expected_collection_token.is_some() { return Err("provider_task_prepare_invalid".into()); }
+    let effect = serde_json::json!({"origin":p.origin,"summary":p.summary,"start":p.start,"due":p.due,"completed_at":p.completed_at});
+    *target = Some(href); *change = serde_json::json!({"verb":"task_occurrence_completion","collection":collection,"uid":uid,"recurrence_id":recurrence_id,"completed_at":completed_at,"window_start":window_start,"window_end":window_end,"effect":effect,"etag":p.edit.expected_etag,"raw_sha256":sha256_hex(&p.edit.raw)});
+    Ok(action)
+}
+
+fn optional_alarm_index(change: &serde_json::Value) -> Result<Option<usize>, String> {
+    match change.get("alarm_index") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value.as_u64().and_then(|n| usize::try_from(n).ok()).map(Some).ok_or_else(|| "invalid_alarm_index".into()),
+    }
+}
+
+pub(crate) fn bind_provider_alarm(cfg: &Config, mut action: isyncyou_agent::ToolAction) -> Result<isyncyou_agent::ToolAction, String> {
+    let isyncyou_agent::ToolAction::LiveWrite { account, service, target, change, .. } = &mut action else { return Ok(action); };
+    if service != "calendar" || change.get("verb").and_then(serde_json::Value::as_str) != Some("calendar_alarm") { return Ok(action); }
+    let collection = required_change_str(change,"collection")?; let uid = required_change_str(change,"uid")?; let href = required_target(target,change)?;
+    let recurrence_id = optional_change_str(change,"recurrence_id")?; let index = optional_alarm_index(change)?;
+    let trigger = optional_change_str(change,"trigger")?; let description = optional_change_str(change,"description")?;
+    let p = isyncyou_engine::dav_live::prepare_alarm_preview(cfg,account,&collection,&href,&uid,recurrence_id.as_deref(),index,trigger.as_deref(),description.as_deref())?;
+    if p.edit.href != href || p.edit.expected_collection_token.is_some() { return Err("provider_alarm_prepare_invalid".into()); }
+    let effect = serde_json::json!({"origin":p.origin,"summary":p.summary,"old_trigger":p.old_trigger,"old_description":p.old_description,"new_trigger":p.new_trigger,"new_description":p.new_description});
+    *target = Some(href); *change = serde_json::json!({"verb":"calendar_alarm","collection":collection,"uid":uid,"recurrence_id":recurrence_id,"alarm_index":index,"trigger":trigger,"description":description,"effect":effect,"etag":p.edit.expected_etag,"raw_sha256":sha256_hex(&p.edit.raw)});
     Ok(action)
 }
 
@@ -2571,8 +2654,8 @@ pub(crate) fn preview_for_pending_action(
             if let AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskParent {target,origin,collection,uid,summary,old_parent,new_parent,..}) = &intent {
                 return Ok(PendingOperationPreview::destructive(format!("Change parent of task ‘{summary}’ (UID {uid}) in account {} at {origin}, collection {collection}, resource {target}. Previous parent UID: {}; new parent UID: {}. The task graph is checked under a collection lock before writing.",action.account(),old_parent.as_deref().unwrap_or("none"),new_parent.as_deref().unwrap_or("none"))));
             }
-            if let AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskAttributes { target, origin, collection, uid, name, priority, due, due_date, old_priority, old_due, .. }) = &intent {
-                return Ok(PendingOperationPreview::destructive(format!("Change task ‘{name}’ (UID {uid}) in account {} at {origin}, collection {collection}, resource {target}. Previous priority: {}; due: {}. New priority: {}; due: {} ({}). Unset new fields remain unchanged.", action.account(), old_priority.as_deref().unwrap_or("unset"), old_due.as_deref().unwrap_or("unset"), priority.map(|v| v.to_string()).unwrap_or("unchanged".into()), due.as_deref().unwrap_or("unchanged"), if *due_date {"date"} else {"UTC"})));
+            if let AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskAttributes { target, origin, collection, uid, name, priority, due, due_date, old_start, new_start, old_priority, old_due, .. }) = &intent {
+                return Ok(PendingOperationPreview::destructive(format!("Change task ‘{name}’ (UID {uid}) in account {} at {origin}, collection {collection}, resource {target}. Previous priority: {}; due: {}; start: {}. New priority: {}; due: {} ({}); start: {}. Unset new fields remain unchanged.", action.account(), old_priority.as_deref().unwrap_or("unset"), old_due.as_deref().unwrap_or("unset"), old_start.as_deref().unwrap_or("unset"), priority.map(|v| v.to_string()).unwrap_or("unchanged".into()), due.as_deref().unwrap_or("unchanged"), if *due_date {"date"} else {"UTC"}, new_start.as_deref().unwrap_or("unchanged"))));
             }
             if let AgentLiveWriteIntent::Calendar(CalendarLiveWrite::ZonedTime { target, origin, collection, uid, start, end, tzid, old_start, old_start_zone, old_end, old_end_zone, .. }) = &intent {
                 return Ok(PendingOperationPreview::destructive(format!("Change event UID {uid} in account {} at {origin}, calendar {collection}, resource {target}. Previous start: {old_start} (zone {}); end: {old_end} (zone {}). New start: {start}; end: {end}; zone {tzid}.", action.account(), old_start_zone.as_deref().unwrap_or("unspecified"), old_end_zone.as_deref().unwrap_or("unspecified"))));
@@ -2584,7 +2667,13 @@ pub(crate) fn preview_for_pending_action(
                 return Ok(PendingOperationPreview::destructive(format!("Change only occurrence {recurrence_id} of ‘{summary}’ (UID {uid}) in account {} at {origin}, calendar {collection}, resource {target}. Previous: {old_start} to {old_end}; new: {start} to {end} UTC. Server expansion window: {window_start} to {window_end}.", action.account())));
             }
             if let AgentLiveWriteIntent::Calendar(CalendarLiveWrite::SeriesRule { target, collection, uid, rule, effect, .. }) = &intent {
-                return Ok(PendingOperationPreview::destructive(format!("Change the entire event series UID {uid} in account {}, calendar {collection}, resource {target}, to rule {rule}. Complete old and new occurrence starts and event duration: {effect}. These are locally computed and have not yet been verified against server expansion.", action.account())));
+                return Ok(PendingOperationPreview::destructive(format!("Change the entire event or task series UID {uid} in account {}, calendar {collection}, resource {target}, to rule {rule}. Complete old and new occurrence starts and duration: {effect}. These are locally computed and have not yet been verified against server expansion.", action.account())));
+            }
+            if let AgentLiveWriteIntent::Calendar(CalendarLiveWrite::Alarm { target, collection, uid, recurrence_id, index, effect, .. }) = &intent {
+                return Ok(PendingOperationPreview::destructive(format!("Change reminder {} for UID {uid}, occurrence {}, in account {}, calendar {collection}, resource {target}. Exact old and new reminder: {effect}.", index.map(|i| i.to_string()).unwrap_or_else(|| "new".into()), recurrence_id.as_deref().unwrap_or("series/master"), action.account())));
+            }
+            if let AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskOccurrence { target, collection, uid, recurrence_id, effect, .. }) = &intent {
+                return Ok(PendingOperationPreview::destructive(format!("Complete only task occurrence {recurrence_id} of UID {uid} in account {}, calendar {collection}, resource {target}. Server-expanded occurrence and fixed completion time: {effect}.", action.account())));
             }
             if let AgentLiveWriteIntent::Mail(MailLiveWrite::SendApproved { origin, mail_from, recipients, email_id, blob_id, .. }) = &intent {
                 return Ok(PendingOperationPreview::destructive(format!("Submit email {email_id} (content {blob_id}) via {origin} from {mail_from} to {}. Delivery is not guaranteed by submission.", recipients.join(", "))));
@@ -2664,7 +2753,7 @@ pub(crate) fn preview_for_pending_action_with_config(cfg: &Config, action: &isyn
                 Ok(AgentLiveWriteIntent::DavAcl { .. } | AgentLiveWriteIntent::DavDelete { .. } | AgentLiveWriteIntent::DavCreate { .. }) |
                 Ok(AgentLiveWriteIntent::Mail(MailLiveWrite::SetRead { .. } | MailLiveWrite::SendApproved { .. } | MailLiveWrite::ProviderCreateDraft { .. } | MailLiveWrite::ProviderAction { .. } | MailLiveWrite::RelatedDraft { .. })) |
                 Ok(AgentLiveWriteIntent::Contacts(ContactLiveWrite::SetName { .. } | ContactLiveWrite::SetField { .. } | ContactLiveWrite::AddField { .. } | ContactLiveWrite::RemoveField { .. })) |
-                Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::SetTaskCompletion { .. } | CalendarLiveWrite::SetText { .. } | CalendarLiveWrite::SetTime { .. } | CalendarLiveWrite::InvitationResponse { .. } | CalendarLiveWrite::TaskAttributes { .. } | CalendarLiveWrite::TaskParent { .. } | CalendarLiveWrite::ZonedTime { .. } | CalendarLiveWrite::Cancellation { .. } | CalendarLiveWrite::Exception { .. } | CalendarLiveWrite::SeriesRule { .. }))),
+                Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::SetTaskCompletion { .. } | CalendarLiveWrite::SetText { .. } | CalendarLiveWrite::SetTime { .. } | CalendarLiveWrite::InvitationResponse { .. } | CalendarLiveWrite::TaskAttributes { .. } | CalendarLiveWrite::TaskParent { .. } | CalendarLiveWrite::ZonedTime { .. } | CalendarLiveWrite::Cancellation { .. } | CalendarLiveWrite::Exception { .. } | CalendarLiveWrite::SeriesRule { .. } | CalendarLiveWrite::Alarm { .. } | CalendarLiveWrite::TaskOccurrence { .. }))),
             _ => false,
         };
         if !supported { return Err("provider_operation_unavailable".into()); }
@@ -3514,6 +3603,12 @@ impl AgentConfirmedActionExecutor for DesktopAgentOperations {
         classify_confirmed_execution(action, || self.execute_confirmed_inner(action))
     }
     fn execute_confirmed_bound(&self, action: &isyncyou_agent::ToolAction, pending_id: &str) -> ConfirmedExecutionOutcome {
+        if matches!(validate_live_write_action(action), Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskOccurrence { .. }))) {
+            return match self.current_config() { Ok(cfg) => execute_bound_task_occurrence(&cfg, action, pending_id, &self.gate), Err(_) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) };
+        }
+        if matches!(validate_live_write_action(action), Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::Alarm { .. }))) {
+            return match self.current_config() { Ok(cfg) => execute_bound_alarm(&cfg, action, pending_id, &self.gate), Err(_) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) };
+        }
         if matches!(validate_live_write_action(action), Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::SeriesRule { .. }))) {
             return match self.current_config() { Ok(cfg) => execute_bound_series_rule(&cfg, action, pending_id, &self.gate), Err(_) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) };
         }
@@ -3770,6 +3865,12 @@ impl AgentConfirmedActionExecutor for MobileFullNodeAgentOperations {
         classify_confirmed_execution(action, || self.execute_confirmed_inner(action))
     }
     fn execute_confirmed_bound(&self, action: &isyncyou_agent::ToolAction, pending_id: &str) -> ConfirmedExecutionOutcome {
+        if matches!(validate_live_write_action(action), Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskOccurrence { .. }))) {
+            return match self.current_config() { Ok(cfg) => execute_bound_task_occurrence(&cfg, action, pending_id, &self.gate), Err(_) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) };
+        }
+        if matches!(validate_live_write_action(action), Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::Alarm { .. }))) {
+            return match self.current_config() { Ok(cfg) => execute_bound_alarm(&cfg, action, pending_id, &self.gate), Err(_) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) };
+        }
         if matches!(validate_live_write_action(action), Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::SeriesRule { .. }))) {
             return match self.current_config() { Ok(cfg) => execute_bound_series_rule(&cfg, action, pending_id, &self.gate), Err(_) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) };
         }
@@ -3973,6 +4074,21 @@ mod tests {
     }
 
     #[test]
+    fn task_occurrence_and_alarm_approvals_identify_exact_effect() {
+        let occurrence: isyncyou_agent::ToolAction = serde_json::from_value(json!({"op":"live-write", "account":"test", "service":"calendar", "target":"/cal/task.ics",
+            "change":{"verb":"task_occurrence_completion", "collection":"/cal/", "uid":"task-1", "recurrence_id":"20261102T100000Z", "completed_at":"20261102T120000Z", "window_start":"20261101T000000Z", "window_end":"20261201T000000Z", "effect":{"origin":"https://example.test", "summary":"Review", "start":"20261102T100000Z", "due":"20261102T110000Z", "completed_at":"20261102T120000Z"}, "etag":"\"v1\"", "raw_sha256":"digest"}})).unwrap();
+        let preview = preview_for_pending_action(&occurrence).unwrap();
+        for expected in ["only task occurrence", "20261102T100000Z", "Review", "20261102T120000Z"] { assert!(preview.text.contains(expected)); }
+        let alarm: isyncyou_agent::ToolAction = serde_json::from_value(json!({"op":"live-write", "account":"test", "service":"calendar", "target":"/cal/task.ics",
+            "change":{"verb":"calendar_alarm", "collection":"/cal/", "uid":"task-1", "recurrence_id":null, "alarm_index":0, "trigger":"-PT15M", "description":"Prepare", "effect":{"origin":"https://example.test", "summary":"Review", "old_trigger":"-PT5M", "new_trigger":"-PT15M", "new_description":"Prepare"}, "etag":"\"v1\"", "raw_sha256":"digest"}})).unwrap();
+        let preview = preview_for_pending_action(&alarm).unwrap();
+        for expected in ["-PT5M", "-PT15M", "Prepare", "task-1"] { assert!(preview.text.contains(expected)); }
+        let mut invalid = alarm;
+        if let isyncyou_agent::ToolAction::LiveWrite { change, .. } = &mut invalid { change["effect"] = serde_json::Value::Null; }
+        assert!(preview_for_pending_action(&invalid).is_err());
+    }
+
+    #[test]
     fn task_attributes_approval_shows_previous_and_requested_values() {
         let action: isyncyou_agent::ToolAction = serde_json::from_value(json!({"op":"live-write", "account":"test", "service":"calendar", "target":"/cal/task.ics",
             "change":{"verb":"task_attributes", "origin":"https://example.test", "collection":"/cal/", "uid":"task-1", "name":"Review", "priority":2, "due":"20261104", "due_date":true, "old_priority":"5", "old_due":"20261103", "etag":"\"v1\"", "raw_sha256":"digest"}})).unwrap();
@@ -4006,7 +4122,7 @@ mod tests {
         let action: isyncyou_agent::ToolAction = serde_json::from_value(json!({"op":"live-write", "account":"test", "service":"calendar", "target":"/cal/event.ics",
             "change":{"verb":"calendar_series_rule", "collection":"/cal/", "uid":"series-1", "rule":"FREQ=DAILY;COUNT=2", "effect":{"old_occurrences":["20261101T100000Z"],"new_occurrences":["20261101T100000Z","20261102T100000Z"]}, "etag":"\"v1\"", "raw_sha256":"digest"}})).unwrap();
         let preview = preview_for_pending_action(&action).unwrap();
-        for expected in ["entire event series", "20261101T100000Z", "20261102T100000Z", "not yet been verified"] { assert!(preview.text.contains(expected)); }
+        for expected in ["entire event or task series", "20261101T100000Z", "20261102T100000Z", "not yet been verified"] { assert!(preview.text.contains(expected)); }
     }
 
     #[test]

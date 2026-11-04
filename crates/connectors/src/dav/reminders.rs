@@ -52,7 +52,7 @@ fn parameter(line: &IcalLine<'_>, key: &str) -> Result<Option<String>, String> {
     Ok(params.first().map(|p| p.values[0].get().trim_matches('"').to_owned()))
 }
 
-fn seconds(value: &str) -> Result<(i64, i64), String> {
+pub(crate) fn seconds(value: &str) -> Result<(i64, i64), String> {
     let (sign, unsigned) = match value.as_bytes().first() { Some(b'-') => (-1i64, &value[1..]), Some(b'+') => (1, &value[1..]), _ => (1, value) };
     let duration = iso8601::duration(unsigned).map_err(|_| "Invalid alarm duration")?;
     let (seconds, days) = match duration {
@@ -66,6 +66,33 @@ fn seconds(value: &str) -> Result<(i64, i64), String> {
     let seconds = seconds.checked_mul(sign).ok_or("Alarm duration overflow")?;
     if seconds.unsigned_abs() > 366 * 86400 { return Err("Alarm duration exceeds planning limit".into()); }
     Ok((seconds, days * sign))
+}
+
+/// Establish the bounded-offset precondition for account-wide coverage.
+/// Absolute triggers and repeats cannot be covered by an occurrence window.
+pub fn require_bounded_relative_alarms(raw: &[u8]) -> Result<(), String> {
+    let tree = IcalCst::parse(raw).map_err(|_| "Invalid calendar resource")?;
+    if tree.to_bytes() != raw { return Err("Calendar resource incomplete".into()); }
+    for entry in &tree.items {
+        let IcalItem::Component(component) = entry else { continue; };
+        if !matches!(kind(component).as_deref(),Some("VEVENT" | "VTODO")) { continue; }
+        for entry in &component.items {
+            let IcalItem::Component(alarm) = entry else { continue; };
+            if kind(alarm).as_deref() != Some("VALARM") { continue; }
+            if one(alarm,"REPEAT")?.is_some() || one(alarm,"DURATION")?.is_some() { return Err("Repeated alarm coverage unavailable".into()); }
+            let trigger = one(alarm,"TRIGGER")?.ok_or("Alarm trigger missing")?;
+            if parameter(trigger,"VALUE")?.is_some() { return Err("Absolute alarm coverage unavailable".into()); }
+            if parameter(trigger,"RELATED")?.as_deref().is_some_and(|v| !v.eq_ignore_ascii_case("START")) { return Err("End-related alarm coverage unavailable".into()); }
+            if one(component,"DTSTART")?.is_none() { return Err("Alarm start anchor unavailable".into()); }
+            seconds(&trigger.value.decode())?;
+        }
+    }
+    Ok(())
+}
+
+pub fn utc_window_bound(value: &str) -> Result<i64, String> {
+    if value.len() != 16 || !value.ends_with('Z') { return Err("Invalid UTC occurrence window".into()); }
+    Ok(ical::recur::IcalRecurDateTime::parse(value).map_err(|_| "Invalid UTC occurrence window")?.seconds())
 }
 
 fn local_instant(local: NaiveDateTime, tzid: &str, calendar: &ical::ical::Ical<'_>) -> Result<i64, String> {
@@ -218,6 +245,15 @@ pub fn plan(expanded: &[u8], original: &[u8], fallback_tzid: Option<&str>, windo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_coverage_rejects_absolute_repeated_and_end_alarms() {
+        let raw = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nDTSTART:20270101T100000Z\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nDESCRIPTION:Reminder\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert!(require_bounded_relative_alarms(raw.as_bytes()).is_ok());
+        for changed in [raw.replace("TRIGGER:-PT15M", "TRIGGER;VALUE=DATE-TIME:20270101T094500Z"), raw.replace("DESCRIPTION:Reminder", "REPEAT:1\r\nDURATION:PT5M\r\nDESCRIPTION:Reminder"), raw.replace("TRIGGER:-PT15M", "TRIGGER;RELATED=END:-PT15M")] {
+            assert!(require_bounded_relative_alarms(changed.as_bytes()).is_err());
+        }
+    }
 
     #[test]
     fn plan_utc_alarm_and_repeat_without_content() {

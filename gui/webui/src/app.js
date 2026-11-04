@@ -3748,21 +3748,22 @@ function openProviderTaskParent(account, collection, href, uid) {
 function openProviderTaskAttributes(account, collection, href, uid) {
   const priority = el("select", { class:"input", "aria-label":"Priority" }, el("option", { value:"", text:"Keep priority" }), ...Array.from({length:10}, (_, n) => el("option", { value:String(n), text:n === 0 ? "Unspecified priority (0)" : `Priority ${n}` })));
   const due = el("input", { class:"input", "aria-label":"Due date", placeholder:"Optional due: YYYYMMDD or YYYYMMDDTHHMMSSZ" });
+  const start = el("input", { class:"input", "aria-label":"Start time", placeholder:"Optional UTC start: YYYYMMDDTHHMMSSZ" });
   const mode = el("select", { class:"input", "aria-label":"Due format" }, el("option", { value:"date", text:"Date" }), el("option", { value:"utc", text:"UTC date and time" }));
   const button = el("button", { class:"btn primary", type:"button", onclick:async () => {
-    if (App.account !== account || (!priority.value && !due.value.trim())) { toast("Choose a change first.", "err"); return; }
+    if (App.account !== account || (!priority.value && !due.value.trim() && !start.value.trim())) { toast("Choose a change first.", "err"); return; }
     button.disabled = true;
     try {
       const sessionId = await ensureAgentSession();
       if (App.account !== account) throw new Error("Account changed");
-      const pending = await postJson("/api/v1/agent/task/attributes/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, href, uid, priority:priority.value === "" ? null : Number(priority.value), due:due.value.trim() || null, due_date:mode.value === "date" }, PROVIDER_NATIVE_TIMEOUT_MS);
+      const pending = await postJson("/api/v1/agent/task/attributes/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, href, uid, priority:priority.value === "" ? null : Number(priority.value), due:due.value.trim() || null, due_date:mode.value === "date", start:start.value.trim() || null }, PROVIDER_NATIVE_TIMEOUT_MS);
       if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
       const record = { ...pending, status:"pending", cancelled_result:"The task was not changed." };
       AssistantState.pendingCardsById.set(record.pending_id, record);
       closeSheet(); openSheet("Review task change", renderAgentPendingCard(record));
     } catch (_) { toast("The task change could not be prepared. Check the input and refresh the calendar.", "err"); button.disabled = false; }
   } }, "Review change");
-  openSheet("Change task details", el("div", { class:"compose" }, el("p", { class:"dim", text:"Leave a field empty to keep its current value. The original and new values are shown before saving." }), priority, due, mode, button));
+  openSheet("Change task details", el("div", { class:"compose" }, el("p", { class:"dim", text:"Leave a field empty to keep its current value. The original and new values are shown before saving." }), priority, start, due, mode, button));
 }
 
 function openProviderOccurrenceTime(account, collection, href, uid, recurrenceId, windowStart, windowEnd) {
@@ -3784,6 +3785,21 @@ function openProviderOccurrenceTime(account, collection, href, uid, recurrenceId
   openSheet("Change one occurrence", el("div", { class:"compose" }, el("p", { class:"dim", text:`Only occurrence ${recurrenceId} is changed. Its current and proposed UTC times are shown for review.` }), start, end, button));
 }
 
+async function prepareTaskOccurrence(account, collection, href, uid, recurrenceId, windowStart, windowEnd, button) {
+  if (App.account !== account) return;
+  button.disabled = true;
+  try {
+    const sessionId = await ensureAgentSession();
+    if (App.account !== account) throw new Error("Account changed");
+    const pending = await postJson("/api/v1/agent/task/occurrence/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, href, uid, recurrence_id:recurrenceId, complete:true, window_start:windowStart, window_end:windowEnd }, PROVIDER_NATIVE_TIMEOUT_MS);
+    if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+    const record = { ...pending, status:"pending", cancelled_result:"The task occurrence was not changed." };
+    AssistantState.pendingCardsById.set(record.pending_id, record);
+    openSheet("Review task occurrence", renderAgentPendingCard(record));
+  } catch (_) { toast("The occurrence could not be prepared. Refresh the live month and check access.", "err"); }
+  finally { button.disabled = false; }
+}
+
 function openProviderSeriesRule(account, collection, href, uid, start, end, oldRule) {
   const rule = el("input", { class:"input", "aria-label":"New recurrence rule", value:oldRule, placeholder:"FREQ=WEEKLY;COUNT=10" });
   const button = el("button", { class:"btn primary", type:"button", onclick:async () => {
@@ -3800,6 +3816,39 @@ function openProviderSeriesRule(account, collection, href, uid, start, end, oldR
     } catch (_) { toast("The series could not be prepared. A supported bounded rule and a simple UTC series are required.", "err"); button.disabled = false; }
   } }, "Review entire series");
   openSheet("Change recurrence", el("div", { class:"compose" }, el("p", { class:"dim", text:"This changes the entire series. Rules must include COUNT from 1 to 100. The full locally computed old and new occurrences are shown before saving." }), rule, button));
+}
+
+function openProviderAlarm(account, collection, href, uid, recurrenceId, index, oldTrigger, oldDescription) {
+  const trigger = el("input", { class:"input", "aria-label":"Reminder trigger", value:oldTrigger || "-PT15M", placeholder:"-PT15M" });
+  const description = el("input", { class:"input", "aria-label":"Reminder text", value:oldDescription || "Reminder" });
+  const delivery = el("p", { class:"dim", role:"status", text:"Reminder planning status is unknown on this device." });
+  void nativeCall("providerReminderStatus", {}, 10000).then(status => {
+    if (!status || !["idle", "planning", "ready", "unavailable", "unsupported_alarm_coverage"].includes(status.planning)
+        || !Number.isSafeInteger(status.last_checked_at) || status.last_checked_at < 0
+        || typeof status.notifications_enabled !== "boolean" || typeof status.network_validated !== "boolean") return;
+    const labels = { idle:"No completed reminder plan is reported", planning:"Reminder planning is in progress or was interrupted", ready:"The last reminder plan completed", unavailable:"Reminder planning or delivery is unavailable for this plan", unsupported_alarm_coverage:"Some reminders cannot be planned on this device" };
+    const checked = status.last_checked_at > 0 && Number.isFinite(new Date(status.last_checked_at).getTime())
+      ? ` Last checked: ${new Date(status.last_checked_at).toLocaleString()}.` : " Check time unknown.";
+    const network = status.network_validated ? " Network validated." : " Offline or network not validated.";
+    const permission = status.notifications_enabled ? " Notifications enabled." : " Notification permission is missing or notifications are disabled.";
+    delivery.textContent = `${labels[status.planning]}.${checked}${network}${permission} A completed plan is not proof of delivery.`;
+  }).catch(() => {});
+  const prepare = async (button, remove) => {
+    if (App.account !== account) return;
+    button.disabled = true;
+    try {
+      const sessionId = await ensureAgentSession();
+      if (App.account !== account) throw new Error("Account changed");
+      const pending = await postJson("/api/v1/agent/calendar/alarm/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, href, uid, recurrence_id:recurrenceId, alarm_index:index, trigger:remove ? null : trigger.value.trim(), description:remove ? null : description.value.trim() }, PROVIDER_NATIVE_TIMEOUT_MS);
+      if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+      const record = { ...pending, status:"pending", cancelled_result:"The reminder was not changed." };
+      AssistantState.pendingCardsById.set(record.pending_id, record);
+      closeSheet(); openSheet("Review reminder", renderAgentPendingCard(record));
+    } catch (_) { toast("Reminder could not be prepared. Refresh and check its format and access.", "err"); button.disabled = false; }
+  };
+  const save = el("button", { class:"btn primary", type:"button", onclick:event => prepare(event.currentTarget, false) }, "Review reminder");
+  const remove = index === null ? null : el("button", { class:"btn danger", type:"button", onclick:event => prepare(event.currentTarget, true) }, "Review removal");
+  openSheet("Reminder", el("div", { class:"compose" }, el("p", { class:"dim", text:"Use a negative duration before the start, such as -PT15M. Absolute, end-related and repeating reminders are not yet delivered. Existing reminders are preserved." }), delivery, trigger, description, save, remove));
 }
 
 function openProviderCollectionAccess(account, service, collection) {
@@ -3912,7 +3961,7 @@ async function renderProviderCalendarView(view, service) {
     if (!collection || !match || App.account !== account) return;
     expand.disabled = true; clear(expanded); expanded.append(el("p", { class:"dim", text:"Loading live occurrences…" }));
     try {
-      const result = await api("/api/v1/calendar/expanded?" + qs({ account, collection, year:match[1], month:match[2] }));
+      const result = await api("/api/v1/calendar/expanded?" + qs({ account, collection, year:match[1], month:match[2], ...(service === "todo" ? {tasks:"1"} : {}) }));
       if (App.account !== account || select.value !== collection || !view.isConnected) return;
       clear(expanded);
       for (const item of result.items || []) for (const component of (item.view && item.view.components || [])) {
@@ -3920,7 +3969,7 @@ async function renderProviderCalendarView(view, service) {
         const recurrenceId = Array.isArray(rid) && rid.length === 1 ? rid[0].value : null;
         if (!recurrenceId || !component.uid || !item.href) continue;
         const label = `${values(props,"SUMMARY") || "(untitled)"} · ${recurrenceId} · ${values(props,"DTSTART")}`;
-        expanded.append(el("div", { class:"pick-row" }, el("span", { class:"grow", text:label }), CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderOccurrenceTime(account, collection, item.href, component.uid, recurrenceId, result.start, result.end) }, "Change occurrence") : null));
+        expanded.append(el("div", { class:"pick-row" }, el("span", { class:"grow", text:label }), CAP.agent ? (service === "todo" ? el("button", { class:"btn sm", type:"button", onclick:event => prepareTaskOccurrence(account,collection,item.href,component.uid,recurrenceId,result.start,result.end,event.currentTarget) }, "Complete occurrence") : el("button", { class:"btn sm", type:"button", onclick:() => openProviderOccurrenceTime(account, collection, item.href, component.uid, recurrenceId, result.start, result.end) }, "Change occurrence")) : null));
       }
       if (!expanded.childNodes.length) expanded.append(el("p", { class:"dim", text:"No expanded occurrences for this month." }));
     } catch (_) { clear(expanded); expanded.append(el("p", { class:"dim", text:"Live occurrence expansion is unavailable." })); }
@@ -3971,9 +4020,17 @@ async function renderProviderCalendarView(view, service) {
           if (CAP.agent && page.accessible === true && typeof item.href === "string" && !properties["RECURRENCE-ID"]) row.append(el("button",{class:"btn sm",type:"button",onclick:event=>prepareSingleCapture(account,"calendar",collection,item.href,event.currentTarget)},"Back up resource"));
           const recurrence = properties["RECURRENCE-ID"];
           const recurrenceId = Array.isArray(recurrence) && recurrence.length === 1 ? recurrence[0].value : null;
-          if (service === "calendar" && CAP.agent && page.accessible === true && component.uid && typeof item.href === "string" && !recurrence && !properties.ORGANIZER && !properties.ATTENDEE) {
-            const startValue = values(properties,"DTSTART"), endValue = values(properties,"DTEND"), ruleValue = values(properties,"RRULE");
+          if (CAP.agent && page.accessible === true && component.uid && typeof item.href === "string" && !recurrence && !properties.ORGANIZER && !properties.ATTENDEE) {
+            const startValue = values(properties,"DTSTART"), endValue = values(properties,service === "todo" ? "DUE" : "DTEND"), ruleValue = values(properties,"RRULE");
             if (startValue && endValue) row.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderSeriesRule(account, collection, item.href, component.uid, startValue, endValue, ruleValue) }, ruleValue ? "Edit series" : "Make recurring"));
+          }
+          if (CAP.agent && page.accessible === true && component.uid && typeof item.href === "string" && (!recurrence || recurrenceId) && !properties.ORGANIZER && !properties.ATTENDEE) {
+            const alarms = (Array.isArray(component.components) ? component.components : []).filter(child => child.kind === "VALARM");
+            row.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderAlarm(account, collection, item.href, component.uid, recurrenceId, null, "", "") }, "Add reminder"));
+            alarms.forEach((alarm, index) => {
+              const p = alarm.properties || {}; const trigger = values(p,"TRIGGER"), description = values(p,"DESCRIPTION");
+              row.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderAlarm(account, collection, item.href, component.uid, recurrenceId, index, trigger, description) }, `Reminder ${index + 1}`));
+            });
           }
           if (service === "calendar" && CAP.agent && page.accessible === true && component.uid && typeof item.href === "string" && properties.ORGANIZER && (!recurrence || recurrenceId) && !(properties.RRULE || properties.RDATE)) {
             const attendees = Array.isArray(properties.ATTENDEE) ? properties.ATTENDEE.map(entry => entry.value).filter(value => typeof value === "string" && value) : [];
@@ -4021,7 +4078,7 @@ async function renderProviderCalendarView(view, service) {
   };
   select.addEventListener("change", () => { cursor = null; void load(true); });
   more.addEventListener("click", () => { if (cursor) void load(false); });
-  view.append(el("div", { class:"con-page" }, el("h2", { text:service === "todo" ? "Tasks" : "Calendar" }), select, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCreate(account, select.value, service === "todo" ? "task" : "event") }, service === "todo" ? "New task" : "New event") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCollectionAccess(account, "calendar", select.value) }, "Manage collection access") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderRecovery(account,"Recovered") }, "Recover…") : null, status, note, list, more, service === "calendar" ? month : null, service === "calendar" ? expand : null, service === "calendar" ? freebusy : null, service === "calendar" ? expanded : null));
+  view.append(el("div", { class:"con-page" }, el("h2", { text:service === "todo" ? "Tasks" : "Calendar" }), select, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCreate(account, select.value, service === "todo" ? "task" : "event") }, service === "todo" ? "New task" : "New event") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCollectionAccess(account, "calendar", select.value) }, "Manage collection access") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderRecovery(account,"Recovered") }, "Recover…") : null, status, note, list, more, month, expand, service === "calendar" ? freebusy : null, expanded));
   try {
     const result = await api("/api/v1/items?" + qs({ account, service }));
     if (App.account !== account || !view.isConnected) return;

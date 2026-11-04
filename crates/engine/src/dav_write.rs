@@ -366,9 +366,27 @@ pub fn execute_contact_photo(cfg: &Config, entry: &str, op: &ApprovedDavWrite, m
 }
 
 pub fn execute_task_attributes(cfg: &Config, entry: &str, op: &ApprovedDavWrite, uid: &str, priority: Option<u8>, due: Option<(&str, bool)>, credentials: Option<&dyn ProviderCredentialStore>) -> Result<WriteOutcome, String> {
+    execute_task_attributes_with_start(cfg,entry,op,uid,priority,due,None,credentials)
+}
+
+pub fn execute_task_attributes_with_start(cfg: &Config, entry: &str, op: &ApprovedDavWrite, uid: &str, priority: Option<u8>, due: Option<(&str, bool)>, start: Option<&str>, credentials: Option<&dyn ProviderCredentialStore>) -> Result<WriteOutcome, String> {
     if op.service != "calendar" || op.expected_collection_token.is_some() { return Err("Invalid task operation".into()); }
-    let preview = crate::dav_live::prepare_task_attributes_preview(cfg,&op.account_id,&op.collection,&op.href,uid,priority,due)?;
+    let preview = crate::dav_live::prepare_task_attributes_with_start_preview(cfg,&op.account_id,&op.collection,&op.href,uid,priority,due,start)?;
     if preview.origin != op.origin || preview.edit.href != op.href || Some(preview.edit.expected_etag.as_str()) != op.expected_etag.as_deref() || Some(preview.edit.raw.as_slice()) != op.raw.as_deref() { return Err("Task changed after approval".into()); }
+    execute_inner(cfg,entry,op,credentials)
+}
+
+pub fn execute_alarm(cfg: &Config, entry: &str, op: &ApprovedDavWrite, uid: &str, recurrence_id: Option<&str>, index: Option<usize>, trigger: Option<&str>, description: Option<&str>, credentials: Option<&dyn ProviderCredentialStore>) -> Result<WriteOutcome, String> {
+    if op.service != "calendar" || op.expected_collection_token.is_some() { return Err("Invalid alarm operation".into()); }
+    let p = crate::dav_live::prepare_alarm_preview(cfg,&op.account_id,&op.collection,&op.href,uid,recurrence_id,index,trigger,description)?;
+    if p.origin != op.origin || p.edit.href != op.href || Some(p.edit.expected_etag.as_str()) != op.expected_etag.as_deref() || Some(p.edit.raw.as_slice()) != op.raw.as_deref() { return Err("Alarm changed after approval".into()); }
+    execute_inner(cfg,entry,op,credentials)
+}
+
+pub fn execute_task_occurrence_completion(cfg: &Config, entry: &str, op: &ApprovedDavWrite, uid: &str, recurrence_id: &str, completed_at: Option<&str>, window_start: &str, window_end: &str, credentials: Option<&dyn ProviderCredentialStore>) -> Result<WriteOutcome, String> {
+    if op.service != "calendar" || op.expected_collection_token.is_some() { return Err("Invalid task occurrence operation".into()); }
+    let p = crate::dav_live::prepare_task_occurrence_completion_preview(cfg,&op.account_id,entry,&op.collection,&op.href,uid,recurrence_id,completed_at,window_start,window_end,credentials)?;
+    if p.origin != op.origin || p.edit.href != op.href || Some(p.edit.expected_etag.as_str()) != op.expected_etag.as_deref() || Some(p.edit.raw.as_slice()) != op.raw.as_deref() { return Err("Task occurrence changed after approval".into()); }
     execute_inner(cfg,entry,op,credentials)
 }
 

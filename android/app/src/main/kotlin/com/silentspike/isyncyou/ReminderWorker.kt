@@ -15,7 +15,28 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
-/** Dormant until a complete, ACL-aware native reminder plan is qualified. */
+internal object ReminderStatus {
+    private const val PREFS = "reminder_status_v1"
+    fun record(context: Context, status: String) {
+        require(status in setOf("idle", "planning", "ready", "unavailable", "unsupported_alarm_coverage"))
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString("status", status).putLong("at", System.currentTimeMillis()).apply()
+    }
+    fun snapshot(context: Context): JSONObject {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val manager = context.getSystemService(NotificationManager::class.java)
+        val enabled = NotificationManagerCompat.from(context).areNotificationsEnabled() &&
+            (Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) &&
+            (Build.VERSION.SDK_INT < 26 || manager?.getNotificationChannel("calendar_reminders")?.importance != NotificationManager.IMPORTANCE_NONE)
+        val connectivity = context.getSystemService(android.net.ConnectivityManager::class.java)
+        val caps = connectivity?.getNetworkCapabilities(connectivity.activeNetwork)
+        val online = caps?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
+        return JSONObject().put("planning", prefs.getString("status", "idle"))
+            .put("last_checked_at", prefs.getLong("at", 0)).put("notifications_enabled", enabled).put("network_validated", online)
+    }
+}
+
+/** Rechecks native authorization and reminder identity immediately before posting. */
 class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val tag = inputData.getString("tag") ?: return@withContext Result.failure()
@@ -23,6 +44,11 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
         // WorkManager stores only the pseudonymous tag. The source record is encrypted.
         val record = runCatching { PushEnrollmentStore.get(applicationContext, "r_$tag") }.getOrNull()
             ?: return@withContext Result.failure()
+        val trigger = record.optLong("trigger_at", 0)
+        if (trigger <= 0 || trigger < System.currentTimeMillis() / 1000 - 86400) {
+            runCatching { PushEnrollmentStore.remove(applicationContext, "r_$tag") }
+            return@withContext Result.failure()
+        }
         if (!runCatching { EngineBootstrap.ensureStarted(applicationContext.filesDir).isNotEmpty() }.getOrDefault(false)) {
             return@withContext Result.retry()
         }
@@ -34,16 +60,19 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
             (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(applicationContext,
                 Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) ||
             (Build.VERSION.SDK_INT >= 26 && manager.getNotificationChannel(CHANNEL)?.importance == NotificationManager.IMPORTANCE_NONE)) {
-            return@withContext Result.failure()
+            return@withContext Result.retry()
         }
         val claimed = runCatching {
             JSONObject(NativeEngine.nativeReminderClaim(applicationContext.filesDir.absolutePath, record.toString()))
-        }.getOrNull() ?: return@withContext Result.failure()
+        }.getOrNull() ?: return@withContext Result.retry()
         val claimStatus = claimed.optString("status")
         when (claimStatus) {
-            "delivered" -> return@withContext Result.success()
+            "delivered" -> {
+                runCatching { PushEnrollmentStore.remove(applicationContext, "r_$tag") }
+                return@withContext Result.success()
+            }
             "new", "pending" -> if (claimed.optString("notification_tag") != tag) return@withContext Result.failure()
-            else -> return@withContext Result.failure()
+            else -> return@withContext Result.retry()
         }
         val notification = NotificationCompat.Builder(applicationContext, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_isyncyou).setContentTitle("Calendar reminder")
@@ -58,7 +87,10 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
         if (!accepted) return@withContext Result.failure()
         // An OS readback is not evidence that a person saw the notification.
         if (runCatching { NativeEngine.nativeReminderAcknowledge(applicationContext.filesDir.absolutePath, record.toString(), tag) == 1 }
-                .getOrDefault(false)) Result.success() else Result.retry()
+                .getOrDefault(false)) {
+            runCatching { PushEnrollmentStore.remove(applicationContext, "r_$tag") }
+            Result.success()
+        } else Result.retry()
     }
 
     companion object {

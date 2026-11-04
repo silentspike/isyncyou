@@ -46,6 +46,7 @@ class ProviderCatchUpWorker(context: Context, params: WorkerParameters) : Corout
     companion object {
         private const val NAME = "provider-account-catch-up"
         fun schedule(context: Context) {
+            ReminderPlanningWorker.schedule(context)
             val request = PeriodicWorkRequestBuilder<ProviderCatchUpWorker>(15, TimeUnit.MINUTES)
                 .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
                 .setInitialDelay(15, TimeUnit.MINUTES)
