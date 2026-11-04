@@ -8,6 +8,10 @@ use ical::tree::cst::{IcalCst, IcalItem};
 use ical::tree::line::IcalLine;
 use std::collections::{HashMap, HashSet};
 
+pub type ZonedEventTimePreview = (String, Option<String>, String, Option<String>, Vec<u8>);
+pub type TaskFieldsPreview = (String, Option<String>, Option<String>, Option<String>, Vec<u8>);
+pub type TaskAttributesPreview = (String, Option<String>, Option<String>, Vec<u8>);
+
 fn name(node: &IcalCst<'_>) -> Option<String> {
     node.begin.as_ref().map(|line| line.raw_value_str().to_ascii_uppercase())
 }
@@ -215,9 +219,7 @@ pub fn task_index(raw: &[u8]) -> Result<TaskIndex, String> {
         if let Some(id) = recurrence.first() { if id.is_empty() || !occurrences.insert(id.clone()) { return Err("Ambiguous task occurrence".into()); } }
         if all_uid.as_ref().is_some_and(|old| old != &ids[0]) { return Err("Multiple task UIDs in resource".into()); }
         all_uid = Some(ids[0].clone());
-        if recurrence.is_empty() {
-            if master.replace(child).is_some() { return Err("Multiple task masters".into()); }
-        }
+        if recurrence.is_empty() && master.replace(child).is_some() { return Err("Multiple task masters".into()); }
     }
     let uid = all_uid.ok_or("Task UID missing")?;
     let master = master.ok_or("Task master missing")?;
@@ -400,7 +402,7 @@ pub fn event_time_zoned(raw: &[u8], uid: &str, recurrence_id: Option<&str>, star
 
 /// Zone-aware preview is restricted to one unscheduled, non-recurring event
 /// with no alarms; source timezone parameters are returned for display.
-pub fn preview_event_time_zoned(raw: &[u8], uid: &str, start: &str, end: &str, tzid: &str) -> Result<(String, Option<String>, String, Option<String>, Vec<u8>), String> {
+pub fn preview_event_time_zoned(raw: &[u8], uid: &str, start: &str, end: &str, tzid: &str) -> Result<ZonedEventTimePreview, String> {
     let tree = parse(raw)?;
     if !values(&tree,"METHOD").is_empty() || tree.items.iter().any(|item| matches!(item,IcalItem::Opaque(_))) { return Err("Calendar effect cannot be previewed safely".into()); }
     let mut target = None;
@@ -857,7 +859,7 @@ pub fn task_completion(raw: &[u8], uid: &str, recurrence_id: Option<&str>, compl
 
 /// Preview and prepare one unambiguous VTODO without scheduling recipients.
 /// Series masters are excluded until their broader effect can be displayed.
-pub fn preview_task_completion(raw: &[u8], uid: &str, recurrence_id: Option<&str>, completed_at: Option<&str>) -> Result<(String, Option<String>, Option<String>, Option<String>, Vec<u8>), String> {
+pub fn preview_task_completion(raw: &[u8], uid: &str, recurrence_id: Option<&str>, completed_at: Option<&str>) -> Result<TaskFieldsPreview, String> {
     let tree = parse(raw)?;
     if !values(&tree,"METHOD").is_empty() { return Err("Scheduled calendar requires explicit scheduling approval".into()); }
     let mut target = None;
@@ -910,9 +912,7 @@ pub fn preview_task_occurrence_completion(raw: &[u8], expanded: &[u8], uid: &str
     let expansion = parse(expanded)?;
     let mut occurrence = None;
     for entry in &expansion.items { if let IcalItem::Component(child) = entry {
-        if name(child).as_deref() == Some("VTODO") && values(child,"UID") == [uid] && values(child,"RECURRENCE-ID") == [recurrence_id] {
-            if occurrence.replace(child).is_some() { return Err("Expanded task occurrence is ambiguous".into()); }
-        }
+        if name(child).as_deref() == Some("VTODO") && values(child,"UID") == [uid] && values(child,"RECURRENCE-ID") == [recurrence_id] && occurrence.replace(child).is_some() { return Err("Expanded task occurrence is ambiguous".into()); }
     } }
     let occurrence = occurrence.ok_or("Expanded task occurrence missing")?;
     for entry in &occurrence.items { if let IcalItem::Prop(line) = entry {
@@ -1123,12 +1123,12 @@ pub fn task_attributes_with_start(raw: &[u8], uid: &str, recurrence_id: Option<&
 
 /// Preview task priority/due changes only when no scheduling or series-wide
 /// side effect is present. Existing due parameters are exposed separately.
-pub fn preview_task_attributes(raw: &[u8], uid: &str, priority: Option<u8>, due: Option<(&str, bool)>) -> Result<(String, Option<String>, Option<String>, Vec<u8>), String> {
+pub fn preview_task_attributes(raw: &[u8], uid: &str, priority: Option<u8>, due: Option<(&str, bool)>) -> Result<TaskAttributesPreview, String> {
     let (name,priority,due,_,raw) = preview_task_attributes_with_start(raw,uid,priority,due,None)?;
     Ok((name,priority,due,raw))
 }
 
-pub fn preview_task_attributes_with_start(raw: &[u8], uid: &str, priority: Option<u8>, due: Option<(&str, bool)>, start: Option<&str>) -> Result<(String, Option<String>, Option<String>, Option<String>, Vec<u8>), String> {
+pub fn preview_task_attributes_with_start(raw: &[u8], uid: &str, priority: Option<u8>, due: Option<(&str, bool)>, start: Option<&str>) -> Result<TaskFieldsPreview, String> {
     let tree = parse(raw)?;
     if !values(&tree,"METHOD").is_empty() || tree.items.iter().any(|item| matches!(item,IcalItem::Opaque(_))) { return Err("Task effect cannot be previewed safely".into()); }
     let mut target = None;

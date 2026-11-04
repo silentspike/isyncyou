@@ -36,7 +36,15 @@ impl Gate {
         c.streams+=1; Permit { gate:self.clone(), attachment:false, stream:true, counts_request:false }
     }
 }
-impl Drop for Permit { fn drop(&mut self) { let mut c=self.gate.counts.lock().unwrap_or_else(|e|e.into_inner()); if self.stream {c.streams-=1;} if self.counts_request {c.requests-=1;} if self.attachment {c.attachments-=1;} self.gate.changed.notify_all(); } }
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let mut c = self.gate.counts.lock().unwrap_or_else(|e| e.into_inner());
+        if self.stream { c.streams -= 1; }
+        if self.counts_request { c.requests -= 1; }
+        if self.attachment { c.attachments -= 1; }
+        self.gate.changed.notify_all();
+    }
+}
 pub(crate) fn account_gate(key: &str, request_limit: usize, attachment_limit: usize) -> Arc<Gate> {
     static GATES: OnceLock<Mutex<HashMap<String,Weak<Gate>>>>=OnceLock::new();
     let mut gates=GATES.get_or_init(||Mutex::new(HashMap::new())).lock().unwrap_or_else(|e|e.into_inner());

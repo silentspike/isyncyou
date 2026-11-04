@@ -769,6 +769,7 @@ impl JmapClient {
     }
     /// Caller must persist the exact approved intent before invoking this once.
     /// Unknown outcomes require native reconciliation, never automatic retry.
+    #[allow(clippy::too_many_arguments)] // The arguments are the approved native submission fields.
     pub fn submit(
         &self,
         creation_id: &str,
@@ -837,6 +838,7 @@ impl JmapClient {
         Ok(payload)
     }
     /// The caller persists an intent and reconciles a lost response before any retry.
+    #[allow(clippy::too_many_arguments)] // These are the native push subscription fields.
     pub fn push_create(
         &self,
         creation_id: &str,
