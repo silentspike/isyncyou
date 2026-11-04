@@ -1964,6 +1964,7 @@ impl Store {
 
     /// Atomically publish a bounded active projection without touching archives,
     /// capture records, or the historical full-collection cursor.
+    #[allow(clippy::too_many_arguments)]
     pub fn publish_provider_mail_window(
         &self,
         scope: &ProviderScope,
@@ -2822,7 +2823,15 @@ mod tests {
             raw: br#"{"id":"new"}"#.to_vec(),
         };
         assert!(store
-            .publish_provider_mail_window(&scope, None, "s1", "q1", 2, 20, &[current.clone()])
+            .publish_provider_mail_window(
+                &scope,
+                None,
+                "s1",
+                "q1",
+                2,
+                20,
+                std::slice::from_ref(&current),
+            )
             .unwrap());
         let page = store
             .provider_mail_window_snapshot(&scope, 0, 50)

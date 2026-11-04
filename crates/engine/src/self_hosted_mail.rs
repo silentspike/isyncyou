@@ -179,6 +179,7 @@ pub fn live_mail_metadata_page(
 }
 
 /// Query a bounded page from the server, including messages outside the local window.
+#[allow(clippy::too_many_arguments)]
 pub fn live_mail_metadata_search_page(
     cfg: &Config,
     account: &str,

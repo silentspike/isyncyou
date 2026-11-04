@@ -44,6 +44,15 @@ internal object PushEnrollmentStore {
         return try { JSONObject(String(plaintext, Charsets.UTF_8)) } finally { plaintext.fill(0) }
     }
 
+    /** Enumerate only bounded pseudonymous reminder keys; values remain encrypted. */
+    @Synchronized
+    fun reminderKeys(context: Context): List<String> {
+        val keys = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).all.keys
+            .filter { it.matches(Regex("r_[0-9a-f]{64}")) }
+        require(keys.size <= 10000)
+        return keys
+    }
+
     @Synchronized
     fun remove(context: Context, instance: String) {
         require(valid(instance))

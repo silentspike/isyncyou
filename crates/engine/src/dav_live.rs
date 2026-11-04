@@ -859,6 +859,43 @@ impl ReminderPlan {
 pub struct ReminderAccountPlan {
     pub records: Vec<serde_json::Value>,
     pub unsupported_count: usize,
+    pub completed_collections: Vec<String>,
+    pub failed_collections: usize,
+    pub failure_reason: Option<String>,
+}
+
+// Publish a collection only after its entire live plan and cursor checks succeed.
+fn finish_reminder_collection(
+    plan: &mut ReminderAccountPlan,
+    collection: String,
+    records: Vec<serde_json::Value>,
+    unsupported: usize,
+    result: Result<(), String>,
+) {
+    match result {
+        Ok(()) => {
+            plan.records.extend(records);
+            plan.unsupported_count += unsupported;
+            plan.completed_collections.push(collection);
+        }
+        Err(reason) => {
+            plan.failed_collections += 1;
+            if plan.failure_reason.is_none() {
+                let code = match reason.as_str() {
+                    "reminder_sync"
+                    | "reminder_cache"
+                    | "reminder_access_denied"
+                    | "reminder_events_report"
+                    | "reminder_tasks_report"
+                    | "reminder_changed"
+                    | "reminder_access_check"
+                    | "reminder_resource_get" => reason,
+                    _ => "reminder_plan".into(),
+                };
+                plan.failure_reason = Some(code);
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -888,8 +925,9 @@ fn reminder_resource_coverage(raw: &[u8]) -> ReminderResourceCoverage {
 }
 
 /// Enumerate a bounded occurrence window across every currently discovered
-/// calendar. Synchronization, access and consistency errors abort the pass;
-/// unsupported individual resources are counted without exposing content.
+/// calendar. Discovery errors abort the account pass; collection errors retain
+/// only complete, authorized collections and mark the result as partial.
+/// Unsupported individual resources are counted without exposing content.
 /// This does not establish coverage outside the occurrence window.
 #[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
 pub fn plan_account_reminders_with_store(
@@ -922,8 +960,13 @@ pub fn plan_account_reminders_with_store(
     let client =
         client_with_store(cfg, account, &origin, credentials).map_err(|_| "reminder_client")?;
     let collections = client.discover(entry).map_err(|_| "reminder_discovery")?;
-    let mut records = Vec::new();
-    let mut unsupported_count = 0usize;
+    let mut plan = ReminderAccountPlan {
+        records: Vec::new(),
+        unsupported_count: 0,
+        completed_collections: Vec::new(),
+        failed_collections: 0,
+        failure_reason: None,
+    };
     let mut objects_seen = 0usize;
     for collection in collections.into_iter().filter(|c| c.calendar) {
         let scope = ProviderScope {
@@ -932,146 +975,155 @@ pub fn plan_account_reminders_with_store(
             service: "calendar".into(),
             collection: collection.url,
         };
-        sync_detached(cfg, &client, &scope).map_err(|_| "reminder_sync")?;
-        let store =
-            crate::provider_store::open_readonly(cfg, account).map_err(|_| "reminder_cache")?;
-        let initial_cursor = store
-            .provider_cursor(&scope)
-            .map_err(|_| "reminder_cache")?;
-        let initial_access = store
-            .provider_accessible(&scope)
-            .map_err(|_| "reminder_cache")?;
-        if initial_access != Some(true) {
-            return Err("reminder_access_denied".into());
-        }
-        let mut expanded = client
-            .expanded_events(&scope, occurrence_start, occurrence_end)
-            .map_err(|_| "reminder_events_report")?;
-        expanded.extend(
-            client
-                .expanded_tasks(&scope, occurrence_start, occurrence_end)
-                .map_err(|_| "reminder_tasks_report")?,
-        );
-        let mut by_href = std::collections::HashMap::new();
-        for item in expanded {
-            if by_href.insert(item.href.clone(), item).is_some() {
+        let mut scope_records = Vec::new();
+        let mut scope_unsupported = 0usize;
+        let result: Result<(), String> = (|| {
+            sync_detached(cfg, &client, &scope).map_err(|_| "reminder_sync")?;
+            let store =
+                crate::provider_store::open_readonly(cfg, account).map_err(|_| "reminder_cache")?;
+            let initial_cursor = store
+                .provider_cursor(&scope)
+                .map_err(|_| "reminder_cache")?;
+            let initial_access = store
+                .provider_accessible(&scope)
+                .map_err(|_| "reminder_cache")?;
+            if initial_access != Some(true) {
+                return Err("reminder_access_denied".into());
+            }
+            let mut expanded = client
+                .expanded_events(&scope, occurrence_start, occurrence_end)
+                .map_err(|_| "reminder_events_report")?;
+            expanded.extend(
+                client
+                    .expanded_tasks(&scope, occurrence_start, occurrence_end)
+                    .map_err(|_| "reminder_tasks_report")?,
+            );
+            let mut by_href = std::collections::HashMap::new();
+            for item in expanded {
+                if by_href.insert(item.href.clone(), item).is_some() {
+                    return Err("reminder_changed".into());
+                }
+            }
+            let mut after = String::new();
+            loop {
+                let page = store
+                    .provider_objects_page(&scope, &after, 128)
+                    .map_err(|_| "reminder_cache")?;
+                if page.is_empty() {
+                    break;
+                }
+                for object in &page {
+                    objects_seen += 1;
+                    if objects_seen > 10000 {
+                        return Err("Reminder account resource limit exceeded".into());
+                    }
+                    let expansion = by_href.remove(&object.remote_id);
+                    if expansion
+                        .as_ref()
+                        .is_some_and(|v| object.etag.as_deref() != Some(v.etag.as_str()))
+                    {
+                        return Err("reminder_changed".into());
+                    }
+                    let standalone = match reminder_resource_coverage(&object.raw) {
+                        ReminderResourceCoverage::NoAlarms => continue,
+                        ReminderResourceCoverage::Standalone => true,
+                        ReminderResourceCoverage::Expanded => false,
+                        ReminderResourceCoverage::Unsupported => {
+                            scope_unsupported += 1;
+                            continue;
+                        }
+                    };
+                    if !standalone && expansion.is_none() {
+                        continue;
+                    }
+                    if !client
+                        .permits(&scope, Some(&object.remote_id), "read")
+                        .map_err(|_| "reminder_access_check")?
+                    {
+                        return Err("reminder_access_denied".into());
+                    }
+                    let source = client
+                        .read_resource(&scope, &object.remote_id)
+                        .map_err(|_| "reminder_resource_get")?;
+                    let etag = source.etag.clone().ok_or("Reminder ETag unavailable")?;
+                    if object.etag.as_deref() != Some(etag.as_str()) {
+                        return Err("reminder_changed".into());
+                    }
+                    let data = if standalone {
+                        source.raw.as_slice()
+                    } else {
+                        expansion
+                            .as_ref()
+                            .ok_or("Missing expansion")?
+                            .calendar_data
+                            .as_bytes()
+                    };
+                    let planned = match isyncyou_connectors::dav::reminders::plan(
+                        data,
+                        &source.raw,
+                        floating_tzid,
+                        window_start,
+                        window_end,
+                    ) {
+                        Ok(planned) => planned,
+                        Err(_) => {
+                            scope_unsupported += 1;
+                            continue;
+                        }
+                    };
+                    let items = planned
+                        .into_iter()
+                        .map(|identity| ReminderPlanItem {
+                            notification_tag: identity.notification_tag(&scope),
+                            identity,
+                        })
+                        .collect();
+                    let item_plan = ReminderPlan {
+                        scope: scope.clone(),
+                        href: object.remote_id.clone(),
+                        etag,
+                        occurrence_start: occurrence_start.into(),
+                        occurrence_end: occurrence_end.into(),
+                        window_start,
+                        window_end,
+                        items,
+                    };
+                    scope_records.extend(item_plan.native_records(floating_tzid)?);
+                    if plan.records.len() + scope_records.len() > 10000 {
+                        return Err("Reminder account plan limit exceeded".into());
+                    }
+                }
+                after = page
+                    .last()
+                    .ok_or("Reminder pagination failed")?
+                    .remote_id
+                    .clone();
+            }
+            if !by_href.is_empty() {
                 return Err("reminder_changed".into());
             }
-        }
-        let mut after = String::new();
-        loop {
-            let page = store
-                .provider_objects_page(&scope, &after, 128)
-                .map_err(|_| "reminder_cache")?;
-            if page.is_empty() {
-                break;
-            }
-            for object in &page {
-                objects_seen += 1;
-                if objects_seen > 10000 {
-                    return Err("Reminder account resource limit exceeded".into());
-                }
-                let expansion = by_href.remove(&object.remote_id);
-                if expansion
-                    .as_ref()
-                    .is_some_and(|v| object.etag.as_deref() != Some(v.etag.as_str()))
-                {
-                    return Err("reminder_changed".into());
-                }
-                let standalone = match reminder_resource_coverage(&object.raw) {
-                    ReminderResourceCoverage::NoAlarms => continue,
-                    ReminderResourceCoverage::Standalone => true,
-                    ReminderResourceCoverage::Expanded => false,
-                    ReminderResourceCoverage::Unsupported => {
-                        unsupported_count += 1;
-                        continue;
-                    }
-                };
-                if !standalone && expansion.is_none() {
-                    continue;
-                }
-                if !client
-                    .permits(&scope, Some(&object.remote_id), "read")
-                    .map_err(|_| "reminder_access_check")?
-                {
-                    return Err("reminder_access_denied".into());
-                }
-                let source = client
-                    .read_resource(&scope, &object.remote_id)
-                    .map_err(|_| "reminder_resource_get")?;
-                let etag = source.etag.clone().ok_or("Reminder ETag unavailable")?;
-                if object.etag.as_deref() != Some(etag.as_str()) {
-                    return Err("reminder_changed".into());
-                }
-                let data = if standalone {
-                    source.raw.as_slice()
-                } else {
-                    expansion
-                        .as_ref()
-                        .ok_or("Missing expansion")?
-                        .calendar_data
-                        .as_bytes()
-                };
-                let planned = match isyncyou_connectors::dav::reminders::plan(
-                    data,
-                    &source.raw,
-                    floating_tzid,
-                    window_start,
-                    window_end,
-                ) {
-                    Ok(planned) => planned,
-                    Err(_) => {
-                        unsupported_count += 1;
-                        continue;
-                    }
-                };
-                let items = planned
-                    .into_iter()
-                    .map(|identity| ReminderPlanItem {
-                        notification_tag: identity.notification_tag(&scope),
-                        identity,
-                    })
-                    .collect();
-                let plan = ReminderPlan {
-                    scope: scope.clone(),
-                    href: object.remote_id.clone(),
-                    etag,
-                    occurrence_start: occurrence_start.into(),
-                    occurrence_end: occurrence_end.into(),
-                    window_start,
-                    window_end,
-                    items,
-                };
-                records.extend(plan.native_records(floating_tzid)?);
-                if records.len() > 10000 {
-                    return Err("Reminder account plan limit exceeded".into());
-                }
-            }
-            after = page
-                .last()
-                .ok_or("Reminder pagination failed")?
-                .remote_id
-                .clone();
-        }
-        if !by_href.is_empty() {
-            return Err("reminder_changed".into());
-        }
-        if store
-            .provider_cursor(&scope)
-            .map_err(|_| "reminder_cache")?
-            != initial_cursor
-            || store
-                .provider_accessible(&scope)
+            if store
+                .provider_cursor(&scope)
                 .map_err(|_| "reminder_cache")?
-                != initial_access
-        {
-            return Err("reminder_changed".into());
-        }
+                != initial_cursor
+                || store
+                    .provider_accessible(&scope)
+                    .map_err(|_| "reminder_cache")?
+                    != initial_access
+            {
+                return Err("reminder_changed".into());
+            }
+            Ok(())
+        })();
+        finish_reminder_collection(
+            &mut plan,
+            scope.collection,
+            scope_records,
+            scope_unsupported,
+            result,
+        );
     }
-    Ok(ReminderAccountPlan {
-        records,
-        unsupported_count,
-    })
+    Ok(plan)
 }
 
 /// A content-free revision for deciding whether a previously complete account
@@ -4458,12 +4510,45 @@ mod tests {
     }
 
     #[test]
+    fn failed_collection_discards_its_records_and_does_not_starve_next_collection() {
+        let mut plan = ReminderAccountPlan {
+            records: vec![],
+            unsupported_count: 0,
+            completed_collections: vec![],
+            failed_collections: 0,
+            failure_reason: None,
+        };
+        finish_reminder_collection(
+            &mut plan,
+            "bad".into(),
+            vec![serde_json::json!("stale")],
+            1,
+            Err("reminder_sync".into()),
+        );
+        finish_reminder_collection(
+            &mut plan,
+            "good".into(),
+            vec![serde_json::json!("valid")],
+            0,
+            Ok(()),
+        );
+        assert_eq!(plan.records, vec![serde_json::json!("valid")]);
+        assert_eq!(plan.completed_collections, vec!["good"]);
+        assert_eq!(plan.failed_collections, 1);
+        assert_eq!(plan.failure_reason.as_deref(), Some("reminder_sync"));
+        assert_eq!(plan.unsupported_count, 0);
+    }
+
+    #[test]
     fn unsupported_recurring_alarm_does_not_hide_supported_reminder() {
         let valid = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//fixture//EN\r\nBEGIN:VEVENT\r\nUID:event\r\nDTSTAMP:20261001T100000Z\r\nDTSTART:20261028T100000Z\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nDESCRIPTION:Alarm\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         let unsupported = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//fixture//EN\r\nBEGIN:VEVENT\r\nUID:series\r\nDTSTAMP:20261001T100000Z\r\nDTSTART:20261028T100000Z\r\nRRULE:FREQ=DAILY\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER;VALUE=DATE-TIME:20261028T094500Z\r\nDESCRIPTION:Alarm\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         let mut plan = ReminderAccountPlan {
             records: Vec::new(),
             unsupported_count: 0,
+            completed_collections: Vec::new(),
+            failed_collections: 0,
+            failure_reason: None,
         };
         for raw in [valid.as_slice(), unsupported.as_slice()] {
             match reminder_resource_coverage(raw) {

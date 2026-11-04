@@ -83,8 +83,17 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
             // Pending with no active OS entry may mean a crash before dispatch OR
             // a previously displayed notification already dismissed by the user.
             // Do not automatically display it a second time when that is unknown.
-            if (claimStatus == "new") manager.notify(tag, NOTIFICATION_ID, notification)
-            manager.activeNotifications.any { it.tag == tag && it.id == NOTIFICATION_ID }
+            synchronized(PushEnrollmentStore) {
+                // Serialize the final local identity check and notification with
+                // planner invalidation. Network authorization happened above.
+                val current = PushEnrollmentStore.get(applicationContext, "r_$tag")
+                if (isStopped || current == null || current.toString() != record.toString()) {
+                    false
+                } else {
+                    if (claimStatus == "new") manager.notify(tag, NOTIFICATION_ID, notification)
+                    manager.activeNotifications.any { it.tag == tag && it.id == NOTIFICATION_ID }
+                }
+            }
         }.getOrDefault(false)
         if (!accepted) return@withContext Result.failure()
         // An OS readback is not evidence that a person saw the notification.

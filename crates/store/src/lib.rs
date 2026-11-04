@@ -746,6 +746,10 @@ pub struct MobileJob {
     pub last_error: Option<String>,
 }
 
+/// File metadata and key digest used to identify a cached read-only archive.
+#[cfg(unix)]
+pub type ReadonlyCacheIdentity = (u64, u64, u32, u32, u32, i64, i64, [u8; 32]);
+
 /// The store. Holds the DB connection and (for on-disk stores) the instance lock.
 pub struct Store {
     conn: Connection,
@@ -842,9 +846,7 @@ impl Store {
     /// Identity of an archive reader, including key configuration and file custody.
     /// This contains only a digest of the configured key, never the key itself.
     #[cfg(unix)]
-    pub fn readonly_cache_identity(
-        path: impl AsRef<Path>,
-    ) -> Result<(u64, u64, u32, u32, u32, i64, i64, [u8; 32])> {
+    pub fn readonly_cache_identity(path: impl AsRef<Path>) -> Result<ReadonlyCacheIdentity> {
         use std::os::unix::fs::MetadataExt;
         let metadata = std::fs::symlink_metadata(path.as_ref())?;
         if !metadata.file_type().is_file() {

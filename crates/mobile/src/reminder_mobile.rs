@@ -50,7 +50,7 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeReminder
             Err(error) if ["reminder_window", "reminder_changed", "reminder_config", "reminder_client", "reminder_discovery", "reminder_sync", "reminder_cache", "reminder_events_report", "reminder_tasks_report", "reminder_read", "reminder_access_check", "reminder_access_denied", "reminder_resource_get", "reminder_plan"].contains(&error.as_str()) => return Ok(serde_json::json!({"ok":false,"reason":error})),
             Err(_) => return Err(()),
         };
-        Ok(serde_json::json!({"ok":true,"records":plan.records,"unsupported_count":plan.unsupported_count}))
+        Ok(serde_json::json!({"ok":true,"records":plan.records,"unsupported_count":plan.unsupported_count,"completed_collections":plan.completed_collections,"failed_collections":plan.failed_collections,"failure_reason":plan.failure_reason}))
     })).ok().and_then(Result::ok).unwrap_or_else(|| serde_json::json!({"ok":false}));
     jni_new_string(&mut env, output.to_string())
 }

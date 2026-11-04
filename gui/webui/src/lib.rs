@@ -4107,6 +4107,7 @@ fn render_provider_mail_view(body: ProviderMailView) -> ApiResponse {
 }
 
 pub trait MailWriteHandler: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
     fn provider_live_mail_page(
         &self,
         _account: &str,
@@ -4975,18 +4976,19 @@ impl EventBus {
     }
 }
 
+#[cfg(unix)]
+type ArchiveReaderCache = Vec<(
+    String,
+    PathBuf,
+    isyncyou_store::ReadonlyCacheIdentity,
+    Store,
+)>;
+
 /// Routes requests against the configured accounts and their stores.
 pub struct Router {
     config: Config,
     #[cfg(unix)]
-    archive_reader: std::sync::Mutex<
-        Vec<(
-            String,
-            PathBuf,
-            (u64, u64, u32, u32, u32, i64, i64, [u8; 32]),
-            Store,
-        )>,
-    >,
+    archive_reader: std::sync::Mutex<ArchiveReaderCache>,
     #[cfg(all(test, unix))]
     archive_reader_opens: std::sync::atomic::AtomicUsize,
     /// Optional change broadcaster for the SSE `/api/v1/events` stream (the
@@ -11505,9 +11507,9 @@ impl Router {
                 .unwrap_or("");
             items.push(json!({"service":"mail","mail_scope":scope.collection,"shared":is_shared,"item_type":"message","remote_id":object.remote_id,"name":value["subject"].as_str().unwrap_or(""),"mailbox_ids":mailboxes,"has_body":false,"preview":{"subject":value["subject"],"from":from,"snippet":value["preview"],"date":value["receivedAt"],"isRead":value["keywords"]["$seen"].as_bool().unwrap_or(false),"isDraft":value["keywords"]["$draft"].as_bool().unwrap_or(false),"attachments":if value["hasAttachment"].as_bool().unwrap_or(false) {1} else {0}}}));
         }
-        return ApiResponse::ok_json(
+        ApiResponse::ok_json(
             &json!({"count":items.len(),"items":items,"scopes":available,"shared_access_status":shared_access_status,"mail_scope":scope.collection,"shared":is_shared,"total":total,"window_limit":window_limit,"provenance":"local","observed_at":observed_at}),
-        );
+        )
     }
 
     fn calendar_expanded(&self, req: &ApiRequest) -> ApiResponse {
@@ -13497,7 +13499,7 @@ mod tests {
                 "query-1",
                 2,
                 1,
-                &[object.clone()]
+                std::slice::from_ref(&object)
             )
             .unwrap());
         store
@@ -21323,7 +21325,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     #[test]
     fn living_ui_pending_card_authority_and_terminal_controls_are_unchanged() {
         for needle in [
-            "postJson(\"/api/v1/agent/confirm\", CAP.agent, attempt.request)",
+            "postJson(\"/api/v1/agent/confirm\", CAP.agent, attempt.request, MUTATION_COMMIT_TIMEOUT_MS)",
             "token: record.token,",
             "action_hash: record.action_hash,",
             "postJson(\"/api/v1/agent/pending/cancel\"",
@@ -21357,7 +21359,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .split("async function cancelAgentPending")
             .next()
             .unwrap();
-        assert!(submit.contains("postJson(\"/api/v1/agent/confirm\", CAP.agent, attempt.request)"));
+        assert!(submit.contains("postJson(\"/api/v1/agent/confirm\", CAP.agent, attempt.request, MUTATION_COMMIT_TIMEOUT_MS)"));
         assert!(APP_JS.contains(
             "return request(method, path, { ...o, perActionToken: d.pending_action_id });"
         ));
@@ -21787,7 +21789,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "AssistantState.pendingCardsById.set(pending.pending_id",
             "token: d.token || \"\"",
             "action_hash: d.action_hash || \"\"",
-            "postJson(\"/api/v1/agent/confirm\", CAP.agent, attempt.request)",
+            "postJson(\"/api/v1/agent/confirm\", CAP.agent, attempt.request, MUTATION_COMMIT_TIMEOUT_MS)",
             "postJson(\"/api/v1/agent/pending/cancel\", CAP.agent",
             "confirmAttemptsByPendingId: new Map()",
             "session_id: turnState.ownerProof?.session_id || \"\"",
