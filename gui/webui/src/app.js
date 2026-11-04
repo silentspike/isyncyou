@@ -9651,7 +9651,7 @@ function renderAccountMenu(body) {
           else if (status && status.auth_state === "pending" && !providerActionsUnknown.has(a.id)) { connectButton.disabled=true; cancelPendingButton.style.display=""; }
         }).catch(() => {});
       }
-      row.append(el("div", { class: "acct-role" },
+      row.append(el("div", { class: "acct-role acct-provider-status" },
         el("span", { class: "acct-role-copy" }, el("b", { text: "Self-hosted account" }),
           el("span", { class: "dim", text: accountRoleStateLabel(providerStatus) })), controls));
       {
@@ -9660,7 +9660,7 @@ function renderAccountMenu(body) {
           : postJson("/api/v1/account/provider/quarantine/list", CAP.account, { request_id: crypto.randomUUID(), account: a.id });
         void listQuarantine.then(result => {
           if (!result || !Array.isArray(result.ids) || !result.ids.length) return;
-          const notice = el("div", { class: "acct-role" }, el("span", { class: "acct-role-copy", text: "A rejected sign-in has a grant whose revocation is pending." }));
+          const notice = el("div", { class: "acct-role acct-provider-notice" }, el("span", { class: "acct-role-copy", text: "A rejected sign-in has a grant whose revocation is pending." }));
           result.ids.forEach(id => {
             if (typeof id !== "string" || !/^[a-f0-9]{64}$/.test(id)) return;
             notice.append(el("button", { class: "btn sm", text: "Retry revocation", onclick: async e => {
@@ -9745,7 +9745,7 @@ function renderAccountMenu(body) {
           openSheet("Retry previous binding removal",content);
         });
         void refreshPush();
-        row.append(el("div", { class: "acct-role" }, el("span", { class: "acct-role-copy" }, el("b", { text: "Push updates" }), pushStatus), setup, reconcile, detach, replacement, retryReplacement));
+        row.append(el("div", { class: "acct-role acct-provider-push" }, el("span", { class: "acct-role-copy" }, el("b", { text: "Push updates" }), pushStatus), el("div", { class:"acct-acts" }, setup, reconcile, detach, replacement, retryReplacement)));
       }    } else if (CAP.account) {
       const roles = el("div", { class: "acct-roles" });
       for (const role of ["reader", "writer"]) {

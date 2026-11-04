@@ -688,6 +688,12 @@ a:hover { text-decoration: underline; }
 .acct-role-icon { display: grid; place-items: center; color: var(--text-mid); }
 .acct-role-copy { display: flex; flex-direction: column; min-width: 0; font-size: var(--fs-xs); }
 .acct-role-copy b, .acct-role-copy span { overflow-wrap: anywhere; }
+/* Self-hosted status rows have no leading role icon; keep text out of the icon column. */
+.acct-provider-status, .acct-provider-push { grid-template-columns: minmax(0, 1fr) auto; }
+.acct-provider-status .acct-acts, .acct-provider-push .acct-acts { flex-wrap: wrap; justify-content: flex-end; }
+.acct-provider-notice { grid-template-columns: minmax(0, 1fr); }
+.acct-provider-notice > button { justify-self: start; }
+
 .acct-note { padding: var(--sp-2) var(--sp-3); font-size: var(--fs-xs); line-height: 1.5; border-top: 1px solid var(--line); margin-top: var(--sp-1); }
 .acct-dc { padding: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-2); align-items: flex-start; }
 .acct-dc-title { font-weight: 600; }
@@ -1165,6 +1171,8 @@ a.note-meta-chip:hover { color: var(--accent); }
   .sheet header { padding-top: calc(16px + env(safe-area-inset-top, 0px)); }
   .sheet .body { padding-bottom: calc(24px + env(safe-area-inset-bottom, 0px)); }
   .acct-menu { top: calc(68px + env(safe-area-inset-top, 0px)); right: 12px; bottom: auto; left: auto; max-height: min(70dvh, 620px); }
+  .acct-provider-push { grid-template-columns: minmax(0, 1fr); }
+  .acct-provider-push .acct-acts { justify-content: flex-start; }
   .btn.sm, .cmp-tb-btn, .seg-btn, .nav-subitem, .state-chip { min-height: 44px; }
   .btn.sm.icon-only, .cmp-tb-btn, .seg-btn { min-width: 44px; }
   .cal-bar, .con-toolbar, .drive-bar, .todo-head { gap: 8px; }
