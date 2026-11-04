@@ -935,11 +935,15 @@ fn provider_jmap_diagnostics() -> &'static Mutex<HashMap<String, serde_json::Val
 
 /// Run the shared JMAP delta against the same encrypted store used by the UI.
 /// A plain or unavailable store fails closed before any provider object is written.
-fn refresh_self_hosted_data(cfg: &Config, base: &Path) -> (bool, HashMap<String, bool>) {
+fn refresh_self_hosted_data(
+    cfg: &Config,
+    base: &Path,
+    only: &str,
+) -> (bool, HashMap<String, bool>) {
     let mut changed = false;
     let mut outcomes = HashMap::new();
     for account in &cfg.accounts {
-        if !cfg.provider_accounts.contains_key(&account.id) {
+        if account.id != only || !cfg.provider_accounts.contains_key(&account.id) {
             continue;
         }
         let mut successful = true;
@@ -955,6 +959,7 @@ fn refresh_self_hosted_data(cfg: &Config, base: &Path) -> (bool, HashMap<String,
             outcomes.insert(account.id.clone(), false);
             continue;
         }
+        let mail_started = std::time::Instant::now();
         let result = (|| -> Result<usize, &'static str> {
             let store =
                 isyncyou_engine::provider_store::open(cfg, &account.id).map_err(|_| "store")?;
@@ -981,6 +986,10 @@ fn refresh_self_hosted_data(cfg: &Config, base: &Path) -> (bool, HashMap<String,
                     }
                 })
         })();
+        android_info(&format!(
+            "provider_refresh_timing phase=jmap elapsed_ms={}",
+            mail_started.elapsed().as_millis()
+        ));
         match result {
             Ok(count) => changed |= count > 0,
             Err(phase) => {
@@ -1012,6 +1021,7 @@ fn refresh_self_hosted_data(cfg: &Config, base: &Path) -> (bool, HashMap<String,
         }
         // DAV opens the same encrypted store itself, so the mail store above must
         // have been dropped before starting this independent protocol pass.
+        let dav_started = std::time::Instant::now();
         if let Ok(credentials) = provider_credentials::AndroidProviderCredentialStore::new(base) {
             match isyncyou_engine::dav_live::sync_all_with_store(
                 cfg,
@@ -1035,6 +1045,10 @@ fn refresh_self_hosted_data(cfg: &Config, base: &Path) -> (bool, HashMap<String,
             android_info("provider_refresh_failed phase=dav_credentials");
             successful = false;
         }
+        android_info(&format!(
+            "provider_refresh_timing phase=dav elapsed_ms={}",
+            dav_started.elapsed().as_millis()
+        ));
         outcomes.insert(account.id.clone(), successful);
     }
     (changed, outcomes)
@@ -1050,17 +1064,53 @@ fn refresh_loop(
     progress: isyncyou_app_host::SharedProgress,
 ) {
     let reload_warned = AtomicBool::new(false);
+    let mut next_periodic =
+        std::time::Instant::now() + Duration::from_secs(interval.load(Ordering::Relaxed).max(5));
     loop {
-        let secs = interval.load(Ordering::Relaxed).max(5);
-        let generation = wait_for_provider_refresh(Duration::from_secs(secs));
+        let generation = wait_for_provider_refresh(
+            next_periodic.saturating_duration_since(std::time::Instant::now()),
+        );
+        if generation.is_none() {
+            cfg = load_mobile_loop_config(&config_path, &base, &cfg, &reload_warned);
+            run_one_targeted_refresh(&cfg, &base, &gate, &events);
+            continue;
+        }
+        let generation = generation.expect("full refresh generation");
         // Isolate a refresh panic so the loop (and the app) survives.
         let successful = std::panic::catch_unwind(AssertUnwindSafe(|| {
             cfg = load_mobile_loop_config(&config_path, &base, &cfg, &reload_warned);
-            let (refreshed, provider_successful) = {
+            let mut provider_successful = HashMap::new();
+            for account in cfg
+                .accounts
+                .iter()
+                .filter(|a| cfg.provider_accounts.contains_key(&a.id))
+            {
+                // A queued hint gets one turn between account passes. A pass
+                // already in progress is never interrupted or duplicated.
+                run_one_targeted_refresh(&cfg, &base, &gate, &events);
+                let wait = std::time::Instant::now();
                 let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
-                let (self_hosted_changed, provider_successful) =
-                    refresh_self_hosted_data(&cfg, &base);
-                let microsoft_changed = if cfg.provider_accounts.contains_key(ACCOUNT) {
+                android_info(&format!(
+                    "provider_refresh_timing phase=gate_wait elapsed_ms={}",
+                    wait.elapsed().as_millis()
+                ));
+                let (changed, outcome) = refresh_self_hosted_data(&cfg, &base, &account.id);
+                drop(_g);
+                provider_successful.extend(outcome);
+                if changed {
+                    events.notify();
+                }
+            }
+            run_one_targeted_refresh(&cfg, &base, &gate, &events);
+            let microsoft_changed = {
+                let wait = std::time::Instant::now();
+                let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
+                android_info(&format!(
+                    "provider_refresh_timing phase=gate_wait elapsed_ms={}",
+                    wait.elapsed().as_millis()
+                ));
+                let started = std::time::Instant::now();
+                let changed = if cfg.provider_accounts.contains_key(ACCOUNT) {
                     false
                 } else {
                     match isyncyou_engine::auth::resolve_cache_refresh_token(&cfg, ACCOUNT) {
@@ -1079,22 +1129,61 @@ fn refresh_loop(
                         Err(_) => false, // not signed in yet — skip quietly
                     }
                 };
-                (
-                    self_hosted_changed || microsoft_changed,
-                    provider_successful,
-                )
+                android_info(&format!(
+                    "provider_refresh_timing phase=microsoft elapsed_ms={}",
+                    started.elapsed().as_millis()
+                ));
+                changed
             };
+            run_one_targeted_refresh(&cfg, &base, &gate, &events);
             // #655/#718: after the read-only cache refresh, run the mobile scoped OneDrive pass
             // for any explicit Sync/Offline folders, then wake SSE if either changed data.
+            let onedrive_started = std::time::Instant::now();
             let onedrive_changed = run_onedrive_scoped_pass(&cfg, &gate, &progress);
-            if refreshed || onedrive_changed {
+            android_info(&format!(
+                "provider_refresh_timing phase=onedrive elapsed_ms={}",
+                onedrive_started.elapsed().as_millis()
+            ));
+            if microsoft_changed || onedrive_changed {
                 events.notify(); // wake SSE subscribers so the UI refetches
             }
             provider_successful
         }))
         .unwrap_or_default();
         finish_provider_refresh(generation, successful);
+        next_periodic = std::time::Instant::now()
+            + Duration::from_secs(interval.load(Ordering::Relaxed).max(5));
     }
+}
+
+fn run_one_targeted_refresh(
+    cfg: &Config,
+    base: &Path,
+    gate: &Arc<Mutex<()>>,
+    events: &Arc<isyncyou_webui::EventBus>,
+) -> bool {
+    let Some((account, generation)) = take_targeted_refresh() else {
+        return false;
+    };
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let wait = std::time::Instant::now();
+        let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
+        android_info(&format!(
+            "provider_refresh_timing phase=target_gate_wait elapsed_ms={}",
+            wait.elapsed().as_millis()
+        ));
+        refresh_self_hosted_data(cfg, base, &account)
+    }));
+    let (changed, outcomes) = result.unwrap_or_default();
+    if changed {
+        events.notify();
+    }
+    finish_targeted_refresh(
+        &account,
+        generation,
+        outcomes.get(&account).copied().unwrap_or(false),
+    );
+    true
 }
 
 #[derive(Default)]
@@ -1102,6 +1191,51 @@ struct RefreshSignal {
     requested: u64,
     completed: u64,
     outcomes: HashMap<String, bool>,
+    targeted: HashMap<String, TargetRefresh>,
+    last_was_targeted: bool,
+    last_target_account: Option<String>,
+}
+
+impl RefreshSignal {
+    fn choose_ready(&mut self, periodic_due: bool) -> Option<u64> {
+        if periodic_due && self.requested == self.completed {
+            self.requested = self.requested.saturating_add(1);
+        }
+        let targets = self.targeted.values().any(|t| t.requested > t.completed);
+        if targets && (!self.last_was_targeted || self.requested == self.completed) {
+            self.last_was_targeted = true;
+            None
+        } else {
+            self.last_was_targeted = false;
+            Some(self.requested)
+        }
+    }
+}
+
+#[derive(Default)]
+struct TargetRefresh {
+    requested: u64,
+    completed: u64,
+    // A result is retained for each waiting generation until its waiter reads it.
+    waiters: HashMap<u64, Option<bool>>,
+}
+
+impl TargetRefresh {
+    fn register(&mut self) -> u64 {
+        self.requested = self.requested.saturating_add(1);
+        let generation = self.requested;
+        self.waiters.insert(generation, None);
+        generation
+    }
+
+    fn complete(&mut self, generation: u64, success: bool) {
+        self.completed = self.completed.max(generation);
+        for (request, result) in &mut self.waiters {
+            if *request <= generation && result.is_none() {
+                *result = Some(success);
+            }
+        }
+    }
 }
 
 fn provider_refresh_wakeup() -> &'static (Mutex<RefreshSignal>, std::sync::Condvar) {
@@ -1114,16 +1248,106 @@ fn provider_refresh_wakeup() -> &'static (Mutex<RefreshSignal>, std::sync::Condv
     })
 }
 
-fn wait_for_provider_refresh(timeout: Duration) -> u64 {
+fn wait_for_provider_refresh(timeout: Duration) -> Option<u64> {
     let (flag, wake) = provider_refresh_wakeup();
     let guard = flag.lock().unwrap_or_else(|e| e.into_inner());
-    let (mut guard, _) = wake
-        .wait_timeout_while(guard, timeout, |state| state.requested == state.completed)
+    let (mut guard, elapsed) = wake
+        .wait_timeout_while(guard, timeout, |state| {
+            state.requested == state.completed
+                && !state.targeted.values().any(|t| t.requested > t.completed)
+        })
         .unwrap_or_else(|e| e.into_inner());
-    if guard.requested == guard.completed {
-        guard.requested = guard.requested.saturating_add(1);
+    guard.choose_ready(elapsed.timed_out() || timeout.is_zero())
+}
+
+fn take_targeted_refresh() -> Option<(String, u64)> {
+    let (flag, _) = provider_refresh_wakeup();
+    let mut state = flag.lock().unwrap_or_else(|e| e.into_inner());
+    let selected = select_targeted_refresh(&state);
+    if let Some((account, _)) = &selected {
+        state.last_target_account = Some(account.clone());
     }
-    guard.requested
+    selected
+}
+
+fn select_targeted_refresh(state: &RefreshSignal) -> Option<(String, u64)> {
+    let pending = || {
+        state
+            .targeted
+            .iter()
+            .filter(|(_, t)| t.requested > t.completed)
+    };
+    pending()
+        .filter(|(account, _)| {
+            state
+                .last_target_account
+                .as_ref()
+                .is_some_and(|last| *account > last)
+        })
+        .min_by(|(left, _), (right, _)| left.cmp(right))
+        .or_else(|| pending().min_by(|(left, _), (right, _)| left.cmp(right)))
+        .map(|(account, t)| (account.clone(), t.requested))
+}
+
+fn finish_targeted_refresh(account: &str, generation: u64, success: bool) {
+    finish_targeted_refresh_on(provider_refresh_wakeup(), account, generation, success);
+}
+
+fn finish_targeted_refresh_on(
+    signal: &(Mutex<RefreshSignal>, std::sync::Condvar),
+    account: &str,
+    generation: u64,
+    success: bool,
+) {
+    let (flag, wake) = signal;
+    let mut state = flag.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(target) = state.targeted.get_mut(account) {
+        target.complete(generation, success);
+        if target.waiters.is_empty() && target.completed >= target.requested {
+            state.targeted.remove(account);
+        }
+    }
+    wake.notify_all();
+}
+
+fn wait_for_targeted_refresh(account: &str, timeout: Duration) -> bool {
+    wait_for_targeted_refresh_on(provider_refresh_wakeup(), account, timeout)
+}
+
+fn wait_for_targeted_refresh_on(
+    signal: &(Mutex<RefreshSignal>, std::sync::Condvar),
+    account: &str,
+    timeout: Duration,
+) -> bool {
+    if account.is_empty() || account.len() > 128 || account.chars().any(char::is_control) {
+        return false;
+    }
+    let (flag, wake) = signal;
+    let mut state = flag.lock().unwrap_or_else(|e| e.into_inner());
+    let target = state.targeted.entry(account.to_owned()).or_default();
+    let generation = target.register();
+    wake.notify_all();
+    let (mut state, _) = wake
+        .wait_timeout_while(state, timeout, |state| {
+            state
+                .targeted
+                .get(account)
+                .and_then(|t| t.waiters.get(&generation))
+                .is_some_and(Option::is_none)
+        })
+        .unwrap_or_else(|e| e.into_inner());
+    let mut outcome = false;
+    if let Some(target) = state.targeted.get_mut(account) {
+        outcome = target
+            .waiters
+            .remove(&generation)
+            .flatten()
+            .unwrap_or(false);
+        if target.waiters.is_empty() && target.completed >= target.requested {
+            state.targeted.remove(account);
+        }
+    }
+    outcome
 }
 
 fn wake_provider_refresh() -> u64 {
@@ -1141,15 +1365,6 @@ fn finish_provider_refresh(generation: u64, outcomes: HashMap<String, bool>) {
     state.completed = state.completed.max(generation);
     state.outcomes = outcomes;
     wake.notify_all();
-}
-
-fn wait_for_completed_refresh(generation: u64, account: &str, timeout: Duration) -> bool {
-    let (flag, wake) = provider_refresh_wakeup();
-    let guard = flag.lock().unwrap_or_else(|e| e.into_inner());
-    let (guard, _) = wake
-        .wait_timeout_while(guard, timeout, |state| state.completed < generation)
-        .unwrap_or_else(|e| e.into_inner());
-    guard.completed >= generation && guard.outcomes.get(account).copied().unwrap_or(false)
 }
 
 #[no_mangle]
@@ -1174,7 +1389,10 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeProvider
     }).unwrap_or_else(|| serde_json::json!({"operation": "none", "class": "unavailable", "http_status": null, "method_type": null}));
     let (flag, _) = provider_refresh_wakeup();
     let signal = flag.lock().unwrap_or_else(|e| e.into_inner());
-    value["pending"] = serde_json::Value::Bool(signal.completed < signal.requested);
+    value["pending"] = serde_json::Value::Bool(
+        signal.completed < signal.requested
+            || signal.targeted.values().any(|t| t.requested > t.completed),
+    );
     jni_new_string(&mut env, value.to_string())
 }
 
@@ -1188,9 +1406,7 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeWaitProv
     let Some(account) = jni_get_string(&mut env, &account) else {
         return 0;
     };
-    let generation = wake_provider_refresh();
-    i32::from(wait_for_completed_refresh(
-        generation,
+    i32::from(wait_for_targeted_refresh(
         &account,
         Duration::from_secs(120),
     ))
@@ -2081,6 +2297,119 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeArmAccou
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn targeted_refresh_results_are_account_and_generation_scoped() {
+        let mut d = TargetRefresh::default();
+        let mut e = TargetRefresh::default();
+        let first = d.register();
+        let same_pass = d.register();
+        let snapshot = d.requested;
+        let later = d.register();
+        let other = e.register();
+        d.complete(snapshot, true);
+        assert_eq!(d.waiters[&first], Some(true));
+        assert_eq!(d.waiters[&same_pass], Some(true));
+        assert_eq!(d.waiters[&later], None);
+        assert_eq!(e.waiters[&other], None);
+        d.complete(later, false);
+        assert_eq!(d.waiters[&first], Some(true));
+        assert_eq!(d.waiters[&later], Some(false));
+        e.complete(other, false);
+        assert_eq!(e.waiters[&other], Some(false));
+    }
+
+    #[test]
+    fn targeted_refresh_prioritizes_hints_without_starving_full_pass() {
+        let mut state = RefreshSignal {
+            requested: 1,
+            ..RefreshSignal::default()
+        };
+        state.targeted.entry("d".into()).or_default().register();
+        assert_eq!(state.choose_ready(false), None);
+        assert_eq!(state.requested, 1);
+        assert_eq!(state.choose_ready(false), Some(1));
+        assert_eq!(state.completed, 0);
+        state.completed = 1;
+        assert_eq!(state.choose_ready(true), None);
+        assert_eq!(state.requested, 2);
+        assert_eq!(state.choose_ready(true), Some(2));
+    }
+
+    #[test]
+    fn targeted_refresh_round_robin_covers_three_busy_accounts() {
+        let mut state = RefreshSignal::default();
+        for account in ["d", "e", "f"] {
+            state.targeted.entry(account.into()).or_default().register();
+        }
+        let mut turns = Vec::new();
+        for _ in 0..6 {
+            let (account, _) = select_targeted_refresh(&state).unwrap();
+            state.last_target_account = Some(account.clone());
+            turns.push(account);
+        }
+        assert_eq!(turns, ["d", "e", "f", "d", "e", "f"]);
+    }
+
+    #[test]
+    fn targeted_waiter_finishes_without_waiting_for_unrelated_full_pass() {
+        let signal = Arc::new((
+            Mutex::new(RefreshSignal::default()),
+            std::sync::Condvar::new(),
+        ));
+        signal.0.lock().unwrap().requested = 1; // Simulated full pass still in flight.
+        let waiter_signal = signal.clone();
+        let waiter = std::thread::spawn(move || {
+            wait_for_targeted_refresh_on(&waiter_signal, "d", Duration::from_secs(3))
+        });
+        let (lock, wake) = &*signal;
+        let state = lock.lock().unwrap();
+        let (state, result) = wake
+            .wait_timeout_while(state, Duration::from_secs(2), |s| {
+                !s.targeted.contains_key("d")
+            })
+            .unwrap();
+        assert!(!result.timed_out());
+        let generation = state.targeted["d"].requested;
+        assert_eq!(state.completed, 0);
+        drop(state);
+        finish_targeted_refresh_on(&signal, "d", generation, true);
+        assert!(waiter.join().unwrap());
+        assert_eq!(signal.0.lock().unwrap().completed, 0);
+    }
+
+    #[test]
+    fn targeted_timeout_keeps_request_and_does_not_credit_later_waiter() {
+        let signal = Arc::new((
+            Mutex::new(RefreshSignal::default()),
+            std::sync::Condvar::new(),
+        ));
+        assert!(!wait_for_targeted_refresh_on(
+            &signal,
+            "d",
+            Duration::from_millis(5)
+        ));
+        let old = signal.0.lock().unwrap().targeted["d"].requested;
+        let waiter_signal = signal.clone();
+        let waiter = std::thread::spawn(move || {
+            wait_for_targeted_refresh_on(&waiter_signal, "d", Duration::from_secs(3))
+        });
+        let (lock, wake) = &*signal;
+        let state = lock.lock().unwrap();
+        let (state, result) = wake
+            .wait_timeout_while(state, Duration::from_secs(2), |s| {
+                s.targeted["d"].requested == old
+            })
+            .unwrap();
+        assert!(!result.timed_out());
+        let later = state.targeted["d"].requested;
+        drop(state);
+        // An old in-flight pass must not acknowledge a request made after it started.
+        finish_targeted_refresh_on(&signal, "d", old, true);
+        assert_eq!(signal.0.lock().unwrap().targeted["d"].waiters[&later], None);
+        finish_targeted_refresh_on(&signal, "d", later, false);
+        assert!(!waiter.join().unwrap());
+    }
 
     #[cfg(feature = "agent-network-device-test-hooks")]
     #[test]
