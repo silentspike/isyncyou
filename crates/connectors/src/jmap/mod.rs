@@ -312,6 +312,16 @@ pub struct JmapClient {
     session_state: String,
     vapid_public_key: Option<String>,
     metrics: Mutex<JmapSyncMetrics>,
+    sync_failure: Arc<Mutex<Option<JmapSyncFailure>>>,
+}
+
+/// Bounded per-client diagnostic; never stores identifiers or server text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JmapSyncFailure {
+    pub operation: &'static str,
+    pub class: &'static str,
+    pub http_status: Option<u16>,
+    pub method_type: Option<&'static str>,
 }
 
 /// Per-client aggregate counters; never contains account identifiers or payloads.
@@ -463,6 +473,7 @@ impl JmapClient {
             session_state,
             vapid_public_key,
             metrics: Mutex::new(JmapSyncMetrics::default()),
+            sync_failure: Arc::new(Mutex::new(None)),
         })
     }
     pub fn sync_metrics(&self) -> JmapSyncMetrics {
@@ -476,8 +487,44 @@ impl JmapClient {
     pub fn record_email_reconciliation(&self) {
         self.metrics.lock().unwrap_or_else(|error| error.into_inner()).email_reconciliations += 1;
     }
+    pub fn clear_sync_failure(&self) { *self.sync_failure.lock().unwrap_or_else(|e|e.into_inner())=None; }
+    pub fn last_sync_failure(&self) -> Option<JmapSyncFailure> { *self.sync_failure.lock().unwrap_or_else(|e|e.into_inner()) }
+    pub fn record_store_failure(&self) { *self.sync_failure.lock().unwrap_or_else(|e|e.into_inner())=Some(JmapSyncFailure {operation:"store",class:"store",http_status:None,method_type:None}); }
+    fn record_sync_error(&self, method:&str, error:&JmapError) {
+        let operation=match method { "Mailbox/query"=>"mailbox_query", "Mailbox/get"=>"mailbox_get", "Mailbox/changes"=>"mailbox_changes", "Email/query"=>"email_query", "Email/get"=>"email_get", "Email/changes"=>"email_changes", _=>return };
+        let (class,http_status,method_type)=match error {
+            JmapError::Http(status)=>("http",Some(*status),None),
+            JmapError::Transport=>("transport",None,None),
+            JmapError::InvalidUrl | JmapError::InvalidResponse=>("invalid_response",None,None),
+            JmapError::Unsupported=>("unsupported",None,None),
+            JmapError::OutcomeUnknown=>("outcome_unknown",None,None),
+            JmapError::Method(kind)=>{
+                let safe=match kind.as_str() { "cannotCalculateChanges"=>"cannotCalculateChanges", "stateMismatch"=>"stateMismatch", "accountNotFound"=>"accountNotFound", "accountNotSupportedByMethod"=>"accountNotSupportedByMethod", "accountReadOnly"=>"accountReadOnly", "forbidden"=>"forbidden", "invalidArguments"=>"invalidArguments", "serverFail"=>"serverFail", "unknownMethod"=>"unknownMethod", "requestTooLarge"=>"requestTooLarge", _=>"other" };
+                ("method",None,Some(safe))
+            }
+        };
+        *self.sync_failure.lock().unwrap_or_else(|e|e.into_inner())=Some(JmapSyncFailure {operation,class,http_status,method_type});
+    }
     pub fn account_id(&self) -> &str {
         &self.account
+    }
+    /// One read-only negative check for the fixed administrative method.
+    pub fn probe_admin_query(&self) -> &'static str {
+        let payload = match self.call_payload("x:Account/query", json!({"accountId":self.account,"limit":1}), false, false) {
+            Ok(payload)=>payload,
+            Err(JmapError::Http(401))=>return "http_401",
+            Err(JmapError::Http(403))=>return "http_403",
+            Err(JmapError::Http(_))=>return "other_http",
+            Err(_)=>return "unavailable",
+        };
+        match parse_method(&payload,"x:Account/query") {
+            Ok(_)=>"allowed",
+            Err(JmapError::Method(kind)) if kind=="forbidden"=>"forbidden",
+            Err(JmapError::Method(kind)) if kind=="accountNotFound"=>"account_not_found",
+            Err(JmapError::Method(kind)) if kind=="unknownMethod"=>"unknown_method",
+            Err(JmapError::Method(_))=>"other_method_error",
+            Err(_)=>"invalid_response",
+        }
     }
     pub fn primary_account_id(&self) -> &str { &self.primary_account }
     /// Only accounts advertised for mail by this freshly authenticated session.
@@ -485,7 +532,7 @@ impl JmapClient {
     /// Bind a client to a discovered account. Shared accounts are read-only locally.
     pub fn for_mail_account(&self, account: &str) -> Result<Self, JmapError> {
         let advertised_read_only = self.mail_accounts.iter().find(|(id,_)| id == account).map(|(_,read_only)| *read_only).ok_or(JmapError::Unsupported)?;
-        Ok(Self { http:self.http.clone(), origin:self.origin.clone(), token:self.token.clone(), account:account.into(), primary_account:self.primary_account.clone(), mail_accounts:self.mail_accounts.clone(), read_only:advertised_read_only || account != self.primary_account, api:self.api.clone(), download:self.download.clone(), upload:self.upload.clone(), event_source:self.event_source.clone(), submission:self.submission && account == self.primary_account, mail_share:self.mail_share, gate:self.gate.clone(), max_get:self.max_get, max_request:self.max_request, max_upload:self.max_upload, session_state:self.session_state.clone(), vapid_public_key:self.vapid_public_key.clone(), metrics:Mutex::new(JmapSyncMetrics::default()) })
+        Ok(Self { http:self.http.clone(), origin:self.origin.clone(), token:self.token.clone(), account:account.into(), primary_account:self.primary_account.clone(), mail_accounts:self.mail_accounts.clone(), read_only:advertised_read_only || account != self.primary_account, api:self.api.clone(), download:self.download.clone(), upload:self.upload.clone(), event_source:self.event_source.clone(), submission:self.submission && account == self.primary_account, mail_share:self.mail_share, gate:self.gate.clone(), max_get:self.max_get, max_request:self.max_request, max_upload:self.max_upload, session_state:self.session_state.clone(), vapid_public_key:self.vapid_public_key.clone(), metrics:Mutex::new(JmapSyncMetrics::default()), sync_failure:self.sync_failure.clone() })
     }
     pub fn origin(&self) -> &str {
         self.origin.as_str()
@@ -595,6 +642,20 @@ impl JmapClient {
         })
     }
     fn call(
+        &self,
+        method: &str,
+        args: Value,
+        mutation: bool,
+        submission: bool,
+    ) -> Result<Value, JmapError> {
+        // If a syntactically valid method response fails later engine validation,
+        // retain its fixed operation as invalid_response. A successful sync clears it.
+        if !mutation { self.record_sync_error(method,&JmapError::InvalidResponse); }
+        let result = self.call_checked(method,args,mutation,submission);
+        if !mutation { if let Err(error)=&result { self.record_sync_error(method,error); } }
+        result
+    }
+    fn call_checked(
         &self,
         method: &str,
         args: Value,
@@ -1276,11 +1337,17 @@ mod tests {
           }
         });
         let origin=Url::parse(&format!("http://{address}/")).unwrap();
-        let client=JmapClient { http:Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().unwrap(), origin:origin.clone(), token:"fixture-token".into(), account:"account".into(), primary_account:"account".into(), mail_accounts:vec![("account".into(),false),("shared".into(),false)], read_only:false, api:origin.clone(), download:String::new(), upload:String::new(), event_source:Some(origin.join("/events").unwrap()), submission:false, mail_share:false, gate:account_gate("event-test",2,1), max_get:10, max_request:1024, max_upload:1024, session_state:"state".into(), vapid_public_key:None, metrics:Mutex::new(JmapSyncMetrics::default()) };
+        let client=JmapClient { http:Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().unwrap(), origin:origin.clone(), token:"fixture-token".into(), account:"account".into(), primary_account:"account".into(), mail_accounts:vec![("account".into(),false),("shared".into(),false)], read_only:false, api:origin.clone(), download:String::new(), upload:String::new(), event_source:Some(origin.join("/events").unwrap()), submission:false, mail_share:false, gate:account_gate("event-test",2,1), max_get:10, max_request:1024, max_upload:1024, session_state:"state".into(), vapid_public_key:None, metrics:Mutex::new(JmapSyncMetrics::default()), sync_failure:Arc::new(Mutex::new(None)) };
         assert!(client.for_mail_account("unadvertised").is_err());
         let shared=client.for_mail_account("shared").unwrap();
         assert!(!shared.supports_submission());
         assert!(matches!(shared.upload(Vec::new(),"application/octet-stream"),Err(JmapError::Unsupported)));
+        shared.record_sync_error("Email/get",&JmapError::Method("untrusted-provider-text".into()));
+        assert_eq!(client.last_sync_failure(),Some(JmapSyncFailure {operation:"email_get",class:"method",http_status:None,method_type:Some("other")}));
+        client.clear_sync_failure();
+        shared.record_sync_error("Mailbox/query",&JmapError::Http(403));
+        assert_eq!(client.last_sync_failure(),Some(JmapSyncFailure {operation:"mailbox_query",class:"http",http_status:Some(403),method_type:None}));
+        client.clear_sync_failure();
         let mut events = Vec::new();
         client.watch_mail_events(&AtomicBool::new(false),|domains| {events.push(domains); Ok(())}).unwrap();
         client.watch_mail_events(&AtomicBool::new(false),|domains| {events.push(domains); Ok(())}).unwrap();

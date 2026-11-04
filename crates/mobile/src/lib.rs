@@ -927,6 +927,12 @@ fn run_onedrive_scoped_pass(
     }
 }
 
+// Fixed diagnostic fields only; scoped to the local account and never exposed to the WebView.
+fn provider_jmap_diagnostics() -> &'static Mutex<HashMap<String, serde_json::Value>> {
+    static DIAGNOSTICS: OnceLock<Mutex<HashMap<String, serde_json::Value>>> = OnceLock::new();
+    DIAGNOSTICS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Run the shared JMAP delta against the same encrypted store used by the UI.
 /// A plain or unavailable store fails closed before any provider object is written.
 fn refresh_self_hosted_data(cfg: &Config, base: &Path) -> (bool, HashMap<String, bool>) {
@@ -935,6 +941,7 @@ fn refresh_self_hosted_data(cfg: &Config, base: &Path) -> (bool, HashMap<String,
     for account in &cfg.accounts {
         if !cfg.provider_accounts.contains_key(&account.id) { continue; }
         let mut successful = true;
+        provider_jmap_diagnostics().lock().unwrap_or_else(|e| e.into_inner()).remove(&account.id);
         let protected = isyncyou_engine::provider_store::open(cfg, &account.id)
             .map(|store| store.protected_provider_storage()).unwrap_or(false);
         if !protected {
@@ -948,8 +955,23 @@ fn refresh_self_hosted_data(cfg: &Config, base: &Path) -> (bool, HashMap<String,
             if !store.protected_provider_storage() { return Err("store"); }
             let client = isyncyou_engine::self_hosted_mail::client(cfg, &account.id)
                 .map_err(|_| "jmap_discovery")?;
-            isyncyou_engine::self_hosted_mail::sync(cfg, &account.id, &store, &client)
-                .map_err(|_| "jmap_sync")
+            isyncyou_engine::self_hosted_mail::sync_with_phase(cfg, &account.id, &store, &client)
+                .map_err(|phase| {
+                    let failure = isyncyou_engine::self_hosted_mail::last_sync_failure(&client);
+                    let diagnostic = match failure {
+                        Some(f) => serde_json::json!({"operation": f.operation, "class": f.class, "http_status": f.http_status, "method_type": f.method_type}),
+                        None => serde_json::json!({"operation": "none", "class": "unavailable", "http_status": null, "method_type": null}),
+                    };
+                    provider_jmap_diagnostics().lock().unwrap_or_else(|e| e.into_inner()).insert(account.id.clone(), diagnostic);
+                    match phase {
+                    isyncyou_engine::self_hosted_mail::MailSyncPhase::Configuration => "jmap_configuration",
+                    isyncyou_engine::self_hosted_mail::MailSyncPhase::SharedAccess => "jmap_shared_access",
+                    isyncyou_engine::self_hosted_mail::MailSyncPhase::Primary => "jmap_primary",
+                    isyncyou_engine::self_hosted_mail::MailSyncPhase::SharedSelection => "jmap_shared_selection",
+                    isyncyou_engine::self_hosted_mail::MailSyncPhase::SharedMailbox => "jmap_shared_mailbox",
+                    isyncyou_engine::self_hosted_mail::MailSyncPhase::SharedEmail => "jmap_shared_email",
+                    }
+                })
         })();
         match result {
             Ok(count) => changed |= count > 0,
@@ -957,6 +979,12 @@ fn refresh_self_hosted_data(cfg: &Config, base: &Path) -> (bool, HashMap<String,
                 match phase {
                     "store" => android_info("provider_refresh_failed phase=store"),
                     "jmap_discovery" => android_info("provider_refresh_failed phase=jmap_discovery"),
+                    "jmap_configuration" => android_info("provider_refresh_failed phase=jmap_configuration"),
+                    "jmap_shared_access" => android_info("provider_refresh_failed phase=jmap_shared_access"),
+                    "jmap_primary" => android_info("provider_refresh_failed phase=jmap_primary"),
+                    "jmap_shared_selection" => android_info("provider_refresh_failed phase=jmap_shared_selection"),
+                    "jmap_shared_mailbox" => android_info("provider_refresh_failed phase=jmap_shared_mailbox"),
+                    "jmap_shared_email" => android_info("provider_refresh_failed phase=jmap_shared_email"),
                     _ => android_info("provider_refresh_failed phase=jmap_sync"),
                 }
                 successful = false;
@@ -1079,6 +1107,20 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeWakeProv
     _env: jni::EnvUnowned<'a>, _class: jni::objects::JClass<'a>,
 ) {
     let _ = wake_provider_refresh();
+}
+
+/// Native-only, fixed diagnostic metadata for one locally selected account.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeProviderRefreshDiagnostic<'a>(
+    mut env: jni::EnvUnowned<'a>, _class: jni::objects::JClass<'a>, account: jni::objects::JString<'a>,
+) -> jni::sys::jstring {
+    let mut value = jni_get_string(&mut env, &account).and_then(|id| {
+        provider_jmap_diagnostics().lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned()
+    }).unwrap_or_else(|| serde_json::json!({"operation": "none", "class": "unavailable", "http_status": null, "method_type": null}));
+    let (flag, _) = provider_refresh_wakeup();
+    let signal = flag.lock().unwrap_or_else(|e| e.into_inner());
+    value["pending"] = serde_json::Value::Bool(signal.completed < signal.requested);
+    jni_new_string(&mut env, value.to_string())
 }
 
 /// Wait for a successful provider pass; timeout, partial errors and panic fail closed.

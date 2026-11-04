@@ -94,6 +94,7 @@ object NativeEngine {
     external fun nativeWakeProviderRefresh()
     /** Wait for a completed provider pass; partial errors and timeout return zero. */
     external fun nativeWaitProviderRefresh(account: String): Int
+    external fun nativeProviderRefreshDiagnostic(account: String): String
     external fun nativeConnectedProviderAccounts(base: String): String
     external fun nativeProviderAuthJournalStatus(base: String): Int
     external fun nativeProviderAuthJournalAccountStatus(base: String, account: String): Int

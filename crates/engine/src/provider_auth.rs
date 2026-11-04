@@ -684,6 +684,29 @@ pub fn with_platform_credential_store<T>(cfg: &Config, id: &str, action: impl Fn
     #[cfg(not(target_os = "android"))]
     { with_desktop_credential_store(cfg,id,action) }
 }
+
+/// Read only the fixed administrative boundary using the current account grant.
+/// Returns only an HTTP status; neither token nor response body is exposed.
+pub fn probe_public_admin_boundary(cfg:&Config, id:&str) -> Result<u16,String> {
+    let (origin,_,_)=account(cfg,id)?;
+    let root=reqwest::Url::parse(&origin).map_err(|_| "invalid provider origin")?;
+    if root.scheme()!="https" || root.host_str().is_none() || !root.username().is_empty() || root.password().is_some() || root.path()!="/" || root.query().is_some() || root.fragment().is_some() { return Err("invalid provider origin".into()); }
+    let target=root.join("/api/principal").map_err(|_| "invalid provider origin")?;
+    with_platform_credential_store(cfg,id,|credentials| with_locked_provider_access_token(cfg,id,credentials,|token| {
+        let http=reqwest::blocking::Client::builder().redirect(reqwest::redirect::Policy::none()).timeout(std::time::Duration::from_secs(20)).build().map_err(|_| "probe unavailable")?;
+        let response=http.get(target).bearer_auth(token).send().map_err(|_| "probe unavailable")?;
+        Ok(response.status().as_u16())
+    }))
+}
+
+/// Probe only the fixed read-only administrative JMAP method with the existing grant.
+pub fn probe_jmap_admin_boundary(cfg:&Config, id:&str) -> Result<&'static str,String> {
+    let (origin,_,_)=account(cfg,id)?;
+    with_platform_credential_store(cfg,id,|credentials| with_locked_provider_access_token(cfg,id,credentials,|token| {
+        let client=isyncyou_connectors::jmap::JmapClient::discover(&origin,token.to_owned()).map_err(|_| "probe unavailable")?;
+        Ok(client.probe_admin_query())
+    }))
+}
 #[cfg(not(target_os = "android"))]
 impl DesktopCredentialStore {
     fn path_for(&self, account:&str, origin:&str) -> Result<PathBuf,String> {

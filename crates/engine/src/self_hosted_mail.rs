@@ -9,12 +9,13 @@ use sha2::{Digest, Sha256};
 
 struct StageGuard<'a> {
     store: &'a Store,
+    client: &'a JmapClient,
     scope: &'a ProviderScope,
     generation: String,
     finished: bool,
 }
 impl<'a> StageGuard<'a> {
-    fn new(store: &'a Store, scope: &'a ProviderScope) -> Result<Self, String> {
+    fn new(store: &'a Store, scope: &'a ProviderScope, client: &'a JmapClient) -> Result<Self, String> {
         let mut bytes = [0u8; 32];
         SystemRandom::new()
             .fill(&mut bytes)
@@ -22,9 +23,10 @@ impl<'a> StageGuard<'a> {
         let generation = format!("{:x}", Sha256::digest(bytes));
         store
             .begin_provider_staging(scope, &generation)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| { client.record_store_failure(); e.to_string() })?;
         Ok(Self {
             store,
+            client,
             scope,
             generation,
             finished: false,
@@ -33,12 +35,12 @@ impl<'a> StageGuard<'a> {
     fn page(&self, objects: &[ProviderObject]) -> Result<(), String> {
         self.store
             .stage_provider_objects(self.scope, &self.generation, objects)
-            .map_err(|e| e.to_string())
+            .map_err(|e| { self.client.record_store_failure(); e.to_string() })
     }
     fn finish(mut self, cursor: &str) -> Result<(), String> {
         self.store
             .finish_provider_staging(self.scope, &self.generation, cursor)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| { self.client.record_store_failure(); e.to_string() })?;
         self.finished = true;
         Ok(())
     }
@@ -757,23 +759,40 @@ pub fn sync(
     store: &Store,
     client: &SelfHostedClient,
 ) -> Result<usize, String> {
-    let primary = scope(cfg, account, client)?;
-    if primary.service != "mail" { return Err("Primary mail client required".into()); }
+    sync_detailed(cfg,account,store,client).map_err(|(_,error)| error)
+}
+
+/// Fixed, non-sensitive phase for diagnostics; never contains account or provider data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MailSyncPhase { Configuration, SharedAccess, Primary, SharedSelection, SharedMailbox, SharedEmail }
+
+pub fn sync_with_phase(cfg:&Config, account:&str, store:&Store, client:&SelfHostedClient) -> Result<usize,MailSyncPhase> {
+    sync_detailed(cfg,account,store,client).map_err(|(phase,_)| phase)
+}
+
+pub fn last_sync_failure(client:&SelfHostedClient) -> Option<isyncyou_connectors::jmap::JmapSyncFailure> { client.client.last_sync_failure() }
+
+fn sync_detailed(cfg:&Config, account:&str, store:&Store, client:&SelfHostedClient) -> Result<usize,(MailSyncPhase,String)> {
+    client.client.clear_sync_failure();
+    let primary = scope(cfg, account, client).map_err(|e|(MailSyncPhase::Configuration,e))?;
+    if primary.service != "mail" { return Err((MailSyncPhase::Configuration,"Primary mail client required".into())); }
     // Hide old shared scopes before any refresh; failed or revoked access stays hidden.
-    for old in store.provider_scopes(account, &primary.origin, "mail-shared").map_err(|e| e.to_string())? {
-        store.set_shared_mail_access(account, &primary.origin, &old.collection, false).map_err(|e| e.to_string())?;
+    for old in store.provider_scopes(account, &primary.origin, "mail-shared").map_err(|e| {client.client.record_store_failure(); (MailSyncPhase::SharedAccess,e.to_string())})? {
+        store.set_shared_mail_access(account, &primary.origin, &old.collection, false).map_err(|e| {client.client.record_store_failure(); (MailSyncPhase::SharedAccess,e.to_string())})?;
     }
-    let mut count = sync_with_page_limit(cfg,account,store,client,100)?;
+    let mut count = sync_with_page_limit(cfg,account,store,client,100).map_err(|e|(MailSyncPhase::Primary,e))?;
+    client.client.clear_sync_failure();
     for (native, _) in client.client.mail_accounts() {
         if native == client.client.primary_account_id() { continue; }
-        store.set_shared_mail_access(account, &primary.origin, native, false).map_err(|e| e.to_string())?;
-        let selected = client.client.for_mail_account(native).map_err(|_| "Shared mail account unavailable")?;
+        store.set_shared_mail_access(account, &primary.origin, native, false).map_err(|e| {client.client.record_store_failure(); (MailSyncPhase::SharedAccess,e.to_string())})?;
+        let selected = client.client.for_mail_account(native).map_err(|_| (MailSyncPhase::SharedSelection,"Shared mail account unavailable".into()))?;
         let shared = SelfHostedClient { client:selected, account:account.into(), origin:primary.origin.clone() };
-        let folders = sync_mailboxes_inner(cfg,account,store,&shared,true)?;
-        let messages = sync_inner(cfg,account,store,&shared,true,100)?;
-        store.set_shared_mail_access(account, &primary.origin, native, true).map_err(|e| e.to_string())?;
+        let folders = sync_mailboxes_inner(cfg,account,store,&shared,true).map_err(|e|(MailSyncPhase::SharedMailbox,e))?;
+        let messages = sync_inner(cfg,account,store,&shared,true,100).map_err(|e|(MailSyncPhase::SharedEmail,e))?;
+        store.set_shared_mail_access(account, &primary.origin, native, true).map_err(|e| {client.client.record_store_failure(); (MailSyncPhase::SharedAccess,e.to_string())})?;
         count += folders + messages;
     }
+    client.client.clear_sync_failure();
     Ok(count)
 }
 
@@ -832,7 +851,7 @@ fn sync_mailboxes_inner(
     let saved = if reconcile {
         None
     } else {
-        store.provider_cursor(&scope).map_err(|e| e.to_string())?
+        store.provider_cursor(&scope).map_err(|e| { client.record_store_failure(); e.to_string() })?
     };
     let mut cursor = if let Some(cursor) = saved {
         cursor
@@ -842,7 +861,7 @@ fn sync_mailboxes_inner(
             .get("Mailbox", Some(&empty), None)
             .map_err(|_| "JMAP mailbox state unavailable")?;
         let baseline = field(&baseline, "state")?.to_owned();
-        let staging = StageGuard::new(store, &scope)?;
+        let staging = StageGuard::new(store, &scope, client)?;
         let mut position = 0usize;
         let mut query_state = None;
         loop {
@@ -908,6 +927,7 @@ fn sync_mailboxes_inner(
         let page = match client.changes("Mailbox", &cursor, page_size) {
             Ok(page) => page,
             Err(JmapError::Method(kind)) if kind == "cannotCalculateChanges" && !reconcile => {
+                client.clear_sync_failure();
                 return sync_mailboxes_inner(cfg, account, store, provider, true)
             }
             Err(_) => return Err("JMAP mailbox delta unavailable".into()),
@@ -957,7 +977,7 @@ fn sync_mailboxes_inner(
             return Err("JMAP mailbox pagination did not advance".into());
         }
         if !store.apply_provider_page_if_cursor(&scope, &cursor, &changes, &next)
-            .map_err(|e| e.to_string())? {
+            .map_err(|e| { client.record_store_failure(); e.to_string() })? {
             return Err("JMAP mailbox checkpoint changed; retry required".into());
         }
         cursor = next;
@@ -984,7 +1004,7 @@ fn sync_inner(
     let cursor = if reconcile {
         None
     } else {
-        store.provider_cursor(&scope).map_err(|e| e.to_string())?
+        store.provider_cursor(&scope).map_err(|e| { client.record_store_failure(); e.to_string() })?
     };
     let mut cursor = if let Some(cursor) = cursor {
         cursor
@@ -994,7 +1014,7 @@ fn sync_inner(
             .get("Email", Some(&empty), None)
             .map_err(|_| "JMAP email state unavailable")?;
         let baseline = field(&baseline, "state")?.to_string();
-        let staging = StageGuard::new(store, &scope)?;
+        let staging = StageGuard::new(store, &scope, client)?;
         let mut position = 0usize;
         let mut query_state = None;
         loop {
@@ -1060,6 +1080,7 @@ fn sync_inner(
         let page = match client.changes("Email", &cursor, page_size) {
             Ok(page) => page,
             Err(JmapError::Method(kind)) if kind == "cannotCalculateChanges" && !reconcile => {
+                client.clear_sync_failure();
                 client.record_email_reconciliation();
                 return sync_inner(cfg, account, store, provider, true, page_limit)
             }
@@ -1111,7 +1132,7 @@ fn sync_inner(
             return Err("JMAP pagination did not advance".into());
         }
         if !store.apply_provider_page_if_cursor(&scope, &cursor, &changes, &next)
-            .map_err(|e| e.to_string())? {
+            .map_err(|e| { client.record_store_failure(); e.to_string() })? {
             return Err("JMAP checkpoint changed; retry required".into());
         }
         cursor = next;
