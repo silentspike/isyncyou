@@ -27075,7 +27075,8 @@ mod tests {
             .split("fn session_list(")
             .next()
             .expect("session_create boundary");
-        assert!(function.contains("ProductSessionRegistry::new(&store).with_config(&cfg).create"));
+        let normalized: String = function.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(normalized.contains("ProductSessionRegistry::new(&store).with_config(&cfg).create"));
         assert!(!function.contains("resolve_cached_sync_token"));
         assert!(!function.contains("OneDriveSessionV2Transport"));
     }
