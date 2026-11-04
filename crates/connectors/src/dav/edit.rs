@@ -3667,8 +3667,16 @@ mod tests {
             Some("20261102T100000Z")
         )
         .is_err());
-        let contact =
-            create_simple("contact", "1234", "20261101T100000Z", "Müller", None, None).unwrap();
+        let contact = create_simple(
+            "contact",
+            "1234",
+            "20261101T100000Z",
+            // lang-allow: exercise UTF-8 contact names.
+            "Müller",
+            None,
+            None,
+        )
+        .unwrap();
         assert!(preview_contact_delete(&contact).is_ok());
     }
 
