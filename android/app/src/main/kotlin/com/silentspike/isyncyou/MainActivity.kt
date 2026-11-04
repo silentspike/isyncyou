@@ -41,6 +41,38 @@ import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import org.json.JSONObject
 
+internal fun securePushCredentialWindow(dialog: android.app.Dialog) {
+    requireNotNull(dialog.window).addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+}
+
+/** Credential content is native-only; the password is never an accessibility value. */
+internal fun pushCredentialContent(context: android.content.Context, origin: String, username: String, secret: String): android.view.View {
+    val password = android.widget.TextView(context).apply {
+        inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+        transformationMethod = android.text.method.PasswordTransformationMethod.getInstance()
+        importantForAccessibility = android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        setTextIsSelectable(false)
+        text = secret
+    }
+    val reveal = android.widget.CheckBox(context).apply {
+        text = "Show password"
+        setOnCheckedChangeListener { _, checked ->
+            password.transformationMethod = if (checked) null else android.text.method.PasswordTransformationMethod.getInstance()
+        }
+    }
+    return android.widget.LinearLayout(context).apply {
+        orientation = android.widget.LinearLayout.VERTICAL
+        val padding = (24 * resources.displayMetrics.density).toInt()
+        setPadding(padding, 0, padding, 0)
+        addView(android.widget.TextView(context).apply {
+            text = "Enter the temporary credentials for $origin in your push distributor.\n\nUser: $username\n\nPassword:"
+        })
+        addView(password)
+        addView(reveal)
+        addView(android.widget.TextView(context).apply { text = "After configuration, return here and continue." })
+    }
+}
+
 /**
  * iSyncYou Android client (#89) — a hardened WebView onto the iSyncYou engine that
  * runs **in this app process**. On launch the Activity first preflights the
@@ -1026,7 +1058,7 @@ class MainActivity : FragmentActivity() {
                     postBridgeError(reply, id, 503, "unavailable", "push_enrollment_expired")
                     return@dispatchBridge
                 }
-                // Credentials are displayed by native UI only and never enter the WebView.
+                // Credentials stay in native UI and are masked until explicitly revealed.
                 val pushOrigin = runCatching {
                     val endpoint = java.net.URI(state.getString("endpoint"))
                     require(endpoint.scheme == "https" && !endpoint.host.isNullOrBlank() && endpoint.rawUserInfo == null)
@@ -1037,9 +1069,10 @@ class MainActivity : FragmentActivity() {
                     return@dispatchBridge
                 }
                 runOnUiThread {
-                    android.app.AlertDialog.Builder(this)
+                    val content = pushCredentialContent(this, pushOrigin, state.optString("username"), state.optString("password"))
+                    val dialog = android.app.AlertDialog.Builder(this)
                         .setTitle("Configure push distributor")
-                        .setMessage("Enter these temporary credentials for $pushOrigin in your push distributor:\n\nUser: ${state.optString("username")}\nPassword: ${state.optString("password")}\n\nAfter configuration, return here and continue.")
+                        .setView(content)
                         .setNegativeButton("Later", null)
                         .setPositiveButton("Configured") { _, _ ->
                             dispatchBridge {
@@ -1056,7 +1089,9 @@ class MainActivity : FragmentActivity() {
                                     }
                                 }
                             }
-                        }.show()
+                        }.create()
+                    securePushCredentialWindow(dialog)
+                    dialog.show()
                     postBridgeResponse(reply, id, 200, JSONObject().put("status", "credentials_ready"))
                 }
                 return@dispatchBridge
