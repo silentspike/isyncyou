@@ -1208,6 +1208,10 @@ mod tests {
         assert_eq!(store.provider_captures(0, 20).unwrap().len(),1);
         store.set_shared_mail_access("local", "https://example.test", "foreign", true).unwrap();
         assert_eq!(store.search_provider_mail_in_scope(&scope, "needle", 20).unwrap().len(),1);
+        let updated=super::ProviderObject {remote_id:"same-id".into(),etag:None,raw:br#"{"subject":"needle updated","mailboxIds":{"box":true}}"#.to_vec()};
+        store.apply_provider_page(&scope,&[super::ProviderChange::Upsert(updated)],"cursor2").unwrap();
+        assert_eq!(store.provider_accessible(&scope).unwrap(),Some(true));
+        assert_eq!(store.search_provider_mail_in_scope(&scope,"needle",20).unwrap().len(),1);
         assert!(store.search_provider_mail_in_scope(&scope, "private", 20).unwrap().is_empty());
         assert!(store.search_provider_mail_in_scope(&primary, "needle", 20).unwrap().is_empty());
         store.set_shared_mail_access("local", "https://example.test", "foreign", false).unwrap();

@@ -5107,7 +5107,12 @@ impl Router {
                 "/" | "/app.js" | "/app.css" | "/callback"
             ) || req.path.ends_with(".woff2")
                 || req.path.starts_with("/sfx/"));
-        let gate_exempt = static_get
+        // Classification is bound to dispatch: config changes cannot turn this
+        // gate-exempt live read into an archive-store read.
+        let live_provider_attachment = req.method == "GET" && req.path == "/api/v1/attachment"
+            && req.q("service") == Some("mail")
+            && req.q("account").is_some_and(|account| self.provider_origin(account).is_some());
+        let gate_exempt = static_get || live_provider_attachment
             || (req.method == "GET" && GATE_EXEMPT_GET.contains(&req.path.as_str()))
             || (req.method == "POST" && GATE_EXEMPT_POST.contains(&req.path.as_str()));
         let _gate = if gate_exempt {
@@ -5117,6 +5122,7 @@ impl Router {
                 .as_ref()
                 .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()))
         };
+        if live_provider_attachment { return self.live_provider_attachment(req); }
         if req.method == "POST" {
             let Some(spec) = product_post_route(&req.path) else {
                 return ApiResponse::error(405, "method not allowed");
@@ -10091,24 +10097,25 @@ impl Router {
     /// archived mail `.eml` (#562). Listing returns JSON metadata; download serves
     /// the decoded part bytes with an inert content-type (mapped through the
     /// attachment filename, `nosniff` always on — never an executable type).
+    fn live_provider_attachment(&self, req:&ApiRequest) -> ApiResponse {
+        let (Some(account),Some(id)) = (req.q("account"),req.q("id")) else { return ApiResponse::error(400,"missing 'account', 'service' or 'id'"); };
+        let Some(handler) = self.mail_write.as_ref() else { return ApiResponse::error(503,"provider_attachment_unavailable"); };
+        match req.q("blob_id") {
+            None => match handler.provider_attachment_list_scoped(account,req.q("mail_scope"),id) {
+                Ok(value)=>with_no_store(ApiResponse::ok_json(&value)), Err(_)=>ApiResponse::error(503,"provider_attachment_unavailable"),
+            },
+            Some(blob_id) => match handler.provider_attachment_download_scoped(account,req.q("mail_scope"),id,blob_id) {
+                Ok(file)=>provider_attachment_response(file), Err(_)=>ApiResponse::error(503,"provider_attachment_unavailable"),
+            },
+        }
+    }
+
     fn attachment(&self, req: &ApiRequest) -> ApiResponse {
         let (account, service, id) = match (req.q("account"), req.q("service"), req.q("id")) {
             (Some(a), Some(s), Some(i)) => (a, s, i),
             _ => return ApiResponse::error(400, "missing 'account', 'service' or 'id'"),
         };
-        if service == "mail" && self.provider_origin(account).is_some() {
-            let Some(handler) = self.mail_write.as_ref() else { return ApiResponse::error(503, "provider_attachment_unavailable"); };
-            return match req.q("blob_id") {
-                None => match handler.provider_attachment_list_scoped(account, req.q("mail_scope"), id) {
-                    Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
-                    Err(_) => ApiResponse::error(503, "provider_attachment_unavailable"),
-                },
-                Some(blob_id) => match handler.provider_attachment_download_scoped(account, req.q("mail_scope"), id, blob_id) {
-                    Ok(file) => provider_attachment_response(file),
-                    Err(_) => ApiResponse::error(503, "provider_attachment_unavailable"),
-                },
-            };
-        }
+        if service == "mail" && self.provider_origin(account).is_some() { return self.live_provider_attachment(req); }
         // ToDo attachments live in the `_taskatt_<id>` sub-resource sidecar as Graph
         // taskFileAttachment[] (inline base64 contentBytes), not a MIME `.eml`
         // (#567 B4): list/decode them from that JSON instead of mail's mime parser.
@@ -11630,6 +11637,30 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             resp.status, 200,
             "the live transfer poll must be served while the offline pass holds the gate"
         );
+    }
+
+    #[test]
+    fn live_provider_attachment_bypasses_gate_but_archive_attachment_waits() {
+        let gate=std::sync::Arc::new(std::sync::Mutex::new(()));
+        let mut cfg=Config::default();
+        cfg.provider_accounts.insert("provider".into(),isyncyou_core::config::ProviderConfig::SelfHosted {origin:"https://example.invalid".into(),client_id:"test".into()});
+        let handler=std::sync::Arc::new(RecordMailWrite(std::sync::Mutex::new(Vec::new())));
+        let router=std::sync::Arc::new(Router::with_gate(cfg,gate.clone()).with_mail_write(handler.clone(),"cap".into()));
+        let held=gate.lock().unwrap();
+        let (tx,rx)=std::sync::mpsc::channel();
+        let live=router.clone(); let live_tx=tx.clone();
+        let a=std::thread::spawn(move || { let r=live.route(&ApiRequest::get("/api/v1/attachment?account=provider&service=mail&id=x&mail_scope=shared")); live_tx.send(("live",r.status)).unwrap(); });
+        let archive=router.clone();
+        let b=std::thread::spawn(move || { let r=archive.route(&ApiRequest::get("/api/v1/attachment?account=archive&service=mail&id=x")); tx.send(("archive",r.status)).unwrap(); });
+        let first=rx.recv_timeout(std::time::Duration::from_secs(2));
+        let premature_archive=rx.recv_timeout(std::time::Duration::from_millis(100)).is_ok();
+        drop(held);
+        let after=if premature_archive { None } else { rx.recv_timeout(std::time::Duration::from_secs(2)).ok() };
+        a.join().unwrap(); b.join().unwrap();
+        assert_eq!(first.ok(),Some(("live",200)));
+        assert!(handler.0.lock().unwrap().iter().any(|entry| entry=="scoped-attachment"));
+        assert!(!premature_archive,"archive attachment must wait for the store gate");
+        assert_eq!(after.map(|(kind,_)| kind),Some("archive"));
     }
 
     #[test]
@@ -15188,6 +15219,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         }
     }
     impl MailWriteHandler for RecordMailWrite {
+        fn provider_attachment_list_scoped(&self, account:&str, scope:Option<&str>, id:&str) -> Result<Value,String> {
+            if account!="provider" || scope!=Some("shared") || id!="x" { return Err("invalid".into()); }
+            self.0.lock().unwrap().push("scoped-attachment".into());
+            Ok(json!({"attachments":[]}))
+        }
         fn provider_shared_mail_accounts(&self, account:&str) -> Result<Vec<String>,String> {
             if account=="unknown" { return Err("offline".into()); }
             Ok(vec!["shared".into()])
