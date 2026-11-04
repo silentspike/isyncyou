@@ -361,14 +361,30 @@ fn sync_all_inner(
     credentials: Option<&dyn ProviderCredentialStore>,
 ) -> Result<SyncPass, String> {
     let origin = configured_origin(cfg, account)?;
+    let started = std::time::Instant::now();
     let client = match credentials {
-        Some(credentials) => client_with_store(cfg, account, &origin, credentials)?,
-        None => client(cfg, account, &origin)?,
+        Some(credentials) => client_with_store(cfg, account, &origin, credentials),
+        None => client(cfg, account, &origin),
     };
-    let collections = client.discover(entry).map_err(|e| e.to_string())?;
+    isyncyou_connectors::dav::diagnostic_timing(
+        "sync_credentials_client",
+        0,
+        started,
+        if client.is_ok() { "ok" } else { "error" },
+    );
+    let client = client?;
+    let started = std::time::Instant::now();
+    let collections = client.discover(entry);
+    isyncyou_connectors::dav::diagnostic_timing(
+        "sync_discovery",
+        0,
+        started,
+        if collections.is_ok() { "ok" } else { "error" },
+    );
+    let collections = collections.map_err(|e| e.to_string())?;
     let mut report = SyncPass::default();
     let mut present = std::collections::HashSet::new();
-    for collection in collections {
+    for (index, collection) in collections.into_iter().enumerate() {
         for (enabled, service) in [
             (collection.calendar, "calendar"),
             (collection.addressbook, "contacts"),
@@ -384,7 +400,19 @@ fn sync_all_inner(
                 service: service.into(),
                 collection: collection.url.clone(),
             };
-            match sync_detached(cfg, &client, &scope) {
+            let started = std::time::Instant::now();
+            let result = sync_detached(cfg, &client, &scope);
+            isyncyou_connectors::dav::diagnostic_timing(
+                if service == "calendar" {
+                    "sync_calendar"
+                } else {
+                    "sync_contacts"
+                },
+                index,
+                started,
+                if result.is_ok() { "ok" } else { "error" },
+            );
+            match result {
                 Ok(changes) => {
                     report.changes += changes;
                 }

@@ -1201,6 +1201,9 @@ a.note-meta-chip:hover { color: var(--accent); }
 @container (max-width: 680px) {
   .mail-layout { grid-template-columns: 1fr; }
   .mail-list { border-right: 0; padding-bottom: 64px; }
+  /* Keep offscreen messages in the list while deferring their layout and paint.
+     Auto retains measured heights, including rows with wrapped badges. */
+  .mail-list .mail-item:not(.skel-row) { content-visibility: auto; contain-intrinsic-size: auto 92px; }
   .mail-reader {
     position: absolute; inset: 0; z-index: 5; background: var(--bg-0);
     transform: translateX(100%); transition: transform var(--t-mid) var(--ease);

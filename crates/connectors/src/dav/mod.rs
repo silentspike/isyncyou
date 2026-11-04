@@ -20,6 +20,65 @@ use std::collections::HashSet;
 use std::io::Read;
 use url::Url;
 
+/// Content-free timings for the native DAV path. Labels are fixed by callers;
+/// neither account identifiers nor DAV paths are included.
+pub fn diagnostic_timing(
+    phase: &'static str,
+    index: usize,
+    started: std::time::Instant,
+    outcome: &'static str,
+) {
+    #[cfg(target_os = "android")]
+    {
+        use std::ffi::CString;
+        use std::os::raw::{c_char, c_int};
+        unsafe extern "C" {
+            fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int;
+        }
+        let message = format!(
+            "dav_phase phase={phase} index={index} thread={:?} elapsed_ms={} outcome={outcome}",
+            std::thread::current().id(),
+            started.elapsed().as_millis()
+        );
+        if let (Ok(tag), Ok(message)) = (CString::new("iSyncYou"), CString::new(message)) {
+            unsafe {
+                let _ = __android_log_write(4, tag.as_ptr(), message.as_ptr());
+            }
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = (phase, index, started, outcome);
+}
+
+fn diagnostic_http(code: u16) -> &'static str {
+    match code {
+        200 => "http200",
+        207 => "http207",
+        301 | 302 | 307 | 308 => "redirect",
+        401 => "http401",
+        403 => "http403",
+        404 => "http404",
+        429 => "http429",
+        500 => "http500",
+        502 => "http502",
+        503 => "http503",
+        504 => "http504",
+        _ => "http_other",
+    }
+}
+
+fn diagnostic_result<T>(result: &Result<T, DavError>) -> &'static str {
+    match result {
+        Ok(_) => "ok",
+        Err(DavError::Http(401)) => "http401",
+        Err(DavError::Http(403)) => "http403",
+        Err(DavError::Http(404)) => "http404",
+        Err(DavError::Http(_)) => "http_other",
+        Err(DavError::Transport(_)) => "transport",
+        Err(_) => "invalid_or_store",
+    }
+}
+
 #[derive(Debug)]
 pub enum DavError {
     InvalidUrl,
@@ -745,6 +804,7 @@ impl DavClient {
             if redirects.len() >= 4 || !redirects.insert(url.clone()) {
                 return Err(DavError::InvalidResponse);
             }
+            let started = std::time::Instant::now();
             let response = self
                 .http
                 .request(
@@ -756,8 +816,16 @@ impl DavClient {
                 .header("Depth", depth)
                 .header(CONTENT_TYPE, "application/xml; charset=utf-8")
                 .body(body.to_owned())
-                .budgeted_send(&self.origin)
-                .map_err(|_| DavError::Transport("DAV discovery failed".into()))?;
+                .budgeted_send(&self.origin);
+            let outcome = match &response {
+                Ok(response) => diagnostic_http(response.status().as_u16()),
+                Err(error) if error.is_timeout() => "timeout",
+                Err(error) if error.is_connect() => "connect",
+                Err(_) => "transport",
+            };
+            diagnostic_timing("propfind_request", 0, started, outcome);
+            let response =
+                response.map_err(|_| DavError::Transport("DAV discovery failed".into()))?;
             if matches!(response.status().as_u16(), 301 | 302 | 307 | 308) {
                 if self.origin.scheme() != "https" {
                     return Err(DavError::Http(response.status().as_u16()));
@@ -1092,7 +1160,10 @@ impl DavClient {
         }
         let principal_body = r#"<d:propfind xmlns:d="DAV:"><d:prop><d:current-user-principal/></d:prop></d:propfind>"#;
         let entry_url = self.checked_url(entry)?;
-        let (entry_url, result) = self.propfind(entry_url, "0", principal_body)?;
+        let started = std::time::Instant::now();
+        let result = self.propfind(entry_url, "0", principal_body);
+        diagnostic_timing("discover_entry", 0, started, diagnostic_result(&result));
+        let (entry_url, result) = result?;
         let responses: Vec<_> = result
             .children
             .iter()
@@ -1112,7 +1183,10 @@ impl DavClient {
         )?;
         let homes_body = r#"<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:a="urn:ietf:params:xml:ns:carddav"><d:prop><c:calendar-home-set/><a:addressbook-home-set/></d:prop></d:propfind>"#;
         let principal_url = self.checked_from(&canonical_entry, principal)?;
-        let (principal_url, homes) = self.propfind(principal_url, "0", homes_body)?;
+        let started = std::time::Instant::now();
+        let homes = self.propfind(principal_url, "0", homes_body);
+        diagnostic_timing("discover_principal", 0, started, diagnostic_result(&homes));
+        let (principal_url, homes) = homes?;
         let home_response = homes
             .children
             .iter()
@@ -1178,7 +1252,19 @@ impl DavClient {
                     return Err(DavError::InvalidUrl);
                 }
                 let body = r#"<d:propfind xmlns:d="DAV:"><d:prop><d:displayname/><d:resourcetype/><d:owner/></d:prop></d:propfind>"#;
-                let (home_url, listing) = self.propfind(home_url, "1", body)?;
+                let started = std::time::Instant::now();
+                let listing = self.propfind(home_url, "1", body);
+                diagnostic_timing(
+                    if ns == C {
+                        "discover_calendar_home"
+                    } else {
+                        "discover_addressbook_home"
+                    },
+                    0,
+                    started,
+                    diagnostic_result(&listing),
+                );
+                let (home_url, listing) = listing?;
                 if !home_url.path().ends_with('/') {
                     return Err(DavError::InvalidUrl);
                 }
@@ -1934,6 +2020,7 @@ impl DavClient {
                 .map(|size| format!("<d:limit><d:nresults>{size}</d:nresults></d:limit>"))
                 .unwrap_or_default();
             let body = format!("<?xml version=\"1.0\"?><d:sync-collection xmlns:d=\"DAV:\"><d:sync-token>{}</d:sync-token><d:sync-level>1</d:sync-level><d:prop><d:getetag/></d:prop>{limit}</d:sync-collection>", escape_xml(&cursor));
+            let started = std::time::Instant::now();
             let response = self
                 .http
                 .request(
@@ -1945,8 +2032,15 @@ impl DavClient {
                 .header("Depth", "0")
                 .header(CONTENT_TYPE, "application/xml; charset=utf-8")
                 .body(body)
-                .budgeted_send(&self.origin)
-                .map_err(|_| DavError::Transport("DAV report failed".into()))?;
+                .budgeted_send(&self.origin);
+            let outcome = match &response {
+                Ok(response) => diagnostic_http(response.status().as_u16()),
+                Err(error) if error.is_timeout() => "timeout",
+                Err(error) if error.is_connect() => "connect",
+                Err(_) => "transport",
+            };
+            diagnostic_timing("sync_report", 0, started, outcome);
+            let response = response.map_err(|_| DavError::Transport("DAV report failed".into()))?;
             let code = response.status().as_u16();
             if code == 403 {
                 if invalid_sync_token(&bounded_body(response)?)? {
@@ -2005,11 +2099,24 @@ impl DavClient {
                             )?;
                             continue;
                         }
+                        let started = std::time::Instant::now();
                         let response = self
                             .http
                             .get(url)
                             .bearer_auth(&self.token)
-                            .budgeted_send(&self.origin)
+                            .budgeted_send(&self.origin);
+                        let outcome = match &response {
+                            Ok(response) => diagnostic_http(response.status().as_u16()),
+                            Err(error) if error.is_timeout() => "timeout",
+                            Err(error) if error.is_connect() => "connect",
+                            Err(_) => "transport",
+                        };
+                        if response.is_err()
+                            || started.elapsed() >= std::time::Duration::from_millis(500)
+                        {
+                            diagnostic_timing("sync_get", 0, started, outcome);
+                        }
+                        let response = response
                             .map_err(|_| DavError::Transport("DAV object fetch failed".into()))?;
                         let code = response.status().as_u16();
                         if code != 200 {

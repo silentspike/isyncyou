@@ -131,7 +131,7 @@ async function main() {
     await page.getByRole("button", { name: "Open Microsoft account picker" }).click();
     await page.evaluate(() => { window.__microsoftAccountSmoke.failNextPoll = true; });
     await page.getByText("Reconnecting to the sign-in status…").waitFor({ timeout: 5000 });
-    await page.getByText("Waiting for Microsoft sign-in…").waitFor({ timeout: 5000 });
+    await page.getByText("Waiting for sign-in…", { exact: true }).waitFor({ timeout: 5000 });
     assert(report, "one transient bridge poll failure keeps the login attempt resumable",
       await page.getByRole("button", { name: "Open Microsoft account picker" }).isEnabled()
       && await page.getByRole("button", { name: "Start sign-in again" }).count() === 0);
@@ -263,6 +263,39 @@ async function main() {
       && snapshot.revoked.selected === null && snapshot.revoked.pending === null && snapshot.revoked.entries === 0, snapshot.revoked);
     assert(report, "metadata snapshots are bounded, expire, omit bodies and deduplicate in-flight requests",
       snapshot.bounded && snapshot.oversizeCleared && snapshot.expired && snapshot.deduplicated && snapshot.staleSafe && snapshot.noBody, snapshot);
+
+    const containment = await page.evaluate(async () => {
+      if (!CSS.supports("content-visibility", "auto")) return { supported: false };
+      App.accounts = [{ id: "fixture", provider: "microsoft", auth: { reader: { state: "connected" } } }]; App.account = "fixture";
+      const originalApi = api;
+      const items = Array.from({ length: 80 }, (_, i) => ({ service: "mail", item_type: "message",
+        remote_id: `fixture-${i}`, name: i === 79 ? "unique-filter-target" : `message-${i}`,
+        preview: { subject: i === 79 ? "unique-filter-target" : `message-${i}` } }));
+      api = async url => url.startsWith("/api/v1/items?") && url.includes("service=mail") ? { items } : { items: [], runs: [] };
+      try {
+        go("overview"); await new Promise(r => setTimeout(r, 50));
+        go("mail");
+        for (let i = 0; i < 300 && document.querySelectorAll("#mail-list .mail-item:not(.skel-row)").length < 80; i++) await new Promise(r => setTimeout(r, 20));
+        const list = document.querySelector("#mail-list"), rows = [...list.querySelectorAll(".mail-item:not(.skel-row)")];
+        if (rows.length !== 80) return { supported: true, count: rows.length };
+        const applied = getComputedStyle(rows[0]).contentVisibility === "auto";
+        rows[0].style.minHeight = "140px"; rows[1].style.minHeight = "180px";
+        const heights = [rows[0].getBoundingClientRect().height, rows[1].getBoundingClientRect().height];
+        list.scrollTop = list.scrollHeight;
+        await new Promise(requestAnimationFrame); await new Promise(requestAnimationFrame);
+        const last = rows.at(-1), rect = last.getBoundingClientRect(), view = list.getBoundingClientRect();
+        const bottomVisible = rect.top < view.bottom && rect.bottom > view.top;
+        last.focus({ preventScroll: true }); const focus = document.activeElement === last;
+        Mail.q = "unique-filter-target"; mailRender();
+        await new Promise(requestAnimationFrame);
+        const searchRows = list.querySelectorAll(".mail-item:not(.skel-row)").length;
+        return { supported: true, count: rows.length, applied, heights, bottomVisible, focus, searchRows };
+      } finally { api = originalApi; Mail.q = ""; clearMailSnapshots(); }
+    });
+    assert(report, "mobile mail containment preserves variable-height rows, bottom focus and search",
+      !containment.supported || (containment.count === 80 && containment.applied
+        && containment.heights[0] >= 140 && containment.heights[1] >= 180
+        && containment.bottomVisible && containment.focus && containment.searchRows === 1), containment);
     report.ok = true;
   } catch (error) {
     report.error = String(error && error.stack ? error.stack : error);
