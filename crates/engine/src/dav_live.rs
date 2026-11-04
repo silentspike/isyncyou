@@ -733,6 +733,15 @@ pub fn prepare_create_simple(cfg: &Config, account: &str, collection: &str, kind
     Ok(PreparedCreatePreview {origin,collection:collection.into(),service:service.into(),href,kind:kind.into(),uid,timestamp,name:name.into(),start:start.map(str::to_owned),end:end.map(str::to_owned),raw})
 }
 
+/// Prepare a single bounded recurring task create and its exact displayed
+/// occurrences; identity and timestamp are generated exactly once.
+pub fn prepare_create_task_series(cfg: &Config, account: &str, collection: &str, name: &str, start: &str, due: &str, rule: &str) -> Result<(PreparedCreatePreview, Vec<String>), String> {
+    let mut create = prepare_create_simple(cfg,account,collection,"task",name,None,None)?;
+    let result = isyncyou_connectors::dav::edit::create_task_series(&create.uid,&create.timestamp,name,start,due,rule)?;
+    create.start = Some(start.into()); create.end = Some(due.into()); create.raw = result.raw;
+    Ok((create,result.new_occurrences))
+}
+
 pub struct PreparedInvitationCreate {
     pub create: PreparedCreatePreview,
     pub organizer: String,

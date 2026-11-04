@@ -37,6 +37,19 @@ pub enum WriteOutcome {
     Unknown,
 }
 
+/// The stage of this invocation before it enters a DAV write boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DavPreDispatchStage { Validation, Store, Credentials, Client, Discovery, Target, Privilege }
+
+/// Dispatch certainty for this invocation only. A caller must independently
+/// exclude another invocation of the same operation before claiming that no
+/// concurrent writer dispatched it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DavWriteExecutionError {
+    PreDispatch(DavPreDispatchStage),
+    DispatchUncertain,
+}
+
 /// A confirmed change to one principal's visible collection ACL. The caller
 /// binds approval to the complete displayed prior ACL and proposed privilege.
 pub struct ApprovedDavAcl {
@@ -320,6 +333,15 @@ pub fn execute_create_simple(cfg: &Config, entry: &str, op: &ApprovedDavWrite, p
     execute_inner(cfg,entry,op,credentials)
 }
 
+pub fn execute_create_task_series(cfg: &Config, entry: &str, op: &ApprovedDavWrite, preview: &crate::dav_live::PreparedCreatePreview, rule: &str, occurrences: &[String], credentials: Option<&dyn ProviderCredentialStore>) -> Result<WriteOutcome, String> {
+    if op.expected_etag.is_some() || op.expected_collection_token.is_some() || preview.kind != "task" || op.origin != preview.origin || op.collection != preview.collection || op.service != "calendar" || preview.service != "calendar" || op.href != preview.href { return Err("Create effect differs from approval".into()); }
+    let base = reqwest::Url::parse(&op.collection).map_err(|_| "Invalid collection URL")?;
+    let expected_href = base.join(&format!("{}.ics",preview.uid)).map_err(|_| "Invalid resource URL")?.to_string();
+    let generated = isyncyou_connectors::dav::edit::create_task_series(&preview.uid,&preview.timestamp,&preview.name,preview.start.as_deref().ok_or("Task start missing")?,preview.end.as_deref().ok_or("Task due missing")?,rule)?;
+    if expected_href != op.href || generated.raw != preview.raw || op.raw.as_deref() != Some(generated.raw.as_slice()) || generated.new_occurrences.as_slice() != occurrences { return Err("Create effect differs from approval".into()); }
+    execute_inner(cfg,entry,op,credentials)
+}
+
 pub fn execute_invitation_create(cfg: &Config, entry: &str, op: &ApprovedDavWrite, preview: &crate::dav_live::PreparedInvitationCreate, credentials: Option<&dyn ProviderCredentialStore>) -> Result<WriteOutcome, String> {
     let create = &preview.create;
     if op.expected_etag.is_some() || op.expected_collection_token.is_some() || op.origin != create.origin || op.collection != create.collection || op.service != "calendar" || create.service != "calendar" || create.kind != "event" || op.href != create.href { return Err("Invitation effect differs from approval".into()); }
@@ -374,6 +396,19 @@ pub fn execute_task_attributes_with_start(cfg: &Config, entry: &str, op: &Approv
     let preview = crate::dav_live::prepare_task_attributes_with_start_preview(cfg,&op.account_id,&op.collection,&op.href,uid,priority,due,start)?;
     if preview.origin != op.origin || preview.edit.href != op.href || Some(preview.edit.expected_etag.as_str()) != op.expected_etag.as_deref() || Some(preview.edit.raw.as_slice()) != op.raw.as_deref() { return Err("Task changed after approval".into()); }
     execute_inner(cfg,entry,op,credentials)
+}
+
+pub fn execute_task_attributes_with_start_classified(cfg: &Config, entry: &str, op: &ApprovedDavWrite, uid: &str, priority: Option<u8>, due: Option<(&str, bool)>, start: Option<&str>, credentials: Option<&dyn ProviderCredentialStore>) -> Result<WriteOutcome, DavWriteExecutionError> {
+    // Until the original scope can be inspected, a previous invocation may
+    // already have dispatched this operation ID under that scope.
+    if op.service != "calendar" || op.expected_collection_token.is_some() { return Err(DavWriteExecutionError::DispatchUncertain); }
+    if !matches!(cfg.provider_accounts.get(&op.account_id), Some(ProviderConfig::SelfHosted {origin,..}) if origin == &op.origin) { return Err(DavWriteExecutionError::DispatchUncertain); }
+    let store = crate::provider_store::open(cfg,&op.account_id).map_err(|_| DavWriteExecutionError::DispatchUncertain)?;
+    let scope = ProviderScope { account_id:op.account_id.clone(), origin:op.origin.clone(), service:op.service.clone(), collection:op.collection.clone() };
+    if store.provider_mutation(&scope,&op.operation_id).map_err(|_| DavWriteExecutionError::DispatchUncertain)?.is_some() { return Err(DavWriteExecutionError::DispatchUncertain); }
+    let preview = crate::dav_live::prepare_task_attributes_with_start_preview(cfg,&op.account_id,&op.collection,&op.href,uid,priority,due,start).map_err(|_| DavWriteExecutionError::PreDispatch(DavPreDispatchStage::Validation))?;
+    if preview.origin != op.origin || preview.edit.href != op.href || Some(preview.edit.expected_etag.as_str()) != op.expected_etag.as_deref() || Some(preview.edit.raw.as_slice()) != op.raw.as_deref() { return Err(DavWriteExecutionError::PreDispatch(DavPreDispatchStage::Validation)); }
+    execute_inner_classified(cfg,entry,op,credentials)
 }
 
 pub fn execute_alarm(cfg: &Config, entry: &str, op: &ApprovedDavWrite, uid: &str, recurrence_id: Option<&str>, index: Option<usize>, trigger: Option<&str>, description: Option<&str>, credentials: Option<&dyn ProviderCredentialStore>) -> Result<WriteOutcome, String> {
@@ -438,6 +473,34 @@ fn execute_inner(
     op: &ApprovedDavWrite,
     credentials: Option<&dyn ProviderCredentialStore>,
 ) -> Result<WriteOutcome, String> {
+    execute_inner_impl(cfg,entry,op,credentials,&std::cell::Cell::new(false),&std::cell::Cell::new(DavPreDispatchStage::Validation),false)
+}
+
+fn execute_inner_classified(
+    cfg: &Config,
+    entry: &str,
+    op: &ApprovedDavWrite,
+    credentials: Option<&dyn ProviderCredentialStore>,
+) -> Result<WriteOutcome, DavWriteExecutionError> {
+    let entered = std::cell::Cell::new(false);
+    let stage = std::cell::Cell::new(DavPreDispatchStage::Validation);
+    let result = execute_inner_impl(cfg,entry,op,credentials,&entered,&stage,true);
+    classify_execution(result,entered.get(),stage.get())
+}
+
+fn classify_execution(result: Result<WriteOutcome,String>, entered: bool, stage: DavPreDispatchStage) -> Result<WriteOutcome,DavWriteExecutionError> {
+    result.map_err(|_| if entered { DavWriteExecutionError::DispatchUncertain } else { DavWriteExecutionError::PreDispatch(stage) })
+}
+
+fn execute_inner_impl(
+    cfg: &Config,
+    entry: &str,
+    op: &ApprovedDavWrite,
+    credentials: Option<&dyn ProviderCredentialStore>,
+    entered: &std::cell::Cell<bool>,
+    stage: &std::cell::Cell<DavPreDispatchStage>,
+    verify_prior: bool,
+) -> Result<WriteOutcome, String> {
     #[cfg(debug_assertions)]
     let perf_start = std::time::Instant::now();
     if !matches!(op.service.as_str(), "calendar" | "contacts") {
@@ -447,11 +510,20 @@ fn execute_inner(
         Some(ProviderConfig::SelfHosted { origin, .. }) if origin == &op.origin => origin,
         _ => return Err("Account or provider changed after approval".into()),
     };
+    stage.set(DavPreDispatchStage::Store);
+    if verify_prior { entered.set(true); }
     let store = crate::provider_store::open(cfg, &op.account_id)?;
+    // A previous invocation with this operation ID may already have dispatched.
+    // Failure to inspect it must never be reported as proof of no dispatch.
+    if verify_prior {
+        let prior_scope = ProviderScope { account_id:op.account_id.clone(), origin:op.origin.clone(), service:op.service.clone(), collection:op.collection.clone() };
+        if store.provider_mutation(&prior_scope, &op.operation_id).map_err(|e| e.to_string())?.is_none() { entered.set(false); }
+    }
     #[cfg(debug_assertions)]
     eprintln!("isyncyou: dav_confirm store_open_ms={}", perf_start.elapsed().as_millis());
     #[cfg(debug_assertions)]
     let auth_start = std::time::Instant::now();
+    stage.set(DavPreDispatchStage::Credentials);
     let token = match credentials {
         Some(credentials) => crate::provider_auth::self_hosted_access_token_with_store(
             cfg,
@@ -460,11 +532,13 @@ fn execute_inner(
         )?,
         None => crate::provider_auth::self_hosted_access_token(cfg, &op.account_id)?,
     };
+    stage.set(DavPreDispatchStage::Client);
     let client = DavClient::new(origin, token).map_err(|e| e.to_string())?;
     #[cfg(debug_assertions)]
     eprintln!("isyncyou: dav_confirm token_client_ms={}", auth_start.elapsed().as_millis());
     #[cfg(debug_assertions)]
     let discovery_start = std::time::Instant::now();
+    stage.set(DavPreDispatchStage::Discovery);
     let collection = client
         .discover(entry)
         .map_err(|e| e.to_string())?
@@ -486,6 +560,7 @@ fn execute_inner(
         service: op.service.clone(),
         collection: collection.url,
     };
+    stage.set(DavPreDispatchStage::Target);
     let target = client
         .validate_target(&scope, &op.href)
         .map_err(|e| e.to_string())?;
@@ -536,6 +611,7 @@ fn execute_inner(
     };
     #[cfg(debug_assertions)]
     let privilege_start = std::time::Instant::now();
+    stage.set(DavPreDispatchStage::Privilege);
     if !client
         .permits(&scope, resource, privilege)
         .map_err(|e| e.to_string())?
@@ -545,6 +621,7 @@ fn execute_inner(
     #[cfg(debug_assertions)]
     eprintln!("isyncyou: dav_confirm privilege_ms={}", privilege_start.elapsed().as_millis());
     if let Some((uid,parent)) = parent_change {
+        entered.set(true);
         return client.with_locked_collection(&scope,|token| {
             client.sync_collection(&store,&scope)?;
             let current = crate::dav_live::prepare_task_parent_in_store(&store,&scope,&target,&uid,parent.as_deref()).map_err(|_| DavError::Conflict)?;
@@ -553,6 +630,7 @@ fn execute_inner(
         }).or_else(|error| match error {DavError::Conflict => Ok(WriteOutcome::Conflict),other => Err(other.to_string())});
     }
     if let Some(uid) = task_delete {
+        entered.set(true);
         return client.with_locked_collection(&scope,|token| {
             client.sync_collection(&store,&scope)?;
             let (_,_,etag,checkpoint) = crate::dav_live::prepare_task_delete_in_store(&store,&scope,&target,&uid).map_err(|_| DavError::Conflict)?;
@@ -563,6 +641,7 @@ fn execute_inner(
     if op.expected_collection_token.is_some() { return Err("Collection checkpoint is supported only for locked task parent changes".into()); }
     #[cfg(debug_assertions)]
     let dispatch_start = std::time::Instant::now();
+    entered.set(true);
     let result = dispatch(&store, &client, &scope, op, &target);
     #[cfg(debug_assertions)]
     eprintln!("isyncyou: dav_confirm dispatch_ms={} total_ms={}", dispatch_start.elapsed().as_millis(), perf_start.elapsed().as_millis());
@@ -617,6 +696,16 @@ mod tests {
             raw: Some(b"original bytes".to_vec()),
         };
         (scope, op)
+    }
+
+    #[test]
+    fn discovery_failure_is_predispatch_but_dispatch_failure_is_unknown() {
+        let private_error = "provider detail must not escape".to_string();
+        assert_eq!(classify_execution(Err(private_error.clone()), false, DavPreDispatchStage::Discovery), Err(DavWriteExecutionError::PreDispatch(DavPreDispatchStage::Discovery)));
+        assert_eq!(classify_execution(Err(private_error), true, DavPreDispatchStage::Discovery), Err(DavWriteExecutionError::DispatchUncertain));
+        assert_eq!(classify_execution(Ok(WriteOutcome::Unknown), true, DavPreDispatchStage::Privilege), Ok(WriteOutcome::Unknown));
+        let (_, op) = fixture();
+        assert_eq!(execute_task_attributes_with_start_classified(&Config::default(), "/.well-known/caldav", &op, "uid", None, None, None, None), Err(DavWriteExecutionError::DispatchUncertain));
     }
 
     #[test]

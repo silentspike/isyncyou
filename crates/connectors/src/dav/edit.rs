@@ -61,6 +61,14 @@ pub fn create_simple(kind: &str, uid: &str, timestamp: &str, name: &str, start: 
     Ok(bytes.into_bytes())
 }
 
+/// Construct a bounded task series and the complete occurrence set that must
+/// be displayed in the approval for this single create-if-absent operation.
+pub fn create_task_series(uid: &str, timestamp: &str, name: &str, start: &str, due: &str, rule: &str) -> Result<SeriesRulePreview, String> {
+    let simple = create_simple("task",uid,timestamp,name,None,None)?;
+    let dated = task_attributes_with_start(&simple,uid,None,None,Some((due,false)),Some(start))?;
+    preview_series_rule(&dated,uid,rule)
+}
+
 /// Create one scheduled event with explicit, bounded mailto recipients.
 pub fn create_invitation(uid: &str, timestamp: &str, name: &str, start: &str, end: &str, organizer: &str, attendees: &[String]) -> Result<Vec<u8>, String> {
     let valid_address = |address: &str| {
@@ -1296,6 +1304,16 @@ mod tests {
         assert_eq!(p.new_occurrences.len(),3);
         let output = String::from_utf8(p.raw).unwrap();
         assert!(output.contains("X-KEEP:yes\r\n")); assert!(output.contains("RRULE:FREQ=DAILY;COUNT=3\r\n"));
+    }
+
+    #[test]
+    fn atomic_task_series_creation_previews_all_occurrences() {
+        let p = create_task_series("task","20261101T100000Z","Work","20270101T100000Z","20270101T110000Z","FREQ=DAILY;COUNT=3").unwrap();
+        assert_eq!(p.new_occurrences,vec!["20270101T100000Z","20270102T100000Z","20270103T100000Z"]);
+        let raw = String::from_utf8(p.raw).unwrap();
+        for expected in ["UID:task", "DTSTART:20270101T100000Z", "DUE:20270101T110000Z", "RRULE:FREQ=DAILY;COUNT=3"] { assert!(raw.contains(expected)); }
+        assert!(create_task_series("task","20261101T100000Z","Work","20270101T100000Z","20270101T110000Z","FREQ=DAILY").is_err());
+        assert!(create_task_series("task","20261101T100000Z","Work","20270101T110000Z","20270101T100000Z","FREQ=DAILY;COUNT=3").is_err());
     }
 
     #[test]

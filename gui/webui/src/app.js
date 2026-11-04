@@ -3927,22 +3927,25 @@ function openProviderCreate(account, collection, kind) {
   const name = el("input", { class:"input", "aria-label":kind === "contact" ? "Contact name" : "Title", placeholder:kind === "contact" ? "Contact name" : "Title" });
   const start = el("input", { class:"input", "aria-label":"UTC start", placeholder:"Start UTC: YYYYMMDDTHHMMSSZ" });
   const end = el("input", { class:"input", "aria-label":"UTC end", placeholder:"End UTC: YYYYMMDDTHHMMSSZ" });
+  const rule = el("input", { class:"input", "aria-label":"Task recurrence rule", placeholder:"Optional: FREQ=DAILY;COUNT=3" });
   const organizer = el("input", { class:"input", "aria-label":"Organizer identity", placeholder:"Optional organizer, e.g. mailto:you@example.com" });
   const attendees = el("input", { class:"input", "aria-label":"Attendees", placeholder:"Optional attendees as comma-separated mailto: addresses" });
   const button = el("button", { class:"btn primary", type:"button", onclick:async () => {
     if (App.account !== account || !name.value.trim()) { toast("Check the account and name.", "err"); return; }
+    if (kind === "task" && !rule.value.trim() && (start.value.trim() || end.value.trim())) { toast("Add a recurrence rule or clear the dates.", "err"); return; }
     button.disabled = true;
     try {
       const sessionId = await ensureAgentSession();
       if (App.account !== account) throw new Error("Account changed");
-      const pending = await postJson("/api/v1/agent/dav/create/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, kind, name:name.value.trim(), start:kind === "event" ? start.value.trim() : null, end:kind === "event" ? end.value.trim() : null, organizer:kind === "event" ? organizer.value.trim() || null : null, attendees:kind === "event" ? attendees.value.split(",").map(value => value.trim()).filter(Boolean) : [] }, PROVIDER_NATIVE_TIMEOUT_MS);
+      const recurringTask = kind === "task" && rule.value.trim();
+      const pending = await postJson("/api/v1/agent/dav/create/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, kind, name:name.value.trim(), start:kind === "event" || recurringTask ? start.value.trim() : null, end:kind === "event" || recurringTask ? end.value.trim() : null, rule:recurringTask || null, organizer:kind === "event" ? organizer.value.trim() || null : null, attendees:kind === "event" ? attendees.value.split(",").map(value => value.trim()).filter(Boolean) : [] }, PROVIDER_NATIVE_TIMEOUT_MS);
       if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
       const record = { ...pending, status:"pending", cancelled_result:"The item was not created." };
       AssistantState.pendingCardsById.set(record.pending_id, record);
       closeSheet(); openSheet("Review new item", renderAgentPendingCard(record));
     } catch (_) { toast("The item could not be prepared. Check the collection and input.", "err"); button.disabled = false; }
   } }, "Review new item");
-  openSheet(`New ${kind}`, el("div", { class:"compose" }, el("p", { class:"dim", text:"Optional event attendees require an organizer identity belonging to this account. The event has no recurrence, alarms or parent; invitations may be sent after confirmation." }), name, kind === "event" ? start : null, kind === "event" ? end : null, kind === "event" ? organizer : null, kind === "event" ? attendees : null, button));
+  openSheet(`New ${kind}`, el("div", { class:"compose" }, el("p", { class:"dim", text:kind === "task" ? "For a recurring task, enter UTC start, UTC due and a rule with COUNT up to 100. All occurrences are shown before creation." : "Optional event attendees require an organizer identity belonging to this account. Invitations may be sent after confirmation." }), name, kind !== "contact" ? start : null, kind !== "contact" ? end : null, kind === "task" ? rule : null, kind === "event" ? organizer : null, kind === "event" ? attendees : null, button));
 }
 
 async function renderProviderCalendarView(view, service) {
@@ -7767,6 +7770,8 @@ async function confirmAgentPending(pendingId) {
         : e.code === "capture_preflight_challenge" ? "Capture authorization could not be prepared; no capture was sent."
         : e.code === "capture_preflight_journal" ? "The capture journal could not be prepared; no capture was sent."
         : e.code === "provider_conflict" ? "The item changed before the update. Review the current version."
+        : e.code === "dav_discovery_unavailable_before_write" ? "The calendar could not be reached. This attempt did not send a write."
+        : e.code === "dav_pre_dispatch_failed" ? "The update could not be prepared. This attempt did not send a write."
         : "The action was not confirmed.";
       clearAgentPendingAuthority(record);
     }

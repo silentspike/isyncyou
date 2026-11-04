@@ -833,6 +833,7 @@ pub enum ClosedExecutionCode {
     ProviderRejected,
     ProviderActionRejected,
     ProviderConflict,
+    DavPreDispatch(isyncyou_engine::dav_write::DavPreDispatchStage),
     CaptureSourceUnavailable,
     CaptureVersionChanged,
     CaptureChallengeUnavailable,
@@ -12178,7 +12179,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             if registry.account_for(&request.session_id)? != request.account { return Err("session_account_mismatch".into()); }
             let service = if request.kind == "contact" { "contacts" } else { "calendar" };
             let proposed = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":service,
-                "change":{"verb":"dav_create", "collection":request.collection, "kind":request.kind, "name":request.name, "start":request.start, "end":request.end, "organizer":request.organizer, "attendees":request.attendees}})).map_err(|_| "confirmation_unavailable")?;
+                "change":{"verb":"dav_create", "collection":request.collection, "kind":request.kind, "name":request.name, "start":request.start, "end":request.end, "rule":request.rule, "organizer":request.organizer, "attendees":request.attendees}})).map_err(|_| "confirmation_unavailable")?;
             let action = agent_ops::bind_provider_dav_create(&cfg, proposed)?;
             let preview = agent_ops::preview_for_pending_action_with_config(&cfg, &action)?;
             let turn_id = turn_id_from_request_id(&request.request_id)?;
@@ -14368,7 +14369,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                         ClosedAuthorizationCode::ExecutorRejected
                     }
                     ClosedExecutionCode::ExecutorFailed => ClosedAuthorizationCode::ExecutorFailed,
-                    ClosedExecutionCode::ProviderRejected | ClosedExecutionCode::ProviderActionRejected | ClosedExecutionCode::ProviderConflict | ClosedExecutionCode::CaptureSourceUnavailable | ClosedExecutionCode::CaptureVersionChanged | ClosedExecutionCode::CaptureChallengeUnavailable | ClosedExecutionCode::CaptureJournalUnavailable => ClosedAuthorizationCode::ExecutorRejected,
+                    ClosedExecutionCode::ProviderRejected | ClosedExecutionCode::ProviderActionRejected | ClosedExecutionCode::ProviderConflict | ClosedExecutionCode::DavPreDispatch(_) | ClosedExecutionCode::CaptureSourceUnavailable | ClosedExecutionCode::CaptureVersionChanged | ClosedExecutionCode::CaptureChallengeUnavailable | ClosedExecutionCode::CaptureJournalUnavailable => ClosedAuthorizationCode::ExecutorRejected,
                 };
                 let event = AgentAuthorizationAuditV1 {
                     state: AuthorizationAuditState::Failed,
@@ -14392,6 +14393,8 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     ClosedExecutionCode::ProviderRejected => isyncyou_webui::ClosedConfirmationFailure::ProviderRejected,
                     ClosedExecutionCode::ProviderActionRejected => isyncyou_webui::ClosedConfirmationFailure::ProviderActionRejected,
                     ClosedExecutionCode::ProviderConflict => isyncyou_webui::ClosedConfirmationFailure::ProviderConflict,
+                    ClosedExecutionCode::DavPreDispatch(isyncyou_engine::dav_write::DavPreDispatchStage::Discovery) => isyncyou_webui::ClosedConfirmationFailure::DavDiscoveryUnavailable,
+                    ClosedExecutionCode::DavPreDispatch(_) => isyncyou_webui::ClosedConfirmationFailure::DavPreDispatchFailed,
                     ClosedExecutionCode::CaptureSourceUnavailable => isyncyou_webui::ClosedConfirmationFailure::CaptureSourceUnavailable,
                     ClosedExecutionCode::CaptureVersionChanged => isyncyou_webui::ClosedConfirmationFailure::CaptureVersionChanged,
                     ClosedExecutionCode::CaptureChallengeUnavailable => isyncyou_webui::ClosedConfirmationFailure::CaptureChallengeUnavailable,

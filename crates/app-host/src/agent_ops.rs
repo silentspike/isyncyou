@@ -144,11 +144,16 @@ fn execute_bound_task_attributes(cfg: &Config, action: &isyncyou_agent::ToolActi
     let prepared = match isyncyou_engine::dav_live::prepare_task_attributes_with_start_preview(cfg,account,&collection,&target,&uid,priority,due.as_deref().map(|d| (d,due_date)),start.as_deref()) { Ok(value) => value, Err(_) => return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) };
     if prepared.origin != origin || prepared.name != name || prepared.old_priority != old_priority || prepared.old_due != old_due || prepared.old_start != old_start || prepared.new_start != new_start || prepared.edit.href != target || prepared.edit.expected_etag != etag || prepared.edit.expected_collection_token.is_some() || sha256_hex(&prepared.edit.raw) != raw_sha256 { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderConflict); }
     let op = isyncyou_engine::dav_write::ApprovedDavWrite { operation_id, account_id:account.into(), origin, collection, service:"calendar".into(), href:target, expected_etag:Some(etag), expected_collection_token:None, raw:Some(prepared.edit.raw) };
-    match isyncyou_engine::dav_write::execute_task_attributes_with_start(cfg,"/.well-known/caldav",&op,&uid,priority,due.as_deref().map(|d| (d,due_date)),start.as_deref(),None) {
+    classify_task_attribute_result(isyncyou_engine::dav_write::execute_task_attributes_with_start_classified(cfg,"/.well-known/caldav",&op,&uid,priority,due.as_deref().map(|d| (d,due_date)),start.as_deref(),None))
+}
+
+fn classify_task_attribute_result(result: Result<isyncyou_engine::dav_write::WriteOutcome, isyncyou_engine::dav_write::DavWriteExecutionError>) -> ConfirmedExecutionOutcome {
+    match result {
         Ok(isyncyou_engine::dav_write::WriteOutcome::Confirmed(_)) => ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new("Task updated; local synchronization pending")),
         Ok(isyncyou_engine::dav_write::WriteOutcome::Conflict) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderConflict),
         Ok(isyncyou_engine::dav_write::WriteOutcome::Rejected) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderActionRejected),
-        _ => ConfirmedExecutionOutcome::OutcomeUnknown,
+        Err(isyncyou_engine::dav_write::DavWriteExecutionError::PreDispatch(stage)) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::DavPreDispatch(stage)),
+        Ok(isyncyou_engine::dav_write::WriteOutcome::Unknown) | Err(isyncyou_engine::dav_write::DavWriteExecutionError::DispatchUncertain) => ConfirmedExecutionOutcome::OutcomeUnknown,
     }
 }
 
@@ -495,18 +500,21 @@ fn execute_bound_dav_delete(cfg: &Config, action: &isyncyou_agent::ToolAction, p
 
 fn execute_bound_dav_create(cfg: &Config, action: &isyncyou_agent::ToolAction, pending_id: &str, gate: &Arc<Mutex<()>>) -> ConfirmedExecutionOutcome {
     let Some(operation_id) = bound_submission_operation_id(pending_id) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
-    let Ok(AgentLiveWriteIntent::DavCreate { service, origin, collection, target, kind, uid, timestamp, name, start, end, organizer, attendees, raw_sha256 }) = validate_live_write_action(action) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
-    let raw = match organizer.as_deref() {
+    let Ok(AgentLiveWriteIntent::DavCreate { service, origin, collection, target, kind, uid, timestamp, name, start, end, rule, occurrences, organizer, attendees, raw_sha256 }) = validate_live_write_action(action) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
+    if rule.is_some() != occurrences.is_some() || (rule.is_some() && (kind != "task" || organizer.is_some() || !attendees.is_empty())) { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); }
+    let raw = if let Some(rule) = rule.as_deref() {
+        match (start.as_deref(),end.as_deref()) { (Some(start),Some(end)) => isyncyou_connectors::dav::edit::create_task_series(&uid,&timestamp,&name,start,end,rule).and_then(|p| if Some(&p.new_occurrences) == occurrences.as_ref() { Ok(p.raw) } else { Err("Task occurrences changed".into()) }), _ => return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) }
+    } else { match organizer.as_deref() {
         Some(organizer) => match (start.as_deref(),end.as_deref()) { (Some(start),Some(end)) => isyncyou_connectors::dav::edit::create_invitation(&uid,&timestamp,&name,start,end,organizer,&attendees), _ => return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) },
         None => isyncyou_connectors::dav::edit::create_simple(&kind,&uid,&timestamp,&name,start.as_deref(),end.as_deref()),
-    };
+    }};
     let raw = match raw { Ok(value) => value, Err(_) => return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) };
     if sha256_hex(&raw) != raw_sha256 { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderConflict); }
     let preview = isyncyou_engine::dav_live::PreparedCreatePreview { origin:origin.clone(), collection:collection.clone(), service:service.clone(), href:target.clone(), kind, uid, timestamp, name, start, end, raw:raw.clone() };
     let op = isyncyou_engine::dav_write::ApprovedDavWrite { operation_id, account_id:action.account().into(), origin, collection, service:service.clone(), href:target, expected_etag:None, expected_collection_token:None, raw:Some(raw) };
     let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
     let scheduled = organizer.is_some();
-    let result = match organizer { Some(organizer) => isyncyou_engine::dav_write::execute_invitation_create(cfg,"/.well-known/caldav",&op,&isyncyou_engine::dav_live::PreparedInvitationCreate { create:preview, organizer, attendees },None), None => isyncyou_engine::dav_write::execute_create_simple(cfg,if service == "calendar" { "/.well-known/caldav" } else { "/.well-known/carddav" },&op,&preview,None) };
+    let result = if let (Some(rule),Some(occurrences)) = (rule.as_deref(),occurrences.as_deref()) { isyncyou_engine::dav_write::execute_create_task_series(cfg,"/.well-known/caldav",&op,&preview,rule,occurrences,None) } else { match organizer { Some(organizer) => isyncyou_engine::dav_write::execute_invitation_create(cfg,"/.well-known/caldav",&op,&isyncyou_engine::dav_live::PreparedInvitationCreate { create:preview, organizer, attendees },None), None => isyncyou_engine::dav_write::execute_create_simple(cfg,if service == "calendar" { "/.well-known/caldav" } else { "/.well-known/carddav" },&op,&preview,None) } };
     match result {
         Ok(isyncyou_engine::dav_write::WriteOutcome::Confirmed(_)) => ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new(if scheduled { "Event created; invitation delivery is not confirmed" } else { "Resource created; local synchronization pending" })),
         Ok(isyncyou_engine::dav_write::WriteOutcome::Conflict) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderConflict),
@@ -985,7 +993,7 @@ fn run_restore_cloud_with_runtime<R: RestoreCloudRuntime>(
 
 #[derive(Debug, Clone, PartialEq)]
 enum AgentLiveWriteIntent {
-    DavCreate { service:String, origin:String, collection:String, target:String, kind:String, uid:String, timestamp:String, name:String, start:Option<String>, end:Option<String>, organizer:Option<String>, attendees:Vec<String>, raw_sha256:String },
+    DavCreate { service:String, origin:String, collection:String, target:String, kind:String, uid:String, timestamp:String, name:String, start:Option<String>, end:Option<String>, rule:Option<String>, occurrences:Option<Vec<String>>, organizer:Option<String>, attendees:Vec<String>, raw_sha256:String },
     DavDelete { service:String, origin:String, collection:String, target:String, kind:String, uid:String, name:String, etag:String, source_sha256:String, projection:serde_json::Value },
     DavAcl { service:String, origin:String, collection:String, principal:String, privilege:Option<String>, expected:serde_json::Value },
     Mail(MailLiveWrite),
@@ -1582,7 +1590,7 @@ fn validate_live_write_action(
     match (service.as_str(), verb.as_str()) {
         ("mail", "provider_mail_action") => Ok(AgentLiveWriteIntent::Mail(MailLiveWrite::ProviderAction { preview:change.get("preview").filter(|v| v.is_object()).cloned().ok_or("invalid_mail_preview")? })),
         ("mail", "provider_related_draft") => Ok(AgentLiveWriteIntent::Mail(MailLiveWrite::RelatedDraft { preview:change.get("preview").filter(|v| v.is_object()).cloned().ok_or("invalid_mail_preview")?, email:change.get("email").filter(|v| v.is_object()).cloned().ok_or("invalid_mail_draft")? })),
-        ("calendar" | "contacts", "dav_create") => Ok(AgentLiveWriteIntent::DavCreate { service:service.clone(), origin:required_change_str(change,"origin")?, collection:required_change_str(change,"collection")?, target:required_target(target,change)?, kind:required_change_str(change,"kind")?, uid:required_change_str(change,"uid")?, timestamp:required_change_str(change,"timestamp")?, name:required_change_str(change,"name")?, start:optional_change_str(change,"start")?, end:optional_change_str(change,"end")?, organizer:optional_change_str(change,"organizer")?, attendees:optional_string_array(change,"attendees")?.unwrap_or_default(), raw_sha256:required_change_str(change,"raw_sha256")? }),
+        ("calendar" | "contacts", "dav_create") => Ok(AgentLiveWriteIntent::DavCreate { service:service.clone(), origin:required_change_str(change,"origin")?, collection:required_change_str(change,"collection")?, target:required_target(target,change)?, kind:required_change_str(change,"kind")?, uid:required_change_str(change,"uid")?, timestamp:required_change_str(change,"timestamp")?, name:required_change_str(change,"name")?, start:optional_change_str(change,"start")?, end:optional_change_str(change,"end")?, rule:optional_change_str(change,"rule")?, occurrences:optional_occurrences(change)?, organizer:optional_change_str(change,"organizer")?, attendees:optional_string_array(change,"attendees")?.unwrap_or_default(), raw_sha256:required_change_str(change,"raw_sha256")? }),
         ("calendar" | "contacts", "dav_delete") => Ok(AgentLiveWriteIntent::DavDelete { service:service.clone(), origin:required_change_str(change,"origin")?, collection:required_change_str(change,"collection")?, target:required_target(target,change)?, kind:required_change_str(change,"kind")?, uid:required_change_str(change,"uid")?, name:required_change_str(change,"name")?, etag:required_change_str(change,"etag")?, source_sha256:required_change_str(change,"source_sha256")?, projection:change.get("projection").cloned().ok_or("invalid_delete_projection")? }),
         ("calendar" | "contacts", "dav_acl") => {
             let privilege = optional_change_str(change,"privilege")?;
@@ -1936,6 +1944,12 @@ fn required_string_array(change: &serde_json::Value, key: &str) -> Result<Vec<St
         return Err(format!("invalid_live_write: {key} is empty"));
     }
     Ok(values)
+}
+
+fn optional_occurrences(change: &serde_json::Value) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = change_object(change)?.get("occurrences").filter(|v| !v.is_null()) else { return Ok(None); };
+    let values = value.as_array().filter(|v| !v.is_empty() && v.len() <= 100).ok_or("invalid_occurrences")?;
+    values.iter().map(|value| validate_bounded_string("occurrence", value.as_str().ok_or("invalid_occurrence")?, LIVE_WRITE_MAX_STRING)).collect::<Result<Vec<_>,_>>().map(Some)
 }
 
 fn optional_string_array(
@@ -2332,14 +2346,18 @@ pub(crate) fn bind_provider_dav_create(cfg: &Config, mut action: isyncyou_agent:
     let isyncyou_agent::ToolAction::LiveWrite { account, service, target, change, .. } = &mut action else { return Ok(action); };
     if !matches!(service.as_str(),"calendar" | "contacts") || change.get("verb").and_then(serde_json::Value::as_str) != Some("dav_create") { return Ok(action); }
     let collection = required_change_str(change,"collection")?; let kind = required_change_str(change,"kind")?; let name = required_change_str(change,"name")?;
-    let start = optional_change_str(change,"start")?; let end = optional_change_str(change,"end")?; let organizer = optional_change_str(change,"organizer")?; let attendees = optional_string_array(change,"attendees")?.unwrap_or_default();
-    let prepared = if let Some(organizer) = &organizer {
+    let start = optional_change_str(change,"start")?; let end = optional_change_str(change,"end")?; let rule = optional_change_str(change,"rule")?; let organizer = optional_change_str(change,"organizer")?; let attendees = optional_string_array(change,"attendees")?.unwrap_or_default();
+    let (prepared, occurrences) = if let Some(rule) = &rule {
+        if kind != "task" || organizer.is_some() || !attendees.is_empty() { return Err("invalid_task_series_kind".into()); }
+        let (prepared, occurrences) = isyncyou_engine::dav_live::prepare_create_task_series(cfg,account,&collection,&name,start.as_deref().ok_or("missing_start")?,end.as_deref().ok_or("missing_end")?,rule)?;
+        (prepared, Some(occurrences))
+    } else if let Some(organizer) = &organizer {
         if kind != "event" { return Err("invalid_invitation_kind".into()); }
-        isyncyou_engine::dav_live::prepare_invitation_create(cfg,account,"/.well-known/caldav",&collection,&name,start.as_deref().ok_or("missing_start")?,end.as_deref().ok_or("missing_end")?,organizer,&attendees,None)?.create
-    } else { if !attendees.is_empty() { return Err("missing_organizer".into()); } isyncyou_engine::dav_live::prepare_create_simple(cfg,account,&collection,&kind,&name,start.as_deref(),end.as_deref())? };
+        (isyncyou_engine::dav_live::prepare_invitation_create(cfg,account,"/.well-known/caldav",&collection,&name,start.as_deref().ok_or("missing_start")?,end.as_deref().ok_or("missing_end")?,organizer,&attendees,None)?.create, None)
+    } else { if !attendees.is_empty() { return Err("missing_organizer".into()); } (isyncyou_engine::dav_live::prepare_create_simple(cfg,account,&collection,&kind,&name,start.as_deref(),end.as_deref())?, None) };
     if prepared.service.as_str() != service.as_str() || prepared.collection != collection { return Err("provider_create_prepare_invalid".into()); }
     *target = Some(prepared.href);
-    *change = serde_json::json!({"verb":"dav_create","origin":prepared.origin,"collection":collection,"kind":prepared.kind,"uid":prepared.uid,"timestamp":prepared.timestamp,"name":prepared.name,"start":prepared.start,"end":prepared.end,"organizer":organizer,"attendees":attendees,"raw_sha256":sha256_hex(&prepared.raw)});
+    *change = serde_json::json!({"verb":"dav_create","origin":prepared.origin,"collection":collection,"kind":prepared.kind,"uid":prepared.uid,"timestamp":prepared.timestamp,"name":prepared.name,"start":prepared.start,"end":prepared.end,"rule":rule,"occurrences":occurrences,"organizer":organizer,"attendees":attendees,"raw_sha256":sha256_hex(&prepared.raw)});
     Ok(action)
 }
 
@@ -2614,6 +2632,9 @@ pub(crate) fn preview_for_pending_action(
             }
             if let AgentLiveWriteIntent::DavDelete { service, origin, collection, target, kind, uid, name, projection, .. } = &intent {
                 return Ok(PendingOperationPreview::destructive(format!("Delete {kind} ‘{name}’ (UID {uid}) from account {}, {service} collection {collection} at {origin}, resource {target}. Entire projected object: {projection}. Only a single unscheduled, non-repeating event without alarms or a contact is accepted.", action.account())));
+            }
+            if let AgentLiveWriteIntent::DavCreate { service, origin, collection, target, kind, uid, name, start, end, rule:Some(rule), occurrences:Some(occurrences), .. } = &intent {
+                return Ok(PendingOperationPreview::destructive(format!("Create {kind} series ‘{name}’ (UID {uid}) in account {}, {service} collection {collection} at {origin}, resource {target}. Start: {}; due: {}. Rule: {rule}. Complete locally computed occurrence starts: {}. No alarms, parent relationship or invitations. Server expansion is not yet verified.", action.account(), start.as_deref().unwrap_or("unset"), end.as_deref().unwrap_or("unset"), occurrences.join(", "))));
             }
             if let AgentLiveWriteIntent::DavCreate { service, origin, collection, target, kind, uid, name, start, end, organizer, attendees, .. } = &intent {
                 return Ok(PendingOperationPreview::destructive(format!("Create {kind} ‘{name}’ (UID {uid}) in account {}, {service} collection {collection} at {origin}, resource {target}. Start: {}; end: {}. Organizer: {}; attendees: {}. No recurrence, alarms or parent relationship. Server acceptance does not prove invitation delivery.", action.account(), start.as_deref().unwrap_or("unset"), end.as_deref().unwrap_or("unset"), organizer.as_deref().unwrap_or("none"), if attendees.is_empty() {"none".into()} else {attendees.join(", ")})));
@@ -4071,6 +4092,24 @@ mod tests {
             "change":{"verb":"provider_mail_action", "preview":{"subject":"Example subject", "mailbox_ids":{"inbox":true}, "action":{"kind":"trash"}}}})).unwrap();
         let preview = preview_for_pending_action(&action).unwrap();
         for expected in ["Example subject", "inbox", "trash", "all current mailboxes"] { assert!(preview.text.contains(expected)); }
+    }
+
+    #[test]
+    fn task_series_approval_shows_rule_and_every_occurrence() {
+        let action: isyncyou_agent::ToolAction = serde_json::from_value(json!({"op":"live-write", "account":"test", "service":"calendar", "target":"/cal/task.ics", "change":{"verb":"dav_create", "origin":"https://example.test", "collection":"/cal/", "kind":"task", "uid":"task-1", "timestamp":"20261101T000000Z", "name":"Review", "start":"20261102T100000Z", "end":"20261102T110000Z", "rule":"FREQ=DAILY;COUNT=2", "occurrences":["20261102T100000Z","20261103T100000Z"], "attendees":[], "raw_sha256":"digest"}})).unwrap();
+        let preview = preview_for_pending_action(&action).unwrap();
+        for value in ["FREQ=DAILY;COUNT=2", "20261102T100000Z", "20261103T100000Z", "not yet verified"] { assert!(preview.text.contains(value)); }
+        let mut invalid = action;
+        if let isyncyou_agent::ToolAction::LiveWrite { change, .. } = &mut invalid { change["occurrences"] = json!(vec!["20261102T100000Z";101]); }
+        assert!(preview_for_pending_action(&invalid).is_err());
+    }
+
+    #[test]
+    fn task_attribute_pre_dispatch_failure_and_uncertain_dispatch_are_distinct() {
+        use isyncyou_engine::dav_write::{DavPreDispatchStage, DavWriteExecutionError, WriteOutcome};
+        assert_eq!(classify_task_attribute_result(Err(DavWriteExecutionError::PreDispatch(DavPreDispatchStage::Discovery))), ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::DavPreDispatch(DavPreDispatchStage::Discovery)));
+        assert_eq!(classify_task_attribute_result(Err(DavWriteExecutionError::DispatchUncertain)), ConfirmedExecutionOutcome::OutcomeUnknown);
+        assert_eq!(classify_task_attribute_result(Ok(WriteOutcome::Unknown)), ConfirmedExecutionOutcome::OutcomeUnknown);
     }
 
     #[test]

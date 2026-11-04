@@ -2670,6 +2670,8 @@ pub enum ClosedConfirmationFailure {
     ProviderRejected,
     ProviderActionRejected,
     ProviderConflict,
+    DavDiscoveryUnavailable,
+    DavPreDispatchFailed,
     CaptureSourceUnavailable,
     CaptureVersionChanged,
     CaptureChallengeUnavailable,
@@ -2980,7 +2982,7 @@ pub struct AgentInvitationResponsePrepareRequest { pub request_id:String, pub se
 pub struct AgentDavDeletePrepareRequest { pub request_id:String, pub session_id:String, pub account:String, pub service:String, pub collection:String, pub href:String }
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgentDavCreatePrepareRequest { pub request_id:String, pub session_id:String, pub account:String, pub collection:String, pub kind:String, pub name:String, pub start:Option<String>, pub end:Option<String>, pub organizer:Option<String>, #[serde(default)] pub attendees:Vec<String> }
+pub struct AgentDavCreatePrepareRequest { pub request_id:String, pub session_id:String, pub account:String, pub collection:String, pub kind:String, pub name:String, pub start:Option<String>, pub end:Option<String>, pub rule:Option<String>, pub organizer:Option<String>, #[serde(default)] pub attendees:Vec<String> }
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentContactFieldPrepareRequest { pub request_id:String, pub session_id:String, pub account:String, pub collection:String, pub href:String, pub key:String, pub index:Option<usize>, pub value_type:Option<String>, #[serde(default)] pub remove:bool, pub new_value:String }
@@ -9035,6 +9037,8 @@ impl Router {
             AgentConfirmOutcome::Failed(ClosedConfirmationFailure::ProviderRejected) => no_store_json_error(409, "provider_submission_rejected"),
             AgentConfirmOutcome::Failed(ClosedConfirmationFailure::ProviderActionRejected) => no_store_json_error(409, "provider_action_rejected"),
             AgentConfirmOutcome::Failed(ClosedConfirmationFailure::ProviderConflict) => no_store_json_error(409, "provider_conflict"),
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::DavDiscoveryUnavailable) => no_store_json_error(409, "dav_discovery_unavailable_before_write"),
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::DavPreDispatchFailed) => no_store_json_error(409, "dav_pre_dispatch_failed"),
             AgentConfirmOutcome::Failed(ClosedConfirmationFailure::CaptureSourceUnavailable) => no_store_json_error(409, "capture_preflight_source"),
             AgentConfirmOutcome::Failed(ClosedConfirmationFailure::CaptureVersionChanged) => no_store_json_error(409, "capture_preflight_version_changed"),
             AgentConfirmOutcome::Failed(ClosedConfirmationFailure::CaptureChallengeUnavailable) => no_store_json_error(409, "capture_preflight_challenge"),
