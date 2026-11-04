@@ -46,8 +46,8 @@ fn bound_submission_operation_id(pending_id: &str) -> Option<String> {
 fn execute_bound_provider_submission(cfg: &Config, action: &isyncyou_agent::ToolAction, pending_id: &str, gate: &Arc<Mutex<()>>) -> ConfirmedExecutionOutcome {
     let Some(operation_id) = bound_submission_operation_id(pending_id) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
     let intent = match validate_live_write_action(action) {
-        Ok(AgentLiveWriteIntent::Mail(MailLiveWrite::SendApproved { origin, email_id, blob_id, identity_id, mail_from, recipients, draft_mailbox_id, sent_mailbox_id })) =>
-            (origin, email_id, blob_id, identity_id, mail_from, recipients, draft_mailbox_id, sent_mailbox_id),
+        Ok(AgentLiveWriteIntent::Mail(MailLiveWrite::SendApproved { origin, email_id, blob_id, identity_id, mail_from, recipients, draft_mailbox_id, sent_mailbox_id, remote_account })) =>
+            (origin, email_id, blob_id, identity_id, mail_from, recipients, draft_mailbox_id, sent_mailbox_id, remote_account),
         _ => return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected),
     };
     let account = action.account();
@@ -60,7 +60,7 @@ fn execute_bound_provider_submission(cfg: &Config, action: &isyncyou_agent::Tool
         let client = isyncyou_engine::self_hosted_mail::client(cfg, account)?;
         let approved = isyncyou_engine::self_hosted_mail::ApprovedSubmission {
             operation_id, email_id:intent.1, blob_id:intent.2, identity_id:intent.3,
-            mail_from:intent.4, recipients:intent.5, draft_mailbox_id:intent.6, sent_mailbox_id:intent.7,
+            mail_from:intent.4, recipients:intent.5, draft_mailbox_id:intent.6, sent_mailbox_id:intent.7, remote_account:intent.8,
         };
         isyncyou_engine::self_hosted_mail::send_approved(cfg, account, &store, &client, &approved)
     })();
@@ -1035,7 +1035,7 @@ enum MailLiveWrite {
         target: String,
     },
     SendApproved {
-        origin: String, email_id: String, blob_id: String,
+        origin: String, remote_account: String, email_id: String, blob_id: String,
         identity_id: String, mail_from: String, recipients: Vec<String>,
         draft_mailbox_id: String, sent_mailbox_id: String,
     },
@@ -1652,9 +1652,10 @@ fn validate_live_write_action(
             }
             let email_id = required_change_str(change, "email_id")?;
             let blob_id = required_change_str(change, "blob_id")?;
-            if email_id.len() > 256 || blob_id.len() > 256 { return Err("invalid_live_write: native identity too long".into()); }
+            let remote_account = required_change_str(change, "remote_account")?;
+            if email_id.len() > 256 || blob_id.len() > 256 || remote_account.len() > 256 || remote_account.chars().any(char::is_control) { return Err("invalid_live_write: invalid native identity".into()); }
             Ok(AgentLiveWriteIntent::Mail(MailLiveWrite::SendApproved {
-                origin: required_change_str(change, "origin")?, email_id,
+                origin: required_change_str(change, "origin")?, remote_account, email_id,
                 blob_id, identity_id: required_change_str(change, "identity_id")?, mail_from, recipients,
                 draft_mailbox_id: required_change_str(change, "draft_mailbox_id")?, sent_mailbox_id: required_change_str(change, "sent_mailbox_id")?,
             }))
@@ -2696,8 +2697,8 @@ pub(crate) fn preview_for_pending_action(
             if let AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskOccurrence { target, collection, uid, recurrence_id, effect, .. }) = &intent {
                 return Ok(PendingOperationPreview::destructive(format!("Complete only task occurrence {recurrence_id} of UID {uid} in account {}, calendar {collection}, resource {target}. Server-expanded occurrence and fixed completion time: {effect}.", action.account())));
             }
-            if let AgentLiveWriteIntent::Mail(MailLiveWrite::SendApproved { origin, mail_from, recipients, email_id, blob_id, .. }) = &intent {
-                return Ok(PendingOperationPreview::destructive(format!("Submit email {email_id} (content {blob_id}) via {origin} from {mail_from} to {}. Delivery is not guaranteed by submission.", recipients.join(", "))));
+            if let AgentLiveWriteIntent::Mail(MailLiveWrite::SendApproved { origin, remote_account, mail_from, recipients, email_id, blob_id, .. }) = &intent {
+                return Ok(PendingOperationPreview::destructive(format!("Submit email {email_id} (content {blob_id}) via {origin}, native account {remote_account}, from {mail_from} to {}. Delivery is not guaranteed by submission.", recipients.join(", "))));
             }
             Ok(PendingOperationPreview::destructive(
                 intent.confirmation_copy().to_string(),
@@ -2793,7 +2794,7 @@ pub(crate) fn preview_for_pending_action_with_config(cfg: &Config, action: &isyn
             return Ok(preview);
         }
     }
-    let AgentLiveWriteIntent::Mail(MailLiveWrite::SendApproved { origin, email_id, blob_id, .. }) = (match action {
+    let AgentLiveWriteIntent::Mail(MailLiveWrite::SendApproved { origin, remote_account, email_id, blob_id, .. }) = (match action {
         isyncyou_agent::ToolAction::LiveWrite { .. } => validate_live_write_action(action)?,
         _ => return Ok(preview),
     }) else { return Ok(preview); };
@@ -2803,6 +2804,9 @@ pub(crate) fn preview_for_pending_action_with_config(cfg: &Config, action: &isyn
         _ => return Err("provider_origin_mismatch".into()),
     }
     let client = isyncyou_engine::self_hosted_mail::client(cfg, account)?;
+    if isyncyou_engine::self_hosted_mail::scope(cfg, account, &client)?.collection != remote_account {
+        return Err("provider_account_mismatch".into());
+    }
     let body = isyncyou_engine::self_hosted_mail::read_body(cfg, account, &client, &email_id, 128 * 1024)?;
     append_verified_submission_preview(&mut preview, account, &email_id, &blob_id, &body)?;
     Ok(preview)
@@ -4258,7 +4262,7 @@ mod tests {
     #[test]
     fn approved_submission_binds_all_envelope_and_native_fields_to_effect() {
         let input = json!({"op":"live-write", "account":"a", "service":"mail", "change": {
-            "verb":"send_approved", "origin":"https://example.invalid", "email_id":"email-1", "blob_id":"blob-1",
+            "verb":"send_approved", "origin":"https://example.invalid", "remote_account":"native-1", "email_id":"email-1", "blob_id":"blob-1",
             "identity_id":"identity-1", "mail_from":"from@example.invalid", "recipients":["to@example.invalid"],
             "draft_mailbox_id":"drafts", "sent_mailbox_id":"sent"
         }});
@@ -4272,7 +4276,11 @@ mod tests {
         let preview = preview_for_pending_action(&action).unwrap();
         assert!(preview.text.contains("to@example.invalid"));
         assert!(preview.text.contains("from@example.invalid"));
-        for field in ["origin", "email_id", "blob_id", "identity_id", "mail_from", "draft_mailbox_id", "sent_mailbox_id"] {
+        assert!(preview.text.contains("native-1"));
+        let mut missing = input.clone();
+        missing["change"].as_object_mut().unwrap().remove("remote_account");
+        assert!(validate_live_write_action(&isyncyou_agent::parse_action(&missing).unwrap()).is_err());
+        for field in ["origin", "remote_account", "email_id", "blob_id", "identity_id", "mail_from", "draft_mailbox_id", "sent_mailbox_id"] {
             let mut changed = input.clone();
             changed["change"][field] = json!("changed");
             let changed = isyncyou_agent::parse_action(&changed).unwrap();

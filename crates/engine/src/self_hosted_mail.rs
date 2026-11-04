@@ -1159,6 +1159,7 @@ fn sync_inner(
 /// bind its owner/session/expiry approval to all fields before invoking send.
 pub struct ApprovedSubmission {
     pub operation_id: String,
+    pub remote_account: String,
     pub email_id: String,
     pub blob_id: String,
     pub identity_id: String,
@@ -1679,6 +1680,9 @@ pub fn send_approved(
         value.is_empty() || value.len() > 320 || value.contains('\r') || value.contains('\n')
     };
     if approved.operation_id.is_empty()
+        || approved.remote_account.is_empty()
+        || approved.remote_account.len() > 256
+        || approved.remote_account.chars().any(char::is_control)
         || approved.email_id.is_empty()
         || approved.blob_id.is_empty()
         || approved.identity_id.is_empty()
@@ -1696,6 +1700,7 @@ pub fn send_approved(
         return Err("Incomplete approved submission".into());
     }
     let scope = scope(cfg, account, provider)?;
+    with_approved_submission_scope(&approved.remote_account, &scope, || {
     let client = &provider.client;
     let intent = serde_json::to_string(&serde_json::json!({"account":account,"origin":scope.origin,"remote_account":scope.collection,"email_id":approved.email_id,"blob_id":approved.blob_id,"identity_id":approved.identity_id,"mail_from":approved.mail_from,"recipients":approved.recipients,"draft_mailbox_id":approved.draft_mailbox_id,"sent_mailbox_id":approved.sent_mailbox_id})).map_err(|_| "Invalid submission")?;
     let digest = format!("{:x}", Sha256::digest(intent.as_bytes()));
@@ -1844,5 +1849,28 @@ pub fn send_approved(
             Ok(SendOutcome::Rejected)
         }
         Err(_) => Ok(SendOutcome::Unknown),
+    }
+    })
+}
+
+fn with_approved_submission_scope<T>(approved: &str, scope: &ProviderScope, dispatch: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    if approved != scope.collection { return Err("Approved native account changed".into()); }
+    dispatch()
+}
+
+#[cfg(test)]
+mod submission_account_binding_tests {
+    use super::*;
+
+    #[test]
+    fn changed_primary_account_at_same_origin_is_rejected() {
+        let mut scope = ProviderScope { account_id: "local".into(), origin: "https://example.invalid".into(), service: "mail".into(), collection: "primary-before".into() };
+        let mut claims = 0;
+        let mut submissions = 0;
+        assert!(with_approved_submission_scope("primary-before", &scope, || { claims += 1; submissions += 1; Ok(()) }).is_ok());
+        assert_eq!((claims, submissions), (1, 1));
+        scope.collection = "primary-after".into();
+        assert_eq!(with_approved_submission_scope("primary-before", &scope, || { claims += 1; submissions += 1; Ok(()) }).unwrap_err(), "Approved native account changed");
+        assert_eq!((claims, submissions), (1, 1));
     }
 }

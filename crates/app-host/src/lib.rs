@@ -12521,7 +12521,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 return Err("provider_preview_unavailable".into());
             }
             let action = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":"mail", "change":{
-                "verb":"send_approved", "origin":prepared.origin, "email_id":prepared.email_id, "blob_id":prepared.blob_id,
+                "verb":"send_approved", "origin":prepared.origin, "remote_account":prepared.remote_account, "email_id":prepared.email_id, "blob_id":prepared.blob_id,
                 "identity_id":prepared.identity_id, "mail_from":prepared.mail_from, "recipients":prepared.recipients,
                 "draft_mailbox_id":prepared.draft_mailbox_id, "sent_mailbox_id":prepared.sent_mailbox_id
             }})).map_err(|_| "confirmation_unavailable")?;

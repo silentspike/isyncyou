@@ -2205,6 +2205,10 @@ function openCompose(opts = {}) {
   setTimeout(() => ((o.to && o.to.length) ? bodyEl : toIn).focus(), 60);
 }
 
+function splitEmails(value) {
+  return String(value || "").split(/[;,]/).map(address => address.trim()).filter(Boolean);
+}
+
 async function prepareExistingProviderDraft(account, draftId, identityId = null) {
   if (App.account !== account) throw new Error("Account changed");
   if (!identityId) identityId = await chooseProviderIdentity(await providerComposerIdentities(account));
@@ -2284,11 +2288,13 @@ async function composeSubmit(btn, asDraft) {
     try {
       await ensureAgentSession();
       if (App.account !== sendingAccount) throw new Error("Account changed");
+      const recipients = splitEmails(to), ccRecipients = splitEmails(cc), bccRecipients = splitEmails(bcc);
+      const draftBody = new TextEncoder().encode(body);
       draftStarted = true;
       const draft = await stageMutation("mail_body", {
-        account: sendingAccount, operation: "draft", target: "", recipients: splitEmails(to), cc: splitEmails(cc), bcc: splitEmails(bcc), subject,
+        account: sendingAccount, operation: "draft", target: "", recipients, cc: ccRecipients, bcc: bccRecipients, subject,
         importance: importance !== "normal" ? importance : null, read_receipt: rr, identity_id: identityId, all: false,
-      }, new TextEncoder().encode(body));
+      }, draftBody);
       if (!draft || !draft.draft_id) throw new Error("Draft result unavailable");
       draftCreated = true;
       await prepareExistingProviderDraft(sendingAccount, draft.draft_id, identityId);
