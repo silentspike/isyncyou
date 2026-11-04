@@ -578,6 +578,136 @@ fn bind_model_contact_photo(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
 ))]
+fn prepare_single_capture_action(
+    cfg: &Config,
+    control: &agent_control_store::AgentControlStore,
+    account: &str,
+    service: &str,
+    collection: &str,
+    href: &str,
+) -> Result<(isyncyou_agent::ToolAction, String, String, String), String> {
+    if account.is_empty()
+        || href.is_empty()
+        || !matches!(service, "calendar" | "contacts" | "mail")
+        || (service != "mail" && collection.is_empty())
+    {
+        return Err("capture_prepare_unavailable".into());
+    }
+    let entry = match service {
+        "mail" => "mail",
+        "contacts" => "/.well-known/carddav",
+        _ => "/.well-known/caldav",
+    };
+    let operation_id = uuid_v4()?;
+    let confirmation = uuid_v4()?;
+    let (intent, prepared_subject) =
+        isyncyou_engine::provider_auth::with_platform_credential_store(
+            cfg,
+            account,
+            |credentials| {
+                isyncyou_engine::self_hosted_mail_restore::prepare_single_capture_with_identity(
+                    cfg,
+                    account,
+                    entry,
+                    collection,
+                    service,
+                    href,
+                    &operation_id,
+                    &confirmation,
+                    credentials,
+                )
+            },
+        )?;
+    if intent.mode != "fresh" {
+        return Err("capture_mode_unavailable".into());
+    }
+    let signer =
+        isyncyou_engine::self_hosted_mail_restore::load_registered_recovery_signer(cfg, account)?;
+    let origin = intent.origin.clone();
+    let protected = serde_json::json!({"purpose":"single_capture","device":signer.device_id(),"subject":prepared_subject,"intent":intent});
+    let expires = unix_now_ms()
+        .checked_add(AGENT_CONFIRM_TTL_MS)
+        .ok_or("confirmation_unavailable")?;
+    let digest =
+        isyncyou_engine::provider_auth::with_locked_provider_subject(cfg, account, |subject| {
+            let subject = subject.ok_or("provider_login_required")?;
+            if subject != prepared_subject {
+                return Err("provider_identity_changed".into());
+            }
+            control.store_recovery_request(
+                &operation_id,
+                account,
+                &origin,
+                subject,
+                &protected,
+                expires,
+                unix_now_ms(),
+            )
+        })?;
+    let action = isyncyou_agent::ToolAction::LiveWrite {
+        account: account.into(),
+        service: "calendar".into(),
+        target: None,
+        change: serde_json::json!({"verb":"single_capture","operation_id":operation_id,"request_sha256":digest,"intent":intent}),
+    };
+    Ok((action, operation_id, digest, origin))
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+fn bind_model_single_capture(
+    cfg: &Config,
+    control: Option<&agent_control_store::AgentControlStore>,
+    action: isyncyou_agent::ToolAction,
+) -> Result<isyncyou_agent::ToolAction, String> {
+    let isyncyou_agent::ToolAction::LiveWrite {
+        account,
+        service,
+        target,
+        change,
+    } = &action
+    else {
+        return Ok(action);
+    };
+    if change.get("verb").and_then(serde_json::Value::as_str) != Some("single_capture") {
+        return Ok(action);
+    }
+    let fields = change.as_object().ok_or("capture_prepare_unavailable")?;
+    if !matches!(service.as_str(), "calendar" | "contacts" | "mail") {
+        return Err("capture_prepare_unavailable".into());
+    }
+    if fields
+        .keys()
+        .any(|key| key != "verb" && key != "collection")
+    {
+        return Err("capture_prepare_unavailable".into());
+    }
+    let collection = match change.get("collection") {
+        Some(value) => value.as_str().ok_or("capture_prepare_unavailable")?,
+        None if service == "mail" => "",
+        None => return Err("capture_prepare_unavailable".into()),
+    };
+    let href = target
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or("capture_prepare_unavailable")?;
+    Ok(prepare_single_capture_action(
+        cfg,
+        control.ok_or("confirmation_unavailable")?,
+        account,
+        service,
+        collection,
+        href,
+    )?
+    .0)
+}
+
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
 fn bind_model_recovery_jobs(
     cfg: &Config,
     control: Option<&agent_control_store::AgentControlStore>,
@@ -703,7 +833,7 @@ fn bind_model_recovery_pending(
         .unwrap_or("");
     if !matches!(
         verb,
-        "recovery_jobs" | "recovery_batch_import" | "contact_set_photo"
+        "recovery_jobs" | "recovery_batch_import" | "contact_set_photo" | "single_capture"
     ) {
         return Ok(());
     }
@@ -718,23 +848,41 @@ fn bind_model_recovery_pending(
     let batch = change
         .get(if verb == "contact_set_photo" {
             "stage_id"
+        } else if verb == "single_capture" {
+            "operation_id"
         } else {
             "batch_id"
         })
         .and_then(serde_json::Value::as_str)
         .ok_or("recovery_request_invalid")?;
     let digest = change
-        .get(if matches!(verb, "recovery_jobs" | "contact_set_photo") {
-            "request_sha256"
-        } else {
-            "manifest_sha256"
-        })
+        .get(
+            if matches!(
+                verb,
+                "recovery_jobs" | "contact_set_photo" | "single_capture"
+            ) {
+                "request_sha256"
+            } else {
+                "manifest_sha256"
+            },
+        )
         .and_then(serde_json::Value::as_str)
         .ok_or("recovery_request_invalid")?;
+    if verb == "single_capture"
+        && change
+            .pointer("/intent/origin")
+            .and_then(serde_json::Value::as_str)
+            != Some(origin.as_str())
+    {
+        return Err("provider_origin_mismatch".into());
+    }
     let control = control.ok_or("confirmation_unavailable")?;
     isyncyou_engine::provider_auth::with_locked_provider_subject(cfg, account, |subject| {
         let subject = subject.ok_or("provider_login_required")?;
-        if matches!(verb, "recovery_jobs" | "contact_set_photo") {
+        if matches!(
+            verb,
+            "recovery_jobs" | "contact_set_photo" | "single_capture"
+        ) {
             control.bind_recovery_request(
                 batch,
                 account,
@@ -5524,6 +5672,8 @@ impl DaemonAgent {
                 if stored.get("purpose").and_then(serde_json::Value::as_str)
                     != Some("single_capture")
                     || stored.get("intent") != Some(value)
+                    || stored.get("subject").and_then(serde_json::Value::as_str)
+                        != Some(subject.as_str())
                     || stored.get("device").and_then(serde_json::Value::as_str)
                         != Some(signer.device_id())
                 {
@@ -5559,12 +5709,13 @@ impl DaemonAgent {
                     cfg,
                     account,
                     |credentials| {
-                        isyncyou_engine::self_hosted_mail_restore::execute_single_capture_with_phase(
+                        isyncyou_engine::self_hosted_mail_restore::execute_single_capture_with_identity_phase(
                             cfg,
                             &intent,
                             &intent.approval_sha256,
                             signer.as_ref(),
                             credentials,
+                            &subject,
                             &mut phase,
                         )
                     },
@@ -12760,6 +12911,10 @@ impl DaemonAgent {
                     Ok(isyncyou_agent::TurnOutcome::PendingConfirmation { action, .. }) => {
                         let (action, preview) = match (if action.account() != account_id.as_str() {
                             Err("account_mismatch".into())
+                        } else if matches!(&*action, isyncyou_agent::ToolAction::LiveWrite { change, .. } if change.get("verb").and_then(serde_json::Value::as_str) == Some("single_capture"))
+                            && (hot_request_binding.is_none() || !pending.is_persistent())
+                        {
+                            Err("confirmation_unavailable".into())
                         } else {
                             with_current_recovery_config(
                                 &recovery_config_path,
@@ -12771,6 +12926,13 @@ impl DaemonAgent {
                                         *action,
                                     )
                                 },
+                            )
+                        })
+                        .and_then(|action| {
+                            with_current_recovery_config(
+                                &recovery_config_path,
+                                &executor_cfg,
+                                |cfg| bind_model_single_capture(cfg, recovery_control.as_deref(), action),
                             )
                         })
                         .and_then(|action| {
@@ -14340,67 +14502,18 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 if registry.account_for(&request.session_id)? != request.account {
                     return Err("session_account_mismatch".into());
                 }
-                let entry = match request.service.as_str() {
-                    "mail" => "mail",
-                    "contacts" => "/.well-known/carddav",
-                    _ => "/.well-known/caldav",
-                };
-                let op_id = uuid_v4()?;
-                let confirmation = uuid_v4()?;
-                let intent = isyncyou_engine::provider_auth::with_platform_credential_store(
-                    cfg,
-                    &request.account,
-                    |credentials| {
-                        isyncyou_engine::self_hosted_mail_restore::prepare_single_capture_with_store(
-                            cfg,
-                            &request.account,
-                            entry,
-                            &request.collection,
-                            &request.service,
-                            &request.href,
-                            &op_id,
-                            &confirmation,
-                            credentials,
-                        )
-                    },
-                )?;
-                if intent.mode != "fresh" {
-                    return Err("capture_mode_unavailable".into());
-                }
-                let signer =
-                    isyncyou_engine::self_hosted_mail_restore::load_registered_recovery_signer(
-                        cfg,
-                        &request.account,
-                    )?;
                 let control = self
                     .control_store
                     .as_ref()
                     .ok_or("confirmation_unavailable")?;
-                let protected = serde_json::json!({"purpose":"single_capture","device":signer.device_id(),"intent":intent});
-                let expires = unix_now_ms()
-                    .checked_add(AGENT_CONFIRM_TTL_MS)
-                    .ok_or("confirmation_unavailable")?;
-                let digest = isyncyou_engine::provider_auth::with_locked_provider_subject(
+                let (action, op_id, digest, origin) = prepare_single_capture_action(
                     cfg,
+                    control,
                     &request.account,
-                    |subject| {
-                        control.store_recovery_request(
-                            &op_id,
-                            &request.account,
-                            &intent.origin,
-                            subject.ok_or("provider_login_required")?,
-                            &protected,
-                            expires,
-                            unix_now_ms(),
-                        )
-                    },
+                    &request.service,
+                    &request.collection,
+                    &request.href,
                 )?;
-                let action = isyncyou_agent::ToolAction::LiveWrite {
-                    account: request.account.clone(),
-                    service: "calendar".into(),
-                    target: None,
-                    change: serde_json::json!({"verb":"single_capture","operation_id":op_id,"request_sha256":digest,"intent":intent}),
-                };
                 let preview = agent_ops::single_capture_preview(&action)?.text;
                 let turn_id = turn_id_from_request_id(&request.request_id)?;
                 let owner = isyncyou_agent::PendingOwnerBinding {
@@ -14427,7 +14540,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                             control.bind_recovery_request(
                                 &op_id,
                                 &request.account,
-                                &intent.origin,
+                                &origin,
                                 subject.ok_or("provider_login_required")?,
                                 &digest,
                                 &pending.id,
@@ -17929,7 +18042,11 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     }
                     Ok(isyncyou_agent::TurnOutcome::PendingConfirmation { action, .. }) => {
                         let (action, preview) =
-                            match agent_ops::bind_provider_contact_name(&executor_cfg, *action)
+                            match (if matches!(&*action, isyncyou_agent::ToolAction::LiveWrite { change, .. } if change.get("verb").and_then(serde_json::Value::as_str) == Some("single_capture")) {
+                                Err("confirmation_unavailable".into())
+                            } else {
+                                agent_ops::bind_provider_contact_name(&executor_cfg, *action)
+                            })
                                 .and_then(|action| {
                                     agent_ops::bind_provider_contact_field(&executor_cfg, action)
                                 })
@@ -24758,6 +24875,52 @@ mod tests {
         feature = "agent-oauth-providers",
         feature = "agent-subscription-experimental"
     ))]
+    #[test]
+    fn model_single_capture_rejects_forged_authority_before_preparation() {
+        let make = |service: &str, target: Option<&str>, change: serde_json::Value| {
+            isyncyou_agent::ToolAction::LiveWrite {
+                account: "test-account".into(),
+                service: service.into(),
+                target: target.map(str::to_owned),
+                change,
+            }
+        };
+        let cfg = Config::default();
+        let selected = make(
+            "calendar",
+            Some("/calendar/item.ics"),
+            serde_json::json!({
+                "verb":"single_capture", "collection":"/calendar/"
+            }),
+        );
+        assert!(
+            matches!(bind_model_single_capture(&cfg, None, selected), Err(e) if e == "confirmation_unavailable")
+        );
+        for key in [
+            "intent",
+            "operation_id",
+            "request_sha256",
+            "origin",
+            "confirmation",
+        ] {
+            let mut change =
+                serde_json::json!({"verb":"single_capture", "collection":"/calendar/"});
+            change[key] = serde_json::json!("model-controlled");
+            assert!(
+                matches!(bind_model_single_capture(&cfg, None, make("calendar", Some("/calendar/item.ics"), change)), Err(e) if e == "capture_prepare_unavailable")
+            );
+        }
+        assert!(
+            matches!(bind_model_single_capture(&cfg, None, make("onedrive", Some("/file"), serde_json::json!({"verb":"single_capture", "collection":"/"}))), Err(e) if e == "capture_prepare_unavailable")
+        );
+        assert!(
+            matches!(bind_model_single_capture(&cfg, None, make("calendar", None, serde_json::json!({"verb":"single_capture", "collection":"/calendar/"}))), Err(e) if e == "capture_prepare_unavailable")
+        );
+        assert!(
+            matches!(bind_model_single_capture(&cfg, None, make("calendar", Some("/calendar/item.ics"), serde_json::json!({"verb":"single_capture"}))), Err(e) if e == "capture_prepare_unavailable")
+        );
+    }
+
     #[test]
     fn single_capture_confirm_routes_once_after_real_pending_revalidation() {
         let order = Arc::new(StdMutex::new(Vec::new()));

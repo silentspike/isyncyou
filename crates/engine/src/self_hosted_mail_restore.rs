@@ -1261,6 +1261,65 @@ pub fn prepare_single_capture_with_store(
     confirmation: &str,
     credentials: &dyn ProviderCredentialStore,
 ) -> Result<ApprovedSingleCapture, String> {
+    prepare_single_capture_inner(
+        cfg,
+        account,
+        entry,
+        collection,
+        service,
+        href,
+        operation_id,
+        confirmation,
+        credentials,
+        false,
+    )
+    .map(|(capture, _)| capture)
+}
+
+/// Prepare a capture and return the verified subject from the same token lock.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_single_capture_with_identity(
+    cfg: &Config,
+    account: &str,
+    entry: &str,
+    collection: &str,
+    service: &str,
+    href: &str,
+    operation_id: &str,
+    confirmation: &str,
+    credentials: &dyn ProviderCredentialStore,
+) -> Result<(ApprovedSingleCapture, String), String> {
+    let (capture, subject) = prepare_single_capture_inner(
+        cfg,
+        account,
+        entry,
+        collection,
+        service,
+        href,
+        operation_id,
+        confirmation,
+        credentials,
+        true,
+    )?;
+    Ok((
+        capture,
+        subject.ok_or("capture_preflight_identity_changed")?,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_single_capture_inner(
+    cfg: &Config,
+    account: &str,
+    entry: &str,
+    collection: &str,
+    service: &str,
+    href: &str,
+    operation_id: &str,
+    confirmation: &str,
+    credentials: &dyn ProviderCredentialStore,
+    identity_required: bool,
+) -> Result<(ApprovedSingleCapture, Option<String>), String> {
     if !matches!(service, "calendar" | "contacts" | "mail")
         || operation_id.is_empty()
         || operation_id.len() > 128
@@ -1278,7 +1337,7 @@ pub fn prepare_single_capture_with_store(
         _ => return Err("Capture account unavailable".into()),
     };
     let store = crate::provider_store::open(cfg, account)?;
-    crate::provider_auth::with_locked_provider_access_token(cfg, account, credentials, |token| {
+    let prepare = |token: &str| -> Result<ApprovedSingleCapture, String> {
         let mut op = ApprovedSingleCapture {
             account_id: account.into(),
             origin,
@@ -1312,29 +1371,87 @@ pub fn prepare_single_capture_with_store(
         op.title = title;
         op.approval_sha256 = single_capture_approval(&op);
         Ok(op)
-    })
+    };
+    if identity_required {
+        crate::provider_auth::with_locked_provider_identity(
+            cfg,
+            account,
+            credentials,
+            |token, subject| Ok((prepare(token)?, Some(subject.to_owned()))),
+        )
+    } else {
+        crate::provider_auth::with_locked_provider_access_token(
+            cfg,
+            account,
+            credentials,
+            |token| Ok((prepare(token)?, None)),
+        )
+    }
 }
 
+/// Legacy signature retained for compatibility; a subject-bound approval is required.
 pub fn execute_single_capture_with_store(
-    cfg: &Config,
-    op: &ApprovedSingleCapture,
-    approved_digest: &str,
-    signer: &dyn RecoveryDeviceSigner,
-    credentials: &dyn ProviderCredentialStore,
+    _cfg: &Config,
+    _op: &ApprovedSingleCapture,
+    _approved_digest: &str,
+    _signer: &dyn RecoveryDeviceSigner,
+    _credentials: &dyn ProviderCredentialStore,
 ) -> Result<SingleCaptureOutcome, String> {
-    execute_single_capture_with_phase(cfg, op, approved_digest, signer, credentials, &mut |_| {
-        Ok(())
-    })
+    Err("capture_identity_binding_required".into())
 }
 
-/// Persist fixed operational phases in the caller's protected request journal.
-/// No callback after the durable provider claim may turn uncertainty into failure.
+/// Legacy signature retained for compatibility; it cannot dispatch without a
+/// subject-bound approval. Use `execute_single_capture_with_identity_phase`.
 pub fn execute_single_capture_with_phase(
+    _cfg: &Config,
+    _op: &ApprovedSingleCapture,
+    _approved_digest: &str,
+    _signer: &dyn RecoveryDeviceSigner,
+    _credentials: &dyn ProviderCredentialStore,
+    _phase: &mut dyn FnMut(&str) -> Result<(), String>,
+) -> Result<SingleCaptureOutcome, String> {
+    Err("capture_identity_binding_required".into())
+}
+
+/// Execute only while the current locked identity matches the prepared subject.
+pub fn execute_single_capture_with_identity_phase(
     cfg: &Config,
     op: &ApprovedSingleCapture,
     approved_digest: &str,
     signer: &dyn RecoveryDeviceSigner,
     credentials: &dyn ProviderCredentialStore,
+    expected_subject: &str,
+    phase: &mut dyn FnMut(&str) -> Result<(), String>,
+) -> Result<SingleCaptureOutcome, String> {
+    if expected_subject.is_empty() {
+        return Err("capture_preflight_unverified".into());
+    }
+    execute_single_capture_inner(
+        cfg,
+        op,
+        approved_digest,
+        signer,
+        credentials,
+        expected_subject,
+        phase,
+    )
+}
+
+fn require_capture_subject(expected: &str, current: &str) -> Result<(), String> {
+    if current.is_empty() || expected != current {
+        return Err("capture_preflight_identity_changed".into());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_single_capture_inner(
+    cfg: &Config,
+    op: &ApprovedSingleCapture,
+    approved_digest: &str,
+    signer: &dyn RecoveryDeviceSigner,
+    credentials: &dyn ProviderCredentialStore,
+    expected_subject: &str,
     phase: &mut dyn FnMut(&str) -> Result<(), String>,
 ) -> Result<SingleCaptureOutcome, String> {
     if approved_digest != op.approval_sha256 || validate_single_capture_approval(op).is_err() {
@@ -1346,11 +1463,12 @@ pub fn execute_single_capture_with_phase(
     }
     let store = crate::provider_store::open(cfg, &op.account_id)
         .map_err(|_| "capture_preflight_unverified")?;
-    crate::provider_auth::with_locked_provider_access_token(
+    crate::provider_auth::with_locked_provider_identity(
         cfg,
         &op.account_id,
         credentials,
-        |token| {
+        |token, subject| {
+            require_capture_subject(expected_subject, subject)?;
             let broker = RecoveryBroker::connect_with_token(cfg, &op.account_id, token)
                 .map_err(|_| "capture_preflight_unverified")?;
             if broker.native_account != op.native_account {
@@ -3962,6 +4080,138 @@ fn execute_inner(
 mod tests {
     use super::*;
     use std::cell::Cell;
+    #[test]
+    fn capture_subject_is_checked_inside_token_lock_before_effects() {
+        use crate::provider_credential::ProviderCredential;
+        use std::{collections::HashMap, path::PathBuf, sync::Mutex};
+        struct Keys(Mutex<HashMap<(String, String), ProviderCredential>>);
+        impl ProviderCredentialStore for Keys {
+            fn load(
+                &self,
+                account: &str,
+                origin: &str,
+            ) -> Result<Option<ProviderCredential>, String> {
+                Ok(self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .get(&(account.into(), origin.into()))
+                    .cloned())
+            }
+            fn replace(
+                &self,
+                account: &str,
+                origin: &str,
+                value: &ProviderCredential,
+            ) -> Result<(), String> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .insert((account.into(), origin.into()), value.clone());
+                Ok(())
+            }
+            fn delete(&self, account: &str, origin: &str) -> Result<(), String> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .remove(&(account.into(), origin.into()));
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.accounts.push(isyncyou_core::AccountConfig {
+            id: "a".into(),
+            username: "test".into(),
+            sync_root: PathBuf::new(),
+            archive_root: dir.path().into(),
+            cache_root: PathBuf::new(),
+            mount_point: None,
+        });
+        cfg.provider_accounts.insert(
+            "a".into(),
+            ProviderConfig::SelfHosted {
+                origin: "https://example.test".into(),
+                client_id: "client".into(),
+            },
+        );
+        let keys = Keys(Mutex::new(HashMap::new()));
+        let value = ProviderCredential {
+            access_token: "fixture".into(),
+            refresh_token: Some("fixture-refresh".into()),
+            expires_at: u64::MAX,
+            subject: Some("current-subject".into()),
+        };
+        keys.replace("a", "https://example.test", &value).unwrap();
+        keys.replace(
+            &format!("isyncyou-internal:subject:{:x}", Sha256::digest(b"a")),
+            "https://example.test",
+            &value,
+        )
+        .unwrap();
+        let effects = Cell::new(0);
+        let result =
+            crate::provider_auth::with_locked_provider_identity(&cfg, "a", &keys, |_, subject| {
+                require_capture_subject("previous-subject", subject)?;
+                effects.set(effects.get() + 1);
+                Ok(())
+            });
+        assert_eq!(result.unwrap_err(), "capture_preflight_identity_changed");
+        assert_eq!(effects.get(), 0);
+        crate::provider_auth::with_locked_provider_identity(&cfg, "a", &keys, |_, subject| {
+            require_capture_subject("current-subject", subject)?;
+            effects.set(effects.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(effects.get(), 1);
+        let without_refresh = ProviderCredential {
+            refresh_token: None,
+            ..value.clone()
+        };
+        keys.replace("a", "https://example.test", &without_refresh)
+            .unwrap();
+        assert!(
+            crate::provider_auth::with_locked_provider_access_token(&cfg, "a", &keys, |_| Ok(()))
+                .is_ok()
+        );
+        assert!(
+            crate::provider_auth::with_locked_provider_identity(&cfg, "a", &keys, |_, _| Ok(()))
+                .is_err()
+        );
+        struct NoSigner;
+        impl RecoveryDeviceSigner for NoSigner {
+            fn device_id(&self) -> &str {
+                panic!("legacy path must not use signer")
+            }
+            fn sign(&self, _: &[u8]) -> Result<String, String> {
+                panic!("legacy path must not sign")
+            }
+        }
+        let op = ApprovedSingleCapture {
+            account_id: String::new(),
+            origin: String::new(),
+            entry: String::new(),
+            service: String::new(),
+            collection: String::new(),
+            href: String::new(),
+            native_account: String::new(),
+            object: String::new(),
+            version: String::new(),
+            operation_id: String::new(),
+            kind: String::new(),
+            title: String::new(),
+            mode: String::new(),
+            confirmation: String::new(),
+            approval_sha256: String::new(),
+        };
+        assert!(
+            matches!(execute_single_capture_with_store(&cfg,&op,"",&NoSigner,&keys),Err(ref e) if e == "capture_identity_binding_required")
+        );
+        assert!(
+            matches!(execute_single_capture_with_phase(&cfg,&op,"",&NoSigner,&keys,&mut |_| panic!("legacy phase must not run")),Err(ref e) if e == "capture_identity_binding_required")
+        );
+    }
     #[test]
     fn selected_capture_approval_binds_visible_effect_and_version() {
         let mut op = ApprovedSingleCapture {
