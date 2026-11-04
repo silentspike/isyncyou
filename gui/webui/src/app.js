@@ -1061,7 +1061,7 @@ function svcFilters(service) {
   if (service === "mail") return [
     { sec: (App.accounts || []).some(a => a.id === App.account && a.provider === "self_hosted") ? "Mailbox · current page" : "Mailbox" },
     { key: "all", label: "All messages", icon: "inbox", count: m => m.length },
-    { key: "attach", label: "With attachments", icon: "paperclip", count: m => m.filter(it => (it.preview || {}).attachments > 0).length },
+    { key: "attach", label: Mail.all.some(it => (it.preview || {}).attachment_presence_unknown) ? "Attachments or unknown" : "With attachments", icon: "paperclip", count: m => m.filter(it => (it.preview || {}).attachments > 0 || (it.preview || {}).attachment_presence_unknown).length },
     { key: "restore", label: (MOBILE ? "Has content" : "Restore-ready"), icon: "rotate-ccw", count: m => m.filter(it => it.has_body).length },
     ...(Mail.folders && Mail.folders.length ? [{ sec: "Folders" }, ...mailFolderSpecs()] : []),
     { sec: "Status" },
@@ -1964,7 +1964,7 @@ async function renderMailView(view) {
   if (liveRequest) void liveRequest.then(applyLive);
   try {
     const activity = api("/api/v1/activity?" + qs({ account, limit: 30 })).catch(() => ({ runs: [] }));
-    const d = await api("/api/v1/items?" + qs({ account, service: "mail", limit: providerMail ? 50 : 1000, ...(scope ? {mail_scope:scope} : {}), ...(primaryCacheOnly ? {primary_cache_only:"1"} : {}) }));
+    const d = await api("/api/v1/items?" + qs({ account, service: "mail", limit: providerMail ? 50 : 1000, ...(scope ? {mail_scope:scope} : {}), ...(primaryCacheOnly ? {primary_cache_only:"1"} : {}), ...(!providerMail ? {metadata_only:"1"} : {}) }));
     if (!current()) return;
     const liveAlready = Mail.livePage;
     const scopeSelect = $("#mail-scope");
@@ -2126,7 +2126,7 @@ async function mailLiveUpdate() {
   const account = App.account, scope = Mail.activeScope, generation = Mail.viewGeneration, pageRequest = Mail.pageRequest, pageCursor = Mail.pageCursor;
   let d;
   const providerMail = (App.accounts || []).some(a => a.id === account && a.provider === "self_hosted");
-  try { d = await api("/api/v1/items?" + qs(Mail.livePage ? {account,service:"mail",live_metadata:"1",limit:50,mail_scope:scope,position:pageCursor,...(Mail.liveQuery ? {text:Mail.liveQuery} : {}),...(Mail.mailboxId ? {mailbox_id:Mail.mailboxId} : {}),...(pageCursor ? {query_state:Mail.queryState} : {})} : { account, service: "mail", limit: providerMail ? 50 : 1000, ...(scope ? {mail_scope:scope} : {}), ...(!scope && providerMail ? {primary_cache_only:"1"} : {}), ...(pageCursor ? {after:pageCursor} : {}) })); }
+  try { d = await api("/api/v1/items?" + qs(Mail.livePage ? {account,service:"mail",live_metadata:"1",limit:50,mail_scope:scope,position:pageCursor,...(Mail.liveQuery ? {text:Mail.liveQuery} : {}),...(Mail.mailboxId ? {mailbox_id:Mail.mailboxId} : {}),...(pageCursor ? {query_state:Mail.queryState} : {})} : { account, service: "mail", limit: providerMail ? 50 : 1000, ...(scope ? {mail_scope:scope} : {}), ...(!scope && providerMail ? {primary_cache_only:"1"} : {}), ...(!providerMail ? {metadata_only:"1"} : {}), ...(pageCursor ? {after:pageCursor} : {}) })); }
   catch (_) { if (App.account === account && Mail.activeScope === scope && Mail.viewGeneration === generation && Mail.pageCursor === pageCursor && Mail.pageRequest === pageRequest && scope) { Mail.all = []; Mail.folders = []; Mail.selected = null; renderMailReader(null); mailRender(); } return; }
   if (App.account !== account || Mail.activeScope !== scope || Mail.viewGeneration !== generation || Mail.pageCursor !== pageCursor || Mail.pageRequest !== pageRequest) return;
   if (Mail.livePage && !pageCursor) Mail.queryState = d.query_state;
@@ -2161,11 +2161,12 @@ function fillMetrics(row, cards) {
 }
 function mailRenderMetrics() {
   const withAtt = Mail.all.filter(it => (it.preview || {}).attachments > 0).length;
+  const unknownAtt = Mail.all.filter(it => (it.preview || {}).attachment_presence_unknown).length;
   const restore = Mail.all.filter(it => it.has_body).length;
   const providerMail = (App.accounts || []).some(a => a.id === App.account && a.provider === "self_hosted");
   fillMetrics($("#mail-metrics-row"), [
     { icon: "inbox", value: Mail.all.length, label: providerMail ? "Messages on this page" : "Total messages", sub: "in this mailbox" },
-    { icon: "paperclip", value: withAtt, label: "With attachments", sub: `${withAtt} of ${Mail.all.length}` },
+    { icon: "paperclip", value: withAtt, label: "With attachments", sub: unknownAtt ? `${unknownAtt} unknown` : `${withAtt} of ${Mail.all.length}` },
     { icon: "rotate-ccw", value: restore, label: (MOBILE ? "Has content" : "Restore-ready"), sub: `${restore} with full body`, tone: "ok" },
     integrityMetric(Mail.all),
     lastActivityMetric(Mail.runs),
@@ -2174,7 +2175,7 @@ function mailRenderMetrics() {
 function mailFiltered() {
   let rows = Mail.all;
   const f = svcFilter("mail");
-  if (f === "attach") rows = rows.filter(it => (it.preview || {}).attachments > 0);
+  if (f === "attach") rows = rows.filter(it => (it.preview || {}).attachments > 0 || (it.preview || {}).attachment_presence_unknown);
   else if (f === "restore") rows = rows.filter(it => it.has_body);
   else if (STATE_KEYS.has(f)) rows = rows.filter(it => stateKey(it) === f);
   else if (f === "unread") rows = rows.filter(it => (it.preview || {}).isRead === false);
@@ -2251,6 +2252,7 @@ function mailRow(it, threadCount = 1) {
   const badges = el("div", { class: "mi-badges" });
   if (threadCount > 1) badges.append(el("span", { class: "mi-chip mi-thread", title: threadCount + " messages in this conversation" }, icon("mail-open", "icon-sm"), String(threadCount)));
   if (p.attachments > 0) badges.append(el("span", { class: "mi-chip", title: p.attachments + " attachment(s)" }, icon("paperclip", "icon-sm"), String(p.attachments)));
+  else if (p.attachment_presence_unknown) badges.append(el("span", { class: "mi-chip", title: "Attachment presence unknown" }, icon("paperclip", "icon-sm"), "?"));
   categoryChips(it).forEach(c => badges.append(c));
   const ownProvider = (App.accounts || []).some(a => a.id === App.account && a.provider === "self_hosted");
   if (!it.shared && CAP.mailwrite && (!ownProvider || CAP.agent)) {

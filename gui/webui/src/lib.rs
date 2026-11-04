@@ -11549,6 +11549,19 @@ impl Router {
             Some(s) => s,
             None => return ApiResponse::error(400, "missing 'service'"),
         };
+        let metadata_only = match req.q("metadata_only") {
+            None => false,
+            Some("1")
+                if service == "mail"
+                    && req.q("parent").is_none()
+                    && req
+                        .q("account")
+                        .is_some_and(|account| self.provider_origin(account).is_none()) =>
+            {
+                true
+            }
+            Some(_) => return ApiResponse::error(400, "invalid_metadata_request"),
+        };
         if req.q("primary_cache_only").is_some()
             && (service != "mail"
                 || req
@@ -11798,6 +11811,7 @@ impl Router {
                 .map_err(|_| ApiResponse::error(500, "store_query_failed"))?;
             Ok((total, items))
         };
+        let tuple_started = std::time::Instant::now();
         let (total, items) = match if use_cached_page {
             self.with_archive_reader_result(account, read_page)
         } else {
@@ -11810,8 +11824,14 @@ impl Router {
             Ok(result) => result,
             Err(error) => return error,
         };
+        let tuple_ms = tuple_started.elapsed().as_millis();
         match Ok::<_, ApiResponse>(items) {
             Ok(items) => {
+                let projection_started = std::time::Instant::now();
+                let mut preview_hits = 0usize;
+                let mut preview_misses = 0usize;
+                let mut disk_parses = 0usize;
+                let mut disk_parse_ms = 0u128;
                 let strict_body_acc = (service == "onedrive"
                     && isyncyou_core::envelope::body_envelope_required_for_process())
                 .then(|| self.config.accounts.iter().find(|a| a.id == account))
@@ -11872,12 +11892,25 @@ impl Router {
                                     .and_then(|s| serde_json::from_str::<Value>(s).ok())
                                     .map(|pv| v["preview"] = pv)
                                     .is_some();
+                            if service == "mail" {
+                                if cached {
+                                    preview_hits += 1;
+                                } else {
+                                    preview_misses += 1;
+                                }
+                            }
                             if !cached {
                                 if let (Some(root), Some(rel)) =
                                     (archive_root.as_ref(), it.local_path.as_ref())
                                 {
-                                    if let Some(bytes) = read_under_root(root, rel) {
+                                    let disk_started = std::time::Instant::now();
+                                    if let Some(bytes) = if metadata_only {
+                                        None
+                                    } else {
+                                        read_under_root(root, rel)
+                                    } {
                                         if service == "mail" {
+                                            disk_parses += 1;
                                             mail_preview_enrichment(&mut v, it, root, rel, &bytes);
                                         } else if service == "onenote" {
                                             // a page's local_path is the .html body, not JSON —
@@ -11901,6 +11934,9 @@ impl Router {
                                                 }),
                                             };
                                         }
+                                    }
+                                    if service == "mail" {
+                                        disk_parse_ms += disk_started.elapsed().as_millis();
                                     }
                                 }
                                 // #89: show a mail's sender from the indexed `sender`
@@ -11938,13 +11974,28 @@ impl Router {
                                 // fast path. Only for a mail with an archived body (the
                                 // expensive case); `set_local_path` clears it when the body
                                 // is re-archived.
-                                if service == "mail" && it.local_path.is_some() {
+                                if service == "mail" && !metadata_only && it.local_path.is_some() {
                                     if let Some(pv) = v.get("preview") {
                                         if let Ok(s) = serde_json::to_string(pv) {
                                             backfill.push((it.remote_id.clone(), s));
                                         }
                                     }
                                 }
+                            }
+                            if service == "mail"
+                                && metadata_only
+                                && v.get("preview")
+                                    .and_then(|p| p.get("attachments"))
+                                    .and_then(Value::as_u64)
+                                    .is_none()
+                            {
+                                let mut p = v
+                                    .get("preview")
+                                    .filter(|p| p.is_object())
+                                    .cloned()
+                                    .unwrap_or_else(|| json!({}));
+                                p["attachment_presence_unknown"] = json!(true);
+                                v["preview"] = p;
                             }
                             v
                         })
@@ -11961,9 +12012,11 @@ impl Router {
                         })
                         .collect()
                 };
+                let projection_ms = projection_started.elapsed().as_millis();
                 // Persist freshly parsed previews so later loads hit the DB fast path.
                 // Brief writable open; if the writer lock is busy (a sync is running) this
                 // simply no-ops and the next load retries — it never blocks the read above.
+                let writer_started = std::time::Instant::now();
                 if !backfill.is_empty() {
                     if let Ok(w) = self.open(Some(account)) {
                         for (id, s) in &backfill {
@@ -11971,13 +12024,19 @@ impl Router {
                         }
                     }
                 }
-                ApiResponse::ok_json(&json!({
+                let writer_ms = writer_started.elapsed().as_millis();
+                let serialize_started = std::time::Instant::now();
+                let response = ApiResponse::ok_json(&json!({
                     "items": arr,
                     "count": arr.len(),
                     "total": total,
                     "limit": limit,
                     "offset": offset,
-                }))
+                }));
+                if service == "mail" {
+                    eprintln!("isyncyou: archive_mail_list metadata_only={metadata_only} tuple_ms={tuple_ms} preview_hits={preview_hits} preview_misses={preview_misses} disk_parses={disk_parses} disk_parse_ms={disk_parse_ms} projection_ms={projection_ms} writer_ms={writer_ms} serialize_ms={}", serialize_started.elapsed().as_millis());
+                }
+                response
             }
             Err(_) => ApiResponse::error(500, "store_query_failed"),
         }
@@ -24447,11 +24506,17 @@ Content-Type: text/html; charset=utf-8\r\n\
             let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
             let mut m = Item::new("a", "mail", "m1", "Quarterly report", "message");
             m.local_path = Some("mail/aa/bb/m.eml".into());
+            m.sender = Some("indexed@example.invalid".into());
             store.upsert_item(&m).unwrap();
             // an item whose body file is absent → still listed, just without a preview
             let mut m2 = Item::new("a", "mail", "m2", "No body", "message");
             m2.local_path = Some("mail/zz/zz/missing.eml".into());
             store.upsert_item(&m2).unwrap();
+            let m3 = Item::new("a", "mail", "m3", "Partial preview", "message");
+            store.upsert_item(&m3).unwrap();
+            store
+                .set_preview_json("a", "mail", "m3", r#"{"from":"partial@example.invalid"}"#)
+                .unwrap();
         }
         let cfg = Config {
             accounts: vec![AccountConfig {
@@ -24465,6 +24530,41 @@ Content-Type: text/html; charset=utf-8\r\n\
             ..Default::default()
         };
         let router = Router::new(cfg);
+        assert_eq!(
+            router
+                .route(&ApiRequest::get(
+                    "/api/v1/items?account=a&service=mail&metadata_only=0"
+                ))
+                .status,
+            400
+        );
+        assert_eq!(
+            router
+                .route(&ApiRequest::get(
+                    "/api/v1/items?account=a&service=calendar&metadata_only=1"
+                ))
+                .status,
+            400
+        );
+        let metadata = body_json(&router.route(&ApiRequest::get(
+            "/api/v1/items?account=a&service=mail&metadata_only=1",
+        )));
+        let rows = metadata["items"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        let first = rows.iter().find(|row| row["remote_id"] == "m1").unwrap();
+        assert_eq!(first["preview"]["from"], "indexed@example.invalid");
+        assert!(first["preview"].get("snippet").is_none());
+        assert_eq!(first["preview"]["attachment_presence_unknown"], true);
+        let partial = rows.iter().find(|row| row["remote_id"] == "m3").unwrap();
+        assert_eq!(partial["preview"]["attachment_presence_unknown"], true);
+        let store = Store::open_readonly(dir.path().join("arch/.isyncyou-store.db")).unwrap();
+        assert!(store
+            .get_item("a", "mail", "m1")
+            .unwrap()
+            .unwrap()
+            .preview_json
+            .is_none());
+        drop(store);
         let v = body_json(&router.route(&ApiRequest::get("/api/v1/items?account=a&service=mail")));
         let items = v["items"].as_array().unwrap();
         let m1 = items.iter().find(|i| i["remote_id"] == "m1").unwrap();
