@@ -327,20 +327,26 @@ fn sync_detached(cfg: &Config, client: &DavClient, scope: &ProviderScope) -> Res
         accessible,
         full,
     };
-    let count =
-        match client.sync_detached_staged(scope, cursor.clone(), accessible, full, &mut stage) {
-            Ok(count) => count,
-            Err(DavError::Http(403)) => {
-                // A denial must not overwrite an access/cursor change observed by
-                // another writer while this network request was in flight.
-                let store = crate::provider_store::open_for_session(cfg, &scope.account_id)?;
-                store
-                    .set_provider_accessible_if_state(scope, cursor.as_deref(), accessible, false)
-                    .map_err(|e| e.to_string())?;
-                return Err("DAV collection access denied".into());
-            }
-            Err(error) => return Err(error.to_string()),
-        };
+    let count = match client.sync_detached_staged(
+        scope,
+        cursor.clone(),
+        accessible,
+        full,
+        cfg.sync.dav_page_size,
+        &mut stage,
+    ) {
+        Ok(count) => count,
+        Err(DavError::Http(403)) => {
+            // A denial must not overwrite an access/cursor change observed by
+            // another writer while this network request was in flight.
+            let store = crate::provider_store::open_for_session(cfg, &scope.account_id)?;
+            store
+                .set_provider_accessible_if_state(scope, cursor.as_deref(), accessible, false)
+                .map_err(|e| e.to_string())?;
+            return Err("DAV collection access denied".into());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     let store = crate::provider_store::open_for_session(cfg, &scope.account_id)?;
     store
         .backfill_provider_dav_search(scope, 100)

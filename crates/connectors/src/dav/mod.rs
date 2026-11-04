@@ -1908,8 +1908,12 @@ impl DavClient {
         expected_cursor: Option<String>,
         expected_accessible: Option<bool>,
         force_full: bool,
+        page_size: Option<u32>,
         stage: &mut dyn DetachedSyncStage,
     ) -> Result<usize, DavError> {
+        if page_size.is_some_and(|n| !(1..=2000).contains(&n)) {
+            return Err(DavError::InvalidResponse);
+        }
         let collection = self.collection(scope)?;
         let mut full = force_full
             || expected_accessible != Some(true)
@@ -1926,7 +1930,10 @@ impl DavClient {
             if !seen_tokens.insert(cursor.clone()) {
                 return Err(DavError::InvalidResponse);
             }
-            let body = format!("<?xml version=\"1.0\"?><d:sync-collection xmlns:d=\"DAV:\"><d:sync-token>{}</d:sync-token><d:sync-level>1</d:sync-level><d:prop><d:getetag/></d:prop></d:sync-collection>", escape_xml(&cursor));
+            let limit = page_size
+                .map(|size| format!("<d:limit><d:nresults>{size}</d:nresults></d:limit>"))
+                .unwrap_or_default();
+            let body = format!("<?xml version=\"1.0\"?><d:sync-collection xmlns:d=\"DAV:\"><d:sync-token>{}</d:sync-token><d:sync-level>1</d:sync-level><d:prop><d:getetag/></d:prop>{limit}</d:sync-collection>", escape_xml(&cursor));
             let response = self
                 .http
                 .request(
@@ -2714,6 +2721,120 @@ impl DavClient {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn detached_sync_sends_page_limit_and_continues_server_cursor() {
+        use super::{DavClient, DavError, DetachedSyncStage};
+        use isyncyou_store::{ProviderAlarmIndex, ProviderDavIndex, ProviderObject, ProviderScope};
+        use std::io::{Read, Write};
+        struct Stage {
+            puts: usize,
+            cursor: String,
+        }
+        impl DetachedSyncStage for Stage {
+            fn reset(&mut self, full: bool) -> Result<(), DavError> {
+                assert!(full);
+                Ok(())
+            }
+            fn existing(&mut self, id: &str) -> Result<Option<ProviderObject>, DavError> {
+                Ok(Some(ProviderObject {
+                    remote_id: id.into(),
+                    etag: Some("\"v1\"".into()),
+                    raw: b"fixture".to_vec(),
+                }))
+            }
+            fn put(
+                &mut self,
+                _: &ProviderObject,
+                _: &ProviderDavIndex,
+                _: &ProviderAlarmIndex,
+            ) -> Result<(), DavError> {
+                self.puts += 1;
+                Ok(())
+            }
+            fn remove(&mut self, _: &str) -> Result<(), DavError> {
+                panic!("unexpected removal")
+            }
+            fn finish(&mut self, cursor: &str) -> Result<(), DavError> {
+                self.cursor = cursor.into();
+                Ok(())
+            }
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for i in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 2048];
+                loop {
+                    let n = socket.read(&mut buf).unwrap();
+                    assert_ne!(n, 0);
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let len = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let wire = String::from_utf8(request).unwrap();
+                assert!(wire.starts_with("REPORT "));
+                assert!(wire.contains("<d:limit><d:nresults>1</d:nresults></d:limit>"));
+                if i == 1 {
+                    assert!(wire.contains("<d:sync-token>urn:page:1</d:sync-token>"));
+                }
+                let boundary = if i == 0 {
+                    "<d:response><d:href>/book/</d:href><d:status>HTTP/1.1 507 Insufficient Storage</d:status></d:response>"
+                } else {
+                    ""
+                };
+                let token = if i == 0 {
+                    "urn:page:1"
+                } else {
+                    "urn:page:done"
+                };
+                let body = format!("<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/book/{i}.vcf</d:href><d:propstat><d:prop><d:getetag>&quot;v1&quot;</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>{boundary}<d:sync-token>{token}</d:sync-token></d:multistatus>");
+                write!(socket,"HTTP/1.1 207 Multi-Status\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        let scope = ProviderScope {
+            account_id: "fixture".into(),
+            origin: origin.clone(),
+            service: "contacts".into(),
+            collection: "/book/".into(),
+        };
+        let client = DavClient {
+            http: reqwest::blocking::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap(),
+            origin: url::Url::parse(&origin).unwrap(),
+            token: "fixture".into(),
+            trusted_public_origin: None,
+        };
+        let mut stage = Stage {
+            puts: 0,
+            cursor: String::new(),
+        };
+        assert_eq!(
+            client
+                .sync_detached_staged(&scope, None, None, true, Some(1), &mut stage)
+                .unwrap(),
+            0
+        );
+        assert_eq!(stage.puts, 2);
+        assert_eq!(stage.cursor, "urn:page:done");
+        server.join().unwrap();
+    }
+    #[test]
     fn private_recovery_requires_capability_and_sends_only_atomic_guard() {
         use isyncyou_store::ProviderScope;
         use std::io::{Read, Write};
@@ -2955,7 +3076,7 @@ mod tests {
         };
         assert_eq!(
             client
-                .sync_detached_staged(&scope, None, None, true, &mut stage)
+                .sync_detached_staged(&scope, None, None, true, None, &mut stage)
                 .unwrap(),
             9
         );
@@ -2972,6 +3093,7 @@ mod tests {
                     Some("https://example.test/token/1".into()),
                     Some(true),
                     true,
+                    None,
                     &mut stage
                 )
                 .unwrap(),
@@ -2984,6 +3106,7 @@ mod tests {
                     Some("https://example.test/token/1".into()),
                     Some(true),
                     false,
+                    None,
                     &mut stage
                 )
                 .unwrap(),
@@ -3021,6 +3144,7 @@ mod tests {
                 Some("https://example.test/token/2".into()),
                 Some(true),
                 true,
+                None,
                 &mut stage
             ),
             Err(DavError::Http(403))

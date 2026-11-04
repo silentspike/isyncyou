@@ -98,7 +98,7 @@ class PushEndpointTransitionTest {
         for (stage in listOf("credentials_ready", "awaiting_proof", "delivery_unknown", "proof_received")) {
             val s = state(stage).put("expires", System.currentTimeMillis() / 1000 - 181).put("password", "fixture")
             val before = s.toString()
-            assertFalse(PushEndpointTransition.reconcileStatus(s, stage, "fixture", "https://provider.example", "https://old.example/topic", "absent"))
+            assertFalse(PushEndpointTransition.reconcileStatus(s, stage, "fixture", "https://provider.example", "https://old.example/topic", "unknown"))
             assertEquals(before, s.toString())
             assertFalse(PushEndpointTransition.reconcileStatus(s, stage, "other", "https://provider.example", "https://old.example/topic", "retired"))
             assertEquals(before, s.toString())
@@ -106,6 +106,14 @@ class PushEndpointTransitionTest {
             assertEquals("prepare_cancelled", s.getString("stage"))
             assertFalse(s.has("password"))
         }
+        val absent = state("delivery_unknown").put("expires", System.currentTimeMillis() / 1000 - 181).put("password", "fixture")
+        assertTrue(PushEndpointTransition.reconcileStatus(absent, "delivery_unknown", "fixture", "https://provider.example", "https://old.example/topic", "absent"))
+        assertEquals("prepare_cancelled", absent.getString("stage"))
+        assertFalse(absent.has("password"))
+        val legacy = state("prepare_unknown")
+        val legacyBefore = legacy.toString()
+        assertFalse(PushEndpointTransition.reconcileStatus(legacy, "prepare_unknown", "fixture", "https://provider.example", "https://old.example/topic", "absent"))
+        assertEquals(legacyBefore, legacy.toString())
         val notExpired = state("awaiting_proof").put("expires", System.currentTimeMillis() / 1000 + 60)
         val before = notExpired.toString()
         assertFalse(PushEndpointTransition.reconcileStatus(notExpired, "awaiting_proof", "fixture", "https://provider.example", "https://old.example/topic", "retired"))

@@ -73,6 +73,16 @@ internal object PushEndpointTransition {
                 state.put("stage", if (previous == "revoke_unknown") "broker_bound_logout" else "replacement_revoke_retry_ready")
             }
             previous == "revoke_unknown" && observed == "retired" -> state.put("stage", "broker_revoked_logout")
+            // A completed prepare with an expired delivery window can be
+            // abandoned after an exact signed status fences outstanding work.
+            // Always detach and obtain a fresh distributor endpoint; do not
+            // infer whether the original delivery happened.
+            previous in setOf("credentials_ready", "awaiting_proof", "delivery_unknown", "proof_received") &&
+                !state.has("replacement") && observed == "absent" && state.optLong("expires", 0) > 0 &&
+                System.currentTimeMillis() / 1000 >= state.optLong("expires", 0) + 180 -> {
+                listOf("subscription_id", "expires", "verify_id", "verify_code", "username", "password", "proof_nonce").forEach { state.remove(it) }
+                state.put("stage", "prepare_cancelled")
+            }
             (previous == "replacement_revoke_unknown" || previous == "prepare_unknown" ||
                 (previous in setOf("credentials_ready", "awaiting_proof", "delivery_unknown", "proof_received", "confirm_unknown") &&
                     state.optLong("expires", 0) > 0 && System.currentTimeMillis() / 1000 >= state.optLong("expires", 0) + 180)) && observed == "retired" -> {

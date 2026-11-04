@@ -93,6 +93,9 @@ impl AccountConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SyncConfig {
+    /// Optional DAV sync-collection page size; absent uses the server limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dav_page_size: Option<u32>,
     pub trash_retention_days: u32,
     pub delete_guard: DeleteGuardConfig,
     pub change_source: ChangeSource,
@@ -124,6 +127,7 @@ pub struct SyncConfig {
 impl Default for SyncConfig {
     fn default() -> Self {
         SyncConfig {
+            dav_page_size: None,
             trash_retention_days: 30,
             delete_guard: DeleteGuardConfig::default(),
             change_source: ChangeSource::default(),
@@ -336,6 +340,13 @@ impl Config {
             }
         }
 
+        if self
+            .sync
+            .dav_page_size
+            .is_some_and(|n| !(1..=2000).contains(&n))
+        {
+            errs.push("sync.dav_page_size must be between 1 and 2000".into());
+        }
         let g = &self.sync.delete_guard;
         if !(g.max_fraction > 0.0 && g.max_fraction <= 1.0) {
             errs.push(format!(
@@ -429,6 +440,19 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dav_page_size_is_optional_and_bounded() {
+        let mut cfg = super::Config::default();
+        assert!(cfg.sync.dav_page_size.is_none());
+        for n in [1, 2000] {
+            cfg.sync.dav_page_size = Some(n);
+            assert!(cfg.validate().is_ok());
+        }
+        for n in [0, 2001] {
+            cfg.sync.dav_page_size = Some(n);
+            assert!(cfg.validate().is_err());
+        }
+    }
     use super::*;
     use crate::onedrive_mode::OneDriveMode;
 
