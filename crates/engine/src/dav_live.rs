@@ -336,51 +336,53 @@ impl ReminderPlan {
 /// pass. This is occurrence-window coverage, not proof that alarms attached to
 /// occurrences outside that window cannot fire inside the trigger window.
 pub fn plan_account_reminders_with_store(cfg: &Config, account: &str, entry: &str, occurrence_start: &str, occurrence_end: &str, window_start: i64, window_end: i64, floating_tzid: Option<&str>, credentials: &dyn ProviderCredentialStore) -> Result<Vec<serde_json::Value>, String> {
-    if window_end <= window_start || window_end.saturating_sub(window_start) > 31 * 86400 || occurrence_start >= occurrence_end { return Err("Invalid reminder planning window".into()); }
-    let start = isyncyou_connectors::dav::reminders::utc_window_bound(occurrence_start)?; let end = isyncyou_connectors::dav::reminders::utc_window_bound(occurrence_end)?;
-    if start > window_start.saturating_sub(368 * 86400) || end < window_end.saturating_add(368 * 86400) { return Err("Occurrence window cannot cover bounded alarms".into()); }
-    let origin = configured_origin(cfg, account)?;
-    let client = client_with_store(cfg, account, &origin, credentials)?;
-    let collections = client.discover(entry).map_err(|e| e.to_string())?;
+    if window_end <= window_start || window_end.saturating_sub(window_start) > 31 * 86400 || occurrence_start >= occurrence_end { return Err("reminder_window".into()); }
+    let start = isyncyou_connectors::dav::reminders::utc_window_bound(occurrence_start).map_err(|_| "reminder_window")?; let end = isyncyou_connectors::dav::reminders::utc_window_bound(occurrence_end).map_err(|_| "reminder_window")?;
+    if start > window_start.saturating_sub(368 * 86400) || end < window_end.saturating_add(368 * 86400) { return Err("reminder_window".into()); }
+    let origin = configured_origin(cfg, account).map_err(|_| "reminder_config")?;
+    let client = client_with_store(cfg, account, &origin, credentials).map_err(|_| "reminder_client")?;
+    let collections = client.discover(entry).map_err(|_| "reminder_discovery")?;
     let mut records = Vec::new();
     let mut objects_seen = 0usize;
     for collection in collections.into_iter().filter(|c| c.calendar) {
         let scope = ProviderScope { account_id:account.into(), origin:origin.clone(), service:"calendar".into(), collection:collection.url };
-        sync_detached(cfg,&client,&scope)?;
-        let store = crate::provider_store::open_readonly(cfg,account)?;
-        let initial_cursor = store.provider_cursor(&scope).map_err(|e| e.to_string())?;
-        let initial_access = store.provider_accessible(&scope).map_err(|e| e.to_string())?;
-        let mut expanded = client.expanded_events(&scope, occurrence_start, occurrence_end).map_err(|e| e.to_string())?;
-        expanded.extend(client.expanded_tasks(&scope, occurrence_start, occurrence_end).map_err(|e| e.to_string())?);
+        sync_detached(cfg,&client,&scope).map_err(|_| "reminder_sync")?;
+        let store = crate::provider_store::open_readonly(cfg,account).map_err(|_| "reminder_cache")?;
+        let initial_cursor = store.provider_cursor(&scope).map_err(|_| "reminder_cache")?;
+        let initial_access = store.provider_accessible(&scope).map_err(|_| "reminder_cache")?;
+        let mut expanded = client.expanded_events(&scope, occurrence_start, occurrence_end).map_err(|_| "reminder_events_report")?;
+        expanded.extend(client.expanded_tasks(&scope, occurrence_start, occurrence_end).map_err(|_| "reminder_tasks_report")?);
         let mut by_href = std::collections::HashMap::new();
         for item in expanded {
-            if by_href.insert(item.href.clone(), item).is_some() { return Err("Ambiguous expanded calendar resource".into()); }
+            if by_href.insert(item.href.clone(), item).is_some() { return Err("reminder_changed".into()); }
         }
         let mut after = String::new();
         loop {
-            let page = store.provider_objects_page(&scope, &after, 128).map_err(|e| e.to_string())?;
+            let page = store.provider_objects_page(&scope, &after, 128).map_err(|_| "reminder_cache")?;
             if page.is_empty() { break; }
             for object in &page {
                 objects_seen += 1;
                 if objects_seen > 10000 { return Err("Reminder account resource limit exceeded".into()); }
-                isyncyou_connectors::dav::reminders::require_bounded_relative_alarms(&object.raw).map_err(|_| "unsupported_alarm_coverage")?;
                 let expansion = by_href.remove(&object.remote_id);
-                let Some(expansion) = expansion else { continue; };
-                if object.etag.as_deref() != Some(expansion.etag.as_str()) { return Err("Calendar changed during reminder enumeration".into()); }
+                if expansion.as_ref().is_some_and(|v| object.etag.as_deref() != Some(v.etag.as_str())) { return Err("reminder_changed".into()); }
                 if !isyncyou_connectors::dav::edit::resource_has_alarms(&object.raw)? { continue; }
-                if !client.permits(&scope, Some(&object.remote_id), "read").map_err(|e| e.to_string())? { return Err("Reminder resource is not readable".into()); }
-                let source = client.read_resource(&scope, &object.remote_id).map_err(|e| e.to_string())?;
+                let standalone = isyncyou_connectors::dav::reminders::is_standalone(&object.raw).map_err(|_| "unsupported_alarm_coverage")?;
+                if !standalone { isyncyou_connectors::dav::reminders::require_bounded_relative_alarms(&object.raw).map_err(|_| "unsupported_alarm_coverage")?; }
+                if !standalone && expansion.is_none() { continue; }
+                if !client.permits(&scope, Some(&object.remote_id), "read").map_err(|_| "reminder_read")? { return Err("reminder_read".into()); }
+                let source = client.read_resource(&scope, &object.remote_id).map_err(|_| "reminder_read")?;
                 let etag = source.etag.clone().ok_or("Reminder ETag unavailable")?;
-                if etag != expansion.etag { return Err("Reminder resource changed during planning".into()); }
-                let items = isyncyou_connectors::dav::reminders::plan(expansion.calendar_data.as_bytes(), &source.raw, floating_tzid, window_start, window_end)?.into_iter().map(|identity| ReminderPlanItem { notification_tag:identity.notification_tag(&scope), identity }).collect();
+                if object.etag.as_deref() != Some(etag.as_str()) { return Err("reminder_changed".into()); }
+                let data = if standalone { source.raw.as_slice() } else { expansion.as_ref().ok_or("Missing expansion")?.calendar_data.as_bytes() };
+                let items = isyncyou_connectors::dav::reminders::plan(data, &source.raw, floating_tzid, window_start, window_end).map_err(|_| "unsupported_alarm_coverage")?.into_iter().map(|identity| ReminderPlanItem { notification_tag:identity.notification_tag(&scope), identity }).collect();
                 let plan = ReminderPlan { scope:scope.clone(), href:object.remote_id.clone(), etag, occurrence_start:occurrence_start.into(), occurrence_end:occurrence_end.into(), window_start, window_end, items };
                 records.extend(plan.native_records(floating_tzid)?);
                 if records.len() > 10000 { return Err("Reminder account plan limit exceeded".into()); }
             }
             after = page.last().ok_or("Reminder pagination failed")?.remote_id.clone();
         }
-        if !by_href.is_empty() { return Err("Calendar changed during reminder enumeration".into()); }
-        if store.provider_cursor(&scope).map_err(|e| e.to_string())? != initial_cursor || store.provider_accessible(&scope).map_err(|e| e.to_string())? != initial_access { return Err("Calendar changed during reminder enumeration".into()); }
+        if !by_href.is_empty() { return Err("reminder_changed".into()); }
+        if store.provider_cursor(&scope).map_err(|_| "reminder_cache")? != initial_cursor || store.provider_accessible(&scope).map_err(|_| "reminder_cache")? != initial_access { return Err("reminder_changed".into()); }
     }
     Ok(records)
 }
@@ -430,12 +432,16 @@ pub fn plan_event_reminders(cfg: &Config, account: &str, entry: &str, collection
     if !client.permits(&scope,Some(&target),"read").map_err(|e| e.to_string())? { return Err("Event is not currently readable".into()); }
     let source = client.read_resource(&scope,&target).map_err(|e| e.to_string())?;
     let etag = source.etag.clone().ok_or("Event ETag unavailable")?;
-    let mut expanded_items = client.expanded_events(&scope,occurrence_start,occurrence_end).map_err(|e| e.to_string())?;
-    expanded_items.extend(client.expanded_tasks(&scope,occurrence_start,occurrence_end).map_err(|e| e.to_string())?);
-    let mut matching = expanded_items.into_iter().filter(|event| event.href == target);
-    let expanded = matching.next().ok_or("No occurrence returned for requested window")?;
-    if matching.next().is_some() || expanded.etag != etag { return Err("Event changed during reminder planning".into()); }
-    let planned = isyncyou_connectors::dav::reminders::plan(expanded.calendar_data.as_bytes(), &source.raw, floating_tzid, window_start, window_end)?;
+    let planned = if isyncyou_connectors::dav::reminders::is_standalone(&source.raw)? {
+        isyncyou_connectors::dav::reminders::plan(&source.raw, &source.raw, floating_tzid, window_start, window_end)?
+    } else {
+        let mut expanded_items = client.expanded_events(&scope,occurrence_start,occurrence_end).map_err(|e| e.to_string())?;
+        expanded_items.extend(client.expanded_tasks(&scope,occurrence_start,occurrence_end).map_err(|e| e.to_string())?);
+        let mut matching = expanded_items.into_iter().filter(|event| event.href == target);
+        let expanded = matching.next().ok_or("No occurrence returned for requested window")?;
+        if matching.next().is_some() || expanded.etag != etag { return Err("Event changed during reminder planning".into()); }
+        isyncyou_connectors::dav::reminders::plan(expanded.calendar_data.as_bytes(), &source.raw, floating_tzid, window_start, window_end)?
+    };
     let items = planned.into_iter().map(|identity| ReminderPlanItem {notification_tag:identity.notification_tag(&scope),identity}).collect();
     Ok(ReminderPlan {scope,href:target,etag,occurrence_start:occurrence_start.into(),occurrence_end:occurrence_end.into(),window_start,window_end,items})
 }

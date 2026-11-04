@@ -17,10 +17,11 @@ import org.json.JSONObject
 
 internal object ReminderStatus {
     private const val PREFS = "reminder_status_v1"
-    fun record(context: Context, status: String) {
+    fun record(context: Context, status: String, reason: String = "") {
         require(status in setOf("idle", "planning", "ready", "unavailable", "unsupported_alarm_coverage"))
+        require(reason in setOf("", "reminder_window", "reminder_changed", "reminder_config", "reminder_client", "reminder_discovery", "reminder_sync", "reminder_cache", "reminder_events_report", "reminder_tasks_report", "reminder_read", "reminder_plan"))
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-            .putString("status", status).putLong("at", System.currentTimeMillis()).apply()
+            .putString("status", status).putString("reason", reason).putLong("at", System.currentTimeMillis()).apply()
     }
     fun snapshot(context: Context): JSONObject {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -32,6 +33,7 @@ internal object ReminderStatus {
         val caps = connectivity?.getNetworkCapabilities(connectivity.activeNetwork)
         val online = caps?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
         return JSONObject().put("planning", prefs.getString("status", "idle"))
+            .put("reason", prefs.getString("reason", ""))
             .put("last_checked_at", prefs.getLong("at", 0)).put("notifications_enabled", enabled).put("network_validated", online)
     }
 }

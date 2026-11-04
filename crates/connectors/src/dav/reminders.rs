@@ -95,6 +95,25 @@ pub fn utc_window_bound(value: &str) -> Result<i64, String> {
     Ok(ical::recur::IcalRecurDateTime::parse(value).map_err(|_| "Invalid UTC occurrence window")?.seconds())
 }
 
+/// True only for one unambiguous non-recurring event or task. Such an object
+/// can be planned directly, even when an absolute trigger is far from DTSTART.
+pub fn is_standalone(raw: &[u8]) -> Result<bool, String> {
+    let tree = IcalCst::parse(raw).map_err(|_| "Invalid calendar resource")?;
+    if tree.to_bytes() != raw { return Err("Calendar resource incomplete".into()); }
+    let mut count = 0;
+    for item in &tree.items {
+        match item {
+            IcalItem::Opaque(_) => return Err("Calendar resource is ambiguous".into()),
+            IcalItem::Component(component) if matches!(kind(component).as_deref(),Some("VEVENT" | "VTODO")) => {
+                count += 1;
+                if ["RRULE","RDATE","EXDATE","EXRULE","RECURRENCE-ID"].iter().any(|key| !lines(component,key).is_empty()) { return Ok(false); }
+            },
+            _ => {}
+        }
+    }
+    Ok(count == 1)
+}
+
 fn local_instant(local: NaiveDateTime, tzid: &str, calendar: &ical::ical::Ical<'_>) -> Result<i64, String> {
     if let Some(zone) = ical::tz::IcalTz::of_calendar(calendar, tzid) {
         if zone.observances.is_empty() { return Err("Calendar timezone has no transitions".into()); }
@@ -253,6 +272,14 @@ mod tests {
         for changed in [raw.replace("TRIGGER:-PT15M", "TRIGGER;VALUE=DATE-TIME:20270101T094500Z"), raw.replace("DESCRIPTION:Reminder", "REPEAT:1\r\nDURATION:PT5M\r\nDESCRIPTION:Reminder"), raw.replace("TRIGGER:-PT15M", "TRIGGER;RELATED=END:-PT15M")] {
             assert!(require_bounded_relative_alarms(changed.as_bytes()).is_err());
         }
+    }
+
+    #[test]
+    fn standalone_classification_rejects_series_and_multiple_components() {
+        let raw = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nDTSTART:20270101T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert!(is_standalone(raw.as_bytes()).unwrap());
+        assert!(!is_standalone(raw.replace("END:VEVENT", "RRULE:FREQ=DAILY;COUNT=2\r\nEND:VEVENT").as_bytes()).unwrap());
+        assert!(!is_standalone(raw.replace("END:VCALENDAR", "BEGIN:VTODO\r\nUID:task\r\nEND:VTODO\r\nEND:VCALENDAR").as_bytes()).unwrap());
     }
 
     #[test]
