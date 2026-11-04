@@ -378,7 +378,8 @@ object BridgeMessagePolicy {
         }
         when (op) {
             "downloadProviderAttachment" -> {
-                if (!hasExactKeys(payload, setOf("account", "id", "blob_id", "filename")) ||
+                if (!hasOnlyKeys(payload, setOf("account", "id", "blob_id", "filename", "mail_scope")) ||
+                    (payload.has("mail_scope") && exactString(payload, "mail_scope").let { it.isNullOrBlank() || it.length > 512 || it.any(Char::isISOControl) }) ||
                     exactString(payload, "account")?.matches(Regex("[A-Za-z0-9._-]{1,128}")) != true ||
                     listOf("id", "blob_id", "filename").any {
                         val value = exactString(payload, it)

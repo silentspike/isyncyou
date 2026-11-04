@@ -563,7 +563,9 @@ class MainActivity : FragmentActivity() {
                     } else {
                         val query = android.net.Uri.Builder().appendQueryParameter("account", payload.getString("account"))
                             .appendQueryParameter("service", "mail").appendQueryParameter("id", payload.getString("id"))
-                            .appendQueryParameter("blob_id", payload.getString("blob_id")).build().encodedQuery
+                            .appendQueryParameter("blob_id", payload.getString("blob_id"))
+                            .apply { if (payload.has("mail_scope")) appendQueryParameter("mail_scope", payload.getString("mail_scope")) }
+                            .build().encodedQuery
                         pendingAttachmentPath = "/api/v1/attachment?$query"
                         try {
                             val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
@@ -618,6 +620,7 @@ class MainActivity : FragmentActivity() {
                     val origin = NativeEngine.nativeProviderOrigin(filesDir.absolutePath, account)
                     val status = when {
                         state != null && (origin.isEmpty() || state.optString("origin") != origin) -> "account_changed"
+                        stage == "credentials_ready" && PushCancelPolicy.canClaim(stage, state?.optLong("expires", 0) ?: 0) -> "credentials_expired"
                         PushStatusPolicy.retainStage(stage) -> stage
                         state?.optBoolean("degraded", false) == true -> "degraded"
                         stage == "active" && expiry == null -> "expiry_unknown"
@@ -913,7 +916,7 @@ class MainActivity : FragmentActivity() {
             val state = identity?.let { runCatching { PushEnrollmentStore.get(this, it.installation) }.getOrNull() }
             val origin = NativeEngine.nativeProviderOrigin(filesDir.absolutePath, account)
             if (identity == null || state == null || origin.isEmpty() || state.optString("account") != account ||
-                state.optString("origin") != origin || !PushCancelPolicy.canClaim(state.optString("stage"))) {
+                state.optString("origin") != origin || !PushCancelPolicy.canClaim(state.optString("stage"), state.optLong("expires", 0))) {
                 postBridgeError(reply, id, 409, "unavailable", "push_reconcile_changed")
                 return@dispatchBridge
             }
@@ -923,7 +926,7 @@ class MainActivity : FragmentActivity() {
                     if (PushInstallationKey.existing(this, account) != identity) return@operation false
                     PushEnrollmentStore.update(this, identity.installation) {
                         if (it.optString("account") != account || it.optString("origin") != origin ||
-                            it.optString("endpoint") != endpoint || !PushCancelPolicy.canClaim(it.optString("stage"))) return@update false
+                            it.optString("endpoint") != endpoint || !PushCancelPolicy.canClaim(it.optString("stage"), it.optLong("expires", 0))) return@update false
                         it.put("stage", "prepare_cancel_unknown"); true
                     }
                 })
@@ -934,6 +937,9 @@ class MainActivity : FragmentActivity() {
                 val saved = PushEnrollmentStore.update(this, identity.installation) {
                     if (it.optString("account") != account || it.optString("origin") != origin ||
                         it.optString("endpoint") != endpoint || it.optString("stage") != "prepare_cancel_unknown") return@update false
+                    if (binding == "absent") {
+                        it.remove("username"); it.remove("password"); it.remove("expires")
+                    }
                     it.put("stage", nextStage)
                     true
                 }

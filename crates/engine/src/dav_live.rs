@@ -262,6 +262,23 @@ pub(crate) fn read_current_with_token(cfg: &Config, account: &str, origin: &str,
     Ok(object)
 }
 
+/// Read only an embedded photo from the current authenticated CardDAV object.
+/// Remote photo URLs are never fetched or returned to the browser.
+pub fn read_contact_photo(cfg: &Config, account: &str, entry: &str, collection: &str, href: &str, credentials: Option<&dyn ProviderCredentialStore>) -> Result<Option<(String, Vec<u8>)>, String> {
+    let object = read_current(cfg, account, entry, collection, "contacts", href, credentials)?;
+    let Some(uri) = isyncyou_connectors::dav::edit::contact_photo_uri(&object.raw)? else { return Ok(None); };
+    decode_embedded_contact_photo(&uri).map(Some)
+}
+
+fn decode_embedded_contact_photo(uri: &str) -> Result<(String, Vec<u8>), String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let (media, encoded) = if let Some(data) = uri.strip_prefix("data:image/png;base64,") { ("image/png", data) } else if let Some(data) = uri.strip_prefix("data:image/jpeg;base64,") { ("image/jpeg", data) } else { return Err("Unsupported contact photo URI".into()); };
+    if encoded.len() > ((2 * 1024 * 1024 + 2) / 3) * 4 { return Err("Contact photo exceeds limit".into()); }
+    let bytes = STANDARD.decode(encoded).map_err(|_| "Invalid contact photo encoding")?;
+    if bytes.is_empty() || bytes.len() > 2 * 1024 * 1024 || !(media == "image/png" && bytes.starts_with(b"\x89PNG\r\n\x1a\n") || media == "image/jpeg" && bytes.starts_with(b"\xff\xd8\xff")) { return Err("Invalid contact photo".into()); }
+    Ok((media.into(), bytes))
+}
+
 pub struct ReminderPlanItem {
     pub identity: isyncyou_connectors::dav::reminders::Reminder,
     /// Full SHA-256 tag; Android uses this tag with a constant numeric ID.
@@ -773,6 +790,8 @@ pub fn prepare_contact_remove_preview(cfg: &Config, account: &str, collection: &
 
 pub struct PreparedContactPhoto {
     pub origin: String,
+    pub uid: String,
+    pub name: String,
     pub media_type: String,
     pub size: usize,
     pub old_photo_uri_sha256: Option<String>,
@@ -790,9 +809,10 @@ pub fn prepare_contact_photo(cfg: &Config, account: &str, collection: &str, href
     if store.provider_accessible(&scope).map_err(|e| e.to_string())? != Some(true) { return Err("Address book access is unknown or unavailable".into()); }
     let object = store.provider_object(&scope,href).map_err(|e| e.to_string())?.ok_or("Cached contact missing")?;
     let expected_etag = object.etag.filter(|tag| !tag.is_empty() && !tag.starts_with("W/")).ok_or("Strong ETag required")?;
+    let (uid, name) = isyncyou_connectors::dav::edit::unique_contact_identity(&object.raw)?;
     let uri = format!("data:{media_type};base64,{}",STANDARD.encode(photo));
     let (old,raw) = isyncyou_connectors::dav::edit::contact_photo(&object.raw,&uri)?;
-    Ok(PreparedContactPhoto {origin,media_type:media_type.into(),size:photo.len(),old_photo_uri_sha256:old.map(|bytes| format!("{:x}",Sha256::digest(bytes))),new_photo_sha256:format!("{:x}",Sha256::digest(photo)),edit:PreparedEdit {href:object.remote_id,expected_etag,expected_collection_token:None,raw}})
+    Ok(PreparedContactPhoto {origin,uid,name,media_type:media_type.into(),size:photo.len(),old_photo_uri_sha256:old.map(|bytes| format!("{:x}",Sha256::digest(bytes))),new_photo_sha256:format!("{:x}",Sha256::digest(photo)),edit:PreparedEdit {href:object.remote_id,expected_etag,expected_collection_token:None,raw}})
 }
 
 pub fn prepare_contact_name(cfg: &Config, account: &str, collection: &str, href: &str, new_name: &str) -> Result<PreparedContactName, String> {
@@ -1373,6 +1393,17 @@ mod tests {
         let result = finish_recovery_dispatch(&store,&scope,"rejected",Err(DavError::Http(403)),|| panic!("definitive rejection should not be read back")).unwrap();
         assert!(matches!(result,RecoveryImportOutcome::Rejected));
         assert_eq!(store.provider_mutation(&scope,"rejected").unwrap().unwrap().1,"rejected");
+    }
+
+    #[test]
+    fn embedded_contact_photo_rejects_remote_and_invalid_data() {
+        assert!(decode_embedded_contact_photo("https://example.test/photo").is_err());
+        assert!(decode_embedded_contact_photo("data:image/png;base64,QUJD").is_err());
+        let uri = format!("data:image/png;base64,{}", "A".repeat(2_796_208));
+        assert!(decode_embedded_contact_photo(&uri).is_err());
+        let (media, bytes) = decode_embedded_contact_photo("data:image/png;base64,iVBORw0KGgo=").unwrap();
+        assert_eq!(media, "image/png");
+        assert_eq!(bytes, b"\x89PNG\r\n\x1a\n");
     }
 
     #[test]

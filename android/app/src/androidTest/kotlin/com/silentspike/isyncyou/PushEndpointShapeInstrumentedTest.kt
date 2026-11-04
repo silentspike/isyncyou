@@ -20,7 +20,7 @@ class PushEndpointShapeInstrumentedTest {
         check(EngineBootstrap.ensureStarted(context.filesDir).isNotEmpty()) { "engine unavailable" }
         val identity = requireNotNull(PushInstallationKey.existing(context, account))
         val state = requireNotNull(PushEnrollmentStore.get(context, identity.installation))
-        check(state.optString("stage") == "prepare_unknown" && state.optString("account") == account &&
+        check(state.optString("stage") in setOf("prepare_unknown", "credentials_ready") && state.optString("account") == account &&
             state.optString("origin") == NativeEngine.nativeProviderOrigin(context.filesDir.absolutePath, account)) { "binding changed" }
         val body = JSONObject().put("installation_id", identity.installation)
             .put("endpoint", state.getString("endpoint")).put("public_key", identity.publicKey).toString().toByteArray()

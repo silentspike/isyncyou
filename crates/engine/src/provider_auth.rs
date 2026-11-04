@@ -1008,7 +1008,8 @@ mod tests {
         cfg.accounts.push(isyncyou_core::AccountConfig {id:"a".into(),username:"user".into(),sync_root:PathBuf::new(),archive_root:dir.path().into(),cache_root:PathBuf::new(),mount_point:None});
         cfg.provider_accounts.insert("a".into(),ProviderConfig::SelfHosted {origin:"https://example.test".into(),client_id:"client".into()});
         let keys=Keys(std::sync::Mutex::new(std::collections::HashMap::new()));
-        let credential=ProviderCredential {access_token:"secret".into(),refresh_token:Some("refresh".into()),expires_at:now()+600,subject:Some("subject".into())};
+        // The local subject must remain readable after access-token expiry, without refresh.
+        let credential=ProviderCredential {access_token:"secret".into(),refresh_token:Some("refresh".into()),expires_at:0,subject:Some("subject".into())};
         keys.replace("a","https://example.test",&credential).unwrap();
         let binding=format!("isyncyou-internal:subject:{:x}",Sha256::digest(b"a"));
         keys.replace(&binding,"https://example.test",&credential).unwrap();

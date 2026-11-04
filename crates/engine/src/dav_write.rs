@@ -420,6 +420,8 @@ fn execute_inner(
     op: &ApprovedDavWrite,
     credentials: Option<&dyn ProviderCredentialStore>,
 ) -> Result<WriteOutcome, String> {
+    #[cfg(debug_assertions)]
+    let perf_start = std::time::Instant::now();
     if !matches!(op.service.as_str(), "calendar" | "contacts") {
         return Err("Unsupported DAV service".into());
     }
@@ -428,6 +430,10 @@ fn execute_inner(
         _ => return Err("Account or provider changed after approval".into()),
     };
     let store = crate::provider_store::open(cfg, &op.account_id)?;
+    #[cfg(debug_assertions)]
+    eprintln!("isyncyou: dav_confirm store_open_ms={}", perf_start.elapsed().as_millis());
+    #[cfg(debug_assertions)]
+    let auth_start = std::time::Instant::now();
     let token = match credentials {
         Some(credentials) => crate::provider_auth::self_hosted_access_token_with_store(
             cfg,
@@ -437,6 +443,10 @@ fn execute_inner(
         None => crate::provider_auth::self_hosted_access_token(cfg, &op.account_id)?,
     };
     let client = DavClient::new(origin, token).map_err(|e| e.to_string())?;
+    #[cfg(debug_assertions)]
+    eprintln!("isyncyou: dav_confirm token_client_ms={}", auth_start.elapsed().as_millis());
+    #[cfg(debug_assertions)]
+    let discovery_start = std::time::Instant::now();
     let collection = client
         .discover(entry)
         .map_err(|e| e.to_string())?
@@ -450,6 +460,8 @@ fn execute_inner(
                 }
         })
         .ok_or("Collection is not currently accessible")?;
+    #[cfg(debug_assertions)]
+    eprintln!("isyncyou: dav_confirm discovery_ms={}", discovery_start.elapsed().as_millis());
     let scope = ProviderScope {
         account_id: op.account_id.clone(),
         origin: origin.clone(),
@@ -504,12 +516,16 @@ fn execute_inner(
         (Some(_), Some(_)) => (Some(target.as_str()), "write-content"),
         (None, _) => (None, "unbind"),
     };
+    #[cfg(debug_assertions)]
+    let privilege_start = std::time::Instant::now();
     if !client
         .permits(&scope, resource, privilege)
         .map_err(|e| e.to_string())?
     {
         return Err("DAV privilege no longer permits this effect".into());
     }
+    #[cfg(debug_assertions)]
+    eprintln!("isyncyou: dav_confirm privilege_ms={}", privilege_start.elapsed().as_millis());
     if let Some((uid,parent)) = parent_change {
         return client.with_locked_collection(&scope,|token| {
             client.sync_collection(&store,&scope)?;
@@ -527,7 +543,12 @@ fn execute_inner(
         }).or_else(|error| match error {DavError::Conflict => Ok(WriteOutcome::Conflict),other => Err(other.to_string())});
     }
     if op.expected_collection_token.is_some() { return Err("Collection checkpoint is supported only for locked task parent changes".into()); }
-    dispatch(&store, &client, &scope, op, &target)
+    #[cfg(debug_assertions)]
+    let dispatch_start = std::time::Instant::now();
+    let result = dispatch(&store, &client, &scope, op, &target);
+    #[cfg(debug_assertions)]
+    eprintln!("isyncyou: dav_confirm dispatch_ms={} total_ms={}", dispatch_start.elapsed().as_millis(), perf_start.elapsed().as_millis());
+    result
 }
 
 #[cfg(test)]

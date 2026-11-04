@@ -23,13 +23,25 @@ pub fn open_for_session(cfg: &Config, account: &str) -> Result<Store, String> {
 
 #[cfg(feature = "encrypted-store")]
 fn open_inner(cfg: &Config, account: &str, recover_staging: bool) -> Result<Store, String> {
+    #[cfg(debug_assertions)]
+    let open_start = std::time::Instant::now();
     let path = location(cfg,account)?;
     let mut wal = path.as_os_str().to_os_string(); wal.push("-wal");
     let mut shm = path.as_os_str().to_os_string(); shm.push("-shm");
     let existing = path.exists() || std::path::Path::new(&wal).exists() || std::path::Path::new(&shm).exists();
     let key = crate::provider_auth::provider_database_key(cfg,account,existing)?;
+    #[cfg(debug_assertions)]
+    eprintln!("isyncyou: provider_store key_ms={}", open_start.elapsed().as_millis());
+    #[cfg(debug_assertions)]
+    let db_start = std::time::Instant::now();
     let store = Store::open_encrypted(path,&key).map_err(|e| e.to_string())?;
+    #[cfg(debug_assertions)]
+    eprintln!("isyncyou: provider_store db_open_ms={}", db_start.elapsed().as_millis());
+    #[cfg(debug_assertions)]
+    let recovery_start = std::time::Instant::now();
     if recover_staging { store.recover_abandoned_provider_staging().map_err(|e| e.to_string())?; }
+    #[cfg(debug_assertions)]
+    eprintln!("isyncyou: provider_store recovery_ms={} total_ms={}", recovery_start.elapsed().as_millis(), open_start.elapsed().as_millis());
     Ok(store)
 }
 
@@ -51,6 +63,22 @@ pub fn open_readonly(cfg: &Config, account: &str) -> Result<Store, String> {
     if !path.exists() { return Err("Provider cache is not initialized".into()); }
     let key = crate::provider_auth::provider_database_key(cfg,account,true)?;
     Store::open_readonly_encrypted(path,&key).map_err(|e| e.to_string())
+}
+
+/// Identity used to invalidate an idle session reader on replacement, permissions or key changes.
+#[cfg(all(feature = "encrypted-store", unix))]
+pub fn readonly_cache_identity(cfg: &Config, account: &str) -> Result<(u64, u64, u32, u32, u32, i64, i64, [u8; 32]), String> {
+    use std::os::unix::fs::MetadataExt;
+    let path = location(cfg, account)?;
+    let metadata = std::fs::symlink_metadata(&path).map_err(|_| "Provider cache unavailable")?;
+    if !metadata.file_type().is_file() { return Err("Provider cache unavailable".into()); }
+    let key = crate::provider_auth::provider_database_key(cfg, account, true)?;
+    Ok((metadata.dev(), metadata.ino(), metadata.mode(), metadata.uid(), metadata.gid(), metadata.ctime(), metadata.ctime_nsec(), Sha256::digest(&key).into()))
+}
+
+#[cfg(not(all(feature = "encrypted-store", unix)))]
+pub fn readonly_cache_identity(_cfg: &Config, _account: &str) -> Result<(u64, u64, u32, u32, u32, i64, i64, [u8; 32]), String> {
+    Err("Encrypted provider storage is unavailable".into())
 }
 
 #[cfg(feature = "encrypted-store")]

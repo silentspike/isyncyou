@@ -99,10 +99,10 @@ fn bounded_fts_snippet(value: String) -> String {
 }
 
 /// Current schema version. Bump + add a migration step when the schema changes.
-pub const SCHEMA_VERSION: i64 = 20;
+pub const SCHEMA_VERSION: i64 = 21;
 
 mod provider;
-pub use provider::{capture_version, mail_capture_object, ProviderAlarmIdentity, ProviderAlarmIndex, ProviderCapture, ProviderChange, ProviderCollectionSnapshot, ProviderDavIndex, ProviderDavIndexEntry, ProviderEvent, ProviderExportSnapshot, ProviderObject, ProviderScope, ProviderSubmission};
+pub use provider::{capture_identity, capture_version, mail_capture_object, ProviderAlarmIdentity, ProviderAlarmIndex, ProviderCapture, ProviderChange, ProviderCollectionSnapshot, ProviderDavIndex, ProviderDavIndexEntry, ProviderEvent, ProviderExportSnapshot, ProviderObject, ProviderScope, ProviderSubmission};
 
 pub const STORE_KEY_ENV: &str = "ISYNCYOU_STORE_KEY";
 pub const STORE_KEY_FILE_ENV: &str = "ISYNCYOU_STORE_KEY_FILE";
@@ -783,11 +783,19 @@ impl Store {
             ));
         }
         let path = path.as_ref();
+        #[cfg(debug_assertions)]
+        let lock_start = std::time::Instant::now();
         let lock = Self::acquire_lock(path)?;
+        #[cfg(debug_assertions)]
+        eprintln!("isyncyou: encrypted_store lock_ms={}", lock_start.elapsed().as_millis());
+        #[cfg(debug_assertions)]
+        let init_start = std::time::Instant::now();
         let conn = Connection::open(path)?;
         apply_sqlcipher_key(&conn, secret)?;
         conn.pragma_update(None, "temp_store", "MEMORY")?;
         Self::init(&conn)?;
+        #[cfg(debug_assertions)]
+        eprintln!("isyncyou: encrypted_store init_ms={}", init_start.elapsed().as_millis());
         Ok(Store {
             conn,
             _lock: Some(lock),
@@ -3090,6 +3098,9 @@ fn migrate(conn: &Connection) -> Result<()> {
     }
     if v < 20 {
         conn.execute_batch(provider::MIGRATION_V20)?;
+    }
+    if v < 21 {
+        conn.execute_batch(provider::MIGRATION_V21)?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;

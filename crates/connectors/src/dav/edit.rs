@@ -687,6 +687,39 @@ pub fn contact_photo(raw: &[u8], uri: &str) -> Result<(Option<Vec<u8>>, Vec<u8>)
     Ok((old,card.to_bytes()))
 }
 
+/// Read one vCard PHOTO URI after vCard property-value unescaping. Remote
+/// URLs are returned to the caller as data only and must never be fetched.
+pub fn contact_photo_uri(raw: &[u8]) -> Result<Option<String>, String> {
+    if raw.len() > 16 * 1024 * 1024 { return Err("Contact resource is too large".into()); }
+    let card = vcard::tree::cst::VcardCst::parse(raw).map_err(|_| "Invalid contact resource")?;
+    if card.begin.is_none() || card.to_bytes() != raw { return Err("Contact must be a single complete vCard".into()); }
+    let mut photos = card.props.iter().filter(|line| line.name.get().rsplit('.').next().is_some_and(|name| name.eq_ignore_ascii_case("PHOTO")));
+    let Some(photo) = photos.next() else { return Ok(None); };
+    if photos.next().is_some() || !photo.name.get().eq_ignore_ascii_case("PHOTO") || photo.params.len() > 1 || photo.params.iter().any(|p| !p.name.get().eq_ignore_ascii_case("VALUE") || p.values.len()!=1 || !p.values[0].get().eq_ignore_ascii_case("URI")) { return Err("Contact photo is ambiguous or not a simple URI".into()); }
+    let bytes = photo.value.decode_bytes();
+    let value = std::str::from_utf8(&bytes).map_err(|_| "Contact photo URI is not UTF-8")?;
+    if value.len() > 3 * 1024 * 1024 || value.chars().any(char::is_control) { return Err("Invalid contact photo URI".into()); }
+    Ok(Some(value.to_owned()))
+}
+
+/// Extract the identity displayed for a photo approval from the same source
+/// bytes as the edit. Ambiguous, grouped or parameterized identity is rejected.
+pub fn unique_contact_identity(raw: &[u8]) -> Result<(String, String), String> {
+    if raw.len() > 16 * 1024 * 1024 { return Err("Contact resource is too large".into()); }
+    let card = vcard::tree::cst::VcardCst::parse(raw).map_err(|_| "Invalid contact resource")?;
+    if card.begin.is_none() || card.to_bytes() != raw { return Err("Contact must be a single complete vCard".into()); }
+    let read = |key: &str| -> Result<String, String> {
+        let mut lines = card.props.iter().filter(|line| line.name.get().rsplit('.').next().is_some_and(|name| name.eq_ignore_ascii_case(key)));
+        let item = lines.next().ok_or("Contact identity is missing")?;
+        if lines.next().is_some() || !item.name.get().eq_ignore_ascii_case(key) || !item.params.is_empty() { return Err("Contact identity is ambiguous or parameterized".into()); }
+        let bytes = item.value.decode_bytes();
+        let value = std::str::from_utf8(&bytes).map_err(|_| "Contact identity is not UTF-8")?;
+        if value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control) { return Err("Contact identity cannot be displayed safely".into()); }
+        Ok(value.to_owned())
+    };
+    Ok((read("UID")?, read("FN")?))
+}
+
 /// Prepare the narrowly scoped, unambiguous formatted-name change used by
 /// the human confirmation flow. Both the displayed old name and proposed bytes
 /// come from the same parsed resource; parameterized names require a richer UI.
@@ -1221,6 +1254,10 @@ mod tests {
         let text = String::from_utf8(changed).unwrap();
         assert!(text.contains("PHOTO;VALUE=uri:data:image/png;base64,iVBORw0KGgo="));
         assert!(text.contains("X-KEEP:yes"));
+        let absent = b"BEGIN:VCARD\r\nVERSION:4.0\r\nUID:id\r\nFN:Example\r\nX-KEEP:yes\r\nEND:VCARD\r\n";
+        let (_, inserted) = contact_photo(absent,"data:image/png;base64,iVBORw0KGgo=").unwrap();
+        let inserted = String::from_utf8(inserted).unwrap();
+        assert!(inserted.contains("PHOTO:data:image/png;base64,iVBORw0KGgo="));
         assert!(contact_photo(raw,"https://example.test/not-embedded").is_err());
     }
 
@@ -1300,6 +1337,24 @@ mod tests {
         assert!(raw.windows(14).any(|w| w == b"SUMMARY:Before"));
         let scheduled = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Before\r\nATTENDEE:mailto:a@example.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         assert!(preview_text_edit(scheduled,"event",None,"SUMMARY","After").is_err());
+    }
+
+    #[test]
+    fn contact_photo_uri_unescapes_vcard_value_and_rejects_ambiguity() {
+        let card = b"BEGIN:VCARD\r\nVERSION:4.0\r\nUID:id\r\nFN:Example\r\nPHOTO:data:image/png;base64\\,QUJD\r\nEND:VCARD\r\n";
+        assert_eq!(contact_photo_uri(card).unwrap().as_deref(), Some("data:image/png;base64,QUJD"));
+        let duplicate = b"BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Example\r\nPHOTO:data:image/png;base64\\,QUJD\r\nPHOTO:https://example.test/x\r\nEND:VCARD\r\n";
+        assert!(contact_photo_uri(duplicate).is_err());
+    }
+
+    #[test]
+    fn photo_identity_requires_one_unambiguous_uid_and_name() {
+        let valid = b"BEGIN:VCARD\r\nVERSION:4.0\r\nUID:contact-1\r\nFN:Example\r\nEND:VCARD\r\n";
+        assert_eq!(unique_contact_identity(valid).unwrap(), ("contact-1".into(), "Example".into()));
+        let duplicate = b"BEGIN:VCARD\r\nVERSION:4.0\r\nUID:one\r\nUID:two\r\nFN:Example\r\nEND:VCARD\r\n";
+        let grouped = b"BEGIN:VCARD\r\nVERSION:4.0\r\nUID:one\r\nitem1.FN:Example\r\nEND:VCARD\r\n";
+        assert!(unique_contact_identity(duplicate).is_err());
+        assert!(unique_contact_identity(grouped).is_err());
     }
 
     #[test]

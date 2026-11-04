@@ -1824,6 +1824,7 @@ function mailAvatarColor(it) {
 const mailDate = (it) => { const p = it.preview || {}; return toDate(p.date || it.remote_mtime) || new Date(0); };
 
 async function renderMailView(view) {
+  if (Mail.scopeAccount !== App.account) { Mail.scopeAccount = App.account; Mail.activeScope = ""; }
   Mail.all = []; Mail.filter = "all"; Mail.sort = Mail.sort || "newest"; Mail.q = ""; Mail.selected = null;
   Mail.threaded = Mail.threaded === undefined ? true : Mail.threaded; // group by conversation (#563)
   clear(view).append(el("div", { id: "mail-page", class: "mail-page" },
@@ -1834,6 +1835,7 @@ async function renderMailView(view) {
     el("div", { class: "mail-toolbar" },
       el("div", { class: "tb-search" }, icon("search", "icon-sm"),
         el("input", { id: "mail-search", placeholder: "Search this mailbox…", oninput: () => { clearTimeout(Mail._qT); Mail._qT = setTimeout(() => { Mail.q = $("#mail-search").value.trim().toLowerCase(); mailRender(); }, 140); } })),
+      el("select", { id:"mail-scope", class:"input", style:"display:none", onchange:event => { Mail.activeScope = event.target.value; Mail.selected = null; Mail.pendingSelect = null; void renderMailView(view); } }),
       el("span", { id: "mail-cache-provenance", class: "dim", style: "font-size:11px" }),
       el("button", { id: "mail-load-more", class: "btn sm", type:"button", style:"display:none", onclick: event => loadMoreProviderMail(event.currentTarget) }, "Load more"),
       el("div", { class: "spacer", style: "flex:1" }),
@@ -1859,9 +1861,16 @@ async function renderMailView(view) {
   for (let i = 0; i < 9; i++) list.append(el("div", { class: "mail-item skel-row" }, el("div", { class: "skel grow", style: "height:46px" })));
   try {
     const [d, act] = await Promise.all([
-      api("/api/v1/items?" + qs({ account: App.account, service: "mail", limit: 1000 })),
+      api("/api/v1/items?" + qs({ account: App.account, service: "mail", limit: 1000, ...(Mail.activeScope ? {mail_scope:Mail.activeScope} : {}) })),
       api("/api/v1/activity?" + qs({ account: App.account, limit: 30 })).catch(() => ({ runs: [] })),
     ]);
+    const scopeSelect = $("#mail-scope");
+    if (scopeSelect && Array.isArray(d.scopes) && (d.scopes.length > 1 || d.scopes.some(scope => !scope.primary))) {
+      clear(scopeSelect);
+      if (!d.scopes.some(scope => scope.primary)) scopeSelect.append(el("option", {value:"", text:"Choose a shared mailbox"}));
+      for (const scope of d.scopes) scopeSelect.append(el("option", {value:scope.primary ? "" : scope.mail_scope, text:scope.primary ? "Personal mail" : `Shared mail · ${scope.mail_scope}`}));
+      scopeSelect.value = Mail.activeScope || ""; scopeSelect.style.display = "";
+    }
     Mail.nextCursor = d.next_cursor || null;
     Mail.expanded = false;
     updateMailCacheProvenance(d);
@@ -1895,12 +1904,12 @@ function updateMailLoadMore() {
   if (button) button.style.display = Mail.nextCursor ? "" : "none";
 }
 async function loadMoreProviderMail(button) {
-  const account = App.account, cursor = Mail.nextCursor;
+  const account = App.account, cursor = Mail.nextCursor, scope = Mail.activeScope;
   if (!cursor) return;
   button.disabled = true;
   try {
-    const page = await api("/api/v1/items?" + qs({ account, service:"mail", limit:1000, after:cursor }));
-    if (App.account !== account || Mail.nextCursor !== cursor) return;
+    const page = await api("/api/v1/items?" + qs({ account, service:"mail", limit:1000, after:cursor, ...(Mail.activeScope ? {mail_scope:Mail.activeScope} : {}) }));
+    if (App.account !== account || Mail.activeScope !== scope || Mail.nextCursor !== cursor) return;
     const known = new Set(Mail.all.map(item => item.remote_id));
     for (const item of page.items || []) if (item.item_type === "message" && !known.has(item.remote_id)) { Mail.all.push(item); known.add(item.remote_id); }
     Mail.nextCursor = page.next_cursor || null;
@@ -1930,10 +1939,12 @@ function mailListSignature() {
 // list ONLY when the visible set changed — preserving filter/search/sort/scroll/selection
 // so a sync tick never reloads the screen.
 async function mailLiveUpdate() {
-  if (Mail.expanded) return;
+  const account = App.account, scope = Mail.activeScope;
   let d;
-  try { d = await api("/api/v1/items?" + qs({ account: App.account, service: "mail", limit: 1000 })); }
-  catch (_) { return; }
+  try { d = await api("/api/v1/items?" + qs({ account: App.account, service: "mail", limit: 1000, ...(Mail.activeScope ? {mail_scope:Mail.activeScope} : {}) })); }
+  catch (_) { if (App.account === account && Mail.activeScope === scope && scope) { Mail.all = []; Mail.folders = []; Mail.selected = null; renderMailReader(null); mailRender(); } return; }
+  if (App.account !== account || Mail.activeScope !== scope) return;
+  Mail.expanded = false;
   Mail.nextCursor = d.next_cursor || null;
   updateMailCacheProvenance(d);
   updateMailLoadMore();
@@ -1947,7 +1958,8 @@ async function mailLiveUpdate() {
   mailRenderMetrics(); mailRender();
   if (Mail.selected) {
     const current = Mail.all.find(item => item.remote_id === Mail.selected.remote_id);
-    if (current && JSON.stringify([current.name, current.preview, current.mailbox_ids]) !== JSON.stringify([Mail.selected.name, Mail.selected.preview, Mail.selected.mailbox_ids])) {
+    if (!current) { Mail.selected = null; renderMailReader(null); }
+    else if (JSON.stringify([current.name, current.preview, current.mailbox_ids]) !== JSON.stringify([Mail.selected.name, Mail.selected.preview, Mail.selected.mailbox_ids])) {
       Mail.selected = current;
       renderMailReader(current);
     }
@@ -2054,7 +2066,7 @@ function mailRow(it, threadCount = 1) {
   if (p.attachments > 0) badges.append(el("span", { class: "mi-chip", title: p.attachments + " attachment(s)" }, icon("paperclip", "icon-sm"), String(p.attachments)));
   categoryChips(it).forEach(c => badges.append(c));
   const ownProvider = (App.accounts || []).some(a => a.id === App.account && a.provider === "self_hosted");
-  if (CAP.mailwrite && (!ownProvider || CAP.agent)) {
+  if (!it.shared && CAP.mailwrite && (!ownProvider || CAP.agent)) {
     const flagged = p.flag === "flagged";
     badges.append(el("button", { class: "mi-flag" + (flagged ? " on" : ""), title: flagged ? "Clear flag" : "Flag",
       onclick: (e) => { e.stopPropagation(); if (ownProvider && CAP.agent) void prepareProviderMailAction(App.account, it.remote_id, { kind:"set_flag", flagged:!flagged }, e.currentTarget); else if (!ownProvider) mailSetFlag(it, flagged ? "notFlagged" : "flagged"); } }, icon("flag", "icon-sm")));
@@ -2325,7 +2337,7 @@ function openInlineComposer(it, mode) {
       class: "cmp-tb-btn", type: "button", title: "Insert link",
       onmousedown: (e) => { e.preventDefault(); const u = prompt("Link URL:"); if (u) document.execCommand("createLink", false, u); editor.focus(); },
     }, icon("link", "icon-sm")));
-  const q = { account: App.account, service: "mail", id: it.remote_id };
+  const q = { account: App.account, service: "mail", id: it.remote_id, ...(it.shared ? {mail_scope:it.mail_scope} : {}) };
   const head = el("div", { class: "cmp-inline-head" },
     el("span", { class: "cmp-inline-title truncate" }, title + (p.subject ? " · " + p.subject : (it.name ? " · " + it.name : ""))),
     el("div", { style: "flex:1" }),
@@ -2534,7 +2546,7 @@ function renderMailReader(it, remoteImages = false) {
   const q = { account: App.account, service: "mail", id: it.remote_id };
   const viewQ = remoteImages ? { ...q, external: "1" } : q;
   const actions = el("div", { class: "mr-actions" });
-  if (CAP.agent && p.isDraft && (App.accounts || []).some(a => a.id === App.account && a.provider === "self_hosted")) {
+  if (!it.shared && CAP.agent && p.isDraft && (App.accounts || []).some(a => a.id === App.account && a.provider === "self_hosted")) {
     actions.append(el("button", { class: "btn primary sm", onclick: async e => {
       const button = e.currentTarget;
       button.disabled = true;
@@ -2542,7 +2554,7 @@ function renderMailReader(it, remoteImages = false) {
       catch (_) { toast("Draft confirmation could not be prepared. Check the draft and account status.", "err"); button.disabled = false; }
     } }, "Review and send"));
   }
-  if (CAP.agent && selfHosted) {
+  if (CAP.agent && selfHosted && !it.shared) {
     const account = App.account, flagged = p.flag === "flagged";
     actions.append(el("button",{class:"btn sm",type:"button",onclick:event=>prepareSingleCapture(account,"mail","",it.remote_id,event.currentTarget)},"Back up message"));
     actions.append(el("button",{class:"btn sm",type:"button",onclick:()=>openSingleCaptureStatus(account)},"Backup status"));
@@ -2575,7 +2587,7 @@ function renderMailReader(it, remoteImages = false) {
       el("button", { class: "btn ghost sm icon-only danger", title: "Delete (to Deleted Items)", onclick: () => mailDelete(it) }, icon("trash-2", "icon-sm")),
     );
   }
-  if (CAP.restore) actions.append(el("button", { class: "btn sm", title: "Restore to cloud", onclick: (e) => doRestore(it, e.currentTarget) }, icon("rotate-ccw", "icon-sm"), "Restore"));
+  if (CAP.restore && !it.shared) actions.append(el("button", { class: "btn sm", title: "Restore to cloud", onclick: (e) => doRestore(it, e.currentTarget) }, icon("rotate-ccw", "icon-sm"), "Restore"));
   box.append(
     el("header", { class: "mail-reader-head" },
       el("button", { class: "mail-back btn ghost sm", title: "Back", onclick: mailBack }, icon("chevron-left", "icon-sm")),
@@ -2652,7 +2664,7 @@ function renderMailReader(it, remoteImages = false) {
     const account = App.account, messageId = it.remote_id;
     const attachments = el("div", { class:"mr-attachments" }, el("span", { class:"dim", text:"Loading attachments…" }));
     box.append(attachments);
-    void request("GET", "/api/v1/attachment?" + qs({ account, service:"mail", id:messageId }), { timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS }).then(result => {
+    void request("GET", "/api/v1/attachment?" + qs({ account, service:"mail", id:messageId, ...(it.shared ? {mail_scope:it.mail_scope} : {}) }), { timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS }).then(result => {
       if (App.account !== account || !attachments.isConnected) return;
       clear(attachments);
       const entries = Array.isArray(result.attachments) ? result.attachments : [];
@@ -2662,7 +2674,9 @@ function renderMailReader(it, remoteImages = false) {
         const tooLarge = Number(attachment.size) > 64 * 1024 * 1024;
         if (tooLarge) { attachments.append(el("span", { class:"dim", text:`${attachment.filename || "attachment"} · exceeds the 64 MiB download limit` })); return; }
         const children = [icon("paperclip", "icon-sm"), el("span", { class:"truncate", text:attachment.filename || "attachment" }), el("span", { class:"dim mr-att-size", text:fmtSize(attachment.size) })];
-        if (BRIDGE) {
+        if (BRIDGE && it.shared) {
+          attachments.append(el("span", {class:"dim", text:`${attachment.filename || "Attachment"} · shared attachment download unavailable on this device`}));
+        } else if (BRIDGE) {
           attachments.append(el("button", { class:"mr-att", type:"button", onclick:async event => {
             const button = event.currentTarget; button.disabled = true;
             try {
@@ -2676,7 +2690,7 @@ function renderMailReader(it, remoteImages = false) {
             }
           } }, ...children));
         } else {
-          attachments.append(el("a", { class:"mr-att", href:`/api/v1/attachment?${qs({account, service:"mail", id:messageId, blob_id:attachment.blob_id})}`, download:attachment.filename || "attachment", rel:"noopener" }, ...children));
+          attachments.append(el("a", { class:"mr-att", href:`/api/v1/attachment?${qs({account, service:"mail", id:messageId, blob_id:attachment.blob_id, ...(it.shared ? {mail_scope:it.mail_scope} : {})})}`, download:attachment.filename || "attachment", rel:"noopener" }, ...children));
         }
       });
     }).catch(() => { if (attachments.isConnected) { clear(attachments); attachments.append(el("span", { class:"dim", text:"Attachments are currently unavailable." })); } });
@@ -3562,7 +3576,7 @@ async function prepareSingleCapture(account,service,collection,href,button) {
     const pending=await postJson("/api/v1/agent/recovery/capture/prepare",CAP.agent,{request_id:crypto.randomUUID(),session_id,account,service,collection,href},PROVIDER_NATIVE_TIMEOUT_MS);
     if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.operation_id) throw new Error("confirmation unavailable");
     operations.push(pending.operation_id); localStorage.setItem("capture-operations:"+account,JSON.stringify(operations));
-    const record={...pending,status:"pending",success_result:"Capture requested. Off-node protection is not confirmed until its status says protected.",cancelled_result:"Capture was not requested."};
+    const record={...pending,status:"pending",capture_operation:true,success_result:"Capture requested. Off-node protection is not confirmed until its status says protected.",cancelled_result:"Capture was not requested."};
     AssistantState.pendingCardsById.set(record.pending_id,record);
     openSheet("Review fresh backup capture",renderAgentPendingCard(record));
   } catch (_) {toast("Capture could not be prepared. Check the source and account.","err");}
@@ -3706,6 +3720,23 @@ function openProviderCalendarTime(account, collection, href, uid) {
     } catch (_) { toast("The time change could not be prepared. Check the dates and refresh; events with alarms, recurrence or invitations require an expanded review.", "err"); button.disabled = false; }
   } }, "Review change");
   openSheet("Change event time", el("div", { class:"compose" }, el("p", { class:"dim", text:"Enter UTC, local time with IANA zone, or all-day dates. For all-day events the end date is exclusive. Ambiguous or nonexistent local times are rejected." }), mode, start, end, tzid, button));
+}
+
+function openProviderTaskParent(account, collection, href, uid) {
+  const parent = el("input", {class:"input", "aria-label":"Parent task UID", placeholder:"Parent task UID, or leave empty to remove"});
+  const button = el("button", {class:"btn primary", type:"button", onclick:async () => {
+    if (App.account !== account) { toast("Account changed.","err"); return; }
+    button.disabled = true;
+    try {
+      const sessionId = await ensureAgentSession();
+      if (App.account !== account) throw new Error("Account changed");
+      const pending = await postJson("/api/v1/agent/task/parent/prepare",CAP.agent,{request_id:crypto.randomUUID(),session_id:sessionId,account,collection,href,uid,new_parent:parent.value.trim() || null},PROVIDER_NATIVE_TIMEOUT_MS);
+      if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+      const record={...pending,status:"pending",cancelled_result:"The task parent was not changed."};
+      AssistantState.pendingCardsById.set(record.pending_id,record); closeSheet(); openSheet("Review task parent",renderAgentPendingCard(record));
+    } catch (_) { toast("The parent change could not be prepared. Check the UID, collection and task graph.","err"); button.disabled=false; }
+  }},"Review change");
+  openSheet("Change task parent",el("div",{class:"compose"},el("p",{class:"dim",text:"Enter the UID of a task in this collection. Leave empty to remove the current parent. The checked change is shown before confirmation."}),parent,button));
 }
 
 function openProviderTaskAttributes(account, collection, href, uid) {
@@ -3972,6 +4003,7 @@ async function renderProviderCalendarView(view, service) {
               finally { button.disabled = false; }
             } }, complete ? "Complete" : "Reopen"));
             if (!recurrence) row.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderTaskAttributes(account, collection, item.href, component.uid) }, "Due and priority"));
+            if (!recurrence) row.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderTaskParent(account, collection, item.href, component.uid) }, "Change parent"));
           }
           list.append(row);
         }
@@ -4471,6 +4503,30 @@ async function prepareProviderContactRemove(account, collection, href, key, inde
   finally { button.disabled = false; }
 }
 
+function chooseProviderContactPhoto(account,collection,href,forAssistant=false) {
+  const input=el("input",{type:"file",accept:"image/png,image/jpeg",style:"display:none"});
+  input.addEventListener("change",async()=>{
+    const file=input.files && input.files[0];input.remove();if(!file || App.account!==account)return;
+    if(!CAP.mutationIntent || !CAP.agent || !["image/png","image/jpeg"].includes(file.type) || file.size<1 || file.size>2*1024*1024) {toast("Choose a PNG or JPEG image no larger than 2 MiB.","err");return;}
+    try {
+      const session_id=await ensureAgentSession();if(App.account!==account)throw new Error("account changed");
+      const staged=await stageMutation("contact_photo",{account,collection,href,media_type:file.type},file);
+      if(!staged.stage_id || App.account!==account)throw new Error("photo stage unavailable");
+      if (forAssistant) {
+        openSheet("Photo staged for Assistant",el("div",{class:"compose"},el("p",{text:"The image is staged for this account and contact for 15 minutes. Give this identifier to the assistant; it must still ask you to confirm the exact contact and photo before changing anything."}),el("code",{text:staged.stage_id}),el("button",{class:"btn sm",type:"button",onclick:async()=>{try{await navigator.clipboard.writeText(staged.stage_id);toast("Identifier copied.");}catch(_){toast("Select and copy the identifier above.","err");}}},"Copy identifier")));
+        return;
+      }
+      const pending=await postJson("/api/v1/agent/contact/photo/prepare",CAP.agent,{request_id:crypto.randomUUID(),session_id,account,stage_id:staged.stage_id},PROVIDER_NATIVE_TIMEOUT_MS);
+      if(!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id)throw new Error("confirmation unavailable");
+      const record={...pending,status:"pending",photo_operation:true,success_result:"Contact photo updated; local synchronization may be pending.",cancelled_result:"The contact photo was not changed."};
+      AssistantState.pendingCardsById.set(record.pending_id,record);
+      const url=URL.createObjectURL(file);const picture=el("img",{src:url,alt:"Selected contact photo",style:"max-width:180px;max-height:180px;object-fit:contain"});
+      picture.addEventListener("load",()=>URL.revokeObjectURL(url),{once:true});picture.addEventListener("error",()=>URL.revokeObjectURL(url),{once:true});
+      openSheet("Review contact photo",el("div",{class:"compose"},picture,renderAgentPendingCard(record)));
+    } catch (_) {toast("The photo could not be prepared. Check the contact and try again.","err");}
+  },{once:true});document.body.append(input);input.click();
+}
+
 async function renderProviderContactsView(view) {
   const account = App.account;
   clear(view);
@@ -4499,8 +4555,17 @@ async function renderProviderContactsView(view) {
         const name = textValues(item.names) || (item.error ? "Contact could not be projected" : "(unnamed contact)");
         const detail = [textValues(item.emails), textValues(item.phones), textValues(item.organizations)].filter(Boolean).join(" · ");
         const row = el("div", { class:"pick-row" }, el("span", { class:"grow" }, el("b", { text:name }), detail ? el("span", { class:"dim", text:` · ${detail}` }) : null));
+        if (page.accessible === true && !item.error && typeof item.href === "string" && typeof item.collection === "string") {
+          row.append(el("button",{class:"btn sm",type:"button",onclick:event=>{
+            const button=event.currentTarget; button.disabled=true;
+            const photo=el("img",{src:"/api/v1/contact/photo?"+qs({account,collection:item.collection,href:item.href}),alt:"Contact photo",style:"max-width:96px;max-height:96px;object-fit:contain"});
+            photo.addEventListener("error",()=>{photo.remove();button.disabled=false;toast("No readable contact photo is available.","err");},{once:true});
+            row.append(photo);
+          }},"Show photo"));
+        }
         if (CAP.agent && page.accessible === true && !item.error && typeof item.href === "string" && typeof item.collection === "string") {
           row.append(el("button",{class:"btn sm",type:"button",onclick:event=>prepareSingleCapture(account,"contacts",item.collection,item.href,event.currentTarget)},"Back up contact"));
+          if(CAP.mutationIntent) {row.append(el("button",{class:"btn sm",type:"button",onclick:()=>chooseProviderContactPhoto(account,item.collection,item.href)},"Change photo"));row.append(el("button",{class:"btn sm",type:"button",onclick:()=>chooseProviderContactPhoto(account,item.collection,item.href,true)},"Stage photo for Assistant"));}
           row.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderContactName(account, item.collection, item.href, name) }, "Change name"));
           for (const [key, fields] of [["EMAIL", item.emails], ["TEL", item.phones], ["ORG", item.organizations]]) {
             row.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderContactField(account, item.collection, item.href, key, null, "") }, `Add ${key}`));
@@ -7614,6 +7679,10 @@ async function confirmAgentPending(pendingId) {
       AssistantState.confirmAttemptsByPendingId.delete(pendingId);
       updateAgentPendingStatus(record, "pending");
       record.error = nativeConfirmationMessage("cancelled");
+    } else if ((record.capture_operation || record.photo_operation || (typeof record.preview === "string" && record.preview.startsWith("Change contact photo for account "))) && (!e || !e.responseReceived || e.code === "confirmation_retryable")) {
+      updateAgentPendingStatus(record, "outcome_unknown");
+      record.error = record.capture_operation ? "The capture outcome is unknown. Check its status; do not repeat the request." : "The contact photo update outcome is unknown. Check the contact before making another change.";
+      clearAgentPendingAuthority(record);
     } else if (!e || !e.responseReceived || e.code === "confirmation_retryable") {
       attempt.phase = "retryable";
       updateAgentPendingStatus(record, "retryable");
@@ -7630,6 +7699,10 @@ async function confirmAgentPending(pendingId) {
       record.error = status === "expired" ? "Confirmation expired."
         : status === "cancelled" ? "Confirmation was cancelled."
         : e.code === "provider_submission_rejected" || e.code === "provider_action_rejected" ? "The provider rejected the action."
+        : e.code === "capture_preflight_source" ? "The source could not be read before the capture was claimed; no capture was sent."
+        : e.code === "capture_preflight_version_changed" ? "The source changed before the capture was claimed; no capture was sent. Review the current version."
+        : e.code === "capture_preflight_challenge" ? "Capture authorization could not be prepared; no capture was sent."
+        : e.code === "capture_preflight_journal" ? "The capture journal could not be prepared; no capture was sent."
         : e.code === "provider_conflict" ? "The item changed before the update. Review the current version."
         : "The action was not confirmed.";
       clearAgentPendingAuthority(record);
@@ -9370,12 +9443,16 @@ const ACCOUNT_ROLE_META = Object.freeze({
 });
 function accountRoleStatus(a, role) {
   const value = a && a.auth && a.auth[role];
-  return value && ["connected", "disconnected", "reconnect_required"].includes(value.state)
+  return value && ["connected", "disconnected", "reconnect_required", "permission_denied", "access_unknown", "service_unreachable", "provider_response_invalid"].includes(value.state)
     ? value : { state: "disconnected", identity_verified: false };
 }
 function accountRoleStateLabel(status) {
-  if (status.state === "connected") return status.identity_verified ? "Connected" : "Connected · verification pending";
-  if (status.state === "reconnect_required") return "Reconnect required";
+  if (status.state === "connected") return status.identity_verified ? "Connected" : "Connected · last access observed; identity verification pending";
+  if (status.state === "reconnect_required") return "Sign-in required";
+  if (status.state === "permission_denied") return "Access denied · check account permissions";
+  if (status.state === "access_unknown") return "Access could not be verified";
+  if (status.state === "service_unreachable") return "Mail service unreachable";
+  if (status.state === "provider_response_invalid") return "Mail service response invalid or unsupported";
   return "Not connected";
 }
 async function reloadAccounts() {
@@ -9399,7 +9476,8 @@ function renderAccountMenu(body) {
         el("div", { class: "dim", style: "font-size:11px", text: active ? "Currently selected" : (a.provider === "self_hosted" ? "Self-hosted account" : "Microsoft 365 account") })),
       active ? icon("check", "icon-sm") : null));
     if (CAP.account && a.provider === "self_hosted") {
-      const connected = accountRoleStatus(a, "reader").state === "connected";
+      const providerStatus = accountRoleStatus(a, "reader");
+      const connected = ["connected", "permission_denied", "access_unknown", "service_unreachable", "provider_response_invalid"].includes(providerStatus.state);
       const controls = el("div", { class: "acct-acts" });
       const connectButton = el("button", { class: "btn sm", disabled: providerActionsUnknown.has(a.id) ? "disabled" : null, onclick: () => providerAccountAction(a, body, connected) }, connected ? "Disconnect" : "Connect");
       controls.append(connectButton);
@@ -9429,7 +9507,7 @@ function renderAccountMenu(body) {
       }
       row.append(el("div", { class: "acct-role" },
         el("span", { class: "acct-role-copy" }, el("b", { text: "Self-hosted account" }),
-          el("span", { class: "dim", text: connected ? "Local grant available" : "Not connected" })), controls));
+          el("span", { class: "dim", text: accountRoleStateLabel(providerStatus) })), controls));
       {
         const listQuarantine = BRIDGE
           ? nativeCall("providerQuarantineList", { account: a.id }, NATIVE_TIMEOUT_MS)
@@ -9463,8 +9541,8 @@ function renderAccountMenu(body) {
         const replacement = el("button", {class:"btn sm",type:"button",style:"display:none"}, "Register replacement");
         const showPush = result => {
           const state = result && result.status;
-          const labels = { not_registered: "Not configured", configuration_required: "Configuration required", registering: "Registering", endpoint_received: "Endpoint received", credentials_ready: "Configure distributor", awaiting_proof: "Awaiting verification", verification_pending: "Verification pending", active: "Registered; delivery not yet observed", degraded: "Delayed", account_changed: "Push configuration must be reviewed", create_unknown: "Enrollment outcome unknown", delivery_unknown: "Verification outcome unknown", prepare_unknown: "Push setup outcome unknown", prepare_cancel_unknown: "Setup cancellation outcome unknown", prepare_cancelled: "Uncertain preparation cancelled", prepare_cancel_conflict: "A server binding remains; review required", distributor_detached: "Local connector removed; distributor acknowledgement unknown", distributor_unregister_unknown: "Local connector removal outcome unknown", unavailable: "Unavailable" };
-          const uncertain = state === "prepare_unknown" || state === "prepare_cancel_unknown";
+          const labels = { not_registered: "Not configured", configuration_required: "Configuration required", registering: "Registering", endpoint_received: "Endpoint received", credentials_ready: "Configure distributor", credentials_expired: "Push preparation expired", awaiting_proof: "Awaiting verification", verification_pending: "Verification pending", active: "Registered; delivery not yet observed", degraded: "Delayed", account_changed: "Push configuration must be reviewed", create_unknown: "Enrollment outcome unknown", delivery_unknown: "Verification outcome unknown", prepare_unknown: "Push setup outcome unknown", prepare_cancel_unknown: "Setup cancellation outcome unknown", prepare_cancelled: "Uncertain preparation cancelled", prepare_cancel_conflict: "A server binding remains; review required", distributor_detached: "Local connector removed; distributor acknowledgement unknown", distributor_unregister_unknown: "Local connector removal outcome unknown", unavailable: "Unavailable" };
+          const uncertain = state === "prepare_unknown" || state === "prepare_cancel_unknown" || state === "credentials_expired";
           setup.disabled = !state || uncertain || ["prepare_cancel_conflict","prepare_cancelled","distributor_detached","distributor_unregister_unknown"].includes(state);
           reconcile.style.display = uncertain ? "" : "none";
           detach.style.display = state === "prepare_cancelled" ? "" : "none";
@@ -9479,7 +9557,7 @@ function renderAccountMenu(body) {
           catch (_) { toast("Push setup outcome could not be confirmed. Check its status before taking further action.", "err"); await refreshPush(); }
         });
         reconcile.addEventListener("click",() => {
-          const explanation=el("div",{class:"compose"},el("p",{text:"The server outcome of push setup is unknown. This action asks the server to cancel the uncertain preparation and checks whether a binding remains. It does not remove an existing binding or sign you out."}));
+          const explanation=el("div",{class:"compose"},el("p",{text:"The push preparation has expired or its server outcome is unknown. This action asks the server to cancel the preparation and checks whether a binding remains. It does not remove an existing binding or sign you out."}));
           explanation.append(el("button",{class:"btn sm",type:"button",onclick:async event=>{
             const button=event.currentTarget;button.disabled=true;reconcile.disabled=true;
             try {

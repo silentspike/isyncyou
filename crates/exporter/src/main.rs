@@ -20,6 +20,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 struct Config {
     origin: String,
     trusted_public_origin: String,
+    identity_origin: String,
     dav_entry: String,
     store: PathBuf,
     archive: PathBuf,
@@ -81,6 +82,13 @@ fn run(config: Config, stage: &Cell<&'static str>) -> Result<()> {
         || config.minimum_free_bytes < 256 * 1024 * 1024
     {
         return Err("invalid private exporter configuration".into());
+    }
+    let identity = Url::parse(&config.identity_origin)?;
+    let public = Url::parse(&config.trusted_public_origin)?;
+    if identity.scheme() != "https" || identity.host_str().is_none() || identity.path() != "/" ||
+        !identity.username().is_empty() || identity.password().is_some() || identity.query().is_some() || identity.fragment().is_some() ||
+        identity != public {
+        return Err("invalid enrolled identity origin".into());
     }
     if config.archive.symlink_metadata().is_ok_and(|meta| meta.file_type().is_symlink()) {
         return Err("archive path is a symlink".into());
@@ -242,7 +250,7 @@ fn run(config: Config, stage: &Cell<&'static str>) -> Result<()> {
             || previous
                 .collections
                 .iter()
-                .any(|x| x.account != account || x.origin != config.origin)
+                .any(|x| x.account != account || (x.origin != config.origin && x.origin != identity.origin().ascii_serialization()))
             || previous.capture_highwater > snapshot.capture_highwater
             || previous.event_highwater > snapshot.event_highwater
         {
@@ -334,7 +342,7 @@ fn run(config: Config, stage: &Cell<&'static str>) -> Result<()> {
     {
         return Err("source checkpoint changed".into());
     }
-    let manifest = Manifest {
+    let mut manifest = Manifest {
         schema: 1,
         capture_highwater: capture,
         event_highwater: after,
@@ -342,6 +350,8 @@ fn run(config: Config, stage: &Cell<&'static str>) -> Result<()> {
         objects,
         events,
     };
+    stage.set("identity-canonicalization");
+    isyncyou_exporter::canonicalize_manifest_identity(&mut manifest, &config.origin, &config.identity_origin)?;
     stage.set("generation-publication");
     let generation = isyncyou_exporter::publish(&config.archive, &manifest)?;
     println!("{{\"state\":\"captured_locally\",\"generation\":\"{generation}\"}}");

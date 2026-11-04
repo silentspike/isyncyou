@@ -411,7 +411,9 @@ product_post_routes! {
     AgentContactFieldPrepare => ("/api/v1/agent/contact/field/prepare", 8 * 1024, Agent),
     AgentMailActionPrepare => ("/api/v1/agent/mail/action/prepare", 8 * 1024, Agent),
     AgentTaskAttributesPrepare => ("/api/v1/agent/task/attributes/prepare", 8 * 1024, Agent),
+    AgentTaskParentPrepare => ("/api/v1/agent/task/parent/prepare", 8 * 1024, Agent),
     AgentCancellationPrepare => ("/api/v1/agent/calendar/cancel/prepare", 8 * 1024, Agent),
+    AgentContactPhotoPrepare => ("/api/v1/agent/contact/photo/prepare", 8 * 1024, Agent),
     AgentSingleCapturePrepare => ("/api/v1/agent/recovery/capture/prepare", 8 * 1024, Agent),
     AgentRecoveryJobsPrepare => ("/api/v1/agent/recovery/jobs/prepare", 32 * 1024, Agent),
     AgentRecoveryImportPrepare => ("/api/v1/agent/recovery/import/prepare", 8 * 1024, Agent),
@@ -451,7 +453,7 @@ impl ProductPostRoute {
         use ProductPostRoute::*;
         match self {
             AgentTurn => ProductReplayPolicy::AtomicTurnAdmission,
-            AccountLoginStart | AccountQuarantineList | AgentUserPresenceStart | AgentComposerPrepare | AgentComposerIdentities | AgentContactNamePrepare | AgentTaskCompletionPrepare | AgentCalendarTextPrepare | AgentCalendarTimePrepare | AgentDavAclPrepare | AgentInvitationResponsePrepare | AgentDavDeletePrepare | AgentDavCreatePrepare | AgentContactFieldPrepare | AgentMailActionPrepare | AgentTaskAttributesPrepare | AgentCancellationPrepare | AgentSingleCapturePrepare | AgentRecoveryJobsPrepare | AgentRecoveryImportPrepare | AgentRecoveryReconcile => ProductReplayPolicy::EphemeralResponse,
+            AccountLoginStart | AccountQuarantineList | AgentUserPresenceStart | AgentComposerPrepare | AgentComposerIdentities | AgentContactNamePrepare | AgentTaskCompletionPrepare | AgentCalendarTextPrepare | AgentCalendarTimePrepare | AgentDavAclPrepare | AgentInvitationResponsePrepare | AgentDavDeletePrepare | AgentDavCreatePrepare | AgentContactFieldPrepare | AgentMailActionPrepare | AgentTaskAttributesPrepare | AgentTaskParentPrepare | AgentCancellationPrepare | AgentContactPhotoPrepare | AgentSingleCapturePrepare | AgentRecoveryJobsPrepare | AgentRecoveryImportPrepare | AgentRecoveryReconcile => ProductReplayPolicy::EphemeralResponse,
             AccountLoginPoll
             | AccountLoginCancel
             | MutationIntentCreate
@@ -1354,7 +1356,9 @@ fn scalar_product_fields(route: ProductPostRoute) -> Option<&'static [&'static s
         | AgentContactFieldPrepare
         | AgentMailActionPrepare
         | AgentTaskAttributesPrepare
+        | AgentTaskParentPrepare
         | AgentCancellationPrepare
+        | AgentContactPhotoPrepare
         | AgentSingleCapturePrepare
         | AgentRecoveryJobsPrepare
         | AgentRecoveryImportPrepare
@@ -1789,7 +1793,9 @@ fn canonicalize_scalar_product_payload(
         | AgentContactFieldPrepare
         | AgentMailActionPrepare
         | AgentTaskAttributesPrepare
+        | AgentTaskParentPrepare
         | AgentCancellationPrepare
+        | AgentContactPhotoPrepare
         | AgentSingleCapturePrepare
         | AgentRecoveryJobsPrepare
         | AgentRecoveryImportPrepare
@@ -1890,7 +1896,9 @@ fn canonicalize_product_payload(
         AgentContactFieldPrepare => canonical_typed!(AgentContactFieldPrepareRequest),
         AgentMailActionPrepare => canonical_typed!(AgentMailActionPrepareRequest),
         AgentTaskAttributesPrepare => canonical_typed!(AgentTaskAttributesPrepareRequest),
+        AgentTaskParentPrepare => canonical_typed!(AgentTaskParentPrepareRequest),
         AgentCancellationPrepare => canonical_typed!(AgentCancellationPrepareRequest),
+        AgentContactPhotoPrepare => canonical_typed!(AgentContactPhotoPrepareRequest),
         AgentSingleCapturePrepare => canonical_typed!(AgentSingleCapturePrepareRequest),
         AgentRecoveryJobsPrepare => canonical_typed!(AgentRecoveryJobsPrepareRequest),
         AgentRecoveryImportPrepare => canonical_typed!(AgentRecoveryImportPrepareRequest),
@@ -2107,9 +2115,17 @@ fn validate_typed_product_request(
             let r = serde_json::from_value::<AgentTaskAttributesPrepareRequest>(value.clone()).map_err(|_| no_store_json_error(400, "invalid product request"))?;
             (valid_opaque_agent_id(&r.session_id) && !r.account.is_empty() && !r.collection.is_empty() && !r.href.is_empty() && !r.uid.is_empty() && (r.priority.is_some() || r.due.is_some())).then_some(()).ok_or_else(|| no_store_json_error(400, "invalid product request"))
         }
+        AgentTaskParentPrepare => {
+            let r = serde_json::from_value::<AgentTaskParentPrepareRequest>(value.clone()).map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&r.session_id) && !r.account.is_empty() && !r.collection.is_empty() && !r.href.is_empty() && !r.uid.is_empty() && r.new_parent.as_ref().is_none_or(|p| !p.is_empty())).then_some(()).ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
         AgentCancellationPrepare => {
             let r = serde_json::from_value::<AgentCancellationPrepareRequest>(value.clone()).map_err(|_| no_store_json_error(400, "invalid product request"))?;
             (valid_opaque_agent_id(&r.session_id) && !r.account.is_empty() && !r.collection.is_empty() && !r.href.is_empty() && !r.uid.is_empty()).then_some(()).ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentContactPhotoPrepare => {
+            let r=serde_json::from_value::<AgentContactPhotoPrepareRequest>(value.clone()).map_err(|_| no_store_json_error(400,"invalid product request"))?;
+            (valid_opaque_agent_id(&r.session_id) && !r.account.is_empty() && valid_opaque_agent_id(&r.stage_id)).then_some(()).ok_or_else(|| no_store_json_error(400,"invalid product request"))
         }
         AgentSingleCapturePrepare => {
             let r=serde_json::from_value::<AgentSingleCapturePrepareRequest>(value.clone()).map_err(|_| no_store_json_error(400,"invalid product request"))?;
@@ -2638,6 +2654,10 @@ pub enum ClosedConfirmationFailure {
     ProviderRejected,
     ProviderActionRejected,
     ProviderConflict,
+    CaptureSourceUnavailable,
+    CaptureVersionChanged,
+    CaptureChallengeUnavailable,
+    CaptureJournalUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2950,10 +2970,16 @@ pub struct AgentMailActionPrepareRequest { pub request_id:String, pub session_id
 pub struct AgentTaskAttributesPrepareRequest { pub request_id:String, pub session_id:String, pub account:String, pub collection:String, pub href:String, pub uid:String, pub priority:Option<u8>, pub due:Option<String>, pub due_date:bool }
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct AgentTaskParentPrepareRequest { pub request_id:String, pub session_id:String, pub account:String, pub collection:String, pub href:String, pub uid:String, pub new_parent:Option<String> }
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentCancellationPrepareRequest { pub request_id:String, pub session_id:String, pub account:String, pub collection:String, pub href:String, pub uid:String, pub recurrence_id:Option<String>, pub sequence:u32 }
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentRecoveryCatalogChoice { pub cursor:u64, pub generation:String, pub object:String, pub version:String, pub kind:String }
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentContactPhotoPrepareRequest { pub request_id:String, pub session_id:String, pub account:String, pub stage_id:String }
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSingleCapturePrepareRequest { pub request_id:String, pub session_id:String, pub account:String, pub service:String, pub collection:String, pub href:String }
@@ -2984,9 +3010,13 @@ pub trait AgentHandler: Send + Sync {
     fn prepare_dav_create(&self, _request:&AgentDavCreatePrepareRequest) -> Result<Value, String> { Err("confirmation_unavailable".into()) }
     fn prepare_contact_field(&self, _request:&AgentContactFieldPrepareRequest) -> Result<Value, String> { Err("confirmation_unavailable".into()) }
     fn prepare_mail_action(&self, _request:&AgentMailActionPrepareRequest) -> Result<Value, String> { Err("confirmation_unavailable".into()) }
+    fn prepare_task_parent(&self, _request:&AgentTaskParentPrepareRequest) -> Result<Value,String> { Err("confirmation_unavailable".into()) }
     fn prepare_task_attributes(&self, _request:&AgentTaskAttributesPrepareRequest) -> Result<Value, String> { Err("confirmation_unavailable".into()) }
     fn prepare_cancellation(&self, _request:&AgentCancellationPrepareRequest) -> Result<Value, String> { Err("confirmation_unavailable".into()) }
+    fn single_capture_intent_phase(&self, _account:&str, _session:&str, _operation:&str, _pending:&str, _action_hash:&str) -> Result<Value,String> { Err("capture_unavailable".into()) }
+    fn single_capture_has_claim(&self, _account:&str, _session:&str, _operation:&str) -> Result<bool,String> { Err("capture_unavailable".into()) }
     fn single_capture_status(&self, _account:&str, _session:&str, _operation:&str) -> Result<Value,String> { Err("capture_unavailable".into()) }
+    fn prepare_contact_photo(&self, _request:&AgentContactPhotoPrepareRequest) -> Result<Value,String> { Err("confirmation_unavailable".into()) }
     fn prepare_single_capture(&self, _request:&AgentSingleCapturePrepareRequest) -> Result<Value,String> { Err("confirmation_unavailable".into()) }
     fn prepare_recovery_jobs(&self, _request:&AgentRecoveryJobsPrepareRequest) -> Result<Value,String> { Err("confirmation_unavailable".into()) }
     fn prepare_recovery_import(&self, _request:&AgentRecoveryImportPrepareRequest) -> Result<Value,String> { Err("confirmation_unavailable".into()) }
@@ -3413,6 +3443,13 @@ pub trait OneDriveRiskHandler: Send + Sync {
 pub struct ProviderMailView { pub content: String, pub is_html: bool, pub incomplete: bool }
 pub struct ProviderAttachmentDownload { pub filename:String, pub bytes:Vec<u8> }
 
+fn provider_contact_photo_response(photo:Option<(String,Vec<u8>)>) -> ApiResponse {
+    match photo {
+        Some((mime,bytes)) if matches!(mime.as_str(),"image/png" | "image/jpeg") && bytes.len() <= 2 * 1024 * 1024 => with_no_store(ApiResponse { status:200, content_type:mime, body:bytes, headers:vec![("X-Content-Type-Options".into(),"nosniff".into())] }),
+        _ => with_no_store(ApiResponse::error(404,"contact_photo_unavailable")),
+    }
+}
+
 fn provider_attachment_response(file: ProviderAttachmentDownload) -> ApiResponse {
     let encoded: String = file.filename.as_bytes().iter().map(|byte| if byte.is_ascii_alphanumeric() || matches!(*byte, b'-'|b'_'|b'.') { (*byte as char).to_string() } else { format!("%{byte:02X}") }).collect::<Vec<_>>().concat();
     ApiResponse { status:200, content_type:"application/octet-stream".into(), body:file.bytes, headers:vec![("Content-Disposition".into(),format!("attachment; filename=\"attachment\"; filename*=UTF-8''{encoded}")), ("Cache-Control".into(),"no-store".into())] }
@@ -3426,6 +3463,13 @@ fn render_provider_mail_view(body: ProviderMailView) -> ApiResponse {
 }
 
 pub trait MailWriteHandler: Send + Sync {
+    /// Fresh authenticated discovery; errors must hide shared cached accounts.
+    fn provider_shared_mail_accounts(&self, _account:&str) -> Result<Vec<String>, String> {
+        Err("provider_scope_unavailable".into())
+    }
+    fn provider_shared_mailbox_ids(&self, _account:&str, _scope:&str) -> Result<Vec<String>, String> {
+        Err("provider_scope_unavailable".into())
+    }
     fn provider_store(&self, _account: &str) -> Result<Store, String> {
         Err("provider_store_unavailable".into())
     }
@@ -3438,8 +3482,20 @@ pub trait MailWriteHandler: Send + Sync {
     }
     fn provider_attachment_list(&self, _account:&str, _message_id:&str) -> Result<Value, String> { Err("provider_attachment_unavailable".into()) }
     fn provider_attachment_download(&self, _account:&str, _message_id:&str, _blob_id:&str) -> Result<ProviderAttachmentDownload, String> { Err("provider_attachment_unavailable".into()) }
+    fn provider_attachment_list_scoped(&self, account:&str, scope:Option<&str>, message_id:&str) -> Result<Value, String> {
+        if scope.is_some() { return Err("provider_scope_unavailable".into()); }
+        self.provider_attachment_list(account, message_id)
+    }
+    fn provider_attachment_download_scoped(&self, account:&str, scope:Option<&str>, message_id:&str, blob_id:&str) -> Result<ProviderAttachmentDownload, String> {
+        if scope.is_some() { return Err("provider_scope_unavailable".into()); }
+        self.provider_attachment_download(account, message_id, blob_id)
+    }
     fn provider_read_view(&self, account: &str, message_id: &str) -> Result<ProviderMailView, String> {
         self.provider_read_body(account, message_id).map(|content| ProviderMailView { content, is_html:false, incomplete:false })
+    }
+    fn provider_read_view_scoped(&self, account:&str, scope:Option<&str>, message_id:&str) -> Result<ProviderMailView, String> {
+        if scope.is_some() { return Err("provider_scope_unavailable".into()); }
+        self.provider_read_view(account, message_id)
     }
     /// Read the current Graph `isRead` value for one opaque message id.
     /// This is intentionally separate from StoreArchive reads so callers can
@@ -3534,6 +3590,7 @@ pub trait MailWriteHandler: Send + Sync {
 /// `/api/v1/calendar/*` POST is refused there. `event` is a Graph event resource
 /// the router builds from the request (sanitized to writable fields downstream).
 pub trait CalendarWriteHandler: Send + Sync {
+    fn provider_contact_photo(&self, _account:&str, _collection:&str, _href:&str) -> Result<Option<(String,Vec<u8>)>,String> { Err("provider_photo_unavailable".into()) }
     fn provider_calendar(&self, _account:&str, _collection:Option<&str>, _after:&str) -> Result<Value, String> { Err("provider_calendar_unavailable".into()) }
     fn provider_expanded_month(&self, _account:&str, _collection:&str, _year:u32, _month:u32) -> Result<Value, String> { Err("provider_calendar_unavailable".into()) }
     fn provider_freebusy_month(&self, _account:&str, _collection:&str, _year:u32, _month:u32) -> Result<Value, String> { Err("provider_freebusy_unavailable".into()) }
@@ -3693,6 +3750,7 @@ pub enum MutationPurpose {
         all: bool,
     },
     MailAttachment { account:String, filename:String, content_type:String },
+    ContactPhoto { account:String, collection:String, href:String, media_type:String },
     OnenoteBody {
         account: String,
         operation: String,
@@ -3765,6 +3823,7 @@ impl MutationPurpose {
                     }
             }
             Self::MailAttachment { account, filename, content_type } => !account.is_empty() && !filename.is_empty() && filename.len() <= 255 && !filename.chars().any(char::is_control) && !content_type.is_empty() && content_type.len() <= 255 && content_type.is_ascii() && !content_type.chars().any(|c| c.is_control() || c.is_whitespace()),
+            Self::ContactPhoto { account,collection,href,media_type } => !account.is_empty() && !collection.is_empty() && collection.len()<=4096 && !href.is_empty() && href.len()<=4096 && matches!(media_type.as_str(),"image/png"|"image/jpeg") && !collection.chars().any(char::is_control) && !href.chars().any(char::is_control),
             Self::OnenoteBody {
                 account,
                 operation,
@@ -3813,6 +3872,7 @@ impl MutationPurpose {
                 format!("{operation}#{binding}"),
             ),
             Self::MailAttachment { account, filename, .. } => ("live-write", account, "mail", format!("attachment:{filename}#{binding}")),
+            Self::ContactPhoto {account,href,..} => ("live-write",account,"contacts",format!("photo:{href}#{binding}")),
             Self::OnenoteBody {
                 account, operation, ..
             } => (
@@ -3951,6 +4011,10 @@ pub enum AccountAuthState {
     Connected,
     Disconnected,
     ReconnectRequired,
+    PermissionDenied,
+    AccessUnknown,
+    ServiceUnreachable,
+    ProviderResponseInvalid,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -5134,7 +5198,9 @@ impl Router {
                 ProductPostRoute::AgentContactFieldPrepare => self.agent_contact_field_prepare(req),
                 ProductPostRoute::AgentMailActionPrepare => self.agent_mail_action_prepare(req),
                 ProductPostRoute::AgentTaskAttributesPrepare => self.agent_task_attributes_prepare(req),
+                ProductPostRoute::AgentTaskParentPrepare => self.agent_task_parent_prepare(req),
                 ProductPostRoute::AgentCancellationPrepare => self.agent_cancellation_prepare(req),
+                ProductPostRoute::AgentContactPhotoPrepare => self.agent_contact_photo_prepare(req),
                 ProductPostRoute::AgentSingleCapturePrepare => self.agent_single_capture_prepare(req),
                 ProductPostRoute::AgentRecoveryJobsPrepare => self.agent_recovery_jobs_prepare(req),
                 ProductPostRoute::AgentRecoveryImportPrepare => self.agent_recovery_import_prepare(req),
@@ -5327,6 +5393,8 @@ impl Router {
             "/api/v1/calendar/expanded" => self.calendar_expanded(req),
             "/api/v1/agent/recovery/catalog" => self.agent_recovery_catalog(req),
             "/api/v1/agent/recovery/requests" => self.agent_recovery_requests(req),
+            "/api/v1/agent/recovery/capture/intent-phase" => self.agent_single_capture_intent_phase(req),
+            "/api/v1/agent/recovery/capture/claim" => self.agent_single_capture_claim(req),
             "/api/v1/agent/recovery/capture/status" => self.agent_single_capture_status(req),
             "/api/v1/agent/recovery/receipt" => self.agent_recovery_receipt(req),
             "/api/v1/agent/recovery/review" => self.agent_recovery_review(req),
@@ -8391,6 +8459,13 @@ impl Router {
         match handler.prepare_mail_action(&r) { Ok(value) => with_no_store(ApiResponse::ok_json(&value)), Err(_) => no_store_json_error(409, "mail_prepare_unavailable") }
     }
 
+    fn agent_task_parent_prepare(&self, req:&ApiRequest) -> ApiResponse {
+        let handler=match self.agent_gate(req) { Ok(handler)=>handler, Err(error)=>return with_no_store(error) };
+        let r:AgentTaskParentPrepareRequest=match parse_agent_strict_json(req,"task parent prepare") { Ok(request)=>request, Err(error)=>return error };
+        if !valid_client_request_id(&r.request_id) || !valid_opaque_agent_id(&r.session_id) || r.account.is_empty() || r.collection.is_empty() || r.href.is_empty() || r.uid.is_empty() || r.new_parent.as_ref().is_some_and(|p| p.is_empty()) { return no_store_json_error(400,"invalid task request"); }
+        match handler.prepare_task_parent(&r) { Ok(value)=>with_no_store(ApiResponse::ok_json(&value)), Err(_)=>no_store_json_error(409,"task_prepare_unavailable") }
+    }
+
     fn agent_task_attributes_prepare(&self, req: &ApiRequest) -> ApiResponse {
         let handler = match self.agent_gate(req) { Ok(handler) => handler, Err(error) => return with_no_store(error) };
         let r: AgentTaskAttributesPrepareRequest = match parse_agent_strict_json(req, "task attributes prepare") { Ok(request) => request, Err(error) => return error };
@@ -8405,11 +8480,29 @@ impl Router {
         match handler.prepare_cancellation(&r) { Ok(value) => with_no_store(ApiResponse::ok_json(&value)), Err(_) => no_store_json_error(409, "cancellation_prepare_unavailable") }
     }
 
+    fn agent_single_capture_intent_phase(&self, req:&ApiRequest) -> ApiResponse {
+        let handler=match self.agent_gate(req) {Ok(handler)=>handler,Err(error)=>return with_no_store(error)};
+        let (Some(account),Some(session),Some(operation),Some(pending),Some(hash))=(req.q("account"),req.q("session_id"),req.q("operation_id"),req.q("pending"),req.q("action_hash")) else {return no_store_json_error(400,"invalid capture request");};
+        if account.is_empty() || !valid_opaque_agent_id(session) || operation.is_empty() || operation.len()>128 || !operation.bytes().all(|b| b.is_ascii_alphanumeric() || b==b'-' || b==b'_') || !valid_exact_base64url(pending,22) || !valid_sha256(hash) {return no_store_json_error(400,"invalid capture request");}
+        match handler.single_capture_intent_phase(account,session,operation,pending,hash) {Ok(value)=>with_no_store(ApiResponse::ok_json(&value)),Err(_)=>no_store_json_error(409,"capture_intent_unavailable")}
+    }
+    fn agent_single_capture_claim(&self, req:&ApiRequest) -> ApiResponse {
+        let handler=match self.agent_gate(req) {Ok(handler)=>handler,Err(error)=>return with_no_store(error)};
+        let (Some(account),Some(session),Some(operation))=(req.q("account"),req.q("session_id"),req.q("operation_id")) else {return no_store_json_error(400,"invalid capture request");};
+        if account.is_empty() || !valid_opaque_agent_id(session) || operation.is_empty() || operation.len()>128 || !operation.bytes().all(|b| b.is_ascii_alphanumeric() || b==b'-' || b==b'_') {return no_store_json_error(400,"invalid capture request");}
+        match handler.single_capture_has_claim(account,session,operation) {Ok(value)=>with_no_store(ApiResponse::ok_json(&json!({"claim_present":value}))),Err(_)=>no_store_json_error(409,"capture_claim_unavailable")}
+    }
     fn agent_single_capture_status(&self, req:&ApiRequest) -> ApiResponse {
         let handler=match self.agent_gate(req) {Ok(handler)=>handler,Err(error)=>return with_no_store(error)};
         let (Some(account),Some(session),Some(operation))=(req.q("account"),req.q("session_id"),req.q("operation_id")) else {return no_store_json_error(400,"invalid capture request");};
         if account.is_empty() || !valid_opaque_agent_id(session) || operation.is_empty() || operation.len()>128 || !operation.bytes().all(|b| b.is_ascii_alphanumeric() || b==b'-' || b==b'_') {return no_store_json_error(400,"invalid capture request");}
-        match handler.single_capture_status(account,session,operation) {Ok(value)=>with_no_store(ApiResponse::ok_json(&value)),Err(_)=>no_store_json_error(409,"capture_status_unavailable")}
+        match handler.single_capture_status(account,session,operation) {Ok(value)=>with_no_store(ApiResponse::ok_json(&value)),Err(error)=>no_store_json_error(409,if error=="capture_local_intent_missing" {"capture_local_intent_missing"} else {"capture_status_unavailable"})}
+    }
+    fn agent_contact_photo_prepare(&self,req:&ApiRequest)->ApiResponse {
+        let handler=match self.agent_gate(req) {Ok(handler)=>handler,Err(error)=>return with_no_store(error)};
+        let r:AgentContactPhotoPrepareRequest=match parse_agent_strict_json(req,"photo prepare") {Ok(request)=>request,Err(error)=>return error};
+        if !valid_client_request_id(&r.request_id) || !valid_opaque_agent_id(&r.session_id) || r.account.is_empty() || !valid_opaque_agent_id(&r.stage_id) {return no_store_json_error(400,"invalid photo request");}
+        match handler.prepare_contact_photo(&r) {Ok(value)=>with_no_store(ApiResponse::ok_json(&value)),Err(_)=>no_store_json_error(409,"photo_prepare_unavailable")}
     }
     fn agent_single_capture_prepare(&self, req:&ApiRequest) -> ApiResponse {
         let handler=match self.agent_gate(req) { Ok(handler)=>handler,Err(error)=>return with_no_store(error) };
@@ -8895,6 +8988,10 @@ impl Router {
             AgentConfirmOutcome::Failed(ClosedConfirmationFailure::ProviderRejected) => no_store_json_error(409, "provider_submission_rejected"),
             AgentConfirmOutcome::Failed(ClosedConfirmationFailure::ProviderActionRejected) => no_store_json_error(409, "provider_action_rejected"),
             AgentConfirmOutcome::Failed(ClosedConfirmationFailure::ProviderConflict) => no_store_json_error(409, "provider_conflict"),
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::CaptureSourceUnavailable) => no_store_json_error(409, "capture_preflight_source"),
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::CaptureVersionChanged) => no_store_json_error(409, "capture_preflight_version_changed"),
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::CaptureChallengeUnavailable) => no_store_json_error(409, "capture_preflight_challenge"),
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::CaptureJournalUnavailable) => no_store_json_error(409, "capture_preflight_journal"),
             AgentConfirmOutcome::Failed(_) => no_store_json_error(409, "confirmation_failed"),
             AgentConfirmOutcome::Rejected(code) => agent_closed_confirmation_response(code),
             AgentConfirmOutcome::Retryable => no_store_json_error(503, "confirmation_retryable"),
@@ -9437,15 +9534,50 @@ impl Router {
             Ok(scopes) if scopes.len() <= 1 => scopes,
             _ => return ApiResponse::error(503, "provider_scope_unavailable"),
         };
-        let Some(scope) = scopes.first() else { return ApiResponse::ok_json(&json!({"items": [], "count": 0, "total": null, "provenance": "local", "observed_at": null})); };
+        let shared = match store.provider_scopes(account, origin, "mail-shared") {
+            Ok(scopes) if scopes.len() <= 1000 => scopes,
+            _ => return ApiResponse::error(503, "provider_scope_unavailable"),
+        };
+        if scopes.first().is_some_and(|primary| shared.iter().any(|candidate| candidate.collection == primary.collection)) { return ApiResponse::error(503, "provider_scope_unavailable"); }
+        let discovered = self.mail_write.as_ref().and_then(|handler| handler.provider_shared_mail_accounts(account).ok()).unwrap_or_default();
+        let mut available = Vec::new();
+        if let Some(primary) = scopes.first() {
+            available.push(json!({"mail_scope":primary.collection,"primary":true}));
+        }
+        for candidate in &shared {
+            match store.provider_accessible(candidate) {
+                Ok(Some(true)) if discovered.contains(&candidate.collection) && self.mail_write.as_ref().and_then(|handler| handler.provider_shared_mailbox_ids(account,&candidate.collection).ok()).is_some_and(|ids| !ids.is_empty()) => available.push(json!({"mail_scope":candidate.collection,"primary":false})),
+                Ok(_) => (),
+                Err(_) => return ApiResponse::error(503, "provider_scope_unavailable"),
+            }
+        }
+        let requested = req.q("mail_scope");
+        let scope = match requested {
+            None => scopes.first(),
+            Some(id) => scopes.iter().chain(shared.iter()).find(|scope| scope.collection == id),
+        };
+        let Some(scope) = scope else {
+            if requested.is_some() { return ApiResponse::error(404, "provider_scope_unavailable"); }
+            return ApiResponse::ok_json(&json!({"items": [], "scopes":available, "count": 0, "total": null, "provenance": "local", "observed_at": null}));
+        };
+        let is_shared = scope.service == "mail-shared";
+        if is_shared && (!discovered.contains(&scope.collection) || store.provider_accessible(scope).ok().flatten() != Some(true)) { return ApiResponse::error(404, "provider_scope_unavailable"); }
+        let current_mailboxes = if is_shared {
+            match self.mail_write.as_ref().and_then(|handler| handler.provider_shared_mailbox_ids(account,&scope.collection).ok()) {
+                Some(ids) => ids,
+                None => return ApiResponse::error(404,"provider_scope_unavailable"),
+            }
+        } else { Vec::new() };
         let cursor = req.q("after").unwrap_or("");
         if cursor.len() > 1024 || cursor.chars().any(char::is_control) { return ApiResponse::error(400, "invalid_provider_cursor"); }
         let offset = if cursor.is_empty() { req.q("offset").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(1000) } else { 0 };
         let limit = (clamp_limit(req.q("limit")) as usize).min(1000);
         let mut items = Vec::new();
-        if offset == 0 && cursor.is_empty() {
+        let mut readable_folders = std::collections::HashSet::new();
+        if (offset == 0 && cursor.is_empty()) || is_shared {
             let mut folders = scope.clone();
-            folders.service = "mailboxes".into();
+            folders.service = if is_shared { "mailboxes-shared" } else { "mailboxes" }.into();
+            if is_shared && store.provider_accessible(&folders).ok().flatten() != Some(true) { return ApiResponse::error(404, "provider_scope_unavailable"); }
             let mut folder_after = String::new();
             let mut folder_count = 0usize;
             loop {
@@ -9455,7 +9587,11 @@ impl Router {
                     folder_after = folder.remote_id.clone(); folder_count += 1;
                     if folder_count > 1000 { return ApiResponse::error(503, "provider_mailboxes_limit"); }
                     let value: Value = match serde_json::from_slice(&folder.raw) { Ok(value) => value, Err(_) => return ApiResponse::error(503, "provider_cache_invalid") };
-                    items.push(json!({"service":"mail", "item_type":"folder", "remote_id":folder.remote_id, "name":value["name"], "has_body":false, "preview":{"role":value["role"]}}));
+                    if is_shared && (value["myRights"]["mayReadItems"].as_bool() != Some(true) || !current_mailboxes.contains(&folder.remote_id)) { continue; }
+                    readable_folders.insert(folder.remote_id.clone());
+                    if offset == 0 && cursor.is_empty() {
+                        items.push(json!({"service":"mail", "mail_scope":scope.collection, "shared":is_shared, "item_type":"folder", "remote_id":folder.remote_id, "name":value["name"], "has_body":false, "preview":{"role":value["role"]}}));
+                    }
                 }
             }
         }
@@ -9468,9 +9604,10 @@ impl Router {
                 after = object.remote_id.clone();
                 if seen >= offset && seen < offset + limit {
                     let value: Value = match serde_json::from_slice(&object.raw) { Ok(value) => value, Err(_) => return ApiResponse::error(503, "provider_cache_invalid") };
-                    let mailboxes: Vec<String> = value["mailboxIds"].as_object().map(|m| m.iter().filter(|(_, v)| v.as_bool() == Some(true)).map(|(k, _)| k.clone()).collect()).unwrap_or_default();
+                    let mailboxes: Vec<String> = value["mailboxIds"].as_object().map(|m| m.iter().filter(|(id, v)| v.as_bool() == Some(true) && (!is_shared || readable_folders.contains(*id))).map(|(k, _)| k.clone()).collect()).unwrap_or_default();
+                    if is_shared && mailboxes.is_empty() { continue; }
                     let from = value["from"].as_array().and_then(|a| a.first()).and_then(|a| a["email"].as_str()).unwrap_or("");
-                    items.push(json!({"service":"mail", "item_type":"message", "remote_id":object.remote_id, "name":value["subject"].as_str().unwrap_or(""), "parent_remote_id":mailboxes.first(), "mailbox_ids":mailboxes, "has_body":false, "preview":{"subject":value["subject"], "from":from, "snippet":value["preview"], "date":value["receivedAt"], "isRead":value["keywords"]["$seen"].as_bool().unwrap_or(false), "isDraft":value["keywords"]["$draft"].as_bool().unwrap_or(false), "attachments":if value["hasAttachment"].as_bool().unwrap_or(false) {1} else {0}, "attachment_count_unknown":value["hasAttachment"].as_bool().unwrap_or(false)}}));
+                    items.push(json!({"service":"mail", "mail_scope":scope.collection, "shared":is_shared, "item_type":"message", "remote_id":object.remote_id, "name":value["subject"].as_str().unwrap_or(""), "parent_remote_id":mailboxes.first(), "mailbox_ids":mailboxes, "has_body":false, "preview":{"subject":value["subject"], "from":from, "snippet":value["preview"], "date":value["receivedAt"], "isRead":value["keywords"]["$seen"].as_bool().unwrap_or(false), "isDraft":value["keywords"]["$draft"].as_bool().unwrap_or(false), "attachments":if value["hasAttachment"].as_bool().unwrap_or(false) {1} else {0}, "attachment_count_unknown":value["hasAttachment"].as_bool().unwrap_or(false)}}));
                 }
                 seen += 1;
                 if seen >= offset + limit { break; }
@@ -9480,7 +9617,7 @@ impl Router {
             match store.provider_objects_page(scope, &after, 1) { Ok(page) if !page.is_empty() => Some(after), Ok(_) => None, Err(_) => return ApiResponse::error(503, "provider_cache_unavailable") }
         } else { None };
         let observed_at = store.provider_observed_at(scope).ok().flatten();
-        ApiResponse::ok_json(&json!({"count":items.len(), "items":items, "total":null, "offset":offset, "limit":limit, "next_cursor":next_cursor, "provenance":"local", "observed_at":observed_at}))
+        ApiResponse::ok_json(&json!({"count":items.len(), "items":items, "scopes":available, "mail_scope":scope.collection, "shared":is_shared, "total":null, "offset":offset, "limit":limit, "next_cursor":next_cursor, "provenance":"local", "observed_at":observed_at}))
     }
 
     fn calendar_expanded(&self, req: &ApiRequest) -> ApiResponse {
@@ -9957,11 +10094,11 @@ impl Router {
         if service == "mail" && self.provider_origin(account).is_some() {
             let Some(handler) = self.mail_write.as_ref() else { return ApiResponse::error(503, "provider_attachment_unavailable"); };
             return match req.q("blob_id") {
-                None => match handler.provider_attachment_list(account, id) {
+                None => match handler.provider_attachment_list_scoped(account, req.q("mail_scope"), id) {
                     Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
                     Err(_) => ApiResponse::error(503, "provider_attachment_unavailable"),
                 },
-                Some(blob_id) => match handler.provider_attachment_download(account, id, blob_id) {
+                Some(blob_id) => match handler.provider_attachment_download_scoped(account, req.q("mail_scope"), id, blob_id) {
                     Ok(file) => provider_attachment_response(file),
                     Err(_) => ApiResponse::error(503, "provider_attachment_unavailable"),
                 },
@@ -10058,6 +10195,13 @@ impl Router {
     /// id-addressed trick as the OneDrive sidecar). `image/jpeg` + the always-on
     /// nosniff; 404 when the contact has no archived photo.
     fn contact_photo(&self, req: &ApiRequest) -> ApiResponse {
+        if let Some(account) = req.q("account") {
+            if self.provider_origin(account).is_some() {
+                let (Some(collection),Some(href)) = (req.q("collection"),req.q("href")) else { return with_no_store(ApiResponse::error(400,"invalid contact photo request")); };
+                let photo = self.calendar_write.as_ref().and_then(|handler| handler.provider_contact_photo(account,collection,href).ok()).flatten();
+                return provider_contact_photo_response(photo);
+            }
+        }
         let (account, id) = match (req.q("account"), req.q("id")) {
             (Some(a), Some(i)) if !a.is_empty() && !i.is_empty() => (a, i),
             _ => return ApiResponse::error(400, "account and id are required"),
@@ -10091,7 +10235,7 @@ impl Router {
             _ => return ApiResponse::error(400, "missing 'account', 'service' or 'id'"),
         };
         if service == "mail" && self.provider_origin(account).is_some() {
-            return match self.mail_write.as_ref().and_then(|h| h.provider_read_view(account, id).ok()) {
+            return match self.mail_write.as_ref().and_then(|h| h.provider_read_view_scoped(account, req.q("mail_scope"), id).ok()) {
                 Some(body) => render_provider_mail_view(body),
                 None => ApiResponse::error(503, "provider_body_unavailable"),
             };
@@ -11066,6 +11210,17 @@ mod tests {
     }
 
     #[test]
+    fn provider_contact_photo_response_is_bounded_and_inert() {
+        let response=provider_contact_photo_response(Some(("image/png".into(),vec![1,2,3])));
+        assert_eq!(response.status,200);
+        assert_eq!(response.content_type,"image/png");
+        assert!(response.headers.iter().any(|(name,value)| name.eq_ignore_ascii_case("cache-control") && value.contains("no-store")));
+        assert!(response.headers.iter().any(|(name,value)| name.eq_ignore_ascii_case("x-content-type-options") && value=="nosniff"));
+        assert_eq!(provider_contact_photo_response(Some(("image/svg+xml".into(),vec![1]))).status,404);
+        assert_eq!(provider_contact_photo_response(Some(("image/png".into(),vec![0;2*1024*1024+1]))).status,404);
+    }
+
+    #[test]
     fn provider_attachment_is_forced_download_and_header_safe() {
         let response = provider_attachment_response(ProviderAttachmentDownload { filename:"file\"\r\nX-Injection: value.html".into(), bytes:b"<script>".to_vec() });
         assert_eq!(response.content_type, "application/octet-stream");
@@ -11127,6 +11282,45 @@ mod tests {
         let second_page = body_json(&router.provider_mail_items(&store, "a", "https://example.invalid", &ApiRequest::get("/api/v1/items?account=a&service=mail&limit=1&after=m1")));
         assert_eq!(second_page["items"][0]["remote_id"], "m2");
         assert!(second_page["next_cursor"].is_null());
+    }
+
+    #[test]
+    #[cfg(feature = "encrypted-store")]
+    fn shared_mail_scope_requires_access_and_readable_membership() {
+        use isyncyou_store::{ProviderChange, ProviderObject, ProviderScope};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_encrypted(dir.path().join("store.db"), b"test-only-provider-key").unwrap();
+        let scope = ProviderScope { account_id:"a".into(), origin:"https://example.invalid".into(), service:"mail-shared".into(), collection:"shared".into() };
+        let folders = ProviderScope { service:"mailboxes-shared".into(), ..scope.clone() };
+        let object = |id:&str, value:Value| ProviderObject { remote_id:id.into(), etag:None, raw:serde_json::to_vec(&value).unwrap() };
+        store.apply_provider_page(&folders, &[
+            ProviderChange::Upsert(object("visible", json!({"name":"visible","myRights":{"mayReadItems":true}}))),
+            ProviderChange::Upsert(object("hidden", json!({"name":"hidden","myRights":{"mayReadItems":false}}))),
+        ], "folders").unwrap();
+        store.apply_provider_page(&scope, &[
+            ProviderChange::Upsert(object("same", json!({"subject":"allowed","mailboxIds":{"visible":true,"hidden":true}}))),
+            ProviderChange::Upsert(object("secret", json!({"subject":"forbidden","mailboxIds":{"hidden":true}}))),
+        ], "messages").unwrap();
+        store.set_provider_accessible(&scope,true).unwrap();
+        store.set_provider_accessible(&folders,true).unwrap();
+        let mut router = Router::new(Config::default());
+        router.mail_write = Some(std::sync::Arc::new(RecordMailWrite(std::sync::Mutex::new(Vec::new()))));
+        let req = ApiRequest::get("/api/v1/items?account=a&service=mail&mail_scope=shared");
+        let result = body_json(&router.provider_mail_items(&store,"a","https://example.invalid",&req));
+        let rows = result["items"].as_array().unwrap();
+        assert_eq!(rows.len(),2);
+        assert_eq!(rows[1]["mailbox_ids"],json!(["visible"]));
+        store.set_provider_accessible(&scope,false).unwrap();
+        assert_eq!(router.provider_mail_items(&store,"a","https://example.invalid",&req).status,404);
+    }
+
+    #[test]
+    fn task_parent_prepare_route_is_agent_bound_and_rejects_extra_fields() {
+        assert_eq!(product_post_route("/api/v1/agent/task/parent/prepare").map(|spec| spec.route), Some(ProductPostRoute::AgentTaskParentPrepare));
+        let good = json!({"request_id":"request","session_id":"session","account":"a","collection":"/cal/","href":"/cal/child.ics","uid":"child","new_parent":null});
+        assert!(serde_json::from_value::<AgentTaskParentPrepareRequest>(good.clone()).is_ok());
+        let mut bad=good; bad["unexpected"]=json!(true);
+        assert!(serde_json::from_value::<AgentTaskParentPrepareRequest>(bad).is_err());
     }
 
     #[test]
@@ -14968,6 +15162,12 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         }
     }
     impl MailWriteHandler for RecordMailWrite {
+        fn provider_shared_mail_accounts(&self, _account:&str) -> Result<Vec<String>,String> {
+            Ok(vec!["shared".into()])
+        }
+        fn provider_shared_mailbox_ids(&self, _account:&str, _scope:&str) -> Result<Vec<String>,String> {
+            Ok(vec!["visible".into()])
+        }
         fn read_state(&self, _a: &str, id: &str) -> Result<bool, String> {
             self.0.lock().unwrap().push(format!("read_state id={id}"));
             Ok(false)

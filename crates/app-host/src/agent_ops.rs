@@ -122,6 +122,21 @@ fn execute_bound_related_draft(cfg: &Config, action: &isyncyou_agent::ToolAction
     }
 }
 
+fn execute_bound_task_parent(cfg:&Config, action:&isyncyou_agent::ToolAction, pending_id:&str, gate:&Arc<Mutex<()>>) -> ConfirmedExecutionOutcome {
+    let Some(operation_id) = bound_submission_operation_id(pending_id) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
+    let Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskParent {target,origin,collection,uid,summary,old_parent,new_parent,etag,checkpoint,raw_sha256})) = validate_live_write_action(action) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
+    let account = action.account(); let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+    let prepared = match isyncyou_engine::dav_live::prepare_task_parent_preview(cfg,account,&collection,&target,&uid,new_parent.as_deref()) { Ok(value)=>value, Err(_)=>return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) };
+    if prepared.origin != origin || prepared.uid != uid || prepared.summary != summary || prepared.old_parent != old_parent || prepared.new_parent != new_parent || prepared.edit.href != target || prepared.edit.expected_etag != etag || prepared.edit.expected_collection_token.as_deref() != Some(checkpoint.as_str()) || sha256_hex(&prepared.edit.raw) != raw_sha256 { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderConflict); }
+    let op = isyncyou_engine::dav_write::ApprovedDavWrite { operation_id, account_id:account.into(), origin, collection, service:"calendar".into(), href:target, expected_etag:Some(etag), expected_collection_token:Some(checkpoint), raw:Some(prepared.edit.raw) };
+    match isyncyou_engine::dav_write::execute_task_parent(cfg,"/.well-known/caldav",&op,&uid,new_parent.as_deref(),None) {
+        Ok(isyncyou_engine::dav_write::WriteOutcome::Confirmed(_)) => ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new("Task parent updated; local synchronization pending")),
+        Ok(isyncyou_engine::dav_write::WriteOutcome::Conflict) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderConflict),
+        Ok(isyncyou_engine::dav_write::WriteOutcome::Rejected) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderActionRejected),
+        _ => ConfirmedExecutionOutcome::OutcomeUnknown,
+    }
+}
+
 fn execute_bound_task_attributes(cfg: &Config, action: &isyncyou_agent::ToolAction, pending_id: &str, gate: &Arc<Mutex<()>>) -> ConfirmedExecutionOutcome {
     let Some(operation_id) = bound_submission_operation_id(pending_id) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
     let Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskAttributes { target, origin, collection, uid, name, priority, due, due_date, old_priority, old_due, etag, raw_sha256 })) = validate_live_write_action(action) else { return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected); };
@@ -987,6 +1002,7 @@ enum CalendarLiveWrite {
     Exception { target:String, origin:String, collection:String, uid:String, recurrence_id:String, summary:String, old_start:String, old_end:String, start:String, end:String, window_start:String, window_end:String, etag:String, raw_sha256:String },
     Cancellation { target:String, collection:String, uid:String, recurrence_id:Option<String>, sequence:u32, effect:serde_json::Value, etag:String, raw_sha256:String },
     ZonedTime { target:String, origin:String, collection:String, uid:String, start:String, end:String, tzid:String, old_start:String, old_start_zone:Option<String>, old_end:String, old_end_zone:Option<String>, etag:String, raw_sha256:String },
+    TaskParent { target:String, origin:String, collection:String, uid:String, summary:String, old_parent:Option<String>, new_parent:Option<String>, etag:String, checkpoint:String, raw_sha256:String },
     TaskAttributes { target:String, origin:String, collection:String, uid:String, name:String, priority:Option<u8>, due:Option<String>, due_date:bool, old_priority:Option<String>, old_due:Option<String>, etag:String, raw_sha256:String },
     InvitationResponse { target:String, origin:String, collection:String, uid:String, recurrence_id:Option<String>, attendee:String, organizer:String, old_response:String, response:String, etag:String, raw_sha256:String },
     SetTime { target:String, origin:String, collection:String, uid:String, start:String, end:String, date_only:bool, old_start:String, old_end:String, etag:String, raw_sha256:String },
@@ -1110,6 +1126,7 @@ impl AgentLiveWriteIntent {
             Self::Calendar(CalendarLiveWrite::SetText { .. }) => "calendar_set_text",
             Self::Calendar(CalendarLiveWrite::SetTime { .. }) => "calendar_set_time",
             Self::Calendar(CalendarLiveWrite::InvitationResponse { .. }) => "invitation_response",
+            Self::Calendar(CalendarLiveWrite::TaskParent { .. }) => "task_parent",
             Self::Calendar(CalendarLiveWrite::TaskAttributes { .. }) => "task_attributes",
             Self::Calendar(CalendarLiveWrite::ZonedTime { .. }) => "calendar_set_zoned_time",
             Self::Calendar(CalendarLiveWrite::Cancellation { .. }) => "calendar_cancel",
@@ -1180,6 +1197,7 @@ impl AgentLiveWriteIntent {
             Self::Calendar(CalendarLiveWrite::SetText { .. }) => "Change calendar text",
             Self::Calendar(CalendarLiveWrite::SetTime { .. }) => "Change event time",
             Self::Calendar(CalendarLiveWrite::InvitationResponse { .. }) => "Respond to invitation",
+            Self::Calendar(CalendarLiveWrite::TaskParent { .. }) => "Change task parent",
             Self::Calendar(CalendarLiveWrite::TaskAttributes { .. }) => "Change task attributes",
             Self::Calendar(CalendarLiveWrite::ZonedTime { .. }) => "Change event time and zone",
             Self::Calendar(CalendarLiveWrite::Cancellation { .. }) => "Cancel event",
@@ -1321,6 +1339,7 @@ impl LiveWriteRuntime for LiveLiveWriteRuntime {
                     CalendarLiveWrite::SetText { .. } => Err("bound_confirmation_required".into()),
                     CalendarLiveWrite::SetTime { .. } => Err("bound_confirmation_required".into()),
                     CalendarLiveWrite::InvitationResponse { .. } => Err("bound_confirmation_required".into()),
+                    CalendarLiveWrite::TaskParent { .. } => Err("bound_confirmation_required".into()),
                     CalendarLiveWrite::TaskAttributes { .. } => Err("bound_confirmation_required".into()),
                     CalendarLiveWrite::ZonedTime { .. } => Err("bound_confirmation_required".into()),
                     CalendarLiveWrite::Cancellation { .. } => Err("bound_confirmation_required".into()),
@@ -1605,6 +1624,7 @@ fn validate_live_write_action(
         ("calendar", "invitation_response") => Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::InvitationResponse {
             target:required_target(target,change)?, origin:required_change_str(change,"origin")?, collection:required_change_str(change,"collection")?, uid:required_change_str(change,"uid")?, recurrence_id:optional_change_str(change,"recurrence_id")?, attendee:required_change_str(change,"attendee")?, organizer:required_change_str(change,"organizer")?, old_response:required_change_str(change,"old_response")?, response:required_change_str(change,"response")?, etag:required_change_str(change,"etag")?, raw_sha256:required_change_str(change,"raw_sha256")?,
         })),
+        ("calendar", "task_parent") => Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskParent { target:required_target(target,change)?, origin:required_change_str(change,"origin")?, collection:required_change_str(change,"collection")?, uid:required_change_str(change,"uid")?, summary:required_change_str(change,"summary")?, old_parent:optional_change_str(change,"old_parent")?, new_parent:optional_change_str(change,"new_parent")?, etag:required_change_str(change,"etag")?, checkpoint:required_change_str(change,"checkpoint")?, raw_sha256:required_change_str(change,"raw_sha256")? })),
         ("calendar", "task_attributes") => Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskAttributes { target:required_target(target,change)?, origin:required_change_str(change,"origin")?, collection:required_change_str(change,"collection")?, uid:required_change_str(change,"uid")?, name:required_change_str(change,"name")?, priority:match change.get("priority") { None | Some(serde_json::Value::Null) => None, Some(v) => Some(v.as_u64().and_then(|n| u8::try_from(n).ok()).ok_or("invalid_priority")?) }, due:optional_change_str(change,"due")?, due_date:required_change_bool(change,"due_date")?, old_priority:optional_change_str(change,"old_priority")?, old_due:optional_change_str(change,"old_due")?, etag:required_change_str(change,"etag")?, raw_sha256:required_change_str(change,"raw_sha256")? })),
         ("calendar", "calendar_set_zoned_time") => Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::ZonedTime { target:required_target(target,change)?, origin:required_change_str(change,"origin")?, collection:required_change_str(change,"collection")?, uid:required_change_str(change,"uid")?, start:required_change_str(change,"start")?, end:required_change_str(change,"end")?, tzid:required_change_str(change,"tzid")?, old_start:required_change_str(change,"old_start")?, old_start_zone:optional_change_str(change,"old_start_zone")?, old_end:required_change_str(change,"old_end")?, old_end_zone:optional_change_str(change,"old_end_zone")?, etag:required_change_str(change,"etag")?, raw_sha256:required_change_str(change,"raw_sha256")? })),
         ("calendar", "calendar_cancel") => Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::Cancellation { target:required_target(target,change)?, collection:required_change_str(change,"collection")?, uid:required_change_str(change,"uid")?, recurrence_id:optional_change_str(change,"recurrence_id")?, sequence:change.get("sequence").and_then(serde_json::Value::as_u64).and_then(|n| u32::try_from(n).ok()).ok_or("invalid_sequence")?, effect:change.get("effect").filter(|v| v.is_object()).cloned().ok_or("invalid_cancellation_effect")?, etag:required_change_str(change,"etag")?, raw_sha256:required_change_str(change,"raw_sha256")? })),
@@ -1735,6 +1755,7 @@ fn ensure_mobile_live_write_allowlisted(action: &isyncyou_agent::ToolAction) -> 
             | AgentLiveWriteIntent::Calendar(CalendarLiveWrite::SetText { .. })
             | AgentLiveWriteIntent::Calendar(CalendarLiveWrite::SetTime { .. })
             | AgentLiveWriteIntent::Calendar(CalendarLiveWrite::InvitationResponse { .. })
+            | AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskParent { .. })
             | AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskAttributes { .. })
             | AgentLiveWriteIntent::Calendar(CalendarLiveWrite::ZonedTime { .. })
             | AgentLiveWriteIntent::Calendar(CalendarLiveWrite::Cancellation { .. })
@@ -2311,6 +2332,7 @@ pub(crate) fn bind_provider_mail_action(cfg: &Config, mut action: isyncyou_agent
     let isyncyou_agent::ToolAction::LiveWrite { account, service, target, change, .. } = &mut action else { return Ok(action); };
     if service != "mail" || change.get("verb").and_then(serde_json::Value::as_str) != Some("provider_mail_action") { return Ok(action); }
     let email_id = required_target(target,change)?;
+    if email_id.starts_with("shared-mail:") { return Err("shared_mail_write_unavailable".into()); }
     let requested = change.get("action").cloned().ok_or("invalid_mail_action")?;
     let requested = serde_json::from_value::<isyncyou_engine::self_hosted_mail::MailAction>(requested).map_err(|_| "invalid_mail_action")?;
     let client = isyncyou_engine::self_hosted_mail::client(cfg,account)?;
@@ -2323,7 +2345,7 @@ pub(crate) fn bind_provider_mail_action(cfg: &Config, mut action: isyncyou_agent
 pub(crate) fn bind_provider_related_draft(cfg: &Config, mut action: isyncyou_agent::ToolAction) -> Result<isyncyou_agent::ToolAction, String> {
     let isyncyou_agent::ToolAction::LiveWrite { account, service, target, change, .. } = &mut action else { return Ok(action); };
     if service != "mail" || change.get("verb").and_then(serde_json::Value::as_str) != Some("provider_related_draft") { return Ok(action); }
-    let source_id = required_target(target,change)?; let kind_text = required_change_str(change,"kind")?;
+    let source_id = required_target(target,change)?; if source_id.starts_with("shared-mail:") { return Err("shared_mail_write_unavailable".into()); } let kind_text = required_change_str(change,"kind")?;
     let kind = match kind_text.as_str() { "reply" => isyncyou_engine::self_hosted_mail::RelatedDraftKind::Reply, "forward" => isyncyou_engine::self_hosted_mail::RelatedDraftKind::Forward, _ => return Err("invalid_draft_kind".into()) };
     let subject = required_change_str(change,"subject")?; let body = required_body_str(change,&["body"])?;
     let to = required_string_array(change,"to")?;
@@ -2340,6 +2362,17 @@ pub(crate) fn bind_provider_related_draft(cfg: &Config, mut action: isyncyou_age
         email["references"] = serde_json::Value::Array(references);
     }
     *target = Some(source_id); *change = serde_json::json!({"verb":"provider_related_draft","preview":preview,"email":email});
+    Ok(action)
+}
+
+pub(crate) fn bind_provider_task_parent(cfg:&Config, mut action:isyncyou_agent::ToolAction) -> Result<isyncyou_agent::ToolAction,String> {
+    let isyncyou_agent::ToolAction::LiveWrite {account,service,target,change,..} = &mut action else { return Ok(action); };
+    if service != "calendar" || change.get("verb").and_then(serde_json::Value::as_str) != Some("task_parent") { return Ok(action); }
+    let collection=required_change_str(change,"collection")?; let uid=required_change_str(change,"uid")?; let href=required_target(target,change)?; let parent=optional_change_str(change,"new_parent")?;
+    let prepared=isyncyou_engine::dav_live::prepare_task_parent_preview(cfg,account,&collection,&href,&uid,parent.as_deref())?;
+    if prepared.edit.href != href { return Err("provider_task_prepare_invalid".into()); }
+    let checkpoint=prepared.edit.expected_collection_token.as_ref().ok_or("provider_task_prepare_invalid")?;
+    *target=Some(href); *change=serde_json::json!({"verb":"task_parent","origin":prepared.origin,"collection":collection,"uid":uid,"summary":prepared.summary,"old_parent":prepared.old_parent,"new_parent":prepared.new_parent,"etag":prepared.edit.expected_etag,"checkpoint":checkpoint,"raw_sha256":sha256_hex(&prepared.edit.raw)});
     Ok(action)
 }
 
@@ -2402,6 +2435,41 @@ pub(crate) fn bind_provider_series_rule(cfg: &Config, mut action: isyncyou_agent
     Ok(action)
 }
 
+/// Preview only the complete immutable capture intent prepared by the host.
+pub(crate) fn single_capture_preview(action: &isyncyou_agent::ToolAction) -> Result<PendingOperationPreview, String> {
+    let isyncyou_agent::ToolAction::LiveWrite { account, service, target, change } = action else {
+        return Err("invalid_capture_intent".into());
+    };
+    if service != "calendar" || target.is_some() || change.get("verb").and_then(serde_json::Value::as_str) != Some("single_capture") {
+        return Err("invalid_capture_intent".into());
+    }
+    let operation = required_change_str(change, "operation_id")?;
+    let digest = required_change_str(change, "request_sha256")?;
+    let value = change.get("intent").ok_or("invalid_capture_intent")?;
+    let intent: isyncyou_engine::self_hosted_mail_restore::ApprovedSingleCapture =
+        serde_json::from_value(value.clone()).map_err(|_| "invalid_capture_intent")?;
+    if change.as_object().is_none_or(|v| v.len()!=4) ||
+        serde_json::to_value(&intent).ok().as_ref() != Some(value) ||
+        intent.account_id != *account || intent.operation_id != operation ||
+        digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) ||
+        isyncyou_engine::self_hosted_mail_restore::validate_single_capture_approval(&intent).is_err() {
+        return Err("invalid_capture_intent".into());
+    }
+    Ok(PendingOperationPreview::destructive(format!("Request a fresh backup capture for account {}, {}: {}. Collection {}, object {}, version {}. The snapshot must start after confirmation; off-node protection is established only after a verified PBS binding.", account,intent.kind,intent.title,intent.collection,intent.href,intent.version)))
+}
+
+pub(crate) fn contact_photo_preview(action:&isyncyou_agent::ToolAction)->Result<PendingOperationPreview,String> {
+    let isyncyou_agent::ToolAction::LiveWrite {account,service,target,change}=action else {return Err("invalid_photo_intent".into())};
+    if service!="contacts" || change.get("verb").and_then(serde_json::Value::as_str)!=Some("contact_set_photo") || change.as_object().is_none_or(|o|o.len()!=14) {return Err("invalid_photo_intent".into());}
+    let get=|key:&str| required_change_str(change,key);
+    let stage=get("stage_id")?;let digest=get("request_sha256")?;let origin=get("origin")?;let collection=get("collection")?;let href=get("href")?;let media=get("media_type")?;let sha=get("sha256")?;let uid=get("uid")?;let name=get("name")?;let etag=get("etag")?;let raw=get("raw_sha256")?;
+    let size=change.get("size").and_then(serde_json::Value::as_u64).filter(|n|*n>0 && *n<=2*1024*1024).ok_or("invalid_photo_intent")?;
+    let hash=|v:&str|v.len()==64 && v.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let old=change.get("old_photo_uri_sha256").ok_or("invalid_photo_intent")?;
+    if stage.len()>128 || !stage.bytes().all(|b|b.is_ascii_alphanumeric() || b==b'-' || b==b'_') || !hash(&digest) || !hash(&sha) || !hash(&raw) || !(old.is_null() || old.as_str().is_some_and(hash)) || !matches!(media.as_str(),"image/png"|"image/jpeg") || target.as_deref()!=Some(href.as_str()) || etag.starts_with("W/") || [&origin,&collection,&href,&uid,&name,&etag].iter().any(|s|s.len()>4096 || s.chars().any(char::is_control)) {return Err("invalid_photo_intent".into());}
+    Ok(PendingOperationPreview::destructive(format!("Change contact photo for account {account}, contact {name} (UID {uid}), address book {collection}, resource {href}, version {etag}. New {media} image: {size} bytes, SHA-256 {sha}; previous photo URI SHA-256: {}. The exact updated contact is bound to SHA-256 {raw}.",old.as_str().unwrap_or("none"))))
+}
+
 pub(crate) fn preview_for_pending_action(
     action: &isyncyou_agent::ToolAction,
 ) -> Result<PendingOperationPreview, String> {
@@ -2438,6 +2506,10 @@ pub(crate) fn preview_for_pending_action(
         }
         isyncyou_agent::ToolAction::LiveWrite { .. } => {
             if let isyncyou_agent::ToolAction::LiveWrite { account,service,change,.. } = action {
+                if service=="contacts" && change.get("verb").and_then(serde_json::Value::as_str)==Some("contact_set_photo") {return contact_photo_preview(action);}
+                if service=="calendar" && change.get("verb").and_then(serde_json::Value::as_str)==Some("single_capture") {
+                    return single_capture_preview(action);
+                }
                 if service=="calendar" && change.get("verb").and_then(serde_json::Value::as_str)==Some("recovery_jobs") {
                     let batch=required_change_str(change,"batch_id")?; let digest=required_change_str(change,"request_sha256")?;
                     let effect=change.get("effect").filter(|v| v.is_object()).ok_or("invalid_recovery_effect")?;
@@ -2495,6 +2567,9 @@ pub(crate) fn preview_for_pending_action(
             }
             if let AgentLiveWriteIntent::Calendar(CalendarLiveWrite::InvitationResponse { target, origin, collection, uid, recurrence_id, attendee, organizer, old_response, response, .. }) = &intent {
                 return Ok(PendingOperationPreview::destructive(format!("Respond to invitation UID {uid}, occurrence {}, in account {} at {origin}, calendar {collection}, resource {target}. Attendee: {attendee}; organizer: {organizer}. Previous response: {old_response}; new response: {response}. This may notify the organizer.", recurrence_id.as_deref().unwrap_or("single event"), action.account())));
+            }
+            if let AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskParent {target,origin,collection,uid,summary,old_parent,new_parent,..}) = &intent {
+                return Ok(PendingOperationPreview::destructive(format!("Change parent of task ‘{summary}’ (UID {uid}) in account {} at {origin}, collection {collection}, resource {target}. Previous parent UID: {}; new parent UID: {}. The task graph is checked under a collection lock before writing.",action.account(),old_parent.as_deref().unwrap_or("none"),new_parent.as_deref().unwrap_or("none"))));
             }
             if let AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskAttributes { target, origin, collection, uid, name, priority, due, due_date, old_priority, old_due, .. }) = &intent {
                 return Ok(PendingOperationPreview::destructive(format!("Change task ‘{name}’ (UID {uid}) in account {} at {origin}, collection {collection}, resource {target}. Previous priority: {}; due: {}. New priority: {}; due: {} ({}). Unset new fields remain unchanged.", action.account(), old_priority.as_deref().unwrap_or("unset"), old_due.as_deref().unwrap_or("unset"), priority.map(|v| v.to_string()).unwrap_or("unchanged".into()), due.as_deref().unwrap_or("unchanged"), if *due_date {"date"} else {"UTC"})));
@@ -2570,8 +2645,16 @@ pub(crate) fn preview_for_pending_action(
 /// Refuse previews that cannot show the complete effect to the approving user.
 pub(crate) fn preview_for_pending_action_with_config(cfg: &Config, action: &isyncyou_agent::ToolAction) -> Result<PendingOperationPreview, String> {
     if let isyncyou_agent::ToolAction::LiveWrite { account,service,change,.. } = action {
-        if service=="calendar" && matches!(change.get("verb").and_then(serde_json::Value::as_str),Some("recovery_batch_import" | "recovery_jobs")) {
+        if service=="contacts" && change.get("verb").and_then(serde_json::Value::as_str)==Some("contact_set_photo") {
+            if !cfg.accounts.iter().any(|a|a.id==*account) || !matches!(cfg.provider_accounts.get(account),Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin,..}) if change.get("origin").and_then(serde_json::Value::as_str)==Some(origin.as_str())) {return Err("provider_origin_mismatch".into());}
+            return contact_photo_preview(action);
+        }
+        if service=="calendar" && matches!(change.get("verb").and_then(serde_json::Value::as_str),Some("recovery_batch_import" | "recovery_jobs" | "single_capture")) {
             if !cfg.accounts.iter().any(|a| a.id==*account) || !matches!(cfg.provider_accounts.get(account),Some(isyncyou_core::config::ProviderConfig::SelfHosted {..})) { return Err("provider_operation_unavailable".into()); }
+            if change.get("verb").and_then(serde_json::Value::as_str)==Some("single_capture") {
+                let origin=change.pointer("/intent/origin").and_then(serde_json::Value::as_str).ok_or("invalid_capture_intent")?;
+                if !matches!(cfg.provider_accounts.get(account),Some(isyncyou_core::config::ProviderConfig::SelfHosted {origin:actual,..}) if actual==origin) { return Err("provider_origin_mismatch".into()); }
+            }
             return preview_for_pending_action(action);
         }
     }
@@ -2581,7 +2664,7 @@ pub(crate) fn preview_for_pending_action_with_config(cfg: &Config, action: &isyn
                 Ok(AgentLiveWriteIntent::DavAcl { .. } | AgentLiveWriteIntent::DavDelete { .. } | AgentLiveWriteIntent::DavCreate { .. }) |
                 Ok(AgentLiveWriteIntent::Mail(MailLiveWrite::SetRead { .. } | MailLiveWrite::SendApproved { .. } | MailLiveWrite::ProviderCreateDraft { .. } | MailLiveWrite::ProviderAction { .. } | MailLiveWrite::RelatedDraft { .. })) |
                 Ok(AgentLiveWriteIntent::Contacts(ContactLiveWrite::SetName { .. } | ContactLiveWrite::SetField { .. } | ContactLiveWrite::AddField { .. } | ContactLiveWrite::RemoveField { .. })) |
-                Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::SetTaskCompletion { .. } | CalendarLiveWrite::SetText { .. } | CalendarLiveWrite::SetTime { .. } | CalendarLiveWrite::InvitationResponse { .. } | CalendarLiveWrite::TaskAttributes { .. } | CalendarLiveWrite::ZonedTime { .. } | CalendarLiveWrite::Cancellation { .. } | CalendarLiveWrite::Exception { .. } | CalendarLiveWrite::SeriesRule { .. }))),
+                Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::SetTaskCompletion { .. } | CalendarLiveWrite::SetText { .. } | CalendarLiveWrite::SetTime { .. } | CalendarLiveWrite::InvitationResponse { .. } | CalendarLiveWrite::TaskAttributes { .. } | CalendarLiveWrite::TaskParent { .. } | CalendarLiveWrite::ZonedTime { .. } | CalendarLiveWrite::Cancellation { .. } | CalendarLiveWrite::Exception { .. } | CalendarLiveWrite::SeriesRule { .. }))),
             _ => false,
         };
         if !supported { return Err("provider_operation_unavailable".into()); }
@@ -3446,6 +3529,9 @@ impl AgentConfirmedActionExecutor for DesktopAgentOperations {
         if matches!(validate_live_write_action(action), Ok(AgentLiveWriteIntent::Contacts(ContactLiveWrite::RemoveField { .. }))) {
             return match self.current_config() { Ok(cfg) => execute_bound_contact_remove(&cfg, action, pending_id, &self.gate), Err(_) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) };
         }
+        if matches!(validate_live_write_action(action), Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskParent { .. }))) {
+            return match self.current_config() { Ok(cfg) => execute_bound_task_parent(&cfg, action, pending_id, &self.gate), Err(_) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) };
+        }
         if matches!(validate_live_write_action(action), Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskAttributes { .. }))) {
             return match self.current_config() { Ok(cfg) => execute_bound_task_attributes(&cfg, action, pending_id, &self.gate), Err(_) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) };
         }
@@ -3699,6 +3785,9 @@ impl AgentConfirmedActionExecutor for MobileFullNodeAgentOperations {
         if matches!(validate_live_write_action(action), Ok(AgentLiveWriteIntent::Contacts(ContactLiveWrite::RemoveField { .. }))) {
             return match self.current_config() { Ok(cfg) => execute_bound_contact_remove(&cfg, action, pending_id, &self.gate), Err(_) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) };
         }
+        if matches!(validate_live_write_action(action), Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskParent { .. }))) {
+            return match self.current_config() { Ok(cfg) => execute_bound_task_parent(&cfg, action, pending_id, &self.gate), Err(_) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) };
+        }
         if matches!(validate_live_write_action(action), Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskAttributes { .. }))) {
             return match self.current_config() { Ok(cfg) => execute_bound_task_attributes(&cfg, action, pending_id, &self.gate), Err(_) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected) };
         }
@@ -3774,6 +3863,53 @@ impl AgentConfirmedActionExecutor for MobileFullNodeAgentOperations {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn contact_photo_preview_binds_identity_version_and_hashes_without_bytes() {
+        let action=isyncyou_agent::ToolAction::LiveWrite {account:"acct".into(),service:"contacts".into(),target:Some("/book/a.vcf".into()),change:json!({"verb":"contact_set_photo","stage_id":"photo-1","request_sha256":"a".repeat(64),"origin":"https://example.test/","collection":"/book/","href":"/book/a.vcf","media_type":"image/png","sha256":"b".repeat(64),"size":128,"uid":"uid-1","name":"Example","old_photo_uri_sha256":null,"etag":"\"v1\"","raw_sha256":"c".repeat(64)})};
+        let preview=contact_photo_preview(&action).unwrap();assert!(preview.text.contains("Example"));assert!(preview.text.contains(&"b".repeat(64)));assert!(preview.text.contains("v1"));assert!(!preview.text.contains("photo_base64"));
+        for field in ["stage_id","request_sha256","origin","collection","href","media_type","sha256","uid","name","etag","raw_sha256"] {let mut altered=action.clone();if let isyncyou_agent::ToolAction::LiveWrite {change,..}=&mut altered {change[field]=serde_json::Value::Null;}assert!(contact_photo_preview(&altered).is_err(),"accepted missing {field}");}
+        let mut too_large=action.clone();if let isyncyou_agent::ToolAction::LiveWrite {change,..}=&mut too_large {change["size"]=json!(2*1024*1024+1);}assert!(contact_photo_preview(&too_large).is_err());
+    }
+
+    #[test]
+    fn single_capture_preview_accepts_only_the_exact_prepared_effect() {
+        let fields = json!(["acct", "https://example.test/", "/.well-known/caldav", "calendar",
+            "/cal/", "/cal/object.ics", "native", "a".repeat(64), "b".repeat(64),
+            "op-1", "event", "Appointment", "fresh", "confirmation"]);
+        let approval = sha256_hex(fields.to_string().as_bytes());
+        let intent = json!({"account_id":"acct","origin":"https://example.test/","entry":"/.well-known/caldav",
+            "service":"calendar","collection":"/cal/","href":"/cal/object.ics","native_account":"native",
+            "object":"a".repeat(64),"version":"b".repeat(64),"operation_id":"op-1","kind":"event",
+            "title":"Appointment","mode":"fresh","confirmation":"confirmation","approval_sha256":approval});
+        let action = isyncyou_agent::ToolAction::LiveWrite { account:"acct".into(), service:"calendar".into(), target:None,
+            change:json!({"verb":"single_capture","operation_id":"op-1","request_sha256":"c".repeat(64),"intent":intent}) };
+        let preview = preview_for_pending_action(&action).unwrap();
+        assert_eq!(preview.text, single_capture_preview(&action).unwrap().text);
+        assert!(preview.text.contains("Appointment"));
+        let mut cfg=Config::default();
+        cfg.accounts.push(isyncyou_core::config::AccountConfig { id:"acct".into(), username:"test".into(),
+            sync_root:"/tmp/sync".into(), archive_root:"/tmp/archive".into(), cache_root:"/tmp/cache".into(), mount_point:None });
+        cfg.provider_accounts.insert("acct".into(),isyncyou_core::config::ProviderConfig::SelfHosted {
+            origin:"https://example.test/".into(), client_id:"test".into() });
+        assert_eq!(preview_for_pending_action_with_config(&cfg,&action).unwrap().text,preview.text);
+        cfg.provider_accounts.insert("acct".into(),isyncyou_core::config::ProviderConfig::SelfHosted {
+            origin:"https://other.test/".into(), client_id:"test".into() });
+        assert!(preview_for_pending_action_with_config(&cfg,&action).is_err());
+        for field in ["account_id", "origin", "service", "title", "object", "version", "kind", "mode", "confirmation", "approval_sha256"] {
+            let mut changed=action.clone();
+            if let isyncyou_agent::ToolAction::LiveWrite { change, .. }=&mut changed { change["intent"][field]=json!("changed"); }
+            assert!(preview_for_pending_action(&changed).is_err(),"accepted changed {field}");
+        }
+        for field in ["verb", "operation_id", "request_sha256", "intent"] {
+            let mut changed=action.clone();
+            if let isyncyou_agent::ToolAction::LiveWrite { change, .. }=&mut changed { change[field]=serde_json::Value::Null; }
+            assert!(preview_for_pending_action(&changed).is_err(),"accepted missing {field}");
+        }
+        let mut changed=action;
+        if let isyncyou_agent::ToolAction::LiveWrite { account, .. }=&mut changed { *account="other".into(); }
+        assert!(preview_for_pending_action(&changed).is_err());
+    }
 
     #[test]
     fn dav_approvals_show_old_access_and_exact_new_effect() {
@@ -3886,6 +4022,20 @@ mod tests {
         assert!(preview.text.contains("20261029T100000Z"));
         assert!(preview.text.contains("IN-PROCESS"));
         assert!(preview.text.contains("30"));
+    }
+
+    #[test]
+    fn task_parent_preview_binds_graph_checkpoint_and_both_parents() {
+        let value = json!({"op":"live-write","account":"test","service":"calendar","target":"https://example.test/cal/child.ics",
+            "change":{"verb":"task_parent","origin":"https://example.test","collection":"/cal/","uid":"child","summary":"Review",
+                "old_parent":"old","new_parent":"new","etag":"\"v1\"","checkpoint":"token-1","raw_sha256":"digest"}});
+        let action:isyncyou_agent::ToolAction = serde_json::from_value(value.clone()).unwrap();
+        let preview = preview_for_pending_action(&action).unwrap();
+        for expected in ["Review","child","old","new","collection lock"] { assert!(preview.text.contains(expected)); }
+        assert!(matches!(validate_live_write_action(&action),Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskParent { .. }))));
+        let mut missing=value; missing["change"].as_object_mut().unwrap().remove("checkpoint");
+        let invalid:isyncyou_agent::ToolAction = serde_json::from_value(missing).unwrap();
+        assert!(validate_live_write_action(&invalid).is_err());
     }
 
     #[test]

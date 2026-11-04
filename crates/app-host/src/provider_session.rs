@@ -18,9 +18,12 @@ pub(crate) struct LocalSessionTransport {
     scope: ProviderScope,
     session_id: String,
     crypto: Arc<Mutex<Option<SessionObjectCrypto>>>,
+    reader: Arc<Mutex<Option<((u64, u64, u32, u32, u32, i64, i64, [u8; 32]), isyncyou_store::Store)>>>,
     _exclusive_session_lock: Arc<isyncyou_agent::FileLock>,
     #[cfg(all(test, feature = "encrypted-store"))]
     test_store: Option<(std::path::PathBuf, Vec<u8>)>,
+    #[cfg(all(test, feature = "encrypted-store"))]
+    test_read_opens: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ProductSessionTransport {
@@ -34,8 +37,9 @@ impl ProductSessionTransport {
                 let lock = isyncyou_agent::FileLock::try_acquire_exclusive(&lock_path).map_err(|_| SessionV2Error::TransportUnavailable)?.ok_or(SessionV2Error::LeaseLost)?;
                 return Ok(Self::Local(LocalSessionTransport {
                     cfg: cfg.clone(), scope: ProviderScope { account_id:account.into(), origin:origin.clone(), service:"agent-session".into(), collection:"local".into() },
-                    session_id:session_id.into(), crypto:Arc::new(Mutex::new(None)), _exclusive_session_lock:Arc::new(lock),
+                    session_id:session_id.into(), crypto:Arc::new(Mutex::new(None)), reader:Arc::new(Mutex::new(None)), _exclusive_session_lock:Arc::new(lock),
                     #[cfg(all(test, feature = "encrypted-store"))] test_store: None,
+                    #[cfg(all(test, feature = "encrypted-store"))] test_read_opens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 }));
             }
         }
@@ -73,8 +77,39 @@ impl LocalSessionTransport {
     }
     fn read_store(&self) -> Result<isyncyou_store::Store, SessionV2Error> {
         #[cfg(all(test, feature = "encrypted-store"))]
-        if let Some((path, key)) = &self.test_store { return isyncyou_store::Store::open_readonly_encrypted(path, key).map_err(|_| SessionV2Error::TransportUnavailable); }
+        if let Some((path, key)) = &self.test_store { self.test_read_opens.fetch_add(1, std::sync::atomic::Ordering::Relaxed); return isyncyou_store::Store::open_readonly_encrypted(path, key).map_err(|_| SessionV2Error::TransportUnavailable); }
         isyncyou_engine::provider_store::open_readonly(&self.cfg, &self.scope.account_id).map_err(|_| SessionV2Error::TransportUnavailable)
+    }
+    fn reader_identity(&self) -> Result<(u64, u64, u32, u32, u32, i64, i64, [u8; 32]), SessionV2Error> {
+        #[cfg(all(test, feature = "encrypted-store", unix))]
+        if let Some((path, _)) = &self.test_store {
+            use std::os::unix::fs::MetadataExt;
+            let m = std::fs::symlink_metadata(path).map_err(|_| SessionV2Error::TransportUnavailable)?;
+            if !m.file_type().is_file() { return Err(SessionV2Error::TransportUnavailable); }
+            return Ok((m.dev(), m.ino(), m.mode(), m.uid(), m.gid(), m.ctime(), m.ctime_nsec(), [0; 32]));
+        }
+        isyncyou_engine::provider_store::readonly_cache_identity(&self.cfg, &self.scope.account_id).map_err(|_| SessionV2Error::TransportUnavailable)
+    }
+    fn with_reader<T>(&self, f: impl FnOnce(&isyncyou_store::Store) -> Result<T, SessionV2Error>) -> Result<T, SessionV2Error> {
+        #[cfg(not(unix))]
+        { return f(&self.read_store()?); }
+        #[cfg(unix)]
+        {
+            let mut reader = self.reader.lock().map_err(|_| SessionV2Error::TransportUnavailable)?;
+            let identity = match self.reader_identity() {
+                Ok(identity) => identity,
+                Err(error) => { *reader = None; return Err(error); }
+            };
+            if reader.as_ref().is_none_or(|(old, _)| *old != identity) {
+                *reader = None;
+                let store = self.read_store()?;
+                if self.reader_identity()? != identity { return Err(SessionV2Error::TransportUnavailable); }
+                *reader = Some((identity, store));
+            }
+            let result = f(&reader.as_ref().ok_or(SessionV2Error::TransportUnavailable)?.1)?;
+            if self.reader_identity()? != identity { *reader = None; return Err(SessionV2Error::TransportUnavailable); }
+            Ok(result)
+        }
     }
     fn seal(&self, manifest: &SessionManifestV1) -> Result<Vec<u8>, SessionV2Error> {
         manifest.validate()?;
@@ -108,7 +143,7 @@ impl SessionV2Transport for LocalSessionTransport {
     }
     fn load_manifest(&self, session_id: &str) -> Result<VersionedManifest, SessionV2Error> {
         if session_id != self.session_id { return Err(SessionV2Error::InvalidRecord); }
-        let (etag, bytes) = self.read_store()?.local_session_manifest(&self.scope, session_id).map_err(|_| SessionV2Error::TransportUnavailable)?.ok_or(SessionV2Error::ManifestConflict)?;
+        let (etag, bytes) = self.with_reader(|store| store.local_session_manifest(&self.scope, session_id).map_err(|_| SessionV2Error::TransportUnavailable)?.ok_or(SessionV2Error::ManifestConflict))?;
         Ok(VersionedManifest { etag, storage_id:None, manifest:self.open(&bytes)? })
     }
     fn stage_immutable(&self, class: SessionObjectClass, id: &str, bytes: &[u8]) -> Result<(), SessionV2Error> {
@@ -118,8 +153,16 @@ impl SessionV2Transport for LocalSessionTransport {
     fn load_immutable(&self, class: SessionObjectClass, id: &str) -> Result<Vec<u8>, SessionV2Error> {
         self.load_immutable_optional(class,id)?.ok_or(SessionV2Error::InvalidJournal)
     }
+    fn load_immutable_batch(&self, class: SessionObjectClass, ids: &[String]) -> Result<Vec<Vec<u8>>, SessionV2Error> {
+        if ids.is_empty() { return Ok(Vec::new()); }
+        self.with_reader(|store| {
+            ids.iter().map(|id| store.local_session_load(&self.scope, &self.session_id, class_name(class), id)
+                .map_err(|_| SessionV2Error::TransportUnavailable)?
+                .ok_or(SessionV2Error::InvalidJournal)).collect()
+        })
+    }
     fn load_immutable_optional(&self, class: SessionObjectClass, id: &str) -> Result<Option<Vec<u8>>, SessionV2Error> {
-        self.read_store()?.local_session_load(&self.scope, &self.session_id, class_name(class), id).map_err(|_| SessionV2Error::TransportUnavailable)
+        self.with_reader(|store| store.local_session_load(&self.scope, &self.session_id, class_name(class), id).map_err(|_| SessionV2Error::TransportUnavailable))
     }
     fn reap_unreachable(&self, _reachable: &BTreeSet<(SessionObjectClass, String)>, _older: u64, _limit: usize, _deadline: Instant) -> Result<usize, SessionV2Error> { Ok(0) }
     fn compare_and_swap_manifest(&self, current: &VersionedManifest, next: &SessionManifestV1) -> Result<Option<VersionedManifest>, SessionV2Error> {
@@ -184,9 +227,26 @@ mod tests {
         let mut lease = session.acquire_lease(id, "lease-a", "holder-a").unwrap();
         assert!(!lease.is_lost());
         lease.release().unwrap();
+        drop(lease);
         drop(session);
         let manifest = first.load_manifest(id).unwrap();
+        if let ProductSessionTransport::Local(local) = &first {
+            let identity = local.reader.lock().unwrap().as_ref().unwrap().0;
+            let opens = local.test_read_opens.load(std::sync::atomic::Ordering::Relaxed);
+            first.load_manifest(id).unwrap();
+            assert_eq!(local.test_read_opens.load(std::sync::atomic::Ordering::Relaxed), opens);
+            assert_eq!(local.reader.lock().unwrap().as_ref().unwrap().0, identity);
+            let moved = root.path().join("session.moved");
+            std::fs::rename(&db, &moved).unwrap();
+            assert!(first.load_manifest(id).is_err());
+            assert!(local.reader.lock().unwrap().is_none());
+            std::fs::rename(&moved, &db).unwrap();
+        }
         first.stage_immutable(SessionObjectClass::VisibleRecord, "item", b"synthetic-ciphertext").unwrap();
+        first.stage_immutable(SessionObjectClass::VisibleRecord, "item-2", b"second-ciphertext").unwrap();
+        assert_eq!(first.load_immutable_batch(SessionObjectClass::VisibleRecord, &["item".into(), "item-2".into()]).unwrap(),
+            vec![b"synthetic-ciphertext".to_vec(), b"second-ciphertext".to_vec()]);
+        assert!(first.load_immutable_batch(SessionObjectClass::VisibleRecord, &["item".into(), "missing".into()]).is_err());
         assert!(first.stage_immutable(SessionObjectClass::VisibleRecord, "item", b"different").is_err());
         let mut next = manifest.manifest.clone(); next.generation += 1;
         let updated = first.compare_and_swap_manifest(&manifest, &next).unwrap().unwrap();

@@ -122,6 +122,13 @@ CREATE TABLE provider_stage_alarm_index (
 );
 "#;
 
+pub(super) const MIGRATION_V21: &str = r#"
+CREATE VIRTUAL TABLE provider_shared_mail_fts USING fts5(
+ account_id UNINDEXED, origin UNINDEXED, collection UNINDEXED, remote_id UNINDEXED,
+ searchable, tokenize='unicode61 remove_diacritics 2'
+);
+"#;
+
 pub(super) const MIGRATION_V20: &str = r#"
 CREATE INDEX provider_dav_parent ON provider_dav_index(account_id,origin,service,collection,parent_uid,kind,valid);
 CREATE VIRTUAL TABLE provider_dav_search_fts USING fts5(
@@ -631,7 +638,7 @@ impl Store {
     }
     /// Search only locally indexed provider mail metadata within the requested identity.
     pub fn search_provider_mail(&self, account: &str, origin: &str, query: &str, limit: usize) -> Result<Vec<(ProviderScope,ProviderObject)>> {
-        let mut stmt = self.conn.prepare("SELECT p.collection,p.remote_id,p.etag,p.raw,length(p.raw) FROM provider_mail_fts f JOIN provider_objects p ON p.account_id=f.account_id AND p.origin=f.origin AND p.service='mail' AND p.collection=f.collection AND p.remote_id=f.remote_id WHERE provider_mail_fts MATCH ?1 AND f.account_id=?2 AND f.origin=?3 ORDER BY rank LIMIT ?4")?;
+        let mut stmt = self.conn.prepare("SELECT p.collection,p.remote_id,p.etag,p.raw,length(p.raw),p.service FROM provider_mail_fts f JOIN provider_objects p ON p.account_id=f.account_id AND p.origin=f.origin AND p.service='mail' AND p.collection=f.collection AND p.remote_id=f.remote_id WHERE provider_mail_fts MATCH ?1 AND f.account_id=?2 AND f.origin=?3 ORDER BY rank LIMIT ?4")?;
         let mut rows = stmt.query(params![query,account,origin,limit.min(100) as i64])?;
         let mut output = Vec::new(); let mut bytes = 0usize;
         while let Some(r) = rows.next()? {
@@ -639,7 +646,25 @@ impl Store {
             if size > 8 * 1024 * 1024 { if output.is_empty() { return Err(StoreError::ProviderObjectTooLarge); } break; }
             if bytes + size > 8 * 1024 * 1024 { break; }
             bytes += size;
-            output.push((ProviderScope { account_id:account.into(),origin:origin.into(),service:"mail".into(),collection:r.get(0)? }, ProviderObject { remote_id:r.get(1)?,etag:r.get(2)?,raw:r.get(3)? }));
+            output.push((ProviderScope { account_id:account.into(),origin:origin.into(),service:r.get(5)?,collection:r.get(0)? }, ProviderObject { remote_id:r.get(1)?,etag:r.get(2)?,raw:r.get(3)? }));
+        }
+        Ok(output)
+    }
+
+    /// Search one explicitly selected accessible native mail scope.
+    pub fn search_provider_mail_in_scope(&self, scope:&ProviderScope, query:&str, limit:usize) -> Result<Vec<ProviderObject>> {
+        if !matches!(scope.service.as_str(), "mail" | "mail-shared") { return Err(StoreError::InvalidProgressiveSearch("invalid mail scope".into())); }
+        if scope.service == "mail-shared" && self.provider_accessible(scope)? != Some(true) { return Ok(Vec::new()); }
+        let table = if scope.service == "mail-shared" { "provider_shared_mail_fts" } else { "provider_mail_fts" };
+        let sql = format!("SELECT p.remote_id,p.etag,p.raw,length(p.raw) FROM {table} f JOIN provider_objects p ON p.account_id=f.account_id AND p.origin=f.origin AND p.collection=f.collection AND p.remote_id=f.remote_id LEFT JOIN provider_collections c ON c.account_id=p.account_id AND c.origin=p.origin AND c.service=p.service AND c.collection=p.collection WHERE {table} MATCH ?1 AND p.account_id=?2 AND p.origin=?3 AND p.service=?4 AND p.collection=?5 AND (p.service='mail' OR c.accessible=1) ORDER BY rank LIMIT ?6");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows=stmt.query(params![query,scope.account_id,scope.origin,scope.service,scope.collection,limit.min(100) as i64])?;
+        let mut output=Vec::new(); let mut bytes=0usize;
+        while let Some(row)=rows.next()? {
+            let size=row.get::<_,i64>(3)? as usize;
+            if size>8*1024*1024 { if output.is_empty() { return Err(StoreError::ProviderObjectTooLarge); } break; }
+            if bytes+size>8*1024*1024 { break; }
+            bytes+=size; output.push(ProviderObject {remote_id:row.get(0)?,etag:row.get(1)?,raw:row.get(2)?});
         }
         Ok(output)
     }
@@ -726,6 +751,15 @@ impl Store {
     pub fn claim_provider_mutation(&self, scope: &ProviderScope, operation: &str, kind: &str, intent: &str, digest: &str) -> Result<bool> {
         if !self.protected_provider_storage() { return Err(StoreError::MissingStoreKey); }
         Ok(self.conn.execute("INSERT OR IGNORE INTO provider_mutations(account_id,origin,service,remote_account,operation_id,kind,intent_json,intent_digest,state) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'unknown')", params![scope.account_id,scope.origin,scope.service,scope.collection,operation,kind,intent,digest])? == 1)
+    }
+
+    /// Check for any selected-capture claim across native account scopes without exposing its contents.
+    pub fn has_recovery_capture_claim(&self, account: &str, origin: &str, operation: &str) -> Result<bool> {
+        if !self.protected_provider_storage() { return Err(StoreError::MissingStoreKey); }
+        if [account, origin, operation].iter().any(|s| s.is_empty() || s.len() > 4096 || s.chars().any(char::is_control)) {
+            return Err(StoreError::InvalidProgressiveSearch("invalid capture identity".into()));
+        }
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_mutations WHERE account_id=?1 AND origin=?2 AND service='recovery-capture' AND operation_id=?3)", params![account, origin, operation], |r| r.get(0))?)
     }
 
     pub fn provider_mutation(&self, scope: &ProviderScope, operation: &str) -> Result<Option<(String, String, Option<String>)>> {
@@ -960,6 +994,16 @@ impl Store {
         Ok(())
     }
 
+    /// Publish or hide the shared message and mailbox scopes as one visibility decision.
+    pub fn set_shared_mail_access(&self, account: &str, origin: &str, native: &str, accessible: bool) -> Result<()> {
+        if !self.protected_provider_storage() { return Err(StoreError::MissingStoreKey); }
+        let tx = self.conn.unchecked_transaction()?;
+        for service in ["mail-shared", "mailboxes-shared"] {
+            tx.execute("INSERT INTO provider_collections(account_id,origin,service,collection,accessible) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(account_id,origin,service,collection) DO UPDATE SET accessible=excluded.accessible", params![account,origin,service,native,accessible])?;
+        }
+        tx.commit()?; Ok(())
+    }
+
     pub fn provider_accessible(&self, scope: &ProviderScope) -> Result<Option<bool>> {
         Ok(self.conn.query_row("SELECT accessible FROM provider_collections WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4", params![scope.account_id,scope.origin,scope.service,scope.collection], |r| r.get(0)).optional()?)
     }
@@ -986,7 +1030,7 @@ fn apply_changes(tx: &rusqlite::Transaction<'_>, scope: &ProviderScope, changes:
             let id = match change { ProviderChange::Upsert(object) => &object.remote_id, ProviderChange::Destroyed(id) => id };
             if scope.service == "calendar" { tx.execute("DELETE FROM provider_dav_index WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND remote_id=?5",params![scope.account_id,scope.origin,scope.service,scope.collection,id])?; tx.execute("DELETE FROM provider_alarm_index WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND remote_id=?5",params![scope.account_id,scope.origin,scope.service,scope.collection,id])?; }
             let previous = tx.query_row("SELECT etag,raw FROM provider_objects WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND remote_id=?5", params![scope.account_id,scope.origin,scope.service,scope.collection,id], |r| Ok((r.get::<_, Option<String>>(0)?,r.get::<_, Vec<u8>>(1)?))).optional()?;
-            if let Some((etag, raw)) = previous {
+            if let Some((etag, raw)) = previous.filter(|_| !matches!(scope.service.as_str(), "mail-shared" | "mailboxes-shared")) {
                 let digest = format!("{:x}", Sha256::digest(&raw));
                 let version = capture_version(etag.as_deref(), &raw);
                 tx.execute("INSERT OR IGNORE INTO provider_capture_outbox(account_id,origin,service,collection,remote_id,digest,version_key,etag,raw) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![scope.account_id,scope.origin,scope.service,scope.collection,id,digest,version,etag,raw])?;
@@ -995,24 +1039,27 @@ fn apply_changes(tx: &rusqlite::Transaction<'_>, scope: &ProviderScope, changes:
                 ProviderChange::Upsert(object) => {
                     let digest = format!("{:x}", Sha256::digest(&object.raw));
                     let version = capture_version(object.etag.as_deref(), &object.raw);
-                    tx.execute("INSERT OR IGNORE INTO provider_capture_outbox(account_id,origin,service,collection,remote_id,digest,version_key,etag,raw) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![scope.account_id,scope.origin,scope.service,scope.collection,id,digest,version,object.etag,object.raw])?;
-                    tx.execute("INSERT INTO provider_events(account_id,origin,service,collection,remote_id,kind,version_key,cursor) VALUES (?1,?2,?3,?4,?5,'upsert',?6,?7)", params![scope.account_id,scope.origin,scope.service,scope.collection,id,version,cursor])?;
+                    if !matches!(scope.service.as_str(), "mail-shared" | "mailboxes-shared") {
+                        tx.execute("INSERT OR IGNORE INTO provider_capture_outbox(account_id,origin,service,collection,remote_id,digest,version_key,etag,raw) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![scope.account_id,scope.origin,scope.service,scope.collection,id,digest,version,object.etag,object.raw])?;
+                        tx.execute("INSERT INTO provider_events(account_id,origin,service,collection,remote_id,kind,version_key,cursor) VALUES (?1,?2,?3,?4,?5,'upsert',?6,?7)", params![scope.account_id,scope.origin,scope.service,scope.collection,id,version,cursor])?;
+                    }
                     tx.execute("INSERT INTO provider_objects VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(account_id,origin,service,collection,remote_id) DO UPDATE SET etag=excluded.etag,raw=excluded.raw", params![scope.account_id,scope.origin,scope.service,scope.collection,object.remote_id,object.etag,object.raw])?;
                     if matches!(scope.service.as_str(), "calendar" | "contacts") { write_dav_search_index(tx, scope, object)?; }
-                    if scope.service == "mail" {
-                        tx.execute("DELETE FROM provider_mail_fts WHERE account_id=?1 AND origin=?2 AND collection=?3 AND remote_id=?4",params![scope.account_id,scope.origin,scope.collection,object.remote_id])?;
+                    if matches!(scope.service.as_str(), "mail" | "mail-shared") {
+                        let table = if scope.service == "mail-shared" { "provider_shared_mail_fts" } else { "provider_mail_fts" };
+                        tx.execute(&format!("DELETE FROM {table} WHERE account_id=?1 AND origin=?2 AND collection=?3 AND remote_id=?4"),params![scope.account_id,scope.origin,scope.collection,object.remote_id])?;
                         if let Ok(mail) = serde_json::from_slice::<serde_json::Value>(&object.raw) {
                         let mut fields = Vec::new();
                         for key in ["subject", "preview"] { if let Some(value) = mail[key].as_str() { fields.push(value.to_owned()); } }
                         for key in ["from", "to", "cc"] { if let Some(entries) = mail[key].as_array() { for entry in entries { for field in ["name", "email"] { if let Some(value) = entry[field].as_str() { fields.push(value.to_owned()); } } } } }
-                        tx.execute("INSERT INTO provider_mail_fts(account_id,origin,collection,remote_id,searchable) VALUES (?1,?2,?3,?4,?5)",params![scope.account_id,scope.origin,scope.collection,object.remote_id,fields.join(" ")])?;
+                        tx.execute(&format!("INSERT INTO {table}(account_id,origin,collection,remote_id,searchable) VALUES (?1,?2,?3,?4,?5)"),params![scope.account_id,scope.origin,scope.collection,object.remote_id,fields.join(" ")])?;
                         }
                     }
                 }
                 ProviderChange::Destroyed(id) => {
-                    tx.execute("INSERT INTO provider_events(account_id,origin,service,collection,remote_id,kind,version_key,cursor) VALUES (?1,?2,?3,?4,?5,'removed',NULL,?6)", params![scope.account_id,scope.origin,scope.service,scope.collection,id,cursor])?;
+                    if !matches!(scope.service.as_str(), "mail-shared" | "mailboxes-shared") { tx.execute("INSERT INTO provider_events(account_id,origin,service,collection,remote_id,kind,version_key,cursor) VALUES (?1,?2,?3,?4,?5,'removed',NULL,?6)", params![scope.account_id,scope.origin,scope.service,scope.collection,id,cursor])?; }
                     tx.execute("DELETE FROM provider_objects WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND remote_id=?5", params![scope.account_id,scope.origin,scope.service,scope.collection,id])?;
-                    if scope.service == "mail" { tx.execute("DELETE FROM provider_mail_fts WHERE account_id=?1 AND origin=?2 AND collection=?3 AND remote_id=?4",params![scope.account_id,scope.origin,scope.collection,id])?; }
+                    if matches!(scope.service.as_str(), "mail" | "mail-shared") { let table=if scope.service == "mail-shared" { "provider_shared_mail_fts" } else { "provider_mail_fts" }; tx.execute(&format!("DELETE FROM {table} WHERE account_id=?1 AND origin=?2 AND collection=?3 AND remote_id=?4"),params![scope.account_id,scope.origin,scope.collection,id])?; }
                     if matches!(scope.service.as_str(), "calendar" | "contacts") {
                         tx.execute("DELETE FROM provider_dav_search_fts WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND remote_id=?5",params![scope.account_id,scope.origin,scope.service,scope.collection,id])?;
                         tx.execute("DELETE FROM provider_dav_search_indexed WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND remote_id=?5",params![scope.account_id,scope.origin,scope.service,scope.collection,id])?;
@@ -1020,7 +1067,7 @@ fn apply_changes(tx: &rusqlite::Transaction<'_>, scope: &ProviderScope, changes:
                 }
             }
         }
-        tx.execute("INSERT INTO provider_collections(account_id,origin,service,collection,cursor,observed_at,accessible) VALUES (?1,?2,?3,?4,?5,CAST(strftime('%s','now') AS INTEGER),1) ON CONFLICT(account_id,origin,service,collection) DO UPDATE SET cursor=excluded.cursor,observed_at=excluded.observed_at,accessible=1", params![scope.account_id,scope.origin,scope.service,scope.collection,cursor])?;
+        tx.execute("INSERT INTO provider_collections(account_id,origin,service,collection,cursor,observed_at,accessible) VALUES (?1,?2,?3,?4,?5,CAST(strftime('%s','now') AS INTEGER),CASE WHEN ?3 IN ('mail-shared','mailboxes-shared') THEN 0 ELSE 1 END) ON CONFLICT(account_id,origin,service,collection) DO UPDATE SET cursor=excluded.cursor,observed_at=excluded.observed_at,accessible=CASE WHEN excluded.service IN ('mail-shared','mailboxes-shared') THEN provider_collections.accessible ELSE 1 END", params![scope.account_id,scope.origin,scope.service,scope.collection,cursor])?;
         Ok(())
 }
 
@@ -1100,6 +1147,33 @@ pub fn capture_version(etag: Option<&str>, raw: &[u8]) -> String {
     format!("{:x}", hash.finalize())
 }
 
+/// Canonical catalog identity for one native object, without exposing its contents.
+pub fn capture_identity(account: &str, origin: &str, service: &str, collection: &str, id: &str) -> std::result::Result<String, &'static str> {
+    if [account, origin, service, collection, id].iter().any(|v| v.is_empty() || v.len() > 4096 || v.chars().any(char::is_control)) { return Err("invalid capture identity"); }
+    let root = url::Url::parse(origin).map_err(|_| "invalid capture origin")?;
+    if root.scheme() != "https" || root.host_str().is_none() || !root.username().is_empty() || root.password().is_some() || root.path() != "/" || root.query().is_some() || root.fragment().is_some() { return Err("invalid capture origin"); }
+    match service {
+        "calendar" | "contacts" => {
+            let validate = |value: &str| -> std::result::Result<url::Url, &'static str> {
+                let raw_lower = value.to_ascii_lowercase();
+                if value.contains('\\') || raw_lower.ends_with("/..") || raw_lower.ends_with("/.") || ["%2f", "%5c", "%2e", "%25", "/../", "/./"].iter().any(|v| raw_lower.contains(v)) { return Err("invalid capture resource"); }
+                let target = url::Url::parse(value).map_err(|_| "invalid capture resource")?;
+                let path = target.path().to_ascii_lowercase();
+                if target.origin() != root.origin() || !target.username().is_empty() || target.password().is_some() || target.query().is_some() || target.fragment().is_some() || ["%2f", "%5c", "%2e", "%25"].iter().any(|v| path.contains(v)) { return Err("invalid capture resource"); }
+                Ok(target)
+            };
+            let parent = validate(collection)?;
+            let child = validate(id)?;
+            if !parent.path().ends_with('/') || !child.path().starts_with(parent.path()) || child.path() == parent.path() { return Err("invalid capture resource"); }
+        },
+        "mail" => {},
+        _ => return Err("invalid capture service"),
+    }
+    let canonical = root.origin().ascii_serialization();
+    let bytes = serde_json::to_vec(&[account, canonical.as_str(), service, collection, id]).map_err(|_| "invalid capture identity")?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
 /// Build the canonical metadata object used by native mail capture.
 pub fn mail_capture_object(native: &serde_json::Value, mime_digest: &str, mime_size: u64) -> std::result::Result<ProviderObject, &'static str> {
     let id = native.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).ok_or("invalid mail identity")?;
@@ -1111,6 +1185,7 @@ pub fn mail_capture_object(native: &serde_json::Value, mime_digest: &str, mime_s
 }
 
 fn capture_observation(tx: &rusqlite::Transaction<'_>, scope: &ProviderScope, object: &ProviderObject) -> Result<()> {
+    if matches!(scope.service.as_str(), "mail-shared" | "mailboxes-shared") { return Ok(()); }
     let digest = format!("{:x}", Sha256::digest(&object.raw));
     let version = capture_version(object.etag.as_deref(),&object.raw);
     tx.execute("INSERT OR IGNORE INTO provider_capture_outbox(account_id,origin,service,collection,remote_id,digest,version_key,etag,raw) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![scope.account_id,scope.origin,scope.service,scope.collection,object.remote_id,digest,version,object.etag,object.raw])?;
@@ -1119,6 +1194,54 @@ fn capture_observation(tx: &rusqlite::Transaction<'_>, scope: &ProviderScope, ob
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shared_mail_visibility_is_scoped_and_never_exports_history() {
+        let store = super::Store::open_in_memory().unwrap();
+        let scope = super::ProviderScope {account_id:"local".into(),origin:"https://example.test".into(),service:"mail-shared".into(),collection:"foreign".into()};
+        let item = super::ProviderObject {remote_id:"same-id".into(),etag:None,raw:br#"{"subject":"needle","mailboxIds":{"box":true}}"#.to_vec()};
+        let primary=super::ProviderScope {service:"mail".into(),..scope.clone()};
+        let other=super::ProviderObject {remote_id:"same-id".into(),etag:None,raw:br#"{"subject":"private"}"#.to_vec()};
+        store.apply_provider_page(&primary,&[super::ProviderChange::Upsert(other)],"primary-cursor").unwrap();
+        store.set_shared_mail_access("local", "https://example.test", "foreign", false).unwrap();
+        store.apply_provider_page(&scope, &[super::ProviderChange::Upsert(item)], "cursor").unwrap();
+        assert!(store.search_provider_mail_in_scope(&scope, "needle", 20).unwrap().is_empty());
+        assert_eq!(store.provider_captures(0, 20).unwrap().len(),1);
+        store.set_shared_mail_access("local", "https://example.test", "foreign", true).unwrap();
+        assert_eq!(store.search_provider_mail_in_scope(&scope, "needle", 20).unwrap().len(),1);
+        assert!(store.search_provider_mail_in_scope(&scope, "private", 20).unwrap().is_empty());
+        assert!(store.search_provider_mail_in_scope(&primary, "needle", 20).unwrap().is_empty());
+        store.set_shared_mail_access("local", "https://example.test", "foreign", false).unwrap();
+        assert!(store.search_provider_mail_in_scope(&scope, "needle", 20).unwrap().is_empty());
+    }
+    #[test]
+    fn capture_identity_canonicalizes_origin_and_rejects_foreign_dav() {
+        let collection = "https://example.test/cal/a%40b/";
+        let id = "https://example.test/cal/a%40b/event.ics";
+        let hash = super::capture_identity("acct", "https://example.test/", "calendar", collection, id).unwrap();
+        assert_eq!(hash, "0626e0d3e360b8182697109c51a2089305e2f5fd7d9ed5270cccefa0588aee31");
+        assert_eq!(hash, super::capture_identity("acct", "https://example.test", "calendar", collection, id).unwrap());
+        assert!(super::capture_identity("acct", "https://example.test", "calendar", collection, "https://other.test/a").is_err());
+        assert!(super::capture_identity("acct", "https://example.test", "calendar", "https://other.test/a", id).is_err());
+        assert!(super::capture_identity("acct", "https://example.test", "calendar", collection, "https://example.test/cal/a%40b/a%2Fb.ics").is_err());
+        assert!(super::capture_identity("acct", "https://example.test", "calendar", collection, collection).is_err());
+        assert!(super::capture_identity("acct", "http://example.test", "calendar", collection, id).is_err());
+        assert!(super::capture_identity("acct", "https://example.test", "mail", "opaque/collection", "opaque:id").is_ok());
+    }
+    #[test]
+    fn recovery_capture_claim_checks_all_native_scopes_and_kinds() {
+        let store = super::Store::open_in_memory().unwrap();
+        let scope = super::ProviderScope { account_id:"a".into(), origin:"https://example.test/".into(), service:"recovery-capture".into(), collection:"native-other".into() };
+        assert!(!store.has_recovery_capture_claim("a", "https://example.test/", "op").unwrap());
+        let other_service = super::ProviderScope { service:"mail".into(), ..scope.clone() };
+        assert!(store.claim_provider_mutation(&other_service, "op", "recovery-capture", "{}", "digest").unwrap());
+        assert!(!store.has_recovery_capture_claim("a", "https://example.test/", "op").unwrap());
+        assert!(store.claim_provider_mutation(&scope, "op", "unexpected-kind", "{}", "digest").unwrap());
+        assert!(store.has_recovery_capture_claim("a", "https://example.test/", "op").unwrap());
+        assert!(!store.has_recovery_capture_claim("b", "https://example.test/", "op").unwrap());
+        assert!(!store.has_recovery_capture_claim("a", "https://elsewhere.test/", "op").unwrap());
+        assert!(!store.has_recovery_capture_claim("a", "https://example.test/", "other").unwrap());
+        assert!(store.has_recovery_capture_claim("", "https://example.test/", "op").is_err());
+    }
     #[test]
     fn mail_capture_uses_exact_exporter_envelope_and_rejects_invalid_digest() {
         let native = serde_json::json!({"id":"id1","blobId":"blob1","keywords":{"$seen":true}});

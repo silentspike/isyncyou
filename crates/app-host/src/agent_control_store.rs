@@ -147,6 +147,16 @@ pub(crate) struct RecoveryBatchManifest {
     pub collection_intent:Option<serde_json::Value>,
 }
 
+/// Projections are stored in execution order; sources and encrypted chunks remain
+/// in original selection order. Resolve by the durable operation identity.
+pub(crate) fn recovery_projection_for_operation<'a>(manifest:&'a RecoveryBatchManifest, operation:&str)->Result<&'a serde_json::Value,String> {
+    if manifest.objects.len()!=manifest.execution_order.len() || manifest.projections.len()!=manifest.execution_order.len() {return Err("recovery_batch_invalid".into());}
+    let mut positions=manifest.execution_order.iter().enumerate().filter(|(_,id)| id.as_str()==operation);
+    let index=positions.next().map(|(i,_)| i).ok_or("recovery_batch_invalid")?;
+    if positions.next().is_some() || manifest.objects.iter().filter(|item| item.operation_id==operation).count()!=1 {return Err("recovery_batch_invalid".into());}
+    manifest.projections.get(index).ok_or_else(|| "recovery_batch_invalid".into())
+}
+
 pub(crate) fn recovery_batch_effect(manifest:&RecoveryBatchManifest) -> serde_json::Value {
     let mut effect=serde_json::json!({"origin":manifest.origin,"collection":manifest.collection,"entry":manifest.entry,"approval_sha256":manifest.approval_sha256,
         "objects":manifest.objects.iter().map(|item| serde_json::json!({"generation":item.generation,"object":item.object,"version":item.version,"kind":item.kind,"label":item.label,"sha256":item.sha256,"size":item.size,"operation_id":item.operation_id})).collect::<Vec<_>>(),
@@ -854,6 +864,8 @@ impl AgentControlStore {
             "installation",
         )?;
         ensure_text_column(&migration, "product_request_receipts", "result_digest", "")?;
+        ensure_text_column(&migration, "recovery_requests", "capture_phase", "")?;
+        ensure_text_column(&migration, "recovery_requests", "capture_error", "")?;
         ensure_integer_column(&migration, "product_request_receipts", "terminal_status")?;
         ensure_text_column(
             &migration,
@@ -1598,13 +1610,39 @@ impl AgentControlStore {
 
     pub(crate) fn store_recovery_request(&self,batch_id:&str,account:&str,origin:&str,subject:&str,request:&serde_json::Value,expires:u64,now:u64)->Result<String,String> {
         if batch_id.is_empty() || batch_id.len()>128 || !batch_id.bytes().all(|b| b.is_ascii_alphanumeric()||b==b'-'||b==b'_') || expires<=now || expires.saturating_sub(now)>24*60*60*1000 { return Err("recovery_request_invalid".into()); }
-        let plain=serde_json::to_vec(request).map_err(|_| "recovery_request_invalid")?; if plain.len()>128*1024 { return Err("recovery_request_invalid".into()); }
+        let plain=serde_json::to_vec(request).map_err(|_| "recovery_request_invalid")?;
+        let is_photo=request.get("purpose").and_then(serde_json::Value::as_str)==Some("contact_photo");
+        if plain.len()>if is_photo {3*1024*1024} else {128*1024} {return Err("recovery_request_invalid".into());}
+        if is_photo {
+            let bytes=base64::engine::general_purpose::STANDARD.decode(request.get("photo_base64").and_then(serde_json::Value::as_str).ok_or("recovery_request_invalid")?).map_err(|_| "recovery_request_invalid")?;
+            if bytes.is_empty() || bytes.len()>2*1024*1024 || request.get("sha256").and_then(serde_json::Value::as_str)!=Some(sha256_hex(&bytes).as_str()) || request.get("size").and_then(serde_json::Value::as_u64)!=Some(bytes.len() as u64) {return Err("recovery_request_invalid".into());}
+        }
         let digest=sha256_hex(&plain); let binding=self.upload_installation_binding(&format!("recovery-request:{batch_id}"),account,origin,subject)?;
         let sealed=seal_row(&self.row_wrap_key,"recovery-request",batch_id,&plain)?; let bytes=sealed.len() as i64;
         let mut connection=self.connection.lock().map_err(|_| "control_store_unavailable")?; let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| "control_store_unavailable")?;
         enforce_control_quota(&tx,bytes)?;
         tx.execute("INSERT INTO recovery_requests(batch_id,identity_binding,request_sha256,sealed_request,expires_at_ms,state,logical_bytes) VALUES(?1,?2,?3,?4,?5,'prepared',?6)",params![batch_id,binding,digest,sealed,u64_to_i64(expires)?,bytes]).map_err(|_| "recovery_request_conflict")?;
         tx.commit().map_err(|_| "control_store_unavailable")?; Ok(digest)
+    }
+
+    pub(crate) fn release_confirmed_photo(&self,id:&str,account:&str,origin:&str,subject:&str)->Result<(),String> {
+        let binding=self.upload_installation_binding(&format!("recovery-request:{id}"),account,origin,subject)?;
+        let connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
+        let sealed:Vec<u8>=connection.query_row("SELECT sealed_request FROM recovery_requests WHERE batch_id=?1 AND identity_binding=?2 AND state='claimed'",params![id,binding],|r|r.get(0)).map_err(|_| "photo_stage_unavailable")?;
+        let plain=open_row(&self.row_wrap_key,"recovery-request",id,&sealed)?;let value:serde_json::Value=serde_json::from_slice(&plain).map_err(|_| "photo_stage_unavailable")?;
+        if value.get("purpose").and_then(serde_json::Value::as_str)!=Some("contact_photo") {return Err("photo_stage_unavailable".into());}
+        if connection.execute("DELETE FROM recovery_requests WHERE batch_id=?1 AND identity_binding=?2 AND state='claimed'",params![id,binding]).map_err(|_| "control_store_unavailable")?!=1 {return Err("photo_stage_unavailable".into());}
+        checkpoint_secure_erasure(&connection).map_err(|_| "control_store_unavailable".into())
+    }
+
+    pub(crate) fn read_prepared_photo(&self,id:&str,account:&str,origin:&str,subject:&str,now:u64)->Result<(serde_json::Value,String),String> {
+        let binding=self.upload_installation_binding(&format!("recovery-request:{id}"),account,origin,subject)?;
+        let connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
+        let (sealed,digest):(Vec<u8>,String)=connection.query_row("SELECT sealed_request,request_sha256 FROM recovery_requests WHERE batch_id=?1 AND identity_binding=?2 AND state='prepared' AND pending_id='' AND expires_at_ms>?3",params![id,binding,u64_to_i64(now)?],|r| Ok((r.get(0)?,r.get(1)?))).map_err(|_| "photo_stage_unavailable")?;
+        let plain=open_row(&self.row_wrap_key,"recovery-request",id,&sealed)?;if sha256_hex(&plain)!=digest {return Err("photo_stage_unavailable".into());}
+        let value:serde_json::Value=serde_json::from_slice(&plain).map_err(|_| "photo_stage_unavailable")?;
+        if value.get("purpose").and_then(serde_json::Value::as_str)!=Some("contact_photo") || value.get("account").and_then(serde_json::Value::as_str)!=Some(account) {return Err("photo_stage_unavailable".into());}
+        Ok((value,digest))
     }
 
     pub(crate) fn bind_recovery_request(&self,batch_id:&str,account:&str,origin:&str,subject:&str,digest:&str,pending_id:&str,action_hash:&str,now:u64)->Result<(),String> {
@@ -1615,7 +1653,13 @@ impl AgentControlStore {
         let sealed:Vec<u8>=tx.query_row("SELECT sealed_request FROM recovery_requests WHERE batch_id=?1 AND identity_binding=?2 AND request_sha256=?3 AND state='prepared' AND pending_id='' AND expires_at_ms>?4",params![batch_id,binding,digest,u64_to_i64(now)?],|r| r.get(0)).map_err(|_| "recovery_request_unavailable")?;
         let plain=open_row(&self.row_wrap_key,"recovery-request",batch_id,&sealed)?; if sha256_hex(&plain)!=digest { return Err("recovery_request_invalid".into()); }
         let request:serde_json::Value=serde_json::from_slice(&plain).map_err(|_| "recovery_request_invalid")?;
-        match secret.action { ToolAction::LiveWrite { account:ref a,service:ref s,ref change,.. } if secret.version==1 && a==account && s=="calendar" && change.get("verb").and_then(serde_json::Value::as_str)==Some("recovery_jobs") && change.get("batch_id").and_then(serde_json::Value::as_str)==Some(batch_id) && change.get("request_sha256").and_then(serde_json::Value::as_str)==Some(digest) && change.get("effect")==request.get("effect") => {}, _=>return Err("recovery_confirmation_required".into()) }
+        match secret.action {
+            ToolAction::LiveWrite { account:ref a,service:ref s,ref change,.. } if secret.version==1 && a==account && (s=="calendar" || s=="contacts") && change.get("request_sha256").and_then(serde_json::Value::as_str)==Some(digest) && (
+                (s=="calendar" && change.get("verb").and_then(serde_json::Value::as_str)==Some("recovery_jobs") && change.get("batch_id").and_then(serde_json::Value::as_str)==Some(batch_id) && change.get("effect")==request.get("effect")) ||
+                (s=="calendar" && change.get("verb").and_then(serde_json::Value::as_str)==Some("single_capture") && request.get("purpose").and_then(serde_json::Value::as_str)==Some("single_capture") && change.get("operation_id").and_then(serde_json::Value::as_str)==Some(batch_id) && change.get("intent")==request.get("intent")) ||
+                (s=="contacts" && change.get("verb").and_then(serde_json::Value::as_str)==Some("contact_set_photo") && request.get("purpose").and_then(serde_json::Value::as_str)==Some("contact_photo") && change.get("stage_id").and_then(serde_json::Value::as_str)==Some(batch_id) && ["collection","href","media_type","sha256","size"].iter().all(|key| change.get(*key).is_some() && change.get(*key)==request.get(*key)))
+            ) => {}, _=>return Err("recovery_confirmation_required".into())
+        }
         if tx.execute("UPDATE recovery_requests SET pending_id=?1,action_hash=?2 WHERE batch_id=?3 AND state='prepared' AND pending_id=''",params![pending_id,action_hash,batch_id]).map_err(|_| "control_store_unavailable")?!=1 { return Err("recovery_request_conflict".into()); }
         tx.commit().map_err(|_| "control_store_unavailable".into())
     }
@@ -1640,6 +1684,37 @@ impl AgentControlStore {
         serde_json::from_slice(&plain).map_err(|_| "recovery_request_invalid".into())
     }
 
+    pub(crate) fn set_single_capture_phase(&self,operation:&str,account:&str,origin:&str,subject:&str,phase:&str,error:&str)->Result<(),String> {
+        if !matches!(phase,"validation_failed"|"host_claimed"|"source_read"|"challenge_request"|"challenge_ready"|"claim_attempt"|"claimed"|"requested"|"preflight_failed"|"unknown") || !matches!(error,""|"capture_preflight_source"|"capture_preflight_version_changed"|"capture_preflight_challenge"|"capture_preflight_journal"|"capture_preflight_validation"|"capture_unverified"|"capture_postclaim_unknown") {return Err("capture_intent_unavailable".into());}
+        let binding=self.upload_installation_binding(&format!("recovery-request:{operation}"),account,origin,subject)?;
+        let connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
+        if connection.execute("UPDATE recovery_requests SET capture_phase=?1,capture_error=?2 WHERE batch_id=?3 AND identity_binding=?4 AND state IN ('approved','claimed')",params![phase,error,operation,binding]).map_err(|_| "control_store_unavailable")?!=1 {return Err("capture_intent_unavailable".into());} Ok(())
+    }
+
+    pub(crate) fn single_capture_operational_status(&self,operation:&str,account:&str,origin:&str,subject:&str)->Result<serde_json::Value,String> {
+        let binding=self.upload_installation_binding(&format!("recovery-request:{operation}"),account,origin,subject)?;
+        let connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
+        let (state,phase,error,pending,digest,sealed):(String,String,String,String,String,Vec<u8>)=connection.query_row("SELECT state,capture_phase,capture_error,pending_id,request_sha256,sealed_request FROM recovery_requests WHERE batch_id=?1 AND identity_binding=?2 AND state IN ('prepared','approved','claimed')",params![operation,binding],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).map_err(|_| "capture_intent_unavailable")?;
+        let plain=open_row(&self.row_wrap_key,"recovery-request",operation,&sealed)?;
+        if sha256_hex(&plain)!=digest {return Err("capture_intent_unavailable".into());}
+        let value:serde_json::Value=serde_json::from_slice(&plain).map_err(|_| "capture_intent_unavailable")?;
+        if value.get("purpose").and_then(serde_json::Value::as_str)!=Some("single_capture") || value.pointer("/intent/operation_id").and_then(serde_json::Value::as_str)!=Some(operation) || value.pointer("/intent/account_id").and_then(serde_json::Value::as_str)!=Some(account) || value.pointer("/intent/origin").and_then(serde_json::Value::as_str)!=Some(origin) {return Err("capture_intent_unavailable".into());}
+        if !matches!(phase.as_str(),""|"validation_failed"|"host_claimed"|"source_read"|"challenge_request"|"challenge_ready"|"claim_attempt"|"claimed"|"requested"|"preflight_failed"|"unknown") || !matches!(error.as_str(),""|"capture_preflight_source"|"capture_preflight_version_changed"|"capture_preflight_challenge"|"capture_preflight_journal"|"capture_preflight_validation"|"capture_unverified"|"capture_postclaim_unknown") {return Err("capture_intent_unavailable".into());}
+        let owner:Option<(String,String,String)>=connection.query_row("SELECT session_id,request_id,turn_id FROM confirmation_intents WHERE intent_id=?1 AND account_id=?2 AND owner_binding=?3",params![pending,account,self.installation_binding],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|_| "control_store_unavailable")?;
+        Ok(serde_json::json!({"journal_state":state,"execution_phase":if phase.is_empty(){"unavailable"}else{phase.as_str()},"last_failure":if error.is_empty(){None}else{Some(error)},"pending_id":if pending.is_empty(){None}else{Some(pending)},"original_session_id":owner.as_ref().map(|v|&v.0),"original_request_id":owner.as_ref().map(|v|&v.1),"original_turn_id":owner.as_ref().map(|v|&v.2)}))
+    }
+
+    pub(crate) fn single_capture_intent_phase(&self,operation:&str,account:&str,origin:&str,subject:&str,pending:&str,action_hash:&str)->Result<(String,bool),String> {
+        let binding=self.upload_installation_binding(&format!("recovery-request:{operation}"),account,origin,subject)?;
+        let connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
+        let (state,stored_pending,stored_hash,digest,sealed):(String,String,String,String,Vec<u8>)=connection.query_row("SELECT state,pending_id,action_hash,request_sha256,sealed_request FROM recovery_requests WHERE batch_id=?1 AND identity_binding=?2 AND state IN ('prepared','approved','claimed')",params![operation,binding],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).map_err(|_| "capture_intent_unavailable")?;
+        let plain=open_row(&self.row_wrap_key,"recovery-request",operation,&sealed)?;
+        if sha256_hex(&plain)!=digest {return Err("capture_intent_unavailable".into());}
+        let value:serde_json::Value=serde_json::from_slice(&plain).map_err(|_| "capture_intent_unavailable")?;
+        if value.get("purpose").and_then(serde_json::Value::as_str)!=Some("single_capture") || value.pointer("/intent/operation_id").and_then(serde_json::Value::as_str)!=Some(operation) || value.pointer("/intent/account_id").and_then(serde_json::Value::as_str)!=Some(account) || value.pointer("/intent/origin").and_then(serde_json::Value::as_str)!=Some(origin) {return Err("capture_intent_unavailable".into());}
+        Ok((state,constant_time_eq(stored_pending.as_bytes(),pending.as_bytes()) && constant_time_eq(stored_hash.as_bytes(),action_hash.as_bytes())))
+    }
+
     pub(crate) fn recovery_request_refs(&self,batch_id:&str,account:&str,origin:&str,subject:&str)->Result<(String,String,String,String),String> {
         let binding=self.upload_installation_binding(&format!("recovery-request:{batch_id}"),account,origin,subject)?;
         let connection=self.connection.lock().map_err(|_| "control_store_unavailable")?;
@@ -1652,7 +1727,7 @@ impl AgentControlStore {
         let mut stmt=connection.prepare("SELECT batch_id,identity_binding,sealed_request,request_sha256,state FROM recovery_requests WHERE state IN ('approved','claimed') ORDER BY batch_id LIMIT 4096").map_err(|_| "control_store_unavailable")?;
         let rows=stmt.query_map([],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Vec<u8>>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?))).map_err(|_| "control_store_unavailable")?;
         let mut result=Vec::new();
-        for row in rows { let (id,binding,sealed,digest,state)=row.map_err(|_| "control_store_unavailable")?; let expected=self.upload_installation_binding(&format!("recovery-request:{id}"),account,origin,subject)?; if !constant_time_eq(binding.as_bytes(),expected.as_bytes()) { continue; } let plain=open_row(&self.row_wrap_key,"recovery-request",&id,&sealed)?; if sha256_hex(&plain)!=digest { return Err("recovery_request_invalid".into()); } let value:serde_json::Value=serde_json::from_slice(&plain).map_err(|_| "recovery_request_invalid")?; let Some(objects)=value.pointer("/effect/objects").and_then(serde_json::Value::as_array) else { return Err("recovery_request_invalid".into()); }; if objects.is_empty() || objects.iter().any(|item| item.get("kind").and_then(serde_json::Value::as_str)!=Some(kind)) { continue; } result.push(serde_json::json!({"batch_id":id,"state":state})); if result.len()>=100 { break; } }
+        for row in rows { let (id,binding,sealed,digest,state)=row.map_err(|_| "control_store_unavailable")?; let expected=self.upload_installation_binding(&format!("recovery-request:{id}"),account,origin,subject)?; if !constant_time_eq(binding.as_bytes(),expected.as_bytes()) { continue; } let plain=open_row(&self.row_wrap_key,"recovery-request",&id,&sealed)?; if sha256_hex(&plain)!=digest { return Err("recovery_request_invalid".into()); } let value:serde_json::Value=serde_json::from_slice(&plain).map_err(|_| "recovery_request_invalid")?; if value.get("purpose").and_then(serde_json::Value::as_str) .is_some_and(|purpose| matches!(purpose,"single_capture"|"contact_photo")) { continue; } let Some(objects)=value.pointer("/effect/objects").and_then(serde_json::Value::as_array) else { return Err("recovery_request_invalid".into()); }; if objects.is_empty() || objects.iter().any(|item| item.get("kind").and_then(serde_json::Value::as_str)!=Some(kind)) { continue; } result.push(serde_json::json!({"batch_id":id,"state":state})); if result.len()>=100 { break; } }
         Ok(result)
     }
 
@@ -1669,6 +1744,7 @@ impl AgentControlStore {
             let plain=open_row(&self.row_wrap_key,"recovery-request",&id,&sealed)?;
             if sha256_hex(&plain)!=digest { return Err("recovery_request_invalid".into()); }
             let value:serde_json::Value=serde_json::from_slice(&plain).map_err(|_| "recovery_request_invalid")?;
+            if value.get("purpose").and_then(serde_json::Value::as_str) .is_some_and(|purpose| matches!(purpose,"single_capture"|"contact_photo")) { continue; }
             let objects=value.pointer("/effect/objects").and_then(serde_json::Value::as_array).ok_or("recovery_request_invalid")?;
             last=Some(id.clone());
             items.push(serde_json::json!({"batch_id":id,"state":state,"objects":objects}));
@@ -1963,6 +2039,7 @@ impl AgentControlStore {
             | isyncyou_webui::MutationPurpose::OnedriveReplace { .. }
             | isyncyou_webui::MutationPurpose::MailAttachment { .. } => 64 * 1024 * 1024,
             isyncyou_webui::MutationPurpose::MailBody { .. }
+            | isyncyou_webui::MutationPurpose::ContactPhoto { .. }
             | isyncyou_webui::MutationPurpose::OnenoteBody { .. } => 2 * 1024 * 1024,
             isyncyou_webui::MutationPurpose::TodoDeleteBatch { .. } => 512 * 1024,
         };
@@ -5772,6 +5849,9 @@ fn ensure_text_column(
         ("mutation_upload_bindings", "dispatch_state", "unknown") => {
             "ALTER TABLE mutation_upload_bindings ADD COLUMN dispatch_state TEXT NOT NULL DEFAULT 'unknown'".into()
         }
+        ("recovery_requests", "capture_phase", "") | ("recovery_requests", "capture_error", "") => {
+            format!("ALTER TABLE recovery_requests ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+        }
         ("pairing_claims", "local_account", "") | ("pairing_claims", "recovery_request_id", "") => {
             format!("ALTER TABLE pairing_claims ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
         }
@@ -9302,6 +9382,19 @@ mod tests {
     }
 
     #[test]
+    fn recovery_receipt_projection_matches_operation_for_both_source_orders() {
+        let object=|id:&str| RecoveryStagedObject {generation:"a".repeat(64),object:"b".repeat(64),version:"c".repeat(64),operation_id:id.into(),confirmation:"confirmation".into(),size:1,sha256:"d".repeat(64),selection_sha256:"e".repeat(64),kind:"task".into(),encoding:"raw".into(),state:"available".into(),label:id.into()};
+        for source_order in [["parent","child"],["child","parent"]] {
+            let mut manifest=RecoveryBatchManifest {approval_sha256:"f".repeat(64),origin:"https://example.test".into(),entry:"/dav".into(),collection:"/recovered/".into(),objects:source_order.into_iter().map(object).collect(),uid_map:std::collections::BTreeMap::new(),execution_order:vec!["parent".into(),"child".into()],projections:vec![json!({"uid":"new-parent","projected_sha256":"parent-hash"}),json!({"uid":"new-child","projected_sha256":"child-hash"})],collection_intent:None};
+            assert_eq!(recovery_projection_for_operation(&manifest,"parent").unwrap()["uid"],"new-parent");
+            assert_eq!(recovery_projection_for_operation(&manifest,"child").unwrap()["projected_sha256"],"child-hash");
+            assert!(recovery_projection_for_operation(&manifest,"missing").is_err());
+            manifest.execution_order[1]="parent".into();
+            assert!(recovery_projection_for_operation(&manifest,"parent").is_err());
+        }
+    }
+
+    #[test]
     fn recovery_batch_chunks_reserve_verify_claim_and_reconcile_without_replay() {
         let root=temp_root("recovery-batch"); let credentials=credential_store(&root);
         let control=Arc::new(AgentControlStore::open(&root,&credentials,INSTALLATION_PRINCIPAL,1).unwrap());
@@ -9348,6 +9441,69 @@ mod tests {
         assert_eq!(recovery_batch_effect_sha256(&receipt),recovery_batch_effect_sha256(&manifest));
         assert!(!reopened.root.join("recovery-staging/batch-1").exists());
         drop(reopened); std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn contact_photo_stage_is_encrypted_account_bound_and_consumed_once() {
+        use base64::Engine as _;
+        let root=temp_root("contact-photo-stage");let credentials=credential_store(&root);let control=Arc::new(AgentControlStore::open(&root,&credentials,INSTALLATION_PRINCIPAL,1).unwrap());let registry=PendingRegistry::with_persistence(control.clone());let account=owner().account;
+        let photo=b"\x89PNG\r\n\x1a\nphoto";let sha=sha256_hex(photo);
+        let saved=json!({"purpose":"contact_photo","account":account,"collection":"/book/","href":"/book/a.vcf","media_type":"image/png","sha256":sha,"size":photo.len(),"photo_base64":base64::engine::general_purpose::STANDARD.encode(photo)});
+        let digest=control.store_recovery_request("photo-1",&account,"https://example.test","subject-a",&saved,60_000,1_000).unwrap();
+        let sealed:Vec<u8>=control.connection.lock().unwrap().query_row("SELECT sealed_request FROM recovery_requests WHERE batch_id='photo-1'",[],|r|r.get(0)).unwrap();assert!(!sealed.windows(photo.len()).any(|window|window==photo));
+        assert!(control.read_prepared_photo("photo-1",&account,"https://example.test","other-subject",1_001).is_err());
+        assert_eq!(control.read_prepared_photo("photo-1",&account,"https://example.test","subject-a",1_001).unwrap().0,saved);
+        let action=ToolAction::LiveWrite {account:account.clone(),service:"contacts".into(),target:Some("/book/a.vcf".into()),change:json!({"verb":"contact_set_photo","stage_id":"photo-1","request_sha256":digest,"collection":"/book/","href":"/book/a.vcf","media_type":"image/png","sha256":sha,"size":photo.len()})};
+        let (pending,token)=registry.register_bound(action,"review photo",1_002,50_000,owner()).unwrap();
+        control.bind_recovery_request("photo-1",&account,"https://example.test","subject-a",&digest,&pending.id,&pending.action_hash,1_003).unwrap();
+        assert!(control.claim_recovery_request("photo-1",&account,"https://example.test","subject-a",&digest,&pending.id,&pending.action_hash,1_004).is_err());
+        assert!(matches!(registry.confirm(&pending.id,&token,&pending.action_hash,&owner_proof(),1_005),PendingConfirmOutcome::Confirmed(_)));
+        assert_eq!(control.claim_recovery_request("photo-1",&account,"https://example.test","subject-a",&digest,&pending.id,&pending.action_hash,1_006).unwrap(),saved);
+        assert!(control.claim_recovery_request("photo-1",&account,"https://example.test","subject-a",&digest,&pending.id,&pending.action_hash,1_007).is_err());
+        assert!(control.release_confirmed_photo("photo-1",&account,"https://example.test","other-subject").is_err());
+        assert_eq!(control.read_claimed_recovery_request("photo-1",&account,"https://example.test","subject-a").unwrap(),saved);
+        control.release_confirmed_photo("photo-1",&account,"https://example.test","subject-a").unwrap();
+        assert!(control.read_claimed_recovery_request("photo-1",&account,"https://example.test","subject-a").is_err());
+        assert!(control.list_recovery_requests_for_ui(&account,"https://example.test","subject-a","").unwrap()["items"].as_array().unwrap().is_empty());
+        drop(registry);drop(control);std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn single_capture_intent_is_sealed_bound_and_survives_claim() {
+        let root=temp_root("single-capture-intent"); let credentials=credential_store(&root);
+        let control=Arc::new(AgentControlStore::open(&root,&credentials,INSTALLATION_PRINCIPAL,1).unwrap());
+        let registry=PendingRegistry::with_persistence(control.clone()); let account=owner().account;
+        let intent=json!({"account_id":account,"origin":"https://example.test","operation_id":"capture-1","approval_sha256":"a".repeat(64),"version":"v1"});
+        let saved=json!({"purpose":"single_capture","device":"device-1","intent":intent});
+        let digest=control.store_recovery_request("capture-1",&account,"https://example.test","subject-a",&saved,60_000,1_000).unwrap();
+        let action=ToolAction::LiveWrite {account:account.clone(),service:"calendar".into(),target:None,change:json!({"verb":"single_capture","operation_id":"capture-1","request_sha256":digest,"intent":intent})};
+        let (pending,token)=registry.register_bound(action,"capture",1_001,50_000,owner()).unwrap();
+        assert!(control.bind_recovery_request("capture-1",&account,"https://example.test","other-subject",&digest,&pending.id,&pending.action_hash,1_002).is_err());
+        control.bind_recovery_request("capture-1",&account,"https://example.test","subject-a",&digest,&pending.id,&pending.action_hash,1_002).unwrap();
+        assert_eq!(control.single_capture_intent_phase("capture-1",&account,"https://example.test","subject-a",&pending.id,&pending.action_hash).unwrap(),("prepared".into(),true));
+        assert_eq!(control.single_capture_operational_status("capture-1",&account,"https://example.test","subject-a").unwrap()["journal_state"],"prepared");
+        assert!(control.single_capture_operational_status("capture-1",&account,"https://example.test","other-subject").is_err());
+        assert_eq!(control.single_capture_intent_phase("capture-1",&account,"https://example.test","subject-a",&pending.id,"wrong").unwrap(),("prepared".into(),false));
+        assert!(control.single_capture_intent_phase("capture-1",&account,"https://example.test","other-subject",&pending.id,&pending.action_hash).is_err());
+        assert!(control.claim_recovery_request("capture-1",&account,"https://example.test","subject-a",&digest,&pending.id,&pending.action_hash,1_003).is_err());
+        assert!(matches!(registry.confirm(&pending.id,&token,&pending.action_hash,&owner_proof(),1_004),PendingConfirmOutcome::Confirmed(_)));
+        assert_eq!(control.single_capture_intent_phase("capture-1",&account,"https://example.test","subject-a",&pending.id,&pending.action_hash).unwrap(),("approved".into(),true));
+        assert_eq!(control.claim_recovery_request("capture-1",&account,"https://example.test","subject-a",&digest,&pending.id,&pending.action_hash,1_005).unwrap(),saved);
+        control.set_single_capture_phase("capture-1",&account,"https://example.test","subject-a","source_read","").unwrap();
+        assert!(control.set_single_capture_phase("capture-1",&account,"https://example.test","subject-a","source_read","arbitrary sensitive text").is_err());
+        control.set_single_capture_phase("capture-1",&account,"https://example.test","subject-a","preflight_failed","capture_preflight_source").unwrap();
+        let status=control.single_capture_operational_status("capture-1",&account,"https://example.test","subject-a").unwrap();
+        assert_eq!(status["journal_state"],"claimed");assert_eq!(status["execution_phase"],"preflight_failed");assert_eq!(status["last_failure"],"capture_preflight_source");
+        assert_eq!(status["original_request_id"],owner().request_id);
+        control.set_single_capture_phase("capture-1",&account,"https://example.test","subject-a","unknown","capture_unverified").unwrap();
+        drop(registry);drop(control);
+        let reopened=AgentControlStore::open(&root,&credentials,INSTALLATION_PRINCIPAL,1).unwrap();
+        assert_eq!(reopened.read_claimed_recovery_request("capture-1",&account,"https://example.test","subject-a").unwrap(),saved);
+        assert_eq!(reopened.single_capture_intent_phase("capture-1",&account,"https://example.test","subject-a",&pending.id,&pending.action_hash).unwrap(),("claimed".into(),true));
+        let status=reopened.single_capture_operational_status("capture-1",&account,"https://example.test","subject-a").unwrap();assert_eq!(status["execution_phase"],"unknown");assert_eq!(status["last_failure"],"capture_unverified");
+        assert!(reopened.read_claimed_recovery_request("capture-1",&account,"https://example.test","other-subject").is_err());
+        assert!(reopened.list_recovery_requests_for_ui(&account,"https://example.test","subject-a","").unwrap()["items"].as_array().unwrap().is_empty());
+        drop(reopened);std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

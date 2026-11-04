@@ -211,6 +211,63 @@ pub struct Manifest {
     pub events: Vec<Event>,
 }
 
+/// Rebase only trusted transport-origin DAV metadata to the enrolled public
+/// identity. Provider payload blobs are never parsed or modified here.
+pub fn canonicalize_manifest_identity(manifest:&mut Manifest, transport:&str, identity:&str) -> io::Result<()> {
+    use url::Url;
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData,"invalid capture identity origin");
+    let transport=Url::parse(transport).map_err(|_| invalid())?;
+    let identity=Url::parse(identity).map_err(|_| invalid())?;
+    let ip=transport.host_str().and_then(|s| s.trim_matches(['[',']']).parse::<std::net::IpAddr>().ok()).ok_or_else(invalid)?;
+    if transport.scheme()!="http" || !ip.is_loopback() || transport.path()!="/" ||
+       identity.scheme()!="https" || identity.host_str().is_none() || identity.path()!="/" ||
+       [&transport,&identity].iter().any(|u| !u.username().is_empty() || u.password().is_some() || u.query().is_some() || u.fragment().is_some()) {
+        return Err(invalid());
+    }
+    fn href(value:&str, transport:&Url, identity:&Url, collection:bool)->io::Result<String> {
+        let invalid=|| io::Error::new(io::ErrorKind::InvalidData,"invalid DAV capture metadata");
+        let raw_lower=value.to_ascii_lowercase();
+        if value.contains('\\') || raw_lower.contains("/../") || raw_lower.contains("/./") ||
+            ["%2f","%5c","%2e","%25"].iter().any(|bad| raw_lower.contains(bad)) { return Err(invalid()); }
+        let url=Url::parse(value).map_err(|_| invalid())?;
+        let lower=url.path().to_ascii_lowercase();
+        if (url.origin()!=transport.origin() && url.origin()!=identity.origin()) ||
+            !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() ||
+            !url.path().starts_with('/') || (collection && !url.path().ends_with('/')) ||
+            ["%2f","%5c","%2e","%25"].iter().any(|bad| lower.contains(bad)) { return Err(invalid()); }
+        let mapped=identity.join(url.path()).map_err(|_| invalid())?;
+        if mapped.origin()!=identity.origin() { return Err(invalid()); }
+        Ok(mapped.to_string())
+    }
+    fn fields(origin:&mut String, service:&str, collection:&mut String, id:Option<&mut String>, transport:&Url, identity:&Url)->io::Result<()> {
+        let invalid=|| io::Error::new(io::ErrorKind::InvalidData,"invalid capture scope");
+        let declared=Url::parse(origin).map_err(|_| invalid())?;
+        if (declared.origin()!=transport.origin() && declared.origin()!=identity.origin()) || declared.path()!="/" ||
+            !declared.username().is_empty() || declared.password().is_some() || declared.query().is_some() || declared.fragment().is_some() { return Err(invalid()); }
+        if matches!(service,"calendar"|"contacts") {
+            *collection=href(collection,transport,identity,true)?;
+            if let Some(id)=id {
+                let mapped=href(id,transport,identity,false)?;
+                let c=Url::parse(collection).map_err(|_| invalid())?;
+                let i=Url::parse(&mapped).map_err(|_| invalid())?;
+                if !i.path().starts_with(c.path()) || i.path()==c.path() { return Err(invalid()); }
+                *id=mapped;
+            }
+        } else if !matches!(service,"mail"|"mailbox") { return Err(invalid()); }
+        *origin=identity.origin().ascii_serialization(); Ok(())
+    }
+    for c in &mut manifest.collections { fields(&mut c.origin,&c.service,&mut c.collection,None,&transport,&identity)?; }
+    for o in &mut manifest.objects {
+        fields(&mut o.origin,&o.service,&mut o.collection,Some(&mut o.id),&transport,&identity)?;
+        if matches!(o.service.as_str(),"calendar"|"contacts"|"mail") {
+            isyncyou_store::capture_identity(&o.account,&o.origin,&o.service,&o.collection,&o.id)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData,"invalid shared capture identity"))?;
+        }
+    }
+    for e in &mut manifest.events { fields(&mut e.origin,&e.service,&mut e.collection,Some(&mut e.id),&transport,&identity)?; }
+    Ok(())
+}
+
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -421,6 +478,32 @@ pub fn publish(root: &Path, manifest: &Manifest) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_capture_metadata_rebases_to_public_identity_without_touching_blob() {
+        let local="http://127.0.0.1:8080/"; let public="https://example.test/";
+        let raw=b"BEGIN:VCALENDAR\r\nURL:http://127.0.0.1:8080/private\r\nEND:VCALENDAR\r\n";
+        let dir=tempfile::tempdir().unwrap(); let hash=put(dir.path(),raw).unwrap();
+        let collection="http://127.0.0.1:8080/dav/user%40example.test/calendar/";
+        let href="http://127.0.0.1:8080/dav/user%40example.test/calendar/item.ics";
+        let mut manifest=Manifest {schema:1,capture_highwater:1,event_highwater:1,
+            collections:vec![Collection {account:"a".into(),origin:local.into(),service:"calendar".into(),collection:collection.into(),cursor:"cursor".into(),observed_at:1,complete:true}],
+            objects:vec![Object {account:"a".into(),origin:local.into(),service:"calendar".into(),collection:collection.into(),id:href.into(),version:"v".into(),digest:hash.clone(),size:raw.len() as u64,related_blobs:vec![]}],
+            events:vec![Event {sequence:1,account:"a".into(),origin:local.into(),service:"calendar".into(),collection:collection.into(),id:href.into(),version:Some("v".into()),cursor:"cursor".into()}]};
+        canonicalize_manifest_identity(&mut manifest,local,public).unwrap();
+        assert_eq!(manifest.objects[0].origin,"https://example.test");
+        assert_eq!(manifest.objects[0].collection,"https://example.test/dav/user%40example.test/calendar/");
+        assert_eq!(manifest.objects[0].id,"https://example.test/dav/user%40example.test/calendar/item.ics");
+        assert_eq!(manifest.events[0].id,manifest.objects[0].id);
+        let selected=&manifest.objects[0];
+        assert_eq!(isyncyou_store::capture_identity(&selected.account,&selected.origin,&selected.service,&selected.collection,&selected.id).unwrap(),"5e300bfd02f7dc22d17982f8614a1317650cb6416eaff0ce63c849a4882241ac");
+        assert_eq!(std::fs::read(dir.path().join("blobs").join(&hash)).unwrap(),raw);
+        canonicalize_manifest_identity(&mut manifest,local,public).unwrap();
+        manifest.objects[0].id="https://evil.test/dav/calendar/item.ics".into();
+        assert!(canonicalize_manifest_identity(&mut manifest,local,public).is_err());
+        manifest.objects[0].id="https://example.test/dav/calendar/%2Fescape".into();
+        assert!(canonicalize_manifest_identity(&mut manifest,local,public).is_err());
+    }
 
     #[test]
     fn provider_outbox_versions_are_copied_without_altering_originals() {

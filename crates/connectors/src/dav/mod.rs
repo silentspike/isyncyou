@@ -615,12 +615,18 @@ impl DavClient {
         const C: &str = "urn:ietf:params:xml:ns:caldav";
         let entry_url = self.checked_url(entry)?;
         let (actual, root) = self.propfind(entry_url,"0",r#"<d:propfind xmlns:d="DAV:"><d:prop><d:current-user-principal/></d:prop></d:propfind>"#)?;
-        let response = root.children.iter().find(|n| n.namespace == D && n.name == "response" && n.child(D,"href").and_then(|h| self.checked_from(&actual,h.text.trim()).ok()).as_ref() == Some(&actual)).ok_or(DavError::InvalidResponse)?;
+        let responses: Vec<_> = root.children.iter().filter(|n| n.namespace == D && n.name == "response").collect();
+        if responses.len() != 1 { return Err(DavError::InvalidResponse); }
+        let response = responses[0];
+        let hrefs: Vec<_> = response.children.iter().filter(|n| n.namespace == D && n.name == "href").collect();
+        if hrefs.len() != 1 { return Err(DavError::InvalidResponse); }
+        let canonical = self.checked_from(&actual, hrefs[0].text.trim())?;
+        if !dav_response_matches(&actual, &canonical, true) { return Err(DavError::InvalidResponse); }
         let principal = response.children.iter().filter(|n| n.namespace == D && n.name == "propstat").find_map(|p| {
             if status(p.child(D,"status")?.text.trim()) != Some(200) { return None; }
             p.child(D,"prop")?.child(D,"current-user-principal")?.child(D,"href")
         }).ok_or(DavError::InvalidResponse)?;
-        let principal_url = self.checked_from(&actual,principal.text.trim())?;
+        let principal_url = self.checked_from(&canonical,principal.text.trim())?;
         let (actual, root) = self.propfind(principal_url.clone(),"0",r#"<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><c:calendar-user-address-set/></d:prop></d:propfind>"#)?;
         if actual != principal_url { return Err(DavError::InvalidUrl); }
         let response = root.children.iter().find(|n| n.namespace == D && n.name == "response" && n.child(D,"href").and_then(|h| self.checked_from(&actual,h.text.trim()).ok()).as_ref() == Some(&actual)).ok_or(DavError::InvalidResponse)?;
@@ -1328,7 +1334,7 @@ mod tests {
     }
 
     #[test]
-    fn calendar_addresses_are_taken_from_authenticated_principal() {
+    fn calendar_addresses_allow_one_canonical_collection_slash() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1350,7 +1356,7 @@ mod tests {
             }
         });
         let client = DavClient {http:Client::builder().no_proxy().timeout(std::time::Duration::from_secs(5)).redirect(reqwest::redirect::Policy::none()).build().unwrap(),origin:Url::parse(&origin).unwrap(),token:"fixture".into(),trusted_public_origin:None};
-        assert_eq!(client.calendar_user_addresses("/dav/").unwrap(),vec!["mailto:me@example.test"]);
+        assert_eq!(client.calendar_user_addresses("/dav").unwrap(),vec!["mailto:me@example.test"]);
         server.join().unwrap();
     }
 

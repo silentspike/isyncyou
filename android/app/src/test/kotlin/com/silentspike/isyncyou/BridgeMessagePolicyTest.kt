@@ -8,6 +8,17 @@ import org.junit.Test
 
 class BridgeMessagePolicyTest {
     @Test
+    fun providerDownloadAcceptsOnlyValidOptionalMailScope() {
+        fun envelope(scope: Any): String = JSONObject().put("t", "native").put("id", "d1")
+            .put("op", "downloadProviderAttachment").put("payload", JSONObject().put("account", "me")
+                .put("id", "m1").put("blob_id", "b1").put("filename", "file.txt").put("mail_scope", scope)).toString()
+        assertValid(BridgeMessagePolicy.validateEnvelope(envelope("shared/account")), "native", "d1")
+        assertInvalid(BridgeMessagePolicy.validateEnvelope(envelope("")), "invalid_attachment")
+        assertInvalid(BridgeMessagePolicy.validateEnvelope(envelope("bad\u0001scope")), "invalid_attachment")
+        assertInvalid(BridgeMessagePolicy.validateEnvelope(envelope(42)), "invalid_attachment")
+    }
+
+    @Test
     fun providerDownloadRejectsUnknownFieldsAndUnsafeAccount() {
         fun envelope(account: String, extra: Boolean = false): String {
             val payload = JSONObject().put("account", account).put("id", "m1")

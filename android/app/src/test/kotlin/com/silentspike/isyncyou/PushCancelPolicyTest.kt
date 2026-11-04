@@ -11,6 +11,12 @@ class PushCancelPolicyTest {
             assertFalse(PushCancelPolicy.canClaim(stage))
         }
     }
+    @Test fun onlyActuallyExpiredCredentialsCanBeReconciled() {
+        assertFalse(PushCancelPolicy.canClaim("credentials_ready", 0, 100))
+        assertFalse(PushCancelPolicy.canClaim("credentials_ready", 101, 100))
+        assertTrue(PushCancelPolicy.canClaim("credentials_ready", 100, 100))
+        assertTrue(PushCancelPolicy.canClaim("credentials_ready", 99, 100))
+    }
     @Test fun existingOrConflictingBindingIsNeverTreatedAsAbsent() {
         assertEquals("prepare_cancelled", PushCancelPolicy.confirmedStage("absent"))
         assertEquals("prepare_cancel_conflict", PushCancelPolicy.confirmedStage("present"))

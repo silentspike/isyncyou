@@ -91,13 +91,53 @@ pub struct SelfHostedClient {
     origin: String,
 }
 
+/// Last live JMAP discovery outcome; independent of locally stored credentials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MailAccessObservation { Available, AuthenticationRejected, PermissionDenied, TransportUnavailable, InvalidResponse, Unknown }
+
+fn access_observations() -> &'static std::sync::Mutex<std::collections::HashMap<(String,String),MailAccessObservation>> {
+    static OBS:std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(String,String),MailAccessObservation>>> = std::sync::OnceLock::new();
+    OBS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Observation is local to this process and never proves current access without a new request.
+pub fn mail_access_observation(cfg:&Config, account:&str) -> MailAccessObservation {
+    let Some(ProviderConfig::SelfHosted {origin,..})=cfg.provider_accounts.get(account) else { return MailAccessObservation::Unknown; };
+    access_observations().lock().unwrap_or_else(|e| e.into_inner()).get(&(account.into(),origin.clone())).copied().unwrap_or(MailAccessObservation::Unknown)
+}
+
+fn observe_discovery(account:&str, origin:&str, result:&Result<JmapClient,JmapError>) {
+    let status=match result { Ok(_) => MailAccessObservation::Available, Err(JmapError::Http(401)) => MailAccessObservation::AuthenticationRejected, Err(JmapError::Http(403)) => MailAccessObservation::PermissionDenied, Err(JmapError::Transport) => MailAccessObservation::TransportUnavailable, Err(JmapError::InvalidUrl | JmapError::InvalidResponse | JmapError::Unsupported) => MailAccessObservation::InvalidResponse, Err(_) => MailAccessObservation::Unknown };
+    let mut map=access_observations().lock().unwrap_or_else(|e| e.into_inner());
+    if map.len()>=256 && !map.contains_key(&(account.into(),origin.into())) { map.clear(); }
+    map.insert((account.into(),origin.into()),status);
+}
+fn observe_unknown(account:&str, origin:&str) {
+    let mut map=access_observations().lock().unwrap_or_else(|e| e.into_inner());
+    if map.len()>=256 && !map.contains_key(&(account.into(),origin.into())) { map.clear(); }
+    map.insert((account.into(),origin.into()),MailAccessObservation::Unknown);
+}
+fn discovery_failure(error:JmapError) -> String {
+    match error {
+        JmapError::InvalidUrl => "JMAP discovery invalid_url".into(),
+        JmapError::InvalidResponse => "JMAP discovery invalid_response".into(),
+        JmapError::Unsupported => "JMAP discovery unsupported".into(),
+        JmapError::Http(code) => format!("JMAP discovery http_{code}"),
+        JmapError::Transport => "JMAP discovery transport".into(),
+        JmapError::OutcomeUnknown => "JMAP discovery outcome_unknown".into(),
+        JmapError::Method(_) => "JMAP discovery method_error".into(),
+    }
+}
+
 pub fn client(cfg: &Config, account: &str) -> Result<SelfHostedClient, String> {
     let origin = match cfg.provider_accounts.get(account) {
         Some(ProviderConfig::SelfHosted { origin, .. }) => origin,
         None => return Err("Not a self-hosted account".into()),
     };
-    let token = crate::provider_auth::self_hosted_access_token(cfg, account)?;
-    let client = JmapClient::discover(origin, token).map_err(|_| "JMAP discovery failed")?;
+    let token = crate::provider_auth::self_hosted_access_token(cfg, account).map_err(|e| { observe_unknown(account,origin); e })?;
+    let discovery = JmapClient::discover(origin, token);
+    observe_discovery(account,origin,&discovery);
+    let client = discovery.map_err(discovery_failure)?;
     Ok(SelfHostedClient {
         client,
         account: account.into(),
@@ -111,7 +151,9 @@ pub fn watch_mail_events(cfg: &Config, account: &str, stop: &std::sync::atomic::
     let _lease = crate::provider_auth::try_event_stream_lease(cfg,account)?;
     let origin = match cfg.provider_accounts.get(account) { Some(ProviderConfig::SelfHosted {origin,..}) => origin, None => return Err("Not a self-hosted account".into()) };
     let token = crate::provider_auth::self_hosted_access_token(cfg, account)?;
-    let native = JmapClient::discover(origin, token.clone()).map_err(|_| "JMAP discovery failed")?;
+    let discovery = JmapClient::discover(origin, token.clone());
+    observe_discovery(account,origin,&discovery);
+    let native = discovery.map_err(|_| "JMAP discovery failed")?;
     let provider = SelfHostedClient {client:native,account:account.into(),origin:origin.clone()};
     scope(cfg, account, &provider)?;
     let mut last_auth_check: Option<std::time::Instant> = None;
@@ -135,9 +177,10 @@ pub fn client_with_store(
         Some(ProviderConfig::SelfHosted { origin, .. }) => origin,
         None => return Err("Not a self-hosted account".into()),
     };
-    let token =
-        crate::provider_auth::self_hosted_access_token_with_store(cfg, account, credentials)?;
-    let client = JmapClient::discover(origin, token).map_err(|_| "JMAP discovery failed")?;
+    let token = crate::provider_auth::self_hosted_access_token_with_store(cfg, account, credentials).map_err(|e| { observe_unknown(account,origin); e })?;
+    let discovery = JmapClient::discover(origin, token);
+    observe_discovery(account,origin,&discovery);
+    let client = discovery.map_err(discovery_failure)?;
     Ok(SelfHostedClient {
         client,
         account: account.into(),
@@ -160,9 +203,51 @@ pub fn scope(
     Ok(ProviderScope {
         account_id: account.into(),
         origin,
-        service: "mail".into(),
+        service: if client.client.account_id() == client.client.primary_account_id() { "mail" } else { "mail-shared" }.into(),
         collection: client.client.account_id().into(),
     })
+}
+
+/// Shared mail accounts advertised by a freshly discovered authenticated session.
+pub fn shared_mail_accessible_accounts(cfg:&Config, account:&str, provider:&SelfHostedClient) -> Result<Vec<String>,String> {
+    scope(cfg,account,provider)?;
+    if provider.client.account_id()!=provider.client.primary_account_id() { return Err("Primary mail client required".into()); }
+    Ok(provider.client.mail_accounts().iter().filter_map(|(id,_)| (id!=provider.client.primary_account_id()).then_some(id.clone())).collect())
+}
+
+/// Live readable mailbox IDs for one freshly discovered shared account.
+pub fn shared_mail_readable_mailboxes(cfg:&Config, account:&str, provider:&SelfHostedClient, native:&str) -> Result<Vec<String>,String> {
+    if !shared_mail_accessible_accounts(cfg,account,provider)?.iter().any(|id| id==native) { return Err("Shared mail scope unavailable".into()); }
+    let client=provider.client.for_mail_account(native).map_err(|_| "Shared mail scope unavailable")?;
+    let page_size=client.max_objects_in_get().min(100);
+    if page_size==0 { return Err("Mailbox rights unavailable".into()); }
+    let mut position=0usize; let mut state:Option<String>=None; let mut readable=Vec::new(); let mut seen=std::collections::HashSet::new();
+    loop {
+        let page=client.query_mailboxes(position,page_size).map_err(|_| "Mailbox rights unavailable")?;
+        let current=field(&page,"queryState")?;
+        if state.as_deref().is_some_and(|s| s!=current) { return Err("Mailbox rights changed".into()); }
+        state=Some(current.into());
+        if page["position"].as_u64()!=Some(position as u64) { return Err("Invalid mailbox page".into()); }
+        let ids=list(&page,"ids")?;
+        let total_u64=page["total"].as_u64().ok_or("Invalid mailbox page")?;
+        if total_u64>1000 { return Err("Invalid mailbox page".into()); }
+        let total=total_u64 as usize;
+        if position+ids.len()>total || (ids.is_empty() && position!=total) || ids.iter().any(|id| !seen.insert(id.clone())) { return Err("Invalid mailbox page".into()); }
+        if !ids.is_empty() {
+            let result=client.get("Mailbox",Some(&ids),None).map_err(|_| "Mailbox rights unavailable")?;
+            if !list(&result,"notFound")?.is_empty() { return Err("Mailbox rights changed".into()); }
+            let rows=result["list"].as_array().ok_or("Mailbox rights unavailable")?;
+            let mut found=std::collections::HashSet::new();
+            for row in rows {
+                let id=field(row,"id")?;
+                if !ids.iter().any(|value| value==id) || !found.insert(id.to_owned()) { return Err("Invalid mailbox identity".into()); }
+                if row["myRights"]["mayReadItems"].as_bool()==Some(true) { readable.push(id.to_owned()); }
+            }
+            if found.len()!=ids.len() { return Err("Mailbox rights changed".into()); }
+        }
+        position+=ids.len(); if position==total { break; }
+    }
+    Ok(readable)
 }
 
 /// Read one export-compatible version while the caller holds the provider account lock.
@@ -208,6 +293,57 @@ pub fn read_body(
         .client
         .get_email_bodies(&[email_id.to_string()], max_bytes)
         .map_err(|_| "JMAP body unavailable".into())
+}
+
+fn readable_scoped_client(cfg: &Config, account: &str, provider: &SelfHostedClient, native: &str, email_id: &str) -> Result<SelfHostedClient, String> {
+    scope(cfg, account, provider)?;
+    let selected = provider.client.for_mail_account(native).map_err(|_| "Mail scope unavailable")?;
+    let scoped = SelfHostedClient { client:selected, account:account.into(), origin:provider.origin.clone() };
+    if native != provider.client.primary_account_id() {
+        let ids = vec![email_id.to_owned()];
+        let email = scoped.client.get("Email", Some(&ids), None).map_err(|_| "Mail unavailable")?;
+        if !list(&email,"notFound")?.is_empty() { return Err("Mail unavailable".into()); }
+        let entries = email["list"].as_array().ok_or("Invalid mail response")?;
+        if entries.len()!=1 || field(&entries[0],"id")? != email_id { return Err("Mail unavailable".into()); }
+        let mailboxes = entries[0]["mailboxIds"].as_object().ok_or("Mail membership unavailable")?;
+        let ids:Vec<String> = mailboxes.iter().filter_map(|(id,v)| (v.as_bool()==Some(true)).then_some(id.clone())).collect();
+        if ids.is_empty() || ids.len()>256 { return Err("Mail membership unavailable".into()); }
+        let response = scoped.client.get("Mailbox",Some(&ids),None).map_err(|_| "Mailbox rights unavailable")?;
+        let entries = response["list"].as_array().ok_or("Mailbox rights unavailable")?;
+        let readable = entries.iter().any(|m| m["id"].as_str().is_some_and(|id| ids.iter().any(|x| x==id)) && m["myRights"]["mayReadItems"].as_bool()==Some(true));
+        if !readable { return Err("Mailbox access unavailable".into()); }
+    }
+    Ok(scoped)
+}
+
+/// Read from an explicitly selected account advertised by the authenticated session.
+pub fn read_body_in_scope(cfg:&Config, account:&str, provider:&SelfHostedClient, native:&str, email_id:&str, max_bytes:usize) -> Result<Value,String> {
+    let selected = readable_scoped_client(cfg,account,provider,native,email_id)?;
+    let mut result=read_body(cfg,account,&selected,email_id,max_bytes)?;
+    if native != provider.client.primary_account_id() {
+        let allowed=shared_mail_readable_mailboxes(cfg,account,provider,native)?;
+        retain_readable_memberships(&mut result,email_id,&allowed)?;
+    }
+    Ok(result)
+}
+
+fn retain_readable_memberships(result:&mut Value, email_id:&str, allowed:&[String]) -> Result<(),String> {
+    let rows=result["list"].as_array_mut().ok_or("Invalid mail response")?;
+    if rows.len()!=1 || field(&rows[0],"id")? != email_id { return Err("Mail unavailable".into()); }
+    let memberships=rows[0]["mailboxIds"].as_object_mut().ok_or("Mail membership unavailable")?;
+    memberships.retain(|id,value| value.as_bool()==Some(true) && allowed.iter().any(|v| v==id));
+    if memberships.is_empty() { return Err("Mailbox access unavailable".into()); }
+    Ok(())
+}
+
+pub fn list_attachments_in_scope(cfg:&Config, account:&str, provider:&SelfHostedClient, native:&str, email_id:&str) -> Result<Vec<AttachmentInfo>,String> {
+    let selected = readable_scoped_client(cfg,account,provider,native,email_id)?;
+    list_attachments(cfg,account,&selected,email_id)
+}
+
+pub fn download_attachment_in_scope(cfg:&Config, account:&str, provider:&SelfHostedClient, native:&str, email_id:&str, blob_id:&str) -> Result<DownloadedAttachment,String> {
+    let selected = readable_scoped_client(cfg,account,provider,native,email_id)?;
+    download_attachment(cfg,account,&selected,email_id,blob_id)
 }
 
 pub struct DownloadedAttachment {
@@ -621,7 +757,24 @@ pub fn sync(
     store: &Store,
     client: &SelfHostedClient,
 ) -> Result<usize, String> {
-    sync_with_page_limit(cfg,account,store,client,100)
+    let primary = scope(cfg, account, client)?;
+    if primary.service != "mail" { return Err("Primary mail client required".into()); }
+    // Hide old shared scopes before any refresh; failed or revoked access stays hidden.
+    for old in store.provider_scopes(account, &primary.origin, "mail-shared").map_err(|e| e.to_string())? {
+        store.set_shared_mail_access(account, &primary.origin, &old.collection, false).map_err(|e| e.to_string())?;
+    }
+    let mut count = sync_with_page_limit(cfg,account,store,client,100)?;
+    for (native, _) in client.client.mail_accounts() {
+        if native == client.client.primary_account_id() { continue; }
+        store.set_shared_mail_access(account, &primary.origin, native, false).map_err(|e| e.to_string())?;
+        let selected = client.client.for_mail_account(native).map_err(|_| "Shared mail account unavailable")?;
+        let shared = SelfHostedClient { client:selected, account:account.into(), origin:primary.origin.clone() };
+        let folders = sync_mailboxes_inner(cfg,account,store,&shared,true)?;
+        let messages = sync_inner(cfg,account,store,&shared,true,100)?;
+        store.set_shared_mail_access(account, &primary.origin, native, true).map_err(|e| e.to_string())?;
+        count += folders + messages;
+    }
+    Ok(count)
 }
 
 /// Run the normal sync with a smaller bounded page size. This permits callers
@@ -658,7 +811,7 @@ pub fn mailbox_scope(
     provider: &SelfHostedClient,
 ) -> Result<ProviderScope, String> {
     let mut scope = scope(cfg, account, provider)?;
-    scope.service = "mailboxes".into();
+    scope.service = if scope.service == "mail-shared" { "mailboxes-shared" } else { "mailboxes" }.into();
     Ok(scope)
 }
 
@@ -1097,6 +1250,29 @@ fn native_recipients(email: &Value) -> Result<Vec<String>, String> {
 mod recipient_tests {
     use super::{complete_body_value, draft_addresses, mime_attachments, native_recipients, pointer_token, validate_complete_body};
     use serde_json::json;
+
+    #[test]
+    fn discovery_access_observation_is_scoped_and_does_not_touch_credentials() {
+        use isyncyou_core::{config::ProviderConfig,Config};
+        let mut cfg=Config::default();
+        cfg.provider_accounts.insert("observation-test".into(),ProviderConfig::SelfHosted {origin:"https://example.test".into(),client_id:"client".into()});
+        let denied:Result<super::JmapClient,super::JmapError>=Err(super::JmapError::Http(403));
+        super::observe_discovery("observation-test","https://example.test",&denied);
+        assert_eq!(super::mail_access_observation(&cfg,"observation-test"),super::MailAccessObservation::PermissionDenied);
+        let unauthorized:Result<super::JmapClient,super::JmapError>=Err(super::JmapError::Http(401));
+        super::observe_discovery("observation-test","https://example.test",&unauthorized);
+        assert_eq!(super::mail_access_observation(&cfg,"observation-test"),super::MailAccessObservation::AuthenticationRejected);
+        super::observe_unknown("observation-test","https://example.test");
+        assert_eq!(super::mail_access_observation(&cfg,"observation-test"),super::MailAccessObservation::Unknown);
+    }
+
+    #[test]
+    fn shared_body_hides_unreadable_mailbox_memberships() {
+        let mut response=json!({"list":[{"id":"m","mailboxIds":{"readable":true,"revoked":true}}]});
+        super::retain_readable_memberships(&mut response,"m",&["readable".into()]).unwrap();
+        assert_eq!(response["list"][0]["mailboxIds"],json!({"readable":true}));
+        assert!(super::retain_readable_memberships(&mut response,"m",&[]).is_err());
+    }
 
     #[test]
     fn offline_upload_resolution_requires_confirmed_scoped_unique_operations() {

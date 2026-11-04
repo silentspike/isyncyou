@@ -217,17 +217,17 @@ fn event_source_endpoint(origin: &Url, template: &str) -> Result<Url, JmapError>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventDomains { pub mail: bool, pub dav: bool }
 
-fn state_change_domains(data: &str, account: &str) -> Result<EventDomains, JmapError> {
+fn state_change_domains(data: &str, _account: &str) -> Result<EventDomains, JmapError> {
     let value: Value = serde_json::from_str(data).map_err(|_| JmapError::InvalidResponse)?;
     if value["@type"].as_str() != Some("StateChange") { return Err(JmapError::InvalidResponse); }
     let changed = value["changed"].as_object().ok_or(JmapError::InvalidResponse)?;
     let mut domains = EventDomains { mail:false, dav:false };
-    for (changed_account, types) in changed {
+    for (_changed_account, types) in changed {
         let types = types.as_object().ok_or(JmapError::InvalidResponse)?;
         for name in ["Email","Mailbox","Calendar","CalendarEvent","AddressBook","ContactCard"] {
             if let Some(state) = types.get(name) {
                 if state.as_str().is_none_or(str::is_empty) { return Err(JmapError::InvalidResponse); }
-                if matches!(name, "Email" | "Mailbox") { domains.mail |= changed_account == account; } else { domains.dav = true; }
+                if matches!(name, "Email" | "Mailbox") { domains.mail = true; } else { domains.dav = true; }
             }
         }
     }
@@ -296,6 +296,9 @@ pub struct JmapClient {
     origin: Url,
     token: String,
     account: String,
+    primary_account: String,
+    mail_accounts: Vec<(String, bool)>,
+    read_only: bool,
     api: Url,
     download: String,
     upload: String,
@@ -399,6 +402,17 @@ impl JmapClient {
         if !account_caps.contains_key(MAIL) {
             return Err(JmapError::Unsupported);
         }
+        let advertised = session.get("accounts").and_then(Value::as_object).ok_or(JmapError::InvalidResponse)?;
+        if advertised.len() > 256 { return Err(JmapError::InvalidResponse); }
+        let mut mail_accounts = Vec::new();
+        for (id, entry) in advertised {
+            let caps = entry.get("accountCapabilities").and_then(Value::as_object).ok_or(JmapError::InvalidResponse)?;
+            if !caps.contains_key(MAIL) { continue; }
+            if id.is_empty() || id.len() > 1024 || id.chars().any(char::is_control) { return Err(JmapError::InvalidResponse); }
+            let read_only = entry.get("isReadOnly").and_then(Value::as_bool).unwrap_or(id != &account);
+            mail_accounts.push((id.clone(), read_only));
+        }
+        let read_only = mail_accounts.iter().find(|(id,_)| id == &account).map(|(_,v)| *v).ok_or(JmapError::InvalidResponse)?;
         let submission =
             capabilities.contains_key(SUBMISSION) && account_caps.contains_key(SUBMISSION);
         let mail_share = capabilities.contains_key(MAIL_SHARE) && account_caps.contains_key(MAIL_SHARE);
@@ -432,7 +446,10 @@ impl JmapClient {
             http,
             origin,
             token,
+            primary_account:account.clone(),
             account,
+            mail_accounts,
+            read_only,
             api,
             download,
             upload,
@@ -461,6 +478,14 @@ impl JmapClient {
     }
     pub fn account_id(&self) -> &str {
         &self.account
+    }
+    pub fn primary_account_id(&self) -> &str { &self.primary_account }
+    /// Only accounts advertised for mail by this freshly authenticated session.
+    pub fn mail_accounts(&self) -> &[(String, bool)] { &self.mail_accounts }
+    /// Bind a client to a discovered account. Shared accounts are read-only locally.
+    pub fn for_mail_account(&self, account: &str) -> Result<Self, JmapError> {
+        let advertised_read_only = self.mail_accounts.iter().find(|(id,_)| id == account).map(|(_,read_only)| *read_only).ok_or(JmapError::Unsupported)?;
+        Ok(Self { http:self.http.clone(), origin:self.origin.clone(), token:self.token.clone(), account:account.into(), primary_account:self.primary_account.clone(), mail_accounts:self.mail_accounts.clone(), read_only:advertised_read_only || account != self.primary_account, api:self.api.clone(), download:self.download.clone(), upload:self.upload.clone(), event_source:self.event_source.clone(), submission:self.submission && account == self.primary_account, mail_share:self.mail_share, gate:self.gate.clone(), max_get:self.max_get, max_request:self.max_request, max_upload:self.max_upload, session_state:self.session_state.clone(), vapid_public_key:self.vapid_public_key.clone(), metrics:Mutex::new(JmapSyncMetrics::default()) })
     }
     pub fn origin(&self) -> &str {
         self.origin.as_str()
@@ -500,6 +525,7 @@ impl JmapClient {
         mutation: bool,
         submission: bool,
     ) -> Result<Value, JmapError> {
+        if mutation && self.read_only { return Err(JmapError::Unsupported); }
         let _permit = self.gate.acquire(false);
         {
             let mut metrics = self.metrics.lock().unwrap_or_else(|error| error.into_inner());
@@ -927,6 +953,7 @@ impl JmapClient {
         Ok(bytes)
     }
     pub fn upload(&self, bytes: Vec<u8>, media_type: &str) -> Result<Value, JmapError> {
+        if self.read_only { return Err(JmapError::Unsupported); }
         if bytes.len() as u64 > self.max_upload {
             return Err(JmapError::InvalidResponse);
         }
@@ -1222,7 +1249,7 @@ mod tests {
         let stream = b"event: ping\ndata: {\"interval\":30}\n\nevent: state\ndata: {\"@type\":\"StateChange\",\"changed\":{\"other\":{\"Email\":\"a\"}}}\n\nevent: state\ndata: {\"@type\":\"StateChange\",\"changed\":{\"account\":{\"Email\":\"b\"}}}\n\n";
         let stop = AtomicBool::new(false); let mut events = Vec::new();
         consume_mail_event_stream(&mut std::io::Cursor::new(stream),"account",&stop,&mut |domains| {events.push(domains); Ok(())}).unwrap();
-        assert_eq!(events,vec![EventDomains {mail:false,dav:false},EventDomains {mail:true,dav:false}]);
+        assert_eq!(events,vec![EventDomains {mail:false,dav:false},EventDomains {mail:true,dav:false},EventDomains {mail:true,dav:false}]);
         let oversized = vec![b'x';65_538];
         assert_eq!(consume_mail_event_stream(&mut std::io::Cursor::new(oversized),"account",&stop,&mut |_| Ok(())),Err(JmapError::InvalidResponse));
         assert!(state_change_domains("{}","account").is_err());
@@ -1249,7 +1276,11 @@ mod tests {
           }
         });
         let origin=Url::parse(&format!("http://{address}/")).unwrap();
-        let client=JmapClient { http:Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().unwrap(), origin:origin.clone(), token:"fixture-token".into(), account:"account".into(), api:origin.clone(), download:String::new(), upload:String::new(), event_source:Some(origin.join("/events").unwrap()), submission:false, mail_share:false, gate:account_gate("event-test",2,1), max_get:10, max_request:1024, max_upload:1024, session_state:"state".into(), vapid_public_key:None, metrics:Mutex::new(JmapSyncMetrics::default()) };
+        let client=JmapClient { http:Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().unwrap(), origin:origin.clone(), token:"fixture-token".into(), account:"account".into(), primary_account:"account".into(), mail_accounts:vec![("account".into(),false),("shared".into(),false)], read_only:false, api:origin.clone(), download:String::new(), upload:String::new(), event_source:Some(origin.join("/events").unwrap()), submission:false, mail_share:false, gate:account_gate("event-test",2,1), max_get:10, max_request:1024, max_upload:1024, session_state:"state".into(), vapid_public_key:None, metrics:Mutex::new(JmapSyncMetrics::default()) };
+        assert!(client.for_mail_account("unadvertised").is_err());
+        let shared=client.for_mail_account("shared").unwrap();
+        assert!(!shared.supports_submission());
+        assert!(matches!(shared.upload(Vec::new(),"application/octet-stream"),Err(JmapError::Unsupported)));
         let mut events = Vec::new();
         client.watch_mail_events(&AtomicBool::new(false),|domains| {events.push(domains); Ok(())}).unwrap();
         client.watch_mail_events(&AtomicBool::new(false),|domains| {events.push(domains); Ok(())}).unwrap();
