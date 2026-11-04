@@ -23,6 +23,15 @@ internal object ReminderStatus {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putString("status", status).putString("reason", reason).putLong("at", System.currentTimeMillis()).apply()
     }
+    fun recordDelivery(context: Context, reason: String) {
+        if (reason !in setOf("record", "expired", "engine", "permission", "credentials", "discovery", "acl", "get", "expansion", "interpretation", "timing", "ledger", "claim_internal", "notification", "ack", "delivered")) return
+        // Diagnostics must never change delivery or retry behavior.
+        runCatching {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .putString("delivery_reason", reason).putLong("delivery_at", System.currentTimeMillis()).apply()
+        }
+    }
+
     fun snapshot(context: Context): JSONObject {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val manager = context.getSystemService(NotificationManager::class.java)
@@ -34,6 +43,8 @@ internal object ReminderStatus {
         val online = caps?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
         return JSONObject().put("planning", prefs.getString("status", "idle"))
             .put("reason", prefs.getString("reason", ""))
+            .put("delivery_reason", prefs.getString("delivery_reason", ""))
+            .put("delivery_at", prefs.getLong("delivery_at", 0))
             .put("last_checked_at", prefs.getLong("at", 0)).put("notifications_enabled", enabled).put("network_validated", online)
     }
 }
@@ -45,13 +56,15 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
         if (!tag.matches(Regex("[0-9a-f]{64}"))) return@withContext Result.failure()
         // WorkManager stores only the pseudonymous tag. The source record is encrypted.
         val record = runCatching { PushEnrollmentStore.get(applicationContext, "r_$tag") }.getOrNull()
-            ?: return@withContext Result.failure()
+            ?: run { ReminderStatus.recordDelivery(applicationContext, "record"); return@withContext Result.failure() }
         val trigger = record.optLong("trigger_at", 0)
         if (trigger <= 0 || trigger < System.currentTimeMillis() / 1000 - 86400) {
             runCatching { PushEnrollmentStore.remove(applicationContext, "r_$tag") }
+            ReminderStatus.recordDelivery(applicationContext, "expired")
             return@withContext Result.failure()
         }
         if (!runCatching { EngineBootstrap.ensureStarted(applicationContext.filesDir).isNotEmpty() }.getOrDefault(false)) {
+            ReminderStatus.recordDelivery(applicationContext, "engine")
             return@withContext Result.retry()
         }
         val manager = applicationContext.getSystemService(NotificationManager::class.java) ?: return@withContext Result.failure()
@@ -62,19 +75,25 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
             (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(applicationContext,
                 Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) ||
             (Build.VERSION.SDK_INT >= 26 && manager.getNotificationChannel(CHANNEL)?.importance == NotificationManager.IMPORTANCE_NONE)) {
+            ReminderStatus.recordDelivery(applicationContext, "permission")
             return@withContext Result.retry()
         }
         val claimed = runCatching {
             JSONObject(NativeEngine.nativeReminderClaim(applicationContext.filesDir.absolutePath, record.toString()))
-        }.getOrNull() ?: return@withContext Result.retry()
+        }.getOrNull() ?: run { ReminderStatus.recordDelivery(applicationContext, "claim_internal"); return@withContext Result.retry() }
         val claimStatus = claimed.optString("status")
         when (claimStatus) {
             "delivered" -> {
                 runCatching { PushEnrollmentStore.remove(applicationContext, "r_$tag") }
+                ReminderStatus.recordDelivery(applicationContext, "delivered")
                 return@withContext Result.success()
             }
             "new", "pending" -> if (claimed.optString("notification_tag") != tag) return@withContext Result.failure()
-            else -> return@withContext Result.retry()
+            else -> {
+                val reason = claimed.optString("reason").takeIf { it in setOf("record", "credentials", "discovery", "acl", "get", "expansion", "interpretation", "timing", "ledger") } ?: "claim_internal"
+                ReminderStatus.recordDelivery(applicationContext, reason)
+                return@withContext Result.retry()
+            }
         }
         val notification = NotificationCompat.Builder(applicationContext, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_isyncyou).setContentTitle("Calendar reminder")
@@ -95,13 +114,17 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
                 }
             }
         }.getOrDefault(false)
-        if (!accepted) return@withContext Result.failure()
+        if (!accepted) { ReminderStatus.recordDelivery(applicationContext, "notification"); return@withContext Result.failure() }
         // An OS readback is not evidence that a person saw the notification.
         if (runCatching { NativeEngine.nativeReminderAcknowledge(applicationContext.filesDir.absolutePath, record.toString(), tag) == 1 }
                 .getOrDefault(false)) {
             runCatching { PushEnrollmentStore.remove(applicationContext, "r_$tag") }
+            ReminderStatus.recordDelivery(applicationContext, "delivered")
             Result.success()
-        } else Result.retry()
+        } else {
+            ReminderStatus.recordDelivery(applicationContext, "ack")
+            Result.retry()
+        }
     }
 
     companion object {

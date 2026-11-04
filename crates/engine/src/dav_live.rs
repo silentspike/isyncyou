@@ -1196,6 +1196,16 @@ pub enum ReminderClaim {
     Delivered,
 }
 
+// The synchronous native claim path keeps only a content-free phase on its
+// calling thread. No account, URL, item or upstream error leaves this seam.
+thread_local! {
+    static REMINDER_CLAIM_PHASE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("record") };
+}
+
+fn reminder_claim_phase(phase: &'static str) {
+    REMINDER_CLAIM_PHASE.with(|current| current.set(phase));
+}
+
 /// Re-read one event, enforce current read permission, and generate a bounded
 /// plan only when the expanded data and original carry the same native ETag.
 #[allow(clippy::too_many_arguments, reason = "DAV operation contract")]
@@ -1212,11 +1222,13 @@ pub fn plan_event_reminders(
     floating_tzid: Option<&str>,
     credentials: Option<&dyn ProviderCredentialStore>,
 ) -> Result<ReminderPlan, String> {
+    reminder_claim_phase("credentials");
     let origin = configured_origin(cfg, account)?;
     let client = match credentials {
         Some(credentials) => client_with_store(cfg, account, &origin, credentials)?,
         None => client(cfg, account, &origin)?,
     };
+    reminder_claim_phase("discovery");
     if !client
         .discover(entry)
         .map_err(|e| e.to_string())?
@@ -1234,16 +1246,19 @@ pub fn plan_event_reminders(
     let target = client
         .validate_target(&scope, href)
         .map_err(|e| e.to_string())?;
+    reminder_claim_phase("acl");
     if !client
         .permits(&scope, Some(&target), "read")
         .map_err(|e| e.to_string())?
     {
         return Err("Event is not currently readable".into());
     }
+    reminder_claim_phase("get");
     let source = client
         .read_resource(&scope, &target)
         .map_err(|e| e.to_string())?;
     let etag = source.etag.clone().ok_or("Event ETag unavailable")?;
+    reminder_claim_phase("interpretation");
     let planned = if isyncyou_connectors::dav::reminders::is_standalone(&source.raw)? {
         isyncyou_connectors::dav::reminders::plan(
             &source.raw,
@@ -1253,6 +1268,7 @@ pub fn plan_event_reminders(
             window_end,
         )?
     } else {
+        reminder_claim_phase("expansion");
         let mut expanded_items = client
             .expanded_events(&scope, occurrence_start, occurrence_end)
             .map_err(|e| e.to_string())?;
@@ -1270,6 +1286,7 @@ pub fn plan_event_reminders(
         if matching.next().is_some() || expanded.etag != etag {
             return Err("Event changed during reminder planning".into());
         }
+        reminder_claim_phase("interpretation");
         isyncyou_connectors::dav::reminders::plan(
             expanded.calendar_data.as_bytes(),
             &source.raw,
@@ -1314,6 +1331,7 @@ pub fn claim_event_reminder(
     desired: &isyncyou_connectors::dav::reminders::Reminder,
     credentials: Option<&dyn ProviderCredentialStore>,
 ) -> Result<ReminderClaim, String> {
+    reminder_claim_phase("timing");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| "System time unavailable")?
@@ -1334,6 +1352,7 @@ pub fn claim_event_reminder(
         floating_tzid,
         credentials,
     )?;
+    reminder_claim_phase("interpretation");
     let item = plan
         .items
         .iter()
@@ -1345,6 +1364,7 @@ pub fn claim_event_reminder(
         alarm_id: desired.alarm_id.clone(),
         trigger_at: desired.trigger_at.to_string(),
     };
+    reminder_claim_phase("ledger");
     let store = crate::provider_store::open(cfg, account)?;
     if store
         .claim_provider_alarm(&plan.scope, &alarm)
@@ -1414,6 +1434,20 @@ fn reminder_identity(
             .and_then(serde_json::Value::as_i64)
             .ok_or("Invalid reminder trigger")?,
     })
+}
+
+/// Report only the bounded phase on a native claim failure; the original
+/// claim result and the existing retry behavior remain unchanged.
+pub fn claim_reminder_record_diagnostic(
+    cfg: &Config,
+    account: &str,
+    entry: &str,
+    record: &serde_json::Value,
+    credentials: &dyn ProviderCredentialStore,
+) -> Result<serde_json::Value, &'static str> {
+    reminder_claim_phase("record");
+    claim_reminder_record(cfg, account, entry, record, credentials)
+        .map_err(|_| REMINDER_CLAIM_PHASE.with(std::cell::Cell::get))
 }
 
 /// Native-only bridge. The caller supplies a persisted engine-produced record;
@@ -4507,6 +4541,52 @@ mod tests {
         );
         writer.set_provider_accessible(&scope, false).unwrap();
         assert!(cached_live_objects(&reader, &scope, "", 10).is_err());
+    }
+
+    #[test]
+    fn reminder_claim_diagnostic_exposes_only_bounded_phase() {
+        struct EmptyCredentials;
+        impl ProviderCredentialStore for EmptyCredentials {
+            fn load(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<Option<crate::provider_credential::ProviderCredential>, String>
+            {
+                Err("private details".into())
+            }
+            fn replace(
+                &self,
+                _: &str,
+                _: &str,
+                _: &crate::provider_credential::ProviderCredential,
+            ) -> Result<(), String> {
+                Err("private details".into())
+            }
+            fn delete(&self, _: &str, _: &str) -> Result<(), String> {
+                Err("private details".into())
+            }
+        }
+        let cfg = Config::default();
+        assert_eq!(
+            claim_reminder_record_diagnostic(
+                &cfg,
+                "a",
+                "/",
+                &serde_json::json!({}),
+                &EmptyCredentials
+            ),
+            Err("record")
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let record = serde_json::json!({"account":"a", "collection":"private-collection", "href":"private-item", "uid":"u", "recurrence_id":"r", "alarm_id":"a", "trigger_at":now, "occurrence_start":"start", "occurrence_end":"end", "window_start":1, "window_end":2});
+        assert_eq!(
+            claim_reminder_record_diagnostic(&cfg, "a", "/", &record, &EmptyCredentials),
+            Err("credentials")
+        );
     }
 
     #[test]

@@ -66,18 +66,36 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeReminder
         || -> Result<serde_json::Value, ()> {
             let base = jni_get_string(&mut env, &base).ok_or(())?;
             let raw = jni_get_string(&mut env, &raw).ok_or(())?;
-            let (record, account) = record(&raw)?;
-            let cfg = config(Path::new(&base)).map_err(|_| ())?;
-            let credentials =
-                AndroidProviderCredentialStore::new(Path::new(&base)).map_err(|_| ())?;
-            isyncyou_engine::dav_live::claim_reminder_record(
-                &cfg,
-                &account,
-                "/.well-known/caldav",
-                &record,
-                &credentials,
+            let (record, account) = match record(&raw) {
+                Ok(value) => value,
+                Err(()) => {
+                    return Ok(serde_json::json!({"status":"unavailable","reason":"record"}))
+                }
+            };
+            let cfg = match config(Path::new(&base)) {
+                Ok(value) => value,
+                Err(_) => {
+                    return Ok(serde_json::json!({"status":"unavailable","reason":"credentials"}))
+                }
+            };
+            let credentials = match AndroidProviderCredentialStore::new(Path::new(&base)) {
+                Ok(value) => value,
+                Err(_) => {
+                    return Ok(serde_json::json!({"status":"unavailable","reason":"credentials"}))
+                }
+            };
+            Ok(
+                match isyncyou_engine::dav_live::claim_reminder_record_diagnostic(
+                    &cfg,
+                    &account,
+                    "/.well-known/caldav",
+                    &record,
+                    &credentials,
+                ) {
+                    Ok(value) => value,
+                    Err(phase) => serde_json::json!({"status":"unavailable","reason":phase}),
+                },
             )
-            .map_err(|_| ())
         },
     ))
     .ok()
