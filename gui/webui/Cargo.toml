@@ -31,3 +31,4 @@ plain-store = ["isyncyou-store/plain-store", "isyncyou-connectors/plain-store"]
 
 [dev-dependencies]
 tempfile = "3"
+rusqlite = { workspace = true }

@@ -4222,7 +4222,8 @@ pub fn objects(
     if !matches!(service, "calendar" | "contacts") {
         return Err("Unsupported DAV service".into());
     }
-    let (origin, store) = configured(cfg, account)?;
+    let origin = configured_origin(cfg, account)?;
+    let store = crate::provider_store::open_readonly(cfg, account)?;
     let scope = ProviderScope {
         account_id: account.into(),
         origin,
@@ -4232,7 +4233,7 @@ pub fn objects(
     cached_live_objects(&store, &scope, after, limit)
 }
 
-fn cached_live_objects(
+pub fn cached_live_objects(
     store: &Store,
     scope: &ProviderScope,
     after: &str,
@@ -4418,6 +4419,42 @@ mod tests {
                 vec![original]
             );
         }
+    }
+
+    #[test]
+    #[cfg(feature = "encrypted-store")]
+    fn cached_dav_page_reads_while_writer_is_held_and_respects_access_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider.db");
+        let key = b"synthetic dav reader key";
+        let writer = Store::open_encrypted(&path, key).unwrap();
+        let scope = ProviderScope {
+            account_id: "fixture".into(),
+            origin: "https://example.test/".into(),
+            service: "calendar".into(),
+            collection: "/calendar/".into(),
+        };
+        let object = ProviderObject {
+            remote_id: "/calendar/one".into(),
+            etag: Some("v1".into()),
+            raw: b"fixture".to_vec(),
+        };
+        writer
+            .apply_provider_page(
+                &scope,
+                &[isyncyou_store::ProviderChange::Upsert(object.clone())],
+                "one",
+            )
+            .unwrap();
+        let reader = Store::open_readonly_encrypted(&path, key).unwrap();
+        assert_eq!(
+            cached_live_objects(&reader, &scope, "", 10)
+                .unwrap()
+                .objects,
+            vec![object]
+        );
+        writer.set_provider_accessible(&scope, false).unwrap();
+        assert!(cached_live_objects(&reader, &scope, "", 10).is_err());
     }
 
     #[test]

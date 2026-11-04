@@ -106,6 +106,259 @@ pub struct SelfHostedClient {
     origin: String,
 }
 
+/// One bounded, server-ordered page. Older pages are never written to the cache.
+#[derive(serde::Serialize)]
+pub struct LiveMailPage {
+    pub account_id: String,
+    pub origin: String,
+    pub native_account: String,
+    pub mailbox_id: Option<String>,
+    pub items: Vec<serde_json::Value>,
+    pub query_state: String,
+    pub next_position: Option<usize>,
+    pub total: usize,
+}
+
+const MAIL_LIST_PROPERTIES: &[&str] = &[
+    "id",
+    "blobId",
+    "threadId",
+    "mailboxIds",
+    "keywords",
+    "size",
+    "receivedAt",
+    "messageId",
+    "from",
+    "to",
+    "cc",
+    "subject",
+    "hasAttachment",
+    "preview",
+];
+
+fn bounded_mail_metadata(value: &Value) -> Result<Value, String> {
+    let source = value.as_object().ok_or("invalid_page")?;
+    let mut safe = serde_json::Map::new();
+    for &name in MAIL_LIST_PROPERTIES {
+        if let Some(value) = source.get(name) {
+            safe.insert(name.into(), value.clone());
+        }
+    }
+    let result = Value::Object(safe);
+    if serde_json::to_vec(&result)
+        .map_err(|_| "invalid_page")?
+        .len()
+        > 1024 * 1024
+    {
+        return Err("provider_page_too_large".into());
+    }
+    Ok(result)
+}
+
+/// Fetch one page from the provider, bound to its native query state.
+/// The query is repeated after fetching to reject changes while a page is read.
+pub fn live_mail_metadata_page(
+    cfg: &Config,
+    account: &str,
+    native_account: Option<&str>,
+    mailbox_id: Option<&str>,
+    position: usize,
+    limit: usize,
+    expected_query_state: Option<&str>,
+) -> Result<LiveMailPage, String> {
+    live_mail_metadata_search_page(
+        cfg,
+        account,
+        native_account,
+        mailbox_id,
+        None,
+        position,
+        limit,
+        expected_query_state,
+    )
+}
+
+/// Query a bounded page from the server, including messages outside the local window.
+pub fn live_mail_metadata_search_page(
+    cfg: &Config,
+    account: &str,
+    native_account: Option<&str>,
+    mailbox_id: Option<&str>,
+    text: Option<&str>,
+    position: usize,
+    limit: usize,
+    expected_query_state: Option<&str>,
+) -> Result<LiveMailPage, String> {
+    if limit == 0
+        || limit > 50
+        || position > 1_000_000
+        || (position > 0 && expected_query_state.is_none())
+    {
+        return Err("invalid_page".into());
+    }
+    if text
+        .is_some_and(|s| s.trim().is_empty() || s.len() > 1024 || s.chars().any(char::is_control))
+    {
+        return Err("invalid_page".into());
+    }
+    if mailbox_id.is_some_and(|s| s.is_empty() || s.len() > 1024 || s.chars().any(char::is_control))
+        || expected_query_state
+            .is_some_and(|s| s.is_empty() || s.len() > 4096 || s.chars().any(char::is_control))
+    {
+        return Err("invalid_page".into());
+    }
+    let provider = client(cfg, account)?;
+    let primary = provider.client.primary_account_id();
+    let native = native_account.unwrap_or(primary);
+    let shared = native != primary;
+    let rights = if shared {
+        let rights = shared_mail_readable_mailboxes(cfg, account, &provider, native)?;
+        if rights.is_empty() || mailbox_id.is_some_and(|id| !rights.iter().any(|v| v == id)) {
+            return Err("provider_scope_unavailable".into());
+        }
+        Some(rights)
+    } else {
+        None
+    };
+    let selected = if shared {
+        provider
+            .client
+            .for_mail_account(native)
+            .map_err(|_| "provider_scope_unavailable")?
+    } else {
+        provider
+            .client
+            .for_mail_account(primary)
+            .map_err(|_| "provider_scope_unavailable")?
+    };
+    let page_size = limit.min(selected.max_objects_in_get());
+    if page_size == 0 {
+        return Err("provider_page_unavailable".into());
+    }
+    let filter = match (mailbox_id, text) {
+        (Some(id), Some(text)) => Some(
+            serde_json::json!({"operator":"AND","conditions":[{"inMailbox":id},{"text":text}]}),
+        ),
+        (Some(id), None) => Some(serde_json::json!({"inMailbox":id})),
+        (None, Some(text)) => Some(serde_json::json!({"text":text})),
+        (None, None) => None,
+    };
+    let page = selected
+        .query_emails_received_desc(position, page_size, filter.clone())
+        .map_err(|_| "provider_page_unavailable")?;
+    let query_state = field(&page, "queryState")?.to_owned();
+    if expected_query_state.is_some_and(|expected| expected != query_state) {
+        return Err("stale_page".into());
+    }
+    if page["position"].as_u64() != Some(position as u64) {
+        return Err("invalid_page".into());
+    }
+    let total = usize::try_from(page["total"].as_u64().ok_or("invalid_page")?)
+        .map_err(|_| "invalid_page")?;
+    let ids = list(&page, "ids")?;
+    if ids.len() > page_size
+        || position > total
+        || ids.len() > total - position
+        || (ids.is_empty() && position < total)
+    {
+        return Err("stale_page".into());
+    }
+    let expected: std::collections::HashSet<_> = ids.iter().map(String::as_str).collect();
+    if expected.len() != ids.len() {
+        return Err("invalid_page".into());
+    }
+    let mut values = std::collections::HashMap::new();
+    let mut bytes = 0usize;
+    if !ids.is_empty() {
+        let properties: Vec<String> = MAIL_LIST_PROPERTIES
+            .iter()
+            .map(|v| (*v).to_owned())
+            .collect();
+        let fetched = selected
+            .get("Email", Some(&ids), Some(&properties))
+            .map_err(|_| "provider_page_unavailable")?;
+        if !list(&fetched, "notFound")?.is_empty() {
+            return Err("stale_page".into());
+        }
+        for item in fetched["list"].as_array().ok_or("invalid_page")? {
+            let id = field(item, "id")?;
+            let safe = bounded_mail_metadata(item)?;
+            bytes = bytes
+                .checked_add(serde_json::to_vec(&safe).map_err(|_| "invalid_page")?.len())
+                .ok_or("provider_page_too_large")?;
+            if bytes > 16 * 1024 * 1024 {
+                return Err("provider_page_too_large".into());
+            }
+            if !expected.contains(id)
+                || values.insert(id.to_owned(), safe).is_some()
+                || item["receivedAt"].as_str().is_none_or(str::is_empty)
+            {
+                return Err("invalid_page".into());
+            }
+            if let Some(allowed) = &rights {
+                let memberships = item["mailboxIds"]
+                    .as_object()
+                    .ok_or("provider_scope_unavailable")?;
+                if !memberships
+                    .iter()
+                    .any(|(id, yes)| yes.as_bool() == Some(true) && allowed.contains(id))
+                {
+                    return Err("provider_scope_unavailable".into());
+                }
+            }
+        }
+    }
+    if values.len() != ids.len() {
+        return Err("stale_page".into());
+    }
+    if let Some(initial_rights) = &rights {
+        let fresh = client(cfg, account)?;
+        let fresh_rights = shared_mail_readable_mailboxes(cfg, account, &fresh, native)?;
+        if fresh_rights.is_empty()
+            || mailbox_id.is_some_and(|id| !fresh_rights.iter().any(|v| v == id))
+            || initial_rights.iter().any(|id| !fresh_rights.contains(id))
+        {
+            return Err("provider_scope_unavailable".into());
+        }
+        for item in values.values() {
+            let memberships = item["mailboxIds"]
+                .as_object()
+                .ok_or("provider_scope_unavailable")?;
+            if !memberships
+                .iter()
+                .any(|(id, yes)| yes.as_bool() == Some(true) && fresh_rights.contains(id))
+            {
+                return Err("provider_scope_unavailable".into());
+            }
+        }
+    }
+    let confirm = selected
+        .query_emails_received_desc(position, page_size, filter)
+        .map_err(|_| "provider_page_unavailable")?;
+    if field(&confirm, "queryState")? != query_state
+        || list(&confirm, "ids")? != ids
+        || confirm["position"].as_u64() != Some(position as u64)
+        || confirm["total"].as_u64() != Some(total as u64)
+    {
+        return Err("stale_page".into());
+    }
+    let items = ids
+        .into_iter()
+        .map(|id| values.remove(&id).expect("validated page identity"))
+        .collect::<Vec<_>>();
+    let next = position + items.len();
+    Ok(LiveMailPage {
+        account_id: account.into(),
+        origin: provider.origin.clone(),
+        native_account: native.into(),
+        mailbox_id: mailbox_id.map(str::to_owned),
+        next_position: (next < total).then_some(next),
+        items,
+        query_state,
+        total,
+    })
+}
+
 /// Last live JMAP discovery outcome; independent of locally stored credentials.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MailAccessObservation {
@@ -1605,8 +1858,8 @@ fn sync_detailed(
         ));
     }
     // Only scopes absent from the newly authenticated discovery are revoked.
-    // Existing scopes remain readable during a refresh; product reads still
-    // require fresh discovery and mailbox rights on every request.
+    // Each still-advertised scope is temporarily hidden while its rights and
+    // bounded projection are refreshed below.
     for old in store
         .provider_scopes(account, &primary.origin, "mail-shared")
         .map_err(|e| {
@@ -1638,21 +1891,10 @@ fn sync_detailed(
             service: "mail-shared".into(),
             collection: native.clone(),
         };
-        if store
-            .provider_accessible(&scope)
-            .map_err(|e| {
-                client.client.record_store_failure();
-                (MailSyncPhase::SharedAccess, e.to_string())
-            })?
-            .is_none()
-        {
-            store
-                .set_shared_mail_access(account, &primary.origin, native, false)
-                .map_err(|e| {
-                    client.client.record_store_failure();
-                    (MailSyncPhase::SharedAccess, e.to_string())
-                })?;
-        }
+        // Do not expose the previous projection while permissions are being refreshed.
+        store
+            .set_shared_mail_access(account, &primary.origin, native, false)
+            .map_err(|e| (MailSyncPhase::SharedAccess, e.to_string()))?;
         let selected = client.client.for_mail_account(native).map_err(|_| {
             (
                 MailSyncPhase::SharedSelection,
@@ -1683,6 +1925,26 @@ fn sync_detailed(
                 return Err(error);
             }
         };
+        let fresh = self::client(cfg, account).map_err(|e| (MailSyncPhase::SharedAccess, e))?;
+        let rights = shared_mail_readable_mailboxes(cfg, account, &fresh, native)
+            .map_err(|e| (MailSyncPhase::SharedAccess, e))?;
+        if rights.is_empty() {
+            return Err((
+                MailSyncPhase::SharedAccess,
+                "Shared mail access unavailable".into(),
+            ));
+        }
+        // The cached projection can only become visible if every item still has
+        // membership in a currently readable mailbox.
+        if !store
+            .provider_mail_window_memberships_allowed(&scope, &rights)
+            .map_err(|e| (MailSyncPhase::SharedAccess, e.to_string()))?
+        {
+            return Err((
+                MailSyncPhase::SharedAccess,
+                "Shared mail access unavailable".into(),
+            ));
+        }
         store
             .set_shared_mail_access(account, &primary.origin, native, true)
             .map_err(|e| {
@@ -1909,166 +2171,149 @@ fn sync_inner(
     account: &str,
     store: &Store,
     provider: &SelfHostedClient,
-    reconcile: bool,
+    _reconcile: bool,
     page_limit: usize,
 ) -> Result<usize, String> {
     let scope = scope(cfg, account, provider)?;
     let client = &provider.client;
     let page_size = client.max_objects_in_get().min(page_limit);
-    if page_size == 0 {
-        return Err("JMAP server has no usable batch size".into());
+    let window_limit = cfg.sync.mail_index_limit as usize;
+    if page_size == 0 || !(1..=5000).contains(&window_limit) {
+        return Err("Invalid mail window size".into());
     }
-    let mut count = 0;
-    let cursor = if reconcile {
-        None
-    } else {
-        store.provider_cursor(&scope).map_err(|e| {
-            client.record_store_failure();
-            e.to_string()
-        })?
-    };
-    let mut cursor = if let Some(cursor) = cursor {
-        cursor
-    } else {
-        let empty: Vec<String> = Vec::new();
-        let baseline = client
-            .get("Email", Some(&empty), None)
-            .map_err(|_| "JMAP email state unavailable")?;
-        let baseline = field(&baseline, "state")?.to_string();
-        let staging = StageGuard::new(store, &scope, client)?;
-        let mut position = 0usize;
-        let mut query_state = None;
-        loop {
-            let page = client
-                .query_emails(position, page_size, None)
-                .map_err(|_| "JMAP email enumeration failed")?;
-            let current = field(&page, "queryState")?;
-            if query_state.as_deref().is_some_and(|s| s != current) {
-                return Err("JMAP query changed during enumeration; retry required".into());
-            }
-            query_state = Some(current.to_owned());
-            if page["position"].as_u64() != Some(position as u64) {
-                return Err("Invalid JMAP query position".into());
-            }
-            let ids = list(&page, "ids")?;
-            let total = page["total"]
-                .as_u64()
-                .ok_or("JMAP query total unavailable")? as usize;
-            if position + ids.len() > total || (ids.is_empty() && position != total) {
-                return Err("Incomplete JMAP enumeration".into());
-            }
-            if !ids.is_empty() {
-                let fetched = client
-                    .get("Email", Some(&ids), None)
-                    .map_err(|_| "JMAP email fetch failed")?;
-                if !list(&fetched, "notFound")?.is_empty() {
-                    return Err("JMAP email changed during enumeration; retry required".into());
-                }
-                let values = fetched["list"]
-                    .as_array()
-                    .ok_or("JMAP email list unavailable")?;
-                if values.len() != ids.len() {
-                    return Err("Incomplete JMAP email fetch".into());
-                }
-                let expected: std::collections::HashSet<&str> =
-                    ids.iter().map(String::as_str).collect();
-                if expected.len() != ids.len() {
-                    return Err("Duplicate JMAP email in enumeration".into());
-                }
-                let mut actual = std::collections::HashSet::new();
-                let mut objects = Vec::new();
-                for value in values {
-                    let item = object(value)?;
-                    if !expected.contains(item.remote_id.as_str())
-                        || !actual.insert(item.remote_id.clone())
-                    {
-                        return Err("Invalid JMAP email fetch identities".into());
-                    }
-                    objects.push(item);
-                }
-                staging.page(&objects)?;
-                count += objects.len();
-            }
-            position += ids.len();
-            if position == total {
-                break;
-            }
-        }
-        staging.finish(&baseline)?;
-        baseline
-    };
+    let checkpoint = store
+        .provider_mail_window_checkpoint(&scope)
+        .map_err(|e| e.to_string())?;
+    let empty: Vec<String> = Vec::new();
+    let id_properties = vec!["id".to_owned()];
+    let properties: Vec<String> = MAIL_LIST_PROPERTIES
+        .iter()
+        .map(|v| (*v).to_owned())
+        .collect();
+    let baseline = client
+        .get("Email", Some(&empty), Some(&id_properties))
+        .map_err(|_| "JMAP email state unavailable")?;
+    let baseline = field(&baseline, "state")?.to_owned();
+    if checkpoint
+        .as_ref()
+        .is_some_and(|(_, state, _, limit)| *state == baseline && *limit == window_limit)
+    {
+        return Ok(0);
+    }
+    let mut position = 0usize;
+    let mut query_state: Option<String> = None;
+    let mut total = 0usize;
+    let mut first_ids: Option<Vec<String>> = None;
+    let mut seen = std::collections::HashSet::new();
+    let mut objects = Vec::new();
+    let mut bytes = 0usize;
     loop {
-        let page = match client.changes("Email", &cursor, page_size) {
-            Ok(page) => page,
-            Err(JmapError::Method(kind)) if kind == "cannotCalculateChanges" && !reconcile => {
-                client.clear_sync_failure();
-                client.record_email_reconciliation();
-                return sync_inner(cfg, account, store, provider, true, page_limit);
-            }
-            Err(_) => return Err("JMAP delta unavailable".into()),
-        };
-        if field(&page, "oldState")? != cursor {
-            return Err("JMAP delta state mismatch".into());
+        let requested = page_size.min(window_limit - position);
+        if requested == 0 {
+            break;
         }
-        let next = field(&page, "newState")?.to_owned();
-        let mut ids = list(&page, "created")?;
-        let updated = list(&page, "updated")?;
-        client.record_email_changes(ids.len(), updated.len());
-        ids.extend(updated);
-        let mut changes = Vec::new();
+        let page = client
+            .query_emails_received_desc(position, requested, None)
+            .map_err(|_| "JMAP email enumeration failed")?;
+        let current = field(&page, "queryState")?;
+        if query_state.as_deref().is_some_and(|state| state != current) {
+            return Err("JMAP query changed during enumeration".into());
+        }
+        query_state = Some(current.to_owned());
+        if page["position"].as_u64() != Some(position as u64) {
+            return Err("Invalid JMAP query position".into());
+        }
+        let ids = list(&page, "ids")?;
+        let page_total = usize::try_from(page["total"].as_u64().ok_or("Invalid JMAP total")?)
+            .map_err(|_| "Invalid JMAP total")?;
+        if position == 0 {
+            total = page_total;
+            first_ids = Some(ids.clone());
+        }
+        if page_total != total
+            || ids.len() > requested
+            || position > total
+            || ids.len() > total - position
+            || (ids.is_empty() && position < total)
+            || ids.iter().any(|id| !seen.insert(id.clone()))
+        {
+            return Err("Incomplete JMAP email window".into());
+        }
         if !ids.is_empty() {
             let fetched = client
-                .get("Email", Some(&ids), None)
-                .map_err(|_| "JMAP changed email fetch failed")?;
+                .get("Email", Some(&ids), Some(&properties))
+                .map_err(|_| "JMAP email fetch failed")?;
             if !list(&fetched, "notFound")?.is_empty() {
-                return Err("JMAP changed email inaccessible; retry required".into());
+                return Err("JMAP email changed during enumeration".into());
             }
             let expected: std::collections::HashSet<&str> =
                 ids.iter().map(String::as_str).collect();
-            let mut actual = std::collections::HashSet::new();
+            let mut values = std::collections::HashMap::new();
             for value in fetched["list"]
                 .as_array()
                 .ok_or("JMAP email list unavailable")?
             {
-                let item = object(value)?;
+                let item = object(&bounded_mail_metadata(value)?)?;
                 if !expected.contains(item.remote_id.as_str())
-                    || !actual.insert(item.remote_id.clone())
+                    || value["receivedAt"].as_str().is_none_or(str::is_empty)
+                    || item.raw.len() > 1024 * 1024
                 {
-                    return Err("Invalid JMAP changed email identities".into());
+                    return Err("Invalid JMAP email metadata".into());
                 }
-                changes.push(ProviderChange::Upsert(item));
+                let id = item.remote_id.clone();
+                if values.insert(id, item).is_some() {
+                    return Err("Duplicate JMAP email metadata".into());
+                }
             }
-            if actual.len() != expected.len() {
-                return Err("Incomplete JMAP changed email fetch".into());
+            if values.len() != ids.len() {
+                return Err("Incomplete JMAP email metadata".into());
+            }
+            for id in &ids {
+                let item = values.remove(id).ok_or("Incomplete JMAP email metadata")?;
+                bytes = bytes
+                    .checked_add(item.raw.len())
+                    .ok_or("Mail window too large")?;
+                if bytes > 16 * 1024 * 1024 {
+                    return Err("Mail window too large".into());
+                }
+                objects.push(item);
             }
         }
-        changes.extend(
-            list(&page, "destroyed")?
-                .into_iter()
-                .map(ProviderChange::Destroyed),
-        );
-        count += changes.len();
-        let more = page["hasMoreChanges"]
-            .as_bool()
-            .ok_or("Invalid JMAP pagination")?;
-        if more && next == cursor {
-            return Err("JMAP pagination did not advance".into());
-        }
-        if !store
-            .apply_provider_page_if_cursor(&scope, &cursor, &changes, &next)
-            .map_err(|e| {
-                client.record_store_failure();
-                e.to_string()
-            })?
-        {
-            return Err("JMAP checkpoint changed; retry required".into());
-        }
-        cursor = next;
-        if !more {
+        position += ids.len();
+        if position == total || position == window_limit {
             break;
         }
     }
-    Ok(count)
+    let query_state = query_state.ok_or("JMAP query state unavailable")?;
+    let verify = client
+        .query_emails_received_desc(0, page_size.min(window_limit), None)
+        .map_err(|_| "JMAP email verification unavailable")?;
+    if field(&verify, "queryState")? != query_state
+        || list(&verify, "ids")? != first_ids.unwrap_or_default()
+    {
+        return Err("JMAP query changed during enumeration".into());
+    }
+    let after = client
+        .get("Email", Some(&empty), Some(&id_properties))
+        .map_err(|_| "JMAP email state unavailable")?;
+    if field(&after, "state")? != baseline {
+        return Err("JMAP email changed during enumeration".into());
+    }
+    if !store
+        .publish_provider_mail_window(
+            &scope,
+            checkpoint.map(|v| v.0),
+            &baseline,
+            &query_state,
+            window_limit,
+            total,
+            &objects,
+        )
+        .map_err(|e| e.to_string())?
+    {
+        return Err("JMAP window changed; retry required".into());
+    }
+    Ok(objects.len())
 }
 
 /// A previously confirmed exact native email and SMTP envelope. The host must
@@ -2314,6 +2559,128 @@ mod recipient_tests {
         validate_complete_body,
     };
     use serde_json::json;
+
+    #[test]
+    fn bounded_mail_metadata_rejects_bulk_body_fields() {
+        let input = json!({"id":"n", "receivedAt":"2026-01-01T00:00:00Z", "subject":"subject", "bodyValues":{"1":{"value":"secret"}}, "bodyStructure":{"type":"text/plain"}});
+        let value = super::bounded_mail_metadata(&input).unwrap();
+        assert_eq!(value["subject"], "subject");
+        assert!(value.get("bodyValues").is_none());
+        assert!(value.get("bodyStructure").is_none());
+    }
+
+    #[test]
+    fn bounded_mail_sync_uses_server_pages_and_skips_unchanged_bulk_get() {
+        use isyncyou_core::{config::ProviderConfig, Config};
+        use isyncyou_store::Store;
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for index in 0..8 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0; 4096];
+                let end = loop {
+                    let n = socket.read(&mut buf).unwrap();
+                    assert_ne!(n, 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]);
+                        let len = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if bytes.len() >= end + 4 + len {
+                            break end + 4;
+                        }
+                    }
+                };
+                let request: serde_json::Value = serde_json::from_slice(&bytes[end..]).unwrap();
+                let call = &request["methodCalls"][0];
+                let method = call[0].as_str().unwrap();
+                let result = match index {
+                    0 | 6 | 7 => {
+                        assert_eq!(method, "Email/get");
+                        assert_eq!(call[1]["ids"], json!([]));
+                        json!({"accountId":"account","state":"s1","list":[],"notFound":[]})
+                    }
+                    1 | 3 | 5 => {
+                        assert_eq!(method, "Email/query");
+                        assert_eq!(
+                            call[1]["sort"],
+                            json!([{"property":"receivedAt","isAscending":false}])
+                        );
+                        let position = if index == 3 { 1 } else { 0 };
+                        assert_eq!(call[1]["position"], position);
+                        json!({"accountId":"account","queryState":"q1","position":position,"total":3,"ids":[if position == 0 {"new"} else {"older"}]})
+                    }
+                    _ => {
+                        assert_eq!(method, "Email/get");
+                        assert!(!call[1]["properties"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|v| v == "bodyValues" || v == "bodyStructure"));
+                        let id = if index == 2 { "new" } else { "older" };
+                        assert_eq!(call[1]["ids"], json!([id]));
+                        json!({"accountId":"account","state":"s1","list":[{"id":id,"receivedAt":"2026-01-01T00:00:00Z","bodyValues":{"1":{"value":"must not persist"}}}],"notFound":[]})
+                    }
+                };
+                let body = json!({"methodResponses":[[method,result,"c1"]]}).to_string();
+                write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        let mut cfg = Config::default();
+        cfg.sync.mail_index_limit = 2;
+        cfg.provider_accounts.insert(
+            "local".into(),
+            ProviderConfig::SelfHosted {
+                origin: origin.clone(),
+                client_id: "client".into(),
+            },
+        );
+        let provider = super::SelfHostedClient {
+            client: super::JmapClient::test_loopback(&origin).unwrap(),
+            account: "local".into(),
+            origin,
+        };
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(
+            super::sync_inner(&cfg, "local", &store, &provider, false, 1).unwrap(),
+            2
+        );
+        assert_eq!(
+            super::sync_inner(&cfg, "local", &store, &provider, false, 1).unwrap(),
+            0
+        );
+        let scope = super::scope(&cfg, "local", &provider).unwrap();
+        let snapshot = store
+            .provider_mail_window_snapshot(&scope, 0, 50)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.3, 3);
+        assert_eq!(
+            snapshot
+                .4
+                .iter()
+                .map(|v| v.remote_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new", "older"]
+        );
+        assert!(snapshot
+            .4
+            .iter()
+            .all(|v| !String::from_utf8_lossy(&v.raw).contains("must not persist")));
+        server.join().unwrap();
+    }
 
     #[test]
     fn draft_http_uses_only_authorized_native_identity_as_from() {

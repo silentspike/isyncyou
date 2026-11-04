@@ -133,6 +133,21 @@ CREATE VIRTUAL TABLE provider_shared_mail_fts USING fts5(
 );
 "#;
 
+/// A bounded current projection, distinct from historical capture and archive.
+pub(super) const MIGRATION_V22: &str = r#"
+CREATE TABLE provider_mail_window_state (
+ account_id TEXT NOT NULL, origin TEXT NOT NULL, service TEXT NOT NULL, collection TEXT NOT NULL,
+ generation INTEGER NOT NULL, email_state TEXT NOT NULL, query_state TEXT NOT NULL, window_limit INTEGER NOT NULL, total INTEGER NOT NULL, observed_at INTEGER NOT NULL,
+ PRIMARY KEY(account_id,origin,service,collection)
+);
+CREATE TABLE provider_mail_window (
+ account_id TEXT NOT NULL, origin TEXT NOT NULL, service TEXT NOT NULL, collection TEXT NOT NULL,
+ position INTEGER NOT NULL, remote_id TEXT NOT NULL, raw BLOB NOT NULL,
+ PRIMARY KEY(account_id,origin,service,collection,position),
+ UNIQUE(account_id,origin,service,collection,remote_id)
+);
+"#;
+
 pub(super) const MIGRATION_V20: &str = r#"
 CREATE INDEX provider_dav_parent ON provider_dav_index(account_id,origin,service,collection,parent_uid,kind,valid);
 CREATE VIRTUAL TABLE provider_dav_search_fts USING fts5(
@@ -193,6 +208,8 @@ pub struct ProviderObject {
 
 pub type ProviderDavResolvedObject = (ProviderScope, ProviderObject, Option<i64>, Option<String>);
 pub type ProviderDavPageSnapshot = (Option<i64>, Option<String>, Vec<ProviderObject>);
+/// Query state, observation time, configured capacity, server total, ordered objects.
+pub type ProviderMailWindowSnapshot = (String, i64, usize, usize, Vec<ProviderObject>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderDavIndex {
@@ -1921,6 +1938,210 @@ impl Store {
         Ok(self.conn.query_row("SELECT remote_id,etag,raw FROM provider_objects WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND remote_id=?5", params![scope.account_id,scope.origin,scope.service,scope.collection,id], |r| Ok(ProviderObject { remote_id:r.get(0)?, etag:r.get(1)?, raw:r.get(2)? })).optional()?)
     }
 
+    /// Window state is independent of historical synchronization checkpoints.
+    pub fn provider_mail_window_checkpoint(
+        &self,
+        scope: &ProviderScope,
+    ) -> Result<Option<(i64, String, String, usize)>> {
+        if !matches!(scope.service.as_str(), "mail" | "mail-shared") {
+            return Err(StoreError::InvalidProgressiveSearch(
+                "invalid mail scope".into(),
+            ));
+        }
+        let row: Option<(i64,String,String,i64)> = self.conn.query_row("SELECT generation,email_state,query_state,window_limit FROM provider_mail_window_state WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4",params![scope.account_id,scope.origin,scope.service,scope.collection],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        row.map(|(generation, email, query, limit)| {
+            Ok((
+                generation,
+                email,
+                query,
+                usize::try_from(limit).map_err(|_| {
+                    StoreError::InvalidProgressiveSearch("invalid window limit".into())
+                })?,
+            ))
+        })
+        .transpose()
+    }
+
+    /// Atomically publish a bounded active projection without touching archives,
+    /// capture records, or the historical full-collection cursor.
+    pub fn publish_provider_mail_window(
+        &self,
+        scope: &ProviderScope,
+        expected_generation: Option<i64>,
+        email_state: &str,
+        query_state: &str,
+        window_limit: usize,
+        total: usize,
+        objects: &[ProviderObject],
+    ) -> Result<bool> {
+        if !self.protected_provider_storage()
+            || !matches!(scope.service.as_str(), "mail" | "mail-shared")
+            || email_state.is_empty()
+            || query_state.is_empty()
+            || window_limit == 0
+            || window_limit > 5000
+            || objects.len() > window_limit
+            || objects.len() > total
+        {
+            return Err(StoreError::InvalidProgressiveSearch(
+                "invalid mail window".into(),
+            ));
+        }
+        let bytes = objects
+            .iter()
+            .try_fold(0usize, |sum, object| sum.checked_add(object.raw.len()))
+            .ok_or(StoreError::ProviderObjectTooLarge)?;
+        if bytes > 16 * 1024 * 1024
+            || objects
+                .iter()
+                .any(|object| object.remote_id.is_empty() || object.raw.len() > 1024 * 1024)
+        {
+            return Err(StoreError::ProviderObjectTooLarge);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let current: Option<i64> = tx.query_row("SELECT generation FROM provider_mail_window_state WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4",params![scope.account_id,scope.origin,scope.service,scope.collection],|r| r.get(0)).optional()?;
+        if current != expected_generation {
+            return Ok(false);
+        }
+        tx.execute("DELETE FROM provider_mail_window WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4",params![scope.account_id,scope.origin,scope.service,scope.collection])?;
+        for (position, object) in objects.iter().enumerate() {
+            tx.execute("INSERT INTO provider_mail_window(account_id,origin,service,collection,position,remote_id,raw) VALUES (?1,?2,?3,?4,?5,?6,?7)",params![scope.account_id,scope.origin,scope.service,scope.collection,position as i64,object.remote_id,object.raw])?;
+        }
+        let generation = current.unwrap_or(0).checked_add(1).ok_or_else(|| {
+            StoreError::InvalidProgressiveSearch("mail window generation overflow".into())
+        })?;
+        tx.execute("INSERT INTO provider_mail_window_state(account_id,origin,service,collection,generation,email_state,query_state,window_limit,total,observed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,CAST(strftime('%s','now') AS INTEGER)) ON CONFLICT(account_id,origin,service,collection) DO UPDATE SET generation=excluded.generation,email_state=excluded.email_state,query_state=excluded.query_state,window_limit=excluded.window_limit,total=excluded.total,observed_at=excluded.observed_at",params![scope.account_id,scope.origin,scope.service,scope.collection,generation,email_state,query_state,window_limit as i64,total as i64])?;
+        tx.execute("INSERT INTO provider_collections(account_id,origin,service,collection,accessible,complete) VALUES (?1,?2,?3,?4,?5,0) ON CONFLICT(account_id,origin,service,collection) DO UPDATE SET complete=0",params![scope.account_id,scope.origin,scope.service,scope.collection,scope.service == "mail"])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Read only the bounded current projection in provider order.
+    pub fn provider_mail_window_page(
+        &self,
+        scope: &ProviderScope,
+        position: usize,
+        limit: usize,
+    ) -> Result<Vec<ProviderObject>> {
+        if !matches!(scope.service.as_str(), "mail" | "mail-shared") || limit == 0 || limit > 200 {
+            return Err(StoreError::InvalidProgressiveSearch(
+                "invalid mail window page".into(),
+            ));
+        }
+        let mut stmt = self.conn.prepare("SELECT w.remote_id,w.raw FROM provider_mail_window w JOIN provider_collections c ON c.account_id=w.account_id AND c.origin=w.origin AND c.service=w.service AND c.collection=w.collection WHERE w.account_id=?1 AND w.origin=?2 AND w.service=?3 AND w.collection=?4 AND w.position>=?5 AND c.accessible=1 ORDER BY w.position LIMIT ?6")?;
+        let rows = stmt.query_map(
+            params![
+                scope.account_id,
+                scope.origin,
+                scope.service,
+                scope.collection,
+                position as i64,
+                limit as i64
+            ],
+            |r| {
+                Ok(ProviderObject {
+                    remote_id: r.get(0)?,
+                    etag: None,
+                    raw: r.get(1)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Read state, authorization and objects from the same SQLite snapshot.
+    pub fn provider_mail_window_snapshot(
+        &self,
+        scope: &ProviderScope,
+        position: usize,
+        limit: usize,
+    ) -> Result<Option<ProviderMailWindowSnapshot>> {
+        if !matches!(scope.service.as_str(), "mail" | "mail-shared")
+            || limit == 0
+            || limit > 200
+            || position > 5000
+        {
+            return Err(StoreError::InvalidProgressiveSearch(
+                "invalid mail window page".into(),
+            ));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let state: Option<(String,i64,i64,i64)> = tx.query_row("SELECT s.query_state,s.observed_at,s.window_limit,s.total FROM provider_mail_window_state s JOIN provider_collections c ON c.account_id=s.account_id AND c.origin=s.origin AND c.service=s.service AND c.collection=s.collection WHERE s.account_id=?1 AND s.origin=?2 AND s.service=?3 AND s.collection=?4 AND c.accessible=1", params![scope.account_id,scope.origin,scope.service,scope.collection], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        let Some((query_state, observed_at, window_limit, total)) = state else {
+            return Ok(None);
+        };
+        let window_limit = usize::try_from(window_limit)
+            .map_err(|_| StoreError::InvalidProgressiveSearch("invalid window limit".into()))?;
+        let total = usize::try_from(total)
+            .map_err(|_| StoreError::InvalidProgressiveSearch("invalid window total".into()))?;
+        let objects = {
+            let mut stmt = tx.prepare("SELECT remote_id,raw FROM provider_mail_window WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND position>=?5 ORDER BY position LIMIT ?6")?;
+            let rows = stmt.query_map(
+                params![
+                    scope.account_id,
+                    scope.origin,
+                    scope.service,
+                    scope.collection,
+                    position as i64,
+                    limit as i64
+                ],
+                |r| {
+                    Ok(ProviderObject {
+                        remote_id: r.get(0)?,
+                        etag: None,
+                        raw: r.get(1)?,
+                    })
+                },
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        tx.commit()?;
+        Ok(Some((
+            query_state,
+            observed_at,
+            window_limit,
+            total,
+            objects,
+        )))
+    }
+
+    /// Validate memberships without exposing data while a shared scope is inaccessible.
+    pub fn provider_mail_window_memberships_allowed(
+        &self,
+        scope: &ProviderScope,
+        allowed: &[String],
+    ) -> Result<bool> {
+        if scope.service != "mail-shared" || allowed.is_empty() {
+            return Ok(false);
+        }
+        let mut stmt = self.conn.prepare("SELECT raw FROM provider_mail_window WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4")?;
+        let rows = stmt.query_map(
+            params![
+                scope.account_id,
+                scope.origin,
+                scope.service,
+                scope.collection
+            ],
+            |r| r.get::<_, Vec<u8>>(0),
+        )?;
+        for row in rows {
+            let raw = row?;
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+                return Ok(false);
+            };
+            let Some(memberships) = value.get("mailboxIds").and_then(|v| v.as_object()) else {
+                return Ok(false);
+            };
+            if !memberships
+                .iter()
+                .any(|(id, yes)| yes.as_bool() == Some(true) && allowed.contains(id))
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Resolve at most two accessible DAV matches in one SQLite snapshot.
     /// Two matches are sufficient to reject an ambiguous unscoped identity.
     pub fn provider_accessible_dav_by_id(
@@ -2577,6 +2798,102 @@ fn capture_observation(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mail_window_is_bounded_atomic_and_preserves_historical_objects() {
+        use super::*;
+        let store = Store::open_in_memory().unwrap();
+        let scope = ProviderScope {
+            account_id: "a".into(),
+            origin: "https://example.test/".into(),
+            service: "mail".into(),
+            collection: "primary".into(),
+        };
+        let old = ProviderObject {
+            remote_id: "old".into(),
+            etag: None,
+            raw: b"old original".to_vec(),
+        };
+        store
+            .apply_provider_page(&scope, &[ProviderChange::Upsert(old.clone())], "historical")
+            .unwrap();
+        let current = ProviderObject {
+            remote_id: "new".into(),
+            etag: None,
+            raw: br#"{"id":"new"}"#.to_vec(),
+        };
+        assert!(store
+            .publish_provider_mail_window(&scope, None, "s1", "q1", 2, 20, &[current.clone()])
+            .unwrap());
+        let page = store
+            .provider_mail_window_snapshot(&scope, 0, 50)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (page.0.as_str(), page.2, page.3, &page.4),
+            ("q1", 2, 20, &vec![current])
+        );
+        assert!(!store
+            .publish_provider_mail_window(&scope, None, "s2", "q2", 2, 0, &[])
+            .unwrap());
+        assert_eq!(
+            store
+                .provider_mail_window_snapshot(&scope, 0, 50)
+                .unwrap()
+                .unwrap()
+                .0,
+            "q1"
+        );
+        assert_eq!(store.provider_object(&scope, "old").unwrap(), Some(old));
+    }
+
+    #[test]
+    fn shared_mail_window_stays_hidden_until_membership_revalidated() {
+        use super::*;
+        let store = Store::open_in_memory().unwrap();
+        let scope = ProviderScope {
+            account_id: "a".into(),
+            origin: "https://example.test/".into(),
+            service: "mail-shared".into(),
+            collection: "shared".into(),
+        };
+        let object = ProviderObject {
+            remote_id: "new".into(),
+            etag: None,
+            raw: br#"{"id":"new","mailboxIds":{"allowed":true}}"#.to_vec(),
+        };
+        assert!(store
+            .publish_provider_mail_window(&scope, None, "s", "q", 2, 1, &[object])
+            .unwrap());
+        assert!(store
+            .provider_mail_window_snapshot(&scope, 0, 50)
+            .unwrap()
+            .is_none());
+        assert!(!store
+            .provider_mail_window_memberships_allowed(&scope, &["revoked".into()])
+            .unwrap());
+        assert!(store
+            .provider_mail_window_memberships_allowed(&scope, &["allowed".into()])
+            .unwrap());
+        store
+            .set_shared_mail_access("a", "https://example.test/", "shared", true)
+            .unwrap();
+        assert_eq!(
+            store
+                .provider_mail_window_snapshot(&scope, 0, 50)
+                .unwrap()
+                .unwrap()
+                .4
+                .len(),
+            1
+        );
+        store
+            .set_shared_mail_access("a", "https://example.test/", "shared", false)
+            .unwrap();
+        assert!(store
+            .provider_mail_window_snapshot(&scope, 0, 50)
+            .unwrap()
+            .is_none());
+    }
     #[cfg(feature = "encrypted-store")]
     #[test]
     fn accessible_dav_lookup_ignores_revoked_duplicates_and_uses_one_read_snapshot() {

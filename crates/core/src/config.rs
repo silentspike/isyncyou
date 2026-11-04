@@ -93,6 +93,8 @@ impl AccountConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SyncConfig {
+    /// Maximum newest self-hosted message metadata retained for navigation.
+    pub mail_index_limit: u32,
     /// Optional DAV sync-collection page size; absent uses the server limit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dav_page_size: Option<u32>,
@@ -127,6 +129,7 @@ pub struct SyncConfig {
 impl Default for SyncConfig {
     fn default() -> Self {
         SyncConfig {
+            mail_index_limit: 500,
             dav_page_size: None,
             trash_retention_days: 30,
             delete_guard: DeleteGuardConfig::default(),
@@ -346,6 +349,9 @@ impl Config {
             .is_some_and(|n| !(1..=2000).contains(&n))
         {
             errs.push("sync.dav_page_size must be between 1 and 2000".into());
+        }
+        if !(1..=5000).contains(&self.sync.mail_index_limit) {
+            errs.push("sync.mail_index_limit must be between 1 and 5000".into());
         }
         let g = &self.sync.delete_guard;
         if !(g.max_fraction > 0.0 && g.max_fraction <= 1.0) {

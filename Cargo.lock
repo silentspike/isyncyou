@@ -2076,6 +2076,7 @@ dependencies = [
  "isyncyou-core",
  "isyncyou-store",
  "ring",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

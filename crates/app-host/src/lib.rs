@@ -1555,109 +1555,65 @@ impl isyncyou_agent::ToolExecutor for ProviderMailExecutor {
                 let mut searched = Vec::new();
                 let mut incomplete = Vec::new();
                 if wants("mail") {
-                    let mut rows = store
-                        .search_provider_mail(&self.account, origin, &literal_query, max)
-                        .map_err(|_| AgentError::Provider("provider search unavailable".into()))?;
-                    let client =
-                        isyncyou_engine::self_hosted_mail::client(&self.cfg, &self.account).ok();
-                    let shared_discovery = client.as_ref().and_then(|client| {
-                        isyncyou_engine::self_hosted_mail::shared_mail_accessible_accounts(
-                            &self.cfg,
-                            &self.account,
-                            client,
-                        )
-                        .ok()
-                    });
-                    if shared_discovery.is_none() {
-                        incomplete.push(
-                            serde_json::json!({"service":"mail","reason":"shared_access_unknown"}),
-                        );
-                    }
-                    let shared_accounts = shared_discovery.unwrap_or_default();
-                    let mut live_mailboxes = std::collections::HashMap::new();
-                    for scope in store
-                        .provider_scopes(&self.account, origin, "mail-shared")
-                        .map_err(|_| AgentError::Provider("provider cache unavailable".into()))?
-                    {
-                        if rows.len() >= max {
-                            break;
-                        }
-                        if !shared_accounts.contains(&scope.collection)
-                            || store.provider_accessible(&scope).ok().flatten() != Some(true)
-                        {
-                            continue;
-                        }
-                        let Some(ids) = client.as_ref().and_then(|client| {
-                            isyncyou_engine::self_hosted_mail::shared_mail_readable_mailboxes(
+                    let mut scopes: Vec<Option<String>> = vec![None];
+                    match isyncyou_engine::self_hosted_mail::client(&self.cfg, &self.account)
+                        .and_then(|client| {
+                            isyncyou_engine::self_hosted_mail::shared_mail_accessible_accounts(
                                 &self.cfg,
                                 &self.account,
-                                client,
-                                &scope.collection,
+                                &client,
                             )
-                            .ok()
-                        }) else {
-                            incomplete.push(serde_json::json!({"service":"mail","reason":"shared_access_unknown"}));
-                            continue;
-                        };
-                        live_mailboxes.insert(scope.collection.clone(), ids);
-                        for item in store
-                            .search_provider_mail_in_scope(&scope, &literal_query, max - rows.len())
-                            .map_err(|_| {
-                                AgentError::Provider("provider search unavailable".into())
-                            })?
-                        {
-                            rows.push((scope.clone(), item));
+                        }) {
+                        Ok(shared) => {
+                            if shared.len() > 8 {
+                                incomplete.push(serde_json::json!({"service":"mail","reason":"shared_scope_limit"}));
+                            }
+                            scopes.extend(shared.into_iter().take(8).map(Some));
                         }
+                        Err(_) => incomplete.push(
+                            serde_json::json!({"service":"mail","reason":"shared_access_unknown"}),
+                        ),
                     }
-                    truncated |= rows.len() >= max;
-                    for (scope, item) in rows {
-                        let metadata: serde_json::Value = serde_json::from_slice(&item.raw)
-                            .map_err(|_| AgentError::Provider("provider cache invalid".into()))?;
-                        let shared = scope.service == "mail-shared";
-                        if shared {
-                            if !shared_accounts.contains(&scope.collection)
-                                || store.provider_accessible(&scope).ok().flatten() != Some(true)
-                            {
-                                continue;
-                            }
-                            let mut folders = scope.clone();
-                            folders.service = "mailboxes-shared".into();
-                            if store.provider_accessible(&folders).ok().flatten() != Some(true) {
-                                continue;
-                            }
-                            let readable = metadata["mailboxIds"].as_object().is_some_and(|ids| {
-                                ids.iter().any(|(id, present)| {
-                                    if present.as_bool() != Some(true)
-                                        || !live_mailboxes
-                                            .get(&scope.collection)
-                                            .is_some_and(|visible| visible.contains(id))
-                                    {
-                                        return false;
-                                    }
-                                    store
-                                        .provider_object(&folders, id)
-                                        .ok()
-                                        .flatten()
-                                        .and_then(|obj| {
-                                            serde_json::from_slice::<serde_json::Value>(&obj.raw)
-                                                .ok()
-                                        })
-                                        .is_some_and(|folder| {
-                                            folder["myRights"]["mayReadItems"].as_bool()
-                                                == Some(true)
-                                        })
-                                })
-                            });
-                            if !readable {
-                                continue;
-                            }
+                    for scope in scopes {
+                        let remaining = max.saturating_sub(results.len());
+                        if remaining == 0 {
+                            truncated = true;
+                            break;
                         }
-                        let result_id = if shared {
-                            shared_mail_ref(&scope.collection, &item.remote_id)
-                        } else {
-                            item.remote_id.clone()
+                        let page =
+                            isyncyou_engine::self_hosted_mail::live_mail_metadata_search_page(
+                                &self.cfg,
+                                &self.account,
+                                scope.as_deref(),
+                                None,
+                                Some(query),
+                                0,
+                                remaining.min(50),
+                                None,
+                            );
+                        let page = match page {
+                            Ok(page) => page,
+                            Err(_) if scope.is_some() => {
+                                incomplete.push(serde_json::json!({"service":"mail","reason":"shared_access_unknown"}));
+                                continue;
+                            }
+                            Err(_) => {
+                                incomplete.push(serde_json::json!({"service":"mail","reason":"live_search_unavailable"}));
+                                continue;
+                            }
                         };
-                        results.push(serde_json::json!({"account":self.account,"provider":origin,"service":"mail","collection":scope.collection,"id":result_id,"blob_id":metadata["blobId"],"mailbox_ids":if shared { serde_json::Value::Null } else { metadata["mailboxIds"].clone() },"subject":metadata["subject"],"preview":metadata["preview"],"provenance":"local","observed_at":store.provider_observed_at(&scope).ok().flatten(),"cursor":store.provider_cursor(&scope).ok().flatten()}));
+                        truncated |= page.next_position.is_some();
+                        let shared = scope.is_some();
+                        for item in page.items {
+                            let Some(id) = item["id"].as_str() else {
+                                continue;
+                            };
+                            let result_id = scope
+                                .as_ref()
+                                .map(|s| shared_mail_ref(s, id))
+                                .unwrap_or_else(|| id.to_owned());
+                            results.push(serde_json::json!({"account":self.account,"provider":origin,"service":"mail","collection":page.native_account,"id":result_id,"blob_id":item["blobId"],"mailbox_ids":if shared {serde_json::Value::Null} else {item["mailboxIds"].clone()},"subject":item["subject"],"preview":item["preview"],"provenance":"live","observed_at":unix_now(),"cursor":null}));
+                        }
                     }
                     searched.push("mail");
                 }
@@ -19952,6 +19908,84 @@ pub struct DaemonMailWrite {
     config_path: Option<PathBuf>,
 }
 
+// Keep at most two provider readers per process. Identity includes
+// the underlying file and key; account and origin are bound independently.
+#[cfg(unix)]
+type MailCacheReader = (
+    String,
+    String,
+    isyncyou_engine::provider_store::ReadonlyCacheIdentity,
+    isyncyou_store::Store,
+);
+#[cfg(unix)]
+static MAIL_CACHE_READER: std::sync::OnceLock<std::sync::Mutex<Vec<MailCacheReader>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(unix)]
+fn bind_mail_cache_reader<'a>(
+    reader: &'a mut Vec<MailCacheReader>,
+    account: &str,
+    origin: &str,
+    identity: isyncyou_engine::provider_store::ReadonlyCacheIdentity,
+    open: impl FnOnce() -> Result<isyncyou_store::Store, String>,
+) -> Result<&'a isyncyou_store::Store, String> {
+    if let Some(pos) = reader
+        .iter()
+        .position(|(a, o, id, _)| a == account && o == origin && id == &identity)
+    {
+        let entry = reader.remove(pos);
+        reader.push(entry);
+    } else {
+        reader.retain(|(a, _, _, _)| a != account);
+        if reader.len() == 2 {
+            reader.remove(0);
+        }
+        let store = open()?;
+        reader.push((account.into(), origin.into(), identity, store));
+    }
+    Ok(&reader.last().ok_or("provider_cache_unavailable")?.3)
+}
+
+#[cfg(all(test, unix, feature = "encrypted-store"))]
+#[test]
+fn mail_reader_reuses_only_same_account_origin_and_file_key_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("provider.db");
+    let key = b"synthetic reader test key";
+    drop(isyncyou_store::Store::open_encrypted(&path, key).unwrap());
+    let mut reader = Vec::new();
+    let identity = (1, 2, 0o600, 3, 4, 5, 6, [7; 32]);
+    let opens = std::cell::Cell::new(0);
+    let open = || {
+        opens.set(opens.get() + 1);
+        isyncyou_store::Store::open_readonly_encrypted(&path, key).map_err(|e| e.to_string())
+    };
+    bind_mail_cache_reader(&mut reader, "a", "https://a.invalid", identity, open).unwrap();
+    bind_mail_cache_reader(&mut reader, "a", "https://a.invalid", identity, open).unwrap();
+    assert_eq!(opens.get(), 1);
+    bind_mail_cache_reader(&mut reader, "b", "https://a.invalid", identity, open).unwrap();
+    bind_mail_cache_reader(&mut reader, "a", "https://a.invalid", identity, open).unwrap();
+    assert_eq!(opens.get(), 2);
+    bind_mail_cache_reader(&mut reader, "c", "https://c.invalid", identity, open).unwrap();
+    assert_eq!(reader.len(), 2);
+    assert!(reader.iter().all(|(a, _, _, _)| a != "b"));
+    bind_mail_cache_reader(&mut reader, "b", "https://b.invalid", identity, open).unwrap();
+    let mut changed = identity;
+    changed.1 += 1;
+    bind_mail_cache_reader(&mut reader, "b", "https://b.invalid", changed, open).unwrap();
+    changed.7 = [8; 32];
+    bind_mail_cache_reader(&mut reader, "b", "https://b.invalid", changed, open).unwrap();
+    assert_eq!(opens.get(), 6);
+    changed.7 = [9; 32];
+    assert!(
+        bind_mail_cache_reader(&mut reader, "b", "https://b.invalid", changed, || Err(
+            "missing key".into()
+        ))
+        .is_err()
+    );
+    assert!(reader.iter().all(|(a, _, _, _)| a != "b"));
+}
+
 #[cfg(test)]
 thread_local! {
     // One-shot, thread-local credential factory seam for real HTTP regression
@@ -19979,6 +20013,103 @@ impl DaemonMailWrite {
             Some(path) => load_host_runtime_config(path),
         }
     }
+    fn with_cached_store<T>(
+        &self,
+        account: &str,
+        expected_origin: &str,
+        f: &mut dyn FnMut(&isyncyou_store::Store) -> Result<T, String>,
+    ) -> Result<T, String> {
+        #[cfg(not(unix))]
+        {
+            let cfg = self.runtime_config()?;
+            if !cfg.accounts.iter().any(|item| item.id == account)
+                || !matches!(cfg.provider_accounts.get(account), Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) if origin == expected_origin)
+            {
+                return Err("provider_cache_changed".into());
+            }
+            let store = isyncyou_engine::provider_store::open_readonly(&cfg, account)?;
+            let result = f(&store)?;
+            if store
+                .schema_version()
+                .map_err(|_| "provider_cache_unavailable")?
+                > isyncyou_store::SCHEMA_VERSION
+            {
+                return Err("provider_cache_changed".into());
+            }
+            let current = self.runtime_config()?;
+            if !current.accounts.iter().any(|item| item.id == account)
+                || !matches!(current.provider_accounts.get(account), Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) if origin == expected_origin)
+            {
+                return Err("provider_cache_changed".into());
+            }
+            return Ok(result);
+        }
+        #[cfg(unix)]
+        {
+            let mut reader = MAIL_CACHE_READER
+                .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+                .lock()
+                .map_err(|_| "provider_cache_unavailable")?;
+            let mut run = || -> Result<_, String> {
+                let cfg = self.runtime_config()?;
+                reader.retain(|(a, o, _, _)| cfg.accounts.iter().any(|account| &account.id == a) && matches!(cfg.provider_accounts.get(a), Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) if origin == o));
+                if !cfg.accounts.iter().any(|item| item.id == account) {
+                    return Err("provider_unavailable".into());
+                }
+                let origin = match cfg.provider_accounts.get(account) {
+                    Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) => {
+                        origin.clone()
+                    }
+                    _ => return Err("provider_unavailable".into()),
+                };
+                if origin != expected_origin {
+                    return Err("provider_cache_changed".into());
+                }
+                let identity =
+                    isyncyou_engine::provider_store::readonly_cache_identity(&cfg, account)?;
+                let store =
+                    bind_mail_cache_reader(&mut reader, account, &origin, identity, || {
+                        let store = isyncyou_engine::provider_store::open_readonly(&cfg, account)?;
+                        if isyncyou_engine::provider_store::readonly_cache_identity(&cfg, account)?
+                            != identity
+                        {
+                            return Err("provider_cache_changed".into());
+                        }
+                        Ok(store)
+                    })?;
+                if store
+                    .schema_version()
+                    .map_err(|_| "provider_cache_unavailable")?
+                    > isyncyou_store::SCHEMA_VERSION
+                {
+                    return Err("provider_cache_changed".into());
+                }
+                let response = f(store)?;
+                if store
+                    .schema_version()
+                    .map_err(|_| "provider_cache_unavailable")?
+                    > isyncyou_store::SCHEMA_VERSION
+                {
+                    return Err("provider_cache_changed".into());
+                }
+                let current = self.runtime_config()?;
+                let same_origin = current.accounts.iter().any(|item| item.id == account)
+                    && matches!(current.provider_accounts.get(account), Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin: o, .. }) if o == &origin);
+                if !same_origin
+                    || isyncyou_engine::provider_store::readonly_cache_identity(&current, account)?
+                        != identity
+                {
+                    return Err("provider_cache_changed".into());
+                }
+                Ok(response)
+            };
+            let result = run();
+            if result.is_err() {
+                reader.retain(|(a, _, _, _)| a != account);
+            }
+            result
+        }
+    }
     fn confirmed_mail_client(&self, account: &str) -> Result<isyncyou_graph::GraphClient, String> {
         #[cfg(test)]
         if let Some(client) = TEST_CONFIRMED_MAIL_CLIENT.with(|slot| slot.borrow_mut().take()) {
@@ -20002,8 +20133,39 @@ fn graph_message_read_state_path(message_id: &str) -> String {
 }
 
 impl isyncyou_webui::MailWriteHandler for DaemonMailWrite {
+    fn provider_live_mail_page(
+        &self,
+        account: &str,
+        native_account: Option<&str>,
+        mailbox_id: Option<&str>,
+        text: Option<&str>,
+        position: usize,
+        limit: usize,
+        query_state: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let cfg = self.runtime_config()?;
+        let page = isyncyou_engine::self_hosted_mail::live_mail_metadata_search_page(
+            &cfg,
+            account,
+            native_account,
+            mailbox_id,
+            text,
+            position,
+            limit,
+            query_state,
+        )?;
+        serde_json::to_value(page).map_err(|_| "provider_mail_unavailable".into())
+    }
     fn provider_store(&self, account: &str) -> Result<isyncyou_store::Store, String> {
         isyncyou_engine::provider_store::open_readonly(&self.runtime_config()?, account)
+    }
+    fn with_provider_cache(
+        &self,
+        account: &str,
+        expected_origin: &str,
+        f: &mut dyn FnMut(&isyncyou_store::Store) -> isyncyou_webui::ApiResponse,
+    ) -> Result<isyncyou_webui::ApiResponse, String> {
+        self.with_cached_store(account, expected_origin, &mut |store| Ok(f(store)))
     }
     fn provider_create_draft(
         &self,
@@ -20561,12 +20723,24 @@ impl isyncyou_webui::CalendarWriteHandler for DaemonCalendarWrite {
             Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }) => origin,
             None => return Err("provider_unavailable".into()),
         };
+        let reader = DaemonMailWrite {
+            cfg: self.cfg.clone(),
+            config_path: self.config_path.clone(),
+        };
         if let Some(collection) = collection {
-            let page =
-                isyncyou_engine::dav_live::calendar_page(&cfg, account, collection, after, 200)?;
-            let items:Vec<_> = page.items.into_iter().map(|item| match item.view {
-                Ok(view) => serde_json::json!({"href":item.href,"collection":item.collection,"etag":item.etag,"view":view}),
-                Err(_) => serde_json::json!({"href":item.href,"collection":item.collection,"etag":item.etag,"error":"projection_unavailable"}),
+            let scope = isyncyou_store::ProviderScope {
+                account_id: account.into(),
+                origin: origin.clone(),
+                service: "calendar".into(),
+                collection: collection.into(),
+            };
+            let page = reader.with_cached_store(account, origin, &mut |store| {
+                isyncyou_engine::dav_live::cached_live_objects(store, &scope, after, 200)
+            })?;
+            let next_after = page.objects.last().map(|item| item.remote_id.clone());
+            let items:Vec<_> = page.objects.into_iter().map(|item| match isyncyou_connectors::dav::projection::calendar(&item.raw) {
+                Ok(view) => serde_json::json!({"href":item.remote_id,"collection":collection,"etag":item.etag,"view":view}),
+                Err(_) => serde_json::json!({"href":item.remote_id,"collection":collection,"etag":item.etag,"error":"projection_unavailable"}),
             }).collect();
             let cursor_digest = page.cursor.as_ref().map(|cursor| {
                 ring::digest::digest(&ring::digest::SHA256, cursor.as_bytes())
@@ -20577,13 +20751,14 @@ impl isyncyou_webui::CalendarWriteHandler for DaemonCalendarWrite {
                     .concat()
             });
             Ok(
-                serde_json::json!({"account":page.account_id,"origin":page.origin,"collection":page.collection,"accessible":page.accessible,"observed_at":page.observed_at,"cursor_digest":cursor_digest,"items":items,"next_after":page.next_after,"provenance":"local"}),
+                serde_json::json!({"account":page.account_id,"origin":page.origin,"collection":collection,"accessible":page.accessible,"observed_at":page.observed_at,"cursor_digest":cursor_digest,"items":items,"next_after":next_after,"provenance":"local"}),
             )
         } else {
-            let store = isyncyou_engine::provider_store::open_readonly(&cfg, account)?;
-            let scopes = store
-                .provider_scopes(account, origin, "calendar")
-                .map_err(|_| "provider_cache_unavailable")?;
+            let scopes = reader.with_cached_store(account, origin, &mut |store| {
+                store
+                    .provider_scopes(account, origin, "calendar")
+                    .map_err(|_| "provider_cache_unavailable".into())
+            })?;
             if scopes.len() > 1000 {
                 return Err("provider_collections_limit".into());
             }

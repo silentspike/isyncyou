@@ -1026,6 +1026,23 @@ impl JmapClient {
         }
         self.call("Email/query", args, false, false)
     }
+
+    /// Query one bounded window in the server's newest-first ordering.
+    pub fn query_emails_received_desc(
+        &self,
+        position: usize,
+        limit: usize,
+        filter: Option<Value>,
+    ) -> Result<Value, JmapError> {
+        if limit == 0 || limit > 1000 {
+            return Err(JmapError::InvalidResponse);
+        }
+        let mut args = json!({"accountId":self.account,"position":position,"limit":limit,"calculateTotal":true,"sort":[{"property":"receivedAt","isAscending":false}]});
+        if let Some(filter) = filter {
+            args["filter"] = filter;
+        }
+        self.call("Email/query", args, false, false)
+    }
     pub fn query_mailboxes(&self, position: usize, limit: usize) -> Result<Value, JmapError> {
         if limit == 0 || limit > 1000 {
             return Err(JmapError::InvalidResponse);

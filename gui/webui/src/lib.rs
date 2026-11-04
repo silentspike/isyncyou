@@ -4107,6 +4107,18 @@ fn render_provider_mail_view(body: ProviderMailView) -> ApiResponse {
 }
 
 pub trait MailWriteHandler: Send + Sync {
+    fn provider_live_mail_page(
+        &self,
+        _account: &str,
+        _native_account: Option<&str>,
+        _mailbox_id: Option<&str>,
+        _text: Option<&str>,
+        _position: usize,
+        _limit: usize,
+        _query_state: Option<&str>,
+    ) -> Result<Value, String> {
+        Err("provider_mail_unavailable".into())
+    }
     /// Fresh authenticated discovery; errors must hide shared cached accounts.
     fn provider_shared_mail_accounts(&self, _account: &str) -> Result<Vec<String>, String> {
         Err("provider_scope_unavailable".into())
@@ -4120,6 +4132,14 @@ pub trait MailWriteHandler: Send + Sync {
     }
     fn provider_store(&self, _account: &str) -> Result<Store, String> {
         Err("provider_store_unavailable".into())
+    }
+    fn with_provider_cache(
+        &self,
+        account: &str,
+        _origin: &str,
+        f: &mut dyn FnMut(&Store) -> ApiResponse,
+    ) -> Result<ApiResponse, String> {
+        self.provider_store(account).map(|store| f(&store))
     }
     // This boundary mirrors the provider draft request fields.
     #[allow(clippy::too_many_arguments)]
@@ -4958,6 +4978,17 @@ impl EventBus {
 /// Routes requests against the configured accounts and their stores.
 pub struct Router {
     config: Config,
+    #[cfg(unix)]
+    archive_reader: std::sync::Mutex<
+        Vec<(
+            String,
+            PathBuf,
+            (u64, u64, u32, u32, u32, i64, i64, [u8; 32]),
+            Store,
+        )>,
+    >,
+    #[cfg(all(test, unix))]
+    archive_reader_opens: std::sync::atomic::AtomicUsize,
     /// Optional change broadcaster for the SSE `/api/v1/events` stream (the
     /// daemon's). `None` => the events endpoint reports no live push.
     events: Option<std::sync::Arc<EventBus>>,
@@ -5118,6 +5149,10 @@ impl Router {
     pub fn new(config: Config) -> Self {
         Router {
             config,
+            #[cfg(unix)]
+            archive_reader: std::sync::Mutex::new(Vec::new()),
+            #[cfg(all(test, unix))]
+            archive_reader_opens: std::sync::atomic::AtomicUsize::new(0),
             events: None,
             gate: None,
             restore: None,
@@ -5177,6 +5212,10 @@ impl Router {
     pub fn with_gate(config: Config, gate: std::sync::Arc<std::sync::Mutex<()>>) -> Self {
         Router {
             config,
+            #[cfg(unix)]
+            archive_reader: std::sync::Mutex::new(Vec::new()),
+            #[cfg(all(test, unix))]
+            archive_reader_opens: std::sync::atomic::AtomicUsize::new(0),
             events: None,
             gate: Some(gate),
             restore: None,
@@ -5967,8 +6006,15 @@ impl Router {
             && req
                 .q("account")
                 .is_some_and(|account| self.provider_origin(account).is_some());
+        let live_provider_mail_view = req.method == "GET"
+            && req.path == "/api/v1/view"
+            && req.q("service") == Some("mail")
+            && req
+                .q("account")
+                .is_some_and(|account| self.provider_origin(account).is_some());
         let gate_exempt = static_get
             || live_provider_attachment
+            || live_provider_mail_view
             || (req.method == "GET" && GATE_EXEMPT_GET.contains(&req.path.as_str()))
             || (req.method == "POST" && GATE_EXEMPT_POST.contains(&req.path.as_str()));
         let _gate = if gate_exempt {
@@ -5980,6 +6026,9 @@ impl Router {
         };
         if live_provider_attachment {
             return self.live_provider_attachment(req);
+        }
+        if live_provider_mail_view {
+            return self.live_provider_mail_view(req);
         }
         if req.method == "POST" {
             let Some(spec) = product_post_route(&req.path) else {
@@ -11035,11 +11084,7 @@ impl Router {
             .filter(|n| *n > 0)
             .unwrap_or(50)
             .min(500);
-        let store = match self.open_readonly(Some(account)) {
-            Ok(s) => s,
-            Err(e) => return e,
-        };
-        match store.recent_runs(account, limit) {
+        self.with_archive_reader(account, |store| match store.recent_runs(account, limit) {
             Ok(runs) => {
                 let arr: Vec<Value> = runs
                     .iter()
@@ -11057,7 +11102,7 @@ impl Router {
                 ApiResponse::ok_json(&json!({ "runs": arr, "count": arr.len() }))
             }
             Err(_) => ApiResponse::error(500, "store_query_failed"),
-        }
+        })
     }
 
     /// Per-account archive overview: for each non-empty service, the tracked-item
@@ -11068,37 +11113,33 @@ impl Router {
             Some(a) => a,
             None => return ApiResponse::error(400, "missing 'account'"),
         };
-        let store = match self.open_readonly(Some(account)) {
-            Ok(s) => s,
-            Err(e) => return e,
-        };
-        let mut services = Vec::new();
-        let (mut total_items, mut total_archived) = (0usize, 0usize);
-        for &svc in STATUS_SERVICES {
-            match store.items_by_service(account, svc) {
-                Ok(items) if !items.is_empty() => {
-                    let archived = items.iter().filter(|i| i.local_path.is_some()).count();
-                    total_items += items.len();
+        self.with_archive_reader(account, |store| {
+            let mut services = Vec::new();
+            let counts = match store.active_service_counts(account) {
+                Ok(counts) => counts,
+                Err(_) => return ApiResponse::error(500, "store_query_failed"),
+            };
+            let (mut total_items, mut total_archived) = (0u64, 0u64);
+            for &svc in STATUS_SERVICES {
+                if let Some((_, count, archived)) = counts.iter().find(|(service, _, _)| service == svc) {
+                    total_items += count;
                     total_archived += archived;
                     services.push(json!({
-                        "service": svc, "items": items.len(), "archived": archived,
+                        "service": svc, "items": count, "archived": archived,
                     }));
                 }
-                Ok(_) => {}
-                Err(_) => return ApiResponse::error(500, "store_query_failed"),
             }
-        }
-        let onedrive_cursor = store
-            .get_delta_cursor(account, "onedrive", "")
-            .map(|c| c.is_some())
-            .unwrap_or(false);
-        // Real integrity signal: how many archived bodies last passed the verify
-        // hash-check, and when verify last ran (backs "Integrity verified N%").
-        let (checked, verified) = store.verify_counts(account).unwrap_or((0, 0));
-        let last_verified = store.recent_runs(account, 50).ok().and_then(|runs| {
-            runs.into_iter()
-                .find(|r| r.kind == "verify")
-                .map(|r| r.finished_at)
+            let onedrive_cursor = store
+                .get_delta_cursor(account, "onedrive", "")
+                .map(|c| c.is_some())
+                .unwrap_or(false);
+            // Real integrity signal: how many archived bodies last passed the verify
+            // hash-check, and when verify last ran (backs "Integrity verified N%").
+            let (checked, verified) = store.verify_counts(account).unwrap_or((0, 0));
+            let last_verified = store.recent_runs(account, 50).ok().and_then(|runs| {
+                runs.into_iter()
+                    .find(|r| r.kind == "verify")
+                    .map(|r| r.finished_at)
         });
         ApiResponse::ok_json(&json!({
             "account": account,
@@ -11107,6 +11148,7 @@ impl Router {
             "onedrive_cursor": onedrive_cursor,
             "verify": { "checked": checked, "verified": verified, "last_verified": last_verified },
         }))
+        })
     }
 
     fn open(&self, account: Option<&str>) -> Result<Store, ApiResponse> {
@@ -11115,6 +11157,99 @@ impl Router {
             .store_path(account)
             .ok_or_else(|| ApiResponse::error(404, "unknown account"))?;
         Store::open(path).map_err(|_| ApiResponse::error(500, "store_unavailable"))
+    }
+
+    /// Reuse at most two archive readers for short queries. The least recently
+    /// used entry is evicted, and identity changes invalidate the affected reader.
+    fn with_archive_reader(
+        &self,
+        account: &str,
+        f: impl FnOnce(&Store) -> ApiResponse,
+    ) -> ApiResponse {
+        self.with_archive_reader_result(account, |store| Ok(f(store)))
+            .unwrap_or_else(|error| error)
+    }
+
+    fn with_archive_reader_result<T>(
+        &self,
+        account: &str,
+        f: impl FnOnce(&Store) -> Result<T, ApiResponse>,
+    ) -> Result<T, ApiResponse> {
+        #[cfg(not(unix))]
+        {
+            return match self.open_readonly(Some(account)) {
+                Ok(store) => f(&store),
+                Err(error) => Err(error),
+            };
+        }
+        #[cfg(unix)]
+        {
+            let Some(path) = self.store_path(account) else {
+                return Err(ApiResponse::error(404, "unknown account"));
+            };
+            let Ok(mut cached) = self.archive_reader.lock() else {
+                return Err(ApiResponse::error(500, "store_unavailable"));
+            };
+            let identity = match Store::readonly_cache_identity(&path) {
+                Ok(identity) => identity,
+                Err(_)
+                    if std::fs::symlink_metadata(&path)
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    cached.retain(|(old_account, _, _, _)| old_account != account);
+                    return match self.open_readonly(Some(account)) {
+                        Ok(store) => f(&store),
+                        Err(error) => Err(error),
+                    };
+                }
+                Err(_) => {
+                    cached.retain(|(old_account, _, _, _)| old_account != account);
+                    return Err(ApiResponse::error(500, "store_unavailable"));
+                }
+            };
+            let found = cached
+                .iter()
+                .position(|(old_account, old_path, old_identity, _)| {
+                    old_account == account && old_path == &path && *old_identity == identity
+                });
+            let entry = if let Some(index) = found {
+                cached.remove(index)
+            } else {
+                cached.retain(|(old_account, _, _, _)| old_account != account);
+                // Evict before opening: even transiently hold no more than two handles.
+                if cached.len() == 2 {
+                    cached.remove(0);
+                }
+                #[cfg(test)]
+                self.archive_reader_opens
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let store = match Store::open_readonly(&path) {
+                    Ok(store) => store,
+                    Err(_) => return Err(ApiResponse::error(500, "store_unavailable")),
+                };
+                if Store::readonly_cache_identity(&path).ok() != Some(identity) {
+                    return Err(ApiResponse::error(500, "store_unavailable"));
+                }
+                (account.to_owned(), path.clone(), identity, store)
+            };
+            if !matches!(entry.3.schema_version(), Ok(version) if version <= isyncyou_store::SCHEMA_VERSION)
+            {
+                return Err(ApiResponse::error(500, "store_unavailable"));
+            }
+            let response = f(&entry.3);
+            if !matches!(entry.3.schema_version(), Ok(version) if version <= isyncyou_store::SCHEMA_VERSION)
+            {
+                return Err(ApiResponse::error(500, "store_unavailable"));
+            }
+            if Store::readonly_cache_identity(&path).ok() != Some(identity) {
+                return Err(ApiResponse::error(500, "store_unavailable"));
+            }
+            if cached.len() == 2 {
+                cached.remove(0);
+            }
+            cached.push(entry);
+            response
+        }
     }
 
     /// Read-only store open for GET endpoints: a WAL reader that takes no instance
@@ -11141,6 +11276,17 @@ impl Router {
         origin: &str,
         req: &ApiRequest,
     ) -> ApiResponse {
+        let primary_cache_only = match req.q("primary_cache_only") {
+            None => false,
+            Some("1")
+                if req.q("mail_scope").is_none()
+                    && req.q("offset").is_none()
+                    && req.q("after").is_none() =>
+            {
+                true
+            }
+            Some(_) => return ApiResponse::error(400, "invalid_primary_cache_request"),
+        };
         let scopes = match store.provider_scopes(account, origin, "mail") {
             Ok(scopes) if scopes.len() <= 1 => scopes,
             _ => return ApiResponse::error(503, "provider_scope_unavailable"),
@@ -11155,6 +11301,61 @@ impl Router {
                 .any(|candidate| candidate.collection == primary.collection)
         }) {
             return ApiResponse::error(503, "provider_scope_unavailable");
+        }
+        if primary_cache_only {
+            let Some(scope) = scopes.first() else {
+                return ApiResponse::ok_json(
+                    &json!({"items":[],"scopes":[],"shared_access_status":"unknown","count":0,"total":null,"provenance":"local","observed_at":null}),
+                );
+            };
+            let limit = (clamp_limit(req.q("limit")) as usize).min(50);
+            let snapshot = match store.provider_mail_window_snapshot(scope, 0, limit) {
+                Ok(snapshot) => snapshot,
+                Err(_) => return ApiResponse::error(503, "provider_cache_unavailable"),
+            };
+            let Some((_state, observed_at, window_limit, total, objects)) = snapshot else {
+                return ApiResponse::ok_json(
+                    &json!({"items":[],"scopes":[{"mail_scope":scope.collection,"primary":true}],"shared_access_status":"unknown","count":0,"total":null,"provenance":"local","observed_at":null}),
+                );
+            };
+            let mut items = Vec::with_capacity(objects.len());
+            let mut folders = scope.clone();
+            folders.service = "mailboxes".into();
+            let folder_page = match store.provider_objects_page(&folders, "", 200) {
+                Ok(page) => page,
+                Err(_) => return ApiResponse::error(503, "provider_cache_unavailable"),
+            };
+            for folder in folder_page {
+                let value: Value = match serde_json::from_slice(&folder.raw) {
+                    Ok(value) => value,
+                    Err(_) => return ApiResponse::error(503, "provider_cache_invalid"),
+                };
+                items.push(json!({"service":"mail","mail_scope":scope.collection,"shared":false,"item_type":"folder","remote_id":folder.remote_id,"name":value["name"],"has_body":false,"preview":{"role":value["role"]}}));
+            }
+            for object in objects {
+                let value: Value = match serde_json::from_slice(&object.raw) {
+                    Ok(value) => value,
+                    Err(_) => return ApiResponse::error(503, "provider_cache_invalid"),
+                };
+                let mailboxes: Vec<String> = value["mailboxIds"]
+                    .as_object()
+                    .map(|m| {
+                        m.iter()
+                            .filter(|(_, v)| v.as_bool() == Some(true))
+                            .map(|(k, _)| k.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let from = value["from"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|a| a["email"].as_str())
+                    .unwrap_or("");
+                items.push(json!({"service":"mail","mail_scope":scope.collection,"shared":false,"item_type":"message","remote_id":object.remote_id,"name":value["subject"].as_str().unwrap_or(""),"mailbox_ids":mailboxes,"has_body":false,"preview":{"subject":value["subject"],"from":from,"snippet":value["preview"],"date":value["receivedAt"],"isRead":value["keywords"]["$seen"].as_bool().unwrap_or(false),"isDraft":value["keywords"]["$draft"].as_bool().unwrap_or(false),"attachments":if value["hasAttachment"].as_bool().unwrap_or(false) {1} else {0}}}));
+            }
+            return ApiResponse::ok_json(
+                &json!({"count":items.len(),"items":items,"scopes":[{"mail_scope":scope.collection,"primary":true}],"shared_access_status":"unknown","total":total,"window_limit":window_limit,"provenance":"local","observed_at":observed_at}),
+            );
         }
         let discovery = self
             .mail_write
@@ -11234,123 +11435,79 @@ impl Router {
         } else {
             Vec::new()
         };
-        let cursor = req.q("after").unwrap_or("");
-        if cursor.len() > 1024 || cursor.chars().any(char::is_control) {
-            return ApiResponse::error(400, "invalid_provider_cursor");
+        if req.q("after").is_some() || req.q("offset").is_some() {
+            return ApiResponse::error(400, "live_mail_paging_required");
         }
-        let offset = if cursor.is_empty() {
-            req.q("offset")
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0)
-                .min(1000)
-        } else {
-            0
+        let snapshot = match store.provider_mail_window_snapshot(
+            scope,
+            0,
+            (clamp_limit(req.q("limit")) as usize).min(50),
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return ApiResponse::error(503, "provider_cache_unavailable"),
         };
-        let limit = (clamp_limit(req.q("limit")) as usize).min(1000);
-        let mut items = Vec::new();
-        let mut readable_folders = std::collections::HashSet::new();
-        if (offset == 0 && cursor.is_empty()) || is_shared {
-            let mut folders = scope.clone();
-            folders.service = if is_shared {
-                "mailboxes-shared"
-            } else {
-                "mailboxes"
-            }
-            .into();
-            if is_shared && store.provider_accessible(&folders).ok().flatten() != Some(true) {
-                return ApiResponse::error(404, "provider_scope_unavailable");
-            }
-            let mut folder_after = String::new();
-            let mut folder_count = 0usize;
-            loop {
-                let page = match store.provider_objects_page(&folders, &folder_after, 200) {
-                    Ok(page) => page,
-                    Err(_) => return ApiResponse::error(503, "provider_cache_unavailable"),
-                };
-                if page.is_empty() {
-                    break;
-                }
-                for folder in page {
-                    folder_after = folder.remote_id.clone();
-                    folder_count += 1;
-                    if folder_count > 1000 {
-                        return ApiResponse::error(503, "provider_mailboxes_limit");
-                    }
-                    let value: Value = match serde_json::from_slice(&folder.raw) {
-                        Ok(value) => value,
-                        Err(_) => return ApiResponse::error(503, "provider_cache_invalid"),
-                    };
-                    if is_shared
-                        && (value["myRights"]["mayReadItems"].as_bool() != Some(true)
-                            || !current_mailboxes.contains(&folder.remote_id))
-                    {
-                        continue;
-                    }
-                    readable_folders.insert(folder.remote_id.clone());
-                    if offset == 0 && cursor.is_empty() {
-                        items.push(json!({"service":"mail", "mail_scope":scope.collection, "shared":is_shared, "item_type":"folder", "remote_id":folder.remote_id, "name":value["name"], "has_body":false, "preview":{"role":value["role"]}}));
-                    }
-                }
-            }
+        let Some((_state, observed_at, window_limit, total, objects)) = snapshot else {
+            return ApiResponse::ok_json(
+                &json!({"items":[],"scopes":available,"shared_access_status":shared_access_status,"count":0,"total":null,"provenance":"local","observed_at":null}),
+            );
+        };
+        let mut items = Vec::with_capacity(objects.len());
+        let mut folders = scope.clone();
+        folders.service = if is_shared {
+            "mailboxes-shared"
+        } else {
+            "mailboxes"
         }
-        let mut after = cursor.to_string();
-        let mut seen = 0usize;
-        while seen < offset.saturating_add(limit) {
-            let page = match store.provider_objects_page(scope, &after, 200) {
+        .into();
+        if !is_shared || store.provider_accessible(&folders).ok().flatten() == Some(true) {
+            let folder_page = match store.provider_objects_page(&folders, "", 200) {
                 Ok(page) => page,
                 Err(_) => return ApiResponse::error(503, "provider_cache_unavailable"),
             };
-            if page.is_empty() {
-                break;
-            }
-            for object in page {
-                after = object.remote_id.clone();
-                if seen >= offset && seen < offset + limit {
-                    let value: Value = match serde_json::from_slice(&object.raw) {
-                        Ok(value) => value,
-                        Err(_) => return ApiResponse::error(503, "provider_cache_invalid"),
-                    };
-                    let mailboxes: Vec<String> = value["mailboxIds"]
-                        .as_object()
-                        .map(|m| {
-                            m.iter()
-                                .filter(|(id, v)| {
-                                    v.as_bool() == Some(true)
-                                        && (!is_shared || readable_folders.contains(*id))
-                                })
-                                .map(|(k, _)| k.clone())
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    if is_shared && mailboxes.is_empty() {
-                        continue;
-                    }
-                    let from = value["from"]
-                        .as_array()
-                        .and_then(|a| a.first())
-                        .and_then(|a| a["email"].as_str())
-                        .unwrap_or("");
-                    items.push(json!({"service":"mail", "mail_scope":scope.collection, "shared":is_shared, "item_type":"message", "remote_id":object.remote_id, "name":value["subject"].as_str().unwrap_or(""), "parent_remote_id":mailboxes.first(), "mailbox_ids":mailboxes, "has_body":false, "preview":{"subject":value["subject"], "from":from, "snippet":value["preview"], "date":value["receivedAt"], "isRead":value["keywords"]["$seen"].as_bool().unwrap_or(false), "isDraft":value["keywords"]["$draft"].as_bool().unwrap_or(false), "attachments":if value["hasAttachment"].as_bool().unwrap_or(false) {1} else {0}, "attachment_count_unknown":value["hasAttachment"].as_bool().unwrap_or(false)}}));
+            for folder in folder_page {
+                let value: Value = match serde_json::from_slice(&folder.raw) {
+                    Ok(value) => value,
+                    Err(_) => return ApiResponse::error(503, "provider_cache_invalid"),
+                };
+                if is_shared
+                    && (value["myRights"]["mayReadItems"].as_bool() != Some(true)
+                        || !current_mailboxes.contains(&folder.remote_id))
+                {
+                    continue;
                 }
-                seen += 1;
-                if seen >= offset + limit {
-                    break;
-                }
+                items.push(json!({"service":"mail","mail_scope":scope.collection,"shared":is_shared,"item_type":"folder","remote_id":folder.remote_id,"name":value["name"],"has_body":false,"preview":{"role":value["role"]}}));
             }
         }
-        let next_cursor = if seen >= offset.saturating_add(limit) && !after.is_empty() {
-            match store.provider_objects_page(scope, &after, 1) {
-                Ok(page) if !page.is_empty() => Some(after),
-                Ok(_) => None,
-                Err(_) => return ApiResponse::error(503, "provider_cache_unavailable"),
+        for object in objects {
+            let value: Value = match serde_json::from_slice(&object.raw) {
+                Ok(value) => value,
+                Err(_) => return ApiResponse::error(503, "provider_cache_invalid"),
+            };
+            let mailboxes: Vec<String> = value["mailboxIds"]
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .filter(|(id, v)| {
+                            v.as_bool() == Some(true)
+                                && (!is_shared || current_mailboxes.contains(id))
+                        })
+                        .map(|(id, _)| id.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if is_shared && mailboxes.is_empty() {
+                continue;
             }
-        } else {
-            None
-        };
-        let observed_at = store.provider_observed_at(scope).ok().flatten();
-        ApiResponse::ok_json(
-            &json!({"count":items.len(), "items":items, "scopes":available, "shared_access_status":shared_access_status, "mail_scope":scope.collection, "shared":is_shared, "total":null, "offset":offset, "limit":limit, "next_cursor":next_cursor, "provenance":"local", "observed_at":observed_at}),
-        )
+            let from = value["from"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|a| a["email"].as_str())
+                .unwrap_or("");
+            items.push(json!({"service":"mail","mail_scope":scope.collection,"shared":is_shared,"item_type":"message","remote_id":object.remote_id,"name":value["subject"].as_str().unwrap_or(""),"mailbox_ids":mailboxes,"has_body":false,"preview":{"subject":value["subject"],"from":from,"snippet":value["preview"],"date":value["receivedAt"],"isRead":value["keywords"]["$seen"].as_bool().unwrap_or(false),"isDraft":value["keywords"]["$draft"].as_bool().unwrap_or(false),"attachments":if value["hasAttachment"].as_bool().unwrap_or(false) {1} else {0}}}));
+        }
+        return ApiResponse::ok_json(
+            &json!({"count":items.len(),"items":items,"scopes":available,"shared_access_status":shared_access_status,"mail_scope":scope.collection,"shared":is_shared,"total":total,"window_limit":window_limit,"provenance":"local","observed_at":observed_at}),
+        );
     }
 
     fn calendar_expanded(&self, req: &ApiRequest) -> ApiResponse {
@@ -11392,6 +11549,24 @@ impl Router {
             Some(s) => s,
             None => return ApiResponse::error(400, "missing 'service'"),
         };
+        if req.q("primary_cache_only").is_some()
+            && (service != "mail"
+                || req
+                    .q("account")
+                    .and_then(|account| self.provider_origin(account))
+                    .is_none())
+        {
+            return ApiResponse::error(400, "invalid_primary_cache_request");
+        }
+        if req.q("live_metadata").is_some()
+            && (service != "mail"
+                || req
+                    .q("account")
+                    .and_then(|account| self.provider_origin(account))
+                    .is_none())
+        {
+            return ApiResponse::error(400, "invalid_live_mail_request");
+        }
         if matches!(service, "calendar" | "todo") {
             if let Some(account) = req.q("account") {
                 if self.provider_origin(account).is_some() {
@@ -11431,6 +11606,76 @@ impl Router {
         if service == "mail" {
             if let Some(account) = req.q("account") {
                 if let Some(origin) = self.provider_origin(account) {
+                    if let Some(live) = req.q("live_metadata") {
+                        if live != "1"
+                            || req.q("primary_cache_only").is_some()
+                            || req.q("after").is_some()
+                            || req.q("offset").is_some()
+                        {
+                            return ApiResponse::error(400, "invalid_live_mail_request");
+                        }
+                        let position = match req.q("position").unwrap_or("0").parse::<usize>() {
+                            Ok(position) if position <= 1_000_000 => position,
+                            _ => return ApiResponse::error(400, "invalid_live_mail_request"),
+                        };
+                        let limit = match req.q("limit").unwrap_or("50").parse::<usize>() {
+                            Ok(limit) if (1..=50).contains(&limit) => limit,
+                            _ => return ApiResponse::error(400, "invalid_live_mail_request"),
+                        };
+                        let state = req.q("query_state");
+                        let text = req.q("text");
+                        let mailbox_id = req.q("mailbox_id");
+                        if mailbox_id.is_some_and(|s| {
+                            s.is_empty() || s.len() > 1024 || s.chars().any(char::is_control)
+                        }) {
+                            return ApiResponse::error(400, "invalid_live_mail_request");
+                        }
+                        if text.is_some_and(|s| {
+                            s.trim().is_empty() || s.len() > 1024 || s.chars().any(char::is_control)
+                        }) {
+                            return ApiResponse::error(400, "invalid_live_mail_request");
+                        }
+                        if (position > 0 && state.is_none())
+                            || state.is_some_and(|s| {
+                                s.is_empty() || s.len() > 1024 || s.chars().any(char::is_control)
+                            })
+                        {
+                            return ApiResponse::error(400, "invalid_live_mail_request");
+                        }
+                        return match self
+                            .mail_write
+                            .as_ref()
+                            .ok_or_else(|| "provider_mail_unavailable".to_owned())
+                            .and_then(|h| {
+                                h.provider_live_mail_page(
+                                    account,
+                                    req.q("mail_scope"),
+                                    mailbox_id,
+                                    text,
+                                    position,
+                                    limit,
+                                    state,
+                                )
+                            }) {
+                            Ok(value) => ApiResponse::ok_json(&value),
+                            Err(error) if error == "stale_page" => {
+                                ApiResponse::error(409, "stale_page")
+                            }
+                            Err(_) => ApiResponse::error(503, "provider_mail_unavailable"),
+                        };
+                    }
+                    if req.q("primary_cache_only").is_some() {
+                        return match self.mail_write.as_ref() {
+                            Some(handler) => handler
+                                .with_provider_cache(account, &origin, &mut |store| {
+                                    self.provider_mail_items(store, account, &origin, req)
+                                })
+                                .unwrap_or_else(|_| {
+                                    ApiResponse::error(503, "provider_store_unavailable")
+                                }),
+                            None => ApiResponse::error(503, "provider_store_unavailable"),
+                        };
+                    }
                     let store = match self
                         .mail_write
                         .as_ref()
@@ -11446,9 +11691,17 @@ impl Router {
         // GETs use a read-only WAL connection so a list load is never serialized behind
         // an in-flight sync holding the writer lock (the measured cause of slow mailbox
         // loads). Any preview back-fill happens afterwards on a brief writable open.
-        let store = match self.open_readonly(req.q("account")) {
-            Ok(s) => s,
-            Err(e) => return e,
+        let use_cached_page = matches!(service, "mail" | "calendar") && req.q("parent").is_none();
+        if use_cached_page && req.q("account").is_none() {
+            return ApiResponse::error(400, "missing 'account'");
+        }
+        let store = if use_cached_page {
+            None
+        } else {
+            match self.open_readonly(req.q("account")) {
+                Ok(store) => Some(store),
+                Err(error) => return error,
+            }
         };
         let account = req.q("account").unwrap_or_default();
         // Folder navigation for the file explorer: `?parent=<id>` lists that
@@ -11457,6 +11710,7 @@ impl Router {
         // folder is bounded — and additive: the call without `parent` keeps the
         // flat paginated behaviour every other view relies on.
         if let Some(parent) = req.q("parent") {
+            let store = store.as_ref().expect("parent listing has its own reader");
             let kids = if parent.is_empty() || parent == "root" {
                 store.roots(account, service)
             } else {
@@ -11535,18 +11789,39 @@ impl Router {
             .q("offset")
             .and_then(|o| o.parse::<u32>().ok())
             .unwrap_or(0);
-        let total = match store.count_by_service(account, service) {
-            Ok(t) => t,
-            Err(_) => return ApiResponse::error(500, "store_query_failed"),
+        let read_page = |store: &Store| -> Result<_, ApiResponse> {
+            let total = store
+                .count_by_service(account, service)
+                .map_err(|_| ApiResponse::error(500, "store_query_failed"))?;
+            let items = store
+                .items_by_service_page(account, service, limit, offset)
+                .map_err(|_| ApiResponse::error(500, "store_query_failed"))?;
+            Ok((total, items))
         };
-        match store.items_by_service_page(account, service, limit, offset) {
+        let (total, items) = match if use_cached_page {
+            self.with_archive_reader_result(account, read_page)
+        } else {
+            read_page(
+                store
+                    .as_ref()
+                    .expect("other listings have their own reader"),
+            )
+        } {
+            Ok(result) => result,
+            Err(error) => return error,
+        };
+        match Ok::<_, ApiResponse>(items) {
             Ok(items) => {
                 let strict_body_acc = (service == "onedrive"
                     && isyncyou_core::envelope::body_envelope_required_for_process())
                 .then(|| self.config.accounts.iter().find(|a| a.id == account))
                 .flatten();
                 let strict_body_all = if strict_body_acc.is_some() {
-                    match store.items_by_service(account, service) {
+                    match store
+                        .as_ref()
+                        .expect("OneDrive uses an uncached reader")
+                        .items_by_service(account, service)
+                    {
                         Ok(all) => Some(all),
                         Err(_) => return ApiResponse::error(500, "store_query_failed"),
                     }
@@ -12038,19 +12313,26 @@ impl Router {
     /// dropped, remote resources blocked); any other raw body is shown as escaped
     /// source. Every page carries a strict `Content-Security-Policy` so the browser
     /// loads nothing remote even if something slipped past.
+    fn live_provider_mail_view(&self, req: &ApiRequest) -> ApiResponse {
+        let (Some(account), Some(id)) = (req.q("account"), req.q("id")) else {
+            return ApiResponse::error(400, "missing 'account', 'service' or 'id'");
+        };
+        match self.mail_write.as_ref().and_then(|h| {
+            h.provider_read_view_scoped(account, req.q("mail_scope"), id)
+                .ok()
+        }) {
+            Some(body) => render_provider_mail_view(body),
+            None => ApiResponse::error(503, "provider_body_unavailable"),
+        }
+    }
+
     fn view(&self, req: &ApiRequest) -> ApiResponse {
         let (account, service, id) = match (req.q("account"), req.q("service"), req.q("id")) {
             (Some(a), Some(s), Some(i)) => (a, s, i),
             _ => return ApiResponse::error(400, "missing 'account', 'service' or 'id'"),
         };
         if service == "mail" && self.provider_origin(account).is_some() {
-            return match self.mail_write.as_ref().and_then(|h| {
-                h.provider_read_view_scoped(account, req.q("mail_scope"), id)
-                    .ok()
-            }) {
-                Some(body) => render_provider_mail_view(body),
-                None => ApiResponse::error(503, "provider_body_unavailable"),
-            };
+            return self.live_provider_mail_view(req);
         }
         let (rel, bytes, name) = match self.read_archived(account, service, id) {
             Ok(v) => v,
@@ -13148,6 +13430,17 @@ mod tests {
             collection: "remote".into(),
         };
         let object = ProviderObject { remote_id:"m1".into(), etag:None, raw:serde_json::to_vec(&json!({"id":"m1","subject":"Hello","from":[{"email":"sender@example.invalid"}],"mailboxIds":{"inbox":true,"archive":true},"keywords":{"$seen":true,"$draft":true}})).unwrap() };
+        assert!(store
+            .publish_provider_mail_window(
+                &scope,
+                None,
+                "email-1",
+                "query-1",
+                2,
+                1,
+                &[object.clone()]
+            )
+            .unwrap());
         store
             .apply_provider_page(&scope, &[ProviderChange::Upsert(object)], "state-1")
             .unwrap();
@@ -13197,15 +13490,122 @@ mod tests {
             "https://example.invalid",
             &ApiRequest::get("/api/v1/items?account=a&service=mail&limit=1"),
         ));
-        assert_eq!(first_page["next_cursor"], "m1");
-        let second_page = body_json(&router.provider_mail_items(
+        assert_eq!(
+            first_page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|v| v["item_type"] == "message")
+                .count(),
+            1
+        );
+        let second_page = router.provider_mail_items(
             &store,
             "a",
             "https://example.invalid",
             &ApiRequest::get("/api/v1/items?account=a&service=mail&limit=1&after=m1"),
-        ));
-        assert_eq!(second_page["items"][0]["remote_id"], "m2");
-        assert!(second_page["next_cursor"].is_null());
+        );
+        assert_eq!(second_page.status, 400);
+    }
+
+    #[test]
+    #[cfg(feature = "encrypted-store")]
+    fn primary_mail_cache_never_discovers_or_returns_shared_data() {
+        use isyncyou_store::{ProviderChange, ProviderObject, ProviderScope};
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Store::open_encrypted(dir.path().join("store.db"), b"test-only-provider-key").unwrap();
+        for (service, collection, subject) in [
+            ("mail", "primary", "personal"),
+            ("mail-shared", "shared", "secret"),
+        ] {
+            let scope = ProviderScope {
+                account_id: "a".into(),
+                origin: "https://example.invalid".into(),
+                service: service.into(),
+                collection: collection.into(),
+            };
+            let object = ProviderObject {
+                remote_id: subject.into(),
+                etag: None,
+                raw: serde_json::to_vec(&json!({"subject":subject})).unwrap(),
+            };
+            store
+                .apply_provider_page(&scope, &[ProviderChange::Upsert(object)], "state")
+                .unwrap();
+        }
+        let primary = ProviderScope {
+            account_id: "a".into(),
+            origin: "https://example.invalid".into(),
+            service: "mail".into(),
+            collection: "primary".into(),
+        };
+        let more: Vec<_> = (0..54)
+            .map(|i| {
+                ProviderChange::Upsert(ProviderObject {
+                    remote_id: format!("p{i:02}"),
+                    etag: None,
+                    raw: serde_json::to_vec(&json!({"subject":"personal"})).unwrap(),
+                })
+            })
+            .collect();
+        store
+            .apply_provider_page(&primary, &more, "state2")
+            .unwrap();
+        let window: Vec<_> = (0..55)
+            .map(|i| ProviderObject {
+                remote_id: format!("w{i:02}"),
+                etag: None,
+                raw: serde_json::to_vec(&json!({"subject":"personal"})).unwrap(),
+            })
+            .collect();
+        assert!(store
+            .publish_provider_mail_window(
+                &primary,
+                None,
+                "email-state",
+                "query-state",
+                55,
+                55,
+                &window
+            )
+            .unwrap());
+        let handler = std::sync::Arc::new(RecordMailWrite(std::sync::Mutex::new(Vec::new())));
+        let mut router = Router::new(Config::default());
+        router.mail_write = Some(handler.clone());
+        let get = |query: &str| {
+            router.provider_mail_items(
+                &store,
+                "a",
+                "https://example.invalid",
+                &ApiRequest::get(query),
+            )
+        };
+        let response = get("/api/v1/items?account=a&service=mail&primary_cache_only=1&limit=1000");
+        assert_eq!(response.status, 200);
+        let body = body_json(&response);
+        assert_eq!(body["shared_access_status"], "unknown");
+        assert_eq!(body["items"].as_array().unwrap().len(), 50);
+        assert_eq!(body["items"][0]["name"], "personal");
+        assert_eq!(body["scopes"].as_array().unwrap().len(), 1);
+        assert!(handler.0.lock().unwrap().is_empty());
+        assert_eq!(
+            get("/api/v1/items?account=a&service=mail&primary_cache_only=1&mail_scope=shared")
+                .status,
+            400
+        );
+        assert_eq!(
+            get("/api/v1/items?account=a&service=mail&primary_cache_only=0").status,
+            400
+        );
+        assert_eq!(
+            get("/api/v1/items?account=a&service=mail&primary_cache_only=1&after=x").status,
+            400
+        );
+        assert_eq!(
+            get("/api/v1/items?account=a&service=mail&primary_cache_only=1&offset=1").status,
+            400
+        );
     }
 
     #[test]
@@ -13262,6 +13662,19 @@ mod tests {
                 "messages",
             )
             .unwrap();
+        let window = [
+            object(
+                "same",
+                json!({"subject":"allowed","mailboxIds":{"visible":true,"hidden":true}}),
+            ),
+            object(
+                "secret",
+                json!({"subject":"forbidden","mailboxIds":{"hidden":true}}),
+            ),
+        ];
+        assert!(store
+            .publish_provider_mail_window(&scope, None, "email", "query", 2, 2, &window)
+            .unwrap());
         store.set_provider_accessible(&scope, true).unwrap();
         store.set_provider_accessible(&folders, true).unwrap();
         let handler = std::sync::Arc::new(RecordMailWrite(std::sync::Mutex::new(Vec::new())));
@@ -13636,6 +14049,82 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             resp.status, 200,
             "the live transfer poll must be served while the offline pass holds the gate"
         );
+    }
+
+    #[test]
+    fn live_mail_page_enforces_bound_window_and_reports_stale_state() {
+        let mut cfg = Config::default();
+        cfg.provider_accounts.insert(
+            "a".into(),
+            isyncyou_core::config::ProviderConfig::SelfHosted {
+                origin: "https://example.invalid".into(),
+                client_id: "test".into(),
+            },
+        );
+        let mut router = Router::new(cfg);
+        router.mail_write = Some(std::sync::Arc::new(RecordMailWrite(std::sync::Mutex::new(
+            Vec::new(),
+        ))));
+        let get = |query: &str| router.items(&ApiRequest::get(query));
+        assert_eq!(get("/api/v1/items?account=a&service=mail&live_metadata=1&position=50&limit=50&query_state=state").status, 409);
+        assert_eq!(
+            get("/api/v1/items?account=a&service=mail&live_metadata=1&position=50&limit=50").status,
+            400
+        );
+        assert_eq!(
+            get("/api/v1/items?account=a&service=mail&live_metadata=1&limit=51").status,
+            400
+        );
+        assert_eq!(
+            get("/api/v1/items?account=a&service=mail&live_metadata=1&primary_cache_only=1").status,
+            400
+        );
+    }
+
+    #[test]
+    fn live_provider_mail_view_bypasses_gate_but_archive_view_waits() {
+        let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let mut cfg = Config::default();
+        cfg.provider_accounts.insert(
+            "provider".into(),
+            isyncyou_core::config::ProviderConfig::SelfHosted {
+                origin: "https://example.invalid".into(),
+                client_id: "test".into(),
+            },
+        );
+        let router = std::sync::Arc::new(Router::with_gate(cfg, gate.clone()));
+        let held = gate.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let live = router.clone();
+        let live_tx = tx.clone();
+        let a = std::thread::spawn(move || {
+            let r = live.route(&ApiRequest::get(
+                "/api/v1/view?account=provider&service=mail&id=x&mail_scope=shared",
+            ));
+            live_tx.send(("live", r.status)).unwrap();
+        });
+        let archive = router.clone();
+        let b = std::thread::spawn(move || {
+            let r = archive.route(&ApiRequest::get(
+                "/api/v1/view?account=archive&service=mail&id=x",
+            ));
+            tx.send(("archive", r.status)).unwrap();
+        });
+        let first = rx.recv_timeout(std::time::Duration::from_secs(2));
+        let premature = rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_ok();
+        drop(held);
+        let after = if premature {
+            None
+        } else {
+            rx.recv_timeout(std::time::Duration::from_secs(2)).ok()
+        };
+        a.join().unwrap();
+        b.join().unwrap();
+        assert_eq!(first.ok(), Some(("live", 503)));
+        assert!(!premature);
+        assert_eq!(after.map(|(kind, _)| kind), Some("archive"));
     }
 
     #[test]
@@ -17259,6 +17748,22 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         }
     }
     impl MailWriteHandler for RecordMailWrite {
+        fn provider_live_mail_page(
+            &self,
+            account: &str,
+            scope: Option<&str>,
+            mailbox: Option<&str>,
+            text: Option<&str>,
+            position: usize,
+            limit: usize,
+            state: Option<&str>,
+        ) -> Result<Value, String> {
+            assert_eq!(
+                (account, scope, mailbox, text, position, limit, state),
+                ("a", None, None, None, 50, 50, Some("state"))
+            );
+            Err("stale_page".into())
+        }
         fn provider_attachment_list_scoped(
             &self,
             account: &str,
@@ -23411,6 +23916,178 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 .route(&ApiRequest::get("/api/v1/status?account=ghost"))
                 .status,
             404
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_reader_reuses_and_invalidates_on_file_change() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, mut router) = setup();
+        let mut second = router.config.accounts[0].clone();
+        second.id = "b".into();
+        router.config.accounts.push(second.clone());
+        second.id = "c".into();
+        router.config.accounts.push(second);
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/status?account=a"))
+                .status,
+            200
+        );
+        let first = {
+            let reader = router.archive_reader.lock().unwrap();
+            reader.last().unwrap().2
+        };
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/activity?account=a"))
+                .status,
+            200
+        );
+        let mail = router.route(&ApiRequest::get("/api/v1/items?account=a&service=mail"));
+        assert_eq!(mail.status, 200);
+        assert_eq!(body_json(&mail)["total"], 2);
+        let calendar = router.route(&ApiRequest::get("/api/v1/items?account=a&service=calendar"));
+        assert_eq!(calendar.status, 200);
+        assert_eq!(body_json(&calendar)["total"], 1);
+        {
+            let reader = router.archive_reader.lock().unwrap();
+            assert_eq!(reader.last().unwrap().2, first);
+            assert_eq!(
+                router
+                    .archive_reader_opens
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+        }
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/status?account=b"))
+                .status,
+            200
+        );
+        assert_eq!(router.archive_reader.lock().unwrap().last().unwrap().0, "b");
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/status?account=a"))
+                .status,
+            200
+        );
+        {
+            let readers = router.archive_reader.lock().unwrap();
+            assert_eq!(readers.len(), 2);
+            assert_eq!(readers.last().unwrap().0, "a");
+            assert_eq!(readers.last().unwrap().2, first);
+            assert_eq!(
+                router
+                    .archive_reader_opens
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                2
+            );
+        }
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/status?account=c"))
+                .status,
+            200
+        );
+        {
+            let readers = router.archive_reader.lock().unwrap();
+            assert_eq!(readers.len(), 2);
+            assert!(readers.iter().any(|entry| entry.0 == "a"));
+            assert!(readers.iter().any(|entry| entry.0 == "c"));
+            assert_eq!(
+                router
+                    .archive_reader_opens
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                3
+            );
+        }
+        let path = router.store_path("a").unwrap();
+        {
+            let writer = Store::open(&path).unwrap();
+            writer
+                .add_run("a", "cache-test", "1", "2", "ok", "new")
+                .unwrap();
+            let response = router.route(&ApiRequest::get("/api/v1/activity?account=a"));
+            assert_eq!(response.status, 200);
+            assert_eq!(body_json(&response)["runs"][0]["kind"], "cache-test");
+        }
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode ^ 0o040)).unwrap();
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/status?account=a"))
+                .status,
+            200
+        );
+        assert_ne!(
+            router.archive_reader.lock().unwrap().last().unwrap().2,
+            first
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("missing-archive-target", &path).unwrap();
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/status?account=a"))
+                .status,
+            500
+        );
+        assert!(router
+            .archive_reader
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|entry| entry.0 != "a"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_reader_rejects_future_schema_from_wal() {
+        let (_dir, router) = setup();
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/status?account=a"))
+                .status,
+            200
+        );
+        let path = router.store_path("a").unwrap();
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        #[cfg(feature = "encrypted-store")]
+        if let Some(key) = isyncyou_store::configured_store_key().unwrap() {
+            let rc = unsafe {
+                rusqlite::ffi::sqlite3_key(writer.handle(), key.as_ptr().cast(), key.len() as i32)
+            };
+            assert_eq!(rc, rusqlite::ffi::SQLITE_OK);
+        }
+        let response = router.with_archive_reader("a", |_| {
+            writer
+                .pragma_update(None, "user_version", isyncyou_store::SCHEMA_VERSION + 1)
+                .unwrap();
+            ApiResponse::ok_json(&json!({"stale": true}))
+        });
+        assert_eq!(response.status, 500);
+        assert!(router
+            .archive_reader
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|entry| entry.0 != "a"));
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/status?account=a"))
+                .status,
+            500
+        );
+        writer
+            .pragma_update(None, "user_version", isyncyou_store::SCHEMA_VERSION)
+            .unwrap();
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/status?account=a"))
+                .status,
+            200
         );
     }
 

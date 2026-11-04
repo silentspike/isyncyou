@@ -1059,7 +1059,7 @@ function mailFolderSpecs() {
 }
 function svcFilters(service) {
   if (service === "mail") return [
-    { sec: "Mailbox" },
+    { sec: (App.accounts || []).some(a => a.id === App.account && a.provider === "self_hosted") ? "Mailbox · current page" : "Mailbox" },
     { key: "all", label: "All messages", icon: "inbox", count: m => m.length },
     { key: "attach", label: "With attachments", icon: "paperclip", count: m => m.filter(it => (it.preview || {}).attachments > 0).length },
     { key: "restore", label: (MOBILE ? "Has content" : "Restore-ready"), icon: "rotate-ccw", count: m => m.filter(it => it.has_body).length },
@@ -1099,7 +1099,12 @@ const svcFilter = (service) => App.svcFilter[service] || "all";
 function setSvcFilter(service, key) {
   App.svcFilter[service] = key;
   document.querySelectorAll(`#subnav-${service} .nav-subitem`).forEach(b => b.classList.toggle("active", b.dataset.k === key));
-  if (service === "mail") mailRender();
+  if (service === "mail") {
+    const provider = (App.accounts || []).some(a => a.id === App.account && a.provider === "self_hosted");
+    const mailbox = key.startsWith("folder:") ? key.slice(7) : "";
+    if (provider && mailbox !== (Mail.mailboxId || "")) { void loadLiveMailFolder(mailbox); return; }
+    mailRender();
+  }
   else if (service === "contacts") contactsRenderList();
 }
 // fill the sidebar sub-item counts once the active view has loaded its items
@@ -1498,12 +1503,18 @@ function renderShell() {
 // Alerts badge. Every value is real (from /sync/state, /activity, /status).
 async function renderSyncWidget() {
   const box = $("#sync-widget"); if (!box) return;
+  if (!box.getClientRects().length) return;
+  const account = App.account;
+  const current = () => box.isConnected && $("#sync-widget") === box && App.account === account;
   let st = { enabled: false, paused: false }, runs = [], status = null;
   try { st = await api("/api/v1/sync/state"); } catch {}
-  if (App.account) {
-    try { runs = (await api("/api/v1/activity?" + qs({ account: App.account, limit: 60 }))).runs || []; } catch {}
-    try { status = await api("/api/v1/status?" + qs({ account: App.account })); } catch {}
+  if (!current()) return;
+  if (account) {
+    try { runs = (await api("/api/v1/activity?" + qs({ account, limit: 60 }))).runs || []; } catch {}
+    if (!current()) return;
+    try { status = await api("/api/v1/status?" + qs({ account })); } catch {}
   }
+  if (!current()) return;
   // back-fill every service's nav count so the sidebar shows them without
   // visiting each view first (the mockup shows all counts up-front).
   if (status && Array.isArray(status.services)) {
@@ -1613,15 +1624,25 @@ async function renderOverview(view) {
     el("div", { id: "ov-body" }),
   );
   const body = $("#ov-body");
+  const account = App.account;
+  const current = () => view.isConnected && view.contains(body) && App.account === account;
   body.append(el("div", { class: "card", style: "height:64px" }, el("div", { class: "skel", style: "height:24px;width:40%" })));
   if (!App.account) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "No account configured" }))); return; }
   try {
+    const status = api("/api/v1/status?" + qs({ account }));
+    void status.then(st => {
+      if (!current()) return;
+      clear(body).append(el("div", { class:"card panel" },
+        el("div", { class:"panel-head", text:"Overview" }),
+        el("div", { class:"panel-body", text:`${(st.totals?.items ?? 0).toLocaleString()} items · ${(st.services || []).length} services · Loading activity and settings…` })));
+    }).catch(() => {});
     const [st, act, cfg, sy] = await Promise.all([
-      api("/api/v1/status?" + qs({ account: App.account })),
-      api("/api/v1/activity?" + qs({ account: App.account, limit: 200 })).catch(() => ({ runs: [] })),
+      status,
+      api("/api/v1/activity?" + qs({ account, limit: 200 })).catch(() => ({ runs: [] })),
       api("/api/v1/settings").catch(() => ({})),
       api("/api/v1/sync/state").catch(() => ({})),
     ]);
+    if (!current()) return;
     const services = (st.services || []).slice().sort((a, b) => b.items - a.items);
     services.forEach(s => { App.counts[s.service] = s.items; });
     updateNavCounts();
@@ -1720,7 +1741,7 @@ async function renderOverview(view) {
     // sync populates data). Repaints only on a real change — never per tick.
     App._ovSig = overviewSignature(st);
     App.liveUpdate = overviewLiveUpdate;
-  } catch (e) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load overview" }), el("p", { text: e.message }))); }
+  } catch (e) { if (current()) clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load overview" }), el("p", { text: e.message }))); }
 }
 function overviewSignature(st) {
   const svc = (st.services || []).map(s => s.service + ":" + s.items).join(",");
@@ -1878,8 +1899,15 @@ function mailAvatarColor(it) {
 const mailDate = (it) => { const p = it.preview || {}; return toDate(p.date || it.remote_mtime) || new Date(0); };
 
 async function renderMailView(view) {
-  if (Mail.scopeAccount !== App.account) { Mail.scopeAccount = App.account; Mail.activeScope = ""; }
-  Mail.all = []; Mail.filter = "all"; Mail.sort = Mail.sort || "newest"; Mail.q = ""; Mail.selected = null;
+  if (Mail.scopeAccount !== App.account) { Mail.scopeAccount = App.account; Mail.activeScope = ""; App.svcFilter.mail = "all"; }
+  App.svcFilter.mail = "all";
+  const account = App.account, scope = Mail.activeScope;
+  const generation = Mail.viewGeneration = (Mail.viewGeneration || 0) + 1;
+  const current = () => view.isConnected && $("#mail-page") && view.contains($("#mail-page")) && App.account === account && Mail.activeScope === scope && Mail.viewGeneration === generation;
+  const providerMail = (App.accounts || []).some(a => a.id === account && a.provider === "self_hosted");
+  const primaryCacheOnly = !scope && providerMail;
+  Mail.all = []; Mail.folders = []; Mail.cats = []; Mail.runs = []; Mail.filter = "all"; Mail.sort = Mail.sort || "newest"; Mail.q = ""; Mail.selected = null;
+  Mail.livePage = false; Mail.liveQuery = ""; Mail.mailboxId = ""; Mail.nextCursor = null; Mail.queryState = null; Mail.pageCursor = 0; Mail.cursorStack = [];
   Mail.threaded = Mail.threaded === undefined ? true : Mail.threaded; // group by conversation (#563)
   clear(view).append(el("div", { id: "mail-page", class: "mail-page" },
     // top metric row leads (title is in the top-bar breadcrumb, counts live in the
@@ -1888,16 +1916,19 @@ async function renderMailView(view) {
     // toolbar
     el("div", { class: "mail-toolbar" },
       el("div", { class: "tb-search" }, icon("search", "icon-sm"),
-        el("input", { id: "mail-search", placeholder: "Search this mailbox…", oninput: () => { clearTimeout(Mail._qT); Mail._qT = setTimeout(() => { Mail.q = $("#mail-search").value.trim().toLowerCase(); mailRender(); }, 140); } })),
+        el("input", { id: "mail-search", placeholder: providerMail ? "Filter this page…" : "Search this mailbox…", oninput: () => { clearTimeout(Mail._qT); Mail._qT = setTimeout(() => { Mail.q = $("#mail-search").value.trim().toLowerCase(); mailRender(); }, 140); } })),
+      providerMail ? el("input", {id:"mail-server-query", class:"input", placeholder:"Search mailbox…", "aria-label":"Search selected mailbox"}) : null,
+      providerMail ? el("button", {class:"btn sm",type:"button",onclick:event=>searchLiveProviderMail(event.currentTarget)}, "Search mailbox") : null,
       el("select", { id:"mail-scope", class:"input", style:"display:none", onchange:event => { Mail.activeScope = event.target.value; Mail.selected = null; Mail.pendingSelect = null; void renderMailView(view); } }),
       el("span", { id: "mail-cache-provenance", class: "dim", style: "font-size:11px" }),
-      el("button", { id: "mail-load-more", class: "btn sm", type:"button", style:"display:none", onclick: event => loadMoreProviderMail(event.currentTarget) }, "Load more"),
+      el("button", { id: "mail-page-prev", class: "btn sm", type:"button", style:"display:none", onclick: event => loadMoreProviderMail(event.currentTarget, true) }, "Previous page"),
+      el("button", { id: "mail-load-more", class: "btn sm", type:"button", style:"display:none", onclick: event => loadMoreProviderMail(event.currentTarget) }, "Next page"),
       el("div", { class: "spacer", style: "flex:1" }),
       el("label", { class: "tb-sort" }, icon("arrow-down-up", "icon-sm"),
-        el("select", { class: "input", onchange: (e) => { Mail.sort = e.target.value; mailRender(); } },
-          el("option", { value: "newest", text: "Newest first" }),
-          el("option", { value: "oldest", text: "Oldest first" }),
-          el("option", { value: "sender", text: "Sender A–Z" }))),
+        el("select", { class: "input", title:providerMail ? "Sort messages on this page" : "Sort messages", onchange: (e) => { Mail.sort = e.target.value; mailRender(); } },
+          el("option", { value: "newest", text: providerMail ? "Page: newest first" : "Newest first" }),
+          el("option", { value: "oldest", text: providerMail ? "Page: oldest first" : "Oldest first" }),
+          el("option", { value: "sender", text: providerMail ? "Page: sender A–Z" : "Sender A–Z" }))),
       el("button", { id: "mail-thread-toggle", class: "btn sm" + (Mail.threaded ? " active" : ""), title: "Group messages into conversations", onclick: (e) => { Mail.threaded = !Mail.threaded; e.currentTarget.classList.toggle("active", Mail.threaded); mailRender(); } }, icon("mail-open", "icon-sm"), "Conversations"),
       CAP.agent && (App.accounts || []).some(account => account.id === App.account && account.provider === "self_hosted") ? el("button", { class:"btn sm", type:"button", onclick:() => {
         openProviderRecovery(App.account,"Recovered","mail");
@@ -1913,11 +1944,29 @@ async function renderMailView(view) {
   renderMailReader(null);
   const list = $("#mail-list");
   for (let i = 0; i < 9; i++) list.append(el("div", { class: "mail-item skel-row" }, el("div", { class: "skel grow", style: "height:46px" })));
+  const liveRequest = providerMail ? api("/api/v1/items?" + qs({account,service:"mail",live_metadata:"1",limit:50,...(scope ? {mail_scope:scope} : {})})).catch(() => null) : null;
+  const initialPageRequest = Mail.pageRequest;
+  const applyLive = page => {
+    if (!current() || Mail.pageRequest !== initialPageRequest || Mail.selected) return false;
+    if (!page || !Array.isArray(page.items) || typeof page.query_state !== "string" || !page.query_state) {
+      if (scope) { Mail.all = []; Mail.folders = []; Mail.selected = null; renderMailReader(null); mailRender(); }
+      const label = $("#mail-cache-provenance"); if (label) label.textContent = scope ? "Shared mail access could not be verified" : "Cached messages · newest order not verified";
+      return false;
+    }
+    Mail.all = projectLiveMail(page.items, scope); Mail.livePage = true; Mail.queryState = page.query_state;
+    Mail.nextCursor = page.next_position ?? null; Mail.pageCursor = 0; Mail.cursorStack = [];
+    if (!scope && Number.isSafeInteger(page.total) && page.total >= 0) { App.counts.mail = page.total; updateNavCounts(); }
+    updateMailLoadMore(); fillSubnavCounts("mail", Mail.all); Mail._sig = mailListSignature(); mailRenderMetrics(); mailRender();
+    const label = $("#mail-cache-provenance"); if (label) label.textContent = "Live mailbox · newest first";
+    App.liveUpdate = mailLiveUpdate;
+    return true;
+  };
+  if (liveRequest) void liveRequest.then(applyLive);
   try {
-    const [d, act] = await Promise.all([
-      api("/api/v1/items?" + qs({ account: App.account, service: "mail", limit: 1000, ...(Mail.activeScope ? {mail_scope:Mail.activeScope} : {}) })),
-      api("/api/v1/activity?" + qs({ account: App.account, limit: 30 })).catch(() => ({ runs: [] })),
-    ]);
+    const activity = api("/api/v1/activity?" + qs({ account, limit: 30 })).catch(() => ({ runs: [] }));
+    const d = await api("/api/v1/items?" + qs({ account, service: "mail", limit: providerMail ? 50 : 1000, ...(scope ? {mail_scope:scope} : {}), ...(primaryCacheOnly ? {primary_cache_only:"1"} : {}) }));
+    if (!current()) return;
+    const liveAlready = Mail.livePage;
     const scopeSelect = $("#mail-scope");
     if (scopeSelect && Array.isArray(d.scopes) && (d.scopes.length > 1 || d.scopes.some(scope => !scope.primary))) {
       clear(scopeSelect);
@@ -1925,17 +1974,21 @@ async function renderMailView(view) {
       for (const scope of d.scopes) scopeSelect.append(el("option", {value:scope.primary ? "" : scope.mail_scope, text:scope.primary ? "Personal mail" : `Shared mail · ${scope.mail_scope}`}));
       scopeSelect.value = Mail.activeScope || ""; scopeSelect.style.display = "";
     }
-    Mail.nextCursor = d.next_cursor || null;
-    Mail.expanded = false;
-    updateMailCacheProvenance(d);
-    updateMailLoadMore();
-    Mail.all = (d.items || []).filter(it => it.item_type === "message");
+    if (!liveAlready) {
+      Mail.nextCursor = providerMail ? null : (d.next_cursor || null);
+      Mail.pageCursor = providerMail ? 0 : ""; Mail.cursorStack = []; Mail.livePage = false; Mail.queryState = null;
+      Mail.expanded = false;
+      updateMailCacheProvenance(d);
+      if (providerMail) { const label = $("#mail-cache-provenance"); if (label) label.textContent = "Cached messages · newest order not verified"; }
+      updateMailLoadMore();
+      Mail.all = (d.items || []).filter(it => it.item_type === "message");
+    }
     // real Outlook categories (#562): build the displayName → colour map
     Mail.cats = (d.items || []).filter(it => it.item_type === "category");
     Mail.catColor = new Map(Mail.cats.map(c => [c.name, presetColor((c.preview || {}).color)]));
     Mail.folders = (d.items || []).filter(it => it.item_type === "folder"); // move targets (#563 B5)
-    Mail.runs = act.runs || [];
-    App.counts.mail = Mail.all.length; updateNavCounts();
+    Mail.runs = [];
+    if (!providerMail) App.counts.mail = Mail.all.length; updateNavCounts();
     refreshMailSubnav(); // rebuild the sidebar now that the real categories are known
     fillSubnavCounts("mail", Mail.all);
     mailRenderMetrics(); mailRender();
@@ -1944,35 +1997,110 @@ async function renderMailView(view) {
     // visible set actually changed.
     Mail._sig = mailListSignature();
     App.liveUpdate = mailLiveUpdate;
+    void activity.then(act => { if (current()) { Mail.runs = act.runs || []; mailRenderMetrics(); } });
+    if (primaryCacheOnly) void api("/api/v1/items?" + qs({account,service:"mail",limit:50})).then(full => {
+      if (!current()) return;
+      const select = $("#mail-scope");
+      if (select && Array.isArray(full.scopes) && full.scopes.some(item => !item.primary)) {
+        clear(select);
+        for (const item of full.scopes) select.append(el("option", {value:item.primary ? "" : item.mail_scope, text:item.primary ? "Personal mail" : `Shared mail · ${item.mail_scope}`}));
+        select.value = ""; select.style.display = "";
+      }
+      if (!Mail.livePage) updateMailCacheProvenance(full);
+    }).catch(() => {});
     // re-open the message that was selected before a live (SSE) refresh, if it survived
     if (Mail.pendingSelect) {
       const keep = Mail.all.find(x => x.remote_id === Mail.pendingSelect);
       Mail.pendingSelect = null;
       if (keep) mailSelect(keep);
     }
-  } catch (e) { clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Could not load mail" }), el("p", { text: e.message }))); }
+  } catch (e) {
+    if (!current()) return;
+    if (liveRequest && applyLive(await liveRequest)) return;
+    if (current()) clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Could not load mail" }), el("p", { text: e.message })));
+  }
+}
+
+function projectLiveMail(items, scope) {
+  return items.map(item => ({service:"mail", item_type:"message", remote_id:item.id, name:item.subject || "", mail_scope:scope || undefined, shared:!!scope, mailbox_ids:Object.keys(item.mailboxIds || {}).filter(id => item.mailboxIds[id] === true), has_body:false, preview:{subject:item.subject, from:item.from?.[0]?.email || "", snippet:item.preview, date:item.receivedAt, isRead:!!item.keywords?.$seen, isDraft:!!item.keywords?.$draft, attachments:item.hasAttachment ? 1 : 0, attachment_count_unknown:!!item.hasAttachment}}));
+}
+
+async function loadLiveMailFolder(mailbox) {
+  const account=App.account, scope=Mail.activeScope, generation=Mail.viewGeneration;
+  const requestId=Mail.pageRequest=(Mail.pageRequest || 0)+1;
+  Mail.mailboxId=mailbox; Mail.liveQuery=""; Mail.queryState=null; Mail.nextCursor=null; Mail.cursorStack=[]; Mail.pageCursor=0;
+  Mail.all=[]; Mail.selected=null; renderMailReader(null); updateMailLoadMore(); mailRender();
+  try {
+    const page=await api("/api/v1/items?"+qs({account,service:"mail",live_metadata:"1",limit:50,...(scope ? {mail_scope:scope} : {}),...(mailbox ? {mailbox_id:mailbox} : {})}));
+    if(App.account!==account || Mail.activeScope!==scope || Mail.viewGeneration!==generation || Mail.pageRequest!==requestId || Mail.mailboxId!==mailbox) return;
+    if(!Array.isArray(page.items) || typeof page.query_state!=="string" || !page.query_state) throw new Error("invalid result");
+    Mail.livePage=true; Mail.queryState=page.query_state; Mail.nextCursor=page.next_position ?? null; Mail.all=projectLiveMail(page.items,scope);
+    updateMailLoadMore(); fillSubnavCounts("mail",Mail.all); Mail._sig=mailListSignature(); mailRenderMetrics(); mailRender();
+    const label=$("#mail-cache-provenance"); if(label) label.textContent="Live mailbox · newest first";
+  } catch (_) {
+    if(App.account===account && Mail.activeScope===scope && Mail.viewGeneration===generation && Mail.pageRequest===requestId && Mail.mailboxId===mailbox) toast("This mailbox could not be loaded.","err");
+  }
+}
+
+async function searchLiveProviderMail(button) {
+  const account=App.account, scope=Mail.activeScope, generation=Mail.viewGeneration;
+  const text=($("#mail-server-query")?.value || "").trim();
+  if (!text || text.length > 1024) { toast("Enter a search term.", "err"); return; }
+  const requestId=Mail.pageRequest=(Mail.pageRequest || 0)+1;
+  button.disabled=true;
+  try {
+    const page=await api("/api/v1/items?"+qs({account,service:"mail",live_metadata:"1",limit:50,text,...(scope ? {mail_scope:scope} : {}),...(Mail.mailboxId ? {mailbox_id:Mail.mailboxId} : {})}));
+    if (App.account!==account || Mail.activeScope!==scope || Mail.viewGeneration!==generation || Mail.pageRequest!==requestId) return;
+    if (!Array.isArray(page.items) || typeof page.query_state!=="string" || !page.query_state) throw new Error("invalid result");
+    Mail.livePage=true; Mail.liveQuery=text; Mail.queryState=page.query_state; Mail.pageCursor=0; Mail.cursorStack=[]; Mail.nextCursor=page.next_position ?? null;
+    Mail.all=projectLiveMail(page.items,scope); Mail.selected=null; renderMailReader(null); Mail.q=""; const filter=$("#mail-search"); if(filter) filter.value="";
+    updateMailLoadMore(); fillSubnavCounts("mail",Mail.all); Mail._sig=mailListSignature(); mailRenderMetrics(); mailRender();
+    const label=$("#mail-cache-provenance"); if(label) label.textContent="Live search · newest first";
+  } catch (_) {
+    if (App.account!==account || Mail.activeScope!==scope || Mail.viewGeneration!==generation || Mail.pageRequest!==requestId) return;
+    if(scope) { Mail.all=[]; Mail.folders=[]; Mail.selected=null; renderMailReader(null); mailRender(); }
+    toast("Mail search could not be completed.","err");
+  } finally { if(button.isConnected) button.disabled=false; }
 }
 
 function updateMailLoadMore() {
   const button = $("#mail-load-more");
-  if (button) button.style.display = Mail.nextCursor ? "" : "none";
+  if (button) button.style.display = Mail.nextCursor && (Mail.cursorStack?.length || 0) < 100 ? "" : "none";
+  const previous = $("#mail-page-prev");
+  if (previous) previous.style.display = Mail.cursorStack?.length ? "" : "none";
 }
-async function loadMoreProviderMail(button) {
-  const account = App.account, cursor = Mail.nextCursor, scope = Mail.activeScope;
-  if (!cursor) return;
+async function loadMoreProviderMail(button, previous = false) {
+  const account = App.account, scope = Mail.activeScope, generation = Mail.viewGeneration;
+  const providerMail = (App.accounts || []).some(a => a.id === account && a.provider === "self_hosted");
+  const cursor = previous ? Mail.cursorStack?.at(-1) : Mail.nextCursor;
+  if (cursor == null || (!previous && !cursor) || (!previous && (Mail.cursorStack?.length || 0) >= 100)) return;
+  const pageRequest = Mail.pageRequest = (Mail.pageRequest || 0) + 1;
   button.disabled = true;
   try {
-    const page = await api("/api/v1/items?" + qs({ account, service:"mail", limit:1000, after:cursor, ...(Mail.activeScope ? {mail_scope:Mail.activeScope} : {}) }));
-    if (App.account !== account || Mail.activeScope !== scope || Mail.nextCursor !== cursor) return;
-    const known = new Set(Mail.all.map(item => item.remote_id));
-    for (const item of page.items || []) if (item.item_type === "message" && !known.has(item.remote_id)) { Mail.all.push(item); known.add(item.remote_id); }
-    Mail.nextCursor = page.next_cursor || null;
+    const page = Mail.livePage
+      ? await api("/api/v1/items?" + qs({account,service:"mail",live_metadata:"1",limit:50,position:cursor,query_state:Mail.queryState,...(Mail.liveQuery ? {text:Mail.liveQuery} : {}),...(Mail.mailboxId ? {mailbox_id:Mail.mailboxId} : {}),...(scope ? {mail_scope:scope} : {})}))
+      : await api("/api/v1/items?" + qs({ account, service:"mail", limit:50, after:cursor, ...(scope ? {mail_scope:scope} : {}), ...(!scope && providerMail ? {primary_cache_only:"1"} : {}) }));
+    if (App.account !== account || Mail.activeScope !== scope || Mail.viewGeneration !== generation || Mail.pageRequest !== pageRequest) return;
+    if (previous) Mail.cursorStack.pop(); else Mail.cursorStack.push(Mail.pageCursor ?? "");
+    Mail.pageCursor = cursor;
+    Mail.all = Mail.livePage ? projectLiveMail(page.items || [], scope) : (page.items || []).filter(item => item.item_type === "message");
+    Mail.selected = null; renderMailReader(null);
+    Mail.nextCursor = Mail.livePage ? (page.next_position ?? null) : (page.next_cursor || null);
     Mail.expanded = true;
     updateMailLoadMore();
-    updateMailCacheProvenance(page);
-    App.counts.mail = Mail.all.length; updateNavCounts(); fillSubnavCounts("mail", Mail.all);
+    if (Mail.livePage) { const label = $("#mail-cache-provenance"); if (label) label.textContent = Mail.liveQuery ? "Live search · newest first" : "Live mailbox · newest first"; }
+    else updateMailCacheProvenance(page);
+    if (!providerMail) App.counts.mail = Mail.all.length; updateNavCounts(); fillSubnavCounts("mail", Mail.all);
     Mail._sig = mailListSignature(); mailRenderMetrics(); mailRender();
-  } catch (_) { toast("More cached messages could not be loaded.", "err"); }
+  } catch (error) {
+    if (scope && App.account === account && Mail.activeScope === scope && Mail.viewGeneration === generation && Mail.pageRequest === pageRequest) {
+      Mail.all = []; Mail.folders = []; Mail.selected = null; renderMailReader(null); mailRender();
+    }
+    if (App.account === account && Mail.activeScope === scope && Mail.viewGeneration === generation && Mail.pageRequest === pageRequest) {
+      if (error?.code === "stale_page") { Mail.nextCursor = null; Mail.cursorStack = []; updateMailLoadMore(); }
+      toast(error?.code === "stale_page" ? "Mailbox changed. Reopen Mail to load a fresh first page." : "More messages could not be loaded.", "err");
+    }
+  }
   finally { if (button.isConnected) button.disabled = false; }
 }
 
@@ -1994,17 +2122,20 @@ function mailListSignature() {
 // list ONLY when the visible set changed — preserving filter/search/sort/scroll/selection
 // so a sync tick never reloads the screen.
 async function mailLiveUpdate() {
-  const account = App.account, scope = Mail.activeScope;
+  if (!Mail.activeScope && (Mail.livePage || Mail.pageCursor)) return;
+  const account = App.account, scope = Mail.activeScope, generation = Mail.viewGeneration, pageRequest = Mail.pageRequest, pageCursor = Mail.pageCursor;
   let d;
-  try { d = await api("/api/v1/items?" + qs({ account: App.account, service: "mail", limit: 1000, ...(Mail.activeScope ? {mail_scope:Mail.activeScope} : {}) })); }
-  catch (_) { if (App.account === account && Mail.activeScope === scope && scope) { Mail.all = []; Mail.folders = []; Mail.selected = null; renderMailReader(null); mailRender(); } return; }
-  if (App.account !== account || Mail.activeScope !== scope) return;
+  const providerMail = (App.accounts || []).some(a => a.id === account && a.provider === "self_hosted");
+  try { d = await api("/api/v1/items?" + qs(Mail.livePage ? {account,service:"mail",live_metadata:"1",limit:50,mail_scope:scope,position:pageCursor,...(Mail.liveQuery ? {text:Mail.liveQuery} : {}),...(Mail.mailboxId ? {mailbox_id:Mail.mailboxId} : {}),...(pageCursor ? {query_state:Mail.queryState} : {})} : { account, service: "mail", limit: providerMail ? 50 : 1000, ...(scope ? {mail_scope:scope} : {}), ...(!scope && providerMail ? {primary_cache_only:"1"} : {}), ...(pageCursor ? {after:pageCursor} : {}) })); }
+  catch (_) { if (App.account === account && Mail.activeScope === scope && Mail.viewGeneration === generation && Mail.pageCursor === pageCursor && Mail.pageRequest === pageRequest && scope) { Mail.all = []; Mail.folders = []; Mail.selected = null; renderMailReader(null); mailRender(); } return; }
+  if (App.account !== account || Mail.activeScope !== scope || Mail.viewGeneration !== generation || Mail.pageCursor !== pageCursor || Mail.pageRequest !== pageRequest) return;
+  if (Mail.livePage && !pageCursor) Mail.queryState = d.query_state;
   Mail.expanded = false;
-  Mail.nextCursor = d.next_cursor || null;
-  updateMailCacheProvenance(d);
+  Mail.nextCursor = Mail.livePage ? (d.next_position ?? null) : (d.next_cursor || null);
+  if (!Mail.livePage) updateMailCacheProvenance(d);
   updateMailLoadMore();
-  Mail.all = (d.items || []).filter(it => it.item_type === "message");
-  App.counts.mail = Mail.all.length; updateNavCounts(); fillSubnavCounts("mail", Mail.all);
+  Mail.all = Mail.livePage ? projectLiveMail(d.items || [], scope) : (d.items || []).filter(it => it.item_type === "message");
+  if (!providerMail) App.counts.mail = Mail.all.length; updateNavCounts(); fillSubnavCounts("mail", Mail.all);
   const sig = mailListSignature();
   if (sig === Mail._sig) { mailRenderMetrics(); return; } // nothing on screen changed → no repaint
   Mail._sig = sig;
@@ -2031,8 +2162,9 @@ function fillMetrics(row, cards) {
 function mailRenderMetrics() {
   const withAtt = Mail.all.filter(it => (it.preview || {}).attachments > 0).length;
   const restore = Mail.all.filter(it => it.has_body).length;
+  const providerMail = (App.accounts || []).some(a => a.id === App.account && a.provider === "self_hosted");
   fillMetrics($("#mail-metrics-row"), [
-    { icon: "inbox", value: Mail.all.length, label: "Total messages", sub: "in this mailbox" },
+    { icon: "inbox", value: Mail.all.length, label: providerMail ? "Messages on this page" : "Total messages", sub: "in this mailbox" },
     { icon: "paperclip", value: withAtt, label: "With attachments", sub: `${withAtt} of ${Mail.all.length}` },
     { icon: "rotate-ccw", value: restore, label: (MOBILE ? "Has content" : "Restore-ready"), sub: `${restore} with full body`, tone: "ok" },
     integrityMetric(Mail.all),
@@ -2053,7 +2185,7 @@ function mailFiltered() {
   if (Mail.q) rows = rows.filter(it => { const p = it.preview || {}; return ((p.subject || it.name || "") + " " + (p.from || "") + " " + (p.snippet || "")).toLowerCase().includes(Mail.q); });
   const dir = Mail.sort === "oldest" ? 1 : -1;
   if (Mail.sort === "sender") rows = rows.slice().sort((a, b) => addrLabel((a.preview || {}).from).localeCompare(addrLabel((b.preview || {}).from)));
-  else rows = rows.slice().sort((a, b) => dir * (mailDate(a) - mailDate(b)));
+  else if (!(Mail.livePage && Mail.sort === "newest")) rows = rows.slice().sort((a, b) => dir * (mailDate(a) - mailDate(b)));
   return rows;
 }
 function mailRender() {
@@ -4186,11 +4318,12 @@ function calNav(dir) {
 }
 async function calLoad() {
   const body = $("#cal-body"); clear(body).append(el("div", { class: "card" }, el("div", { class: "skel", style: "height:360px" })));
+  const account = App.account;
+  const current = () => body.isConnected && $("#cal-body") === body && App.account === account;
   try {
-    const [d, act] = await Promise.all([
-      api("/api/v1/items?" + qs({ account: App.account, service: "calendar", limit: 1000 })),
-      api("/api/v1/activity?" + qs({ account: App.account, limit: 30 })).catch(() => ({ runs: [] })),
-    ]);
+    const activity = api("/api/v1/activity?" + qs({ account, limit: 30 })).catch(() => ({ runs: [] }));
+    const d = await api("/api/v1/items?" + qs({ account, service: "calendar", limit: 1000 }));
+    if (!current()) return;
     const items = d.items || [];
     Cal.raw = items.filter(it => it.item_type === "event");
     // calendar colour map (#565 B5): calendar id -> hexColor, for colour-coding
@@ -4198,7 +4331,7 @@ async function calLoad() {
       items.filter(it => it.item_type === "calendar")
         .map(it => [it.remote_id, (it.preview || {}).hex_color])
         .filter(([, c]) => c));
-    Cal.runs = act.runs || [];
+    Cal.runs = [];
     Cal.events = items.filter(it => it.item_type === "event").map(it => {
       const p = it.preview || {};
       const start = evDate(p.start, p.start_tz) || (it.remote_mtime ? new Date(it.remote_mtime) : null);
@@ -4210,7 +4343,8 @@ async function calLoad() {
     }).filter(e => e.start);
     App.counts.calendar = d.total ?? Cal.events.length; updateNavCounts();
     calRenderMetrics(); calRender();
-  } catch (e) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load calendar" }), el("p", { text: e.message }))); }
+    void activity.then(act => { if (current()) { Cal.runs = act.runs || []; calRenderMetrics(); } });
+  } catch (e) { if (current()) clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load calendar" }), el("p", { text: e.message }))); }
 }
 function calRenderMetrics() {
   const now = Date.now();
@@ -7794,7 +7928,7 @@ async function confirmAgentPending(pendingId) {
   record.error = "";
   rerenderPendingCards(pendingId);
   try {
-    await postJson("/api/v1/agent/confirm", CAP.agent, attempt.request);
+    await postJson("/api/v1/agent/confirm", CAP.agent, attempt.request, MUTATION_COMMIT_TIMEOUT_MS);
     updateAgentPendingStatus(record, "confirmed");
     if (Array.isArray(record.uploadKeys)) {
       try {
@@ -9617,7 +9751,7 @@ function renderAccountMenu(body) {
     const row = el("div", { class: "acct-row" + (active ? " active" : "") });
     row.append(el("div", { class: "acct-main" },
       el("span", { class: "avatar mail-av", style: "--c:var(--accent)", text: initials(accountLabel) }),
-      el("button", { class: "acct-pick grow", title: "Switch to this account", onclick: () => { if (!active) { App.account = a.id; toast("Switched to " + accountLabel); } closeAccountMenu(); if (!active) onRoute(); } },
+      el("button", { class: "acct-pick grow", title: "Switch to this account", onclick: () => { if (!active) { App.account = a.id; App.counts = {}; toast("Switched to " + accountLabel); } closeAccountMenu(); if (!active) onRoute(); } },
         el("div", { class: "truncate", text: accountLabel }),
         el("div", { class: "dim", style: "font-size:11px", text: active ? "Currently selected" : (a.provider === "self_hosted" ? "Self-hosted account" : "Microsoft 365 account") })),
       active ? icon("check", "icon-sm") : null));
