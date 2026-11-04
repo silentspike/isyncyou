@@ -4022,8 +4022,42 @@ pub(crate) fn import_recovered_with_token(
         .map_err(|e| e.to_string())?;
     let intent = serde_json::json!({"generation":generation,"object_id":object_id,"version":version,"href":href,"original_sha256":source_digest,"original":base64::engine::general_purpose::STANDARD.encode(original),"projection":base64::engine::general_purpose::STANDARD.encode(&projected)}).to_string();
     let digest = format!("{:x}", Sha256::digest(intent.as_bytes()));
+    journaled_recovery_dispatch(
+        store,
+        &scope,
+        operation_id,
+        &intent,
+        &digest,
+        || {
+            if !client
+                .permits(&scope, None, "bind")
+                .map_err(|e| e.to_string())?
+            {
+                return Err("Recovered collection is not writable".into());
+            }
+            client
+                .require_private_parent_atomic(&scope)
+                .map_err(|_| "Atomic private recovery is unavailable".to_string())
+        },
+        || client.put_private_recovery(&scope, &href, projected.clone()),
+        || reconcile_recovery(store, &client, &scope, operation_id, &href, &projected),
+    )
+}
+
+/// Existing intents are observed only; a first dispatch follows an atomic claim.
+#[allow(clippy::too_many_arguments)]
+fn journaled_recovery_dispatch(
+    store: &Store,
+    scope: &ProviderScope,
+    operation_id: &str,
+    intent: &str,
+    digest: &str,
+    preflight: impl FnOnce() -> Result<(), String>,
+    dispatch: impl FnOnce() -> Result<Option<String>, DavError>,
+    readback: impl FnOnce() -> Result<RecoveryImportOutcome, String>,
+) -> Result<RecoveryImportOutcome, String> {
     if let Some((previous, state, result)) = store
-        .provider_mutation(&scope, operation_id)
+        .provider_mutation(scope, operation_id)
         .map_err(|e| e.to_string())?
     {
         if previous != digest {
@@ -4035,28 +4069,17 @@ pub(crate) fn import_recovered_with_token(
             }),
             "rejected" => Ok(RecoveryImportOutcome::Rejected),
             "conflict" => Ok(RecoveryImportOutcome::Conflict),
-            _ => reconcile_recovery(store, &client, &scope, operation_id, &href, &projected),
+            _ => readback(),
         };
     }
-    if !client
-        .permits(&scope, None, "bind")
-        .map_err(|e| e.to_string())?
-    {
-        return Err("Recovered collection is not writable".into());
-    }
-    client
-        .require_private_parent_atomic(&scope)
-        .map_err(|_| "Atomic private recovery is unavailable".to_string())?;
+    preflight()?;
     if !store
-        .claim_provider_mutation(&scope, operation_id, "dav_recovery", &intent, &digest)
+        .claim_provider_mutation(scope, operation_id, "dav_recovery", intent, digest)
         .map_err(|e| e.to_string())?
     {
         return Ok(RecoveryImportOutcome::Unknown);
     }
-    let result = client.put_private_recovery(&scope, &href, projected.clone());
-    finish_recovery_dispatch(store, &scope, operation_id, result, || {
-        reconcile_recovery(store, &client, &scope, operation_id, &href, &projected)
-    })
+    finish_recovery_dispatch(store, scope, operation_id, dispatch(), readback)
 }
 
 fn finish_recovery_dispatch(
@@ -4119,11 +4142,27 @@ fn reconcile_recovery(
     }
 }
 
-/// Strict byte comparison for a native recovery readback. A server-normalized
-/// result remains unverified until a semantic comparison is implemented.
+/// Compare exact content after only RFC line unfolding. Other server changes
+/// remain unverified; an ETag is required for the native observation.
 pub fn recovery_readback_matches(prepared: &[u8], current: &ProviderObject) -> bool {
+    fn unfold(input: &[u8]) -> Vec<u8> {
+        let mut output = Vec::with_capacity(input.len());
+        let mut i = 0;
+        while i < input.len() {
+            if input
+                .get(i..i + 3)
+                .is_some_and(|v| v == b"\r\n " || v == b"\r\n\t")
+            {
+                i += 3;
+            } else {
+                output.push(input[i]);
+                i += 1;
+            }
+        }
+        output
+    }
     !prepared.is_empty()
-        && prepared == current.raw.as_slice()
+        && (prepared == current.raw.as_slice() || unfold(prepared) == unfold(&current.raw))
         && current.etag.as_ref().is_some_and(|etag| !etag.is_empty())
 }
 
@@ -4210,6 +4249,126 @@ fn cached_live_objects(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_readback_only_accepts_exact_rfc_line_folding() {
+        let prepared = b"BEGIN:VCALENDAR\r\nRELATED-TO:parent-uid\r\nEND:VCALENDAR\r\n";
+        let mut current = ProviderObject {
+            remote_id: "fixture".into(),
+            etag: Some("\"etag\"".into()),
+            raw: b"BEGIN:VCALENDAR\r\nRELATED-TO:parent-\r\n uid\r\nEND:VCALENDAR\r\n".to_vec(),
+        };
+        assert!(recovery_readback_matches(prepared, &current));
+        current.raw =
+            b"BEGIN:VCALENDAR\r\nRELATED-TO:parent-\r\n\tuid\r\nEND:VCALENDAR\r\n".to_vec();
+        assert!(recovery_readback_matches(prepared, &current));
+        current.raw =
+            b"BEGIN:VCALENDAR\r\nRELATED-TO:parent-\r\n  uid\r\nEND:VCALENDAR\r\n".to_vec();
+        assert!(!recovery_readback_matches(prepared, &current));
+        current.raw = b"BEGIN:VCALENDAR\r\nRELATED-TO:parent-\n uid\r\nEND:VCALENDAR\r\n".to_vec();
+        assert!(!recovery_readback_matches(prepared, &current));
+        current.raw = b"BEGIN:VCALENDAR\r\nRELATED-TO:parent-other\r\nEND:VCALENDAR\r\n".to_vec();
+        assert!(!recovery_readback_matches(prepared, &current));
+        current.raw = prepared.to_vec();
+        current.etag = None;
+        assert!(!recovery_readback_matches(prepared, &current));
+    }
+
+    #[test]
+    fn recovery_continuation_reconciles_unknown_before_first_new_dispatch() {
+        use std::cell::Cell;
+        let store = Store::open_in_memory().unwrap();
+        let scope = ProviderScope {
+            account_id: "account".into(),
+            origin: "https://example.test/".into(),
+            service: "calendar".into(),
+            collection: "https://example.test/recovered/".into(),
+        };
+        for op in ["parent", "child"] {
+            assert!(store
+                .claim_provider_mutation(&scope, op, "dav_recovery", "intent", "digest")
+                .unwrap());
+        }
+        assert!(store
+            .finish_provider_mutation(&scope, "parent", Some("parent-href"))
+            .unwrap());
+        let dispatches = Cell::new(0);
+        let child_reads = Cell::new(0);
+        let parent = journaled_recovery_dispatch(
+            &store,
+            &scope,
+            "parent",
+            "intent",
+            "digest",
+            || panic!("confirmed preflight"),
+            || panic!("confirmed write"),
+            || panic!("confirmed readback"),
+        )
+        .unwrap();
+        assert!(matches!(parent, RecoveryImportOutcome::Confirmed { .. }));
+        let child = journaled_recovery_dispatch(
+            &store,
+            &scope,
+            "child",
+            "intent",
+            "digest",
+            || panic!("unknown preflight"),
+            || panic!("unknown must not write"),
+            || {
+                child_reads.set(child_reads.get() + 1);
+                let current = ProviderObject {
+                    remote_id: "child".into(),
+                    etag: Some("\"etag\"".into()),
+                    raw: b"RELATED-TO:parent-\r\n uid\r\n".to_vec(),
+                };
+                assert!(recovery_readback_matches(
+                    b"RELATED-TO:parent-uid\r\n",
+                    &current
+                ));
+                assert!(store
+                    .finish_provider_mutation(&scope, "child", Some("child-href"))
+                    .unwrap());
+                Ok(RecoveryImportOutcome::Confirmed {
+                    href: "child-href".into(),
+                })
+            },
+        )
+        .unwrap();
+        assert!(matches!(child, RecoveryImportOutcome::Confirmed { .. }));
+        assert_eq!(child_reads.get(), 1);
+        let event = journaled_recovery_dispatch(
+            &store,
+            &scope,
+            "event",
+            "intent",
+            "digest",
+            || Ok(()),
+            || {
+                assert_eq!(
+                    store.provider_mutation(&scope, "event").unwrap().unwrap().1,
+                    "unknown"
+                );
+                dispatches.set(dispatches.get() + 1);
+                Err(DavError::Transport("fixture response lost".into()))
+            },
+            || Ok(RecoveryImportOutcome::Unknown),
+        )
+        .unwrap();
+        assert!(matches!(event, RecoveryImportOutcome::Unknown));
+        let repeated = journaled_recovery_dispatch(
+            &store,
+            &scope,
+            "event",
+            "intent",
+            "digest",
+            || panic!("unknown preflight"),
+            || panic!("unknown must not repeat"),
+            || Ok(RecoveryImportOutcome::Unknown),
+        )
+        .unwrap();
+        assert!(matches!(repeated, RecoveryImportOutcome::Unknown));
+        assert_eq!(dispatches.get(), 1);
+    }
 
     #[test]
     fn cached_dav_pages_hide_lost_access_and_restore_without_deleting_originals() {
