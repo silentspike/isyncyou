@@ -179,8 +179,73 @@ fn collection_sync_lease(cfg: &Config, scope: &ProviderScope) -> Result<std::fs:
     Ok(file)
 }
 
-struct DetachedStage<'a> {
+struct DavPassStore<'a> {
     store: Store,
+    cfg: &'a Config,
+    account: &'a str,
+    credentials: Option<&'a dyn ProviderCredentialStore>,
+    identity: crate::provider_store::ReadonlyCacheIdentity,
+    subject: String,
+}
+
+impl DavPassStore<'_> {
+    fn current_subject(&self) -> Result<Option<String>, String> {
+        match self.credentials {
+            Some(credentials) => crate::provider_auth::verified_local_provider_subject_with_store(
+                self.cfg,
+                self.account,
+                credentials,
+            ),
+            None => crate::provider_auth::verified_local_provider_subject(self.cfg, self.account),
+        }
+    }
+    fn validate(&self) -> Result<(), String> {
+        if crate::provider_store::readonly_cache_identity(self.cfg, self.account)? != self.identity
+            || self.current_subject()?.as_deref() != Some(self.subject.as_str())
+        {
+            return Err("DAV pass binding changed".into());
+        }
+        Ok(())
+    }
+}
+
+// Reuse is optional: an uninitialized, unverifiable or legacy identity keeps
+// the existing per-scope path. Never weaken a failed validation during a pass.
+fn open_dav_pass_store<'a>(
+    cfg: &'a Config,
+    account: &'a str,
+    credentials: Option<&'a dyn ProviderCredentialStore>,
+) -> Result<Option<DavPassStore<'a>>, String> {
+    let Ok(identity) = crate::provider_store::readonly_cache_identity(cfg, account) else {
+        return Ok(None);
+    };
+    let subject = match credentials {
+        Some(store) => {
+            crate::provider_auth::verified_local_provider_subject_with_store(cfg, account, store)
+        }
+        None => crate::provider_auth::verified_local_provider_subject(cfg, account),
+    }
+    .ok()
+    .flatten();
+    let Some(subject) = subject else {
+        return Ok(None);
+    };
+    let store = crate::provider_store::open_sync(cfg, account)?;
+    let pass = DavPassStore {
+        store,
+        cfg,
+        account,
+        credentials,
+        identity,
+        subject,
+    };
+    pass.validate()?;
+    Ok(Some(pass))
+}
+
+struct DetachedStage<'a> {
+    store: &'a Store,
+    binding: Option<&'a dyn Fn() -> Result<(), String>>,
     scope: &'a ProviderScope,
     generation: Option<String>,
     cursor: Option<String>,
@@ -190,6 +255,10 @@ struct DetachedStage<'a> {
 
 impl DetachedStage<'_> {
     fn abort(&mut self) -> Result<(), DavError> {
+        if self.binding.is_some_and(|binding| binding().is_err()) {
+            self.generation = None;
+            return Ok(());
+        }
         if let Some(generation) = self.generation.take() {
             self.store
                 .abort_provider_staging(self.scope, &generation)
@@ -201,6 +270,9 @@ impl DetachedStage<'_> {
 
 impl DetachedSyncStage for DetachedStage<'_> {
     fn reset(&mut self, full: bool) -> Result<(), DavError> {
+        if let Some(binding) = self.binding {
+            binding().map_err(DavError::Store)?;
+        }
         use ring::rand::{SecureRandom, SystemRandom};
         self.abort()?;
         let store = &self.store;
@@ -241,6 +313,9 @@ impl DetachedSyncStage for DetachedStage<'_> {
         Ok(())
     }
     fn existing(&mut self, id: &str) -> Result<Option<ProviderObject>, DavError> {
+        if let Some(binding) = self.binding {
+            binding().map_err(DavError::Store)?;
+        }
         self.store
             .provider_object(self.scope, id)
             .map_err(|e| DavError::Store(e.to_string()))
@@ -251,6 +326,9 @@ impl DetachedSyncStage for DetachedStage<'_> {
         index: &isyncyou_store::ProviderDavIndex,
         alarm: &isyncyou_store::ProviderAlarmIndex,
     ) -> Result<(), DavError> {
+        if let Some(binding) = self.binding {
+            binding().map_err(DavError::Store)?;
+        }
         let store = &self.store;
         let generation = self.generation.as_deref().ok_or(DavError::Conflict)?;
         store
@@ -267,6 +345,9 @@ impl DetachedSyncStage for DetachedStage<'_> {
         Ok(())
     }
     fn remove(&mut self, id: &str) -> Result<(), DavError> {
+        if let Some(binding) = self.binding {
+            binding().map_err(DavError::Store)?;
+        }
         let generation = self.generation.as_deref().ok_or(DavError::Conflict)?;
         if self.full {
             self.store
@@ -278,6 +359,9 @@ impl DetachedSyncStage for DetachedStage<'_> {
         .map_err(|e| DavError::Store(e.to_string()))
     }
     fn finish(&mut self, cursor: &str) -> Result<(), DavError> {
+        if let Some(binding) = self.binding {
+            binding().map_err(DavError::Store)?;
+        }
         let generation = self.generation.as_deref().ok_or(DavError::Conflict)?;
         if self.full {
             self.store
@@ -299,52 +383,84 @@ impl Drop for DetachedStage<'_> {
 }
 
 fn sync_detached(cfg: &Config, client: &DavClient, scope: &ProviderScope) -> Result<usize, String> {
+    sync_detached_inner(cfg, client, scope, None)
+}
+
+fn sync_detached_inner(
+    cfg: &Config,
+    client: &DavClient,
+    scope: &ProviderScope,
+    pass: Option<&DavPassStore<'_>>,
+) -> Result<usize, String> {
     let _lease = collection_sync_lease(cfg, scope)?;
+    if let Some(pass) = pass {
+        pass.validate()?;
+    }
     let started = std::time::Instant::now();
-    let snapshot = crate::provider_store::open_readonly(cfg, &scope.account_id);
+    let snapshot = if pass.is_none() {
+        Some(
+            match crate::provider_store::open_readonly(cfg, &scope.account_id) {
+                Ok(store) => store,
+                Err(error) if error == "Provider cache is not initialized" => {
+                    drop(crate::provider_store::open_for_session(
+                        cfg,
+                        &scope.account_id,
+                    )?);
+                    crate::provider_store::open_readonly(cfg, &scope.account_id)?
+                }
+                Err(error) => return Err(error),
+            },
+        )
+    } else {
+        None
+    };
     isyncyou_connectors::dav::diagnostic_timing(
         "scope_snapshot_open",
         0,
         started,
-        if snapshot.is_ok() { "ok" } else { "error" },
+        if pass.is_some() { "reused" } else { "ok" },
     );
-    let snapshot = match snapshot {
-        Ok(store) => store,
-        Err(error) if error == "Provider cache is not initialized" => {
-            drop(crate::provider_store::open_for_session(
-                cfg,
-                &scope.account_id,
-            )?);
-            crate::provider_store::open_readonly(cfg, &scope.account_id)?
-        }
-        Err(error) => return Err(error),
-    };
-    let cursor = snapshot.provider_cursor(scope).map_err(|e| e.to_string())?;
-    let accessible = snapshot
+    let snapshot_ref = pass
+        .map(|p| &p.store)
+        .or(snapshot.as_ref())
+        .ok_or("DAV snapshot unavailable")?;
+    let cursor = snapshot_ref
+        .provider_cursor(scope)
+        .map_err(|e| e.to_string())?;
+    let accessible = snapshot_ref
         .provider_accessible(scope)
         .map_err(|e| e.to_string())?;
     let full = scope.service == "calendar"
-        && (snapshot
+        && (snapshot_ref
             .provider_dav_unindexed_count(scope)
             .map_err(|e| e.to_string())?
             > 0
-            || snapshot
+            || snapshot_ref
                 .provider_alarm_unindexed_count(scope)
                 .map_err(|e| e.to_string())?
                 > 0);
     drop(snapshot);
     let _staging_lease = crate::provider_store::sync_staging_lease(cfg, &scope.account_id)?;
     let started = std::time::Instant::now();
-    let store = crate::provider_store::open_sync(cfg, &scope.account_id);
+    let owned = if pass.is_none() {
+        Some(crate::provider_store::open_sync(cfg, &scope.account_id)?)
+    } else {
+        None
+    };
     isyncyou_connectors::dav::diagnostic_timing(
         "scope_sync_open",
         0,
         started,
-        if store.is_ok() { "ok" } else { "error" },
+        if pass.is_some() { "reused" } else { "ok" },
     );
-    let store = store?;
+    let store = pass
+        .map(|p| &p.store)
+        .or(owned.as_ref())
+        .ok_or("DAV sync store unavailable")?;
+    let validate = || pass.map_or(Ok(()), DavPassStore::validate);
     let mut stage = DetachedStage {
         store,
+        binding: pass.map(|_| &validate as &dyn Fn() -> Result<(), String>),
         scope,
         generation: None,
         cursor: cursor.clone(),
@@ -361,8 +477,10 @@ fn sync_detached(cfg: &Config, client: &DavClient, scope: &ProviderScope) -> Res
     ) {
         Ok(count) => count,
         Err(DavError::Http(403)) => {
-            // A denial must not overwrite an access/cursor change observed by
-            // another writer while this network request was in flight.
+            if let Some(pass) = pass {
+                pass.validate()?;
+            }
+            // Do not overwrite an access/cursor change observed by another writer.
             let store = crate::provider_store::open_for_session(cfg, &scope.account_id)?;
             store
                 .set_provider_accessible_if_state(scope, cursor.as_deref(), accessible, false)
@@ -372,17 +490,25 @@ fn sync_detached(cfg: &Config, client: &DavClient, scope: &ProviderScope) -> Res
         Err(error) => return Err(error.to_string()),
     };
     let started = std::time::Instant::now();
-    let store = crate::provider_store::open_for_session(cfg, &scope.account_id);
+    if let Some(pass) = pass {
+        pass.validate()?;
+        // This connection has no archive-wide writer lease; the bounded
+        // backfill still runs in its own SQLite transaction.
+        pass.store
+            .backfill_provider_dav_search(scope, 100)
+            .map_err(|e| e.to_string())?;
+    } else {
+        let store = crate::provider_store::open_for_session(cfg, &scope.account_id)?;
+        store
+            .backfill_provider_dav_search(scope, 100)
+            .map_err(|e| e.to_string())?;
+    }
     isyncyou_connectors::dav::diagnostic_timing(
         "scope_backfill_open",
         0,
         started,
-        if store.is_ok() { "ok" } else { "error" },
+        if pass.is_some() { "reused" } else { "ok" },
     );
-    let store = store?;
-    store
-        .backfill_provider_dav_search(scope, 100)
-        .map_err(|e| e.to_string())?;
     Ok(count)
 }
 
@@ -404,6 +530,14 @@ fn sync_all_inner(
 ) -> Result<SyncPass, String> {
     let origin = configured_origin(cfg, account)?;
     let started = std::time::Instant::now();
+    let pass = open_dav_pass_store(cfg, account, credentials)?;
+    isyncyou_connectors::dav::diagnostic_timing(
+        "pass_store_open",
+        0,
+        started,
+        if pass.is_some() { "reused" } else { "fallback" },
+    );
+    let started = std::time::Instant::now();
     let client = match credentials {
         Some(credentials) => client_with_store(cfg, account, &origin, credentials),
         None => client(cfg, account, &origin),
@@ -415,6 +549,9 @@ fn sync_all_inner(
         if client.is_ok() { "ok" } else { "error" },
     );
     let client = client?;
+    if let Some(pass) = pass.as_ref() {
+        pass.validate()?;
+    }
     let started = std::time::Instant::now();
     let collections = client.discover(entry);
     isyncyou_connectors::dav::diagnostic_timing(
@@ -424,6 +561,9 @@ fn sync_all_inner(
         if collections.is_ok() { "ok" } else { "error" },
     );
     let collections = collections.map_err(|e| e.to_string())?;
+    if let Some(pass) = pass.as_ref() {
+        pass.validate()?;
+    }
     let mut report = SyncPass::default();
     let mut present = std::collections::HashSet::new();
     for (index, collection) in collections.into_iter().enumerate() {
@@ -443,7 +583,10 @@ fn sync_all_inner(
                 collection: collection.url.clone(),
             };
             let started = std::time::Instant::now();
-            let result = sync_detached(cfg, &client, &scope);
+            let result = sync_detached_inner(cfg, &client, &scope, pass.as_ref());
+            if let Some(pass) = pass.as_ref() {
+                pass.validate()?;
+            }
             isyncyou_connectors::dav::diagnostic_timing(
                 if service == "calendar" {
                     "sync_calendar"
@@ -461,6 +604,9 @@ fn sync_all_inner(
                 Err(_) => report.failed += 1,
             }
         }
+    }
+    if let Some(pass) = pass.as_ref() {
+        pass.validate()?;
     }
     let store = crate::provider_store::open_for_session(cfg, account)?;
     for service in ["calendar", "contacts"] {
@@ -4611,6 +4757,214 @@ mod tests {
         );
         writer.set_provider_accessible(&scope, false).unwrap();
         assert!(cached_live_objects(&reader, &scope, "", 10).is_err());
+    }
+
+    #[test]
+    fn reused_stage_rejects_binding_change_without_committing_or_hiding_original() {
+        let store = Store::open_in_memory().unwrap();
+        let scope = ProviderScope {
+            account_id: "a".into(),
+            origin: "https://example.test/".into(),
+            service: "contacts".into(),
+            collection: "/contacts/".into(),
+        };
+        let original = ProviderObject {
+            remote_id: "/contacts/one".into(),
+            etag: Some("v1".into()),
+            raw: b"original".to_vec(),
+        };
+        store
+            .apply_provider_page(
+                &scope,
+                &[isyncyou_store::ProviderChange::Upsert(original.clone())],
+                "cursor-1",
+            )
+            .unwrap();
+        let valid = std::cell::Cell::new(true);
+        let validate = || {
+            if valid.get() {
+                Ok(())
+            } else {
+                Err("binding changed".into())
+            }
+        };
+        {
+            let mut stage = DetachedStage {
+                store: &store,
+                binding: Some(&validate),
+                scope: &scope,
+                generation: None,
+                cursor: Some("cursor-1".into()),
+                accessible: Some(true),
+                full: false,
+            };
+            stage.reset(false).unwrap();
+            stage.remove(&original.remote_id).unwrap();
+            valid.set(false);
+            assert!(stage.finish("cursor-2").is_err());
+        }
+        assert_eq!(
+            store.provider_cursor(&scope).unwrap().as_deref(),
+            Some("cursor-1")
+        );
+        assert_eq!(
+            store.provider_object(&scope, &original.remote_id).unwrap(),
+            Some(original)
+        );
+        assert_eq!(store.provider_accessible(&scope).unwrap(), Some(true));
+    }
+
+    #[test]
+    fn reused_stage_rejects_concurrent_acl_change() {
+        let store = Store::open_in_memory().unwrap();
+        let scope = ProviderScope {
+            account_id: "a".into(),
+            origin: "https://example.test/".into(),
+            service: "contacts".into(),
+            collection: "/contacts/".into(),
+        };
+        let original = ProviderObject {
+            remote_id: "/contacts/one".into(),
+            etag: Some("v1".into()),
+            raw: b"original".to_vec(),
+        };
+        store
+            .apply_provider_page(
+                &scope,
+                &[isyncyou_store::ProviderChange::Upsert(original.clone())],
+                "cursor-1",
+            )
+            .unwrap();
+        {
+            let mut stage = DetachedStage {
+                store: &store,
+                binding: None,
+                scope: &scope,
+                generation: None,
+                cursor: Some("cursor-1".into()),
+                accessible: Some(true),
+                full: false,
+            };
+            stage.reset(false).unwrap();
+            stage.remove(&original.remote_id).unwrap();
+            store.set_provider_accessible(&scope, false).unwrap();
+            assert!(stage.finish("cursor-2").is_err());
+        }
+        assert_eq!(
+            store.provider_cursor(&scope).unwrap().as_deref(),
+            Some("cursor-1")
+        );
+        assert_eq!(store.provider_accessible(&scope).unwrap(), Some(false));
+        assert_eq!(
+            store.provider_object(&scope, &original.remote_id).unwrap(),
+            Some(original)
+        );
+    }
+
+    #[cfg(feature = "encrypted-store")]
+    #[test]
+    fn reused_stage_keeps_encrypted_writer_free_and_rejects_changed_acl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider.db");
+        let key = b"test-only strong store key";
+        let scope = ProviderScope {
+            account_id: "a".into(),
+            origin: "https://example.test/".into(),
+            service: "contacts".into(),
+            collection: "/contacts/".into(),
+        };
+        let original = ProviderObject {
+            remote_id: "/contacts/one".into(),
+            etag: Some("v1".into()),
+            raw: b"original".to_vec(),
+        };
+        {
+            let initial = Store::open_encrypted(&path, key).unwrap();
+            initial
+                .apply_provider_page(
+                    &scope,
+                    &[isyncyou_store::ProviderChange::Upsert(original.clone())],
+                    "cursor-1",
+                )
+                .unwrap();
+        }
+        let reused = Store::open_provider_sync_encrypted(&path, key).unwrap();
+        {
+            let mut stage = DetachedStage {
+                store: &reused,
+                binding: None,
+                scope: &scope,
+                generation: None,
+                cursor: Some("cursor-1".into()),
+                accessible: Some(true),
+                full: false,
+            };
+            stage.reset(false).unwrap();
+            stage.remove(&original.remote_id).unwrap();
+            // This separate session writer obtains its normal advisory lease
+            // while the staged connection is idle between network steps.
+            let writer = Store::open_encrypted(&path, key).unwrap();
+            writer.set_provider_accessible(&scope, false).unwrap();
+            drop(writer);
+            assert!(stage.finish("stale-cursor").is_err());
+        }
+        assert_eq!(
+            reused.provider_cursor(&scope).unwrap().as_deref(),
+            Some("cursor-1")
+        );
+        assert_eq!(reused.provider_accessible(&scope).unwrap(), Some(false));
+        assert_eq!(
+            reused.provider_object(&scope, &original.remote_id).unwrap(),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn reused_stage_rejects_concurrent_cursor_change() {
+        let store = Store::open_in_memory().unwrap();
+        let scope = ProviderScope {
+            account_id: "a".into(),
+            origin: "https://example.test/".into(),
+            service: "contacts".into(),
+            collection: "/contacts/".into(),
+        };
+        let original = ProviderObject {
+            remote_id: "/contacts/one".into(),
+            etag: Some("v1".into()),
+            raw: b"original".to_vec(),
+        };
+        store
+            .apply_provider_page(
+                &scope,
+                &[isyncyou_store::ProviderChange::Upsert(original.clone())],
+                "cursor-1",
+            )
+            .unwrap();
+        {
+            let mut stage = DetachedStage {
+                store: &store,
+                binding: None,
+                scope: &scope,
+                generation: None,
+                cursor: Some("cursor-1".into()),
+                accessible: Some(true),
+                full: false,
+            };
+            stage.reset(false).unwrap();
+            stage.remove(&original.remote_id).unwrap();
+            store
+                .apply_provider_page(&scope, &[], "winner-cursor")
+                .unwrap();
+            assert!(stage.finish("stale-cursor").is_err());
+        }
+        assert_eq!(
+            store.provider_cursor(&scope).unwrap().as_deref(),
+            Some("winner-cursor")
+        );
+        assert_eq!(
+            store.provider_object(&scope, &original.remote_id).unwrap(),
+            Some(original)
+        );
     }
 
     #[test]
