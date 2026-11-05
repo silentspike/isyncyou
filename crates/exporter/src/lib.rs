@@ -478,7 +478,13 @@ struct DomainSummary {
 
 // This optional projection is not part of the manifest or PBS protection ABI.
 // A missing projection is unknown; publication must remain independent of it.
-fn write_summary(root: &Path, generation: &str, manifest: &Manifest) -> io::Result<()> {
+fn write_summary(
+    root: &Path,
+    generation: &str,
+    manifest: &Manifest,
+    baseline_generation: Option<&str>,
+    previous: &HashSet<(String, u64)>,
+) -> io::Result<()> {
     let mut domains: BTreeMap<&str, DomainSummary> = BTreeMap::new();
     for c in &manifest.collections {
         if !matches!(
@@ -520,8 +526,34 @@ fn write_summary(root: &Path, generation: &str, manifest: &Manifest) -> io::Resu
             .checked_add(object.size)
             .ok_or_else(|| io::Error::other("summary overflow"))?;
     }
+    // These are unique referenced export blobs, not PBS transfer or disk bytes.
+    let mut payloads = HashSet::new();
+    for object in &manifest.objects {
+        payloads.insert((object.digest.clone(), object.size));
+        payloads.extend(
+            object
+                .related_blobs
+                .iter()
+                .map(|b| (b.digest.clone(), b.size)),
+        );
+    }
+    let payload_bytes = payloads
+        .iter()
+        .try_fold(0_u64, |total, (_, size)| total.checked_add(*size))
+        .ok_or_else(|| io::Error::other("summary overflow"))?;
+    let changed_payload_bytes = match baseline_generation {
+        Some(_) => Some(
+            payloads
+                .difference(previous)
+                .try_fold(0_u64, |total, (_, size)| total.checked_add(*size))
+                .ok_or_else(|| io::Error::other("summary overflow"))?,
+        ),
+        None => None,
+    };
     let bytes = serde_json::to_vec(
-        &serde_json::json!({"schema": 1, "generation": generation, "domains": domains}),
+        &serde_json::json!({"schema": 1, "generation": generation, "domains": domains,
+                            "payload_bytes": payload_bytes, "baseline_generation": baseline_generation,
+                            "changed_payload_bytes": changed_payload_bytes}),
     )
     .map_err(io::Error::other)?;
     if bytes.len() > 4096 {
@@ -538,9 +570,10 @@ fn write_summary(root: &Path, generation: &str, manifest: &Manifest) -> io::Resu
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
     sync_dir(root)?;
     let path = dir.join(generation);
-    // Invalidate any old projection before attempting its replacement.
-    match fs::remove_file(&path) {
-        Ok(()) => sync_dir(&dir)?,
+    // A generation can recur. Its original provenance must not be rewritten
+    // relative to a later predecessor; an invalid existing sidecar is unknown.
+    match fs::symlink_metadata(&path) {
+        Ok(_) => return Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => (),
         Err(e) => return Err(e),
     }
@@ -604,6 +637,7 @@ pub fn publish(root: &Path, manifest: &Manifest) -> io::Result<String> {
     lock.lock_exclusive()?;
     let current = root.join("current");
     let mut previous = HashSet::new();
+    let mut baseline_generation = None;
     if current.exists() {
         let generation = fs::read_to_string(current)?;
         if generation.len() != 64
@@ -624,6 +658,7 @@ pub fn publish(root: &Path, manifest: &Manifest) -> io::Result<String> {
             ));
         }
         let old: Manifest = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        baseline_generation = Some(generation);
         for o in old.objects {
             previous.insert((o.digest, o.size));
             previous.extend(o.related_blobs.into_iter().map(|b| (b.digest, b.size)));
@@ -724,7 +759,13 @@ pub fn publish(root: &Path, manifest: &Manifest) -> io::Result<String> {
         sync_dir(&manifests)?;
     }
     // Observability is optional and cannot hold back a valid recovery generation.
-    let _ = write_summary(root, &generation, manifest);
+    let _ = write_summary(
+        root,
+        &generation,
+        manifest,
+        baseline_generation.as_deref(),
+        &previous,
+    );
     let tmp = root.join("current.tmp");
     let mut f = OpenOptions::new()
         .write(true)
@@ -910,6 +951,9 @@ mod tests {
         let summary: serde_json::Value =
             serde_json::from_slice(&fs::read(root.join("summaries").join(&old)).unwrap()).unwrap();
         assert_eq!(summary["generation"], old);
+        assert_eq!(summary["payload_bytes"], 8);
+        assert!(summary["baseline_generation"].is_null());
+        assert!(summary["changed_payload_bytes"].is_null());
         assert_eq!(summary["domains"]["calendar"]["collections"], 1);
         assert_eq!(summary["domains"]["calendar"]["complete"], 1);
         assert_eq!(summary["domains"]["calendar"]["oldest_at"], 100);
@@ -1020,9 +1064,26 @@ mod tests {
             objects: vec![make(a, a_data.len() as u64, "one")],
             events: vec![],
         };
-        publish(root, &manifest).unwrap();
+        let baseline = publish(root, &manifest).unwrap();
+        let original_summary = fs::read(root.join("summaries").join(&baseline)).unwrap();
         manifest.objects.push(make(b, b_data.len() as u64, "two"));
-        publish(root, &manifest).unwrap();
+        let current = publish(root, &manifest).unwrap();
+        let summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("summaries").join(current)).unwrap())
+                .unwrap();
+        assert_eq!(summary["baseline_generation"], baseline);
+        assert_eq!(summary["changed_payload_bytes"], b_data.len() as u64);
+        assert_eq!(
+            summary["payload_bytes"],
+            (a_data.len() + b_data.len()) as u64 + 18
+        );
+        let removed = manifest.objects.pop().unwrap();
+        assert_eq!(publish(root, &manifest).unwrap(), baseline);
+        assert_eq!(
+            fs::read(root.join("summaries").join(&baseline)).unwrap(),
+            original_summary
+        );
+        manifest.objects.push(removed);
         manifest.objects[1].related_blobs[0].digest = "f".repeat(64);
         assert!(publish(root, &manifest).is_err());
     }
