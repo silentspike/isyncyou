@@ -8045,6 +8045,7 @@ async function confirmAgentPending(pendingId) {
         : e.code === "capture_preflight_version_changed" ? "The source changed before the capture was claimed; no capture was sent. Review the current version."
         : e.code === "capture_preflight_challenge" ? "Capture authorization could not be prepared; no capture was sent."
         : e.code === "capture_preflight_journal" ? "The capture journal could not be prepared; no capture was sent."
+        : e.code === "mail_pre_dispatch_failed" ? "The message could not be prepared; this attempt did not submit it."
         : e.code === "provider_conflict" ? "The item changed before the update. Review the current version."
         : e.code === "dav_discovery_unavailable_before_write" ? "The calendar could not be reached. This attempt did not send a write."
         : e.code === "dav_pre_dispatch_failed" ? "The update could not be prepared. This attempt did not send a write."

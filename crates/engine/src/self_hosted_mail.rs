@@ -2492,7 +2492,12 @@ fn complete_body_value(value: &Value) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 pub enum SendOutcome {
     Confirmed(String),
-    Submitted { id: String, sent_update: String },
+    Submitted {
+        id: String,
+        sent_update: String,
+    },
+    /// A new submission failed its read-only checks before any claim or send.
+    PreDispatchFailed,
     Rejected,
     Unknown,
 }
@@ -3502,91 +3507,17 @@ pub fn send_approved(
                 _ => return reconcile_submission(store, &scope, client, &existing),
             });
         }
-        let ids = vec![approved.email_id.clone()];
-        let email = client
-            .get("Email", Some(&ids), None)
-            .map_err(|_| "Approved email unavailable")?;
-        let rows = email["list"].as_array().ok_or("Invalid approved email")?;
-        if rows.len() != 1
-            || rows[0]["id"].as_str() != Some(approved.email_id.as_str())
-            || rows[0]["blobId"].as_str() != Some(approved.blob_id.as_str())
-        {
-            return Err("Approved email changed or is unavailable".into());
-        }
-        let mut approved_recipients = approved.recipients.clone();
-        approved_recipients.sort();
-        approved_recipients.dedup();
-        if native_recipients(&rows[0])? != approved_recipients {
-            return Err("Approved recipients do not match the native draft".into());
-        }
-        let identity_ids = vec![approved.identity_id.clone()];
-        let identities = client
-            .get("Identity", Some(&identity_ids), None)
-            .map_err(|_| "Sending identity unavailable")?;
-        let identities = identities["list"]
-            .as_array()
-            .ok_or("Sending identity unavailable")?;
-        if identities.len() != 1
-            || identities[0]["id"].as_str() != Some(approved.identity_id.as_str())
-            || identities[0]["email"].as_str() != Some(approved.mail_from.as_str())
-        {
-            return Err("Sending identity does not match approved sender".into());
-        }
-        let mailbox_ids = vec![
-            approved.draft_mailbox_id.clone(),
-            approved.sent_mailbox_id.clone(),
-        ];
-        let mailboxes = client
-            .get("Mailbox", Some(&mailbox_ids), None)
-            .map_err(|_| "Submission mailboxes unavailable")?;
-        let mailboxes = mailboxes["list"]
-            .as_array()
-            .ok_or("Submission mailboxes unavailable")?;
-        let drafts = mailboxes.iter().find(|mailbox| {
-            mailbox["id"].as_str() == Some(approved.draft_mailbox_id.as_str())
-                && mailbox["role"].as_str() == Some("drafts")
-        });
-        let sent = mailboxes.iter().find(|mailbox| {
-            mailbox["id"].as_str() == Some(approved.sent_mailbox_id.as_str())
-                && mailbox["role"].as_str() == Some("sent")
-        });
-        if drafts
-            .and_then(|value| value.pointer("/myRights/mayRemoveItems"))
-            .and_then(Value::as_bool)
-            != Some(true)
-            || sent
-                .and_then(|value| value.pointer("/myRights/mayAddItems"))
-                .and_then(Value::as_bool)
-                != Some(true)
-            || rows[0]["mailboxIds"]
-                .get(approved.draft_mailbox_id.as_str())
-                .and_then(Value::as_bool)
-                != Some(true)
-        {
-            return Err("Approved draft or Sent mailbox changed or is not writable".into());
-        }
-        let empty: Vec<String> = Vec::new();
-        let submission = client
-            .get_submissions(Some(&empty))
-            .map_err(|_| "Submission state unavailable")?;
-        let submission_state = field(&submission, "state")?.to_string();
-        let creation_id = format!("op_{:x}", Sha256::digest(approved.operation_id.as_bytes()));
-        let mut recorded_intent: Value =
-            serde_json::from_str(&intent).map_err(|_| "Invalid submission")?;
-        recorded_intent["submission_state"] = Value::String(submission_state.clone());
-        let op = ProviderSubmission {
-            scope: scope.clone(),
-            operation_id: approved.operation_id.clone(),
-            draft_id: approved.email_id.clone(),
-            identity_id: approved.identity_id.clone(),
-            email_state: field(&email, "state")?.into(),
-            snapshot_digest: digest,
-            creation_id: creation_id.clone(),
-            intent_json: serde_json::to_string(&recorded_intent)
-                .map_err(|_| "Invalid submission")?,
-            state: "unknown".into(),
-            submission_id: None,
-            sent_update: None,
+        let preflight = prepare_approved_submission(&scope, client, approved, &intent, digest);
+        let (op, creation_id, submission_state) = match preflight {
+            Ok(value) => value,
+            Err(_) => {
+                // Never report a known pre-dispatch failure if a concurrent or
+                // earlier original acquired a claim while reads were in flight.
+                return match store.provider_submission(&scope, &approved.operation_id) {
+                    Ok(None) => Ok(SendOutcome::PreDispatchFailed),
+                    Ok(Some(_)) | Err(_) => Ok(SendOutcome::Unknown),
+                };
+            }
         };
         if !store
             .claim_provider_submission(&op)
@@ -3635,6 +3566,146 @@ pub fn send_approved(
     })
 }
 
+/// Content-free timing of a read-only approved-send preflight failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailPreflightFailure {
+    pub stage: &'static str,
+    pub elapsed_ms: u128,
+}
+
+fn prepare_approved_submission(
+    scope: &ProviderScope,
+    client: &JmapClient,
+    approved: &ApprovedSubmission,
+    intent: &str,
+    digest: String,
+) -> Result<(ProviderSubmission, String, String), MailPreflightFailure> {
+    let mut stage = "email";
+    let mut phase_started = std::time::Instant::now();
+    let result = (|| -> Result<_, String> {
+        let ids = vec![approved.email_id.clone()];
+        let email = client
+            .get("Email", Some(&ids), None)
+            .map_err(|_| "Approved email unavailable")?;
+        let rows = email["list"].as_array().ok_or("Invalid approved email")?;
+        if rows.len() != 1
+            || rows[0]["id"].as_str() != Some(approved.email_id.as_str())
+            || rows[0]["blobId"].as_str() != Some(approved.blob_id.as_str())
+        {
+            return Err("Approved email changed or is unavailable".into());
+        }
+        let mut approved_recipients = approved.recipients.clone();
+        approved_recipients.sort();
+        approved_recipients.dedup();
+        if native_recipients(&rows[0])? != approved_recipients {
+            return Err("Approved recipients do not match the native draft".into());
+        }
+        stage = "identity";
+        phase_started = std::time::Instant::now();
+        let identity_ids = vec![approved.identity_id.clone()];
+        let identities = client
+            .get("Identity", Some(&identity_ids), None)
+            .map_err(|_| "Sending identity unavailable")?;
+        let identities = identities["list"]
+            .as_array()
+            .ok_or("Sending identity unavailable")?;
+        if identities.len() != 1
+            || identities[0]["id"].as_str() != Some(approved.identity_id.as_str())
+            || identities[0]["email"].as_str() != Some(approved.mail_from.as_str())
+        {
+            return Err("Sending identity does not match approved sender".into());
+        }
+        stage = "mailbox";
+        phase_started = std::time::Instant::now();
+        let mailbox_ids = vec![
+            approved.draft_mailbox_id.clone(),
+            approved.sent_mailbox_id.clone(),
+        ];
+        let mailboxes = client
+            .get("Mailbox", Some(&mailbox_ids), None)
+            .map_err(|_| "Submission mailboxes unavailable")?;
+        let mailboxes = mailboxes["list"]
+            .as_array()
+            .ok_or("Submission mailboxes unavailable")?;
+        let drafts = mailboxes.iter().find(|mailbox| {
+            mailbox["id"].as_str() == Some(approved.draft_mailbox_id.as_str())
+                && mailbox["role"].as_str() == Some("drafts")
+        });
+        let sent = mailboxes.iter().find(|mailbox| {
+            mailbox["id"].as_str() == Some(approved.sent_mailbox_id.as_str())
+                && mailbox["role"].as_str() == Some("sent")
+        });
+        if drafts
+            .and_then(|value| value.pointer("/myRights/mayRemoveItems"))
+            .and_then(Value::as_bool)
+            != Some(true)
+            || sent
+                .and_then(|value| value.pointer("/myRights/mayAddItems"))
+                .and_then(Value::as_bool)
+                != Some(true)
+            || rows[0]["mailboxIds"]
+                .get(approved.draft_mailbox_id.as_str())
+                .and_then(Value::as_bool)
+                != Some(true)
+        {
+            return Err("Approved draft or Sent mailbox changed or is not writable".into());
+        }
+        stage = "submission_state";
+        phase_started = std::time::Instant::now();
+        let empty: Vec<String> = Vec::new();
+        let submission = client
+            .get_submissions(Some(&empty))
+            .map_err(|_| "Submission state unavailable")?;
+        let submission_state = field(&submission, "state")?.to_string();
+        let creation_id = format!("op_{:x}", Sha256::digest(approved.operation_id.as_bytes()));
+        let mut recorded_intent: Value =
+            serde_json::from_str(&intent).map_err(|_| "Invalid submission")?;
+        recorded_intent["submission_state"] = Value::String(submission_state.clone());
+        let op = ProviderSubmission {
+            scope: scope.clone(),
+            operation_id: approved.operation_id.clone(),
+            draft_id: approved.email_id.clone(),
+            identity_id: approved.identity_id.clone(),
+            email_state: field(&email, "state")?.into(),
+            snapshot_digest: digest,
+            creation_id: creation_id.clone(),
+            intent_json: serde_json::to_string(&recorded_intent)
+                .map_err(|_| "Invalid submission")?,
+            state: "unknown".into(),
+            submission_id: None,
+            sent_update: None,
+        };
+        Ok((op, creation_id, submission_state))
+    })();
+    result.map_err(|_| MailPreflightFailure {
+        stage,
+        elapsed_ms: phase_started.elapsed().as_millis(),
+    })
+}
+
+/// Execute the same read-only preflight as send_approved, without a claim or submission.
+pub fn probe_approved_submission_preflight(
+    cfg: &Config,
+    account: &str,
+    provider: &SelfHostedClient,
+    approved: &ApprovedSubmission,
+) -> Result<(), MailPreflightFailure> {
+    let start = std::time::Instant::now();
+    let scope = scope(cfg, account, provider).map_err(|_| MailPreflightFailure {
+        stage: "scope",
+        elapsed_ms: start.elapsed().as_millis(),
+    })?;
+    if approved.remote_account != scope.collection {
+        return Err(MailPreflightFailure {
+            stage: "scope",
+            elapsed_ms: start.elapsed().as_millis(),
+        });
+    }
+    let intent = serde_json::to_string(&serde_json::json!({"account":account,"origin":scope.origin,"remote_account":scope.collection,"email_id":approved.email_id,"blob_id":approved.blob_id,"identity_id":approved.identity_id,"mail_from":approved.mail_from,"recipients":approved.recipients,"draft_mailbox_id":approved.draft_mailbox_id,"sent_mailbox_id":approved.sent_mailbox_id})).map_err(|_| MailPreflightFailure { stage: "scope", elapsed_ms: start.elapsed().as_millis() })?;
+    let digest = format!("{:x}", Sha256::digest(intent.as_bytes()));
+    prepare_approved_submission(&scope, &provider.client, approved, &intent, digest).map(|_| ())
+}
+
 fn with_approved_submission_scope<T>(
     approved: &str,
     scope: &ProviderScope,
@@ -3649,6 +3720,163 @@ fn with_approved_submission_scope<T>(
 #[cfg(test)]
 mod submission_account_binding_tests {
     use super::*;
+
+    #[test]
+    fn approved_mail_preflight_failure_leaves_no_claim_or_submit() {
+        use isyncyou_core::config::ProviderConfig;
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = [0u8; 4096];
+            assert!(stream.read(&mut bytes).unwrap() > 0);
+            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let mut cfg = Config::default();
+        cfg.provider_accounts.insert(
+            "local".into(),
+            ProviderConfig::SelfHosted {
+                origin: origin.clone(),
+                client_id: "client".into(),
+            },
+        );
+        let provider = SelfHostedClient {
+            client: JmapClient::test_loopback(&origin).unwrap(),
+            account: "local".into(),
+            origin,
+        };
+        let store = Store::open_in_memory().unwrap();
+        let approved = ApprovedSubmission {
+            operation_id: "agent:test".into(),
+            remote_account: "account".into(),
+            email_id: "draft".into(),
+            blob_id: "blob".into(),
+            identity_id: "identity".into(),
+            mail_from: "sender@example.test".into(),
+            recipients: vec!["recipient@example.test".into()],
+            draft_mailbox_id: "drafts".into(),
+            sent_mailbox_id: "sent".into(),
+        };
+        let scope = scope(&cfg, "local", &provider).unwrap();
+        assert_eq!(
+            send_approved(&cfg, "local", &store, &provider, &approved).unwrap(),
+            SendOutcome::PreDispatchFailed
+        );
+        assert!(store
+            .provider_submission(&scope, &approved.operation_id)
+            .unwrap()
+            .is_none());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn approved_mail_disconnect_after_claim_remains_unknown() {
+        use isyncyou_core::config::ProviderConfig;
+        use serde_json::json;
+        use std::io::{Read, Write};
+        use std::net::Shutdown;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for index in 0..5 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0; 4096];
+                let end = loop {
+                    let n = socket.read(&mut buf).unwrap();
+                    assert_ne!(n, 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]);
+                        let len = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if bytes.len() >= end + 4 + len {
+                            break end + 4;
+                        }
+                    }
+                };
+                let request: Value = serde_json::from_slice(&bytes[end..]).unwrap();
+                let method = request["methodCalls"][0][0].as_str().unwrap();
+                let result = match index {
+                    0 => {
+                        assert_eq!(method, "Email/get");
+                        json!({"accountId":"account","state":"s1","list":[{"id":"draft","blobId":"blob","to":[{"email":"recipient@example.test"}],"mailboxIds":{"drafts":true}}],"notFound":[]})
+                    }
+                    1 => {
+                        assert_eq!(method, "Identity/get");
+                        json!({"accountId":"account","state":"s1","list":[{"id":"identity","email":"sender@example.test"}],"notFound":[]})
+                    }
+                    2 => {
+                        assert_eq!(method, "Mailbox/get");
+                        json!({"accountId":"account","state":"s1","list":[{"id":"drafts","role":"drafts","myRights":{"mayRemoveItems":true}},{"id":"sent","role":"sent","myRights":{"mayAddItems":true}}],"notFound":[]})
+                    }
+                    3 => {
+                        assert_eq!(method, "EmailSubmission/get");
+                        json!({"accountId":"account","state":"s1","list":[],"notFound":[]})
+                    }
+                    _ => {
+                        assert_eq!(method, "EmailSubmission/set");
+                        socket.shutdown(Shutdown::Both).unwrap();
+                        break;
+                    }
+                };
+                let body = json!({"methodResponses":[[method,result,"c1"]]}).to_string();
+                write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        let mut cfg = Config::default();
+        cfg.provider_accounts.insert(
+            "local".into(),
+            ProviderConfig::SelfHosted {
+                origin: origin.clone(),
+                client_id: "client".into(),
+            },
+        );
+        let provider = SelfHostedClient {
+            client: JmapClient::test_loopback(&origin).unwrap(),
+            account: "local".into(),
+            origin,
+        };
+        let store = Store::open_in_memory().unwrap();
+        let approved = ApprovedSubmission {
+            operation_id: "agent:test".into(),
+            remote_account: "account".into(),
+            email_id: "draft".into(),
+            blob_id: "blob".into(),
+            identity_id: "identity".into(),
+            mail_from: "sender@example.test".into(),
+            recipients: vec!["recipient@example.test".into()],
+            draft_mailbox_id: "drafts".into(),
+            sent_mailbox_id: "sent".into(),
+        };
+        let scope = scope(&cfg, "local", &provider).unwrap();
+        assert_eq!(
+            send_approved(&cfg, "local", &store, &provider, &approved).unwrap(),
+            SendOutcome::Unknown
+        );
+        assert_eq!(
+            store
+                .provider_submission(&scope, &approved.operation_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "unknown"
+        );
+        server.join().unwrap();
+    }
 
     #[test]
     fn changed_primary_account_at_same_origin_is_rejected() {

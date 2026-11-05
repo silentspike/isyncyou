@@ -2893,6 +2893,7 @@ pub enum ClosedConfirmationFailure {
     ProviderRejected,
     ProviderActionRejected,
     ProviderConflict,
+    MailPreDispatchFailed,
     DavDiscoveryUnavailable,
     DavPreDispatchFailed,
     CaptureSourceUnavailable,
@@ -10628,6 +10629,9 @@ impl Router {
             }
             AgentConfirmOutcome::Failed(ClosedConfirmationFailure::ProviderConflict) => {
                 no_store_json_error(409, "provider_conflict")
+            }
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::MailPreDispatchFailed) => {
+                no_store_json_error(409, "mail_pre_dispatch_failed")
             }
             AgentConfirmOutcome::Failed(ClosedConfirmationFailure::DavDiscoveryUnavailable) => {
                 no_store_json_error(409, "dav_discovery_unavailable_before_write")
@@ -21826,6 +21830,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "updateAgentPendingStatus(record, \"confirmed\")",
             "updateAgentPendingStatus(record, \"retryable\")",
             "updateAgentPendingStatus(record, \"outcome_unknown\")",
+            "mail_pre_dispatch_failed",
+            "The message could not be prepared; this attempt did not submit it.",
             "updateAgentPendingStatus(record, \"cancelling\")",
             "updateAgentPendingStatus(record, \"cancelled\")",
             "updateAgentPendingStatus(pending, \"expired\")",

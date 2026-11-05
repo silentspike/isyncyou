@@ -2082,6 +2082,7 @@ pub enum ClosedExecutionCode {
     ProviderRejected,
     ProviderActionRejected,
     ProviderConflict,
+    MailPreDispatchFailed,
     DavPreDispatch(isyncyou_engine::dav_write::DavPreDispatchStage),
     CaptureSourceUnavailable,
     CaptureVersionChanged,
@@ -18835,6 +18836,7 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     ClosedExecutionCode::ProviderRejected
                     | ClosedExecutionCode::ProviderActionRejected
                     | ClosedExecutionCode::ProviderConflict
+                    | ClosedExecutionCode::MailPreDispatchFailed
                     | ClosedExecutionCode::DavPreDispatch(_)
                     | ClosedExecutionCode::CaptureSourceUnavailable
                     | ClosedExecutionCode::CaptureVersionChanged
@@ -18870,6 +18872,9 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                     }
                     ClosedExecutionCode::ProviderConflict => {
                         isyncyou_webui::ClosedConfirmationFailure::ProviderConflict
+                    }
+                    ClosedExecutionCode::MailPreDispatchFailed => {
+                        isyncyou_webui::ClosedConfirmationFailure::MailPreDispatchFailed
                     }
                     ClosedExecutionCode::DavPreDispatch(
                         isyncyou_engine::dav_write::DavPreDispatchStage::Discovery,

@@ -37,6 +37,9 @@ fn submission_outcome(
                 "Message submitted; delivery not confirmed; Sent update {sent_update}"
             )))
         }
+        isyncyou_engine::self_hosted_mail::SendOutcome::PreDispatchFailed => {
+            ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::MailPreDispatchFailed)
+        }
         isyncyou_engine::self_hosted_mail::SendOutcome::Rejected => {
             ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderRejected)
         }
@@ -8715,6 +8718,10 @@ mod tests {
     #[test]
     fn submission_rejection_and_unknown_are_distinct_and_pending_ids_are_stable() {
         use isyncyou_engine::self_hosted_mail::SendOutcome;
+        assert_eq!(
+            submission_outcome(SendOutcome::PreDispatchFailed),
+            ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::MailPreDispatchFailed)
+        );
         assert_eq!(
             submission_outcome(SendOutcome::Rejected),
             ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderRejected)
