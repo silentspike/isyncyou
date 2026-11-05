@@ -2306,7 +2306,9 @@ function mailRender() {
       paint(i, i + BATCH); i += BATCH;
       if (i < display.length) requestAnimationFrame(step);
     };
-    requestAnimationFrame(step);
+    // Give the initial viewport a rendering opportunity before constructing
+    // offscreen rows. The generation guard in step also covers this delay.
+    requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(step, 0)));
   }
 }
 function mailRow(it, threadCount = 1) {

@@ -278,24 +278,47 @@ async function main() {
         for (let i = 0; i < 300 && document.querySelectorAll("#mail-list .mail-item:not(.skel-row)").length < 80; i++) await new Promise(r => setTimeout(r, 20));
         const list = document.querySelector("#mail-list"), rows = [...list.querySelectorAll(".mail-item:not(.skel-row)")];
         if (rows.length !== 80) return { supported: true, count: rows.length };
-        const applied = getComputedStyle(rows[0]).contentVisibility === "auto";
-        rows[0].style.minHeight = "140px"; rows[1].style.minHeight = "180px";
-        const heights = [rows[0].getBoundingClientRect().height, rows[1].getBoundingClientRect().height];
+        // Control the render scheduler to verify the first viewport gets a
+        // rendering opportunity and stale deferred batches cannot append.
+        const originalFrame = window.requestAnimationFrame, originalTimeout = window.setTimeout;
+        const frames = [], tasks = [];
+        let deferred;
+        try {
+          window.requestAnimationFrame = callback => { frames.push(callback); return frames.length; };
+          window.setTimeout = (callback, delay, ...args) => {
+            if (delay === 0) { tasks.push(() => callback(...args)); return tasks.length; }
+            return originalTimeout(callback, delay, ...args);
+          };
+          const rowCount = () => list.querySelectorAll(".mail-item:not(.skel-row)").length;
+          mailRender(); const initial = rowCount();
+          frames.shift()(0); frames.shift()(16); const beforeTask = rowCount();
+          const stale = tasks.shift(); mailRender(); stale(); const afterStale = rowCount();
+          frames.shift()(32); frames.shift()(48); tasks.shift()(); const afterBatch = rowCount();
+          frames.shift()(64); const complete = rowCount();
+          deferred = { initial, beforeTask, afterStale, afterBatch, complete };
+        } finally { window.requestAnimationFrame = originalFrame; window.setTimeout = originalTimeout; }
+        const currentRows = [...list.querySelectorAll(".mail-item:not(.skel-row)")];
+        const applied = getComputedStyle(currentRows[0]).contentVisibility === "auto";
+        currentRows[0].style.minHeight = "140px"; currentRows[1].style.minHeight = "180px";
+        const heights = [currentRows[0].getBoundingClientRect().height, currentRows[1].getBoundingClientRect().height];
         list.scrollTop = list.scrollHeight;
         await new Promise(requestAnimationFrame); await new Promise(requestAnimationFrame);
-        const last = rows.at(-1), rect = last.getBoundingClientRect(), view = list.getBoundingClientRect();
+        const last = currentRows.at(-1), rect = last.getBoundingClientRect(), view = list.getBoundingClientRect();
         const bottomVisible = rect.top < view.bottom && rect.bottom > view.top;
         last.focus({ preventScroll: true }); const focus = document.activeElement === last;
         Mail.q = "unique-filter-target"; mailRender();
         await new Promise(requestAnimationFrame);
         const searchRows = list.querySelectorAll(".mail-item:not(.skel-row)").length;
-        return { supported: true, count: rows.length, applied, heights, bottomVisible, focus, searchRows };
+        return { supported: true, count: rows.length, applied, heights, bottomVisible, focus, searchRows, deferred };
       } finally { api = originalApi; Mail.q = ""; clearMailSnapshots(); }
     });
     assert(report, "mobile mail containment preserves variable-height rows, bottom focus and search",
       !containment.supported || (containment.count === 80 && containment.applied
         && containment.heights[0] >= 140 && containment.heights[1] >= 180
-        && containment.bottomVisible && containment.focus && containment.searchRows === 1), containment);
+        && containment.bottomVisible && containment.focus && containment.searchRows === 1
+        && containment.deferred.initial === 24 && containment.deferred.beforeTask === 24
+        && containment.deferred.afterStale === 24 && containment.deferred.afterBatch === 64
+        && containment.deferred.complete === 80), containment);
     report.ok = true;
   } catch (error) {
     report.error = String(error && error.stack ? error.stack : error);
