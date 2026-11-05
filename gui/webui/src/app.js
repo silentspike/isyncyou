@@ -9876,7 +9876,8 @@ function renderAccountMenu(body) {
       }
       row.append(el("div", { class: "acct-role acct-provider-status" },
         el("span", { class: "acct-role-copy" }, el("b", { text: "Self-hosted account" }),
-          el("span", { class: "dim", text: accountRoleStateLabel(providerStatus) })), controls));
+          el("span", { class: "dim", text: accountRoleStateLabel(providerStatus) }),
+          el("span", { class: "dim", text: "Conflict and retry history: unknown" })), controls));
       {
         const listQuarantine = BRIDGE
           ? nativeCall("providerQuarantineList", { account: a.id }, NATIVE_TIMEOUT_MS)
@@ -9911,15 +9912,21 @@ function renderAccountMenu(body) {
         const retryReplacement = el("button", {class:"btn sm",type:"button",style:"display:none"}, "Review replacement retry");
         const showPush = result => {
           const state = result && result.status;
-          const labels = { not_registered: "Not configured", configuration_required: "Configuration required", registering: "Registering", endpoint_received: "Endpoint received", credentials_ready: "Configure distributor", credentials_expired: "Push preparation expired", awaiting_proof: "Awaiting verification", verification_pending: "Verification pending", active: "Registered; delivery not yet observed", degraded: "Delayed", account_changed: "Push configuration must be reviewed", create_unknown: "Enrollment outcome unknown", delivery_unknown: "Verification outcome unknown", prepare_unknown: "Push setup outcome unknown", prepare_cancel_unknown: "Setup cancellation outcome unknown", prepare_cancelled: "Uncertain preparation cancelled", prepare_cancel_conflict: "A server binding remains; review required", distributor_detached: "Local connector removed; distributor acknowledgement unknown", distributor_unregister_unknown: "Local connector removal outcome unknown", replacement_revoke_retry_ready: "Previous replacement revoke can be retried", broker_bound_logout: "Push remains bound; sign out again to finish removal", broker_revoked_logout: "Push revoked; sign out again to finish local cleanup", unavailable: "Unavailable" };
+          const labels = { not_registered: "Not configured", configuration_required: "Configuration required", registering: "Registering", endpoint_received: "Endpoint received", credentials_ready: "Configure distributor", credentials_expired: "Push preparation expired", awaiting_proof: "Awaiting verification", verification_pending: "Verification pending", active: "Registered", degraded: "Delayed", account_changed: "Push configuration must be reviewed", create_unknown: "Enrollment outcome unknown", delivery_unknown: "Verification outcome unknown", prepare_unknown: "Push setup outcome unknown", prepare_cancel_unknown: "Setup cancellation outcome unknown", prepare_cancelled: "Uncertain preparation cancelled", prepare_cancel_conflict: "A server binding remains; review required", distributor_detached: "Local connector removed; distributor acknowledgement unknown", distributor_unregister_unknown: "Local connector removal outcome unknown", replacement_revoke_retry_ready: "Previous replacement revoke can be retried", broker_bound_logout: "Push remains bound; sign out again to finish removal", broker_revoked_logout: "Push revoked; sign out again to finish local cleanup", unavailable: "Unavailable" };
           const uncertain = state === "prepare_unknown" || state === "prepare_cancel_unknown" || state === "credentials_expired";
           setup.disabled = !state || uncertain || ["prepare_cancel_conflict","prepare_cancelled","distributor_detached","distributor_unregister_unknown","replacement_revoke_retry_ready","broker_bound_logout","broker_revoked_logout"].includes(state);
           reconcile.style.display = uncertain ? "" : "none";
           detach.style.display = state === "prepare_cancelled" ? "" : "none";
           replacement.style.display = state === "distributor_detached" ? "" : "none";
           retryReplacement.style.display = state === "replacement_revoke_retry_ready" ? "" : "none";
-          const lastSync = result && Number(result.last_sync_at) > 0 ? ` · Last account sync ${new Date(Number(result.last_sync_at) * 1000).toLocaleString()}` : " · No successful account sync observed";
-          pushStatus.textContent = (labels[state] || "Status unavailable") + (result && result.endpoint_change_pending === true ? " · A distributor endpoint change is pending review" : "") + (result && result.catch_up_pending ? " · Catch-up pending" : "") + lastSync;
+          const observedTime = value => {
+            const seconds = typeof value === "number" ? value : NaN;
+            const date = new Date(seconds * 1000);
+            return Number.isFinite(seconds) && seconds > 0 && Number.isFinite(date.getTime()) ? date.toLocaleString() : "unknown";
+          };
+          const lastHint = observedTime(result && result.last_hint_at);
+          const lastSync = observedTime(result && result.last_sync_at);
+          pushStatus.textContent = (labels[state] || "Status unavailable") + (result && result.endpoint_change_pending === true ? " · A distributor endpoint change is pending review" : "") + (result && result.catch_up_pending ? " · Catch-up pending" : "") + ` · Last push hint: ${lastHint} · Last push-triggered account sync: ${lastSync}`;
         };
         const refreshPush = () => nativeCall("providerPushStatus", { account: a.id }, NATIVE_TIMEOUT_MS).then(showPush).catch(() => showPush(null));
         setup.addEventListener("click",async () => {

@@ -1102,39 +1102,28 @@ fn refresh_loop(
                 }
             }
             run_one_targeted_refresh(&cfg, &base, &gate, &events);
-            let microsoft_changed = {
-                let wait = std::time::Instant::now();
-                let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
-                android_info(&format!(
-                    "provider_refresh_timing phase=gate_wait elapsed_ms={}",
-                    wait.elapsed().as_millis()
-                ));
-                let started = std::time::Instant::now();
-                let changed = if cfg.provider_accounts.contains_key(ACCOUNT) {
-                    false
-                } else {
-                    match isyncyou_engine::auth::resolve_cache_refresh_token(&cfg, ACCOUNT) {
-                        Ok(read) => {
-                            let write =
-                                isyncyou_engine::auth::resolve_cached_restore_token(&cfg, ACCOUNT)
-                                    .ok();
-                            // Notify the UI ONLY when the pass actually changed something —
-                            // a no-op refresh (the common idle case every poll_interval_secs)
-                            // must not wake SSE, or the whole view reloads periodically (the
-                            // visible "screen flicker"). `.changed()` is false for a no-op.
-                            isyncyou_engine::refresh_cache_account(&cfg, ACCOUNT, read, write)
-                                .map(|counts| counts.changed())
-                                .unwrap_or(false)
-                        }
-                        Err(_) => false, // not signed in yet — skip quietly
-                    }
-                };
-                android_info(&format!(
-                    "provider_refresh_timing phase=microsoft elapsed_ms={}",
-                    started.elapsed().as_millis()
-                ));
-                changed
+            let microsoft_started = std::time::Instant::now();
+            let microsoft_changed = if cfg.provider_accounts.contains_key(ACCOUNT) {
+                false
+            } else {
+                run_microsoft_sections(
+                    |index, services| {
+                        let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
+                        // Resolve inside every gate acquisition so a logout between
+                        // sections cannot reuse a token captured before the logout.
+                        let read = isyncyou_engine::auth::resolve_cache_refresh_token(&cfg, ACCOUNT).map_err(|_| ())?;
+                        let write = isyncyou_engine::auth::resolve_cached_restore_token(&cfg, ACCOUNT).ok();
+                        let started = std::time::Instant::now();
+                        let result = isyncyou_engine::refresh_cache_account_filtered(
+                            &cfg, ACCOUNT, read, write, services,
+                        ).map(|counts| counts.changed()).map_err(|_| ());
+                        android_info(&format!("provider_refresh_timing phase=microsoft_section index={} elapsed_ms={}", index, started.elapsed().as_millis()));
+                        result
+                    },
+                    || { run_one_targeted_refresh(&cfg, &base, &gate, &events); },
+                )
             };
+            android_info(&format!("provider_refresh_timing phase=microsoft elapsed_ms={}", microsoft_started.elapsed().as_millis()));
             run_one_targeted_refresh(&cfg, &base, &gate, &events);
             // #655/#718: after the read-only cache refresh, run the mobile scoped OneDrive pass
             // for any explicit Sync/Offline folders, then wake SSE if either changed data.
@@ -1154,6 +1143,61 @@ fn refresh_loop(
         next_periodic = std::time::Instant::now()
             + Duration::from_secs(interval.load(Ordering::Relaxed).max(5));
     }
+}
+
+// Keep the existing store gate for each bounded service pass, while allowing
+// already queued self-hosted hints to run at service boundaries.
+fn run_microsoft_sections(
+    mut refresh: impl FnMut(usize, isyncyou_engine::RefreshServices) -> Result<bool, ()>,
+    mut serve_target: impl FnMut(),
+) -> bool {
+    let services = [
+        isyncyou_engine::RefreshServices {
+            mail: true,
+            calendar: false,
+            contacts: false,
+            todo: false,
+            onenote: false,
+        },
+        isyncyou_engine::RefreshServices {
+            mail: false,
+            calendar: true,
+            contacts: false,
+            todo: false,
+            onenote: false,
+        },
+        isyncyou_engine::RefreshServices {
+            mail: false,
+            calendar: false,
+            contacts: true,
+            todo: false,
+            onenote: false,
+        },
+        isyncyou_engine::RefreshServices {
+            mail: false,
+            calendar: false,
+            contacts: false,
+            todo: true,
+            onenote: false,
+        },
+        isyncyou_engine::RefreshServices {
+            mail: false,
+            calendar: false,
+            contacts: false,
+            todo: false,
+            onenote: true,
+        },
+    ];
+    let mut changed = false;
+    for (index, section) in services.into_iter().enumerate() {
+        let outcome = refresh(index, section);
+        serve_target();
+        match outcome {
+            Ok(section_changed) => changed |= section_changed,
+            Err(()) => return changed,
+        }
+    }
+    changed
 }
 
 fn run_one_targeted_refresh(
@@ -2333,6 +2377,52 @@ mod tests {
         assert_eq!(d.waiters[&later], Some(false));
         e.complete(other, false);
         assert_eq!(e.waiters[&other], Some(false));
+    }
+
+    #[test]
+    fn microsoft_sections_yield_after_each_section_and_stop_on_error() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let changed = run_microsoft_sections(
+            |index, services| {
+                let enabled = [
+                    services.mail,
+                    services.calendar,
+                    services.contacts,
+                    services.todo,
+                    services.onenote,
+                ];
+                assert_eq!(enabled.iter().filter(|value| **value).count(), 1);
+                assert!(enabled[index]);
+                events.borrow_mut().push((index, false));
+                if index == 2 {
+                    Err(())
+                } else {
+                    Ok(index == 1)
+                }
+            },
+            || events.borrow_mut().push((usize::MAX, true)),
+        );
+        assert!(changed);
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                (0, false),
+                (usize::MAX, true),
+                (1, false),
+                (usize::MAX, true),
+                (2, false),
+                (usize::MAX, true)
+            ]
+        );
+    }
+
+    #[test]
+    fn microsoft_sections_aggregate_changes_and_run_all_five() {
+        let turns = std::cell::Cell::new(0);
+        let changed =
+            run_microsoft_sections(|index, _| Ok(index == 2), || turns.set(turns.get() + 1));
+        assert!(changed);
+        assert_eq!(turns.get(), 5);
     }
 
     #[test]

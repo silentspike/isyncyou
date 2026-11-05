@@ -50,7 +50,7 @@ async function main() {
   try {
     await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
     const origin = `http://127.0.0.1:${server.address().port}`;
-    browser = await chromium.launch();
+    browser = await chromium.launch(process.env.ISY_SMOKE_BROWSER ? { executablePath: process.env.ISY_SMOKE_BROWSER } : {});
     const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
     await page.addInitScript(() => {
       const state = { events: [], guardAvailable: true, loginSequence: 0 };
@@ -72,6 +72,10 @@ async function main() {
             } else if (msg.op === "endNetworkGuard") {
               state.events.push("native:end");
               value = { ok: true };
+            } else if (msg.op === "providerPushStatus") {
+              value = state.pushStatus;
+            } else if (msg.op === "providerQuarantineList") {
+              value = { ids: [] };
             } else if (msg.op === "pushToken") value = { ok: true };
             reply({ t: "res", id: msg.id, status: 200, body: JSON.stringify(value) });
             return;
@@ -319,6 +323,33 @@ async function main() {
         && containment.deferred.initial === 24 && containment.deferred.beforeTask === 24
         && containment.deferred.afterStale === 24 && containment.deferred.afterBatch === 64
         && containment.deferred.complete === 80), containment);
+    const push = await page.evaluate(async () => {
+      const body = document.createElement("div"); document.body.append(body);
+      const originalAccounts = App.accounts, originalAccount = App.account;
+      App.accounts = [{ id: "fixture", provider: "self_hosted", auth: { reader: { state: "connected" } } }];
+      App.account = "fixture";
+      const state = window.__microsoftAccountSmoke;
+      const render = async value => {
+        state.pushStatus = value;
+        renderAccountMenu(body);
+        await new Promise(resolve => setTimeout(resolve, 30));
+        return { push: body.querySelector(".acct-provider-push")?.textContent,
+          account: body.querySelector(".acct-provider-status")?.textContent };
+      };
+      try {
+        return { observed: await render({ status: "active", last_hint_at: 1700000000, last_sync_at: 1700000010, catch_up_pending: true }),
+          unknown: await render({ status: "active", last_hint_at: 0, last_sync_at: 0 }),
+          invalid: await render({ status: "unavailable", last_hint_at: 1e100, last_sync_at: "not-a-time" }) };
+      } finally { body.remove(); App.accounts = originalAccounts; App.account = originalAccount; }
+    });
+    assert(report, "push diagnostics show separate observations and preserve catch-up state",
+      push.observed.push.includes(`Last push hint: ${new Date(1700000000 * 1000).toLocaleString()}`)
+      && push.observed.push.includes(`Last push-triggered account sync: ${new Date(1700000010 * 1000).toLocaleString()}`)
+      && push.observed.push.includes("Catch-up pending") && !push.observed.push.includes("latency")
+      && push.observed.account.includes("Conflict and retry history: unknown"), push.observed);
+    assert(report, "missing and invalid push timestamps remain unknown",
+      [push.unknown, push.invalid].every(row => row.push.includes("Last push hint: unknown")
+        && row.push.includes("Last push-triggered account sync: unknown") && !row.push.includes("Invalid Date")), push);
     report.ok = true;
   } catch (error) {
     report.error = String(error && error.stack ? error.stack : error);
