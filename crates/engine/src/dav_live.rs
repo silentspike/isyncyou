@@ -134,6 +134,14 @@ pub fn sync_all(cfg: &Config, account: &str, entry: &str) -> Result<SyncPass, St
     sync_all_inner(cfg, account, entry, None)
 }
 
+fn collection_lease_error(error: &std::io::Error) -> &'static str {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        "DAV collection sync already active"
+    } else {
+        "DAV collection sync lease unavailable"
+    }
+}
+
 /// One cross-process lease per account/origin/collection keeps two detached
 /// network observations from racing; it is independent of the provider writer.
 fn collection_sync_lease(cfg: &Config, scope: &ProviderScope) -> Result<std::fs::File, String> {
@@ -167,7 +175,7 @@ fn collection_sync_lease(cfg: &Config, scope: &ProviderScope) -> Result<std::fs:
         .open(path)
         .map_err(|_| "DAV sync lease unavailable")?;
     file.try_lock_exclusive()
-        .map_err(|_| "DAV collection sync already active")?;
+        .map_err(|error| collection_lease_error(&error))?;
     Ok(file)
 }
 
@@ -354,6 +362,16 @@ fn sync_detached(cfg: &Config, client: &DavClient, scope: &ProviderScope) -> Res
     Ok(count)
 }
 
+// Never expose scope names or raw upstream/storage errors in diagnostics.
+fn dav_sync_outcome(result: &Result<usize, String>) -> &'static str {
+    match result {
+        Ok(_) => "ok",
+        Err(error) if error == "DAV collection sync already active" => "lease_busy",
+        Err(error) if error == "DAV collection access denied" => "denied",
+        Err(_) => "error",
+    }
+}
+
 fn sync_all_inner(
     cfg: &Config,
     account: &str,
@@ -410,7 +428,7 @@ fn sync_all_inner(
                 },
                 index,
                 started,
-                if result.is_ok() { "ok" } else { "error" },
+                dav_sync_outcome(&result),
             );
             match result {
                 Ok(changes) => {
@@ -4569,6 +4587,36 @@ mod tests {
         );
         writer.set_provider_accessible(&scope, false).unwrap();
         assert!(cached_live_objects(&reader, &scope, "", 10).is_err());
+    }
+
+    #[test]
+    fn dav_scope_lease_busy_is_only_would_block() {
+        assert_eq!(
+            collection_lease_error(&std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            "DAV collection sync already active"
+        );
+        assert_eq!(
+            collection_lease_error(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            "DAV collection sync lease unavailable"
+        );
+    }
+
+    #[test]
+    fn dav_scope_diagnostics_never_expose_raw_failure() {
+        assert_eq!(dav_sync_outcome(&Ok(0)), "ok");
+        assert_eq!(
+            dav_sync_outcome(&Err("DAV collection sync already active".into())),
+            "lease_busy"
+        );
+        assert_eq!(
+            dav_sync_outcome(&Err("DAV collection access denied".into())),
+            "denied"
+        );
+        assert_eq!(
+            dav_sync_outcome(&Err("Transport(private-token)".into())),
+            "error"
+        );
+        assert_eq!(dav_sync_outcome(&Err("private-collection".into())), "error");
     }
 
     #[test]

@@ -11803,13 +11803,19 @@ impl Router {
             .q("offset")
             .and_then(|o| o.parse::<u32>().ok())
             .unwrap_or(0);
-        let read_page = |store: &Store| -> Result<_, ApiResponse> {
+        let mut count_ms = 0u128;
+        let mut page_ms = 0u128;
+        let mut read_page = |store: &Store| -> Result<_, ApiResponse> {
+            let count_started = std::time::Instant::now();
             let total = store
                 .count_by_service(account, service)
                 .map_err(|_| ApiResponse::error(500, "store_query_failed"))?;
+            count_ms = count_started.elapsed().as_millis();
+            let page_started = std::time::Instant::now();
             let items = store
                 .items_by_service_page(account, service, limit, offset)
                 .map_err(|_| ApiResponse::error(500, "store_query_failed"))?;
+            page_ms = page_started.elapsed().as_millis();
             Ok((total, items))
         };
         let tuple_started = std::time::Instant::now();
@@ -12027,6 +12033,7 @@ impl Router {
                 }
                 let writer_ms = writer_started.elapsed().as_millis();
                 let serialize_started = std::time::Instant::now();
+                let row_count = arr.len();
                 let response = ApiResponse::ok_json(&json!({
                     "items": arr,
                     "count": arr.len(),
@@ -12035,7 +12042,7 @@ impl Router {
                     "offset": offset,
                 }));
                 if service == "mail" {
-                    eprintln!("isyncyou: archive_mail_list metadata_only={metadata_only} tuple_ms={tuple_ms} preview_hits={preview_hits} preview_misses={preview_misses} disk_parses={disk_parses} disk_parse_ms={disk_parse_ms} projection_ms={projection_ms} writer_ms={writer_ms} serialize_ms={}", serialize_started.elapsed().as_millis());
+                    log_archive_mail_timing(&format!("archive_mail_list metadata_only={metadata_only} rows={row_count} total={total} tuple_ms={tuple_ms} count_ms={count_ms} page_ms={page_ms} preview_hits={preview_hits} preview_misses={preview_misses} disk_parses={disk_parses} disk_parse_ms={disk_parse_ms} projection_ms={projection_ms} writer_ms={writer_ms} serialize_ms={}", serialize_started.elapsed().as_millis()));
                 }
                 response
             }
@@ -12674,6 +12681,28 @@ fn backup_state(it: &Item) -> &'static str {
         (Some(e), Some(b)) if e != b => "stale",
         _ => "live_backup",
     }
+}
+
+// Only fixed labels and numeric counters from the mail-list route are passed in.
+// Android does not reliably forward native stderr to logcat.
+#[cfg(target_os = "android")]
+fn log_archive_mail_timing(message: &str) {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_int};
+
+    #[link(name = "log")]
+    unsafe extern "C" {
+        fn __android_log_write(priority: c_int, tag: *const c_char, text: *const c_char) -> c_int;
+    }
+    if let (Ok(tag), Ok(text)) = (CString::new("iSyncYou"), CString::new(message)) {
+        // ANDROID_LOG_INFO = 4; both C strings live through the call.
+        unsafe { __android_log_write(4, tag.as_ptr(), text.as_ptr()) };
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn log_archive_mail_timing(message: &str) {
+    eprintln!("isyncyou: {message}");
 }
 
 fn item_json(it: &Item) -> Value {
