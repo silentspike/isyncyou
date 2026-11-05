@@ -29,6 +29,8 @@ mod mail_restore;
 mod onedrive_live;
 mod onedrive_write;
 mod onenote_live;
+#[cfg(unix)]
+pub mod onenote_mobile_refresh;
 pub mod provider_auth;
 pub mod provider_credential;
 pub mod provider_push;

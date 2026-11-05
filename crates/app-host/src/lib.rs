@@ -21028,6 +21028,7 @@ static LOGIN_SEQ: AtomicU64 = AtomicU64::new(1);
 pub struct DaemonAccountAuth {
     cfg: Config,
     config_path: Option<PathBuf>,
+    credential_commit_gate: Option<Arc<Mutex<()>>>,
     logins: Mutex<std::collections::HashMap<u64, Arc<Mutex<LoginState>>>>,
 }
 
@@ -21160,26 +21161,78 @@ fn load_or_bind_microsoft_subject(
     client_id: &str,
     scopes: &[&str],
     now: u64,
+    credential_commit_gate: Option<&Arc<Mutex<()>>>,
 ) -> Result<Option<String>, &'static str> {
     if !cache_path.exists() {
         return Ok(None);
     }
+    let original = std::fs::read(cache_path).map_err(|_| "account_identity_unverified")?;
     let mut cache = isyncyou_graph::auth::TokenCache::load(cache_path)
         .map_err(|_| "account_identity_unverified")?;
+    let original_cache = cache.clone();
     if let Some(subject) = cache.account_subject.clone() {
         return Ok(Some(subject));
     }
-    let access_token =
-        isyncyou_graph::auth::flow::ensure_access_token(cache_path, client_id, scopes, now)
+    if !cache.is_access_valid(now) {
+        let refresh_token = cache
+            .refresh_token
+            .clone()
+            .ok_or("account_identity_unverified")?;
+        let response = isyncyou_graph::auth::flow::refresh(client_id, &refresh_token, scopes)
             .map_err(|_| "account_identity_unverified")?;
-    let subject = microsoft_account_subject(&access_token)?;
-    cache = isyncyou_graph::auth::TokenCache::load(cache_path)
-        .map_err(|_| "account_identity_unverified")?;
+        cache = isyncyou_graph::auth::TokenCache::from_response(&response, now);
+        if cache.refresh_token.is_none() {
+            cache.refresh_token = Some(refresh_token);
+        }
+    }
+    let subject = microsoft_account_subject(&cache.access_token)?;
     cache.account_subject = Some(subject.clone());
+    let _gate = credential_commit_gate.map(|gate| gate.lock().unwrap_or_else(|e| e.into_inner()));
+    let current = isyncyou_graph::auth::TokenCache::load(cache_path)
+        .map_err(|_| "account_identity_unverified")?;
+    if std::fs::read(cache_path).map_err(|_| "account_identity_unverified")? != original
+        || current.access_token != original_cache.access_token
+        || current.refresh_token != original_cache.refresh_token
+        || current.expires_at != original_cache.expires_at
+        || current.account_subject != original_cache.account_subject
+    {
+        return Err("account_identity_unverified");
+    }
     cache
         .save(cache_path)
         .map_err(|_| "account_identity_unverified")?;
     Ok(Some(subject))
+}
+
+fn microsoft_peer_grant_snapshot(
+    path: &std::path::Path,
+) -> Result<Option<(Vec<u8>, isyncyou_graph::auth::TokenCache)>, &'static str> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let cache = isyncyou_graph::auth::TokenCache::load(path)
+                .map_err(|_| "account_identity_unverified")?;
+            Ok(Some((bytes, cache)))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("account_identity_unverified"),
+    }
+}
+
+fn microsoft_peer_grant_unchanged(
+    before: &Option<(Vec<u8>, isyncyou_graph::auth::TokenCache)>,
+    after: &Option<(Vec<u8>, isyncyou_graph::auth::TokenCache)>,
+) -> bool {
+    match (before, after) {
+        (None, None) => true,
+        (Some((a_bytes, a)), Some((b_bytes, b))) => {
+            a_bytes == b_bytes
+                && a.access_token == b.access_token
+                && a.refresh_token == b.refresh_token
+                && a.expires_at == b.expires_at
+                && a.account_subject == b.account_subject
+        }
+        _ => false,
+    }
 }
 
 impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
@@ -21284,6 +21337,7 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
         }
         let authorization_uri = start.authorization_uri.clone();
         let callback_state = Arc::clone(&state);
+        let credential_commit_gate = self.credential_commit_gate.clone();
         if std::thread::Builder::new()
             .name("microsoft-account-callback".into())
             .spawn(move || {
@@ -21294,6 +21348,7 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
                     start.verifier,
                     redirect_uri,
                     role_config,
+                    credential_commit_gate,
                 );
             })
             .is_err()
@@ -21372,6 +21427,20 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
                 serde_json::json!({"removed": 1, "role": role.as_str(), "message": "Provider account disconnected"}),
             );
         }
+        // A callback can be completing its network exchange while signout
+        // holds the router gate. Prevent that older exchange from restoring the
+        // just-removed grant after signout has completed.
+        let logins = self
+            .logins
+            .lock()
+            .map_err(|_| "account_sign_out_unavailable")?;
+        for login in logins.values() {
+            let mut login = login.lock().map_err(|_| "account_sign_out_unavailable")?;
+            if login.account == account && login.role == role && !login.done {
+                login.error_code = Some("account_login_cancelled");
+            }
+        }
+        drop(logins);
         let removed = match role {
             isyncyou_webui::AccountAuthRole::Reader => {
                 isyncyou_engine::auth::sign_out_reader(&cfg, account)?
@@ -21737,6 +21806,7 @@ fn microsoft_callback_serve(
     verifier: String,
     redirect_uri: String,
     role_config: MicrosoftRoleConfig,
+    credential_commit_gate: Option<Arc<Mutex<()>>>,
 ) {
     use std::io::Read;
     let deadline = std::time::Instant::now() + MICROSOFT_LOGIN_TTL;
@@ -21840,21 +21910,47 @@ fn microsoft_callback_serve(
                     &verifier,
                     now,
                 );
+                let verified_tokens = token_result.and_then(|mut tokens| {
+                    let subject =
+                        microsoft_account_subject(&tokens.access_token).map_err(str::to_string)?;
+                    let peer_subject = load_or_bind_microsoft_subject(
+                        &role_config.peer_cache,
+                        role_config.peer_client_id,
+                        role_config.peer_scopes,
+                        now,
+                        credential_commit_gate.as_ref(),
+                    )?;
+                    if peer_subject.as_ref().is_some_and(|peer| peer != &subject) {
+                        return Err("account_identity_mismatch".into());
+                    }
+                    let peer_grant = microsoft_peer_grant_snapshot(&role_config.peer_cache)?;
+                    if peer_grant
+                        .as_ref()
+                        .and_then(|(_, cache)| cache.account_subject.as_ref())
+                        != peer_subject.as_ref()
+                    {
+                        return Err("account_identity_unverified".into());
+                    }
+                    tokens.account_subject = Some(subject);
+                    Ok((tokens, peer_grant))
+                });
+                // Lock order is gate then login state, matching router requests.
+                // Network work above is outside both locks.
+                let _gate = credential_commit_gate
+                    .as_ref()
+                    .map(|gate| gate.lock().unwrap_or_else(|e| e.into_inner()));
                 let succeeded = if let Ok(mut state) = state.lock() {
-                    match token_result.and_then(|mut tokens| {
-                        let subject = microsoft_account_subject(&tokens.access_token)
+                    let verified_tokens = if state.done || state.error_code.is_some() {
+                        Err("account_login_cancelled".to_string())
+                    } else {
+                        verified_tokens
+                    };
+                    match verified_tokens.and_then(|(tokens, peer_grant)| {
+                        let current = microsoft_peer_grant_snapshot(&role_config.peer_cache)
                             .map_err(str::to_string)?;
-                        if load_or_bind_microsoft_subject(
-                            &role_config.peer_cache,
-                            role_config.peer_client_id,
-                            role_config.peer_scopes,
-                            now,
-                        )?
-                        .is_some_and(|peer_subject| peer_subject != subject)
-                        {
-                            return Err("account_identity_mismatch".into());
+                        if !microsoft_peer_grant_unchanged(&peer_grant, &current) {
+                            return Err("account_identity_unverified".to_string());
                         }
-                        tokens.account_subject = Some(subject);
                         tokens
                             .save(&role_config.cache)
                             .map_err(|_| "account_credential_store_failed".to_string())
@@ -21874,6 +21970,7 @@ fn microsoft_callback_serve(
                                 "account_credential_store_failed" => {
                                     "account_credential_store_failed"
                                 }
+                                "account_login_cancelled" => "account_login_cancelled",
                                 _ => "account_authorization_failed",
                             });
                             false
@@ -23612,6 +23709,7 @@ pub fn build_live_router(
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
     let agent_gate = gate.clone().unwrap_or_else(|| Arc::new(Mutex::new(())));
+    let credential_commit_gate = gate.clone();
     let base = match gate {
         Some(g) => isyncyou_webui::Router::with_gate(cfg.clone(), g),
         None => isyncyou_webui::Router::new(cfg.clone()),
@@ -23721,6 +23819,7 @@ pub fn build_live_router(
             Arc::new(DaemonAccountAuth {
                 cfg: cfg.clone(),
                 config_path: Some(config_path.clone()),
+                credential_commit_gate,
                 logins: Mutex::new(std::collections::HashMap::new()),
             }),
             mint_cap_token(),
@@ -38464,6 +38563,91 @@ fn microsoft_callback_pages_are_no_store_and_sanitize_address_bar() {
 
 #[cfg(test)]
 #[test]
+fn microsoft_callback_rejects_peer_grant_changed_during_exchange() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reader-token");
+    assert!(microsoft_peer_grant_unchanged(
+        &None,
+        &microsoft_peer_grant_snapshot(&path).unwrap()
+    ));
+    let mut token = isyncyou_graph::auth::TokenCache {
+        access_token: "test-access".into(),
+        refresh_token: Some("test-refresh".into()),
+        expires_at: 100,
+        account_subject: Some("test-subject".into()),
+    };
+    token.save(&path).unwrap();
+    let before = microsoft_peer_grant_snapshot(&path).unwrap();
+    assert!(microsoft_peer_grant_unchanged(
+        &before,
+        &microsoft_peer_grant_snapshot(&path).unwrap()
+    ));
+    token.account_subject = Some("other-subject".into());
+    token.save(&path).unwrap();
+    assert!(!microsoft_peer_grant_unchanged(
+        &before,
+        &microsoft_peer_grant_snapshot(&path).unwrap()
+    ));
+    std::fs::remove_file(&path).unwrap();
+    assert!(!microsoft_peer_grant_unchanged(
+        &before,
+        &microsoft_peer_grant_snapshot(&path).unwrap()
+    ));
+}
+
+#[cfg(test)]
+#[test]
+fn microsoft_signout_cancels_inflight_login_without_touching_other_roles() {
+    use isyncyou_webui::{AccountAuthHandler, AccountAuthRole};
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Config {
+        accounts: vec![isyncyou_core::AccountConfig {
+            id: "a".into(),
+            username: "a".into(),
+            sync_root: dir.path().join("sync"),
+            archive_root: dir.path().join("archive"),
+            cache_root: dir.path().join("cache"),
+            mount_point: None,
+        }],
+        ..Default::default()
+    };
+    std::fs::create_dir_all(&cfg.accounts[0].archive_root).unwrap();
+    let reader = Arc::new(Mutex::new(LoginState {
+        account: "a".into(),
+        role: AccountAuthRole::Reader,
+        started_at: std::time::Instant::now(),
+        exchange_in_flight: true,
+        done: false,
+        error_code: None,
+    }));
+    let writer = Arc::new(Mutex::new(LoginState {
+        account: "a".into(),
+        role: AccountAuthRole::Writer,
+        started_at: std::time::Instant::now(),
+        exchange_in_flight: true,
+        done: false,
+        error_code: None,
+    }));
+    let auth = DaemonAccountAuth {
+        cfg,
+        config_path: None,
+        credential_commit_gate: None,
+        logins: Mutex::new(
+            [(1, reader.clone()), (2, writer.clone())]
+                .into_iter()
+                .collect(),
+        ),
+    };
+    auth.sign_out("a", AccountAuthRole::Reader).unwrap();
+    assert_eq!(
+        reader.lock().unwrap().error_code,
+        Some("account_login_cancelled")
+    );
+    assert_eq!(writer.lock().unwrap().error_code, None);
+}
+
+#[cfg(test)]
+#[test]
 fn provider_setup_reloads_account_without_cross_account_fallback() {
     use isyncyou_webui::AccountAuthHandler;
     let root = tempfile::tempdir().unwrap();
@@ -38473,6 +38657,7 @@ fn provider_setup_reloads_account_without_cross_account_fallback() {
     let auth = DaemonAccountAuth {
         cfg: initial.clone(),
         config_path: Some(config_path.clone()),
+        credential_commit_gate: None,
         logins: Mutex::new(std::collections::HashMap::new()),
     };
     auth.create_provider_account("team", "Team", "https://example.invalid", "client")
@@ -38513,6 +38698,7 @@ fn self_hosted_account_never_reports_microsoft_status() {
     let auth = DaemonAccountAuth {
         cfg,
         config_path: None,
+        credential_commit_gate: None,
         logins: Mutex::new(std::collections::HashMap::new()),
     };
     let status = auth.status("account-slot");
@@ -38544,6 +38730,7 @@ fn microsoft_account_login_start_uses_picker_and_cancel_closes_attempt() {
             ..Default::default()
         },
         config_path: None,
+        credential_commit_gate: None,
         logins: Mutex::new(std::collections::HashMap::new()),
     };
     let started = isyncyou_webui::AccountAuthHandler::start_login(
@@ -38685,6 +38872,7 @@ fn microsoft_account_login_start_replaces_only_orphaned_idle_attempt() {
             ..Default::default()
         },
         config_path: None,
+        credential_commit_gate: None,
         logins: Mutex::new(std::collections::HashMap::new()),
     };
 

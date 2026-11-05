@@ -14,7 +14,7 @@
 //! access only (no app-only); read app keeps `Notes.Read`.
 
 use crate::archive::JsonFetcher;
-use crate::common::{fetch_pages, shard_path};
+use crate::common::shard_path;
 use crate::onedrive::SyncError;
 use isyncyou_graph::Transport;
 use isyncyou_store::{Item, Store};
@@ -60,6 +60,92 @@ pub struct OneNoteReport {
     pub deleted: usize,
 }
 
+/// An authoritative page list is created only after every Graph page was read
+/// and validated. In particular, a failed continuation cannot be reconciled as
+/// an empty list and tombstone previously indexed pages.
+pub struct OneNotePageSnapshot(Vec<Value>);
+
+pub fn fetch_onenote_page_snapshot<T: Transport>(
+    transport: &mut T,
+) -> Result<OneNotePageSnapshot, SyncError> {
+    fetch_onenote_page_snapshot_with_limits(transport, false)
+}
+
+/// Mobile's cache refresh uses explicit memory and pagination budgets.
+pub fn fetch_onenote_page_snapshot_bounded<T: Transport>(
+    transport: &mut T,
+) -> Result<OneNotePageSnapshot, SyncError> {
+    fetch_onenote_page_snapshot_with_limits(transport, true)
+}
+
+fn fetch_onenote_page_snapshot_with_limits<T: Transport>(
+    transport: &mut T,
+    bounded: bool,
+) -> Result<OneNotePageSnapshot, SyncError> {
+    let mut url = PAGES_URL.to_string();
+    let mut pages = Vec::new();
+    let mut seen_urls = HashSet::new();
+    let mut seen_ids = HashSet::new();
+    // Refuse oversized/infinite enumerations before any reconciliation. The
+    // caller still has its previous complete snapshot in the store.
+    const MAX_LIST_PAGES: usize = 512;
+    const MAX_ITEMS: usize = 50_000;
+    const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+    let mut snapshot_bytes = 0usize;
+    loop {
+        if bounded && seen_urls.len() >= MAX_LIST_PAGES {
+            return Err(SyncError::Malformed(
+                "OneNote continuation budget exceeded".into(),
+            ));
+        }
+        if !seen_urls.insert(url.clone()) {
+            return Err(SyncError::Malformed("repeated OneNote continuation".into()));
+        }
+        let response = transport.get(&url);
+        if !(200..300).contains(&response.status) {
+            return Err(SyncError::HttpStatus(response.status));
+        }
+        let body = response
+            .body
+            .ok_or_else(|| SyncError::Malformed("empty OneNote list page".into()))?;
+        let values = body
+            .get("value")
+            .and_then(Value::as_array)
+            .ok_or_else(|| SyncError::Malformed("invalid OneNote list page".into()))?;
+        for page in values {
+            if bounded && pages.len() >= MAX_ITEMS {
+                return Err(SyncError::Malformed("OneNote item budget exceeded".into()));
+            }
+            if bounded {
+                let bytes = serde_json::to_vec(page)
+                    .map_err(|e| SyncError::Malformed(e.to_string()))?
+                    .len();
+                snapshot_bytes = snapshot_bytes
+                    .checked_add(bytes)
+                    .filter(|size| *size <= MAX_SNAPSHOT_BYTES)
+                    .ok_or_else(|| {
+                        SyncError::Malformed("OneNote snapshot budget exceeded".into())
+                    })?;
+            }
+            let id = page
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| SyncError::Malformed("page has no id".into()))?;
+            if !seen_ids.insert(id.to_string()) {
+                return Err(SyncError::Malformed("duplicate OneNote page".into()));
+            }
+            pages.push(page.clone());
+        }
+        match body.get("@odata.nextLink") {
+            None => break,
+            Some(Value::String(next)) if !next.is_empty() => url = next.clone(),
+            _ => return Err(SyncError::Malformed("invalid OneNote continuation".into())),
+        }
+    }
+    Ok(OneNotePageSnapshot(pages))
+}
+
 /// Reconcile the full OneNote page list into `store`. `now` is the RFC3339
 /// tombstone timestamp.
 pub fn incremental_sync_onenote<T: Transport>(
@@ -69,10 +155,24 @@ pub fn incremental_sync_onenote<T: Transport>(
     now: &str,
     archive_root: Option<&Path>,
 ) -> Result<OneNoteReport, SyncError> {
-    let pages = fetch_pages(transport, PAGES_URL)?;
+    let snapshot = fetch_onenote_page_snapshot(transport)?;
+    reconcile_onenote_page_snapshot(snapshot, store, account, now, archive_root)
+}
+
+/// Apply only a complete snapshot. Callers splitting fetch from commit must
+/// revalidate account, grant and store generation while holding their gate.
+pub fn reconcile_onenote_page_snapshot(
+    snapshot: OneNotePageSnapshot,
+    store: &Store,
+    account: &str,
+    now: &str,
+    archive_root: Option<&Path>,
+) -> Result<OneNoteReport, SyncError> {
+    let pages = snapshot.0;
     let prior: HashSet<String> = store
-        .live_remote_ids(account, SERVICE)?
+        .items_by_type(account, SERVICE, "page")?
         .into_iter()
+        .map(|item| item.remote_id)
         .collect();
     let mut report = OneNoteReport {
         pages: pages.len(),
@@ -286,6 +386,92 @@ mod tests {
             "lastModifiedDateTime": mtime,
             "parentSection": { "id": section }
         })
+    }
+
+    #[test]
+    fn partial_or_malformed_snapshot_does_not_tombstone_existing_pages() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_item(&Item::new("acc", SERVICE, "existing", "old", "page"))
+            .unwrap();
+        for second in [
+            Response::status(503),
+            Response::ok(json!({"other": []})),
+            Response::ok(json!({"value": [{"title": "missing id"}]})),
+        ] {
+            let mut transport = MockTransport(
+                vec![
+                    Response::ok(
+                        json!({"value": [page("new", "new", "t", "s")], "@odata.nextLink": "next"}),
+                    ),
+                    second,
+                ],
+                0,
+            );
+            assert!(incremental_sync_onenote(&mut transport, &store, "acc", "t", None).is_err());
+            assert!(store
+                .get_item("acc", SERVICE, "existing")
+                .unwrap()
+                .unwrap()
+                .deleted_at
+                .is_none());
+            assert!(store.get_item("acc", SERVICE, "new").unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn complete_paginated_snapshot_reconciles_only_after_fetch() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_item(&Item::new("acc", SERVICE, "old", "old", "page"))
+            .unwrap();
+        let mut transport = MockTransport(
+            vec![
+                Response::ok(
+                    json!({"value": [page("a", "a", "t", "s")], "@odata.nextLink": "next"}),
+                ),
+                Response::ok(json!({"value": [page("b", "b", "t", "s")]})),
+            ],
+            0,
+        );
+        let snapshot = fetch_onenote_page_snapshot(&mut transport).unwrap();
+        assert!(store
+            .get_item("acc", SERVICE, "old")
+            .unwrap()
+            .unwrap()
+            .deleted_at
+            .is_none());
+        let report = reconcile_onenote_page_snapshot(snapshot, &store, "acc", "t", None).unwrap();
+        assert_eq!((report.pages, report.upserted, report.deleted), (2, 2, 1));
+        assert!(store
+            .get_item("acc", SERVICE, "old")
+            .unwrap()
+            .unwrap()
+            .deleted_at
+            .is_some());
+    }
+
+    #[test]
+    fn continuation_budget_aborts_before_any_reconciliation() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_item(&Item::new("acc", SERVICE, "old", "old", "page"))
+            .unwrap();
+        let responses = (0..512)
+            .map(|index| {
+                Response::ok(json!({
+                    "value": [], "@odata.nextLink": format!("next-{index}")
+                }))
+            })
+            .collect();
+        let mut transport = MockTransport(responses, 0);
+        assert!(fetch_onenote_page_snapshot_bounded(&mut transport).is_err());
+        assert!(store
+            .get_item("acc", SERVICE, "old")
+            .unwrap()
+            .unwrap()
+            .deleted_at
+            .is_none());
     }
 
     #[test]

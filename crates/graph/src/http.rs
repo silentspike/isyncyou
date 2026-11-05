@@ -1461,9 +1461,11 @@ impl GraphClient {
         let mut resp = self.get_with_retry(&url)?;
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
+            let mut body = Vec::new();
+            let _ = resp.take(300).read_to_end(&mut body);
             return Err(UploadError::Http {
                 status,
-                body: resp.text().unwrap_or_default().chars().take(300).collect(),
+                body: String::from_utf8_lossy(&body).into_owned(),
             });
         }
         if resp
@@ -3122,6 +3124,22 @@ mod tests {
             .get_bytes_bounded("/bounded", 4)
             .unwrap_err();
         assert!(matches!(error, UploadError::TooLarge));
+    }
+
+    #[test]
+    fn get_bytes_bounded_limits_http_error_body() {
+        let (base, _server) = serve(vec![http_response(403, "Forbidden", "", &"x".repeat(4096))]);
+        let error = GraphClient::new("tok")
+            .with_base_url(&base)
+            .get_bytes_bounded("/bounded", 4)
+            .unwrap_err();
+        match error {
+            UploadError::Http { status, body } => {
+                assert_eq!(status, 403);
+                assert_eq!(body.len(), 300);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]

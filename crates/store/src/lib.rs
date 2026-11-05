@@ -758,6 +758,13 @@ pub struct Store {
 }
 
 impl Store {
+    /// Detect commits by other connections while retaining this same reader.
+    /// Values from different connections are not comparable.
+    pub fn data_version(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?)
+    }
     /// Open (or create) an on-disk store. Acquires an exclusive `<path>.lock`;
     /// returns [`StoreError::AlreadyRunning`] if another instance holds it.
     ///
@@ -3165,6 +3172,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     if v > SCHEMA_VERSION {
         return Err(StoreError::FutureSchema(v));
     }
+    // Do not create a spurious database commit on every normal writer open.
+    // Besides avoiding unnecessary writes, retained readers use data_version
+    // to detect actual changes between an external fetch and its commit.
+    if v == SCHEMA_VERSION {
+        return Ok(());
+    }
     let tx = conn.unchecked_transaction()?;
     let conn = &*tx;
     if v < 1 {
@@ -3243,6 +3256,18 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn opening_current_schema_does_not_advance_reader_data_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        drop(Store::open(&path).unwrap());
+        let reader = Store::open_readonly(&path).unwrap();
+        let version = reader.data_version().unwrap();
+        let writer = Store::open(&path).unwrap();
+        assert_eq!(reader.data_version().unwrap(), version);
+        drop(writer);
+    }
 
     #[test]
     fn failed_provider_migration_rolls_back_schema_and_version() {

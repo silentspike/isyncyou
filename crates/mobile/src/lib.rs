@@ -1064,6 +1064,7 @@ fn refresh_loop(
     progress: isyncyou_app_host::SharedProgress,
 ) {
     let reload_warned = AtomicBool::new(false);
+    let mut onenote_cursor = isyncyou_engine::onenote_mobile_refresh::RefreshCursor::default();
     let mut next_periodic =
         std::time::Instant::now() + Duration::from_secs(interval.load(Ordering::Relaxed).max(5));
     loop {
@@ -1108,6 +1109,27 @@ fn refresh_loop(
             } else {
                 run_microsoft_sections(
                     |index, services| {
+                        if index == 4 {
+                            let started = std::time::Instant::now();
+                            let result = isyncyou_engine::onenote_mobile_refresh::refresh(
+                                &gate,
+                                ACCOUNT,
+                                &mut onenote_cursor,
+                                || {
+                                    let mut current = Config::load(&config_path)
+                                        .map_err(|_| "mobile config unavailable".to_string())?;
+                                    if !current.accounts.iter().any(|a| a.id == ACCOUNT) {
+                                        return Err("mobile account removed".into());
+                                    }
+                                    prepare_mobile_config_for_files_dir(&mut current, &base)?;
+                                    Ok(current)
+                                },
+                                || { run_one_targeted_refresh(&cfg, &base, &gate, &events); },
+                                || { events.notify(); },
+                            ).map_err(|_| ());
+                            android_info(&format!("provider_refresh_timing phase=microsoft_section index={} elapsed_ms={}", index, started.elapsed().as_millis()));
+                            return result;
+                        }
                         let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
                         // Resolve inside every gate acquisition so a logout between
                         // sections cannot reuse a token captured before the logout.
