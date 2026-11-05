@@ -42,6 +42,10 @@ pub enum StoreError {
     InvalidMobileJob(String),
     #[error("invalid progressive search: {0}")]
     InvalidProgressiveSearch(String),
+    #[error("provider object exceeds the permitted page size")]
+    ProviderObjectTooLarge,
+    #[error("store schema version {0} is newer than this application supports")]
+    FutureSchema(i64),
 }
 
 impl StoreError {
@@ -95,7 +99,16 @@ fn bounded_fts_snippet(value: String) -> String {
 }
 
 /// Current schema version. Bump + add a migration step when the schema changes.
-pub const SCHEMA_VERSION: i64 = 16;
+pub const SCHEMA_VERSION: i64 = 22;
+
+mod provider;
+pub use provider::{
+    capture_identity, capture_version, mail_capture_object, ProviderAlarmIdentity,
+    ProviderAlarmIndex, ProviderCapture, ProviderChange, ProviderCollectionSnapshot,
+    ProviderDavIndex, ProviderDavIndexEntry, ProviderEvent, ProviderExportSnapshot, ProviderObject,
+    ProviderScope, ProviderSubmission,
+};
+pub use provider::{ProviderMailUploadIntentRecord, ProviderMutationIntentRecord};
 
 pub const STORE_KEY_ENV: &str = "ISYNCYOU_STORE_KEY";
 pub const STORE_KEY_FILE_ENV: &str = "ISYNCYOU_STORE_KEY_FILE";
@@ -733,13 +746,25 @@ pub struct MobileJob {
     pub last_error: Option<String>,
 }
 
+/// File metadata and key digest used to identify a cached read-only archive.
+#[cfg(unix)]
+pub type ReadonlyCacheIdentity = (u64, u64, u32, u32, u32, i64, i64, [u8; 32]);
+
 /// The store. Holds the DB connection and (for on-disk stores) the instance lock.
 pub struct Store {
     conn: Connection,
     _lock: Option<File>,
+    protected: bool,
 }
 
 impl Store {
+    /// Detect commits by other connections while retaining this same reader.
+    /// Values from different connections are not comparable.
+    pub fn data_version(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?)
+    }
     /// Open (or create) an on-disk store. Acquires an exclusive `<path>.lock`;
     /// returns [`StoreError::AlreadyRunning`] if another instance holds it.
     ///
@@ -775,13 +800,29 @@ impl Store {
             ));
         }
         let path = path.as_ref();
+        #[cfg(debug_assertions)]
+        let lock_start = std::time::Instant::now();
         let lock = Self::acquire_lock(path)?;
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "isyncyou: encrypted_store lock_ms={}",
+            lock_start.elapsed().as_millis()
+        );
+        #[cfg(debug_assertions)]
+        let init_start = std::time::Instant::now();
         let conn = Connection::open(path)?;
         apply_sqlcipher_key(&conn, secret)?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
         Self::init(&conn)?;
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "isyncyou: encrypted_store init_ms={}",
+            init_start.elapsed().as_millis()
+        );
         Ok(Store {
             conn,
             _lock: Some(lock),
+            protected: true,
         })
     }
 
@@ -793,6 +834,7 @@ impl Store {
         Ok(Store {
             conn,
             _lock: Some(lock),
+            protected: false,
         })
     }
 
@@ -808,6 +850,52 @@ impl Store {
     /// guarded against a *second process*, and this handle only ever runs SELECTs, so
     /// skipping it keeps the single-writer invariant intact. The DB must already exist
     /// and be migrated by a writer. **Never call a mutating method on the returned store.**
+    /// Identity of an archive reader, including key configuration and file custody.
+    /// This contains only a digest of the configured key, never the key itself.
+    #[cfg(unix)]
+    pub fn readonly_cache_identity(path: impl AsRef<Path>) -> Result<ReadonlyCacheIdentity> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(path.as_ref())?;
+        if !metadata.file_type().is_file() {
+            return Err(StoreError::InvalidStoreSecret(
+                "archive is not a regular file".into(),
+            ));
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"isyncyou-archive-reader-v1\0");
+        digest.update([u8::from(store_key_required_for_process())]);
+        #[cfg(feature = "encrypted-store")]
+        match configured_store_key()? {
+            Some(key) => {
+                digest.update([1]);
+                digest.update(key);
+            }
+            None => {
+                if store_key_required_for_process() {
+                    return Err(StoreError::MissingStoreKey);
+                }
+                digest.update([0]);
+            }
+        }
+        #[cfg(not(feature = "encrypted-store"))]
+        {
+            if store_key_required_for_process() {
+                return Err(StoreError::MissingStoreKey);
+            }
+            digest.update([0]);
+        }
+        Ok((
+            metadata.dev(),
+            metadata.ino(),
+            metadata.mode(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+            digest.finalize().into(),
+        ))
+    }
+
     pub fn open_readonly(path: impl AsRef<Path>) -> Result<Self> {
         // No CREATE flag: a missing DB errors here so the caller falls back to a
         // writable open that creates + migrates it. NO_MUTEX: single-threaded per handle.
@@ -825,12 +913,58 @@ impl Store {
         }
         let conn = Connection::open_with_flags(path, flags)?;
         #[cfg(feature = "encrypted-store")]
+        let protected = secret.is_some();
+        #[cfg(feature = "encrypted-store")]
         if let Some(secret) = secret {
             apply_sqlcipher_key(&conn, &secret)?;
-            let _: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        }
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version > SCHEMA_VERSION {
+            return Err(StoreError::FutureSchema(version));
         }
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        Ok(Store { conn, _lock: None })
+        #[cfg(not(feature = "encrypted-store"))]
+        let protected = false;
+        Ok(Store {
+            conn,
+            _lock: None,
+            protected,
+        })
+    }
+
+    /// Open an existing encrypted provider store for concurrent reads without
+    /// creating a database or acquiring the writer lock.
+    #[cfg(feature = "encrypted-store")]
+    pub fn open_readonly_encrypted(path: impl AsRef<Path>, secret: &[u8]) -> Result<Self> {
+        if secret.is_empty() {
+            return Err(StoreError::InvalidStoreSecret(
+                "secret must not be empty".into(),
+            ));
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        apply_sqlcipher_key(&conn, secret)?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version > SCHEMA_VERSION {
+            return Err(StoreError::FutureSchema(version));
+        }
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Store {
+            conn,
+            _lock: None,
+            protected: true,
+        })
+    }
+
+    /// Open a pre-initialized provider database for short WAL transactions.
+    /// The caller coordinates staging recovery separately; this connection does
+    /// not own the archive-wide advisory writer lock.
+    #[cfg(feature = "encrypted-store")]
+    pub fn open_provider_sync_encrypted(path: impl AsRef<Path>, secret: &[u8]) -> Result<Self> {
+        Self::open_readonly_encrypted(path, secret)
     }
 
     /// In-memory store for tests (no lock, no WAL).
@@ -838,7 +972,16 @@ impl Store {
         let conn = Connection::open_in_memory()?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&conn)?;
-        Ok(Store { conn, _lock: None })
+        Ok(Store {
+            conn,
+            _lock: None,
+            protected: true,
+        })
+    }
+
+    /// Whether this store uses encrypted persistence or exists only in memory.
+    pub fn protected_provider_storage(&self) -> bool {
+        self.protected
     }
 
     /// Consume this read handle and begin one consistent progressive-search snapshot.
@@ -1787,6 +1930,35 @@ impl Store {
              ORDER BY item_type, name"
         ))?;
         let rows = stmt.query_map(params![account, service], row_to_item)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Counts for the status view, without reading names, previews or bodies.
+    /// Deleted items stay excluded even if an archived body remains, matching
+    /// `items_by_service` rather than the archive-browser pagination total.
+    pub fn active_service_counts(&self, account: &str) -> Result<Vec<(String, u64, u64)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT service, COUNT(*), SUM(CASE WHEN local_path IS NOT NULL THEN 1 ELSE 0 END)
+             FROM items WHERE account_id=?1 AND deleted_at IS NULL
+             GROUP BY service ORDER BY service",
+        )?;
+        let rows = statement.query_map(params![account], |row| {
+            let count = u64::try_from(row.get::<_, i64>(1)?).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })?;
+            let archived = u64::try_from(row.get::<_, i64>(2)?).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })?;
+            Ok((row.get(0)?, count, archived))
+        })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -2997,6 +3169,17 @@ fn map_restore_op(r: &rusqlite::Row) -> rusqlite::Result<RestoreOperation> {
 
 fn migrate(conn: &Connection) -> Result<()> {
     let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if v > SCHEMA_VERSION {
+        return Err(StoreError::FutureSchema(v));
+    }
+    // Do not create a spurious database commit on every normal writer open.
+    // Besides avoiding unnecessary writes, retained readers use data_version
+    // to detect actual changes between an external fetch and its commit.
+    if v == SCHEMA_VERSION {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    let conn = &*tx;
     if v < 1 {
         conn.execute_batch(MIGRATION_V1)?;
     }
@@ -3045,7 +3228,26 @@ fn migrate(conn: &Connection) -> Result<()> {
     if v < 16 {
         conn.execute_batch(MIGRATION_V16)?;
     }
+    if v < 17 {
+        conn.execute_batch(provider::MIGRATION)?;
+    }
+    if v < 18 {
+        conn.execute_batch(provider::MIGRATION_V18)?;
+    }
+    if v < 19 {
+        conn.execute_batch(provider::MIGRATION_V19)?;
+    }
+    if v < 20 {
+        conn.execute_batch(provider::MIGRATION_V20)?;
+    }
+    if v < 21 {
+        conn.execute_batch(provider::MIGRATION_V21)?;
+    }
+    if v < 22 {
+        conn.execute_batch(provider::MIGRATION_V22)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -3054,6 +3256,174 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn opening_current_schema_does_not_advance_reader_data_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        drop(Store::open(&path).unwrap());
+        let reader = Store::open_readonly(&path).unwrap();
+        let version = reader.data_version().unwrap();
+        let writer = Store::open(&path).unwrap();
+        assert_eq!(reader.data_version().unwrap(), version);
+        drop(writer);
+    }
+
+    #[test]
+    fn failed_provider_migration_rolls_back_schema_and_version() {
+        let store = Store::open_in_memory().unwrap();
+        store.conn.execute_batch("DROP TABLE provider_dav_index; DROP TABLE provider_stage_dav_index; DROP TABLE provider_sessions; DROP TABLE provider_session_objects; DROP TABLE provider_session_quotas; PRAGMA user_version=17; CREATE TABLE provider_sessions(blocker INTEGER);").unwrap();
+        assert!(migrate(&store.conn).is_err());
+        assert_eq!(store.schema_version().unwrap(), 17);
+        let created: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='provider_dav_index'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(created, 0);
+    }
+
+    #[test]
+    fn future_schema_is_rejected_without_version_downgrade() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        assert!(matches!(
+            migrate(&store.conn),
+            Err(StoreError::FutureSchema(_))
+        ));
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION + 1);
+    }
+
+    #[test]
+    fn readonly_open_rejects_future_schema_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(conn);
+        assert!(
+            matches!(Store::open_readonly(&path), Err(StoreError::FutureSchema(v)) if v == SCHEMA_VERSION + 1)
+        );
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION + 1);
+    }
+
+    #[cfg(feature = "encrypted-store")]
+    #[test]
+    fn encrypted_readonly_open_rejects_future_schema_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future-encrypted.db");
+        let writer = Store::open_encrypted(&path, b"synthetic key").unwrap();
+        writer
+            .conn
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        assert!(
+            matches!(Store::open_readonly_encrypted(&path, b"synthetic key"), Err(StoreError::FutureSchema(v)) if v == SCHEMA_VERSION + 1)
+        );
+        assert_eq!(writer.schema_version().unwrap(), SCHEMA_VERSION + 1);
+    }
+
+    #[cfg(feature = "encrypted-store")]
+    #[test]
+    fn encrypted_provider_readonly_requires_existing_database_and_correct_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.db");
+        assert!(Store::open_readonly_encrypted(&missing, b"secret").is_err());
+        assert!(!missing.exists());
+        let path = dir.path().join("provider.db");
+        let writer = Store::open_encrypted(&path, b"secret").unwrap();
+        writer
+            .upsert_item(&Item::new("a", "mail", "m", "subject", "message"))
+            .unwrap();
+        let reader = Store::open_readonly_encrypted(&path, b"secret").unwrap();
+        assert_eq!(
+            reader.get_item("a", "mail", "m").unwrap().unwrap().name,
+            "subject"
+        );
+        assert!(Store::open_readonly_encrypted(&path, b"wrong").is_err());
+    }
+
+    #[cfg(feature = "encrypted-store")]
+    #[test]
+    fn abandoned_provider_staging_preserves_observed_versions_and_published_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider.db");
+        let scope = ProviderScope {
+            account_id: "a".into(),
+            origin: "https://example.test".into(),
+            service: "contacts".into(),
+            collection: "c".into(),
+        };
+        let writer = Store::open_encrypted(&path, b"secret").unwrap();
+        writer.apply_provider_page(&scope, &[], "original").unwrap();
+        writer.begin_provider_staging(&scope, "abandoned").unwrap();
+        writer
+            .stage_provider_objects(
+                &scope,
+                "abandoned",
+                &[ProviderObject {
+                    remote_id: "id".into(),
+                    etag: None,
+                    raw: b"observed".to_vec(),
+                }],
+            )
+            .unwrap();
+        drop(writer);
+        let recovered = Store::open_encrypted(&path, b"secret").unwrap();
+        recovered.recover_abandoned_provider_staging().unwrap();
+        assert_eq!(
+            recovered.provider_cursor(&scope).unwrap().as_deref(),
+            Some("original")
+        );
+        assert!(recovered.provider_objects(&scope).unwrap().is_empty());
+        assert_eq!(
+            recovered
+                .provider_captures_for("a", "https://example.test", 0, 10)
+                .unwrap()[0]
+                .object
+                .raw,
+            b"observed"
+        );
+        assert!(recovered
+            .finish_provider_staging(&scope, "abandoned", "new")
+            .is_err());
+    }
+
+    #[test]
+    fn status_counts_preserve_active_scope_without_materializing_previews() {
+        let store = Store::open_in_memory().unwrap();
+        let mut archived = Item::new("a", "mail", "archived", "mail", "message");
+        archived.local_path = Some("/never-read.eml".into());
+        archived.preview_json = Some("not valid JSON; counts must not parse it".into());
+        let mut deleted = archived.clone();
+        deleted.remote_id = "deleted".into();
+        deleted.deleted_at = Some("2026-11-04T00:00:00Z".into());
+        for entry in [
+            archived,
+            deleted,
+            Item::new("a", "mail", "online", "mail", "message"),
+            Item::new("a", "calendar", "event", "event", "event"),
+            Item::new("b", "mail", "foreign", "mail", "message"),
+        ] {
+            store.upsert_item(&entry).unwrap();
+        }
+        assert_eq!(
+            store.active_service_counts("a").unwrap(),
+            vec![("calendar".into(), 1, 0), ("mail".into(), 2, 1),]
+        );
+        assert!(store.active_service_counts("missing").unwrap().is_empty());
+    }
 
     fn item(acc: &str, id: &str, name: &str) -> Item {
         Item::new(acc, "onedrive", id, name, "file")

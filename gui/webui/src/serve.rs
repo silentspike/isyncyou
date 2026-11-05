@@ -781,8 +781,8 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
             }
         }
         // Agent token stream (S-AG.6/#621): a long-lived per-turn SSE driven by the agent
-        // handler's `Receiver<String>` (pre-serialized JSON data lines). Same session gate;
-        // the turn id rides the `turn` query param (EventSource can't set headers).
+        // handler's `Receiver<String>` (pre-serialized JSON data lines). Session and Agent
+        // capability are independent gates; the opaque turn id is the only query value.
         if method == "GET" && req.path == "/api/v1/agent/stream" {
             if req.q("_st").is_some() {
                 let resp = ApiResponse::error(400, "session token query is not allowed");
@@ -792,6 +792,12 @@ fn handle<S: Conn>(stream: &mut S, router: &Router, policy: AccessPolicy) -> std
             }
             if !router.session_authorized(req.session_token.as_deref()) {
                 let resp = ApiResponse::error(401, "missing or invalid session token");
+                stream.write_all(&format_http(&resp))?;
+                stream.flush()?;
+                return Ok(());
+            }
+            if !router.agent_stream_capability_authorized(req.cap_token.as_deref()) {
+                let resp = ApiResponse::error(403, "missing or invalid capability token");
                 stream.write_all(&format_http(&resp))?;
                 stream.flush()?;
                 return Ok(());
@@ -1682,27 +1688,26 @@ mod tests {
     }
 
     #[test]
-    fn agent_stream_sse_requires_session_token_on_mobile() {
+    fn http_agent_stream_requires_session_and_agent_cap_before_opening_handler() {
         use isyncyou_core::Config;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        struct StreamAgent;
+        struct StreamAgent {
+            opens: Arc<AtomicUsize>,
+        }
         impl crate::AgentHandler for StreamAgent {
             fn start_turn(&self, _account: &str, _prompt: &str) -> Result<String, String> {
                 Ok("turn-123".into())
             }
 
-            fn confirm(
-                &self,
-                _pending_id: &str,
-                _token: &str,
-                _action_hash: &str,
-            ) -> Result<String, String> {
-                Ok("{}".into())
+            fn confirm(&self, _command: &crate::AgentConfirmCommand) -> crate::AgentConfirmOutcome {
+                crate::AgentConfirmOutcome::Completed
             }
 
             fn cancel(&self, _turn_id: &str) {}
 
             fn open_stream(&self, turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>> {
+                self.opens.fetch_add(1, Ordering::SeqCst);
                 if turn_id != "turn-123" {
                     return None;
                 }
@@ -1713,10 +1718,16 @@ mod tests {
             }
         }
 
+        let opens = Arc::new(AtomicUsize::new(0));
         let router = Arc::new(
             Router::new(Config::default())
                 .with_session_token("sess-http-tok".into())
-                .with_agent(Arc::new(StreamAgent), "agentsecret".into()),
+                .with_agent(
+                    Arc::new(StreamAgent {
+                        opens: Arc::clone(&opens),
+                    }),
+                    "agentsecret".into(),
+                ),
         );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1741,12 +1752,23 @@ mod tests {
             no_token.starts_with("HTTP/1.1 401"),
             "agent stream without session token must 401: {no_token}"
         );
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+
+        let no_cap = req(
+            "GET /api/v1/agent/stream?turn=turn-123 HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: isy_session=sess-http-tok\r\n\r\n",
+        );
+        assert!(no_cap.starts_with("HTTP/1.1 403"), "{no_cap}");
+        let wrong_cap = req(
+            "GET /api/v1/agent/stream?turn=turn-123 HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: isy_session=sess-http-tok\r\nX-Capability-Token: wrong\r\n\r\n",
+        );
+        assert!(wrong_cap.starts_with("HTTP/1.1 403"), "{wrong_cap}");
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
 
         let mut sse = TcpStream::connect(addr).unwrap();
         sse.set_read_timeout(Some(std::time::Duration::from_secs(2)))
             .unwrap();
         sse.write_all(
-            b"GET /api/v1/agent/stream?turn=turn-123 HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: isy_session=sess-http-tok\r\n\r\n",
+            b"GET /api/v1/agent/stream?turn=turn-123 HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: isy_session=sess-http-tok\r\nX-Capability-Token: agentsecret\r\n\r\n",
         )
         .unwrap();
         let mut raw = Vec::new();
@@ -1776,7 +1798,9 @@ mod tests {
             "agent stream with session token must connect: {with_token}"
         );
         assert!(with_token.contains("Content-Type: text/event-stream"));
+        assert!(with_token.contains("Cache-Control: no-store"));
         assert!(with_token.contains("data: {\"event\":\"token\",\"text\":\"hi\"}"));
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -2109,6 +2133,6 @@ mod tests {
     #[test]
     fn session_token_query_is_rejected_for_api_and_sse() {
         session_token_gates_data_routes_over_http();
-        agent_stream_sse_requires_session_token_on_mobile();
+        http_agent_stream_requires_session_and_agent_cap_before_opening_handler();
     }
 }

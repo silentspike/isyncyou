@@ -22,6 +22,19 @@ class MobileJobWakeupPolicyTest {
     }
 
     @Test
+    fun response_status_is_read_only_for_eligible_post_paths() {
+        var reads = 0
+        val ok = { reads++; 202 }
+        assertFalse(MobileJobWakeupPolicy.shouldReconcileResponse("GET", "/api/v1/items?metadata_only=1", ok))
+        assertFalse(MobileJobWakeupPolicy.shouldReconcileResponse("POST", "/api/v1/backupish", ok))
+        assertTrue(reads == 0)
+        assertTrue(MobileJobWakeupPolicy.shouldReconcileResponse("post", "/api/v1/backup?account=me", ok))
+        assertTrue(reads == 1)
+        assertFalse(MobileJobWakeupPolicy.shouldReconcileResponse("POST", "/api/v1/restore") { reads++; 500 })
+        assertTrue(reads == 2)
+    }
+
+    @Test
     fun coldStartReconcilesImmediatelyAfterEngineTokenArrives() {
         assertFalse(MobileJobWakeupPolicy.shouldReconcileAfterEngineReady(""))
         assertTrue(MobileJobWakeupPolicy.shouldReconcileAfterEngineReady("native-session"))

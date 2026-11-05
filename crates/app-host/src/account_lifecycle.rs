@@ -398,7 +398,7 @@ type LifecycleAuditHook = Arc<dyn Fn(&LifecycleAuditEvent) + Send + Sync>;
 
 impl LifecycleDiagnostics {
     pub(crate) fn record_audit_failure(&self) {
-        let _ = self.audit_failures.fetch_update(
+        let _ = self.audit_failures.try_update(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
             |value| {

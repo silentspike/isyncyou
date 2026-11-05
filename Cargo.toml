@@ -31,3 +31,6 @@ cosmic-text = "0.19"
 taffy = "0.5"
 winit = "0.30"
 softbuffer = "0.4"
+
+[profile.dev.package.argon2]
+opt-level = 3

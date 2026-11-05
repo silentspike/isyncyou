@@ -8,13 +8,19 @@ internal object MobileJobWakeupPolicy {
         "/api/v1/agent/confirm",
     )
 
-    fun shouldReconcile(method: String?, rawPath: String?, status: Int): Boolean {
-        if (!method.equals("POST", ignoreCase = true) || status !in 200..299) return false
+    fun mayReconcile(method: String?, rawPath: String?): Boolean {
+        if (!method.equals("POST", ignoreCase = true)) return false
         val value = rawPath ?: return false
         if (!value.startsWith('/') || value.contains("://") || value.contains('#')) return false
         val path = value.substringBefore('?')
         return path in paths
     }
+
+    fun shouldReconcile(method: String?, rawPath: String?, status: Int): Boolean =
+        status in 200..299 && mayReconcile(method, rawPath)
+
+    fun shouldReconcileResponse(method: String?, rawPath: String?, status: () -> Int): Boolean =
+        mayReconcile(method, rawPath) && status() in 200..299
 
     fun shouldReconcileAfterEngineReady(sessionToken: String): Boolean = sessionToken.isNotBlank()
 }

@@ -32,6 +32,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod serve;
 mod view;
+
+/// Sanitize untrusted mail HTML before it enters a confirmation viewer.
+pub fn sanitize_confirmation_mail_html(raw: &str) -> String {
+    view::sanitize_mail_html(raw)
+}
 pub use serve::{
     bind_loopback, dispatch_message, format_http, handle_bridge_request, parse_request_line, serve,
     serve_listener, serve_listener_shared, BridgeDispatchRequest,
@@ -294,8 +299,8 @@ pub(crate) struct ProductPostRouteSpec {
 enum ProductReplayPolicy {
     /// The generic store may persist only a closed terminal status and result digest.
     DurableTerminal,
-    /// The route's own journal owns replay and retention. The global layer binds
-    /// the UUID only and never stores a response body.
+    /// The route owns replay and retention (or performs a fresh read). The global
+    /// layer binds the UUID only and never stores a response body.
     RouteOwned,
     /// The response contains short-lived authority and must never be replayed
     /// from the global store. An exact retry is reported as outcome unknown.
@@ -344,6 +349,7 @@ product_post_routes! {
     MailForward => ("/api/v1/mail/forward", 8 * 1024, Mail),
     MailMove => ("/api/v1/mail/move", 8 * 1024, Mail),
     MailRead => ("/api/v1/mail/read", 8 * 1024, Mail),
+    MailReadState => ("/api/v1/mail/read-state", 8 * 1024, Mail),
     MailFlag => ("/api/v1/mail/flag", 8 * 1024, Mail),
     MailCategories => ("/api/v1/mail/categories", 8 * 1024, Mail),
     MailDraft => ("/api/v1/mail/draft", 8 * 1024, Mail),
@@ -383,12 +389,37 @@ product_post_routes! {
     OnedriveConflictResolve => ("/api/v1/onedrive/conflict/resolve", 8 * 1024, OnedriveManage),
     OnedriveCleanup => ("/api/v1/onedrive/cleanup", 8 * 1024, OnedriveManage),
     AccountLoginStart => ("/api/v1/account/login/start", 8 * 1024, Account),
+    AccountCreateProvider => ("/api/v1/account/provider/create", 8 * 1024, Account),
+    AccountQuarantineList => ("/api/v1/account/provider/quarantine/list", 8 * 1024, Account),
+    AccountQuarantineRevoke => ("/api/v1/account/provider/quarantine/revoke", 8 * 1024, Account),
     AccountLoginPoll => ("/api/v1/account/login/poll", 8 * 1024, Account),
     AccountLoginCancel => ("/api/v1/account/login/cancel", 8 * 1024, Account),
     AccountSignout => ("/api/v1/account/signout", 8 * 1024, Account),
     PushRegister => ("/api/v1/push/register", 8 * 1024, Push),
     PushTest => ("/api/v1/push/test", 8 * 1024, Push),
     AgentTurn => ("/api/v1/agent/turn", AGENT_TURN_JSON_MAX_BYTES, Agent),
+    AgentComposerPrepare => ("/api/v1/agent/composer/prepare", 8 * 1024, Agent),
+    AgentComposerIdentities => ("/api/v1/agent/composer/identities", 8 * 1024, Agent),
+    AgentContactNamePrepare => ("/api/v1/agent/contact/name/prepare", 8 * 1024, Agent),
+    AgentTaskCompletionPrepare => ("/api/v1/agent/task/completion/prepare", 8 * 1024, Agent),
+    AgentTaskOccurrencePrepare => ("/api/v1/agent/task/occurrence/prepare", 8 * 1024, Agent),
+    AgentCalendarTextPrepare => ("/api/v1/agent/calendar/text/prepare", 8 * 1024, Agent),
+    AgentCalendarTimePrepare => ("/api/v1/agent/calendar/time/prepare", 8 * 1024, Agent),
+    AgentCalendarAlarmPrepare => ("/api/v1/agent/calendar/alarm/prepare", 8 * 1024, Agent),
+    AgentDavAclPrepare => ("/api/v1/agent/dav/acl/prepare", 8 * 1024, Agent),
+    AgentInvitationResponsePrepare => ("/api/v1/agent/calendar/invitation/prepare", 8 * 1024, Agent),
+    AgentDavDeletePrepare => ("/api/v1/agent/dav/delete/prepare", 8 * 1024, Agent),
+    AgentDavCreatePrepare => ("/api/v1/agent/dav/create/prepare", 8 * 1024, Agent),
+    AgentContactFieldPrepare => ("/api/v1/agent/contact/field/prepare", 8 * 1024, Agent),
+    AgentMailActionPrepare => ("/api/v1/agent/mail/action/prepare", 8 * 1024, Agent),
+    AgentTaskAttributesPrepare => ("/api/v1/agent/task/attributes/prepare", 8 * 1024, Agent),
+    AgentTaskParentPrepare => ("/api/v1/agent/task/parent/prepare", 8 * 1024, Agent),
+    AgentCancellationPrepare => ("/api/v1/agent/calendar/cancel/prepare", 8 * 1024, Agent),
+    AgentContactPhotoPrepare => ("/api/v1/agent/contact/photo/prepare", 8 * 1024, Agent),
+    AgentSingleCapturePrepare => ("/api/v1/agent/recovery/capture/prepare", 8 * 1024, Agent),
+    AgentRecoveryJobsPrepare => ("/api/v1/agent/recovery/jobs/prepare", 32 * 1024, Agent),
+    AgentRecoveryImportPrepare => ("/api/v1/agent/recovery/import/prepare", 8 * 1024, Agent),
+    AgentRecoveryReconcile => ("/api/v1/agent/recovery/reconcile", 8 * 1024, Agent),
     AgentSessionCreate => ("/api/v1/agent/session/create", 8 * 1024, Agent),
     AgentSessionSelect => ("/api/v1/agent/session/select", 8 * 1024, Agent),
     AgentSessionArchive => ("/api/v1/agent/session/archive", 8 * 1024, Agent),
@@ -424,7 +455,31 @@ impl ProductPostRoute {
         use ProductPostRoute::*;
         match self {
             AgentTurn => ProductReplayPolicy::AtomicTurnAdmission,
-            AccountLoginStart | AgentUserPresenceStart => ProductReplayPolicy::EphemeralResponse,
+            AccountLoginStart
+            | AccountQuarantineList
+            | AgentUserPresenceStart
+            | AgentComposerPrepare
+            | AgentComposerIdentities
+            | AgentContactNamePrepare
+            | AgentTaskCompletionPrepare
+            | AgentTaskOccurrencePrepare
+            | AgentCalendarTextPrepare
+            | AgentCalendarTimePrepare
+            | AgentCalendarAlarmPrepare
+            | AgentDavAclPrepare
+            | AgentInvitationResponsePrepare
+            | AgentDavDeletePrepare
+            | AgentDavCreatePrepare
+            | AgentContactFieldPrepare
+            | AgentMailActionPrepare
+            | AgentTaskAttributesPrepare
+            | AgentTaskParentPrepare
+            | AgentCancellationPrepare
+            | AgentContactPhotoPrepare
+            | AgentSingleCapturePrepare
+            | AgentRecoveryJobsPrepare
+            | AgentRecoveryImportPrepare
+            | AgentRecoveryReconcile => ProductReplayPolicy::EphemeralResponse,
             AccountLoginPoll
             | AccountLoginCancel
             | MutationIntentCreate
@@ -441,6 +496,7 @@ impl ProductPostRoute {
             | AgentPairingRevoke
             | AgentConnectivityPreflight
             | AgentOauthStart
+            | MailReadState
             | Share => ProductReplayPolicy::RouteOwned,
             Restore
             | Backup
@@ -490,6 +546,8 @@ impl ProductPostRoute {
             | OnedriveConflictResolve
             | OnedriveCleanup
             | AccountSignout
+            | AccountCreateProvider
+            | AccountQuarantineRevoke
             | PushRegister
             | PushTest
             | AgentUserPresenceConfirm
@@ -770,6 +828,46 @@ fn parse_strict_scalar_mutation(
     Ok(parsed)
 }
 
+fn safe_recovery_result_diagnostic(error: &str) -> bool {
+    if matches!(
+        error,
+        "recovery_result_store_unavailable"
+            | "recovery_result_binding_unavailable"
+            | "recovery_result_auth_unavailable"
+            | "recovery_result_status_invalid"
+            | "recovery_result_not_available"
+            | "recovery_result_integrity_size_true_hash_false"
+            | "recovery_result_integrity_size_false_hash_true"
+            | "recovery_result_integrity_size_false_hash_false"
+    ) {
+        return true;
+    }
+    let Some(detail) = error
+        .strip_prefix("recovery_result_status:")
+        .or_else(|| error.strip_prefix("recovery_result_body:"))
+    else {
+        return false;
+    };
+    if matches!(
+        detail,
+        "recovery_challenge_unavailable"
+            | "recovery_read_transport_unavailable"
+            | "recovery_read_content_type_invalid"
+            | "recovery_read_length_exceeded"
+            | "recovery_read_body_unavailable"
+    ) {
+        return true;
+    }
+    detail
+        .strip_prefix("recovery_challenge_http_")
+        .or_else(|| detail.strip_prefix("recovery_read_http_"))
+        .is_some_and(|code| code.len() == 3 && code.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn valid_recovery_catalog_service(value: &str) -> bool {
+    matches!(value, "calendar" | "todo" | "mail" | "contacts")
+}
+
 fn valid_opaque_agent_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -785,6 +883,13 @@ fn valid_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_exact_base64url(value: &str, exact_len: usize) -> bool {
+    value.len() == exact_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn mutation_error_response(error: &str) -> ApiResponse {
@@ -927,6 +1032,10 @@ struct MutationIntentCommitRequest {
 struct MutationIntentCancelRequest {
     request_id: String,
     intent_id: String,
+    #[serde(default)]
+    account: Option<String>,
+    #[serde(default)]
+    release_confirmed: bool,
 }
 
 fn parse_bounded_page_limit(value: Option<&str>) -> Result<Option<usize>, ApiResponse> {
@@ -1154,6 +1263,7 @@ fn scalar_product_fields(route: ProductPostRoute) -> Option<&'static [&'static s
         Settings => Some(&["poll_interval_secs"]),
         MailMove => Some(&["account", "id", "destination"]),
         MailRead => Some(&["account", "id", "is_read"]),
+        MailReadState => Some(&["account", "id"]),
         MailFlag => Some(&["account", "id", "status", "due", "tz"]),
         MailCategories => Some(&["account", "id", "categories"]),
         CalendarCreate => Some(&[
@@ -1272,6 +1382,9 @@ fn scalar_product_fields(route: ProductPostRoute) -> Option<&'static [&'static s
         OnedriveConflictResolve => Some(&["account", "id", "resolution"]),
         OnedriveCleanup => Some(&["account"]),
         AccountLoginStart | AccountSignout => Some(&["account", "role"]),
+        AccountCreateProvider => Some(&["account", "username", "origin", "client_id"]),
+        AccountQuarantineList => Some(&["account"]),
+        AccountQuarantineRevoke => Some(&["account", "recovery_id"]),
         AccountLoginPoll | AccountLoginCancel => Some(&["id"]),
         MailSend
         | MailReply
@@ -1285,6 +1398,28 @@ fn scalar_product_fields(route: ProductPostRoute) -> Option<&'static [&'static s
         | MutationIntentCancel
         | PushRegister
         | AgentTurn
+        | AgentComposerPrepare
+        | AgentComposerIdentities
+        | AgentContactNamePrepare
+        | AgentTaskCompletionPrepare
+        | AgentTaskOccurrencePrepare
+        | AgentCalendarTextPrepare
+        | AgentCalendarTimePrepare
+        | AgentCalendarAlarmPrepare
+        | AgentDavAclPrepare
+        | AgentInvitationResponsePrepare
+        | AgentDavDeletePrepare
+        | AgentDavCreatePrepare
+        | AgentContactFieldPrepare
+        | AgentMailActionPrepare
+        | AgentTaskAttributesPrepare
+        | AgentTaskParentPrepare
+        | AgentCancellationPrepare
+        | AgentContactPhotoPrepare
+        | AgentSingleCapturePrepare
+        | AgentRecoveryJobsPrepare
+        | AgentRecoveryImportPrepare
+        | AgentRecoveryReconcile
         | AgentSessionCreate
         | AgentSessionSelect
         | AgentSessionArchive
@@ -1506,6 +1641,9 @@ fn canonicalize_scalar_product_payload(
         MailMove => {
             require_non_empty_scalar_fields(object, &["account", "id", "destination"])?;
         }
+        MailReadState => {
+            require_non_empty_scalar_fields(object, &["account", "id"])?;
+        }
         MailRead => {
             require_non_empty_scalar_fields(object, &["account", "id"])?;
             let value = if object.get("is_read").and_then(Value::as_str) == Some("0") {
@@ -1684,6 +1822,14 @@ fn canonicalize_scalar_product_payload(
                 return Err(no_store_json_error(400, "invalid account role"));
             }
         }
+        AccountCreateProvider => require_non_empty_scalar_fields(
+            object,
+            &["account", "username", "origin", "client_id"],
+        )?,
+        AccountQuarantineList => require_non_empty_scalar_fields(object, &["account"])?,
+        AccountQuarantineRevoke => {
+            require_non_empty_scalar_fields(object, &["account", "recovery_id"])?
+        }
         MailSend
         | MailReply
         | MailForward
@@ -1696,6 +1842,28 @@ fn canonicalize_scalar_product_payload(
         | MutationIntentCancel
         | PushRegister
         | AgentTurn
+        | AgentComposerPrepare
+        | AgentComposerIdentities
+        | AgentContactNamePrepare
+        | AgentTaskCompletionPrepare
+        | AgentTaskOccurrencePrepare
+        | AgentCalendarTextPrepare
+        | AgentCalendarTimePrepare
+        | AgentCalendarAlarmPrepare
+        | AgentDavAclPrepare
+        | AgentInvitationResponsePrepare
+        | AgentDavDeletePrepare
+        | AgentDavCreatePrepare
+        | AgentContactFieldPrepare
+        | AgentMailActionPrepare
+        | AgentTaskAttributesPrepare
+        | AgentTaskParentPrepare
+        | AgentCancellationPrepare
+        | AgentContactPhotoPrepare
+        | AgentSingleCapturePrepare
+        | AgentRecoveryJobsPrepare
+        | AgentRecoveryImportPrepare
+        | AgentRecoveryReconcile
         | AgentSessionCreate
         | AgentSessionSelect
         | AgentSessionArchive
@@ -1779,6 +1947,28 @@ fn canonicalize_product_payload(
         MutationIntentCommit => canonical_typed!(MutationIntentCommitRequest),
         MutationIntentCancel => canonical_typed!(MutationIntentCancelRequest),
         AgentTurn => canonical_typed!(AgentTurnRequest),
+        AgentComposerPrepare => canonical_typed!(AgentComposerPrepareRequest),
+        AgentComposerIdentities => canonical_typed!(AgentComposerIdentitiesRequest),
+        AgentContactNamePrepare => canonical_typed!(AgentContactNamePrepareRequest),
+        AgentTaskCompletionPrepare => canonical_typed!(AgentTaskCompletionPrepareRequest),
+        AgentTaskOccurrencePrepare => canonical_typed!(AgentTaskOccurrencePrepareRequest),
+        AgentCalendarTextPrepare => canonical_typed!(AgentCalendarTextPrepareRequest),
+        AgentCalendarTimePrepare => canonical_typed!(AgentCalendarTimePrepareRequest),
+        AgentCalendarAlarmPrepare => canonical_typed!(AgentCalendarAlarmPrepareRequest),
+        AgentDavAclPrepare => canonical_typed!(AgentDavAclPrepareRequest),
+        AgentInvitationResponsePrepare => canonical_typed!(AgentInvitationResponsePrepareRequest),
+        AgentDavDeletePrepare => canonical_typed!(AgentDavDeletePrepareRequest),
+        AgentDavCreatePrepare => canonical_typed!(AgentDavCreatePrepareRequest),
+        AgentContactFieldPrepare => canonical_typed!(AgentContactFieldPrepareRequest),
+        AgentMailActionPrepare => canonical_typed!(AgentMailActionPrepareRequest),
+        AgentTaskAttributesPrepare => canonical_typed!(AgentTaskAttributesPrepareRequest),
+        AgentTaskParentPrepare => canonical_typed!(AgentTaskParentPrepareRequest),
+        AgentCancellationPrepare => canonical_typed!(AgentCancellationPrepareRequest),
+        AgentContactPhotoPrepare => canonical_typed!(AgentContactPhotoPrepareRequest),
+        AgentSingleCapturePrepare => canonical_typed!(AgentSingleCapturePrepareRequest),
+        AgentRecoveryJobsPrepare => canonical_typed!(AgentRecoveryJobsPrepareRequest),
+        AgentRecoveryImportPrepare => canonical_typed!(AgentRecoveryImportPrepareRequest),
+        AgentRecoveryReconcile => canonical_typed!(AgentRecoveryReconcileRequest),
         AgentSessionCreate => canonical_typed!(AgentSessionCreateRequest),
         AgentSessionSelect => canonical_typed!(AgentSessionSelectRequest),
         AgentSessionArchive | AgentPairingReveal | AgentPairingClaim | AgentPairingFinalize
@@ -1947,6 +2137,259 @@ fn validate_typed_product_request(
             }
             Ok(())
         }
+        AgentContactNamePrepare => {
+            let request = serde_json::from_value::<AgentContactNamePrepareRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&request.session_id)
+                && !request.account.is_empty()
+                && !request.collection.is_empty()
+                && !request.href.is_empty()
+                && !request.new_name.is_empty())
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentTaskCompletionPrepare => {
+            let request =
+                serde_json::from_value::<AgentTaskCompletionPrepareRequest>(value.clone())
+                    .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&request.session_id)
+                && !request.account.is_empty()
+                && !request.collection.is_empty()
+                && !request.href.is_empty()
+                && !request.uid.is_empty())
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentTaskOccurrencePrepare => {
+            let r = serde_json::from_value::<AgentTaskOccurrencePrepareRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&r.session_id)
+                && !r.account.is_empty()
+                && !r.collection.is_empty()
+                && !r.href.is_empty()
+                && !r.uid.is_empty()
+                && !r.recurrence_id.is_empty()
+                && r.complete
+                && !r.window_start.is_empty()
+                && !r.window_end.is_empty())
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentCalendarTextPrepare => {
+            let request = serde_json::from_value::<AgentCalendarTextPrepareRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&request.session_id)
+                && !request.account.is_empty()
+                && !request.collection.is_empty()
+                && !request.href.is_empty()
+                && !request.uid.is_empty()
+                && matches!(request.field.as_str(), "SUMMARY" | "DESCRIPTION")
+                && !request.new_value.is_empty())
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentCalendarTimePrepare => {
+            let request = serde_json::from_value::<AgentCalendarTimePrepareRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&request.session_id)
+                && !request.account.is_empty()
+                && !request.collection.is_empty()
+                && !request.href.is_empty()
+                && !request.uid.is_empty()
+                && !request.start.is_empty()
+                && !request.end.is_empty())
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentCalendarAlarmPrepare => {
+            let r = serde_json::from_value::<AgentCalendarAlarmPrepareRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&r.session_id)
+                && !r.account.is_empty()
+                && !r.collection.is_empty()
+                && !r.href.is_empty()
+                && !r.uid.is_empty()
+                && (r.alarm_index.is_some() || r.trigger.is_some()))
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentDavAclPrepare => {
+            let request = serde_json::from_value::<AgentDavAclPrepareRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&request.session_id)
+                && !request.account.is_empty()
+                && matches!(request.service.as_str(), "calendar" | "contacts")
+                && !request.collection.is_empty()
+                && !request.principal.is_empty()
+                && matches!(
+                    request.privilege.as_deref(),
+                    None | Some("read") | Some("write") | Some("read-write")
+                ))
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentInvitationResponsePrepare => {
+            let r = serde_json::from_value::<AgentInvitationResponsePrepareRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&r.session_id)
+                && !r.account.is_empty()
+                && !r.collection.is_empty()
+                && !r.href.is_empty()
+                && !r.uid.is_empty()
+                && !r.attendee.is_empty()
+                && matches!(r.response.as_str(), "accept" | "tentative" | "decline"))
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentDavDeletePrepare => {
+            let r = serde_json::from_value::<AgentDavDeletePrepareRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&r.session_id)
+                && !r.account.is_empty()
+                && matches!(r.service.as_str(), "calendar" | "contacts")
+                && !r.collection.is_empty()
+                && !r.href.is_empty())
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentDavCreatePrepare => {
+            let r = serde_json::from_value::<AgentDavCreatePrepareRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&r.session_id)
+                && !r.account.is_empty()
+                && matches!(r.kind.as_str(), "event" | "task" | "contact")
+                && !r.collection.is_empty()
+                && !r.name.is_empty())
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentContactFieldPrepare => {
+            let r = serde_json::from_value::<AgentContactFieldPrepareRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&r.session_id)
+                && !r.account.is_empty()
+                && !r.collection.is_empty()
+                && !r.href.is_empty()
+                && matches!(r.key.as_str(), "EMAIL" | "TEL" | "ORG")
+                && (if r.remove {
+                    r.index.is_some()
+                } else {
+                    !r.new_value.is_empty()
+                }))
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentMailActionPrepare => {
+            let r = serde_json::from_value::<AgentMailActionPrepareRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&r.session_id)
+                && !r.account.is_empty()
+                && !r.email_id.is_empty()
+                && r.action.is_object())
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentTaskAttributesPrepare => {
+            let r = serde_json::from_value::<AgentTaskAttributesPrepareRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&r.session_id)
+                && !r.account.is_empty()
+                && !r.collection.is_empty()
+                && !r.href.is_empty()
+                && !r.uid.is_empty()
+                && (r.priority.is_some() || r.due.is_some() || r.start.is_some()))
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentTaskParentPrepare => {
+            let r = serde_json::from_value::<AgentTaskParentPrepareRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&r.session_id)
+                && !r.account.is_empty()
+                && !r.collection.is_empty()
+                && !r.href.is_empty()
+                && !r.uid.is_empty()
+                && r.new_parent.as_ref().is_none_or(|p| !p.is_empty()))
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentCancellationPrepare => {
+            let r = serde_json::from_value::<AgentCancellationPrepareRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&r.session_id)
+                && !r.account.is_empty()
+                && !r.collection.is_empty()
+                && !r.href.is_empty()
+                && !r.uid.is_empty())
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentContactPhotoPrepare => {
+            let r = serde_json::from_value::<AgentContactPhotoPrepareRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&r.session_id)
+                && !r.account.is_empty()
+                && valid_opaque_agent_id(&r.stage_id))
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentSingleCapturePrepare => {
+            let r = serde_json::from_value::<AgentSingleCapturePrepareRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&r.session_id)
+                && !r.account.is_empty()
+                && matches!(r.service.as_str(), "calendar" | "contacts" | "mail")
+                && (r.service == "mail" || !r.collection.is_empty())
+                && !r.href.is_empty())
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentRecoveryJobsPrepare => {
+            let r = serde_json::from_value::<AgentRecoveryJobsPrepareRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&r.session_id)
+                && !r.account.is_empty()
+                && !r.items.is_empty()
+                && r.items.len() <= 32)
+                .then_some(())
+                .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentRecoveryImportPrepare => {
+            let r = serde_json::from_value::<AgentRecoveryImportPrepareRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&r.session_id)
+                && !r.account.is_empty()
+                && !r.batch_id.is_empty()
+                && !r.collection.is_empty())
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentRecoveryReconcile => {
+            let r = serde_json::from_value::<AgentRecoveryReconcileRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&r.session_id)
+                && !r.account.is_empty()
+                && !r.batch_id.is_empty())
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentComposerIdentities => {
+            let request = serde_json::from_value::<AgentComposerIdentitiesRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (!request.account.is_empty())
+                .then_some(())
+                .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentComposerPrepare => {
+            let request = serde_json::from_value::<AgentComposerPrepareRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&request.session_id)
+                && !request.account.is_empty()
+                && !request.email_id.is_empty()
+                && !request.identity_id.is_empty())
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
         AgentSessionCreate => {
             let request = serde_json::from_value::<AgentSessionCreateRequest>(value.clone())
                 .map_err(|_| no_store_json_error(400, "invalid product request"))?;
@@ -2026,13 +2469,14 @@ fn validate_typed_product_request(
         AgentConfirm => {
             let request = serde_json::from_value::<AgentConfirmRequest>(value.clone())
                 .map_err(|_| no_store_json_error(400, "invalid product request"))?;
-            (valid_opaque_agent_id(&request.pending)
-                && !request.token.is_empty()
-                && request.token.len() <= 512
-                && !request.action_hash.is_empty()
-                && request.action_hash.len() <= 128)
-                .then_some(())
-                .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+            (valid_opaque_agent_id(&request.session_id)
+                && valid_client_request_id(&request.turn_request_id)
+                && valid_opaque_agent_id(&request.turn_id)
+                && valid_exact_base64url(&request.pending, 22)
+                && valid_exact_base64url(&request.token, 43)
+                && valid_sha256(&request.action_hash))
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
         }
         AgentTurnCancel => {
             let request = serde_json::from_value::<AgentTurnCancelRequest>(value.clone())
@@ -2380,6 +2824,93 @@ pub struct AgentPendingBinding {
     pub item: String,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentPendingOwnerProof {
+    pub session_id: String,
+    pub turn_request_id: String,
+    pub turn_id: String,
+}
+
+impl std::fmt::Debug for AgentPendingOwnerProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentPendingOwnerProof")
+            .field("session_id_present", &!self.session_id.is_empty())
+            .field("turn_request_id_present", &!self.turn_request_id.is_empty())
+            .field("turn_id_present", &!self.turn_id.is_empty())
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentPendingBindingCommand {
+    pub pending: String,
+    pub action_hash: String,
+    pub owner: AgentPendingOwnerProof,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentConfirmCommand {
+    pub pending: String,
+    pub token: String,
+    pub action_hash: String,
+    pub owner: AgentPendingOwnerProof,
+}
+
+impl std::fmt::Debug for AgentConfirmCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentConfirmCommand")
+            .field("pending_present", &!self.pending.is_empty())
+            .field("token_present", &!self.token.is_empty())
+            .field("action_hash_present", &!self.action_hash.is_empty())
+            .field("owner", &self.owner)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentClosedConfirmationCode {
+    Invalid,
+    Expired,
+    Cancelled,
+    Replayed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentPendingBindingOutcome {
+    Ready(AgentPendingBinding),
+    Rejected(AgentClosedConfirmationCode),
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosedConfirmationFailure {
+    PostConsumeValidationFailed,
+    AuditStartFailed,
+    ExecutorRejected,
+    ExecutorFailed,
+    ProviderRejected,
+    ProviderActionRejected,
+    ProviderConflict,
+    MailPreDispatchFailed,
+    DavDiscoveryUnavailable,
+    DavPreDispatchFailed,
+    CaptureSourceUnavailable,
+    CaptureVersionChanged,
+    CaptureChallengeUnavailable,
+    CaptureJournalUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentConfirmOutcome {
+    Completed,
+    Failed(ClosedConfirmationFailure),
+    Rejected(AgentClosedConfirmationCode),
+    Retryable,
+    OutcomeUnknown,
+}
+
 /// The only provider/purpose pairs accepted by the connectivity preflight route.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -2414,6 +2945,8 @@ pub struct AgentCredentialRefreshRequest {
 #[serde(deny_unknown_fields)]
 pub struct AgentSessionCreateRequest {
     pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     #[serde(default)]
     pub display_name: Option<String>,
 }
@@ -2494,13 +3027,31 @@ pub struct AgentUserPresenceConfirmRequest {
     pub action_hash: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfirmRequest {
     pub request_id: String,
+    pub session_id: String,
+    pub turn_request_id: String,
+    pub turn_id: String,
     pub pending: String,
     pub token: String,
     pub action_hash: String,
+}
+
+impl std::fmt::Debug for AgentConfirmRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentConfirmRequest")
+            .field("request_id_present", &!self.request_id.is_empty())
+            .field("session_id_present", &!self.session_id.is_empty())
+            .field("turn_request_id_present", &!self.turn_request_id.is_empty())
+            .field("turn_id_present", &!self.turn_id.is_empty())
+            .field("pending_present", &!self.pending.is_empty())
+            .field("token_present", &!self.token.is_empty())
+            .field("action_hash_present", &!self.action_hash.is_empty())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -2620,9 +3171,443 @@ pub struct AgentOAuthCompleteRequest {
 /// `Receiver<String>`) so the webui crate stays decoupled from `isyncyou-agent`.
 /// The model never receives a capability token; destructive actions become a pending
 /// action confirmed out-of-band via `confirm` (REQ-AGENT-003/004).
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentComposerPrepareRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub email_id: String,
+    pub identity_id: String,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentComposerIdentitiesRequest {
+    pub request_id: String,
+    pub account: String,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentContactNamePrepareRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub collection: String,
+    pub href: String,
+    pub new_name: String,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentTaskCompletionPrepareRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub collection: String,
+    pub href: String,
+    pub uid: String,
+    pub recurrence_id: Option<String>,
+    pub complete: bool,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentTaskOccurrencePrepareRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub collection: String,
+    pub href: String,
+    pub uid: String,
+    pub recurrence_id: String,
+    pub complete: bool,
+    pub window_start: String,
+    pub window_end: String,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCalendarTextPrepareRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub collection: String,
+    pub href: String,
+    pub uid: String,
+    pub recurrence_id: Option<String>,
+    pub field: String,
+    pub new_value: String,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCalendarTimePrepareRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub collection: String,
+    pub href: String,
+    pub uid: String,
+    pub start: String,
+    pub end: String,
+    pub date_only: bool,
+    pub tzid: Option<String>,
+    pub recurrence_id: Option<String>,
+    pub window_start: Option<String>,
+    pub window_end: Option<String>,
+    pub rule: Option<String>,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCalendarAlarmPrepareRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub collection: String,
+    pub href: String,
+    pub uid: String,
+    pub recurrence_id: Option<String>,
+    pub alarm_index: Option<usize>,
+    pub trigger: Option<String>,
+    pub description: Option<String>,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentDavAclPrepareRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub service: String,
+    pub collection: String,
+    pub principal: String,
+    pub privilege: Option<String>,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentInvitationResponsePrepareRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub collection: String,
+    pub href: String,
+    pub uid: String,
+    pub recurrence_id: Option<String>,
+    pub attendee: String,
+    pub response: String,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentDavDeletePrepareRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub service: String,
+    pub collection: String,
+    pub href: String,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentDavCreatePrepareRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub collection: String,
+    pub kind: String,
+    pub name: String,
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub rule: Option<String>,
+    pub organizer: Option<String>,
+    #[serde(default)]
+    pub attendees: Vec<String>,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentContactFieldPrepareRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub collection: String,
+    pub href: String,
+    pub key: String,
+    pub index: Option<usize>,
+    pub value_type: Option<String>,
+    #[serde(default)]
+    pub remove: bool,
+    pub new_value: String,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentMailActionPrepareRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub email_id: String,
+    pub action: Value,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentTaskAttributesPrepareRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub collection: String,
+    pub href: String,
+    pub uid: String,
+    pub priority: Option<u8>,
+    pub due: Option<String>,
+    pub due_date: bool,
+    pub start: Option<String>,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentTaskParentPrepareRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub collection: String,
+    pub href: String,
+    pub uid: String,
+    pub new_parent: Option<String>,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCancellationPrepareRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub collection: String,
+    pub href: String,
+    pub uid: String,
+    pub recurrence_id: Option<String>,
+    pub sequence: u32,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRecoveryCatalogChoice {
+    pub cursor: u64,
+    pub generation: String,
+    pub object: String,
+    pub version: String,
+    pub kind: String,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentContactPhotoPrepareRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub stage_id: String,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSingleCapturePrepareRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub service: String,
+    pub collection: String,
+    pub href: String,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRecoveryJobsPrepareRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub items: Vec<AgentRecoveryCatalogChoice>,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRecoveryImportPrepareRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub batch_id: String,
+    pub collection: String,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRecoveryReconcileRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub batch_id: String,
+}
+
 pub trait AgentHandler: Send + Sync {
+    fn recovery_catalog(
+        &self,
+        _account: &str,
+        _session: &str,
+        _service: &str,
+        _after: u64,
+    ) -> Result<Value, String> {
+        Err("recovery_unavailable".into())
+    }
+    fn recovery_receipt(
+        &self,
+        _account: &str,
+        _session: &str,
+        _batch: &str,
+    ) -> Result<Value, String> {
+        Err("recovery_unavailable".into())
+    }
+    fn recovery_requests(
+        &self,
+        _account: &str,
+        _session: &str,
+        _after: &str,
+    ) -> Result<Value, String> {
+        Err("recovery_unavailable".into())
+    }
+    fn recovery_review(&self, _command: &AgentPendingBindingCommand) -> Result<Value, String> {
+        Err("recovery_unavailable".into())
+    }
     /// Start a turn for `prompt` on `account`; returns a `turn_id` the client streams.
     fn start_turn(&self, account: &str, prompt: &str) -> Result<String, String>;
+    fn prepare_contact_name(
+        &self,
+        _request: &AgentContactNamePrepareRequest,
+    ) -> Result<Value, String> {
+        Err("confirmation_unavailable".into())
+    }
+    fn prepare_task_completion(
+        &self,
+        _request: &AgentTaskCompletionPrepareRequest,
+    ) -> Result<Value, String> {
+        Err("confirmation_unavailable".into())
+    }
+    fn prepare_task_occurrence(
+        &self,
+        _request: &AgentTaskOccurrencePrepareRequest,
+    ) -> Result<Value, String> {
+        Err("confirmation_unavailable".into())
+    }
+    fn prepare_calendar_text(
+        &self,
+        _request: &AgentCalendarTextPrepareRequest,
+    ) -> Result<Value, String> {
+        Err("confirmation_unavailable".into())
+    }
+    fn prepare_calendar_time(
+        &self,
+        _request: &AgentCalendarTimePrepareRequest,
+    ) -> Result<Value, String> {
+        Err("confirmation_unavailable".into())
+    }
+    fn prepare_calendar_alarm(
+        &self,
+        _request: &AgentCalendarAlarmPrepareRequest,
+    ) -> Result<Value, String> {
+        Err("confirmation_unavailable".into())
+    }
+    fn prepare_dav_acl(&self, _request: &AgentDavAclPrepareRequest) -> Result<Value, String> {
+        Err("confirmation_unavailable".into())
+    }
+    fn prepare_invitation_response(
+        &self,
+        _request: &AgentInvitationResponsePrepareRequest,
+    ) -> Result<Value, String> {
+        Err("confirmation_unavailable".into())
+    }
+    fn prepare_dav_delete(&self, _request: &AgentDavDeletePrepareRequest) -> Result<Value, String> {
+        Err("confirmation_unavailable".into())
+    }
+    fn prepare_dav_create(&self, _request: &AgentDavCreatePrepareRequest) -> Result<Value, String> {
+        Err("confirmation_unavailable".into())
+    }
+    fn prepare_contact_field(
+        &self,
+        _request: &AgentContactFieldPrepareRequest,
+    ) -> Result<Value, String> {
+        Err("confirmation_unavailable".into())
+    }
+    fn prepare_mail_action(
+        &self,
+        _request: &AgentMailActionPrepareRequest,
+    ) -> Result<Value, String> {
+        Err("confirmation_unavailable".into())
+    }
+    fn prepare_task_parent(
+        &self,
+        _request: &AgentTaskParentPrepareRequest,
+    ) -> Result<Value, String> {
+        Err("confirmation_unavailable".into())
+    }
+    fn prepare_task_attributes(
+        &self,
+        _request: &AgentTaskAttributesPrepareRequest,
+    ) -> Result<Value, String> {
+        Err("confirmation_unavailable".into())
+    }
+    fn prepare_cancellation(
+        &self,
+        _request: &AgentCancellationPrepareRequest,
+    ) -> Result<Value, String> {
+        Err("confirmation_unavailable".into())
+    }
+    fn single_capture_intent_phase(
+        &self,
+        _account: &str,
+        _session: &str,
+        _operation: &str,
+        _pending: &str,
+        _action_hash: &str,
+    ) -> Result<Value, String> {
+        Err("capture_unavailable".into())
+    }
+    fn single_capture_has_claim(
+        &self,
+        _account: &str,
+        _session: &str,
+        _operation: &str,
+    ) -> Result<bool, String> {
+        Err("capture_unavailable".into())
+    }
+    fn single_capture_status(
+        &self,
+        _account: &str,
+        _session: &str,
+        _operation: &str,
+    ) -> Result<Value, String> {
+        Err("capture_unavailable".into())
+    }
+    fn prepare_contact_photo(
+        &self,
+        _request: &AgentContactPhotoPrepareRequest,
+    ) -> Result<Value, String> {
+        Err("confirmation_unavailable".into())
+    }
+    fn prepare_single_capture(
+        &self,
+        _request: &AgentSingleCapturePrepareRequest,
+    ) -> Result<Value, String> {
+        Err("confirmation_unavailable".into())
+    }
+    fn prepare_recovery_jobs(
+        &self,
+        _request: &AgentRecoveryJobsPrepareRequest,
+    ) -> Result<Value, String> {
+        Err("confirmation_unavailable".into())
+    }
+    fn prepare_recovery_import(
+        &self,
+        _request: &AgentRecoveryImportPrepareRequest,
+    ) -> Result<Value, String> {
+        Err("confirmation_unavailable".into())
+    }
+    fn reconcile_recovery(
+        &self,
+        _request: &AgentRecoveryReconcileRequest,
+    ) -> Result<Value, String> {
+        Err("recovery_unavailable".into())
+    }
+    fn composer_identities(&self, _account: &str) -> Result<Value, String> {
+        Err("provider_identity_unavailable".into())
+    }
+    fn prepare_composer_send(
+        &self,
+        _request: &AgentComposerPrepareRequest,
+    ) -> Result<Value, String> {
+        Err("confirmation_unavailable".into())
+    }
     fn start_turn_request(
         self: std::sync::Arc<Self>,
         request: AgentTurnRequest,
@@ -2632,15 +3617,11 @@ pub trait AgentHandler: Send + Sync {
     }
     /// Peek the non-secret binding for a pending destructive action without checking
     /// or consuming its one-time Agent confirmation token.
-    fn pending_binding(
-        &self,
-        _pending_id: &str,
-        _action_hash: &str,
-    ) -> Result<AgentPendingBinding, String> {
-        Err("pending binding is not enabled on this server".into())
+    fn pending_binding(&self, _command: &AgentPendingBindingCommand) -> AgentPendingBindingOutcome {
+        AgentPendingBindingOutcome::Unavailable
     }
-    /// Confirm a pending destructive action with its one-time token; returns a summary.
-    fn confirm(&self, pending_id: &str, token: &str, action_hash: &str) -> Result<String, String>;
+    /// Confirm a pending destructive action without exposing executor output.
+    fn confirm(&self, command: &AgentConfirmCommand) -> AgentConfirmOutcome;
     /// Cancel an in-flight turn.
     fn cancel(&self, turn_id: &str);
     fn cancel_turn(&self, turn_id: &str) -> Result<(), String> {
@@ -2660,6 +3641,14 @@ pub trait AgentHandler: Send + Sync {
     ) -> Result<serde_json::Value, String> {
         Err("product sessions are not enabled on this server".into())
     }
+    fn session_create_for_account(
+        &self,
+        request_id: &str,
+        _account: Option<&str>,
+        display_name: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        self.session_create(request_id, display_name)
+    }
 
     fn session_list(
         &self,
@@ -2667,6 +3656,14 @@ pub trait AgentHandler: Send + Sync {
         _limit: Option<usize>,
     ) -> Result<serde_json::Value, String> {
         Err("product sessions are not enabled on this server".into())
+    }
+    fn session_list_for_account(
+        &self,
+        _account: Option<&str>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<serde_json::Value, String> {
+        self.session_list(cursor, limit)
     }
 
     fn session_select(
@@ -3038,7 +4035,197 @@ pub trait OneDriveRiskHandler: Send + Sync {
 /// read-only CLI `serve` does not set it, so every `/api/v1/mail/*` POST is
 /// refused there. The web UI for these verbs lands in #563 — this trait + the
 /// endpoints are the backend they build on.
+pub struct ProviderMailView {
+    pub content: String,
+    pub is_html: bool,
+    pub incomplete: bool,
+}
+pub struct ProviderAttachmentDownload {
+    pub filename: String,
+    pub bytes: Vec<u8>,
+}
+
+fn provider_contact_photo_response(photo: Option<(String, Vec<u8>)>) -> ApiResponse {
+    match photo {
+        Some((mime, bytes))
+            if matches!(mime.as_str(), "image/png" | "image/jpeg")
+                && bytes.len() <= 2 * 1024 * 1024 =>
+        {
+            with_no_store(ApiResponse {
+                status: 200,
+                content_type: mime,
+                body: bytes,
+                headers: vec![("X-Content-Type-Options".into(), "nosniff".into())],
+            })
+        }
+        _ => with_no_store(ApiResponse::error(404, "contact_photo_unavailable")),
+    }
+}
+
+fn provider_attachment_response(file: ProviderAttachmentDownload) -> ApiResponse {
+    let encoded: String = file
+        .filename
+        .as_bytes()
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.') {
+                (*byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .concat();
+    ApiResponse {
+        status: 200,
+        content_type: "application/octet-stream".into(),
+        body: file.bytes,
+        headers: vec![
+            (
+                "Content-Disposition".into(),
+                format!("attachment; filename=\"attachment\"; filename*=UTF-8''{encoded}"),
+            ),
+            ("Cache-Control".into(), "no-store".into()),
+        ],
+    }
+}
+
+fn render_provider_mail_view(body: ProviderMailView) -> ApiResponse {
+    let content = if body.is_html {
+        view::sanitize_mail_html(&body.content)
+    } else {
+        format!("<pre>{}</pre>", view::escape(&body.content))
+    };
+    let warning = if body.incomplete {
+        "<p>Message body is incomplete or has an encoding problem.</p>"
+    } else {
+        ""
+    };
+    ApiResponse::html_with_csp(
+        &view::page("Message", &format!("{warning}{content}")),
+        view::VIEWER_CSP,
+    )
+}
+
 pub trait MailWriteHandler: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
+    fn provider_live_mail_page(
+        &self,
+        _account: &str,
+        _native_account: Option<&str>,
+        _mailbox_id: Option<&str>,
+        _text: Option<&str>,
+        _position: usize,
+        _limit: usize,
+        _query_state: Option<&str>,
+    ) -> Result<Value, String> {
+        Err("provider_mail_unavailable".into())
+    }
+    /// Fresh authenticated discovery; errors must hide shared cached accounts.
+    fn provider_shared_mail_accounts(&self, _account: &str) -> Result<Vec<String>, String> {
+        Err("provider_scope_unavailable".into())
+    }
+    fn provider_shared_mailbox_ids(
+        &self,
+        _account: &str,
+        _scope: &str,
+    ) -> Result<Vec<String>, String> {
+        Err("provider_scope_unavailable".into())
+    }
+    fn provider_store(&self, _account: &str) -> Result<Store, String> {
+        Err("provider_store_unavailable".into())
+    }
+    fn with_provider_cache(
+        &self,
+        account: &str,
+        _origin: &str,
+        f: &mut dyn FnMut(&Store) -> ApiResponse,
+    ) -> Result<ApiResponse, String> {
+        self.provider_store(account).map(|store| f(&store))
+    }
+    // This boundary mirrors the provider draft request fields.
+    #[allow(clippy::too_many_arguments)]
+    fn provider_create_draft(
+        &self,
+        _account: &str,
+        _request_id: &str,
+        _subject: &str,
+        _body: &str,
+        _to: &[String],
+        _cc: &[String],
+        _bcc: &[String],
+        _importance: Option<&str>,
+        _read_receipt: bool,
+        _identity_id: Option<&str>,
+        _expected_draft_mailbox: Option<&str>,
+    ) -> Result<Value, String> {
+        Err("provider_draft_unavailable".into())
+    }
+    /// Fetch a bounded, plain-text provider body. This does not imply archival capture.
+    fn provider_read_body(&self, _account: &str, _message_id: &str) -> Result<String, String> {
+        Err("provider_read_unavailable".into())
+    }
+    fn provider_attachment_list(&self, _account: &str, _message_id: &str) -> Result<Value, String> {
+        Err("provider_attachment_unavailable".into())
+    }
+    fn provider_attachment_download(
+        &self,
+        _account: &str,
+        _message_id: &str,
+        _blob_id: &str,
+    ) -> Result<ProviderAttachmentDownload, String> {
+        Err("provider_attachment_unavailable".into())
+    }
+    fn provider_attachment_list_scoped(
+        &self,
+        account: &str,
+        scope: Option<&str>,
+        message_id: &str,
+    ) -> Result<Value, String> {
+        if scope.is_some() {
+            return Err("provider_scope_unavailable".into());
+        }
+        self.provider_attachment_list(account, message_id)
+    }
+    fn provider_attachment_download_scoped(
+        &self,
+        account: &str,
+        scope: Option<&str>,
+        message_id: &str,
+        blob_id: &str,
+    ) -> Result<ProviderAttachmentDownload, String> {
+        if scope.is_some() {
+            return Err("provider_scope_unavailable".into());
+        }
+        self.provider_attachment_download(account, message_id, blob_id)
+    }
+    fn provider_read_view(
+        &self,
+        account: &str,
+        message_id: &str,
+    ) -> Result<ProviderMailView, String> {
+        self.provider_read_body(account, message_id)
+            .map(|content| ProviderMailView {
+                content,
+                is_html: false,
+                incomplete: false,
+            })
+    }
+    fn provider_read_view_scoped(
+        &self,
+        account: &str,
+        scope: Option<&str>,
+        message_id: &str,
+    ) -> Result<ProviderMailView, String> {
+        if scope.is_some() {
+            return Err("provider_scope_unavailable".into());
+        }
+        self.provider_read_view(account, message_id)
+    }
+    /// Read the current Graph `isRead` value for one opaque message id.
+    /// This is intentionally separate from StoreArchive reads so callers can
+    /// reconcile a live write without treating the local archive as Graph.
+    fn read_state(&self, account: &str, message_id: &str) -> Result<bool, String>;
     /// Compose and send a new message (saved to Sent Items).
     #[allow(clippy::too_many_arguments)] // a compose genuinely has many fields
     fn send(
@@ -3128,6 +4315,49 @@ pub trait MailWriteHandler: Send + Sync {
 /// `/api/v1/calendar/*` POST is refused there. `event` is a Graph event resource
 /// the router builds from the request (sanitized to writable fields downstream).
 pub trait CalendarWriteHandler: Send + Sync {
+    fn provider_contact_photo(
+        &self,
+        _account: &str,
+        _collection: &str,
+        _href: &str,
+    ) -> Result<Option<(String, Vec<u8>)>, String> {
+        Err("provider_photo_unavailable".into())
+    }
+    fn provider_calendar(
+        &self,
+        _account: &str,
+        _collection: Option<&str>,
+        _after: &str,
+    ) -> Result<Value, String> {
+        Err("provider_calendar_unavailable".into())
+    }
+    fn provider_expanded_month(
+        &self,
+        _account: &str,
+        _collection: &str,
+        _year: u32,
+        _month: u32,
+    ) -> Result<Value, String> {
+        Err("provider_calendar_unavailable".into())
+    }
+    fn provider_expanded_tasks_month(
+        &self,
+        _account: &str,
+        _collection: &str,
+        _year: u32,
+        _month: u32,
+    ) -> Result<Value, String> {
+        Err("provider_calendar_unavailable".into())
+    }
+    fn provider_freebusy_month(
+        &self,
+        _account: &str,
+        _collection: &str,
+        _year: u32,
+        _month: u32,
+    ) -> Result<Value, String> {
+        Err("provider_freebusy_unavailable".into())
+    }
     /// Create an event; returns the new cloud id.
     fn create(&self, account: &str, event: &Value) -> Result<String, String>;
     /// Update an event's writable fields from a (partial) event resource.
@@ -3151,6 +4381,14 @@ pub trait CalendarWriteHandler: Send + Sync {
 /// Graph contact resource the router builds from the request (sanitized to the
 /// writable fields downstream).
 pub trait ContactWriteHandler: Send + Sync {
+    fn provider_contacts(
+        &self,
+        _account: &str,
+        _collection: Option<&str>,
+        _after: &str,
+    ) -> Result<Value, String> {
+        Err("provider_contacts_unavailable".into())
+    }
     /// Create a contact; returns the new cloud id.
     fn create(&self, account: &str, contact: &Value) -> Result<String, String>;
     /// Update a contact's writable fields from a (partial) contact resource.
@@ -3278,7 +4516,20 @@ pub enum MutationPurpose {
         subject: String,
         importance: Option<String>,
         read_receipt: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity_id: Option<String>,
         all: bool,
+    },
+    MailAttachment {
+        account: String,
+        filename: String,
+        content_type: String,
+    },
+    ContactPhoto {
+        account: String,
+        collection: String,
+        href: String,
+        media_type: String,
     },
     OnenoteBody {
         account: String,
@@ -3313,6 +4564,7 @@ impl MutationPurpose {
                 subject: _,
                 importance,
                 read_receipt,
+                identity_id,
                 all,
             } => {
                 let recipient_count = recipients
@@ -3323,18 +4575,15 @@ impl MutationPurpose {
                     .as_deref()
                     .is_none_or(|value| matches!(value, "low" | "normal" | "high"));
                 !account.is_empty()
-                    && recipient_count.is_some_and(|count| count <= 256)
+                    && recipient_count.is_some_and(|count| count <= 1000)
                     && valid_importance
+                    && identity_id.as_ref().is_none_or(|id| {
+                        !id.is_empty() && id.len() <= 1024 && !id.chars().any(char::is_control)
+                    })
+                    && (operation == "draft" || identity_id.is_none())
                     && match operation.as_str() {
                         "send" => !recipients.is_empty() && target.is_empty(),
-                        "draft" => {
-                            target.is_empty()
-                                && cc.is_empty()
-                                && bcc.is_empty()
-                                && importance.is_none()
-                                && !read_receipt
-                                && !all
-                        }
+                        "draft" => target.is_empty() && !all,
                         "reply" => {
                             !target.is_empty()
                                 && recipients.is_empty()
@@ -3354,6 +4603,37 @@ impl MutationPurpose {
                         }
                         _ => false,
                     }
+            }
+            Self::MailAttachment {
+                account,
+                filename,
+                content_type,
+            } => {
+                !account.is_empty()
+                    && !filename.is_empty()
+                    && filename.len() <= 255
+                    && !filename.chars().any(char::is_control)
+                    && !content_type.is_empty()
+                    && content_type.len() <= 255
+                    && content_type.is_ascii()
+                    && !content_type
+                        .chars()
+                        .any(|c| c.is_control() || c.is_whitespace())
+            }
+            Self::ContactPhoto {
+                account,
+                collection,
+                href,
+                media_type,
+            } => {
+                !account.is_empty()
+                    && !collection.is_empty()
+                    && collection.len() <= 4096
+                    && !href.is_empty()
+                    && href.len() <= 4096
+                    && matches!(media_type.as_str(), "image/png" | "image/jpeg")
+                    && !collection.chars().any(char::is_control)
+                    && !href.chars().any(char::is_control)
             }
             Self::OnenoteBody {
                 account,
@@ -3401,6 +4681,20 @@ impl MutationPurpose {
                 account,
                 "mail",
                 format!("{operation}#{binding}"),
+            ),
+            Self::MailAttachment {
+                account, filename, ..
+            } => (
+                "live-write",
+                account,
+                "mail",
+                format!("attachment:{filename}#{binding}"),
+            ),
+            Self::ContactPhoto { account, href, .. } => (
+                "live-write",
+                account,
+                "contacts",
+                format!("photo:{href}#{binding}"),
             ),
             Self::OnenoteBody {
                 account, operation, ..
@@ -3457,6 +4751,49 @@ pub trait MutationIntentHandler: Send + Sync {
         sha256: &str,
     ) -> Result<Value, String>;
     fn cancel(&self, owner: &str, request_id: &str, intent_id: &str) -> Result<(), String>;
+    fn cancel_attachment_staging(
+        &self,
+        _owner: &str,
+        _request_id: &str,
+        _intent_id: &str,
+        _account: &str,
+    ) -> Result<(), String> {
+        Err("mutation_intent_unavailable".into())
+    }
+    fn release_confirmed_attachment(
+        &self,
+        _owner: &str,
+        _request_id: &str,
+        _intent_id: &str,
+        _account: &str,
+    ) -> Result<(), String> {
+        Err("mutation_intent_unavailable".into())
+    }
+    fn attachment_status(
+        &self,
+        _owner: &str,
+        _account: &str,
+        _intent_id: &str,
+    ) -> Result<Value, String> {
+        Err("mutation_intent_unavailable".into())
+    }
+    fn mail_status(&self, _owner: &str, _account: &str, _intent_id: &str) -> Result<Value, String> {
+        Err("mutation_intent_unavailable".into())
+    }
+    fn recover_mail_status(
+        &self,
+        _owner: &str,
+        _account: &str,
+        _subject_sha256: &str,
+    ) -> Result<Value, String> {
+        Err("mutation_intent_unavailable".into())
+    }
+    fn legacy_mail_status(&self, _owner: &str, _account: &str) -> Result<Value, String> {
+        Err("mutation_intent_unavailable".into())
+    }
+    fn confirmed_attachments(&self, _owner: &str, _account: &str) -> Result<Value, String> {
+        Err("mutation_intent_unavailable".into())
+    }
 }
 
 /// Performs the OneDrive **local-body management** verbs on behalf of a cap-token POST (#659):
@@ -3534,6 +4871,10 @@ pub enum AccountAuthState {
     Connected,
     Disconnected,
     ReconnectRequired,
+    PermissionDenied,
+    AccessUnknown,
+    ServiceUnreachable,
+    ProviderResponseInvalid,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -3551,6 +4892,24 @@ pub struct AccountAuthStatus {
 /// Live account-auth handler (#68): the daemon's Microsoft sign-in + sign-out.
 /// `None` => the account menu offers only switching (the read-only CLI `serve`).
 pub trait AccountAuthHandler: Send + Sync {
+    fn current_config(&self) -> Option<Config> {
+        None
+    }
+    fn quarantine_list(&self, _account: &str) -> Result<Vec<String>, String> {
+        Err("account_recovery_unavailable".into())
+    }
+    fn quarantine_revoke(&self, _account: &str, _id: &str) -> Result<(), String> {
+        Err("account_recovery_unavailable".into())
+    }
+    fn create_provider_account(
+        &self,
+        _account: &str,
+        _username: &str,
+        _origin: &str,
+        _client_id: &str,
+    ) -> Result<(), String> {
+        Err("account_setup_unavailable".into())
+    }
     /// Begin Authorization Code + PKCE for a configured account. Returns only an opaque login ID
     /// and a reviewed authorization URI. The expected state, verifier, callback code, and tokens
     /// stay in Rust; the authorization URI necessarily contains the public state challenge.
@@ -3618,9 +4977,21 @@ impl EventBus {
     }
 }
 
+#[cfg(unix)]
+type ArchiveReaderCache = Vec<(
+    String,
+    PathBuf,
+    isyncyou_store::ReadonlyCacheIdentity,
+    Store,
+)>;
+
 /// Routes requests against the configured accounts and their stores.
 pub struct Router {
     config: Config,
+    #[cfg(unix)]
+    archive_reader: std::sync::Mutex<ArchiveReaderCache>,
+    #[cfg(all(test, unix))]
+    archive_reader_opens: std::sync::atomic::AtomicUsize,
     /// Optional change broadcaster for the SSE `/api/v1/events` stream (the
     /// daemon's). `None` => the events endpoint reports no live push.
     events: Option<std::sync::Arc<EventBus>>,
@@ -3781,6 +5152,10 @@ impl Router {
     pub fn new(config: Config) -> Self {
         Router {
             config,
+            #[cfg(unix)]
+            archive_reader: std::sync::Mutex::new(Vec::new()),
+            #[cfg(all(test, unix))]
+            archive_reader_opens: std::sync::atomic::AtomicUsize::new(0),
             events: None,
             gate: None,
             restore: None,
@@ -3840,6 +5215,10 @@ impl Router {
     pub fn with_gate(config: Config, gate: std::sync::Arc<std::sync::Mutex<()>>) -> Self {
         Router {
             config,
+            #[cfg(unix)]
+            archive_reader: std::sync::Mutex::new(Vec::new()),
+            #[cfg(all(test, unix))]
+            archive_reader_opens: std::sync::atomic::AtomicUsize::new(0),
             events: None,
             gate: Some(gate),
             restore: None,
@@ -4009,10 +5388,6 @@ impl Router {
                     Ok(id) => Some(ApiResponse::ok_json(&json!({
                         "status": "confirmation_required",
                         "pending_action_id": id,
-                        "op": op,
-                        "account": account,
-                        "service": service,
-                        "item": item,
                     }))),
                     Err(e) => {
                         let status = match e {
@@ -4275,6 +5650,15 @@ impl Router {
         }
     }
 
+    /// Check the independent Agent capability required before opening a turn stream.
+    /// The capability is transport metadata only and must never be placed in the target.
+    pub fn agent_stream_capability_authorized(&self, provided: Option<&str>) -> bool {
+        match (&self.agent_cap_token, provided) {
+            (Some(expected), Some(provided)) => ct_eq(expected.as_bytes(), provided.as_bytes()),
+            _ => false,
+        }
+    }
+
     /// Open a push stream for the Android in-process bridge (#0A) — the replacement for the
     /// two `EventSource` endpoints on the phone, where no loopback port exists to hold an
     /// SSE socket open. Items are ready-to-embed JSON event objects
@@ -4286,6 +5670,7 @@ impl Router {
         &self,
         target: &str,
         session_token: Option<&str>,
+        capability_token: Option<&str>,
     ) -> Option<std::sync::mpsc::Receiver<String>> {
         let req =
             ApiRequest::new("GET", target).with_session_token(session_token.map(str::to_string));
@@ -4294,6 +5679,9 @@ impl Router {
         }
         match req.path.as_str() {
             "/api/v1/events" => {
+                if capability_token.is_some() {
+                    return None;
+                }
                 let bus = self.events_bus()?.clone();
                 let (tx, rx) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
@@ -4316,6 +5704,9 @@ impl Router {
                 Some(rx)
             }
             "/api/v1/agent/stream" => {
+                if !self.agent_stream_capability_authorized(capability_token) {
+                    return None;
+                }
                 let turn = req
                     .query
                     .iter()
@@ -4438,17 +5829,25 @@ impl Router {
         }
 
         let response = execute(Some(&identity));
-        let confirmation_required = response.status == 200
-            && response.content_type == "application/json"
-            && serde_json::from_slice::<Value>(&response.body)
-                .ok()
-                .is_some_and(|value| {
-                    value.get("status").and_then(Value::as_str) == Some("confirmation_required")
-                });
-        if confirmation_required {
+        let response_code = (response.content_type == "application/json")
+            .then(|| serde_json::from_slice::<Value>(&response.body).ok())
+            .flatten()
+            .and_then(|value| {
+                value
+                    .get("status")
+                    .or_else(|| value.get("error"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        let confirmation_required =
+            response.status == 200 && response_code.as_deref() == Some("confirmation_required");
+        let confirmation_retryable = spec.route == ProductPostRoute::AgentConfirm
+            && response.status == 503
+            && response_code.as_deref() == Some("confirmation_retryable");
+        if confirmation_required || confirmation_retryable {
             // Native user presence is an intermediate state. The retry carrying
-            // the confirmed public handle must reach the handler, after which its
-            // terminal result becomes the replayable receipt.
+            // the confirmed public handle, or a host-proven pre-consume retry, must
+            // reach the handler. The global UUID binding remains authoritative.
             if store.abort(&identity).is_err() {
                 return ApiResponse::error(503, "request_store_unavailable");
             }
@@ -4579,6 +5978,9 @@ impl Router {
         // AC is exactly "pause a LIVE materialization"). They are still session-token-gated (checked
         // above) and cap-token-gated in the handler; only the store gate is skipped.
         const GATE_EXEMPT_POST: &[&str] = &[
+            // A body-based live read touches no archive Store and must remain
+            // available while that Store is being refreshed.
+            "/api/v1/mail/read-state",
             "/api/v1/onedrive/transfers/cancel",
             "/api/v1/onedrive/transfers/pause",
             "/api/v1/onedrive/transfers/retry",
@@ -4588,6 +5990,10 @@ impl Router {
             "/api/v1/agent/turn",
             "/api/v1/agent/turn/cancel",
             "/api/v1/agent/pending/cancel",
+            // Confirmation consumes its persistent authority first; the selected
+            // executor acquires this same archive gate around its own store work.
+            // Holding it here would deadlock a non-reentrant mutex.
+            "/api/v1/agent/confirm",
         ];
         let static_get = req.method == "GET"
             && (matches!(
@@ -4595,7 +6001,23 @@ impl Router {
                 "/" | "/app.js" | "/app.css" | "/callback"
             ) || req.path.ends_with(".woff2")
                 || req.path.starts_with("/sfx/"));
+        // Classification is bound to dispatch: config changes cannot turn this
+        // gate-exempt live read into an archive-store read.
+        let live_provider_attachment = req.method == "GET"
+            && req.path == "/api/v1/attachment"
+            && req.q("service") == Some("mail")
+            && req
+                .q("account")
+                .is_some_and(|account| self.provider_origin(account).is_some());
+        let live_provider_mail_view = req.method == "GET"
+            && req.path == "/api/v1/view"
+            && req.q("service") == Some("mail")
+            && req
+                .q("account")
+                .is_some_and(|account| self.provider_origin(account).is_some());
         let gate_exempt = static_get
+            || live_provider_attachment
+            || live_provider_mail_view
             || (req.method == "GET" && GATE_EXEMPT_GET.contains(&req.path.as_str()))
             || (req.method == "POST" && GATE_EXEMPT_POST.contains(&req.path.as_str()));
         let _gate = if gate_exempt {
@@ -4605,6 +6027,12 @@ impl Router {
                 .as_ref()
                 .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()))
         };
+        if live_provider_attachment {
+            return self.live_provider_attachment(req);
+        }
+        if live_provider_mail_view {
+            return self.live_provider_mail_view(req);
+        }
         if req.method == "POST" {
             let Some(spec) = product_post_route(&req.path) else {
                 return ApiResponse::error(405, "method not allowed");
@@ -4624,6 +6052,7 @@ impl Router {
                 ProductPostRoute::MailForward => self.mail_forward(req),
                 ProductPostRoute::MailMove => self.mail_move(req),
                 ProductPostRoute::MailRead => self.mail_read(req),
+                ProductPostRoute::MailReadState => self.mail_read_state(req),
                 ProductPostRoute::MailFlag => self.mail_flag(req),
                 ProductPostRoute::MailCategories => self.mail_categories(req),
                 ProductPostRoute::MailDraft => self.mail_draft(req),
@@ -4663,12 +6092,51 @@ impl Router {
                 ProductPostRoute::OnedriveConflictResolve => self.onedrive_conflict_resolve(req),
                 ProductPostRoute::OnedriveCleanup => self.onedrive_cleanup(req),
                 ProductPostRoute::AccountLoginStart => self.account_login_start(req),
+                ProductPostRoute::AccountCreateProvider => self.account_create_provider(req),
+                ProductPostRoute::AccountQuarantineList => self.account_quarantine(req, false),
+                ProductPostRoute::AccountQuarantineRevoke => self.account_quarantine(req, true),
                 ProductPostRoute::AccountLoginPoll => self.account_login_poll(req),
                 ProductPostRoute::AccountLoginCancel => self.account_login_cancel(req),
                 ProductPostRoute::AccountSignout => self.account_signout(req),
                 ProductPostRoute::PushRegister => self.push_register(req),
                 ProductPostRoute::PushTest => self.push_test(req),
                 ProductPostRoute::AgentTurn => self.agent_turn(req, identity.cloned()),
+                ProductPostRoute::AgentComposerPrepare => self.agent_composer_prepare(req),
+                ProductPostRoute::AgentComposerIdentities => self.agent_composer_identities(req),
+                ProductPostRoute::AgentContactNamePrepare => self.agent_contact_name_prepare(req),
+                ProductPostRoute::AgentTaskCompletionPrepare => {
+                    self.agent_task_completion_prepare(req)
+                }
+                ProductPostRoute::AgentTaskOccurrencePrepare => {
+                    self.agent_task_occurrence_prepare(req)
+                }
+                ProductPostRoute::AgentCalendarTextPrepare => self.agent_calendar_text_prepare(req),
+                ProductPostRoute::AgentCalendarTimePrepare => self.agent_calendar_time_prepare(req),
+                ProductPostRoute::AgentCalendarAlarmPrepare => {
+                    self.agent_calendar_alarm_prepare(req)
+                }
+                ProductPostRoute::AgentDavAclPrepare => self.agent_dav_acl_prepare(req),
+                ProductPostRoute::AgentInvitationResponsePrepare => {
+                    self.agent_invitation_response_prepare(req)
+                }
+                ProductPostRoute::AgentDavDeletePrepare => self.agent_dav_delete_prepare(req),
+                ProductPostRoute::AgentDavCreatePrepare => self.agent_dav_create_prepare(req),
+                ProductPostRoute::AgentContactFieldPrepare => self.agent_contact_field_prepare(req),
+                ProductPostRoute::AgentMailActionPrepare => self.agent_mail_action_prepare(req),
+                ProductPostRoute::AgentTaskAttributesPrepare => {
+                    self.agent_task_attributes_prepare(req)
+                }
+                ProductPostRoute::AgentTaskParentPrepare => self.agent_task_parent_prepare(req),
+                ProductPostRoute::AgentCancellationPrepare => self.agent_cancellation_prepare(req),
+                ProductPostRoute::AgentContactPhotoPrepare => self.agent_contact_photo_prepare(req),
+                ProductPostRoute::AgentSingleCapturePrepare => {
+                    self.agent_single_capture_prepare(req)
+                }
+                ProductPostRoute::AgentRecoveryJobsPrepare => self.agent_recovery_jobs_prepare(req),
+                ProductPostRoute::AgentRecoveryImportPrepare => {
+                    self.agent_recovery_import_prepare(req)
+                }
+                ProductPostRoute::AgentRecoveryReconcile => self.agent_recovery_reconcile(req),
                 ProductPostRoute::AgentSessionCreate => self.agent_session_create(req),
                 ProductPostRoute::AgentSessionSelect => self.agent_session_select(req),
                 ProductPostRoute::AgentSessionArchive => self.agent_session_archive(req),
@@ -4854,6 +6322,18 @@ impl Router {
             "/api/v1/activity" => self.activity(req),
             "/api/v1/status" => self.status(req),
             "/api/v1/items" => self.items(req),
+            "/api/v1/calendar/expanded" => self.calendar_expanded(req),
+            "/api/v1/agent/recovery/catalog" => self.agent_recovery_catalog(req),
+            "/api/v1/agent/recovery/requests" => self.agent_recovery_requests(req),
+            "/api/v1/agent/recovery/capture/intent-phase" => {
+                self.agent_single_capture_intent_phase(req)
+            }
+            "/api/v1/agent/recovery/capture/claim" => self.agent_single_capture_claim(req),
+            "/api/v1/agent/recovery/capture/status" => self.agent_single_capture_status(req),
+            "/api/v1/agent/recovery/receipt" => self.agent_recovery_receipt(req),
+            "/api/v1/agent/recovery/review" => self.agent_recovery_review(req),
+            "/api/v1/mutation-intent/attachment-status" => self.mutation_attachment_status(req),
+            "/api/v1/mutation-intent/mail-status" => self.mutation_mail_status(req),
             "/api/v1/item" => self.item(req),
             "/api/v1/body" => self.body(req),
             "/api/v1/attachment" => self.attachment(req),
@@ -4872,6 +6352,7 @@ impl Router {
             "/api/v1/onedrive/open" => self.onedrive_open(req),
             "/api/v1/contact/photo" => self.contact_photo(req),
             "/api/v1/debug/stats" => self.debug_stats(),
+            "/api/v1/mail/read-state" => ApiResponse::error(405, "method not allowed"),
             _ => ApiResponse::error(404, "not found"),
         }
     }
@@ -4930,6 +6411,30 @@ impl Router {
             ));
         }
         Ok(h)
+    }
+
+    fn mail_read_state(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.mail_gate(req) {
+            Ok(h) => h,
+            Err(response) => return response,
+        };
+        let parsed = match parse_strict_scalar_mutation(req, "mail read state", &["account", "id"])
+        {
+            Ok(parsed) => parsed,
+            Err(response) => return response,
+        };
+        let req = &parsed;
+        let (account, id) = match (
+            req.q("account").filter(|value| !value.is_empty()),
+            req.q("id").filter(|value| !value.is_empty()),
+        ) {
+            (Some(account), Some(id)) => (account, id),
+            _ => return ApiResponse::error(400, "account and id are required"),
+        };
+        match h.read_state(account, id) {
+            Ok(is_read) => ApiResponse::ok_json(&json!({ "is_read": is_read })),
+            Err(_) => ApiResponse::error(502, "mail_read_state_failed"),
+        }
     }
 
     /// Audit + map a unit mail result to a response. NB: we deliberately do NOT
@@ -5926,6 +7431,73 @@ impl Router {
         Ok((handler, owner.to_owned()))
     }
 
+    fn mutation_attachment_status(&self, req: &ApiRequest) -> ApiResponse {
+        let (handler, owner) = match self.mutation_intent_gate(req) {
+            Ok(value) => value,
+            Err(response) => return with_no_store(response),
+        };
+        let Some(account) = req.q("account") else {
+            return no_store_json_error(400, "invalid_attachment_status");
+        };
+        if account.is_empty() {
+            return no_store_json_error(400, "invalid_attachment_status");
+        }
+        if req.q("list") == Some("confirmed") {
+            return match handler.confirmed_attachments(&owner, account) {
+                Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+                Err(_) => no_store_json_error(409, "attachment_status_unavailable"),
+            };
+        }
+        let Some(intent_id) = req.q("intent_id") else {
+            return no_store_json_error(400, "invalid_attachment_status");
+        };
+        if account.is_empty() || intent_id.is_empty() || intent_id.len() > 128 {
+            return no_store_json_error(400, "invalid_attachment_status");
+        }
+        match handler.attachment_status(&owner, account, intent_id) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "attachment_status_unavailable"),
+        }
+    }
+
+    fn mutation_mail_status(&self, req: &ApiRequest) -> ApiResponse {
+        let (handler, owner) = match self.mutation_intent_gate(req) {
+            Ok(value) => value,
+            Err(response) => return with_no_store(response),
+        };
+        let Some(account) = req.q("account") else {
+            return no_store_json_error(400, "invalid_mail_status");
+        };
+        if account.is_empty() {
+            return no_store_json_error(400, "invalid_mail_status");
+        }
+        if req.q("list") == Some("legacy") {
+            return match handler.legacy_mail_status(&owner, account) {
+                Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+                Err(_) => no_store_json_error(409, "mail_status_unavailable"),
+            };
+        }
+        if let Some(digest) = req.q("subject_sha256") {
+            if !valid_sha256(digest) || req.q("intent_id").is_some() {
+                return no_store_json_error(400, "invalid_mail_status");
+            }
+            return match handler.recover_mail_status(&owner, account, digest) {
+                Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+                Err(_) => no_store_json_error(409, "mail_status_unavailable"),
+            };
+        }
+        let Some(intent_id) = req.q("intent_id") else {
+            return no_store_json_error(400, "invalid_mail_status");
+        };
+        if account.is_empty() || intent_id.is_empty() || intent_id.len() > 128 {
+            return no_store_json_error(400, "invalid_mail_status");
+        }
+        match handler.mail_status(&owner, account, intent_id) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "mail_status_unavailable"),
+        }
+    }
+
     fn mutation_intent_create(&self, req: &ApiRequest) -> ApiResponse {
         let (handler, owner) = match self.mutation_intent_gate(req) {
             Ok(value) => value,
@@ -6063,7 +7635,31 @@ impl Router {
         {
             return ApiResponse::error(400, "invalid mutation cancel request");
         }
-        match handler.cancel(&owner, &request.request_id, &request.intent_id) {
+        let result = if let Some(account) = request.account.as_deref() {
+            if account.is_empty() {
+                return ApiResponse::error(400, "invalid mutation cancel request");
+            }
+            if request.release_confirmed {
+                handler.release_confirmed_attachment(
+                    &owner,
+                    &request.request_id,
+                    &request.intent_id,
+                    account,
+                )
+            } else {
+                handler.cancel_attachment_staging(
+                    &owner,
+                    &request.request_id,
+                    &request.intent_id,
+                    account,
+                )
+            }
+        } else if request.release_confirmed {
+            return ApiResponse::error(400, "invalid mutation cancel request");
+        } else {
+            handler.cancel(&owner, &request.request_id, &request.intent_id)
+        };
+        match result {
             Ok(()) => ApiResponse::ok_json(&json!({ "cancelled": true })),
             Err(error) => mutation_error_response(&error),
         }
@@ -6652,6 +8248,27 @@ impl Router {
             };
         if !valid_client_request_id(&request.request_id) || request.account.is_empty() {
             return ApiResponse::error(400, "invalid mail draft request");
+        }
+        if self.provider_origin(&request.account).is_some() {
+            if request.id.is_some() {
+                return ApiResponse::error(409, "provider_send_requires_confirmation");
+            }
+            return match h.provider_create_draft(
+                &request.account,
+                &request.request_id,
+                &request.subject,
+                &request.body,
+                &request.to,
+                &[],
+                &[],
+                None,
+                false,
+                None,
+                None,
+            ) {
+                Ok(value) => ApiResponse::ok_json(&value),
+                Err(_) => ApiResponse::error(409, "provider_draft_outcome_unknown"),
+            };
         }
         if let Some(id) = request.id.as_deref().filter(|id| !id.is_empty()) {
             let r = h.send_draft(&request.account, id);
@@ -7522,8 +9139,12 @@ impl Router {
     }
 
     fn accounts(&self) -> ApiResponse {
-        let accounts: Vec<Value> = self
-            .config
+        let cfg = self
+            .account_auth
+            .as_ref()
+            .and_then(|h| h.current_config())
+            .unwrap_or_else(|| self.config.clone());
+        let accounts: Vec<Value> = cfg
             .accounts
             .iter()
             .map(|a| {
@@ -7531,10 +9152,86 @@ impl Router {
                     .account_auth
                     .as_ref()
                     .map(|handler| handler.status(&a.id));
-                json!({ "id": a.id, "username": a.username, "auth": auth })
+                let provider = if cfg.provider_accounts.contains_key(&a.id) {
+                    "self_hosted"
+                } else {
+                    "microsoft"
+                };
+                json!({ "id": a.id, "username": a.username, "auth": auth, "provider": provider })
             })
             .collect();
         ApiResponse::ok_json(&json!({ "accounts": accounts }))
+    }
+
+    fn provider_origin(&self, account: &str) -> Option<String> {
+        let cfg = self
+            .account_auth
+            .as_ref()
+            .and_then(|h| h.current_config())
+            .unwrap_or_else(|| self.config.clone());
+        cfg.provider_accounts
+            .get(account)
+            .map(|isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }| origin.clone())
+    }
+
+    fn account_quarantine(&self, req: &ApiRequest, revoke: bool) -> ApiResponse {
+        let h = match self.account_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let fields: &[&str] = if revoke {
+            &["account", "recovery_id"]
+        } else {
+            &["account"]
+        };
+        let parsed = match parse_strict_scalar_mutation(req, "account recovery", fields) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        let Some(account) = parsed.q("account") else {
+            return ApiResponse::error(400, "invalid_account_recovery");
+        };
+        if revoke {
+            let Some(id) = parsed.q("recovery_id") else {
+                return ApiResponse::error(400, "invalid_account_recovery");
+            };
+            match h.quarantine_revoke(account, id) {
+                Ok(()) => ApiResponse::ok_json(&json!({"revoked":true})),
+                Err(_) => ApiResponse::error(409, "grant_revocation_unconfirmed"),
+            }
+        } else {
+            match h.quarantine_list(account) {
+                Ok(ids) => ApiResponse::ok_json(&json!({"ids":ids})),
+                Err(_) => ApiResponse::error(409, "account_recovery_unavailable"),
+            }
+        }
+    }
+
+    fn account_create_provider(&self, req: &ApiRequest) -> ApiResponse {
+        let h = match self.account_gate(req) {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let parsed = match parse_strict_scalar_mutation(
+            req,
+            "provider account",
+            &["account", "username", "origin", "client_id"],
+        ) {
+            Ok(req) => req,
+            Err(e) => return e,
+        };
+        let (Some(account), Some(username), Some(origin), Some(client_id)) = (
+            parsed.q("account"),
+            parsed.q("username"),
+            parsed.q("origin"),
+            parsed.q("client_id"),
+        ) else {
+            return ApiResponse::error(400, "invalid_account_setup");
+        };
+        match h.create_provider_account(account, username, origin, client_id) {
+            Ok(()) => ApiResponse::ok_json(&json!({"created":true})),
+            Err(_) => ApiResponse::error(409, "account_setup_failed"),
+        }
     }
 
     /// Account-auth cap check (#68): 404 if sign-in isn't enabled (read-only serve),
@@ -7705,6 +9402,795 @@ impl Router {
         Ok(handler)
     }
 
+    fn agent_recovery_catalog(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let (Some(account), Some(session), Some(service)) =
+            (req.q("account"), req.q("session_id"), req.q("service"))
+        else {
+            return no_store_json_error(400, "invalid recovery request");
+        };
+        let after = match req.q("after").unwrap_or("0").parse::<u64>() {
+            Ok(value) => value,
+            Err(_) => return no_store_json_error(400, "invalid recovery request"),
+        };
+        if account.is_empty()
+            || !valid_opaque_agent_id(session)
+            || !valid_recovery_catalog_service(service)
+        {
+            return no_store_json_error(400, "invalid recovery request");
+        }
+        match handler.recovery_catalog(account, session, service, after) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "recovery_catalog_unavailable"),
+        }
+    }
+    fn agent_recovery_requests(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let (Some(account), Some(session)) = (req.q("account"), req.q("session_id")) else {
+            return no_store_json_error(400, "invalid recovery request");
+        };
+        let after = req.q("after").unwrap_or("");
+        if account.is_empty()
+            || !valid_opaque_agent_id(session)
+            || after.len() > 128
+            || after.chars().any(char::is_control)
+        {
+            return no_store_json_error(400, "invalid recovery request");
+        }
+        match handler.recovery_requests(account, session, after) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "recovery_requests_unavailable"),
+        }
+    }
+    fn agent_recovery_receipt(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let (Some(account), Some(session), Some(batch)) =
+            (req.q("account"), req.q("session_id"), req.q("batch_id"))
+        else {
+            return no_store_json_error(400, "invalid recovery request");
+        };
+        if account.is_empty()
+            || !valid_opaque_agent_id(session)
+            || batch.is_empty()
+            || batch.len() > 128
+            || !batch
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return no_store_json_error(400, "invalid recovery request");
+        }
+        match handler.recovery_receipt(account, session, batch) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "recovery_receipt_unavailable"),
+        }
+    }
+    fn agent_recovery_review(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let (
+            Some(pending),
+            Some(action_hash),
+            Some(session_id),
+            Some(turn_request_id),
+            Some(turn_id),
+        ) = (
+            req.q("pending"),
+            req.q("action_hash"),
+            req.q("session_id"),
+            req.q("turn_request_id"),
+            req.q("turn_id"),
+        )
+        else {
+            return no_store_json_error(400, "invalid recovery review");
+        };
+        if !valid_exact_base64url(pending, 22)
+            || !valid_sha256(action_hash)
+            || !valid_opaque_agent_id(session_id)
+            || !valid_client_request_id(turn_request_id)
+            || !valid_opaque_agent_id(turn_id)
+        {
+            return no_store_json_error(400, "invalid recovery review");
+        }
+        let command = AgentPendingBindingCommand {
+            pending: pending.into(),
+            action_hash: action_hash.into(),
+            owner: AgentPendingOwnerProof {
+                session_id: session_id.into(),
+                turn_request_id: turn_request_id.into(),
+                turn_id: turn_id.into(),
+            },
+        };
+        match handler.recovery_review(&command) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "recovery_review_unavailable"),
+        }
+    }
+
+    fn agent_contact_name_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let request: AgentContactNamePrepareRequest =
+            match parse_agent_strict_json(req, "contact name prepare") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || !valid_opaque_agent_id(&request.session_id)
+            || request.account.is_empty()
+            || request.collection.is_empty()
+            || request.href.is_empty()
+            || request.new_name.is_empty()
+        {
+            return no_store_json_error(400, "invalid contact request");
+        }
+        match handler.prepare_contact_name(&request) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "contact_prepare_unavailable"),
+        }
+    }
+
+    fn agent_task_occurrence_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let r: AgentTaskOccurrencePrepareRequest =
+            match parse_agent_strict_json(req, "task occurrence prepare") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&r.request_id)
+            || !valid_opaque_agent_id(&r.session_id)
+            || r.account.is_empty()
+            || r.collection.is_empty()
+            || r.href.is_empty()
+            || r.uid.is_empty()
+            || r.recurrence_id.is_empty()
+            || !r.complete
+            || r.window_start.is_empty()
+            || r.window_end.is_empty()
+        {
+            return no_store_json_error(400, "invalid task request");
+        }
+        match handler.prepare_task_occurrence(&r) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "task_prepare_unavailable"),
+        }
+    }
+
+    fn agent_task_completion_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let request: AgentTaskCompletionPrepareRequest =
+            match parse_agent_strict_json(req, "task completion prepare") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || !valid_opaque_agent_id(&request.session_id)
+            || request.account.is_empty()
+            || request.collection.is_empty()
+            || request.href.is_empty()
+            || request.uid.is_empty()
+        {
+            return no_store_json_error(400, "invalid task request");
+        }
+        match handler.prepare_task_completion(&request) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "task_prepare_unavailable"),
+        }
+    }
+
+    fn agent_calendar_text_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let request: AgentCalendarTextPrepareRequest =
+            match parse_agent_strict_json(req, "calendar text prepare") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || !valid_opaque_agent_id(&request.session_id)
+            || request.account.is_empty()
+            || request.collection.is_empty()
+            || request.href.is_empty()
+            || request.uid.is_empty()
+            || !matches!(request.field.as_str(), "SUMMARY" | "DESCRIPTION")
+            || request.new_value.is_empty()
+        {
+            return no_store_json_error(400, "invalid calendar request");
+        }
+        match handler.prepare_calendar_text(&request) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "calendar_prepare_unavailable"),
+        }
+    }
+
+    fn agent_calendar_alarm_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let request: AgentCalendarAlarmPrepareRequest =
+            match parse_agent_strict_json(req, "calendar alarm prepare") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || !valid_opaque_agent_id(&request.session_id)
+            || request.account.is_empty()
+            || request.collection.is_empty()
+            || request.href.is_empty()
+            || request.uid.is_empty()
+            || (request.alarm_index.is_none() && request.trigger.is_none())
+        {
+            return no_store_json_error(400, "invalid calendar request");
+        }
+        match handler.prepare_calendar_alarm(&request) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "calendar_alarm_prepare_unavailable"),
+        }
+    }
+
+    fn agent_calendar_time_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let request: AgentCalendarTimePrepareRequest =
+            match parse_agent_strict_json(req, "calendar time prepare") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || !valid_opaque_agent_id(&request.session_id)
+            || request.account.is_empty()
+            || request.collection.is_empty()
+            || request.href.is_empty()
+            || request.uid.is_empty()
+            || request.start.is_empty()
+            || request.end.is_empty()
+        {
+            return no_store_json_error(400, "invalid calendar request");
+        }
+        match handler.prepare_calendar_time(&request) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(error) => {
+                let code = match error.as_str() {
+                    "invalid_calendar_window" => "calendar_invalid_window",
+                    "Calendar is not currently accessible" => "calendar_collection_unavailable",
+                    "Calendar access is unknown or unavailable" => "calendar_access_unavailable",
+                    "Cached event missing" => "calendar_cached_event_missing",
+                    "Strong ETag required" => "calendar_strong_etag_required",
+                    "Occurrence is not in server expansion" => "calendar_occurrence_missing",
+                    "Calendar changed during expansion" => "calendar_expansion_changed",
+                    _ => "calendar_prepare_unavailable",
+                };
+                no_store_json_error(409, code)
+            }
+        }
+    }
+
+    fn agent_dav_acl_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let request: AgentDavAclPrepareRequest =
+            match parse_agent_strict_json(req, "DAV access prepare") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || !valid_opaque_agent_id(&request.session_id)
+            || request.account.is_empty()
+            || !matches!(request.service.as_str(), "calendar" | "contacts")
+            || request.collection.is_empty()
+            || request.principal.is_empty()
+            || !matches!(
+                request.privilege.as_deref(),
+                None | Some("read") | Some("write") | Some("read-write")
+            )
+        {
+            return no_store_json_error(400, "invalid access request");
+        }
+        match handler.prepare_dav_acl(&request) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "access_prepare_unavailable"),
+        }
+    }
+
+    fn agent_invitation_response_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let r: AgentInvitationResponsePrepareRequest =
+            match parse_agent_strict_json(req, "invitation response prepare") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&r.request_id)
+            || !valid_opaque_agent_id(&r.session_id)
+            || r.account.is_empty()
+            || r.collection.is_empty()
+            || r.href.is_empty()
+            || r.uid.is_empty()
+            || r.attendee.is_empty()
+            || !matches!(r.response.as_str(), "accept" | "tentative" | "decline")
+        {
+            return no_store_json_error(400, "invalid invitation request");
+        }
+        match handler.prepare_invitation_response(&r) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "invitation_prepare_unavailable"),
+        }
+    }
+
+    fn agent_dav_delete_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let r: AgentDavDeletePrepareRequest =
+            match parse_agent_strict_json(req, "DAV delete prepare") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&r.request_id)
+            || !valid_opaque_agent_id(&r.session_id)
+            || r.account.is_empty()
+            || !matches!(r.service.as_str(), "calendar" | "contacts")
+            || r.collection.is_empty()
+            || r.href.is_empty()
+        {
+            return no_store_json_error(400, "invalid delete request");
+        }
+        match handler.prepare_dav_delete(&r) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "delete_prepare_unavailable"),
+        }
+    }
+
+    fn agent_dav_create_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let r: AgentDavCreatePrepareRequest =
+            match parse_agent_strict_json(req, "DAV create prepare") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&r.request_id)
+            || !valid_opaque_agent_id(&r.session_id)
+            || r.account.is_empty()
+            || !matches!(r.kind.as_str(), "event" | "task" | "contact")
+            || r.collection.is_empty()
+            || r.name.is_empty()
+        {
+            return no_store_json_error(400, "invalid create request");
+        }
+        match handler.prepare_dav_create(&r) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "create_prepare_unavailable"),
+        }
+    }
+
+    fn agent_contact_field_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let r: AgentContactFieldPrepareRequest =
+            match parse_agent_strict_json(req, "contact field prepare") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&r.request_id)
+            || !valid_opaque_agent_id(&r.session_id)
+            || r.account.is_empty()
+            || r.collection.is_empty()
+            || r.href.is_empty()
+            || !matches!(r.key.as_str(), "EMAIL" | "TEL" | "ORG")
+            || (if r.remove {
+                r.index.is_none()
+            } else {
+                r.new_value.is_empty()
+            })
+        {
+            return no_store_json_error(400, "invalid contact request");
+        }
+        match handler.prepare_contact_field(&r) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "contact_prepare_unavailable"),
+        }
+    }
+
+    fn agent_mail_action_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let r: AgentMailActionPrepareRequest =
+            match parse_agent_strict_json(req, "mail action prepare") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&r.request_id)
+            || !valid_opaque_agent_id(&r.session_id)
+            || r.account.is_empty()
+            || r.email_id.is_empty()
+            || !r.action.is_object()
+        {
+            return no_store_json_error(400, "invalid mail request");
+        }
+        match handler.prepare_mail_action(&r) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "mail_prepare_unavailable"),
+        }
+    }
+
+    fn agent_task_parent_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let r: AgentTaskParentPrepareRequest =
+            match parse_agent_strict_json(req, "task parent prepare") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&r.request_id)
+            || !valid_opaque_agent_id(&r.session_id)
+            || r.account.is_empty()
+            || r.collection.is_empty()
+            || r.href.is_empty()
+            || r.uid.is_empty()
+            || r.new_parent.as_ref().is_some_and(|p| p.is_empty())
+        {
+            return no_store_json_error(400, "invalid task request");
+        }
+        match handler.prepare_task_parent(&r) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "task_prepare_unavailable"),
+        }
+    }
+
+    fn agent_task_attributes_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let r: AgentTaskAttributesPrepareRequest =
+            match parse_agent_strict_json(req, "task attributes prepare") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&r.request_id)
+            || !valid_opaque_agent_id(&r.session_id)
+            || r.account.is_empty()
+            || r.collection.is_empty()
+            || r.href.is_empty()
+            || r.uid.is_empty()
+            || (r.priority.is_none() && r.due.is_none() && r.start.is_none())
+        {
+            return no_store_json_error(400, "invalid task request");
+        }
+        match handler.prepare_task_attributes(&r) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "task_prepare_unavailable"),
+        }
+    }
+
+    fn agent_cancellation_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let r: AgentCancellationPrepareRequest =
+            match parse_agent_strict_json(req, "cancellation prepare") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&r.request_id)
+            || !valid_opaque_agent_id(&r.session_id)
+            || r.account.is_empty()
+            || r.collection.is_empty()
+            || r.href.is_empty()
+            || r.uid.is_empty()
+        {
+            return no_store_json_error(400, "invalid cancellation request");
+        }
+        match handler.prepare_cancellation(&r) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "cancellation_prepare_unavailable"),
+        }
+    }
+
+    fn agent_single_capture_intent_phase(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let (Some(account), Some(session), Some(pending), Some(hash)) = (
+            req.q("account"),
+            req.q("session_id"),
+            req.q("pending"),
+            req.q("action_hash"),
+        ) else {
+            return no_store_json_error(400, "invalid capture request");
+        };
+        let operation = req.q("operation_id").unwrap_or("");
+        if account.is_empty()
+            || !valid_opaque_agent_id(session)
+            || operation.len() > 128
+            || !operation
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            || !valid_exact_base64url(pending, 22)
+            || !valid_sha256(hash)
+        {
+            return no_store_json_error(400, "invalid capture request");
+        }
+        match handler.single_capture_intent_phase(account, session, operation, pending, hash) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "capture_intent_unavailable"),
+        }
+    }
+    fn agent_single_capture_claim(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let (Some(account), Some(session), Some(operation)) =
+            (req.q("account"), req.q("session_id"), req.q("operation_id"))
+        else {
+            return no_store_json_error(400, "invalid capture request");
+        };
+        if account.is_empty()
+            || !valid_opaque_agent_id(session)
+            || operation.is_empty()
+            || operation.len() > 128
+            || !operation
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return no_store_json_error(400, "invalid capture request");
+        }
+        match handler.single_capture_has_claim(account, session, operation) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&json!({"claim_present":value}))),
+            Err(_) => no_store_json_error(409, "capture_claim_unavailable"),
+        }
+    }
+    fn agent_single_capture_status(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let (Some(account), Some(session), Some(operation)) =
+            (req.q("account"), req.q("session_id"), req.q("operation_id"))
+        else {
+            return no_store_json_error(400, "invalid capture request");
+        };
+        if account.is_empty()
+            || !valid_opaque_agent_id(session)
+            || operation.is_empty()
+            || operation.len() > 128
+            || !operation
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return no_store_json_error(400, "invalid capture request");
+        }
+        match handler.single_capture_status(account, session, operation) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(error) => no_store_json_error(
+                409,
+                if error == "capture_local_intent_missing" {
+                    "capture_local_intent_missing"
+                } else {
+                    "capture_status_unavailable"
+                },
+            ),
+        }
+    }
+    fn agent_contact_photo_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let r: AgentContactPhotoPrepareRequest = match parse_agent_strict_json(req, "photo prepare")
+        {
+            Ok(request) => request,
+            Err(error) => return error,
+        };
+        if !valid_client_request_id(&r.request_id)
+            || !valid_opaque_agent_id(&r.session_id)
+            || r.account.is_empty()
+            || !valid_opaque_agent_id(&r.stage_id)
+        {
+            return no_store_json_error(400, "invalid photo request");
+        }
+        match handler.prepare_contact_photo(&r) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "photo_prepare_unavailable"),
+        }
+    }
+    fn agent_single_capture_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let r: AgentSingleCapturePrepareRequest =
+            match parse_agent_strict_json(req, "capture prepare") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&r.request_id)
+            || !valid_opaque_agent_id(&r.session_id)
+            || r.account.is_empty()
+            || !matches!(r.service.as_str(), "calendar" | "contacts" | "mail")
+            || (r.service != "mail" && r.collection.is_empty())
+            || r.href.is_empty()
+        {
+            return no_store_json_error(400, "invalid capture request");
+        }
+        match handler.prepare_single_capture(&r) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "capture_prepare_unavailable"),
+        }
+    }
+    fn agent_recovery_jobs_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let request: AgentRecoveryJobsPrepareRequest =
+            match parse_agent_strict_json(req, "recovery jobs prepare") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || !valid_opaque_agent_id(&request.session_id)
+            || request.account.is_empty()
+            || request.items.is_empty()
+            || request.items.len() > 32
+        {
+            return no_store_json_error(400, "invalid recovery request");
+        }
+        match handler.prepare_recovery_jobs(&request) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "recovery_prepare_unavailable"),
+        }
+    }
+    fn agent_recovery_import_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let request: AgentRecoveryImportPrepareRequest =
+            match parse_agent_strict_json(req, "recovery import prepare") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || !valid_opaque_agent_id(&request.session_id)
+            || request.account.is_empty()
+            || request.batch_id.is_empty()
+            || request.collection.is_empty()
+        {
+            return no_store_json_error(400, "invalid recovery request");
+        }
+        match handler.prepare_recovery_import(&request) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(error) => {
+                let code = match error.as_str() {
+                    "recovery_prepare_request_unavailable" => {
+                        "recovery_prepare_request_unavailable"
+                    }
+                    "recovery_prepare_device_unavailable" => "recovery_prepare_device_unavailable",
+                    "recovery_prepare_status_unavailable" => "recovery_prepare_status_unavailable",
+                    "recovery_prepare_collection_unavailable" => {
+                        "recovery_prepare_collection_unavailable"
+                    }
+                    "recovery_prepare_staging_unavailable" => {
+                        "recovery_prepare_staging_unavailable"
+                    }
+                    "recovery_prepare_result_unavailable" => "recovery_prepare_result_unavailable",
+                    "recovery_prepare_projection_unavailable" => {
+                        "recovery_prepare_projection_unavailable"
+                    }
+                    _ if safe_recovery_result_diagnostic(&error) => error.as_str(),
+                    _ => "recovery_import_prepare_unavailable",
+                };
+                no_store_json_error(409, code)
+            }
+        }
+    }
+    fn agent_recovery_reconcile(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let request: AgentRecoveryReconcileRequest =
+            match parse_agent_strict_json(req, "recovery reconcile") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || !valid_opaque_agent_id(&request.session_id)
+            || request.account.is_empty()
+            || request.batch_id.is_empty()
+        {
+            return no_store_json_error(400, "invalid recovery request");
+        }
+        match handler.reconcile_recovery(&request) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "recovery_reconcile_unavailable"),
+        }
+    }
+
+    fn agent_composer_identities(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let request: AgentComposerIdentitiesRequest =
+            match parse_agent_strict_json(req, "composer identities") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&request.request_id) || request.account.is_empty() {
+            return no_store_json_error(400, "invalid composer request");
+        }
+        match handler.composer_identities(&request.account) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "provider_identity_unavailable"),
+        }
+    }
+
+    fn agent_composer_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let request: AgentComposerPrepareRequest =
+            match parse_agent_strict_json(req, "composer prepare") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&request.request_id)
+            || !valid_opaque_agent_id(&request.session_id)
+            || request.account.is_empty()
+            || request.email_id.is_empty()
+            || request.identity_id.is_empty()
+        {
+            return no_store_json_error(400, "invalid composer request");
+        }
+        match handler.prepare_composer_send(&request) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "composer_prepare_unavailable"),
+        }
+    }
+
     fn agent_session_create(&self, req: &ApiRequest) -> ApiResponse {
         let handler = match self.agent_gate(req) {
             Ok(handler) => handler,
@@ -7723,7 +10209,11 @@ impl Router {
         {
             return no_store_json_error(400, "invalid session create request");
         }
-        match handler.session_create(&request.request_id, request.display_name.as_deref()) {
+        match handler.session_create_for_account(
+            &request.request_id,
+            request.account.as_deref(),
+            request.display_name.as_deref(),
+        ) {
             Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
             Err(error) => agent_session_error_response(&error),
         }
@@ -7763,7 +10253,7 @@ impl Router {
             Ok(limit) => limit,
             Err(error) => return error,
         };
-        match handler.session_list(cursor, limit) {
+        match handler.session_list_for_account(req.q("account"), cursor, limit) {
             Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
             Err(error) => agent_session_error_response(&error),
         }
@@ -8081,18 +10571,34 @@ impl Router {
             Err(response) => return response,
         };
         if !valid_client_request_id(&request.request_id)
-            || !valid_opaque_agent_id(&request.pending)
-            || request.token.is_empty()
-            || request.token.len() > 512
-            || request.action_hash.is_empty()
-            || request.action_hash.len() > 128
+            || !valid_opaque_agent_id(&request.session_id)
+            || !valid_client_request_id(&request.turn_request_id)
+            || !valid_opaque_agent_id(&request.turn_id)
+            || !valid_exact_base64url(&request.pending, 22)
+            || !valid_exact_base64url(&request.token, 43)
+            || !valid_sha256(&request.action_hash)
         {
             return no_store_json_error(400, "invalid agent confirm request");
         }
+        let owner = AgentPendingOwnerProof {
+            session_id: request.session_id,
+            turn_request_id: request.turn_request_id,
+            turn_id: request.turn_id,
+        };
+        let binding_command = AgentPendingBindingCommand {
+            pending: request.pending.clone(),
+            action_hash: request.action_hash.clone(),
+            owner: owner.clone(),
+        };
         if self.biometric_gate {
-            let binding = match handler.pending_binding(&request.pending, &request.action_hash) {
-                Ok(binding) => binding,
-                Err(e) => return agent_confirm_error_response(&e),
+            let binding = match handler.pending_binding(&binding_command) {
+                AgentPendingBindingOutcome::Ready(binding) => binding,
+                AgentPendingBindingOutcome::Rejected(code) => {
+                    return agent_closed_confirmation_response(code)
+                }
+                AgentPendingBindingOutcome::Unavailable => {
+                    return no_store_json_error(503, "confirmation_retryable")
+                }
             };
             if let Some(r) = self.biometric_challenge(
                 &binding.op,
@@ -8104,12 +10610,53 @@ impl Router {
                 return r;
             }
         }
-        match handler.confirm(&request.pending, &request.token, &request.action_hash) {
-            Ok(_internal_summary) => ApiResponse::ok_json(&json!({
+        let command = AgentConfirmCommand {
+            pending: request.pending.clone(),
+            token: request.token,
+            action_hash: request.action_hash,
+            owner,
+        };
+        match handler.confirm(&command) {
+            AgentConfirmOutcome::Completed => ApiResponse::ok_json(&json!({
                 "confirmed": request.pending,
                 "result": "Completed successfully."
             })),
-            Err(e) => agent_confirm_error_response(&e),
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::ProviderRejected) => {
+                no_store_json_error(409, "provider_submission_rejected")
+            }
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::ProviderActionRejected) => {
+                no_store_json_error(409, "provider_action_rejected")
+            }
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::ProviderConflict) => {
+                no_store_json_error(409, "provider_conflict")
+            }
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::MailPreDispatchFailed) => {
+                no_store_json_error(409, "mail_pre_dispatch_failed")
+            }
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::DavDiscoveryUnavailable) => {
+                no_store_json_error(409, "dav_discovery_unavailable_before_write")
+            }
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::DavPreDispatchFailed) => {
+                no_store_json_error(409, "dav_pre_dispatch_failed")
+            }
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::CaptureSourceUnavailable) => {
+                no_store_json_error(409, "capture_preflight_source")
+            }
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::CaptureVersionChanged) => {
+                no_store_json_error(409, "capture_preflight_version_changed")
+            }
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::CaptureChallengeUnavailable) => {
+                no_store_json_error(409, "capture_preflight_challenge")
+            }
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::CaptureJournalUnavailable) => {
+                no_store_json_error(409, "capture_preflight_journal")
+            }
+            AgentConfirmOutcome::Failed(_) => no_store_json_error(409, "confirmation_failed"),
+            AgentConfirmOutcome::Rejected(code) => agent_closed_confirmation_response(code),
+            AgentConfirmOutcome::Retryable => no_store_json_error(503, "confirmation_retryable"),
+            AgentConfirmOutcome::OutcomeUnknown => {
+                no_store_json_error(409, "confirmation_outcome_unknown")
+            }
         }
     }
 
@@ -8542,11 +11089,7 @@ impl Router {
             .filter(|n| *n > 0)
             .unwrap_or(50)
             .min(500);
-        let store = match self.open_readonly(Some(account)) {
-            Ok(s) => s,
-            Err(e) => return e,
-        };
-        match store.recent_runs(account, limit) {
+        self.with_archive_reader(account, |store| match store.recent_runs(account, limit) {
             Ok(runs) => {
                 let arr: Vec<Value> = runs
                     .iter()
@@ -8564,7 +11107,7 @@ impl Router {
                 ApiResponse::ok_json(&json!({ "runs": arr, "count": arr.len() }))
             }
             Err(_) => ApiResponse::error(500, "store_query_failed"),
-        }
+        })
     }
 
     /// Per-account archive overview: for each non-empty service, the tracked-item
@@ -8575,37 +11118,33 @@ impl Router {
             Some(a) => a,
             None => return ApiResponse::error(400, "missing 'account'"),
         };
-        let store = match self.open_readonly(Some(account)) {
-            Ok(s) => s,
-            Err(e) => return e,
-        };
-        let mut services = Vec::new();
-        let (mut total_items, mut total_archived) = (0usize, 0usize);
-        for &svc in STATUS_SERVICES {
-            match store.items_by_service(account, svc) {
-                Ok(items) if !items.is_empty() => {
-                    let archived = items.iter().filter(|i| i.local_path.is_some()).count();
-                    total_items += items.len();
+        self.with_archive_reader(account, |store| {
+            let mut services = Vec::new();
+            let counts = match store.active_service_counts(account) {
+                Ok(counts) => counts,
+                Err(_) => return ApiResponse::error(500, "store_query_failed"),
+            };
+            let (mut total_items, mut total_archived) = (0u64, 0u64);
+            for &svc in STATUS_SERVICES {
+                if let Some((_, count, archived)) = counts.iter().find(|(service, _, _)| service == svc) {
+                    total_items += count;
                     total_archived += archived;
                     services.push(json!({
-                        "service": svc, "items": items.len(), "archived": archived,
+                        "service": svc, "items": count, "archived": archived,
                     }));
                 }
-                Ok(_) => {}
-                Err(_) => return ApiResponse::error(500, "store_query_failed"),
             }
-        }
-        let onedrive_cursor = store
-            .get_delta_cursor(account, "onedrive", "")
-            .map(|c| c.is_some())
-            .unwrap_or(false);
-        // Real integrity signal: how many archived bodies last passed the verify
-        // hash-check, and when verify last ran (backs "Integrity verified N%").
-        let (checked, verified) = store.verify_counts(account).unwrap_or((0, 0));
-        let last_verified = store.recent_runs(account, 50).ok().and_then(|runs| {
-            runs.into_iter()
-                .find(|r| r.kind == "verify")
-                .map(|r| r.finished_at)
+            let onedrive_cursor = store
+                .get_delta_cursor(account, "onedrive", "")
+                .map(|c| c.is_some())
+                .unwrap_or(false);
+            // Real integrity signal: how many archived bodies last passed the verify
+            // hash-check, and when verify last ran (backs "Integrity verified N%").
+            let (checked, verified) = store.verify_counts(account).unwrap_or((0, 0));
+            let last_verified = store.recent_runs(account, 50).ok().and_then(|runs| {
+                runs.into_iter()
+                    .find(|r| r.kind == "verify")
+                    .map(|r| r.finished_at)
         });
         ApiResponse::ok_json(&json!({
             "account": account,
@@ -8614,6 +11153,7 @@ impl Router {
             "onedrive_cursor": onedrive_cursor,
             "verify": { "checked": checked, "verified": verified, "last_verified": last_verified },
         }))
+        })
     }
 
     fn open(&self, account: Option<&str>) -> Result<Store, ApiResponse> {
@@ -8622,6 +11162,99 @@ impl Router {
             .store_path(account)
             .ok_or_else(|| ApiResponse::error(404, "unknown account"))?;
         Store::open(path).map_err(|_| ApiResponse::error(500, "store_unavailable"))
+    }
+
+    /// Reuse at most two archive readers for short queries. The least recently
+    /// used entry is evicted, and identity changes invalidate the affected reader.
+    fn with_archive_reader(
+        &self,
+        account: &str,
+        f: impl FnOnce(&Store) -> ApiResponse,
+    ) -> ApiResponse {
+        self.with_archive_reader_result(account, |store| Ok(f(store)))
+            .unwrap_or_else(|error| error)
+    }
+
+    fn with_archive_reader_result<T>(
+        &self,
+        account: &str,
+        f: impl FnOnce(&Store) -> Result<T, ApiResponse>,
+    ) -> Result<T, ApiResponse> {
+        #[cfg(not(unix))]
+        {
+            return match self.open_readonly(Some(account)) {
+                Ok(store) => f(&store),
+                Err(error) => Err(error),
+            };
+        }
+        #[cfg(unix)]
+        {
+            let Some(path) = self.store_path(account) else {
+                return Err(ApiResponse::error(404, "unknown account"));
+            };
+            let Ok(mut cached) = self.archive_reader.lock() else {
+                return Err(ApiResponse::error(500, "store_unavailable"));
+            };
+            let identity = match Store::readonly_cache_identity(&path) {
+                Ok(identity) => identity,
+                Err(_)
+                    if std::fs::symlink_metadata(&path)
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    cached.retain(|(old_account, _, _, _)| old_account != account);
+                    return match self.open_readonly(Some(account)) {
+                        Ok(store) => f(&store),
+                        Err(error) => Err(error),
+                    };
+                }
+                Err(_) => {
+                    cached.retain(|(old_account, _, _, _)| old_account != account);
+                    return Err(ApiResponse::error(500, "store_unavailable"));
+                }
+            };
+            let found = cached
+                .iter()
+                .position(|(old_account, old_path, old_identity, _)| {
+                    old_account == account && old_path == &path && *old_identity == identity
+                });
+            let entry = if let Some(index) = found {
+                cached.remove(index)
+            } else {
+                cached.retain(|(old_account, _, _, _)| old_account != account);
+                // Evict before opening: even transiently hold no more than two handles.
+                if cached.len() == 2 {
+                    cached.remove(0);
+                }
+                #[cfg(test)]
+                self.archive_reader_opens
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let store = match Store::open_readonly(&path) {
+                    Ok(store) => store,
+                    Err(_) => return Err(ApiResponse::error(500, "store_unavailable")),
+                };
+                if Store::readonly_cache_identity(&path).ok() != Some(identity) {
+                    return Err(ApiResponse::error(500, "store_unavailable"));
+                }
+                (account.to_owned(), path.clone(), identity, store)
+            };
+            if !matches!(entry.3.schema_version(), Ok(version) if version <= isyncyou_store::SCHEMA_VERSION)
+            {
+                return Err(ApiResponse::error(500, "store_unavailable"));
+            }
+            let response = f(&entry.3);
+            if !matches!(entry.3.schema_version(), Ok(version) if version <= isyncyou_store::SCHEMA_VERSION)
+            {
+                return Err(ApiResponse::error(500, "store_unavailable"));
+            }
+            if Store::readonly_cache_identity(&path).ok() != Some(identity) {
+                return Err(ApiResponse::error(500, "store_unavailable"));
+            }
+            if cached.len() == 2 {
+                cached.remove(0);
+            }
+            cached.push(entry);
+            response
+        }
     }
 
     /// Read-only store open for GET endpoints: a WAL reader that takes no instance
@@ -8641,17 +11274,452 @@ impl Router {
         }
     }
 
+    fn provider_mail_items(
+        &self,
+        store: &Store,
+        account: &str,
+        origin: &str,
+        req: &ApiRequest,
+    ) -> ApiResponse {
+        let primary_cache_only = match req.q("primary_cache_only") {
+            None => false,
+            Some("1")
+                if req.q("mail_scope").is_none()
+                    && req.q("offset").is_none()
+                    && req.q("after").is_none() =>
+            {
+                true
+            }
+            Some(_) => return ApiResponse::error(400, "invalid_primary_cache_request"),
+        };
+        let scopes = match store.provider_scopes(account, origin, "mail") {
+            Ok(scopes) if scopes.len() <= 1 => scopes,
+            _ => return ApiResponse::error(503, "provider_scope_unavailable"),
+        };
+        let shared = match store.provider_scopes(account, origin, "mail-shared") {
+            Ok(scopes) if scopes.len() <= 1000 => scopes,
+            _ => return ApiResponse::error(503, "provider_scope_unavailable"),
+        };
+        if scopes.first().is_some_and(|primary| {
+            shared
+                .iter()
+                .any(|candidate| candidate.collection == primary.collection)
+        }) {
+            return ApiResponse::error(503, "provider_scope_unavailable");
+        }
+        if primary_cache_only {
+            let Some(scope) = scopes.first() else {
+                return ApiResponse::ok_json(
+                    &json!({"items":[],"scopes":[],"shared_access_status":"unknown","count":0,"total":null,"provenance":"local","observed_at":null}),
+                );
+            };
+            let limit = (clamp_limit(req.q("limit")) as usize).min(50);
+            let snapshot = match store.provider_mail_window_snapshot(scope, 0, limit) {
+                Ok(snapshot) => snapshot,
+                Err(_) => return ApiResponse::error(503, "provider_cache_unavailable"),
+            };
+            let Some((_state, observed_at, window_limit, total, objects)) = snapshot else {
+                return ApiResponse::ok_json(
+                    &json!({"items":[],"scopes":[{"mail_scope":scope.collection,"primary":true}],"shared_access_status":"unknown","count":0,"total":null,"provenance":"local","observed_at":null}),
+                );
+            };
+            let mut items = Vec::with_capacity(objects.len());
+            let mut folders = scope.clone();
+            folders.service = "mailboxes".into();
+            let folder_page = match store.provider_objects_page(&folders, "", 200) {
+                Ok(page) => page,
+                Err(_) => return ApiResponse::error(503, "provider_cache_unavailable"),
+            };
+            for folder in folder_page {
+                let value: Value = match serde_json::from_slice(&folder.raw) {
+                    Ok(value) => value,
+                    Err(_) => return ApiResponse::error(503, "provider_cache_invalid"),
+                };
+                items.push(json!({"service":"mail","mail_scope":scope.collection,"shared":false,"item_type":"folder","remote_id":folder.remote_id,"name":value["name"],"has_body":false,"preview":{"role":value["role"]}}));
+            }
+            for object in objects {
+                let value: Value = match serde_json::from_slice(&object.raw) {
+                    Ok(value) => value,
+                    Err(_) => return ApiResponse::error(503, "provider_cache_invalid"),
+                };
+                let mailboxes: Vec<String> = value["mailboxIds"]
+                    .as_object()
+                    .map(|m| {
+                        m.iter()
+                            .filter(|(_, v)| v.as_bool() == Some(true))
+                            .map(|(k, _)| k.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let from = value["from"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|a| a["email"].as_str())
+                    .unwrap_or("");
+                items.push(json!({"service":"mail","mail_scope":scope.collection,"shared":false,"item_type":"message","remote_id":object.remote_id,"name":value["subject"].as_str().unwrap_or(""),"mailbox_ids":mailboxes,"has_body":false,"preview":{"subject":value["subject"],"from":from,"snippet":value["preview"],"date":value["receivedAt"],"isRead":value["keywords"]["$seen"].as_bool().unwrap_or(false),"isDraft":value["keywords"]["$draft"].as_bool().unwrap_or(false),"attachments":if value["hasAttachment"].as_bool().unwrap_or(false) {1} else {0}}}));
+            }
+            return ApiResponse::ok_json(
+                &json!({"count":items.len(),"items":items,"scopes":[{"mail_scope":scope.collection,"primary":true}],"shared_access_status":"unknown","total":total,"window_limit":window_limit,"provenance":"local","observed_at":observed_at}),
+            );
+        }
+        let discovery = self
+            .mail_write
+            .as_ref()
+            .ok_or("unavailable")
+            .and_then(|handler| {
+                handler
+                    .provider_shared_mail_accounts(account)
+                    .map_err(|_| "unavailable")
+            });
+        let mut shared_access_status = if discovery.is_ok() {
+            "observed"
+        } else {
+            "unknown"
+        };
+        let mut rights = std::collections::HashMap::new();
+        let mut available = Vec::new();
+        if let Some(primary) = scopes.first() {
+            available.push(json!({"mail_scope":primary.collection,"primary":true}));
+        }
+        if let Ok(discovered) = &discovery {
+            for candidate in &shared {
+                match store.provider_accessible(candidate) {
+                    Ok(Some(true)) if discovered.contains(&candidate.collection) => {
+                        let current = self
+                            .mail_write
+                            .as_ref()
+                            .expect("discovery requires handler")
+                            .provider_shared_mailbox_ids(account, &candidate.collection);
+                        match current {
+                            Ok(ids) => {
+                                if !ids.is_empty() {
+                                    available.push(
+                                        json!({"mail_scope":candidate.collection,"primary":false}),
+                                    );
+                                }
+                                rights.insert(candidate.collection.clone(), ids);
+                            }
+                            Err(_) => shared_access_status = "unknown",
+                        }
+                    }
+                    Ok(_) => (),
+                    Err(_) => return ApiResponse::error(503, "provider_scope_unavailable"),
+                }
+            }
+        }
+        let requested = req.q("mail_scope");
+        let scope = match requested {
+            None => scopes.first(),
+            Some(id) => scopes
+                .iter()
+                .chain(shared.iter())
+                .find(|scope| scope.collection == id),
+        };
+        let Some(scope) = scope else {
+            if requested.is_some() {
+                return ApiResponse::error(
+                    if discovery.is_err() { 503 } else { 404 },
+                    "provider_scope_unavailable",
+                );
+            }
+            return ApiResponse::ok_json(
+                &json!({"items":[],"scopes":available,"shared_access_status":shared_access_status,"count":0,"total":null,"provenance":"local","observed_at":null}),
+            );
+        };
+        let is_shared = scope.service == "mail-shared";
+        let current_mailboxes = if is_shared {
+            if discovery.is_err()
+                || (shared_access_status == "unknown" && !rights.contains_key(&scope.collection))
+            {
+                return ApiResponse::error(503, "provider_scope_unavailable");
+            }
+            match rights.get(&scope.collection) {
+                Some(ids) if !ids.is_empty() => ids.clone(),
+                _ => return ApiResponse::error(404, "provider_scope_unavailable"),
+            }
+        } else {
+            Vec::new()
+        };
+        if req.q("after").is_some() || req.q("offset").is_some() {
+            return ApiResponse::error(400, "live_mail_paging_required");
+        }
+        let snapshot = match store.provider_mail_window_snapshot(
+            scope,
+            0,
+            (clamp_limit(req.q("limit")) as usize).min(50),
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return ApiResponse::error(503, "provider_cache_unavailable"),
+        };
+        let Some((_state, observed_at, window_limit, total, objects)) = snapshot else {
+            return ApiResponse::ok_json(
+                &json!({"items":[],"scopes":available,"shared_access_status":shared_access_status,"count":0,"total":null,"provenance":"local","observed_at":null}),
+            );
+        };
+        let mut items = Vec::with_capacity(objects.len());
+        let mut folders = scope.clone();
+        folders.service = if is_shared {
+            "mailboxes-shared"
+        } else {
+            "mailboxes"
+        }
+        .into();
+        if !is_shared || store.provider_accessible(&folders).ok().flatten() == Some(true) {
+            let folder_page = match store.provider_objects_page(&folders, "", 200) {
+                Ok(page) => page,
+                Err(_) => return ApiResponse::error(503, "provider_cache_unavailable"),
+            };
+            for folder in folder_page {
+                let value: Value = match serde_json::from_slice(&folder.raw) {
+                    Ok(value) => value,
+                    Err(_) => return ApiResponse::error(503, "provider_cache_invalid"),
+                };
+                if is_shared
+                    && (value["myRights"]["mayReadItems"].as_bool() != Some(true)
+                        || !current_mailboxes.contains(&folder.remote_id))
+                {
+                    continue;
+                }
+                items.push(json!({"service":"mail","mail_scope":scope.collection,"shared":is_shared,"item_type":"folder","remote_id":folder.remote_id,"name":value["name"],"has_body":false,"preview":{"role":value["role"]}}));
+            }
+        }
+        for object in objects {
+            let value: Value = match serde_json::from_slice(&object.raw) {
+                Ok(value) => value,
+                Err(_) => return ApiResponse::error(503, "provider_cache_invalid"),
+            };
+            let mailboxes: Vec<String> = value["mailboxIds"]
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .filter(|(id, v)| {
+                            v.as_bool() == Some(true)
+                                && (!is_shared || current_mailboxes.contains(id))
+                        })
+                        .map(|(id, _)| id.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if is_shared && mailboxes.is_empty() {
+                continue;
+            }
+            let from = value["from"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|a| a["email"].as_str())
+                .unwrap_or("");
+            items.push(json!({"service":"mail","mail_scope":scope.collection,"shared":is_shared,"item_type":"message","remote_id":object.remote_id,"name":value["subject"].as_str().unwrap_or(""),"mailbox_ids":mailboxes,"has_body":false,"preview":{"subject":value["subject"],"from":from,"snippet":value["preview"],"date":value["receivedAt"],"isRead":value["keywords"]["$seen"].as_bool().unwrap_or(false),"isDraft":value["keywords"]["$draft"].as_bool().unwrap_or(false),"attachments":if value["hasAttachment"].as_bool().unwrap_or(false) {1} else {0}}}));
+        }
+        ApiResponse::ok_json(
+            &json!({"count":items.len(),"items":items,"scopes":available,"shared_access_status":shared_access_status,"mail_scope":scope.collection,"shared":is_shared,"total":total,"window_limit":window_limit,"provenance":"local","observed_at":observed_at}),
+        )
+    }
+
+    fn calendar_expanded(&self, req: &ApiRequest) -> ApiResponse {
+        let (Some(account), Some(collection), Some(year), Some(month)) = (
+            req.q("account"),
+            req.q("collection"),
+            req.q("year").and_then(|v| v.parse::<u32>().ok()),
+            req.q("month").and_then(|v| v.parse::<u32>().ok()),
+        ) else {
+            return ApiResponse::error(400, "invalid_calendar_window");
+        };
+        if !(1900..=9998).contains(&year)
+            || !(1..=12).contains(&month)
+            || self.provider_origin(account).is_none()
+        {
+            return ApiResponse::error(400, "invalid_calendar_window");
+        }
+        let Some(handler) = self.calendar_write.as_ref() else {
+            return ApiResponse::error(503, "provider_calendar_unavailable");
+        };
+        let value = if req.q("freebusy") == Some("1") {
+            handler.provider_freebusy_month(account, collection, year, month)
+        } else if req.q("tasks") == Some("1") {
+            handler.provider_expanded_tasks_month(account, collection, year, month)
+        } else {
+            handler.provider_expanded_month(account, collection, year, month)
+        };
+        match value {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(error) if error == "freebusy_access_denied" => {
+                with_no_store(ApiResponse::error(403, "freebusy_access_denied"))
+            }
+            Err(_) => with_no_store(ApiResponse::error(503, "provider_calendar_unavailable")),
+        }
+    }
+
     fn items(&self, req: &ApiRequest) -> ApiResponse {
         let service = match req.q("service") {
             Some(s) => s,
             None => return ApiResponse::error(400, "missing 'service'"),
         };
+        let metadata_only = match req.q("metadata_only") {
+            None => false,
+            Some("1")
+                if service == "mail"
+                    && req.q("parent").is_none()
+                    && req
+                        .q("account")
+                        .is_some_and(|account| self.provider_origin(account).is_none()) =>
+            {
+                true
+            }
+            Some(_) => return ApiResponse::error(400, "invalid_metadata_request"),
+        };
+        if req.q("primary_cache_only").is_some()
+            && (service != "mail"
+                || req
+                    .q("account")
+                    .and_then(|account| self.provider_origin(account))
+                    .is_none())
+        {
+            return ApiResponse::error(400, "invalid_primary_cache_request");
+        }
+        if req.q("live_metadata").is_some()
+            && (service != "mail"
+                || req
+                    .q("account")
+                    .and_then(|account| self.provider_origin(account))
+                    .is_none())
+        {
+            return ApiResponse::error(400, "invalid_live_mail_request");
+        }
+        if matches!(service, "calendar" | "todo") {
+            if let Some(account) = req.q("account") {
+                if self.provider_origin(account).is_some() {
+                    let after = req.q("after").unwrap_or("");
+                    if after.len() > 1024 || after.chars().any(char::is_control) {
+                        return ApiResponse::error(400, "invalid_provider_cursor");
+                    }
+                    return match self.calendar_write.as_ref().and_then(|handler| {
+                        handler
+                            .provider_calendar(account, req.q("collection"), after)
+                            .ok()
+                    }) {
+                        Some(value) => ApiResponse::ok_json(&value),
+                        None => ApiResponse::error(503, "provider_calendar_unavailable"),
+                    };
+                }
+            }
+        }
+        if service == "contacts" {
+            if let Some(account) = req.q("account") {
+                if self.provider_origin(account).is_some() {
+                    let after = req.q("after").unwrap_or("");
+                    if after.len() > 1024 || after.chars().any(char::is_control) {
+                        return ApiResponse::error(400, "invalid_provider_cursor");
+                    }
+                    return match self.contact_write.as_ref().and_then(|handler| {
+                        handler
+                            .provider_contacts(account, req.q("collection"), after)
+                            .ok()
+                    }) {
+                        Some(value) => ApiResponse::ok_json(&value),
+                        None => ApiResponse::error(503, "provider_contacts_unavailable"),
+                    };
+                }
+            }
+        }
+        if service == "mail" {
+            if let Some(account) = req.q("account") {
+                if let Some(origin) = self.provider_origin(account) {
+                    if let Some(live) = req.q("live_metadata") {
+                        if live != "1"
+                            || req.q("primary_cache_only").is_some()
+                            || req.q("after").is_some()
+                            || req.q("offset").is_some()
+                        {
+                            return ApiResponse::error(400, "invalid_live_mail_request");
+                        }
+                        let position = match req.q("position").unwrap_or("0").parse::<usize>() {
+                            Ok(position) if position <= 1_000_000 => position,
+                            _ => return ApiResponse::error(400, "invalid_live_mail_request"),
+                        };
+                        let limit = match req.q("limit").unwrap_or("50").parse::<usize>() {
+                            Ok(limit) if (1..=50).contains(&limit) => limit,
+                            _ => return ApiResponse::error(400, "invalid_live_mail_request"),
+                        };
+                        let state = req.q("query_state");
+                        let text = req.q("text");
+                        let mailbox_id = req.q("mailbox_id");
+                        if mailbox_id.is_some_and(|s| {
+                            s.is_empty() || s.len() > 1024 || s.chars().any(char::is_control)
+                        }) {
+                            return ApiResponse::error(400, "invalid_live_mail_request");
+                        }
+                        if text.is_some_and(|s| {
+                            s.trim().is_empty() || s.len() > 1024 || s.chars().any(char::is_control)
+                        }) {
+                            return ApiResponse::error(400, "invalid_live_mail_request");
+                        }
+                        if (position > 0 && state.is_none())
+                            || state.is_some_and(|s| {
+                                s.is_empty() || s.len() > 1024 || s.chars().any(char::is_control)
+                            })
+                        {
+                            return ApiResponse::error(400, "invalid_live_mail_request");
+                        }
+                        return match self
+                            .mail_write
+                            .as_ref()
+                            .ok_or_else(|| "provider_mail_unavailable".to_owned())
+                            .and_then(|h| {
+                                h.provider_live_mail_page(
+                                    account,
+                                    req.q("mail_scope"),
+                                    mailbox_id,
+                                    text,
+                                    position,
+                                    limit,
+                                    state,
+                                )
+                            }) {
+                            Ok(value) => ApiResponse::ok_json(&value),
+                            Err(error) if error == "stale_page" => {
+                                ApiResponse::error(409, "stale_page")
+                            }
+                            Err(_) => ApiResponse::error(503, "provider_mail_unavailable"),
+                        };
+                    }
+                    if req.q("primary_cache_only").is_some() {
+                        return match self.mail_write.as_ref() {
+                            Some(handler) => handler
+                                .with_provider_cache(account, &origin, &mut |store| {
+                                    self.provider_mail_items(store, account, &origin, req)
+                                })
+                                .unwrap_or_else(|_| {
+                                    ApiResponse::error(503, "provider_store_unavailable")
+                                }),
+                            None => ApiResponse::error(503, "provider_store_unavailable"),
+                        };
+                    }
+                    let store = match self
+                        .mail_write
+                        .as_ref()
+                        .and_then(|h| h.provider_store(account).ok())
+                    {
+                        Some(store) => store,
+                        None => return ApiResponse::error(503, "provider_store_unavailable"),
+                    };
+                    return self.provider_mail_items(&store, account, &origin, req);
+                }
+            }
+        }
         // GETs use a read-only WAL connection so a list load is never serialized behind
         // an in-flight sync holding the writer lock (the measured cause of slow mailbox
         // loads). Any preview back-fill happens afterwards on a brief writable open.
-        let store = match self.open_readonly(req.q("account")) {
-            Ok(s) => s,
-            Err(e) => return e,
+        let use_cached_page = matches!(service, "mail" | "calendar") && req.q("parent").is_none();
+        if use_cached_page && req.q("account").is_none() {
+            return ApiResponse::error(400, "missing 'account'");
+        }
+        let store = if use_cached_page {
+            None
+        } else {
+            match self.open_readonly(req.q("account")) {
+                Ok(store) => Some(store),
+                Err(error) => return error,
+            }
         };
         let account = req.q("account").unwrap_or_default();
         // Folder navigation for the file explorer: `?parent=<id>` lists that
@@ -8660,6 +11728,7 @@ impl Router {
         // folder is bounded — and additive: the call without `parent` keeps the
         // flat paginated behaviour every other view relies on.
         if let Some(parent) = req.q("parent") {
+            let store = store.as_ref().expect("parent listing has its own reader");
             let kids = if parent.is_empty() || parent == "root" {
                 store.roots(account, service)
             } else {
@@ -8738,18 +11807,52 @@ impl Router {
             .q("offset")
             .and_then(|o| o.parse::<u32>().ok())
             .unwrap_or(0);
-        let total = match store.count_by_service(account, service) {
-            Ok(t) => t,
-            Err(_) => return ApiResponse::error(500, "store_query_failed"),
+        let mut count_ms = 0u128;
+        let mut page_ms = 0u128;
+        let mut read_page = |store: &Store| -> Result<_, ApiResponse> {
+            let count_started = std::time::Instant::now();
+            let total = store
+                .count_by_service(account, service)
+                .map_err(|_| ApiResponse::error(500, "store_query_failed"))?;
+            count_ms = count_started.elapsed().as_millis();
+            let page_started = std::time::Instant::now();
+            let items = store
+                .items_by_service_page(account, service, limit, offset)
+                .map_err(|_| ApiResponse::error(500, "store_query_failed"))?;
+            page_ms = page_started.elapsed().as_millis();
+            Ok((total, items))
         };
-        match store.items_by_service_page(account, service, limit, offset) {
+        let tuple_started = std::time::Instant::now();
+        let (total, items) = match if use_cached_page {
+            self.with_archive_reader_result(account, read_page)
+        } else {
+            read_page(
+                store
+                    .as_ref()
+                    .expect("other listings have their own reader"),
+            )
+        } {
+            Ok(result) => result,
+            Err(error) => return error,
+        };
+        let tuple_ms = tuple_started.elapsed().as_millis();
+        match Ok::<_, ApiResponse>(items) {
             Ok(items) => {
+                let projection_started = std::time::Instant::now();
+                let mut preview_hits = 0usize;
+                let mut preview_misses = 0usize;
+                let mut disk_parses = 0usize;
+                let mut disk_parse_ms = 0u128;
                 let strict_body_acc = (service == "onedrive"
                     && isyncyou_core::envelope::body_envelope_required_for_process())
                 .then(|| self.config.accounts.iter().find(|a| a.id == account))
                 .flatten();
                 let strict_body_all = if strict_body_acc.is_some() {
-                    match store.items_by_service(account, service) {
+                    match store
+                        .as_ref()
+                        .expect("OneDrive uses an uncached reader")
+                        .items_by_service(account, service)
+                    {
                         Ok(all) => Some(all),
                         Err(_) => return ApiResponse::error(500, "store_query_failed"),
                     }
@@ -8800,12 +11903,25 @@ impl Router {
                                     .and_then(|s| serde_json::from_str::<Value>(s).ok())
                                     .map(|pv| v["preview"] = pv)
                                     .is_some();
+                            if service == "mail" {
+                                if cached {
+                                    preview_hits += 1;
+                                } else {
+                                    preview_misses += 1;
+                                }
+                            }
                             if !cached {
                                 if let (Some(root), Some(rel)) =
                                     (archive_root.as_ref(), it.local_path.as_ref())
                                 {
-                                    if let Some(bytes) = read_under_root(root, rel) {
+                                    let disk_started = std::time::Instant::now();
+                                    if let Some(bytes) = if metadata_only {
+                                        None
+                                    } else {
+                                        read_under_root(root, rel)
+                                    } {
                                         if service == "mail" {
+                                            disk_parses += 1;
                                             mail_preview_enrichment(&mut v, it, root, rel, &bytes);
                                         } else if service == "onenote" {
                                             // a page's local_path is the .html body, not JSON —
@@ -8829,6 +11945,9 @@ impl Router {
                                                 }),
                                             };
                                         }
+                                    }
+                                    if service == "mail" {
+                                        disk_parse_ms += disk_started.elapsed().as_millis();
                                     }
                                 }
                                 // #89: show a mail's sender from the indexed `sender`
@@ -8866,13 +11985,28 @@ impl Router {
                                 // fast path. Only for a mail with an archived body (the
                                 // expensive case); `set_local_path` clears it when the body
                                 // is re-archived.
-                                if service == "mail" && it.local_path.is_some() {
+                                if service == "mail" && !metadata_only && it.local_path.is_some() {
                                     if let Some(pv) = v.get("preview") {
                                         if let Ok(s) = serde_json::to_string(pv) {
                                             backfill.push((it.remote_id.clone(), s));
                                         }
                                     }
                                 }
+                            }
+                            if service == "mail"
+                                && metadata_only
+                                && v.get("preview")
+                                    .and_then(|p| p.get("attachments"))
+                                    .and_then(Value::as_u64)
+                                    .is_none()
+                            {
+                                let mut p = v
+                                    .get("preview")
+                                    .filter(|p| p.is_object())
+                                    .cloned()
+                                    .unwrap_or_else(|| json!({}));
+                                p["attachment_presence_unknown"] = json!(true);
+                                v["preview"] = p;
                             }
                             v
                         })
@@ -8889,9 +12023,11 @@ impl Router {
                         })
                         .collect()
                 };
+                let projection_ms = projection_started.elapsed().as_millis();
                 // Persist freshly parsed previews so later loads hit the DB fast path.
                 // Brief writable open; if the writer lock is busy (a sync is running) this
                 // simply no-ops and the next load retries — it never blocks the read above.
+                let writer_started = std::time::Instant::now();
                 if !backfill.is_empty() {
                     if let Ok(w) = self.open(Some(account)) {
                         for (id, s) in &backfill {
@@ -8899,13 +12035,20 @@ impl Router {
                         }
                     }
                 }
-                ApiResponse::ok_json(&json!({
+                let writer_ms = writer_started.elapsed().as_millis();
+                let serialize_started = std::time::Instant::now();
+                let row_count = arr.len();
+                let response = ApiResponse::ok_json(&json!({
                     "items": arr,
                     "count": arr.len(),
                     "total": total,
                     "limit": limit,
                     "offset": offset,
-                }))
+                }));
+                if service == "mail" {
+                    log_archive_mail_timing(&format!("archive_mail_list metadata_only={metadata_only} rows={row_count} total={total} tuple_ms={tuple_ms} count_ms={count_ms} page_ms={page_ms} preview_hits={preview_hits} preview_misses={preview_misses} disk_parses={disk_parses} disk_parse_ms={disk_parse_ms} projection_ms={projection_ms} writer_ms={writer_ms} serialize_ms={}", serialize_started.elapsed().as_millis()));
+                }
+                response
             }
             Err(_) => ApiResponse::error(500, "store_query_failed"),
         }
@@ -9043,6 +12186,21 @@ impl Router {
             (Some(a), Some(s), Some(i)) => (a, s, i),
             _ => return ApiResponse::error(400, "missing 'account', 'service' or 'id'"),
         };
+        if service == "mail" && self.provider_origin(account).is_some() {
+            return match self
+                .mail_write
+                .as_ref()
+                .and_then(|h| h.provider_read_body(account, id).ok())
+            {
+                Some(text) => ApiResponse {
+                    status: 200,
+                    content_type: "text/plain; charset=utf-8".into(),
+                    body: text.into_bytes(),
+                    headers: Vec::new(),
+                },
+                None => ApiResponse::error(503, "provider_body_unavailable"),
+            };
+        }
         match self.read_archived(account, service, id) {
             Ok((rel, bytes, _name)) => ApiResponse {
                 status: 200,
@@ -9058,11 +12216,39 @@ impl Router {
     /// archived mail `.eml` (#562). Listing returns JSON metadata; download serves
     /// the decoded part bytes with an inert content-type (mapped through the
     /// attachment filename, `nosniff` always on — never an executable type).
+    fn live_provider_attachment(&self, req: &ApiRequest) -> ApiResponse {
+        let (Some(account), Some(id)) = (req.q("account"), req.q("id")) else {
+            return ApiResponse::error(400, "missing 'account', 'service' or 'id'");
+        };
+        let Some(handler) = self.mail_write.as_ref() else {
+            return ApiResponse::error(503, "provider_attachment_unavailable");
+        };
+        match req.q("blob_id") {
+            None => match handler.provider_attachment_list_scoped(account, req.q("mail_scope"), id)
+            {
+                Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+                Err(_) => ApiResponse::error(503, "provider_attachment_unavailable"),
+            },
+            Some(blob_id) => match handler.provider_attachment_download_scoped(
+                account,
+                req.q("mail_scope"),
+                id,
+                blob_id,
+            ) {
+                Ok(file) => provider_attachment_response(file),
+                Err(_) => ApiResponse::error(503, "provider_attachment_unavailable"),
+            },
+        }
+    }
+
     fn attachment(&self, req: &ApiRequest) -> ApiResponse {
         let (account, service, id) = match (req.q("account"), req.q("service"), req.q("id")) {
             (Some(a), Some(s), Some(i)) => (a, s, i),
             _ => return ApiResponse::error(400, "missing 'account', 'service' or 'id'"),
         };
+        if service == "mail" && self.provider_origin(account).is_some() {
+            return self.live_provider_attachment(req);
+        }
         // ToDo attachments live in the `_taskatt_<id>` sub-resource sidecar as Graph
         // taskFileAttachment[] (inline base64 contentBytes), not a MIME `.eml`
         // (#567 B4): list/decode them from that JSON instead of mail's mime parser.
@@ -9154,6 +12340,23 @@ impl Router {
     /// id-addressed trick as the OneDrive sidecar). `image/jpeg` + the always-on
     /// nosniff; 404 when the contact has no archived photo.
     fn contact_photo(&self, req: &ApiRequest) -> ApiResponse {
+        if let Some(account) = req.q("account") {
+            if self.provider_origin(account).is_some() {
+                let (Some(collection), Some(href)) = (req.q("collection"), req.q("href")) else {
+                    return with_no_store(ApiResponse::error(400, "invalid contact photo request"));
+                };
+                let photo = self
+                    .calendar_write
+                    .as_ref()
+                    .and_then(|handler| {
+                        handler
+                            .provider_contact_photo(account, collection, href)
+                            .ok()
+                    })
+                    .flatten();
+                return provider_contact_photo_response(photo);
+            }
+        }
         let (account, id) = match (req.q("account"), req.q("id")) {
             (Some(a), Some(i)) if !a.is_empty() && !i.is_empty() => (a, i),
             _ => return ApiResponse::error(400, "account and id are required"),
@@ -9181,11 +12384,27 @@ impl Router {
     /// dropped, remote resources blocked); any other raw body is shown as escaped
     /// source. Every page carries a strict `Content-Security-Policy` so the browser
     /// loads nothing remote even if something slipped past.
+    fn live_provider_mail_view(&self, req: &ApiRequest) -> ApiResponse {
+        let (Some(account), Some(id)) = (req.q("account"), req.q("id")) else {
+            return ApiResponse::error(400, "missing 'account', 'service' or 'id'");
+        };
+        match self.mail_write.as_ref().and_then(|h| {
+            h.provider_read_view_scoped(account, req.q("mail_scope"), id)
+                .ok()
+        }) {
+            Some(body) => render_provider_mail_view(body),
+            None => ApiResponse::error(503, "provider_body_unavailable"),
+        }
+    }
+
     fn view(&self, req: &ApiRequest) -> ApiResponse {
         let (account, service, id) = match (req.q("account"), req.q("service"), req.q("id")) {
             (Some(a), Some(s), Some(i)) => (a, s, i),
             _ => return ApiResponse::error(400, "missing 'account', 'service' or 'id'"),
         };
+        if service == "mail" && self.provider_origin(account).is_some() {
+            return self.live_provider_mail_view(req);
+        }
         let (rel, bytes, name) = match self.read_archived(account, service, id) {
             Ok(v) => v,
             Err(e) if e.status == 404 => {
@@ -9350,6 +12569,16 @@ fn agent_confirm_error_response(error: &str) -> ApiResponse {
     no_store_json_error(status, code)
 }
 
+fn agent_closed_confirmation_response(code: AgentClosedConfirmationCode) -> ApiResponse {
+    let code = match code {
+        AgentClosedConfirmationCode::Invalid => "confirmation_invalid",
+        AgentClosedConfirmationCode::Expired => "confirmation_expired",
+        AgentClosedConfirmationCode::Cancelled => "confirmation_cancelled",
+        AgentClosedConfirmationCode::Replayed => "confirmation_replayed",
+    };
+    no_store_json_error(409, code)
+}
+
 /// Default and maximum page size for the items listing.
 const DEFAULT_LIMIT: u32 = 200;
 const MAX_LIMIT: u32 = 1000;
@@ -9456,6 +12685,28 @@ fn backup_state(it: &Item) -> &'static str {
         (Some(e), Some(b)) if e != b => "stale",
         _ => "live_backup",
     }
+}
+
+// Only fixed labels and numeric counters from the mail-list route are passed in.
+// Android does not reliably forward native stderr to logcat.
+#[cfg(target_os = "android")]
+fn log_archive_mail_timing(message: &str) {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_int};
+
+    #[link(name = "log")]
+    unsafe extern "C" {
+        fn __android_log_write(priority: c_int, tag: *const c_char, text: *const c_char) -> c_int;
+    }
+    if let (Ok(tag), Ok(text)) = (CString::new("iSyncYou"), CString::new(message)) {
+        // ANDROID_LOG_INFO = 4; both C strings live through the call.
+        unsafe { __android_log_write(4, tag.as_ptr(), text.as_ptr()) };
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn log_archive_mail_timing(message: &str) {
+    eprintln!("isyncyou: {message}");
 }
 
 fn item_json(it: &Item) -> Value {
@@ -9912,6 +13163,61 @@ fn mail_preview_enrichment(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovery_result_diagnostics_are_bounded_and_do_not_echo_arbitrary_errors() {
+        assert!(super::safe_recovery_result_diagnostic(
+            "recovery_result_body:recovery_read_http_404"
+        ));
+        assert!(super::safe_recovery_result_diagnostic(
+            "recovery_result_integrity_size_true_hash_false"
+        ));
+        assert!(!super::safe_recovery_result_diagnostic(
+            "recovery_result_body:secret"
+        ));
+        assert!(!super::safe_recovery_result_diagnostic(
+            "recovery_result_body:recovery_read_http_404secret"
+        ));
+    }
+
+    #[test]
+    fn single_capture_route_requires_capability_and_rejects_unsupported_service() {
+        let (_d, router) = setup();
+        let router = router.with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into());
+        let make = |service: &str| {
+            ApiRequest::new("POST","/api/v1/agent/recovery/capture/prepare")
+            .with_content_type(Some("application/json".into()))
+            .with_body(serde_json::to_vec(&serde_json::json!({"request_id":"123e4567-e89b-42d3-a456-426614174000","session_id":"session-1","account":"account-1","service":service,"collection":"/calendar/","href":"/calendar/item.ics"})).unwrap())
+        };
+        assert_eq!(router.route(&make("calendar")).status, 401);
+        assert_eq!(
+            router
+                .route(&make("files").with_cap_token(Some("agentsecret".into())))
+                .status,
+            400
+        );
+        assert_eq!(
+            router
+                .route(&make("calendar").with_cap_token(Some("agentsecret".into())))
+                .status,
+            409
+        );
+        assert_eq!(
+            router
+                .route(&make("mail").with_cap_token(Some("agentsecret".into())))
+                .status,
+            409
+        );
+    }
+
+    #[test]
+    fn recovery_catalog_accepts_four_domains_only() {
+        for service in ["calendar", "todo", "mail", "contacts"] {
+            assert!(super::valid_recovery_catalog_service(service));
+        }
+        for service in ["", "files", "contact", "MAIL"] {
+            assert!(!super::valid_recovery_catalog_service(service));
+        }
+    }
     use super::*;
     use isyncyou_core::config::AccountConfig;
 
@@ -10046,6 +13352,17 @@ mod tests {
         serde_json::from_slice(&resp.body).unwrap()
     }
 
+    fn assert_opaque_confirmation_challenge(value: &Value) {
+        let object = value.as_object().expect("confirmation challenge object");
+        assert_eq!(
+            object.len(),
+            2,
+            "challenge must expose only status and handle"
+        );
+        assert_eq!(value["status"], "confirmation_required");
+        assert!(value["pending_action_id"].as_str().is_some());
+    }
+
     fn strict_json_post(path: &str, body: Value, cap: Option<&str>) -> ApiRequest {
         ApiRequest::new("POST", path)
             .with_cap_token(cap.map(str::to_string))
@@ -10066,18 +13383,482 @@ mod tests {
         strict_json_post(&legacy_shape.path, Value::Object(body), Some(cap))
     }
 
+    const TEST_CONFIRM_SESSION_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const TEST_CONFIRM_TURN_REQUEST_ID: &str = "550e8400-e29b-41d4-a716-446655440020";
+    const TEST_CONFIRM_TURN_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+    const TEST_CONFIRM_PENDING_ID: &str = "AAAAAAAAAAAAAAAAAAAAAA";
+    const TEST_CONFIRM_TOKEN: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+    const TEST_CONFIRM_ACTION_HASH: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
     fn agent_confirm_request(action_hash: &str) -> ApiRequest {
         strict_json_post(
             "/api/v1/agent/confirm",
             json!({
                 "request_id": "550e8400-e29b-41d4-a716-446655440010",
-                "pending": "p1",
-                "token": "right",
+                "session_id": TEST_CONFIRM_SESSION_ID,
+                "turn_request_id": TEST_CONFIRM_TURN_REQUEST_ID,
+                "turn_id": TEST_CONFIRM_TURN_ID,
+                "pending": TEST_CONFIRM_PENDING_ID,
+                "token": TEST_CONFIRM_TOKEN,
                 "action_hash": action_hash,
             }),
             Some("agentsecret"),
         )
         .with_session_token(Some("sess".into()))
+    }
+
+    fn mutate_agent_confirm_request(
+        request: ApiRequest,
+        mutate: impl FnOnce(&mut serde_json::Map<String, Value>),
+    ) -> ApiRequest {
+        let mut body: Value = serde_json::from_slice(&request.body).unwrap();
+        mutate(body.as_object_mut().unwrap());
+        ApiRequest::new("POST", "/api/v1/agent/confirm")
+            .with_cap_token(Some("agentsecret".into()))
+            .with_session_token(Some("sess".into()))
+            .with_content_type(Some("application/json".into()))
+            .with_body(serde_json::to_vec(&body).unwrap())
+    }
+
+    #[test]
+    fn provider_contact_photo_response_is_bounded_and_inert() {
+        let response = provider_contact_photo_response(Some(("image/png".into(), vec![1, 2, 3])));
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, "image/png");
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("cache-control")
+                && value.contains("no-store")));
+        assert!(response.headers.iter().any(|(name, value)| name
+            .eq_ignore_ascii_case("x-content-type-options")
+            && value == "nosniff"));
+        assert_eq!(
+            provider_contact_photo_response(Some(("image/svg+xml".into(), vec![1]))).status,
+            404
+        );
+        assert_eq!(
+            provider_contact_photo_response(Some((
+                "image/png".into(),
+                vec![0; 2 * 1024 * 1024 + 1]
+            )))
+            .status,
+            404
+        );
+    }
+
+    #[test]
+    fn provider_attachment_is_forced_download_and_header_safe() {
+        let response = provider_attachment_response(ProviderAttachmentDownload {
+            filename: "file\"\r\nX-Injection: value.html".into(),
+            bytes: b"<script>".to_vec(),
+        });
+        assert_eq!(response.content_type, "application/octet-stream");
+        let disposition = &response
+            .headers
+            .iter()
+            .find(|(name, _)| name == "Content-Disposition")
+            .unwrap()
+            .1;
+        assert!(disposition.starts_with("attachment;"));
+        assert!(!disposition.contains('\r') && !disposition.contains('\n'));
+        assert!(disposition.contains("%0D%0A"));
+    }
+
+    #[test]
+    fn provider_mail_view_sanitizes_html_and_reports_incomplete_body() {
+        let response = render_provider_mail_view(ProviderMailView {
+            content: "<p>Hello</p><script>alert(1)</script>".into(),
+            is_html: true,
+            incomplete: true,
+        });
+        let html = String::from_utf8(response.body).unwrap();
+        assert!(html.contains("Hello"));
+        assert!(html.contains("Message body is incomplete"));
+        assert!(!html.contains("<script"));
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-security-policy")));
+    }
+
+    #[test]
+    fn draft_mutation_accepts_explicit_provider_mail_fields() {
+        let purpose = MutationPurpose::MailBody {
+            account: "a".into(),
+            operation: "draft".into(),
+            target: String::new(),
+            recipients: vec!["to@example.invalid".into()],
+            cc: vec!["cc@example.invalid".into()],
+            bcc: vec!["bcc@example.invalid".into()],
+            subject: "Subject".into(),
+            importance: Some("high".into()),
+            read_receipt: true,
+            identity_id: Some("identity".into()),
+            all: false,
+        };
+        assert!(purpose.is_valid());
+        let mut changed = purpose.clone();
+        if let MutationPurpose::MailBody { identity_id, .. } = &mut changed {
+            *identity_id = Some("other".into());
+        }
+        assert_ne!(
+            purpose.confirmation_binding(4, "digest").3,
+            changed.confirmation_binding(4, "digest").3
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "encrypted-store")]
+    fn provider_mail_projection_keeps_all_memberships_and_cached_provenance() {
+        use isyncyou_store::{ProviderChange, ProviderObject, ProviderScope};
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Store::open_encrypted(dir.path().join("store.db"), b"test-only-provider-key").unwrap();
+        let scope = ProviderScope {
+            account_id: "a".into(),
+            origin: "https://example.invalid".into(),
+            service: "mail".into(),
+            collection: "remote".into(),
+        };
+        let object = ProviderObject { remote_id:"m1".into(), etag:None, raw:serde_json::to_vec(&json!({"id":"m1","subject":"Hello","from":[{"email":"sender@example.invalid"}],"mailboxIds":{"inbox":true,"archive":true},"keywords":{"$seen":true,"$draft":true}})).unwrap() };
+        assert!(store
+            .publish_provider_mail_window(
+                &scope,
+                None,
+                "email-1",
+                "query-1",
+                2,
+                1,
+                std::slice::from_ref(&object)
+            )
+            .unwrap());
+        store
+            .apply_provider_page(&scope, &[ProviderChange::Upsert(object)], "state-1")
+            .unwrap();
+        let mut folders = scope.clone();
+        folders.service = "mailboxes".into();
+        let folder = ProviderObject {
+            remote_id: "inbox".into(),
+            etag: None,
+            raw: serde_json::to_vec(&json!({"id":"inbox","name":"Inbox","role":"inbox"})).unwrap(),
+        };
+        store
+            .apply_provider_page(&folders, &[ProviderChange::Upsert(folder)], "state-2")
+            .unwrap();
+        let router = Router::new(Config::default());
+        let response = router.provider_mail_items(
+            &store,
+            "a",
+            "https://example.invalid",
+            &ApiRequest::get("/api/v1/items?account=a&service=mail"),
+        );
+        assert_eq!(response.status, 200);
+        let value = body_json(&response);
+        assert_eq!(value["provenance"], "local");
+        let rows = value["items"].as_array().unwrap();
+        assert!(rows
+            .iter()
+            .any(|v| v["item_type"] == "folder" && v["remote_id"] == "inbox"));
+        let mail = rows.iter().find(|v| v["remote_id"] == "m1").unwrap();
+        assert_eq!(mail["preview"]["subject"], "Hello");
+        assert_eq!(mail["preview"]["isDraft"], true);
+        assert_eq!(mail["mailbox_ids"].as_array().unwrap().len(), 2);
+        assert_eq!(mail["has_body"], false);
+        let second = ProviderObject {
+            remote_id: "m2".into(),
+            etag: None,
+            raw: serde_json::to_vec(
+                &json!({"id":"m2","subject":"Second","mailboxIds":{"inbox":true},"keywords":{}}),
+            )
+            .unwrap(),
+        };
+        store
+            .apply_provider_page(&scope, &[ProviderChange::Upsert(second)], "state-3")
+            .unwrap();
+        let first_page = body_json(&router.provider_mail_items(
+            &store,
+            "a",
+            "https://example.invalid",
+            &ApiRequest::get("/api/v1/items?account=a&service=mail&limit=1"),
+        ));
+        assert_eq!(
+            first_page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|v| v["item_type"] == "message")
+                .count(),
+            1
+        );
+        let second_page = router.provider_mail_items(
+            &store,
+            "a",
+            "https://example.invalid",
+            &ApiRequest::get("/api/v1/items?account=a&service=mail&limit=1&after=m1"),
+        );
+        assert_eq!(second_page.status, 400);
+    }
+
+    #[test]
+    #[cfg(feature = "encrypted-store")]
+    fn primary_mail_cache_never_discovers_or_returns_shared_data() {
+        use isyncyou_store::{ProviderChange, ProviderObject, ProviderScope};
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Store::open_encrypted(dir.path().join("store.db"), b"test-only-provider-key").unwrap();
+        for (service, collection, subject) in [
+            ("mail", "primary", "personal"),
+            ("mail-shared", "shared", "secret"),
+        ] {
+            let scope = ProviderScope {
+                account_id: "a".into(),
+                origin: "https://example.invalid".into(),
+                service: service.into(),
+                collection: collection.into(),
+            };
+            let object = ProviderObject {
+                remote_id: subject.into(),
+                etag: None,
+                raw: serde_json::to_vec(&json!({"subject":subject})).unwrap(),
+            };
+            store
+                .apply_provider_page(&scope, &[ProviderChange::Upsert(object)], "state")
+                .unwrap();
+        }
+        let primary = ProviderScope {
+            account_id: "a".into(),
+            origin: "https://example.invalid".into(),
+            service: "mail".into(),
+            collection: "primary".into(),
+        };
+        let more: Vec<_> = (0..54)
+            .map(|i| {
+                ProviderChange::Upsert(ProviderObject {
+                    remote_id: format!("p{i:02}"),
+                    etag: None,
+                    raw: serde_json::to_vec(&json!({"subject":"personal"})).unwrap(),
+                })
+            })
+            .collect();
+        store
+            .apply_provider_page(&primary, &more, "state2")
+            .unwrap();
+        let window: Vec<_> = (0..55)
+            .map(|i| ProviderObject {
+                remote_id: format!("w{i:02}"),
+                etag: None,
+                raw: serde_json::to_vec(&json!({"subject":"personal"})).unwrap(),
+            })
+            .collect();
+        assert!(store
+            .publish_provider_mail_window(
+                &primary,
+                None,
+                "email-state",
+                "query-state",
+                55,
+                55,
+                &window
+            )
+            .unwrap());
+        let handler = std::sync::Arc::new(RecordMailWrite(std::sync::Mutex::new(Vec::new())));
+        let mut router = Router::new(Config::default());
+        router.mail_write = Some(handler.clone());
+        let get = |query: &str| {
+            router.provider_mail_items(
+                &store,
+                "a",
+                "https://example.invalid",
+                &ApiRequest::get(query),
+            )
+        };
+        let response = get("/api/v1/items?account=a&service=mail&primary_cache_only=1&limit=1000");
+        assert_eq!(response.status, 200);
+        let body = body_json(&response);
+        assert_eq!(body["shared_access_status"], "unknown");
+        assert_eq!(body["items"].as_array().unwrap().len(), 50);
+        assert_eq!(body["items"][0]["name"], "personal");
+        assert_eq!(body["scopes"].as_array().unwrap().len(), 1);
+        assert!(handler.0.lock().unwrap().is_empty());
+        assert_eq!(
+            get("/api/v1/items?account=a&service=mail&primary_cache_only=1&mail_scope=shared")
+                .status,
+            400
+        );
+        assert_eq!(
+            get("/api/v1/items?account=a&service=mail&primary_cache_only=0").status,
+            400
+        );
+        assert_eq!(
+            get("/api/v1/items?account=a&service=mail&primary_cache_only=1&after=x").status,
+            400
+        );
+        assert_eq!(
+            get("/api/v1/items?account=a&service=mail&primary_cache_only=1&offset=1").status,
+            400
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "encrypted-store")]
+    fn shared_mail_scope_requires_access_and_readable_membership() {
+        use isyncyou_store::{ProviderChange, ProviderObject, ProviderScope};
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Store::open_encrypted(dir.path().join("store.db"), b"test-only-provider-key").unwrap();
+        let scope = ProviderScope {
+            account_id: "a".into(),
+            origin: "https://example.invalid".into(),
+            service: "mail-shared".into(),
+            collection: "shared".into(),
+        };
+        let folders = ProviderScope {
+            service: "mailboxes-shared".into(),
+            ..scope.clone()
+        };
+        let object = |id: &str, value: Value| ProviderObject {
+            remote_id: id.into(),
+            etag: None,
+            raw: serde_json::to_vec(&value).unwrap(),
+        };
+        store
+            .apply_provider_page(
+                &folders,
+                &[
+                    ProviderChange::Upsert(object(
+                        "visible",
+                        json!({"name":"visible","myRights":{"mayReadItems":true}}),
+                    )),
+                    ProviderChange::Upsert(object(
+                        "hidden",
+                        json!({"name":"hidden","myRights":{"mayReadItems":false}}),
+                    )),
+                ],
+                "folders",
+            )
+            .unwrap();
+        store
+            .apply_provider_page(
+                &scope,
+                &[
+                    ProviderChange::Upsert(object(
+                        "same",
+                        json!({"subject":"allowed","mailboxIds":{"visible":true,"hidden":true}}),
+                    )),
+                    ProviderChange::Upsert(object(
+                        "secret",
+                        json!({"subject":"forbidden","mailboxIds":{"hidden":true}}),
+                    )),
+                ],
+                "messages",
+            )
+            .unwrap();
+        let window = [
+            object(
+                "same",
+                json!({"subject":"allowed","mailboxIds":{"visible":true,"hidden":true}}),
+            ),
+            object(
+                "secret",
+                json!({"subject":"forbidden","mailboxIds":{"hidden":true}}),
+            ),
+        ];
+        assert!(store
+            .publish_provider_mail_window(&scope, None, "email", "query", 2, 2, &window)
+            .unwrap());
+        store.set_provider_accessible(&scope, true).unwrap();
+        store.set_provider_accessible(&folders, true).unwrap();
+        let handler = std::sync::Arc::new(RecordMailWrite(std::sync::Mutex::new(Vec::new())));
+        let mut router = Router::new(Config::default());
+        router.mail_write = Some(handler.clone());
+        let req = ApiRequest::get("/api/v1/items?account=a&service=mail&mail_scope=shared");
+        let result =
+            body_json(&router.provider_mail_items(&store, "a", "https://example.invalid", &req));
+        let rows = result["items"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1]["mailbox_ids"], json!(["visible"]));
+        assert_eq!(result["shared_access_status"], "observed");
+        assert_eq!(
+            handler
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.as_str() == "shared-rights")
+                .count(),
+            1
+        );
+        store.set_provider_accessible(&scope, false).unwrap();
+        assert_eq!(
+            router
+                .provider_mail_items(&store, "a", "https://example.invalid", &req)
+                .status,
+            404
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "encrypted-store")]
+    fn shared_mail_discovery_failure_is_explicitly_unknown() {
+        use isyncyou_store::{ProviderChange, ProviderObject, ProviderScope};
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Store::open_encrypted(dir.path().join("store.db"), b"test-only-provider-key").unwrap();
+        let scope = ProviderScope {
+            account_id: "unknown".into(),
+            origin: "https://example.invalid".into(),
+            service: "mail-shared".into(),
+            collection: "shared".into(),
+        };
+        let item = ProviderObject {
+            remote_id: "x".into(),
+            etag: None,
+            raw: serde_json::to_vec(&json!({"mailboxIds":{"visible":true}})).unwrap(),
+        };
+        store
+            .apply_provider_page(&scope, &[ProviderChange::Upsert(item)], "state")
+            .unwrap();
+        store.set_provider_accessible(&scope, true).unwrap();
+        let mut router = Router::new(Config::default());
+        router.mail_write = Some(std::sync::Arc::new(RecordMailWrite(std::sync::Mutex::new(
+            Vec::new(),
+        ))));
+        let primary = body_json(&router.provider_mail_items(
+            &store,
+            "unknown",
+            "https://example.invalid",
+            &ApiRequest::get("/api/v1/items?account=unknown&service=mail"),
+        ));
+        assert_eq!(primary["shared_access_status"], "unknown");
+        assert!(primary["scopes"].as_array().unwrap().is_empty());
+        assert_eq!(
+            router
+                .provider_mail_items(
+                    &store,
+                    "unknown",
+                    "https://example.invalid",
+                    &ApiRequest::get(
+                        "/api/v1/items?account=unknown&service=mail&mail_scope=shared"
+                    )
+                )
+                .status,
+            503
+        );
+    }
+
+    #[test]
+    fn task_parent_prepare_route_is_agent_bound_and_rejects_extra_fields() {
+        assert_eq!(
+            product_post_route("/api/v1/agent/task/parent/prepare").map(|spec| spec.route),
+            Some(ProductPostRoute::AgentTaskParentPrepare)
+        );
+        let good = json!({"request_id":"request","session_id":"session","account":"a","collection":"/cal/","href":"/cal/child.ics","uid":"child","new_parent":null});
+        assert!(serde_json::from_value::<AgentTaskParentPrepareRequest>(good.clone()).is_ok());
+        let mut bad = good;
+        bad["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<AgentTaskParentPrepareRequest>(bad).is_err());
     }
 
     #[test]
@@ -10364,6 +14145,140 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
+    fn live_mail_page_enforces_bound_window_and_reports_stale_state() {
+        let mut cfg = Config::default();
+        cfg.provider_accounts.insert(
+            "a".into(),
+            isyncyou_core::config::ProviderConfig::SelfHosted {
+                origin: "https://example.invalid".into(),
+                client_id: "test".into(),
+            },
+        );
+        let mut router = Router::new(cfg);
+        router.mail_write = Some(std::sync::Arc::new(RecordMailWrite(std::sync::Mutex::new(
+            Vec::new(),
+        ))));
+        let get = |query: &str| router.items(&ApiRequest::get(query));
+        assert_eq!(get("/api/v1/items?account=a&service=mail&live_metadata=1&position=50&limit=50&query_state=state").status, 409);
+        assert_eq!(
+            get("/api/v1/items?account=a&service=mail&live_metadata=1&position=50&limit=50").status,
+            400
+        );
+        assert_eq!(
+            get("/api/v1/items?account=a&service=mail&live_metadata=1&limit=51").status,
+            400
+        );
+        assert_eq!(
+            get("/api/v1/items?account=a&service=mail&live_metadata=1&primary_cache_only=1").status,
+            400
+        );
+    }
+
+    #[test]
+    fn live_provider_mail_view_bypasses_gate_but_archive_view_waits() {
+        let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let mut cfg = Config::default();
+        cfg.provider_accounts.insert(
+            "provider".into(),
+            isyncyou_core::config::ProviderConfig::SelfHosted {
+                origin: "https://example.invalid".into(),
+                client_id: "test".into(),
+            },
+        );
+        let router = std::sync::Arc::new(Router::with_gate(cfg, gate.clone()));
+        let held = gate.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let live = router.clone();
+        let live_tx = tx.clone();
+        let a = std::thread::spawn(move || {
+            let r = live.route(&ApiRequest::get(
+                "/api/v1/view?account=provider&service=mail&id=x&mail_scope=shared",
+            ));
+            live_tx.send(("live", r.status)).unwrap();
+        });
+        let archive = router.clone();
+        let b = std::thread::spawn(move || {
+            let r = archive.route(&ApiRequest::get(
+                "/api/v1/view?account=archive&service=mail&id=x",
+            ));
+            tx.send(("archive", r.status)).unwrap();
+        });
+        let first = rx.recv_timeout(std::time::Duration::from_secs(2));
+        let premature = rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_ok();
+        drop(held);
+        let after = if premature {
+            None
+        } else {
+            rx.recv_timeout(std::time::Duration::from_secs(2)).ok()
+        };
+        a.join().unwrap();
+        b.join().unwrap();
+        assert_eq!(first.ok(), Some(("live", 503)));
+        assert!(!premature);
+        assert_eq!(after.map(|(kind, _)| kind), Some("archive"));
+    }
+
+    #[test]
+    fn live_provider_attachment_bypasses_gate_but_archive_attachment_waits() {
+        let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let mut cfg = Config::default();
+        cfg.provider_accounts.insert(
+            "provider".into(),
+            isyncyou_core::config::ProviderConfig::SelfHosted {
+                origin: "https://example.invalid".into(),
+                client_id: "test".into(),
+            },
+        );
+        let handler = std::sync::Arc::new(RecordMailWrite(std::sync::Mutex::new(Vec::new())));
+        let router = std::sync::Arc::new(
+            Router::with_gate(cfg, gate.clone()).with_mail_write(handler.clone(), "cap".into()),
+        );
+        let held = gate.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let live = router.clone();
+        let live_tx = tx.clone();
+        let a = std::thread::spawn(move || {
+            let r = live.route(&ApiRequest::get(
+                "/api/v1/attachment?account=provider&service=mail&id=x&mail_scope=shared",
+            ));
+            live_tx.send(("live", r.status)).unwrap();
+        });
+        let archive = router.clone();
+        let b = std::thread::spawn(move || {
+            let r = archive.route(&ApiRequest::get(
+                "/api/v1/attachment?account=archive&service=mail&id=x",
+            ));
+            tx.send(("archive", r.status)).unwrap();
+        });
+        let first = rx.recv_timeout(std::time::Duration::from_secs(2));
+        let premature_archive = rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_ok();
+        drop(held);
+        let after = if premature_archive {
+            None
+        } else {
+            rx.recv_timeout(std::time::Duration::from_secs(2)).ok()
+        };
+        a.join().unwrap();
+        b.join().unwrap();
+        assert_eq!(first.ok(), Some(("live", 200)));
+        assert!(handler
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry == "scoped-attachment"));
+        assert!(
+            !premature_archive,
+            "archive attachment must wait for the store gate"
+        );
+        assert_eq!(after.map(|(kind, _)| kind), Some("archive"));
+    }
+
+    #[test]
     fn agent_hot_reads_are_gate_exempt_during_archive_sync() {
         let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
         let router = Router::with_gate(Config::default(), gate.clone());
@@ -10386,6 +14301,33 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 "Agent hot read must be served without the archive gate: {path}"
             );
         }
+    }
+
+    #[test]
+    fn agent_confirmation_executor_can_acquire_shared_nonrecursive_gate() {
+        struct GateAgent(std::sync::Arc<std::sync::Mutex<()>>);
+        impl AgentHandler for GateAgent {
+            fn start_turn(&self, _account: &str, _prompt: &str) -> Result<String, String> {
+                Err("unused".into())
+            }
+            fn confirm(&self, _command: &AgentConfirmCommand) -> AgentConfirmOutcome {
+                let _held = self
+                    .0
+                    .try_lock()
+                    .expect("router must not hold the executor gate");
+                AgentConfirmOutcome::Completed
+            }
+            fn cancel(&self, _turn: &str) {}
+            fn open_stream(&self, _turn: &str) -> Option<std::sync::mpsc::Receiver<String>> {
+                None
+            }
+        }
+        let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let router = Router::with_gate(Config::default(), gate.clone())
+            .with_agent(std::sync::Arc::new(GateAgent(gate)), "agentsecret".into())
+            .with_session_token("sess".into());
+        let response = router.route(&agent_confirm_request(TEST_CONFIRM_ACTION_HASH));
+        assert_eq!(response.status, 200);
     }
 
     #[test]
@@ -10626,11 +14568,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
         assert_eq!(ch.status, 200);
         let body = body_json(&ch);
-        assert_eq!(body["status"], "confirmation_required");
-        assert_eq!(body["op"], "restore-cloud");
-        assert_eq!(body["account"], "a");
-        assert_eq!(body["service"], "mail");
-        assert_eq!(body["item"], restore_cloud_pending_item("mail", "x"));
+        assert_opaque_confirmation_challenge(&body);
         assert!(restore.calls.lock().unwrap().is_empty());
 
         let pat = body["pending_action_id"].as_str().unwrap().to_string();
@@ -10762,8 +14700,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         let ch = mobile.route(&post("/api/v1/backup?account=a&services=mail"));
         assert_eq!(ch.status, 200);
         let body = body_json(&ch);
-        assert_eq!(body["status"], "confirmation_required");
-        assert_eq!(body["op"], "backup");
+        assert_opaque_confirmation_challenge(&body);
         assert!(backup.calls.lock().unwrap().is_empty());
         let pat = body["pending_action_id"].as_str().unwrap().to_string();
 
@@ -10839,8 +14776,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         fn start_turn(&self, _a: &str, _p: &str) -> Result<String, String> {
             Err("product_not_ready".into())
         }
-        fn confirm(&self, _p: &str, _t: &str, _h: &str) -> Result<String, String> {
-            Err("n/a".into())
+        fn confirm(&self, _command: &AgentConfirmCommand) -> AgentConfirmOutcome {
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::ExecutorRejected)
         }
         fn cancel(&self, _t: &str) {}
         fn open_stream(&self, _t: &str) -> Option<std::sync::mpsc::Receiver<String>> {
@@ -10858,13 +14795,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             Err("not enabled".into())
         }
 
-        fn confirm(
-            &self,
-            _pending_id: &str,
-            _token: &str,
-            _action_hash: &str,
-        ) -> Result<String, String> {
-            Err("not enabled".into())
+        fn confirm(&self, _command: &AgentConfirmCommand) -> AgentConfirmOutcome {
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::ExecutorRejected)
         }
 
         fn cancel(&self, _turn_id: &str) {}
@@ -10931,13 +14863,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             Ok("01ARZ3NDEKTSV4RRFFQ69G5FAW".into())
         }
 
-        fn confirm(
-            &self,
-            _pending_id: &str,
-            _token: &str,
-            _action_hash: &str,
-        ) -> Result<String, String> {
-            Err("not enabled".into())
+        fn confirm(&self, _command: &AgentConfirmCommand) -> AgentConfirmOutcome {
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::ExecutorRejected)
         }
 
         fn cancel(&self, _turn_id: &str) {}
@@ -11242,11 +15169,14 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         fn start_turn(&self, _a: &str, _p: &str) -> Result<String, String> {
             Ok("turn-123".into())
         }
-        fn confirm(&self, pending: &str, token: &str, action_hash: &str) -> Result<String, String> {
-            if token == "right" && action_hash == "hash" {
-                Ok(format!("ran {pending}"))
+        fn confirm(&self, command: &AgentConfirmCommand) -> AgentConfirmOutcome {
+            if command.pending == TEST_CONFIRM_PENDING_ID
+                && command.token == TEST_CONFIRM_TOKEN
+                && command.action_hash == TEST_CONFIRM_ACTION_HASH
+            {
+                AgentConfirmOutcome::Completed
             } else {
-                Err("bad token".into())
+                AgentConfirmOutcome::Rejected(AgentClosedConfirmationCode::Invalid)
             }
         }
         fn cancel(&self, _t: &str) {}
@@ -11533,13 +15463,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             Err("not enabled".into())
         }
 
-        fn confirm(
-            &self,
-            _pending_id: &str,
-            _token: &str,
-            _action_hash: &str,
-        ) -> Result<String, String> {
-            Err("not enabled".into())
+        fn confirm(&self, _command: &AgentConfirmCommand) -> AgentConfirmOutcome {
+            AgentConfirmOutcome::Failed(ClosedConfirmationFailure::ExecutorRejected)
         }
 
         fn cancel(&self, _turn_id: &str) {}
@@ -11630,8 +15555,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
     struct RecordingAgent {
         binding: AgentPendingBinding,
-        binding_calls: std::sync::Mutex<Vec<(String, String)>>,
-        confirm_calls: std::sync::Mutex<Vec<(String, String, String)>>,
+        binding_calls: std::sync::Mutex<Vec<AgentPendingBindingCommand>>,
+        confirm_calls: std::sync::Mutex<Vec<AgentConfirmCommand>>,
     }
 
     impl RecordingAgent {
@@ -11641,7 +15566,13 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                     op: "backup".into(),
                     account: "a".into(),
                     service: "agent".into(),
-                    item: "pending:2:p1:action_hash:4:hash".into(),
+                    item: format!(
+                        "pending:{}:{}:action_hash:{}:{}",
+                        TEST_CONFIRM_PENDING_ID.len(),
+                        TEST_CONFIRM_PENDING_ID,
+                        TEST_CONFIRM_ACTION_HASH.len(),
+                        TEST_CONFIRM_ACTION_HASH
+                    ),
                 },
                 binding_calls: std::sync::Mutex::new(Vec::new()),
                 confirm_calls: std::sync::Mutex::new(Vec::new()),
@@ -11660,31 +15591,91 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
 
         fn pending_binding(
             &self,
-            pending_id: &str,
-            action_hash: &str,
-        ) -> Result<AgentPendingBinding, String> {
-            self.binding_calls
-                .lock()
-                .unwrap()
-                .push((pending_id.to_string(), action_hash.to_string()));
-            if pending_id == "p1" && action_hash == "hash" {
-                Ok(self.binding.clone())
+            command: &AgentPendingBindingCommand,
+        ) -> AgentPendingBindingOutcome {
+            self.binding_calls.lock().unwrap().push(command.clone());
+            if command.pending == TEST_CONFIRM_PENDING_ID
+                && command.action_hash == TEST_CONFIRM_ACTION_HASH
+                && command.owner.session_id == TEST_CONFIRM_SESSION_ID
+                && command.owner.turn_request_id == TEST_CONFIRM_TURN_REQUEST_ID
+                && command.owner.turn_id == TEST_CONFIRM_TURN_ID
+            {
+                AgentPendingBindingOutcome::Ready(self.binding.clone())
             } else {
-                Err("ActionMismatch".into())
+                AgentPendingBindingOutcome::Rejected(AgentClosedConfirmationCode::Invalid)
             }
         }
 
-        fn confirm(&self, pending: &str, token: &str, action_hash: &str) -> Result<String, String> {
-            self.confirm_calls.lock().unwrap().push((
-                pending.to_string(),
-                token.to_string(),
-                action_hash.to_string(),
-            ));
-            if pending == "p1" && token == "right" && action_hash == "hash" {
-                Ok(format!("ran {pending}"))
+        fn confirm(&self, command: &AgentConfirmCommand) -> AgentConfirmOutcome {
+            self.confirm_calls.lock().unwrap().push(command.clone());
+            if command.pending == TEST_CONFIRM_PENDING_ID
+                && command.token == TEST_CONFIRM_TOKEN
+                && command.action_hash == TEST_CONFIRM_ACTION_HASH
+                && command.owner.session_id == TEST_CONFIRM_SESSION_ID
+                && command.owner.turn_request_id == TEST_CONFIRM_TURN_REQUEST_ID
+                && command.owner.turn_id == TEST_CONFIRM_TURN_ID
+            {
+                AgentConfirmOutcome::Completed
             } else {
-                Err("bad token".into())
+                AgentConfirmOutcome::Rejected(AgentClosedConfirmationCode::Invalid)
             }
+        }
+
+        fn cancel(&self, _turn_id: &str) {}
+
+        fn open_stream(&self, _turn_id: &str) -> Option<std::sync::mpsc::Receiver<String>> {
+            None
+        }
+    }
+
+    struct FixedConfirmAgent {
+        outcome: AgentConfirmOutcome,
+        confirm_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FixedConfirmAgent {
+        fn new(outcome: AgentConfirmOutcome) -> Self {
+            Self {
+                outcome,
+                confirm_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn confirm_call_count(&self) -> usize {
+            self.confirm_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl AgentHandler for FixedConfirmAgent {
+        fn start_turn(&self, _account: &str, _prompt: &str) -> Result<String, String> {
+            Ok("turn-fixed".into())
+        }
+
+        fn pending_binding(
+            &self,
+            command: &AgentPendingBindingCommand,
+        ) -> AgentPendingBindingOutcome {
+            if command.pending == TEST_CONFIRM_PENDING_ID
+                && command.action_hash == TEST_CONFIRM_ACTION_HASH
+                && command.owner.session_id == TEST_CONFIRM_SESSION_ID
+                && command.owner.turn_request_id == TEST_CONFIRM_TURN_REQUEST_ID
+                && command.owner.turn_id == TEST_CONFIRM_TURN_ID
+            {
+                AgentPendingBindingOutcome::Ready(AgentPendingBinding {
+                    op: "backup".into(),
+                    account: "a".into(),
+                    service: "agent".into(),
+                    item: "opaque".into(),
+                })
+            } else {
+                AgentPendingBindingOutcome::Rejected(AgentClosedConfirmationCode::Invalid)
+            }
+        }
+
+        fn confirm(&self, _command: &AgentConfirmCommand) -> AgentConfirmOutcome {
+            self.confirm_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.outcome
         }
 
         fn cancel(&self, _turn_id: &str) {}
@@ -12084,9 +16075,12 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "/api/v1/agent/confirm",
             json!({
                 "request_id": "550e8400-e29b-41d4-a716-446655440001",
-                "pending": "p1",
-                "token": "wrong",
-                "action_hash": "hash",
+                "session_id": TEST_CONFIRM_SESSION_ID,
+                "turn_request_id": TEST_CONFIRM_TURN_REQUEST_ID,
+                "turn_id": TEST_CONFIRM_TURN_ID,
+                "pending": TEST_CONFIRM_PENDING_ID,
+                "token": "w".repeat(43),
+                "action_hash": TEST_CONFIRM_ACTION_HASH,
             }),
             Some("agentsecret"),
         );
@@ -12095,9 +16089,12 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "/api/v1/agent/confirm",
             json!({
                 "request_id": "550e8400-e29b-41d4-a716-446655440002",
-                "pending": "p1",
-                "token": "right",
-                "action_hash": "hash",
+                "session_id": TEST_CONFIRM_SESSION_ID,
+                "turn_request_id": TEST_CONFIRM_TURN_REQUEST_ID,
+                "turn_id": TEST_CONFIRM_TURN_ID,
+                "pending": TEST_CONFIRM_PENDING_ID,
+                "token": TEST_CONFIRM_TOKEN,
+                "action_hash": TEST_CONFIRM_ACTION_HASH,
             }),
             Some("agentsecret"),
         );
@@ -12197,8 +16194,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "/api/v1/agent/confirm",
             json!({
                 "request_id": "550e8400-e29b-41d4-a716-446655440003",
-                "pending": "p1",
-                "token": "right",
+                "session_id": TEST_CONFIRM_SESSION_ID,
+                "turn_request_id": TEST_CONFIRM_TURN_REQUEST_ID,
+                "turn_id": TEST_CONFIRM_TURN_ID,
+                "pending": TEST_CONFIRM_PENDING_ID,
+                "token": TEST_CONFIRM_TOKEN,
             }),
             Some("agentsecret"),
         ));
@@ -12207,8 +16207,11 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "/api/v1/agent/confirm",
             json!({
                 "request_id": "550e8400-e29b-41d4-a716-446655440004",
-                "pending": "p1",
-                "action_hash": "hash",
+                "session_id": TEST_CONFIRM_SESSION_ID,
+                "turn_request_id": TEST_CONFIRM_TURN_REQUEST_ID,
+                "turn_id": TEST_CONFIRM_TURN_ID,
+                "pending": TEST_CONFIRM_PENDING_ID,
+                "action_hash": TEST_CONFIRM_ACTION_HASH,
             }),
             Some("agentsecret"),
         ));
@@ -12235,9 +16238,12 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "/api/v1/agent/confirm",
             json!({
                 "request_id": "550e8400-e29b-41d4-a716-446655440005",
-                "pending": "p1",
-                "token": "right",
-                "action_hash": "hash",
+                "session_id": TEST_CONFIRM_SESSION_ID,
+                "turn_request_id": TEST_CONFIRM_TURN_REQUEST_ID,
+                "turn_id": TEST_CONFIRM_TURN_ID,
+                "pending": TEST_CONFIRM_PENDING_ID,
+                "token": TEST_CONFIRM_TOKEN,
+                "action_hash": TEST_CONFIRM_ACTION_HASH,
             }),
             Some("agentsecret"),
         ));
@@ -12249,6 +16255,294 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(!encoded.contains("ran p1"));
         assert!(!encoded.contains("live-write"));
         assert!(!encoded.contains("set_read"));
+    }
+
+    #[test]
+    fn agent_confirm_requires_session_turn_request_and_turn_owner_binding() {
+        let (_d, router) = setup();
+        let agent = std::sync::Arc::new(RecordingAgent::backup());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into());
+
+        for field in ["session_id", "turn_request_id", "turn_id"] {
+            let request = mutate_agent_confirm_request(
+                agent_confirm_request(TEST_CONFIRM_ACTION_HASH),
+                |body| {
+                    body.remove(field);
+                },
+            );
+            assert_eq!(router.route(&request).status, 400, "missing {field}");
+        }
+
+        let response = router.route(&agent_confirm_request(TEST_CONFIRM_ACTION_HASH));
+        assert_eq!(response.status, 200);
+        let call = agent.confirm_calls.lock().unwrap().last().unwrap().clone();
+        assert_eq!(call.owner.session_id, TEST_CONFIRM_SESSION_ID);
+        assert_eq!(call.owner.turn_request_id, TEST_CONFIRM_TURN_REQUEST_ID);
+        assert_eq!(call.owner.turn_id, TEST_CONFIRM_TURN_ID);
+    }
+
+    #[test]
+    fn agent_confirm_rejects_noncanonical_pending_token_and_hash_encodings() {
+        let (_d, router) = setup();
+        let router = router
+            .with_agent(
+                std::sync::Arc::new(RecordingAgent::backup()),
+                "agentsecret".into(),
+            )
+            .with_session_token("sess".into());
+        for (field, value) in [
+            ("pending", "short".to_string()),
+            ("pending", "A".repeat(21) + "="),
+            ("token", "B".repeat(42)),
+            ("token", "B".repeat(42) + "="),
+            ("action_hash", "A".repeat(64)),
+            ("action_hash", "a".repeat(63)),
+        ] {
+            let request = mutate_agent_confirm_request(
+                agent_confirm_request(TEST_CONFIRM_ACTION_HASH),
+                |body| {
+                    body.insert(field.into(), Value::String(value));
+                },
+            );
+            assert_eq!(router.route(&request).status, 400, "accepted {field}");
+        }
+    }
+
+    #[test]
+    fn agent_confirm_semantic_digest_excludes_token_but_includes_owner_and_action_binding() {
+        let spec = product_post_route("/api/v1/agent/confirm").unwrap();
+        let base = agent_confirm_request(TEST_CONFIRM_ACTION_HASH);
+        let token_changed = mutate_agent_confirm_request(base.clone(), |body| {
+            body.insert("token".into(), Value::String("C".repeat(43)));
+        });
+        let owner_changed = mutate_agent_confirm_request(base.clone(), |body| {
+            body.insert("turn_id".into(), Value::String("OTHER_TURN".into()));
+        });
+        let action_changed = mutate_agent_confirm_request(base.clone(), |body| {
+            body.insert("action_hash".into(), Value::String("b".repeat(64)));
+        });
+        let base_identity = canonical_product_identity(&base, spec).unwrap();
+        assert_eq!(
+            base_identity.payload_digest,
+            canonical_product_identity(&token_changed, spec)
+                .unwrap()
+                .payload_digest
+        );
+        assert_ne!(
+            base_identity.payload_digest,
+            canonical_product_identity(&owner_changed, spec)
+                .unwrap()
+                .payload_digest
+        );
+        assert_ne!(
+            base_identity.payload_digest,
+            canonical_product_identity(&action_changed, spec)
+                .unwrap()
+                .payload_digest
+        );
+    }
+
+    #[test]
+    fn agent_confirm_uses_session_scope_in_global_uuid_binding() {
+        let identity = canonical_product_identity(
+            &agent_confirm_request(TEST_CONFIRM_ACTION_HASH),
+            product_post_route("/api/v1/agent/confirm").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            identity.request_scope,
+            format!("session_id:{TEST_CONFIRM_SESSION_ID}")
+        );
+        assert_eq!(identity.route_domain, "post:/api/v1/agent/confirm");
+    }
+
+    #[test]
+    fn agent_confirm_same_request_replay_never_executes_twice() {
+        let (_d, router) = setup();
+        let agent = std::sync::Arc::new(RecordingAgent::backup());
+        let receipts = std::sync::Arc::new(MemoryDurableRequests::default());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_durable_requests(receipts.clone());
+        let first = router.route(&agent_confirm_request(TEST_CONFIRM_ACTION_HASH));
+        let replay = router.route(&agent_confirm_request(TEST_CONFIRM_ACTION_HASH));
+        assert_eq!(first.status, 200);
+        assert_eq!(replay.status, 200);
+        assert_eq!(agent.confirm_call_count(), 1);
+        assert_eq!(receipts.completed_receipt_count(), 1);
+    }
+
+    #[test]
+    fn agent_confirm_retryable_retains_in_memory_authority_and_global_uuid_binding() {
+        let (_d, router) = setup();
+        let agent = std::sync::Arc::new(FixedConfirmAgent::new(AgentConfirmOutcome::Retryable));
+        let receipts = std::sync::Arc::new(MemoryDurableRequests::default());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_durable_requests(receipts.clone());
+        let request = || agent_confirm_request(TEST_CONFIRM_ACTION_HASH);
+
+        assert_eq!(router.route(&request()).status, 503);
+        assert_eq!(router.route(&request()).status, 503);
+        assert_eq!(agent.confirm_call_count(), 2);
+        assert_eq!(receipts.binding_count(), 1);
+        assert_eq!(receipts.completed_receipt_count(), 0);
+    }
+
+    #[test]
+    fn agent_confirm_restart_with_stale_started_receipt_remains_request_outcome_unknown() {
+        let receipts = std::sync::Arc::new(MemoryDurableRequests::default());
+        let request = agent_confirm_request(TEST_CONFIRM_ACTION_HASH);
+        let identity = canonical_product_identity(
+            &request,
+            product_post_route("/api/v1/agent/confirm").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            receipts.begin(&identity).unwrap(),
+            DurableRequestBegin::Execute
+        );
+
+        let (_d, router) = setup();
+        let agent = std::sync::Arc::new(RecordingAgent::backup());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_durable_requests(receipts);
+        let response = router.route(&request);
+        assert_eq!(response.status, 409);
+        assert_eq!(body_json(&response)["error"], "request_outcome_unknown");
+        assert_eq!(agent.confirm_call_count(), 0);
+    }
+
+    #[test]
+    fn agent_confirm_restart_after_consumption_never_reenters_executor() {
+        let receipts = std::sync::Arc::new(MemoryDurableRequests::default());
+        let (_d, first_router) = setup();
+        let first_agent = std::sync::Arc::new(RecordingAgent::backup());
+        let first_router = first_router
+            .with_agent(first_agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_durable_requests(receipts.clone());
+        assert_eq!(
+            first_router
+                .route(&agent_confirm_request(TEST_CONFIRM_ACTION_HASH))
+                .status,
+            200
+        );
+        assert_eq!(first_agent.confirm_call_count(), 1);
+
+        let (_d2, restarted_router) = setup();
+        let restarted_agent = std::sync::Arc::new(RecordingAgent::backup());
+        let restarted_router = restarted_router
+            .with_agent(restarted_agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_durable_requests(receipts);
+        assert_eq!(
+            restarted_router
+                .route(&agent_confirm_request(TEST_CONFIRM_ACTION_HASH))
+                .status,
+            200
+        );
+        assert_eq!(restarted_agent.confirm_call_count(), 0);
+    }
+
+    #[test]
+    fn agent_confirm_invalid_states_return_closed_codes_without_raw_details() {
+        for (outcome, expected) in [
+            (
+                AgentConfirmOutcome::Rejected(AgentClosedConfirmationCode::Invalid),
+                "confirmation_invalid",
+            ),
+            (
+                AgentConfirmOutcome::Rejected(AgentClosedConfirmationCode::Expired),
+                "confirmation_expired",
+            ),
+            (
+                AgentConfirmOutcome::Rejected(AgentClosedConfirmationCode::Cancelled),
+                "confirmation_cancelled",
+            ),
+            (
+                AgentConfirmOutcome::Rejected(AgentClosedConfirmationCode::Replayed),
+                "confirmation_replayed",
+            ),
+            (
+                AgentConfirmOutcome::OutcomeUnknown,
+                "confirmation_outcome_unknown",
+            ),
+        ] {
+            let (_d, router) = setup();
+            let router = router
+                .with_agent(
+                    std::sync::Arc::new(FixedConfirmAgent::new(outcome)),
+                    "agentsecret".into(),
+                )
+                .with_session_token("sess".into());
+            let response = router.route(&agent_confirm_request(TEST_CONFIRM_ACTION_HASH));
+            assert_eq!(response.status, 409);
+            let encoded = String::from_utf8_lossy(&response.body);
+            assert!(encoded.contains(expected));
+            for forbidden in [
+                TEST_CONFIRM_TOKEN,
+                TEST_CONFIRM_ACTION_HASH,
+                TEST_CONFIRM_PENDING_ID,
+            ] {
+                assert!(!encoded.contains(forbidden));
+            }
+        }
+    }
+
+    #[test]
+    fn agent_confirm_request_and_owner_debug_omit_token_hash_ids_and_owner_values() {
+        let request: AgentConfirmRequest =
+            serde_json::from_slice(&agent_confirm_request(TEST_CONFIRM_ACTION_HASH).body).unwrap();
+        let owner = AgentPendingOwnerProof {
+            session_id: TEST_CONFIRM_SESSION_ID.into(),
+            turn_request_id: TEST_CONFIRM_TURN_REQUEST_ID.into(),
+            turn_id: TEST_CONFIRM_TURN_ID.into(),
+        };
+        let output = format!("{request:?} {owner:?}");
+        for secret in [
+            TEST_CONFIRM_TOKEN,
+            TEST_CONFIRM_ACTION_HASH,
+            TEST_CONFIRM_PENDING_ID,
+            TEST_CONFIRM_SESSION_ID,
+            TEST_CONFIRM_TURN_REQUEST_ID,
+            TEST_CONFIRM_TURN_ID,
+        ] {
+            assert!(!output.contains(secret));
+        }
+        assert!(output.contains("token_present: true"));
+        assert!(output.contains("turn_id_present: true"));
+    }
+
+    #[test]
+    fn agent_confirm_rejects_always_allow_remember_and_unknown_bypass_fields() {
+        let (_d, router) = setup();
+        let router = router
+            .with_agent(
+                std::sync::Arc::new(RecordingAgent::backup()),
+                "agentsecret".into(),
+            )
+            .with_session_token("sess".into());
+        for field in [
+            "always_allow",
+            "remember",
+            "policy_override",
+            "account_override",
+        ] {
+            let request = mutate_agent_confirm_request(
+                agent_confirm_request(TEST_CONFIRM_ACTION_HASH),
+                |body| {
+                    body.insert(field.into(), Value::Bool(true));
+                },
+            );
+            assert_eq!(router.route(&request).status, 400, "accepted {field}");
+        }
     }
 
     #[test]
@@ -12289,7 +16583,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
-    fn open_bridge_stream_gates_events_and_agent() {
+    fn bridge_agent_stream_requires_separate_session_and_agent_cap_before_opening_handler() {
         // #0A: the bridge push channel replaces both EventSource endpoints, with the same
         // session gate. Change stream pushes on notify; agent stream wraps each line.
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -12301,11 +16595,13 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into())
             .with_session_token("s".into());
         // Unauthorized → None (identical gate to the HTTP SSE path).
-        assert!(router.open_bridge_stream("/api/v1/events", None).is_none());
+        assert!(router
+            .open_bridge_stream("/api/v1/events", None, None)
+            .is_none());
         // Authorized change stream (trusted bridge token) → a change follows a notify. A
         // background notifier removes the capture-vs-notify race (mirrors the SSE test).
         let rx = router
-            .open_bridge_stream("/api/v1/events", Some("s"))
+            .open_bridge_stream("/api/v1/events", Some("s"), None)
             .expect("events stream");
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let (n, s2) = (bus.clone(), stop.clone());
@@ -12327,8 +16623,22 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         stop.store(true, Ordering::SeqCst);
         assert!(got_change, "change stream must push a change after notify");
         // Agent stream (session + turn) → the pre-serialized line wrapped as `data`.
+        assert!(router
+            .open_bridge_stream("/api/v1/agent/stream?turn=turn-123", Some("s"), None,)
+            .is_none());
+        assert!(router
+            .open_bridge_stream(
+                "/api/v1/agent/stream?turn=turn-123",
+                Some("s"),
+                Some("wrong"),
+            )
+            .is_none());
         let arx = router
-            .open_bridge_stream("/api/v1/agent/stream?turn=turn-123", Some("s"))
+            .open_bridge_stream(
+                "/api/v1/agent/stream?turn=turn-123",
+                Some("s"),
+                Some("agentsecret"),
+            )
             .expect("agent stream");
         let first = arx.recv_timeout(Duration::from_secs(2)).expect("an event");
         assert!(
@@ -12342,7 +16652,23 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         );
         // Unknown path → None.
         assert!(router
-            .open_bridge_stream("/api/v1/nope", Some("s"))
+            .open_bridge_stream("/api/v1/nope", Some("s"), None)
+            .is_none());
+    }
+
+    #[test]
+    fn generic_events_stream_remains_session_only() {
+        let bus = std::sync::Arc::new(EventBus::new());
+        let (_d, router) = setup();
+        let router = router
+            .with_events(bus)
+            .with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into())
+            .with_session_token("s".into());
+        assert!(router
+            .open_bridge_stream("/api/v1/events", Some("s"), None)
+            .is_some());
+        assert!(router
+            .open_bridge_stream("/api/v1/events", Some("s"), Some("agentsecret"))
             .is_none());
     }
 
@@ -12422,25 +16748,127 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
-    fn mobile_agent_confirm_requires_biometric_before_agent_token_consumption() {
+    fn mobile_agent_confirmation_challenge_returns_only_opaque_handle() {
         let (_d, router) = setup();
         let agent = std::sync::Arc::new(RecordingAgent::backup());
         let router = router
             .with_agent(agent.clone(), "agentsecret".into())
             .with_session_token("sess".into())
             .with_biometric_gate();
-        let req = agent_confirm_request("hash");
+        let req = agent_confirm_request(TEST_CONFIRM_ACTION_HASH);
 
         let resp = router.route(&req);
 
         assert_eq!(resp.status, 200);
         let body = body_json(&resp);
-        assert_eq!(body["status"], "confirmation_required");
-        assert_eq!(body["op"], "backup");
-        assert_eq!(body["account"], "a");
-        assert_eq!(body["service"], "agent");
-        assert_eq!(body["item"], "pending:2:p1:action_hash:4:hash");
+        assert_opaque_confirmation_challenge(&body);
+        assert_eq!(body.as_object().unwrap().len(), 2);
         assert_eq!(agent.confirm_call_count(), 0);
+    }
+
+    #[test]
+    fn mobile_agent_confirm_revalidates_owner_before_native_handle_consumption() {
+        let (_d, router) = setup();
+        let agent = std::sync::Arc::new(RecordingAgent::backup());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_biometric_gate();
+        let exact = agent_confirm_request(TEST_CONFIRM_ACTION_HASH);
+        let challenge = router.route(&exact);
+        let handle = body_json(&challenge)["pending_action_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(router.confirm_biometric(&handle));
+
+        let wrong_owner = mutate_agent_confirm_request(exact.clone(), |body| {
+            body.insert("turn_id".into(), Value::String("OTHER_TURN".into()));
+        })
+        .with_per_action_token(Some(handle.clone()));
+        assert_eq!(router.route(&wrong_owner).status, 409);
+        assert_eq!(agent.confirm_call_count(), 0);
+
+        let accepted = router.route(&exact.with_per_action_token(Some(handle)));
+        assert_eq!(accepted.status, 200);
+        assert_eq!(agent.confirm_call_count(), 1);
+    }
+
+    #[test]
+    fn agent_native_handle_cannot_bypass_owner_bound_agent_confirmation() {
+        let (_d, router) = setup();
+        let agent = std::sync::Arc::new(RecordingAgent::backup());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_biometric_gate();
+        let exact = agent_confirm_request(TEST_CONFIRM_ACTION_HASH);
+        let challenge = router.route(&exact);
+        let handle = body_json(&challenge)["pending_action_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(router.confirm_biometric(&handle));
+        let wrong_owner = mutate_agent_confirm_request(exact, |body| {
+            body.insert(
+                "turn_request_id".into(),
+                Value::String("550e8400-e29b-41d4-a716-446655440099".into()),
+            );
+        })
+        .with_per_action_token(Some(handle));
+        assert_eq!(router.route(&wrong_owner).status, 409);
+        assert_eq!(agent.confirm_call_count(), 0);
+    }
+
+    #[test]
+    fn agent_pending_confirmation_routes_existing_native_presence_gate() {
+        let (_d, router) = setup();
+        let agent = std::sync::Arc::new(RecordingAgent::backup());
+        let router = router
+            .with_agent(agent.clone(), "agentsecret".into())
+            .with_session_token("sess".into())
+            .with_biometric_gate();
+        let request = agent_confirm_request(TEST_CONFIRM_ACTION_HASH);
+        let challenge = router.route(&request);
+        assert_eq!(body_json(&challenge)["status"], "confirmation_required");
+        let handle = body_json(&challenge)["pending_action_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(router.describe_biometric(&handle).is_ok());
+        assert!(router.confirm_biometric(&handle));
+        assert_eq!(
+            router
+                .route(&request.with_per_action_token(Some(handle)))
+                .status,
+            200
+        );
+        assert_eq!(agent.confirm_call_count(), 1);
+    }
+
+    #[test]
+    fn agent_stream_bridge_requires_session_and_agent_capability() {
+        let (_d, router) = setup();
+        let router = router
+            .with_agent(std::sync::Arc::new(FakeAgent), "agentsecret".into())
+            .with_session_token("session".into());
+        assert!(router
+            .open_bridge_stream(
+                "/api/v1/agent/stream?turn=turn-123",
+                Some("session"),
+                Some("agentsecret"),
+            )
+            .is_some());
+        for (session, capability) in [
+            (None, Some("agentsecret")),
+            (Some("session"), None),
+            (Some("wrong"), Some("agentsecret")),
+            (Some("session"), Some("wrong")),
+        ] {
+            assert!(router
+                .open_bridge_stream("/api/v1/agent/stream?turn=turn-123", session, capability,)
+                .is_none());
+        }
     }
 
     #[test]
@@ -12452,7 +16880,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .with_session_token("sess".into())
             .with_biometric_gate()
             .with_durable_requests(std::sync::Arc::new(MemoryDurableRequests::default()));
-        let auth = || agent_confirm_request("hash");
+        let auth = || agent_confirm_request(TEST_CONFIRM_ACTION_HASH);
 
         let first = router.route(&auth());
         let pat = body_json(&first)["pending_action_id"]
@@ -12477,7 +16905,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .with_agent(agent.clone(), "agentsecret".into())
             .with_session_token("sess".into())
             .with_biometric_gate();
-        let auth = || agent_confirm_request("hash");
+        let auth = || agent_confirm_request(TEST_CONFIRM_ACTION_HASH);
         let challenge = router.route(&auth());
         let pat = body_json(&challenge)["pending_action_id"]
             .as_str()
@@ -12500,13 +16928,14 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             .with_agent(agent.clone(), "agentsecret".into())
             .with_session_token("sess".into())
             .with_biometric_gate();
-        let req = agent_confirm_request("wrong");
+        let req = agent_confirm_request(&"b".repeat(64));
 
         let resp = router.route(&req);
 
         assert_eq!(resp.status, 409);
         let body = String::from_utf8_lossy(&resp.body);
-        assert!(body.contains("ActionMismatch"));
+        assert!(body.contains("confirmation_invalid"));
+        assert!(!body.contains("ActionMismatch"));
         assert!(!body.contains("confirmation_required"));
         assert_eq!(agent.confirm_call_count(), 0);
     }
@@ -13412,6 +17841,52 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         }
     }
     impl MailWriteHandler for RecordMailWrite {
+        fn provider_live_mail_page(
+            &self,
+            account: &str,
+            scope: Option<&str>,
+            mailbox: Option<&str>,
+            text: Option<&str>,
+            position: usize,
+            limit: usize,
+            state: Option<&str>,
+        ) -> Result<Value, String> {
+            assert_eq!(
+                (account, scope, mailbox, text, position, limit, state),
+                ("a", None, None, None, 50, 50, Some("state"))
+            );
+            Err("stale_page".into())
+        }
+        fn provider_attachment_list_scoped(
+            &self,
+            account: &str,
+            scope: Option<&str>,
+            id: &str,
+        ) -> Result<Value, String> {
+            if account != "provider" || scope != Some("shared") || id != "x" {
+                return Err("invalid".into());
+            }
+            self.0.lock().unwrap().push("scoped-attachment".into());
+            Ok(json!({"attachments":[]}))
+        }
+        fn provider_shared_mail_accounts(&self, account: &str) -> Result<Vec<String>, String> {
+            if account == "unknown" {
+                return Err("offline".into());
+            }
+            Ok(vec!["shared".into()])
+        }
+        fn provider_shared_mailbox_ids(
+            &self,
+            _account: &str,
+            _scope: &str,
+        ) -> Result<Vec<String>, String> {
+            self.0.lock().unwrap().push("shared-rights".into());
+            Ok(vec!["visible".into()])
+        }
+        fn read_state(&self, _a: &str, id: &str) -> Result<bool, String> {
+            self.0.lock().unwrap().push(format!("read_state id={id}"));
+            Ok(false)
+        }
         #[allow(clippy::too_many_arguments)]
         fn send(
             &self,
@@ -14272,7 +18747,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     fn product_post_transport_retry_reuses_one_serialized_body_and_skips_ephemeral_authority() {
         let source = include_str!("app.js");
         let helper = source
-            .split("async function postJson(path, capToken, value) {")
+            .split("async function postJson(path, capToken, value, timeoutMs) {")
             .nth(1)
             .unwrap()
             .split("function isReplayedRequest")
@@ -14520,7 +18995,10 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 confirm_spec.path,
                 json!({
                     "request_id": "123e4567-e89b-42d3-a456-426614174111",
-                    "pending": "01JPENDING0000000000000000",
+                    "session_id": TEST_CONFIRM_SESSION_ID,
+                    "turn_request_id": TEST_CONFIRM_TURN_REQUEST_ID,
+                    "turn_id": TEST_CONFIRM_TURN_ID,
+                    "pending": TEST_CONFIRM_PENDING_ID,
                     "token": token,
                     "action_hash": action_hash
                 }),
@@ -14528,14 +19006,24 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             )
         };
         let first =
-            canonical_product_identity(&confirm("first-proof", &"a".repeat(64)), confirm_spec)
+            canonical_product_identity(&confirm(TEST_CONFIRM_TOKEN, &"a".repeat(64)), confirm_spec)
                 .unwrap();
-        let rotated_proof =
-            canonical_product_identity(&confirm("second-proof", &"a".repeat(64)), confirm_spec)
-                .unwrap();
-        let changed_effect =
-            canonical_product_identity(&confirm("second-proof", &"b".repeat(64)), confirm_spec)
-                .unwrap();
+        let rotated_proof = canonical_product_identity(
+            &confirm(
+                "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+                &"a".repeat(64),
+            ),
+            confirm_spec,
+        )
+        .unwrap();
+        let changed_effect = canonical_product_identity(
+            &confirm(
+                "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+                &"b".repeat(64),
+            ),
+            confirm_spec,
+        )
+        .unwrap();
         assert_eq!(first, rotated_proof);
         assert_ne!(first.payload_digest, changed_effect.payload_digest);
 
@@ -15159,12 +19647,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         ));
         assert_eq!(ch.status, 200);
         let j = body_json(&ch);
-        assert_eq!(j["status"], "confirmation_required");
-        assert_eq!(j["op"], "move-out-of-protected");
-        assert_eq!(
-            serde_json::from_str::<Value>(j["item"].as_str().unwrap()).unwrap(),
-            json!(["onedrive_move", "A:B", "P]1", "N:\"1"])
-        );
+        assert_opaque_confirmation_challenge(&j);
         let pat = j["pending_action_id"].as_str().unwrap().to_string();
         assert!(writes.moves.lock().unwrap().is_empty());
         assert_eq!(risk.move_calls(), 1);
@@ -15261,8 +19744,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         ));
         assert_eq!(ch.status, 200);
         let j = body_json(&ch);
-        assert_eq!(j["status"], "confirmation_required");
-        assert_eq!(j["op"], "move-out-of-protected");
+        assert_opaque_confirmation_challenge(&j);
         assert!(writes.moves.lock().unwrap().is_empty());
         assert_eq!(risk.move_calls(), 1);
     }
@@ -15300,12 +19782,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         ));
         assert_eq!(ch.status, 200);
         let j = body_json(&ch);
-        assert_eq!(j["status"], "confirmation_required");
-        assert_eq!(j["op"], "mode-switch-offline-large");
-        assert_eq!(
-            serde_json::from_str::<Value>(j["item"].as_str().unwrap()).unwrap(),
-            json!(["onedrive_mode_offline", "Photos"])
-        );
+        assert_opaque_confirmation_challenge(&j);
         assert!(
             !modes
                 .modes("a")
@@ -15411,12 +19888,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         ));
         assert_eq!(ch.status, 200);
         let j = body_json(&ch);
-        assert_eq!(j["status"], "confirmation_required");
-        assert_eq!(j["op"], "bulk");
-        assert_eq!(
-            serde_json::from_str::<Value>(j["item"].as_str().unwrap()).unwrap(),
-            json!(["onedrive_mode_online_account_cleanup", "Photos"])
-        );
+        assert_opaque_confirmation_challenge(&j);
         assert!(
             !modes
                 .modes("a")
@@ -15762,6 +20234,120 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             g0,
             "a self-write must not notify (would clobber optimistic UI from a stale re-fetch)"
         );
+    }
+
+    #[test]
+    fn mail_live_read_state_requires_session_and_capability_and_is_not_store_projection() {
+        let (_dir, router) = setup();
+        let mail = std::sync::Arc::new(RecordMailWrite::default());
+        let router = router
+            .with_mail_write(mail.clone(), "mail-cap".into())
+            .with_session_token("session".into());
+        let path = "/api/v1/mail/read-state";
+        let request = strict_json_post(
+            path,
+            json!({
+                "request_id": "123e4567-e89b-42d3-a456-426614174008", "account": "a", "id": "m1"
+            }),
+            Some("mail-cap"),
+        );
+        assert_eq!(router.route(&request).status, 401);
+        assert_eq!(
+            router
+                .route(
+                    &request
+                        .clone()
+                        .with_session_token(Some("session".into()))
+                        .with_cap_token(None)
+                )
+                .status,
+            401
+        );
+        let response = router.route(&request.with_session_token(Some("session".into())));
+        assert_eq!(response.status, 200);
+        assert_eq!(body_json(&response), json!({"is_read": false}));
+        assert_eq!(
+            mail.0.lock().unwrap().as_slice(),
+            ["read_state id=m1"],
+            "the live-state route must invoke its Graph-backed handler"
+        );
+    }
+
+    #[test]
+    fn mail_live_read_state_rejects_query_unknown_duplicate_and_oversized_bodies() {
+        let (_dir, router) = setup();
+        let mail = std::sync::Arc::new(RecordMailWrite::default());
+        let router = router
+            .with_mail_write(mail.clone(), "mail-cap".into())
+            .with_session_token("session".into());
+        let authorize = |request: ApiRequest| {
+            request
+                .with_session_token(Some("session".into()))
+                .with_cap_token(Some("mail-cap".into()))
+        };
+        assert_eq!(
+            router
+                .route(&authorize(ApiRequest::get(
+                    "/api/v1/mail/read-state?account=a&id=m1"
+                )))
+                .status,
+            405
+        );
+        let valid =
+            json!({"request_id":"123e4567-e89b-42d3-a456-426614174008", "account":"a", "id":"m1"});
+        for body in [
+            json!({"request_id":"123e4567-e89b-42d3-a456-426614174008", "account":"a", "id":"m1", "is_read":true}).to_string(),
+            r#"{"request_id":"123e4567-e89b-42d3-a456-426614174008","account":"a","id":"m1","id":"m2"}"#.into(),
+            "{}".into(),
+        ] {
+            let request = authorize(ApiRequest::new("POST", "/api/v1/mail/read-state")
+                .with_content_type(Some("application/json".into())).with_body(body.into_bytes()));
+            assert_eq!(router.route(&request).status, 400);
+        }
+        assert_eq!(
+            router
+                .route(&authorize(strict_json_post(
+                    "/api/v1/mail/read-state?account=a&id=m1",
+                    valid,
+                    Some("mail-cap")
+                )))
+                .status,
+            400
+        );
+        assert_eq!(
+            router
+                .route(&authorize(
+                    ApiRequest::new("POST", "/api/v1/mail/read-state")
+                        .with_content_type(Some("application/json".into()))
+                        .with_body(vec![b' '; 8193])
+                ))
+                .status,
+            413
+        );
+        assert!(mail.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mail_live_read_state_replay_performs_fresh_read_without_terminal_receipt() {
+        let (_dir, router) = setup();
+        let mail = std::sync::Arc::new(RecordMailWrite::default());
+        let receipts = std::sync::Arc::new(MemoryDurableRequests::default());
+        let router = router
+            .with_mail_write(mail.clone(), "mail-cap".into())
+            .with_durable_requests(receipts.clone());
+        let request = strict_json_post(
+            "/api/v1/mail/read-state",
+            json!({
+                "request_id":"123e4567-e89b-42d3-a456-426614174008", "account":"a", "id":"m1"
+            }),
+            Some("mail-cap"),
+        );
+        for _ in 0..2 {
+            assert_eq!(body_json(&router.route(&request)), json!({"is_read":false}));
+        }
+        assert_eq!(mail.0.lock().unwrap().len(), 2);
+        assert_eq!(receipts.binding_count(), 1);
+        assert_eq!(receipts.completed_receipt_count(), 0);
     }
 
     /// app.js carries the mail-write cap token placeholder so #563's UI can POST.
@@ -16610,7 +21196,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "if (!isCurrentTurn()) return;",
             "activityProtocol = finishAssistantActivityState(",
             "activityProtocol, activityIdentity, \"cancelled\"",
-            "turn_id: turnState.turnId || \"\"",
+            "session_id: turnState.ownerProof?.session_id || \"\"",
+            "turn_request_id: turnState.ownerProof?.turn_request_id || \"\"",
+            "turn_id: turnState.ownerProof?.turn_id || turnState.turnId || \"\"",
         ] {
             assert!(
                 APP_JS.contains(needle),
@@ -16769,8 +21357,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     #[test]
     fn living_ui_pending_card_authority_and_terminal_controls_are_unchanged() {
         for needle in [
-            "postJson(\"/api/v1/agent/confirm\"",
-            "token: record.token, action_hash: record.action_hash",
+            "postJson(\"/api/v1/agent/confirm\", CAP.agent, attempt.request, MUTATION_COMMIT_TIMEOUT_MS)",
+            "token: record.token,",
+            "action_hash: record.action_hash,",
             "postJson(\"/api/v1/agent/pending/cancel\"",
             "action_hash: record.action_hash",
             "done ? null : el(\"div\", { class: \"asst-pending-actions\" }",
@@ -16781,6 +21370,169 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 "pending authority changed: {needle}"
             );
         }
+    }
+
+    #[test]
+    fn agent_confirm_attempt_reuses_one_uuid_for_native_challenge_and_transport_retry() {
+        let factory = APP_JS
+            .split("function getOrCreateAgentConfirmAttempt")
+            .nth(1)
+            .unwrap()
+            .split("async function confirmAgentPending")
+            .next()
+            .unwrap();
+        assert!(factory.contains("if (existing) return existing;"));
+        assert_eq!(factory.matches("crypto.randomUUID()").count(), 1);
+        assert!(factory.contains("AssistantState.confirmAttemptsByPendingId.set"));
+        let submit = APP_JS
+            .split("async function confirmAgentPending")
+            .nth(1)
+            .unwrap()
+            .split("async function cancelAgentPending")
+            .next()
+            .unwrap();
+        assert!(submit.contains("postJson(\"/api/v1/agent/confirm\", CAP.agent, attempt.request, MUTATION_COMMIT_TIMEOUT_MS)"));
+        assert!(APP_JS.contains(
+            "return request(method, path, { ...o, perActionToken: d.pending_action_id });"
+        ));
+    }
+
+    #[test]
+    fn agent_confirm_native_prompt_denial_discards_attempt_but_retains_pending_authority() {
+        let submit = APP_JS
+            .split("async function confirmAgentPending")
+            .nth(1)
+            .unwrap()
+            .split("async function cancelAgentPending")
+            .next()
+            .unwrap();
+        let denied = submit
+            .split("if (e && e.nativePromptDenied)")
+            .nth(1)
+            .unwrap()
+            .split("} else if")
+            .next()
+            .unwrap();
+        assert!(denied.contains("confirmAttemptsByPendingId.delete(pendingId)"));
+        assert!(denied.contains("updateAgentPendingStatus(record, \"pending\")"));
+        assert!(!denied.contains("clearAgentPendingAuthority"));
+        assert!(!denied.contains("record.token = \"\""));
+    }
+
+    #[test]
+    fn agent_confirm_outcome_unknown_clears_authority_and_reconciles_without_new_uuid() {
+        let submit = APP_JS
+            .split("async function confirmAgentPending")
+            .nth(1)
+            .unwrap()
+            .split("async function cancelAgentPending")
+            .next()
+            .unwrap();
+        let unknown = submit
+            .split("e.code === \"confirmation_outcome_unknown\"")
+            .nth(1)
+            .unwrap()
+            .split("} else {")
+            .next()
+            .unwrap();
+        assert!(unknown.contains("updateAgentPendingStatus(record, \"outcome_unknown\")"));
+        assert!(unknown.contains("clearAgentPendingAuthority(record)"));
+        assert!(!unknown.contains("crypto.randomUUID"));
+    }
+
+    #[test]
+    fn assistant_pending_confirmation_posts_exact_original_turn_owner_proof() {
+        let factory = APP_JS
+            .split("function getOrCreateAgentConfirmAttempt")
+            .nth(1)
+            .unwrap()
+            .split("async function confirmAgentPending")
+            .next()
+            .unwrap();
+        for field in [
+            "session_id: record.session_id",
+            "turn_request_id: record.turn_request_id",
+            "turn_id: record.turn_id",
+            "pending: record.pending_id",
+            "action_hash: record.action_hash",
+        ] {
+            assert!(factory.contains(field), "missing owner field: {field}");
+        }
+        assert!(APP_JS.contains(
+            "activityIdentity = Object.freeze({\n    session_id: sessionId, turn_request_id: requestId, turn_id: turn,"
+        ));
+    }
+
+    #[test]
+    fn assistant_pending_confirmation_authority_is_memory_only_and_erased_on_terminal_state() {
+        let state = APP_JS
+            .split("const AssistantState = {")
+            .nth(1)
+            .unwrap()
+            .split("function closeAssistantStream")
+            .next()
+            .unwrap();
+        assert!(state.contains("confirmAttemptsByPendingId: new Map()"));
+        let authority = APP_JS
+            .split("function clearAgentPendingAuthority")
+            .nth(1)
+            .unwrap()
+            .split("function getOrCreateAgentConfirmAttempt")
+            .next()
+            .unwrap();
+        for field in [
+            "record.token",
+            "record.action_hash",
+            "record.session_id",
+            "record.turn_id",
+        ] {
+            assert!(authority.contains(&format!("{field} = \"\"")));
+        }
+        assert!(!state.contains("localStorage"));
+        assert!(!state.contains("sessionStorage"));
+        assert!(!state.contains("indexedDB"));
+    }
+
+    #[test]
+    fn desktop_agent_fetch_stream_sends_cap_header_and_never_query_authority() {
+        let stream = APP_JS
+            .split("function openAgentFetchStream")
+            .nth(1)
+            .unwrap()
+            .split("function openEventStream")
+            .next()
+            .unwrap();
+        assert!(stream.contains("headers: { \"X-Capability-Token\": capToken }"));
+        assert!(stream.contains("credentials: \"same-origin\""));
+        assert!(!stream.contains("cap_token="));
+        assert!(!stream.contains("_st="));
+    }
+
+    #[test]
+    fn desktop_agent_sse_decoder_rejects_invalid_or_oversized_frames() {
+        assert!(APP_JS.contains("const AGENT_SSE_FRAME_MAX_BYTES = 72 * 1024;"));
+        assert!(APP_JS.contains("const AGENT_SSE_CARRY_MAX_BYTES = 144 * 1024;"));
+        assert!(APP_JS.contains("throw new Error(\"agent_stream_frame_too_large\")"));
+        assert!(APP_JS.contains("throw new Error(\"agent_stream_invalid_field\")"));
+        assert!(APP_JS.contains("throw new Error(\"agent_stream_invalid_framing\")"));
+        assert!(APP_JS.contains("throw new Error(\"agent_stream_truncated_frame\")"));
+        assert!(APP_JS.contains("new TextDecoder(\"utf-8\", { fatal: true })"));
+    }
+
+    #[test]
+    fn agent_stream_response_is_no_store_and_rejects_redirect_or_non_success() {
+        let stream = APP_JS
+            .split("function openAgentFetchStream")
+            .nth(1)
+            .unwrap()
+            .split("function openEventStream")
+            .next()
+            .unwrap();
+        assert!(stream.contains("redirect: \"error\""));
+        assert!(stream.contains("response.redirected || !response.ok"));
+        assert!(stream.contains("cache: \"no-store\""));
+        assert!(stream.contains("cacheControl.toLowerCase()"));
+        assert!(stream.contains("v.trim() === \"no-store\""));
     }
 
     #[test]
@@ -17069,14 +21821,20 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "AssistantState.pendingCardsById.set(pending.pending_id",
             "token: d.token || \"\"",
             "action_hash: d.action_hash || \"\"",
-            "postJson(\"/api/v1/agent/confirm\", CAP.agent, {",
+            "postJson(\"/api/v1/agent/confirm\", CAP.agent, attempt.request, MUTATION_COMMIT_TIMEOUT_MS)",
             "postJson(\"/api/v1/agent/pending/cancel\", CAP.agent",
+            "confirmAttemptsByPendingId: new Map()",
+            "session_id: turnState.ownerProof?.session_id || \"\"",
+            "turn_request_id: turnState.ownerProof?.turn_request_id || \"\"",
             "updateAgentPendingStatus(record, \"confirming\")",
             "updateAgentPendingStatus(record, \"confirmed\")",
+            "updateAgentPendingStatus(record, \"retryable\")",
+            "updateAgentPendingStatus(record, \"outcome_unknown\")",
+            "mail_pre_dispatch_failed",
+            "The message could not be prepared; this attempt did not submit it.",
             "updateAgentPendingStatus(record, \"cancelling\")",
             "updateAgentPendingStatus(record, \"cancelled\")",
             "updateAgentPendingStatus(pending, \"expired\")",
-            "updateAgentPendingStatus(record, \"error\")",
             "confirm.setAttribute(\"disabled\", \"disabled\")",
             "cancel.setAttribute(\"disabled\", \"disabled\")",
             "\"data-agent-pending-confirm\": \"1\"",
@@ -17339,8 +22097,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     }
 
     #[test]
-    fn app_js_biometric_labels_cover_onedrive_risk_ops() {
-        for needle in [
+    fn app_js_delegates_onedrive_risk_labels_to_native_policy() {
+        for forbidden in [
+            "function biometricServiceLabel(service)",
             "\"move-out-of-protected\"",
             "Move out of offline folder",
             "\"mode-switch-offline-large\"",
@@ -17351,15 +22110,16 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "biometricServiceLabel(d.service)",
         ] {
             assert!(
-                APP_JS.contains(needle),
-                "app.js missing #723 biometric label invariant: {needle}"
+                !APP_JS.contains(forbidden),
+                "app.js must delegate #723 biometric labels to native policy: {forbidden}"
             );
         }
+        assert!(APP_JS.contains("BRIDGE.postMessage(JSON.stringify({ t: \"bio\", id, pat }))"));
     }
 
     #[test]
-    fn app_js_biometric_labels_cover_mobile_full_node_ops() {
-        for needle in [
+    fn app_js_delegates_mobile_full_node_labels_to_native_policy() {
+        for forbidden in [
             "function biometricServiceLabel(service)",
             "service === \"backup\" || service === \"agent\" ? \"iSyncYou\"",
             "\"backup\" ? \"Start backup\"",
@@ -17368,8 +22128,8 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             "biometricServiceLabel(d.service)",
         ] {
             assert!(
-                APP_JS.contains(needle),
-                "app.js missing #625 biometric label invariant: {needle}"
+                !APP_JS.contains(forbidden),
+                "app.js must delegate #625 biometric labels to native policy: {forbidden}"
             );
         }
         for forbidden in ["body_html", "body_text", "recipient", "change"] {
@@ -19254,6 +24014,178 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn archive_reader_reuses_and_invalidates_on_file_change() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, mut router) = setup();
+        let mut second = router.config.accounts[0].clone();
+        second.id = "b".into();
+        router.config.accounts.push(second.clone());
+        second.id = "c".into();
+        router.config.accounts.push(second);
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/status?account=a"))
+                .status,
+            200
+        );
+        let first = {
+            let reader = router.archive_reader.lock().unwrap();
+            reader.last().unwrap().2
+        };
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/activity?account=a"))
+                .status,
+            200
+        );
+        let mail = router.route(&ApiRequest::get("/api/v1/items?account=a&service=mail"));
+        assert_eq!(mail.status, 200);
+        assert_eq!(body_json(&mail)["total"], 2);
+        let calendar = router.route(&ApiRequest::get("/api/v1/items?account=a&service=calendar"));
+        assert_eq!(calendar.status, 200);
+        assert_eq!(body_json(&calendar)["total"], 1);
+        {
+            let reader = router.archive_reader.lock().unwrap();
+            assert_eq!(reader.last().unwrap().2, first);
+            assert_eq!(
+                router
+                    .archive_reader_opens
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+        }
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/status?account=b"))
+                .status,
+            200
+        );
+        assert_eq!(router.archive_reader.lock().unwrap().last().unwrap().0, "b");
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/status?account=a"))
+                .status,
+            200
+        );
+        {
+            let readers = router.archive_reader.lock().unwrap();
+            assert_eq!(readers.len(), 2);
+            assert_eq!(readers.last().unwrap().0, "a");
+            assert_eq!(readers.last().unwrap().2, first);
+            assert_eq!(
+                router
+                    .archive_reader_opens
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                2
+            );
+        }
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/status?account=c"))
+                .status,
+            200
+        );
+        {
+            let readers = router.archive_reader.lock().unwrap();
+            assert_eq!(readers.len(), 2);
+            assert!(readers.iter().any(|entry| entry.0 == "a"));
+            assert!(readers.iter().any(|entry| entry.0 == "c"));
+            assert_eq!(
+                router
+                    .archive_reader_opens
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                3
+            );
+        }
+        let path = router.store_path("a").unwrap();
+        {
+            let writer = Store::open(&path).unwrap();
+            writer
+                .add_run("a", "cache-test", "1", "2", "ok", "new")
+                .unwrap();
+            let response = router.route(&ApiRequest::get("/api/v1/activity?account=a"));
+            assert_eq!(response.status, 200);
+            assert_eq!(body_json(&response)["runs"][0]["kind"], "cache-test");
+        }
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode ^ 0o040)).unwrap();
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/status?account=a"))
+                .status,
+            200
+        );
+        assert_ne!(
+            router.archive_reader.lock().unwrap().last().unwrap().2,
+            first
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("missing-archive-target", &path).unwrap();
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/status?account=a"))
+                .status,
+            500
+        );
+        assert!(router
+            .archive_reader
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|entry| entry.0 != "a"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_reader_rejects_future_schema_from_wal() {
+        let (_dir, router) = setup();
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/status?account=a"))
+                .status,
+            200
+        );
+        let path = router.store_path("a").unwrap();
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        #[cfg(feature = "encrypted-store")]
+        if let Some(key) = isyncyou_store::configured_store_key().unwrap() {
+            let rc = unsafe {
+                rusqlite::ffi::sqlite3_key(writer.handle(), key.as_ptr().cast(), key.len() as i32)
+            };
+            assert_eq!(rc, rusqlite::ffi::SQLITE_OK);
+        }
+        let response = router.with_archive_reader("a", |_| {
+            writer
+                .pragma_update(None, "user_version", isyncyou_store::SCHEMA_VERSION + 1)
+                .unwrap();
+            ApiResponse::ok_json(&json!({"stale": true}))
+        });
+        assert_eq!(response.status, 500);
+        assert!(router
+            .archive_reader
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|entry| entry.0 != "a"));
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/status?account=a"))
+                .status,
+            500
+        );
+        writer
+            .pragma_update(None, "user_version", isyncyou_store::SCHEMA_VERSION)
+            .unwrap();
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/status?account=a"))
+                .status,
+            200
+        );
+    }
+
     #[test]
     fn app_js_wires_pagination() {
         for needle in ["loadMore", "offset", "limit"] {
@@ -19610,11 +24542,17 @@ Content-Type: text/html; charset=utf-8\r\n\
             let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
             let mut m = Item::new("a", "mail", "m1", "Quarterly report", "message");
             m.local_path = Some("mail/aa/bb/m.eml".into());
+            m.sender = Some("indexed@example.invalid".into());
             store.upsert_item(&m).unwrap();
             // an item whose body file is absent → still listed, just without a preview
             let mut m2 = Item::new("a", "mail", "m2", "No body", "message");
             m2.local_path = Some("mail/zz/zz/missing.eml".into());
             store.upsert_item(&m2).unwrap();
+            let m3 = Item::new("a", "mail", "m3", "Partial preview", "message");
+            store.upsert_item(&m3).unwrap();
+            store
+                .set_preview_json("a", "mail", "m3", r#"{"from":"partial@example.invalid"}"#)
+                .unwrap();
         }
         let cfg = Config {
             accounts: vec![AccountConfig {
@@ -19628,6 +24566,41 @@ Content-Type: text/html; charset=utf-8\r\n\
             ..Default::default()
         };
         let router = Router::new(cfg);
+        assert_eq!(
+            router
+                .route(&ApiRequest::get(
+                    "/api/v1/items?account=a&service=mail&metadata_only=0"
+                ))
+                .status,
+            400
+        );
+        assert_eq!(
+            router
+                .route(&ApiRequest::get(
+                    "/api/v1/items?account=a&service=calendar&metadata_only=1"
+                ))
+                .status,
+            400
+        );
+        let metadata = body_json(&router.route(&ApiRequest::get(
+            "/api/v1/items?account=a&service=mail&metadata_only=1",
+        )));
+        let rows = metadata["items"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        let first = rows.iter().find(|row| row["remote_id"] == "m1").unwrap();
+        assert_eq!(first["preview"]["from"], "indexed@example.invalid");
+        assert!(first["preview"].get("snippet").is_none());
+        assert_eq!(first["preview"]["attachment_presence_unknown"], true);
+        let partial = rows.iter().find(|row| row["remote_id"] == "m3").unwrap();
+        assert_eq!(partial["preview"]["attachment_presence_unknown"], true);
+        let store = Store::open_readonly(dir.path().join("arch/.isyncyou-store.db")).unwrap();
+        assert!(store
+            .get_item("a", "mail", "m1")
+            .unwrap()
+            .unwrap()
+            .preview_json
+            .is_none());
+        drop(store);
         let v = body_json(&router.route(&ApiRequest::get("/api/v1/items?account=a&service=mail")));
         let items = v["items"].as_array().unwrap();
         let m1 = items.iter().find(|i| i["remote_id"] == "m1").unwrap();
@@ -20680,7 +25653,9 @@ Content-Type: text/html; charset=utf-8\r\n\
         assert!(!source.contains("postJson(\"/api/v1/onenote/create\""));
         assert!(!source.contains("postJson(\"/api/v1/onenote/append\""));
         assert!(source.contains("async function mutationPostWithTransportRetry"));
-        assert!(source.contains("if (error && error.responseReceived) throw error"));
+        assert!(source
+            .contains("if (!retryTransport || (error && error.responseReceived)) throw error"));
+        assert!(source.contains("MUTATION_COMMIT_TIMEOUT_MS, purpose !== \"mail_body\""));
         assert!(source.contains("error.code === \"mutation_intent_already_completed\""));
         assert!(source.contains("return { status: \"completed\" }"));
         assert!(source.contains("if (!commitAttempted && error && error.responseReceived)"));
@@ -20869,7 +25844,7 @@ Content-Type: text/html; charset=utf-8\r\n\
         assert!(source.contains("async function deleteTodoBatch(items)"));
         assert!(source.contains("return stageMutation(\"todo_delete_batch\""));
         assert!(source.contains("const MUTATION_COMMIT_TIMEOUT_MS = 125000"));
-        assert!(source.contains("}, MUTATION_COMMIT_TIMEOUT_MS);"));
+        assert!(source.contains("}, MUTATION_COMMIT_TIMEOUT_MS, purpose !== \"mail_body\");"));
         assert!(source.contains("function selectAllVisibleTodoTasks()"));
         assert!(source.contains("function todoTaskCanBeDeleted(t)"));
         assert!(source.contains("stateKey(t) !== \"backup_only\""));
@@ -21007,7 +25982,7 @@ Content-Type: text/html; charset=utf-8\r\n\
 
     #[test]
     fn android_user_presence_confirm_requires_armed_public_handle() {
-        mobile_agent_confirm_requires_biometric_before_agent_token_consumption();
+        mobile_agent_confirmation_challenge_returns_only_opaque_handle();
         mobile_agent_confirm_after_biometric_consumes_agent_token_once();
     }
 

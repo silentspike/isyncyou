@@ -23,6 +23,8 @@ object BridgeMessagePolicy {
     private val TYPES = setOf("req", "sub", "unsub", "bio", "native")
     private val HEADER_NAME = Regex("^[A-Za-z0-9-]{1,128}$")
     private val OPAQUE_ACTIVITY_ID = Regex("^[A-Za-z0-9_-]{22}$")
+    private val AGENT_CAPABILITY = Regex("^[0-9a-f]{32}$")
+    private const val AGENT_STREAM_PATH = "/api/v1/agent/stream"
     private val PROGRESS_STAGES = setOf("names", "bodies", "deep")
     private val PROGRESS_STATUSES = setOf(
         "queued",
@@ -330,21 +332,29 @@ object BridgeMessagePolicy {
     }
 
     private fun validateSubscription(obj: JSONObject, type: String, id: String): BridgeValidation {
-        if (!hasOnlyKeys(obj, setOf("t", "id", "path"))) {
-            return BridgeValidation(false, type, id, "unknown_field")
-        }
         val path = exactString(obj, "path")
-        return if (
+        if (
             path.isNullOrBlank() ||
             !path.startsWith('/') ||
             path.startsWith("//") ||
             path.contains('#') ||
             path.length > MAX_PATH_CHARS
         ) {
-            BridgeValidation(false, type, id, "missing_path")
-        } else {
-            BridgeValidation(true, type, id)
+            return BridgeValidation(false, type, id, "missing_path")
         }
+        val route = path.substringBefore('?')
+        if (route == AGENT_STREAM_PATH) {
+            if (!hasOnlyKeys(obj, setOf("t", "id", "path", "cap_token"))) {
+                return BridgeValidation(false, type, id, "unknown_field")
+            }
+            val capability = exactString(obj, "cap_token")
+            if (capability == null || !AGENT_CAPABILITY.matches(capability)) {
+                return BridgeValidation(false, type, id, "invalid_capability")
+            }
+        } else if (!hasOnlyKeys(obj, setOf("t", "id", "path"))) {
+            return BridgeValidation(false, type, id, "unexpected_capability")
+        }
+        return BridgeValidation(true, type, id)
     }
 
     private fun validateNative(obj: JSONObject, type: String, id: String): BridgeValidation {
@@ -367,6 +377,45 @@ object BridgeMessagePolicy {
             }
         }
         when (op) {
+            "bridgeCapabilities" -> if (!hasOnlyKeys(payload, emptySet())) {
+                return BridgeValidation(false, type, id, "invalid_capabilities_request")
+            }
+            "providerReminderStatus" -> if (!hasOnlyKeys(payload, emptySet())) {
+                return BridgeValidation(false, type, id, "unknown_field")
+            }
+            "downloadProviderAttachment" -> {
+                if (!hasOnlyKeys(payload, setOf("account", "id", "blob_id", "filename", "mail_scope")) ||
+                    (payload.has("mail_scope") && exactString(payload, "mail_scope").let { it.isNullOrBlank() || it.length > 512 || it.any(Char::isISOControl) }) ||
+                    exactString(payload, "account")?.matches(Regex("[A-Za-z0-9._-]{1,128}")) != true ||
+                    listOf("id", "blob_id", "filename").any {
+                        val value = exactString(payload, it)
+                        value.isNullOrBlank() || value.length > 512 || value.any(Char::isISOControl)
+                    }) return BridgeValidation(false, type, id, "invalid_attachment")
+            }
+            "providerCreateAccount" -> {
+                if (!hasExactKeys(payload, setOf("account", "username", "origin", "client_id")) ||
+                    exactString(payload, "account")?.matches(Regex("[A-Za-z0-9_-]{1,64}")) != true ||
+                    listOf("username", "origin", "client_id").any {
+                        val value = exactString(payload, it)
+                        value.isNullOrBlank() || value.length > 2048 || value.any(Char::isISOControl)
+                    }) return BridgeValidation(false, type, id, "invalid_account_setup")
+            }
+            "providerSignIn", "providerSignOut", "providerStatus", "providerPushSetup", "providerPushStatus", "providerPushCancelPrepare", "providerPushDetachCancelled", "providerPushRegisterReplacement", "providerPushRetryReplacement", "providerQuarantineList", "providerAuthResolve", "providerAuthCancelPending" -> {
+                val account = exactString(payload, "account")
+                if (!hasOnlyKeys(payload, setOf("account")) || account == null ||
+                    !account.matches(Regex("[A-Za-z0-9._-]{1,128}"))) {
+                    return BridgeValidation(false, type, id, "invalid_account")
+                }
+            }
+            "providerQuarantineRevoke" -> {
+                val account = exactString(payload, "account")
+                val recovery = exactString(payload, "recovery_id")
+                if (!hasOnlyKeys(payload, setOf("account", "recovery_id")) || account == null ||
+                    !account.matches(Regex("[A-Za-z0-9._-]{1,128}")) ||
+                    recovery?.matches(Regex("[0-9a-f]{64}")) != true) {
+                    return BridgeValidation(false, type, id, "invalid_recovery")
+                }
+            }
             "beginNetworkGuard" -> {
                 if (
                     !hasOnlyKeys(payload, setOf("reason")) ||

@@ -1,16 +1,16 @@
+use crate::provider_session::ProductSessionTransport;
 use base64::Engine as _;
 use isyncyou_agent::{
     new_ulid, parse_action, payload_digest, request_object_digest, select_provider_context,
     tool_result_digest, AgentCredentialStore, AssistantBlock, IdempotencyTombstoneV1,
-    LocalEffectCheckpointV1, OneDriveSessionV2Transport, PairingPayload, PendingOwnerBinding,
-    PersistedLeaseBinding, PersistedNormalizedAssistantBlockV2, PersistedToolActionV2,
-    ProviderAttemptBindingV1, ReadToolCheckpointV2, RequestJournalV2, RequestPhase,
-    RequestRouteDomain, RequestStepOutcomeV2, RequestStepRef, RequestUuidBindingV1, SanitizedUsage,
-    Secret, SecretClass, SessionCommitV1, SessionId, SessionLeaseGuard, SessionObjectCrypto,
-    SessionRecordKind, SessionRecordV2, SessionV2Error, SessionV2Store, SessionV2Transport,
-    SourceRef, ToolAction, TurnObserver, TurnTerminalStatus, VersionedManifest,
-    READ_CHECKPOINT_V2_VERSION, REQUEST_JOURNAL_V2_VERSION, REQUEST_OUTCOME_V2_VERSION,
-    SESSION_RECORD_VERSION,
+    LocalEffectCheckpointV1, PairingPayload, PendingOwnerBinding, PersistedLeaseBinding,
+    PersistedNormalizedAssistantBlockV2, PersistedToolActionV2, ProviderAttemptBindingV1,
+    ReadToolCheckpointV2, RequestJournalV2, RequestPhase, RequestRouteDomain, RequestStepOutcomeV2,
+    RequestStepRef, RequestUuidBindingV1, SanitizedUsage, Secret, SecretClass, SessionCommitV1,
+    SessionId, SessionLeaseGuard, SessionObjectCrypto, SessionRecordKind, SessionRecordV2,
+    SessionV2Error, SessionV2Store, SessionV2Transport, SourceRef, ToolAction, TurnObserver,
+    TurnTerminalStatus, VersionedManifest, READ_CHECKPOINT_V2_VERSION, REQUEST_JOURNAL_V2_VERSION,
+    REQUEST_OUTCOME_V2_VERSION, SESSION_RECORD_VERSION,
 };
 #[cfg(test)]
 use isyncyou_agent::{
@@ -52,6 +52,8 @@ struct ProductSessionStoredSummaryV1 {
     created_at_ms: u64,
     archived: bool,
     local_account: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_origin: Option<String>,
     // Missing means the record predates local-first creation. Those sessions were
     // created remotely before the local index was committed.
     #[serde(default)]
@@ -155,6 +157,7 @@ impl ProductSessionIndexV1 {
 
 pub struct ProductSessionRegistry<'a> {
     store: &'a AgentCredentialStore,
+    config: Option<isyncyou_core::Config>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,7 +179,7 @@ struct ProductSessionIndexGuard {
 }
 
 pub struct ProductTurnRuntime {
-    guard: SessionLeaseGuard<OneDriveSessionV2Transport>,
+    guard: SessionLeaseGuard<ProductSessionTransport>,
     session_id: String,
     request_id: String,
     request_binding: RequestUuidBindingV1,
@@ -1418,7 +1421,43 @@ impl TurnObserver for ProductTurnRuntime {
 
 impl<'a> ProductSessionRegistry<'a> {
     pub fn new(store: &'a AgentCredentialStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            config: None,
+        }
+    }
+
+    pub fn with_config(mut self, config: &isyncyou_core::Config) -> Self {
+        self.config = Some(config.clone());
+        self
+    }
+
+    fn transport(&self, token: &str, session_id: &str) -> Result<ProductSessionTransport, String> {
+        let session = self
+            .load_index()?
+            .sessions
+            .into_iter()
+            .find(|s| s.session_id == session_id)
+            .ok_or_else(|| "session_not_found".to_string())?;
+        let configured = self
+            .config
+            .as_ref()
+            .and_then(|cfg| cfg.provider_accounts.get(&session.local_account));
+        match (session.provider_origin.as_deref(), configured) {
+            (None, None) => {}
+            (
+                Some(expected),
+                Some(isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. }),
+            ) if expected == origin => {}
+            _ => return Err("session_account_mismatch".into()),
+        }
+        ProductSessionTransport::new(
+            self.config.as_ref(),
+            &session.local_account,
+            token,
+            session_id,
+        )
+        .map_err(map_session_error)
     }
 
     fn lock_index_rmw(&self) -> Result<ProductSessionIndexGuard, String> {
@@ -1446,8 +1485,19 @@ impl<'a> ProductSessionRegistry<'a> {
         let _index_guard = self.lock_index_rmw()?;
         let display_name = normalize_display_name(display_name)?;
         let mut index = self.load_index()?;
-        let digest =
-            payload_digest(&(local_account, display_name.as_deref())).map_err(map_session_error)?;
+        let provider_origin = self
+            .config
+            .as_ref()
+            .and_then(|cfg| cfg.provider_accounts.get(local_account))
+            .map(|provider| match provider {
+                isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. } => origin.clone(),
+            });
+        let digest = if let Some(origin) = &provider_origin {
+            payload_digest(&(local_account, display_name.as_deref(), origin))
+                .map_err(map_session_error)?
+        } else {
+            payload_digest(&(local_account, display_name.as_deref())).map_err(map_session_error)?
+        };
         if let Some(receipt) = index
             .request_receipts
             .iter()
@@ -1496,6 +1546,7 @@ impl<'a> ProductSessionRegistry<'a> {
             created_at_ms,
             archived: false,
             local_account: local_account.to_owned(),
+            provider_origin,
             remote_initialized: Some(false),
         };
         index.sessions.push(summary.clone());
@@ -1529,10 +1580,21 @@ impl<'a> ProductSessionRegistry<'a> {
             .map(|cursor| self.decode_cursor(cursor, index.generation))
             .transpose()?
             .unwrap_or(0);
+        let provider_origin = self
+            .config
+            .as_ref()
+            .and_then(|cfg| cfg.provider_accounts.get(local_account))
+            .map(|provider| match provider {
+                isyncyou_core::config::ProviderConfig::SelfHosted { origin, .. } => origin.as_str(),
+            });
         let mut sessions = index
             .sessions
             .iter()
-            .filter(|session| session.local_account == local_account)
+            .filter(|session| {
+                session.local_account == local_account
+                    && (self.config.is_none()
+                        || session.provider_origin.as_deref() == provider_origin)
+            })
             .cloned()
             .collect::<Vec<_>>();
         sessions
@@ -1742,6 +1804,7 @@ impl<'a> ProductSessionRegistry<'a> {
             created_at_ms,
             archived: false,
             local_account: local_account.to_owned(),
+            provider_origin: None,
             // Pairing reveal ensures the source manifest exists before exposing
             // the transfer code, so an imported session can read it immediately.
             remote_initialized: Some(true),
@@ -1775,26 +1838,25 @@ impl<'a> ProductSessionRegistry<'a> {
         &self,
         graph_token: &str,
         session_id: &str,
-    ) -> Result<SessionV2Store<OneDriveSessionV2Transport>, String> {
-        let transport =
-            OneDriveSessionV2Transport::new(graph_token, session_id).map_err(map_session_error)?;
+    ) -> Result<SessionV2Store<ProductSessionTransport>, String> {
+        let transport = self.transport(graph_token, session_id)?;
         self.open_with_transport(session_id, transport)
     }
 
     fn open_with_transport(
         &self,
         session_id: &str,
-        transport: OneDriveSessionV2Transport,
-    ) -> Result<SessionV2Store<OneDriveSessionV2Transport>, String> {
+        transport: ProductSessionTransport,
+    ) -> Result<SessionV2Store<ProductSessionTransport>, String> {
         self.open_known_with_transport(session_id, transport, false)
     }
 
     fn open_known_with_transport(
         &self,
         session_id: &str,
-        transport: OneDriveSessionV2Transport,
+        transport: ProductSessionTransport,
         allow_archived: bool,
-    ) -> Result<SessionV2Store<OneDriveSessionV2Transport>, String> {
+    ) -> Result<SessionV2Store<ProductSessionTransport>, String> {
         let index = self.load_index()?;
         if !index.sessions.iter().any(|session| {
             session.session_id == session_id && (allow_archived || !session.archived)
@@ -1842,8 +1904,7 @@ impl<'a> ProductSessionRegistry<'a> {
         target: &ProductSessionMaintenanceTarget,
         candidate_limit: usize,
     ) -> Result<usize, String> {
-        let transport = OneDriveSessionV2Transport::new(graph_token, &target.session_id)
-            .map_err(map_session_error)?;
+        let transport = self.transport(graph_token, &target.session_id)?;
         let session = self.open_known_with_transport(&target.session_id, transport, true)?;
         let (current, server_time) = session
             .current_manifest_with_server_time(&target.session_id)
@@ -1892,9 +1953,8 @@ impl<'a> ProductSessionRegistry<'a> {
         &self,
         graph_token: &str,
         session_id: &str,
-    ) -> Result<SessionV2Store<OneDriveSessionV2Transport>, String> {
-        let transport =
-            OneDriveSessionV2Transport::new(graph_token, session_id).map_err(map_session_error)?;
+    ) -> Result<SessionV2Store<ProductSessionTransport>, String> {
+        let transport = self.transport(graph_token, session_id)?;
         self.ensure_remote_session_with_transport(session_id, transport)
     }
 
@@ -1902,9 +1962,8 @@ impl<'a> ProductSessionRegistry<'a> {
         &self,
         graph_token: &str,
         session_id: &str,
-    ) -> Result<SessionV2Store<OneDriveSessionV2Transport>, String> {
-        let transport =
-            OneDriveSessionV2Transport::new(graph_token, session_id).map_err(map_session_error)?;
+    ) -> Result<SessionV2Store<ProductSessionTransport>, String> {
+        let transport = self.transport(graph_token, session_id)?;
         // The route has already reserved the deterministic turn ID and detached
         // this worker from the synchronous response path. Keep the normal bounded
         // Graph request timeouts, but do not apply one aggregate interactive
@@ -1918,8 +1977,8 @@ impl<'a> ProductSessionRegistry<'a> {
     fn ensure_remote_session_with_transport(
         &self,
         session_id: &str,
-        transport: OneDriveSessionV2Transport,
-    ) -> Result<SessionV2Store<OneDriveSessionV2Transport>, String> {
+        transport: ProductSessionTransport,
+    ) -> Result<SessionV2Store<ProductSessionTransport>, String> {
         let session = self.open_with_transport(session_id, transport.clone())?;
         if !self.remote_initialization_pending(session_id)? {
             return Ok(session);
@@ -1939,6 +1998,65 @@ impl<'a> ProductSessionRegistry<'a> {
             .ok_or_else(|| "session_store_unavailable".to_string())?;
         self.save_index(&index)?;
         Ok(session)
+    }
+
+    /// Persist a user-initiated confirmation in the same session history used by agent turns.
+    /// The caller must register the bound action first and cancel it if this publish fails.
+    pub fn append_user_pending(
+        &self,
+        graph_token: &str,
+        owner: &PendingOwnerBinding,
+        installation_principal: &str,
+        created_at_ms: u64,
+    ) -> Result<(), String> {
+        if owner.session_id == "legacy-local" {
+            return Err("session_state_invalid".into());
+        }
+        let store = self.ensure_remote_session(graph_token, &owner.session_id)?;
+        let lease_id = new_ulid().map_err(|_| "session_store_unavailable")?;
+        let holder_binding = self
+            .store
+            .domain_hmac(
+                TURN_HOLDER_DOMAIN,
+                format!("{installation_principal}:{}", owner.session_id).as_bytes(),
+            )
+            .map(|bytes| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+            .map_err(|_| "session_store_unavailable")?;
+        let mut guard = store
+            .acquire_lease(&owner.session_id, &lease_id, &holder_binding)
+            .map_err(map_session_error)?;
+        let current = guard.manifest_snapshot().map_err(map_session_error)?;
+        let existing = store
+            .visible_records_for_request_from_manifest(&current, &owner.request_id, &owner.turn_id)
+            .map_err(map_session_error)?;
+        if !existing.is_empty() {
+            return Err("request_id_conflict".into());
+        }
+        let observed_head = guard.visible_record_head().map_err(map_session_error)?;
+        let lease = guard.binding().map_err(map_session_error)?;
+        let record = SessionRecordV2 {
+            record_version: SESSION_RECORD_VERSION,
+            record_id: new_ulid().map_err(|_| "session_store_unavailable")?,
+            session_id: owner.session_id.clone(),
+            request_id: owner.request_id.clone(),
+            turn_id: owner.turn_id.clone(),
+            kind: SessionRecordKind::PendingOperation {
+                code: "confirmation_required".into(),
+            },
+            parent_record_ids: visible_parent_ids(&[], &observed_head),
+            observed_head,
+            lease,
+            created_at_ms,
+        };
+        guard
+            .publish(SessionCommitV1 {
+                visible_records: vec![record],
+                request_objects: vec![],
+                uuid_bindings: vec![],
+            })
+            .map_err(map_session_error)?;
+        guard.release().map_err(map_session_error)?;
+        Ok(())
     }
 
     pub fn append_pending_cancelled(
@@ -1970,75 +2088,87 @@ impl<'a> ProductSessionRegistry<'a> {
         }
         if !matches!(
             code,
-            "cancelled" | "completed" | "failed" | "outcome_unknown"
+            "cancelled"
+                | "completed"
+                | "failed"
+                | "provider_rejected"
+                | "provider_conflict"
+                | "outcome_unknown"
         ) {
             return Err("session_state_invalid".into());
         }
-        let store = self.open(graph_token, &owner.session_id)?;
-        let lease_id = new_ulid().map_err(|_| "session_store_unavailable")?;
-        let holder_binding = self
-            .store
-            .domain_hmac(
-                TURN_HOLDER_DOMAIN,
-                format!("{installation_principal}:{}", owner.session_id).as_bytes(),
-            )
-            .map(|bytes| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
-            .map_err(|_| "session_store_unavailable")?;
-        let mut guard = store
-            .acquire_lease(&owner.session_id, &lease_id, &holder_binding)
-            .map_err(map_session_error)?;
-        let current = guard.manifest_snapshot().map_err(map_session_error)?;
-        let records = store
-            .visible_records_for_request_from_manifest(&current, &owner.request_id, &owner.turn_id)
-            .map_err(map_session_error)?;
-        let mut pending_record_id = None;
-        let mut state_exists = false;
-        for record in records {
-            match record.kind {
-                SessionRecordKind::PendingOperation { .. } => {
-                    pending_record_id = Some(record.record_id);
+        let transport = self.transport(graph_token, &owner.session_id)?;
+        let store = self.open_with_transport(&owner.session_id, transport.clone())?;
+        transport.with_projection_writer(|| {
+            let lease_id = new_ulid().map_err(|_| "session_store_unavailable")?;
+            let holder_binding = self
+                .store
+                .domain_hmac(
+                    TURN_HOLDER_DOMAIN,
+                    format!("{installation_principal}:{}", owner.session_id).as_bytes(),
+                )
+                .map(|bytes| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+                .map_err(|_| "session_store_unavailable")?;
+            let mut guard = store
+                .acquire_lease(&owner.session_id, &lease_id, &holder_binding)
+                .map_err(map_session_error)?;
+            let current = guard.manifest_snapshot().map_err(map_session_error)?;
+            let records = store
+                .visible_records_for_request_from_manifest(
+                    &current,
+                    &owner.request_id,
+                    &owner.turn_id,
+                )
+                .map_err(map_session_error)?;
+            let mut pending_record_id = None;
+            let mut state_exists = false;
+            for record in records {
+                match record.kind {
+                    SessionRecordKind::PendingOperation { .. } => {
+                        pending_record_id = Some(record.record_id);
+                    }
+                    SessionRecordKind::OperationState { code: existing } if existing == code => {
+                        state_exists = true;
+                    }
+                    _ => {}
                 }
-                SessionRecordKind::OperationState { code: existing } if existing == code => {
-                    state_exists = true;
-                }
-                _ => {}
             }
-        }
-        if state_exists {
-            guard.release().map_err(map_session_error)?;
-            return Ok(());
-        }
-        let Some(pending_record_id) = pending_record_id else {
-            // Cancellation only reduces authority. If pending publication never
-            // became visible, there is no transcript operation left to cancel.
-            let result = if code == "cancelled" {
-                Ok(())
-            } else {
-                Err("session_state_invalid".into())
+            if state_exists {
+                guard.release().map_err(map_session_error)?;
+                return Ok(());
+            }
+            let Some(pending_record_id) = pending_record_id else {
+                // Cancellation only reduces authority. If pending publication never
+                // became visible, there is no transcript operation left to cancel.
+                let result = if code == "cancelled" {
+                    Ok(())
+                } else {
+                    Err("session_state_invalid".into())
+                };
+                guard.release().map_err(map_session_error)?;
+                return result;
             };
+            let record_id = new_ulid().map_err(|_| "session_store_unavailable")?;
+            let lease = guard.binding().map_err(map_session_error)?;
+            let observed_head = guard.visible_record_head().map_err(map_session_error)?;
+            guard
+                .publish(SessionCommitV1 {
+                    visible_records: vec![pending_operation_state_record(
+                        owner,
+                        record_id,
+                        pending_record_id,
+                        observed_head,
+                        lease,
+                        code,
+                        created_at_ms,
+                    )],
+                    request_objects: vec![],
+                    uuid_bindings: vec![],
+                })
+                .map_err(map_session_error)?;
             guard.release().map_err(map_session_error)?;
-            return result;
-        };
-        let record_id = new_ulid().map_err(|_| "session_store_unavailable")?;
-        let lease = guard.binding().map_err(map_session_error)?;
-        let observed_head = guard.visible_record_head().map_err(map_session_error)?;
-        guard
-            .publish(SessionCommitV1 {
-                visible_records: vec![pending_operation_state_record(
-                    owner,
-                    record_id,
-                    pending_record_id,
-                    observed_head,
-                    lease,
-                    code,
-                    created_at_ms,
-                )],
-                request_objects: vec![],
-                uuid_bindings: vec![],
-            })
-            .map_err(map_session_error)?;
-        guard.release().map_err(map_session_error)?;
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn begin_turn(&self, request: ProductTurnRequest<'_>) -> Result<ProductTurnStart, String> {
@@ -2716,6 +2846,66 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn self_hosted_session_index_is_bound_to_account_and_origin() {
+        let root = temp_root("provider-origin");
+        let store = credential_store(&root);
+        let mut cfg = isyncyou_core::Config::default();
+        cfg.accounts.push(isyncyou_core::AccountConfig {
+            id: "a".into(),
+            username: "a".into(),
+            sync_root: root.join("sync"),
+            archive_root: root.join("archive"),
+            cache_root: root.join("cache"),
+            mount_point: None,
+        });
+        cfg.provider_accounts.insert(
+            "a".into(),
+            isyncyou_core::config::ProviderConfig::SelfHosted {
+                origin: "https://one.example.invalid".into(),
+                client_id: "client".into(),
+            },
+        );
+        let registry = ProductSessionRegistry::new(&store).with_config(&cfg);
+        let session = registry
+            .create(
+                "a",
+                "123e4567-e89b-42d3-a456-426614174000",
+                Some("Assistant"),
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            registry
+                .list_page("a", None, Some(10))
+                .unwrap()
+                .sessions
+                .len(),
+            1
+        );
+        assert!(registry
+            .list_page("other", None, Some(10))
+            .unwrap()
+            .sessions
+            .is_empty());
+        cfg.provider_accounts.insert(
+            "a".into(),
+            isyncyou_core::config::ProviderConfig::SelfHosted {
+                origin: "https://two.example.invalid".into(),
+                client_id: "client".into(),
+            },
+        );
+        let changed = ProductSessionRegistry::new(&store).with_config(&cfg);
+        assert!(changed
+            .list_page("a", None, Some(10))
+            .unwrap()
+            .sessions
+            .is_empty());
+        assert!(changed.transport("", &session.session_id).is_err());
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn insert_session(
         registry: &ProductSessionRegistry<'_>,
         session_id: &str,
@@ -2739,6 +2929,7 @@ mod tests {
             created_at_ms,
             archived: false,
             local_account: account.into(),
+            provider_origin: None,
             remote_initialized: None,
         });
         index.selected_session_id = Some(session_id.into());

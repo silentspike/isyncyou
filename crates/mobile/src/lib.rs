@@ -8,7 +8,13 @@
 //! minted here, used only by trusted native request paths, and required on every
 //! `/api/v1/*` route. Tokens are NEVER logged or exposed to WebView JavaScript.
 
-use isyncyou_core::{AccountConfig, Config, OneDriveMode};
+#[cfg(test)]
+use isyncyou_core::AccountConfig;
+use isyncyou_core::{Config, OneDriveMode};
+mod provider_auth_mobile;
+mod provider_credentials;
+mod recovery_signer;
+mod reminder_mobile;
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -164,6 +170,7 @@ fn install_test_mobile_encryption() {
     isyncyou_core::envelope::set_body_key(1, key);
     isyncyou_core::envelope::require_body_envelope_for_process();
     isyncyou_store::set_store_key(key.to_vec());
+    #[cfg(feature = "encrypted-store")]
     isyncyou_store::require_store_key_for_process();
     isyncyou_agent::set_process_credential_key(key);
     mark_mobile_encryption_ready();
@@ -187,6 +194,7 @@ fn install_mobile_body_key(key_id: i32, bytes: &[u8]) -> bool {
         isyncyou_core::envelope::set_body_key(key_id as u32, k);
         isyncyou_core::envelope::require_body_envelope_for_process();
         isyncyou_store::set_store_key(k.to_vec());
+        #[cfg(feature = "encrypted-store")]
         isyncyou_store::require_store_key_for_process();
         mark_mobile_encryption_ready();
     }))
@@ -262,23 +270,7 @@ fn cleanup_legacy_plaintext_mobile_state(base: &Path) -> Result<(), String> {
 }
 
 fn prepare_mobile_config_for_files_dir(cfg: &mut Config, base: &Path) -> Result<(), String> {
-    let (archive_root, sync_root, cache_root) = mobile_roots(base);
-    if let Some(acc) = cfg.accounts.iter_mut().find(|a| a.id == ACCOUNT) {
-        acc.sync_root = sync_root;
-        acc.archive_root = archive_root;
-        acc.cache_root = cache_root;
-        acc.mount_point = None;
-    } else {
-        cfg.accounts.push(AccountConfig {
-            id: ACCOUNT.into(),
-            username: ACCOUNT.into(),
-            sync_root,
-            archive_root,
-            cache_root,
-            mount_point: None,
-        });
-    }
-    cfg.validate().map_err(|errs| errs.join("; "))
+    cfg.prepare_mobile_for_files_dir(base)
 }
 
 #[cfg(feature = "agent-session-kdf-bench")]
@@ -617,9 +609,9 @@ fn streams() -> &'static Mutex<StreamRegistry> {
     STREAMS.get_or_init(|| Mutex::new(StreamRegistry::default()))
 }
 
-/// Open a bridge push stream (#0A) for `path`, session-gated. Returns a stream id (>0), or
-/// 0 when the engine hasn't started / the stream is unknown / the session is unauthorized.
-pub fn stream_open(path: &str, session_token: Option<&str>) -> i64 {
+/// Open a bridge push stream (#0A) for `path`. Agent streams require the independent
+/// capability token; the generic events stream rejects one.
+pub fn stream_open(path: &str, session_token: Option<&str>, capability_token: Option<&str>) -> i64 {
     let router = {
         let guard = cell().lock().unwrap_or_else(|e| e.into_inner());
         guard.as_ref().map(|s| Arc::clone(&s.router))
@@ -627,7 +619,16 @@ pub fn stream_open(path: &str, session_token: Option<&str>) -> i64 {
     let Some(router) = router else {
         return 0;
     };
-    let Some(rx) = router.open_bridge_stream(path, session_token) else {
+    stream_open_with_router(router, path, session_token, capability_token)
+}
+
+fn stream_open_with_router(
+    router: Arc<isyncyou_webui::Router>,
+    path: &str,
+    session_token: Option<&str>,
+    capability_token: Option<&str>,
+) -> i64 {
+    let Some(rx) = router.open_bridge_stream(path, session_token, capability_token) else {
         return 0;
     };
     let id = STREAM_SEQ.fetch_add(1, Ordering::SeqCst) as i64;
@@ -799,8 +800,11 @@ fn start_inner(
         return Err("agent credential storage setup failed; local data was not opened".into());
     }
     isyncyou_core::envelope::require_body_envelope_for_process();
+    #[cfg(feature = "encrypted-store")]
     isyncyou_store::require_store_key_for_process();
     let base = PathBuf::from(files_dir);
+    #[cfg(target_os = "android")]
+    provider_credentials::install(&base)?;
     cleanup_legacy_plaintext_mobile_state(&base)?;
     let (archive_root, sync_root, cache_root) = mobile_roots(&base);
     // OneDrive online/sync-mode lazy previews live here, apart from the offline working
@@ -811,18 +815,16 @@ fn start_inner(
     let config_path = base.join("isyncyou.toml");
 
     // Load the persisted config so user settings — notably the per-folder `onedrive_modes` the
-    // Mode-3 offline pass (#655) acts on — survive restarts; fall back to a fresh default on
-    // first run or a parse error. The account's storage roots (and the companion poll interval)
+    // Mode-3 offline pass (#655) acts on — survive restarts. Invalid existing configuration
+    // fails closed rather than replacing account setup. The account's storage roots
     // are ALWAYS re-derived from `files_dir` below, so a persisted config can never point the
     // engine at a stale device path.
-    let mut cfg = Config::load(&config_path).unwrap_or_default();
-    prepare_mobile_config_for_files_dir(&mut cfg, &base)?;
-    // A phone is a cache/live companion, not the desktop's 5 s near-real-time loop:
-    // poll every 30 s to spare battery/mobile-data and cut the periodic view refresh
-    // frequency (the live-refresh is otherwise driven every poll a change lands).
-    cfg.sync.poll_interval_secs = 30;
-    // Persist so DaemonSettings (which reads/writes the config file) works on-device.
-    cfg.save(&config_path)?;
+    let cfg = Config::update_atomically(&config_path, |cfg| {
+        prepare_mobile_config_for_files_dir(cfg, &base)?;
+        // The phone is a cache/live companion, not the desktop's 5 s loop.
+        cfg.sync.poll_interval_secs = 30;
+        Ok(cfg.clone())
+    })?;
 
     // An unguessable per-process token gating the whole data API (#89 P1).
     let session_token = isyncyou_app_host::mint_cap_token();
@@ -895,6 +897,9 @@ fn run_onedrive_scoped_pass(
     gate: &Arc<Mutex<()>>,
     progress: &isyncyou_app_host::SharedProgress,
 ) -> bool {
+    if cfg.provider_accounts.contains_key(ACCOUNT) {
+        return false;
+    }
     if !has_onedrive_explicit_scopes(cfg, ACCOUNT) {
         return false;
     }
@@ -922,6 +927,133 @@ fn run_onedrive_scoped_pass(
     }
 }
 
+// Fixed diagnostic fields only; scoped to the local account and never exposed to the WebView.
+fn provider_jmap_diagnostics() -> &'static Mutex<HashMap<String, serde_json::Value>> {
+    static DIAGNOSTICS: OnceLock<Mutex<HashMap<String, serde_json::Value>>> = OnceLock::new();
+    DIAGNOSTICS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Run the shared JMAP delta against the same encrypted store used by the UI.
+/// A plain or unavailable store fails closed before any provider object is written.
+fn refresh_self_hosted_data(
+    cfg: &Config,
+    base: &Path,
+    only: &str,
+) -> (bool, HashMap<String, bool>) {
+    let mut changed = false;
+    let mut outcomes = HashMap::new();
+    for account in &cfg.accounts {
+        if account.id != only || !cfg.provider_accounts.contains_key(&account.id) {
+            continue;
+        }
+        let mut successful = true;
+        provider_jmap_diagnostics()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&account.id);
+        let protected = isyncyou_engine::provider_store::open(cfg, &account.id)
+            .map(|store| store.protected_provider_storage())
+            .unwrap_or(false);
+        if !protected {
+            android_info("provider_refresh_failed phase=store");
+            outcomes.insert(account.id.clone(), false);
+            continue;
+        }
+        let mail_started = std::time::Instant::now();
+        let result = (|| -> Result<usize, &'static str> {
+            let store =
+                isyncyou_engine::provider_store::open(cfg, &account.id).map_err(|_| "store")?;
+            if !store.protected_provider_storage() {
+                return Err("store");
+            }
+            let client = isyncyou_engine::self_hosted_mail::client(cfg, &account.id)
+                .map_err(|_| "jmap_discovery")?;
+            isyncyou_engine::self_hosted_mail::sync_with_phase(cfg, &account.id, &store, &client)
+                .map_err(|phase| {
+                    let failure = isyncyou_engine::self_hosted_mail::last_sync_failure(&client);
+                    let diagnostic = match failure {
+                        Some(f) => serde_json::json!({"operation": f.operation, "class": f.class, "http_status": f.http_status, "method_type": f.method_type}),
+                        None => serde_json::json!({"operation": "none", "class": "unavailable", "http_status": null, "method_type": null}),
+                    };
+                    provider_jmap_diagnostics().lock().unwrap_or_else(|e| e.into_inner()).insert(account.id.clone(), diagnostic);
+                    match phase {
+                    isyncyou_engine::self_hosted_mail::MailSyncPhase::Configuration => "jmap_configuration",
+                    isyncyou_engine::self_hosted_mail::MailSyncPhase::SharedAccess => "jmap_shared_access",
+                    isyncyou_engine::self_hosted_mail::MailSyncPhase::Primary => "jmap_primary",
+                    isyncyou_engine::self_hosted_mail::MailSyncPhase::SharedSelection => "jmap_shared_selection",
+                    isyncyou_engine::self_hosted_mail::MailSyncPhase::SharedMailbox => "jmap_shared_mailbox",
+                    isyncyou_engine::self_hosted_mail::MailSyncPhase::SharedEmail => "jmap_shared_email",
+                    }
+                })
+        })();
+        android_info(&format!(
+            "provider_refresh_timing phase=jmap elapsed_ms={}",
+            mail_started.elapsed().as_millis()
+        ));
+        match result {
+            Ok(count) => changed |= count > 0,
+            Err(phase) => {
+                match phase {
+                    "store" => android_info("provider_refresh_failed phase=store"),
+                    "jmap_discovery" => {
+                        android_info("provider_refresh_failed phase=jmap_discovery")
+                    }
+                    "jmap_configuration" => {
+                        android_info("provider_refresh_failed phase=jmap_configuration")
+                    }
+                    "jmap_shared_access" => {
+                        android_info("provider_refresh_failed phase=jmap_shared_access")
+                    }
+                    "jmap_primary" => android_info("provider_refresh_failed phase=jmap_primary"),
+                    "jmap_shared_selection" => {
+                        android_info("provider_refresh_failed phase=jmap_shared_selection")
+                    }
+                    "jmap_shared_mailbox" => {
+                        android_info("provider_refresh_failed phase=jmap_shared_mailbox")
+                    }
+                    "jmap_shared_email" => {
+                        android_info("provider_refresh_failed phase=jmap_shared_email")
+                    }
+                    _ => android_info("provider_refresh_failed phase=jmap_sync"),
+                }
+                successful = false;
+            }
+        }
+        // DAV opens the same encrypted store itself, so the mail store above must
+        // have been dropped before starting this independent protocol pass.
+        let dav_started = std::time::Instant::now();
+        if let Ok(credentials) = provider_credentials::AndroidProviderCredentialStore::new(base) {
+            match isyncyou_engine::dav_live::sync_all_with_store(
+                cfg,
+                &account.id,
+                "/.well-known/caldav",
+                &credentials,
+            ) {
+                Ok(report) => {
+                    changed |= report.changes > 0;
+                    if report.failed != 0 {
+                        android_info("provider_refresh_failed phase=dav_partial");
+                        successful = false;
+                    }
+                }
+                Err(_) => {
+                    android_info("provider_refresh_failed phase=dav_sync");
+                    successful = false;
+                }
+            }
+        } else {
+            android_info("provider_refresh_failed phase=dav_credentials");
+            successful = false;
+        }
+        android_info(&format!(
+            "provider_refresh_timing phase=dav elapsed_ms={}",
+            dav_started.elapsed().as_millis()
+        ));
+        outcomes.insert(account.id.clone(), successful);
+    }
+    (changed, outcomes)
+}
+
 fn refresh_loop(
     mut cfg: Config,
     base: PathBuf,
@@ -932,37 +1064,458 @@ fn refresh_loop(
     progress: isyncyou_app_host::SharedProgress,
 ) {
     let reload_warned = AtomicBool::new(false);
+    let mut onenote_cursor = isyncyou_engine::onenote_mobile_refresh::RefreshCursor::default();
+    let mut next_periodic =
+        std::time::Instant::now() + Duration::from_secs(interval.load(Ordering::Relaxed).max(5));
     loop {
-        let secs = interval.load(Ordering::Relaxed).max(5);
-        std::thread::sleep(Duration::from_secs(secs));
-        // Isolate a refresh panic so the loop (and the app) survives.
-        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let generation = wait_for_provider_refresh(
+            next_periodic.saturating_duration_since(std::time::Instant::now()),
+        );
+        if generation.is_none() {
             cfg = load_mobile_loop_config(&config_path, &base, &cfg, &reload_warned);
-            let refreshed = {
+            run_one_targeted_refresh(&cfg, &base, &gate, &events);
+            continue;
+        }
+        let generation = generation.expect("full refresh generation");
+        // Isolate a refresh panic so the loop (and the app) survives.
+        let successful = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            cfg = load_mobile_loop_config(&config_path, &base, &cfg, &reload_warned);
+            let mut provider_successful = HashMap::new();
+            for account in cfg
+                .accounts
+                .iter()
+                .filter(|a| cfg.provider_accounts.contains_key(&a.id))
+            {
+                // A queued hint gets one turn between account passes. A pass
+                // already in progress is never interrupted or duplicated.
+                run_one_targeted_refresh(&cfg, &base, &gate, &events);
+                let wait = std::time::Instant::now();
                 let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
-                match isyncyou_engine::auth::resolve_cache_refresh_token(&cfg, ACCOUNT) {
-                    Ok(read) => {
-                        let write =
-                            isyncyou_engine::auth::resolve_cached_restore_token(&cfg, ACCOUNT).ok();
-                        // Notify the UI ONLY when the pass actually changed something —
-                        // a no-op refresh (the common idle case every poll_interval_secs)
-                        // must not wake SSE, or the whole view reloads periodically (the
-                        // visible "screen flicker"). `.changed()` is false for a no-op.
-                        isyncyou_engine::refresh_cache_account(&cfg, ACCOUNT, read, write)
-                            .map(|counts| counts.changed())
-                            .unwrap_or(false)
-                    }
-                    Err(_) => false, // not signed in yet — skip quietly
+                android_info(&format!(
+                    "provider_refresh_timing phase=gate_wait elapsed_ms={}",
+                    wait.elapsed().as_millis()
+                ));
+                let (changed, outcome) = refresh_self_hosted_data(&cfg, &base, &account.id);
+                drop(_g);
+                provider_successful.extend(outcome);
+                if changed {
+                    events.notify();
                 }
+            }
+            run_one_targeted_refresh(&cfg, &base, &gate, &events);
+            let microsoft_started = std::time::Instant::now();
+            let microsoft_changed = if cfg.provider_accounts.contains_key(ACCOUNT) {
+                false
+            } else {
+                run_microsoft_sections(
+                    |index, services| {
+                        if index == 4 {
+                            let started = std::time::Instant::now();
+                            let result = isyncyou_engine::onenote_mobile_refresh::refresh(
+                                &gate,
+                                ACCOUNT,
+                                &mut onenote_cursor,
+                                || {
+                                    let mut current = Config::load(&config_path)
+                                        .map_err(|_| "mobile config unavailable".to_string())?;
+                                    if !current.accounts.iter().any(|a| a.id == ACCOUNT) {
+                                        return Err("mobile account removed".into());
+                                    }
+                                    prepare_mobile_config_for_files_dir(&mut current, &base)?;
+                                    Ok(current)
+                                },
+                                || { run_one_targeted_refresh(&cfg, &base, &gate, &events); },
+                                || { events.notify(); },
+                            ).map_err(|_| ());
+                            android_info(&format!("provider_refresh_timing phase=microsoft_section index={} elapsed_ms={}", index, started.elapsed().as_millis()));
+                            return result;
+                        }
+                        let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
+                        // Resolve inside every gate acquisition so a logout between
+                        // sections cannot reuse a token captured before the logout.
+                        let read = isyncyou_engine::auth::resolve_cache_refresh_token(&cfg, ACCOUNT).map_err(|_| ())?;
+                        let write = isyncyou_engine::auth::resolve_cached_restore_token(&cfg, ACCOUNT).ok();
+                        let started = std::time::Instant::now();
+                        let result = isyncyou_engine::refresh_cache_account_filtered(
+                            &cfg, ACCOUNT, read, write, services,
+                        ).map(|counts| counts.changed()).map_err(|_| ());
+                        android_info(&format!("provider_refresh_timing phase=microsoft_section index={} elapsed_ms={}", index, started.elapsed().as_millis()));
+                        result
+                    },
+                    || { run_one_targeted_refresh(&cfg, &base, &gate, &events); },
+                )
             };
+            android_info(&format!("provider_refresh_timing phase=microsoft elapsed_ms={}", microsoft_started.elapsed().as_millis()));
+            run_one_targeted_refresh(&cfg, &base, &gate, &events);
             // #655/#718: after the read-only cache refresh, run the mobile scoped OneDrive pass
             // for any explicit Sync/Offline folders, then wake SSE if either changed data.
+            let onedrive_started = std::time::Instant::now();
             let onedrive_changed = run_onedrive_scoped_pass(&cfg, &gate, &progress);
-            if refreshed || onedrive_changed {
+            android_info(&format!(
+                "provider_refresh_timing phase=onedrive elapsed_ms={}",
+                onedrive_started.elapsed().as_millis()
+            ));
+            if microsoft_changed || onedrive_changed {
                 events.notify(); // wake SSE subscribers so the UI refetches
             }
-        }));
+            provider_successful
+        }))
+        .unwrap_or_default();
+        finish_provider_refresh(generation, successful);
+        next_periodic = std::time::Instant::now()
+            + Duration::from_secs(interval.load(Ordering::Relaxed).max(5));
     }
+}
+
+// Keep the existing store gate for each bounded service pass, while allowing
+// already queued self-hosted hints to run at service boundaries.
+fn run_microsoft_sections(
+    mut refresh: impl FnMut(usize, isyncyou_engine::RefreshServices) -> Result<bool, ()>,
+    mut serve_target: impl FnMut(),
+) -> bool {
+    let services = [
+        isyncyou_engine::RefreshServices {
+            mail: true,
+            calendar: false,
+            contacts: false,
+            todo: false,
+            onenote: false,
+        },
+        isyncyou_engine::RefreshServices {
+            mail: false,
+            calendar: true,
+            contacts: false,
+            todo: false,
+            onenote: false,
+        },
+        isyncyou_engine::RefreshServices {
+            mail: false,
+            calendar: false,
+            contacts: true,
+            todo: false,
+            onenote: false,
+        },
+        isyncyou_engine::RefreshServices {
+            mail: false,
+            calendar: false,
+            contacts: false,
+            todo: true,
+            onenote: false,
+        },
+        isyncyou_engine::RefreshServices {
+            mail: false,
+            calendar: false,
+            contacts: false,
+            todo: false,
+            onenote: true,
+        },
+    ];
+    let mut changed = false;
+    for (index, section) in services.into_iter().enumerate() {
+        let outcome = refresh(index, section);
+        serve_target();
+        match outcome {
+            Ok(section_changed) => changed |= section_changed,
+            Err(()) => return changed,
+        }
+    }
+    changed
+}
+
+fn run_one_targeted_refresh(
+    cfg: &Config,
+    base: &Path,
+    gate: &Arc<Mutex<()>>,
+    events: &Arc<isyncyou_webui::EventBus>,
+) -> bool {
+    let Some((account, generation)) = take_targeted_refresh() else {
+        return false;
+    };
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let wait = std::time::Instant::now();
+        let _g = gate.lock().unwrap_or_else(|e| e.into_inner());
+        android_info(&format!(
+            "provider_refresh_timing phase=target_gate_wait elapsed_ms={}",
+            wait.elapsed().as_millis()
+        ));
+        refresh_self_hosted_data(cfg, base, &account)
+    }));
+    let (changed, outcomes) = result.unwrap_or_default();
+    if changed {
+        events.notify();
+    }
+    finish_targeted_refresh(
+        &account,
+        generation,
+        outcomes.get(&account).copied().unwrap_or(false),
+    );
+    true
+}
+
+#[derive(Default)]
+struct RefreshSignal {
+    requested: u64,
+    completed: u64,
+    outcomes: HashMap<String, bool>,
+    targeted: HashMap<String, TargetRefresh>,
+    last_was_targeted: bool,
+    last_target_account: Option<String>,
+}
+
+impl RefreshSignal {
+    fn choose_ready(&mut self, periodic_due: bool) -> Option<u64> {
+        if periodic_due && self.requested == self.completed {
+            self.requested = self.requested.saturating_add(1);
+        }
+        let targets = self.targeted.values().any(|t| t.requested > t.completed);
+        if targets && (!self.last_was_targeted || self.requested == self.completed) {
+            self.last_was_targeted = true;
+            None
+        } else {
+            self.last_was_targeted = false;
+            Some(self.requested)
+        }
+    }
+}
+
+#[derive(Default)]
+struct TargetRefresh {
+    requested: u64,
+    completed: u64,
+    // First registration since the previous dispatch, for monotonic queue timing only.
+    queued_at: Option<std::time::Instant>,
+    // A result is retained for each waiting generation until its waiter reads it.
+    waiters: HashMap<u64, Option<bool>>,
+}
+
+impl TargetRefresh {
+    fn register(&mut self) -> u64 {
+        self.queued_at.get_or_insert_with(std::time::Instant::now);
+        self.requested = self.requested.saturating_add(1);
+        let generation = self.requested;
+        self.waiters.insert(generation, None);
+        generation
+    }
+
+    fn complete(&mut self, generation: u64, success: bool) {
+        self.completed = self.completed.max(generation);
+        for (request, result) in &mut self.waiters {
+            if *request <= generation && result.is_none() {
+                *result = Some(success);
+            }
+        }
+    }
+}
+
+fn provider_refresh_wakeup() -> &'static (Mutex<RefreshSignal>, std::sync::Condvar) {
+    static WAKE: OnceLock<(Mutex<RefreshSignal>, std::sync::Condvar)> = OnceLock::new();
+    WAKE.get_or_init(|| {
+        (
+            Mutex::new(RefreshSignal::default()),
+            std::sync::Condvar::new(),
+        )
+    })
+}
+
+fn wait_for_provider_refresh(timeout: Duration) -> Option<u64> {
+    let (flag, wake) = provider_refresh_wakeup();
+    let guard = flag.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut guard, elapsed) = wake
+        .wait_timeout_while(guard, timeout, |state| {
+            state.requested == state.completed
+                && !state.targeted.values().any(|t| t.requested > t.completed)
+        })
+        .unwrap_or_else(|e| e.into_inner());
+    guard.choose_ready(elapsed.timed_out() || timeout.is_zero())
+}
+
+fn take_targeted_refresh() -> Option<(String, u64)> {
+    let (flag, _) = provider_refresh_wakeup();
+    let mut state = flag.lock().unwrap_or_else(|e| e.into_inner());
+    let selected = select_targeted_refresh(&state);
+    let queued_at = if let Some((account, _)) = &selected {
+        state.last_target_account = Some(account.clone());
+        state
+            .targeted
+            .get_mut(account)
+            .and_then(|target| target.queued_at.take())
+    } else {
+        None
+    };
+    drop(state);
+    if let Some(queued_at) = queued_at {
+        android_info(&format!(
+            "provider_refresh_timing phase=target_queue_wait elapsed_ms={}",
+            queued_at.elapsed().as_millis()
+        ));
+    }
+    selected
+}
+
+fn select_targeted_refresh(state: &RefreshSignal) -> Option<(String, u64)> {
+    let pending = || {
+        state
+            .targeted
+            .iter()
+            .filter(|(_, t)| t.requested > t.completed)
+    };
+    pending()
+        .filter(|(account, _)| {
+            state
+                .last_target_account
+                .as_ref()
+                .is_some_and(|last| *account > last)
+        })
+        .min_by(|(left, _), (right, _)| left.cmp(right))
+        .or_else(|| pending().min_by(|(left, _), (right, _)| left.cmp(right)))
+        .map(|(account, t)| (account.clone(), t.requested))
+}
+
+fn finish_targeted_refresh(account: &str, generation: u64, success: bool) {
+    finish_targeted_refresh_on(provider_refresh_wakeup(), account, generation, success);
+}
+
+fn finish_targeted_refresh_on(
+    signal: &(Mutex<RefreshSignal>, std::sync::Condvar),
+    account: &str,
+    generation: u64,
+    success: bool,
+) {
+    let (flag, wake) = signal;
+    let mut state = flag.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(target) = state.targeted.get_mut(account) {
+        target.complete(generation, success);
+        if target.waiters.is_empty() && target.completed >= target.requested {
+            state.targeted.remove(account);
+        }
+    }
+    wake.notify_all();
+}
+
+fn wait_for_targeted_refresh(account: &str, timeout: Duration) -> bool {
+    wait_for_targeted_refresh_on(provider_refresh_wakeup(), account, timeout)
+}
+
+fn wait_for_targeted_refresh_on(
+    signal: &(Mutex<RefreshSignal>, std::sync::Condvar),
+    account: &str,
+    timeout: Duration,
+) -> bool {
+    if account.is_empty() || account.len() > 128 || account.chars().any(char::is_control) {
+        return false;
+    }
+    let (flag, wake) = signal;
+    let mut state = flag.lock().unwrap_or_else(|e| e.into_inner());
+    let target = state.targeted.entry(account.to_owned()).or_default();
+    let generation = target.register();
+    wake.notify_all();
+    let (mut state, _) = wake
+        .wait_timeout_while(state, timeout, |state| {
+            state
+                .targeted
+                .get(account)
+                .and_then(|t| t.waiters.get(&generation))
+                .is_some_and(Option::is_none)
+        })
+        .unwrap_or_else(|e| e.into_inner());
+    let mut outcome = false;
+    if let Some(target) = state.targeted.get_mut(account) {
+        outcome = target
+            .waiters
+            .remove(&generation)
+            .flatten()
+            .unwrap_or(false);
+        if target.waiters.is_empty() && target.completed >= target.requested {
+            state.targeted.remove(account);
+        }
+    }
+    outcome
+}
+
+fn wake_provider_refresh() -> u64 {
+    let (flag, wake) = provider_refresh_wakeup();
+    let mut state = flag.lock().unwrap_or_else(|e| e.into_inner());
+    state.requested = state.requested.saturating_add(1);
+    let generation = state.requested;
+    wake.notify_all();
+    generation
+}
+
+fn finish_provider_refresh(generation: u64, outcomes: HashMap<String, bool>) {
+    let (flag, wake) = provider_refresh_wakeup();
+    let mut state = flag.lock().unwrap_or_else(|e| e.into_inner());
+    state.completed = state.completed.max(generation);
+    state.outcomes = outcomes;
+    wake.notify_all();
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeWakeProviderRefresh<'a>(
+    _env: jni::EnvUnowned<'a>,
+    _class: jni::objects::JClass<'a>,
+) {
+    let _ = wake_provider_refresh();
+}
+
+/// Native-only, fixed diagnostic metadata for one locally selected account.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeProviderRefreshDiagnostic<
+    'a,
+>(
+    mut env: jni::EnvUnowned<'a>,
+    _class: jni::objects::JClass<'a>,
+    account: jni::objects::JString<'a>,
+) -> jni::sys::jstring {
+    let mut value = jni_get_string(&mut env, &account).and_then(|id| {
+        provider_jmap_diagnostics().lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned()
+    }).unwrap_or_else(|| serde_json::json!({"operation": "none", "class": "unavailable", "http_status": null, "method_type": null}));
+    let (flag, _) = provider_refresh_wakeup();
+    let signal = flag.lock().unwrap_or_else(|e| e.into_inner());
+    value["pending"] = serde_json::Value::Bool(
+        signal.completed < signal.requested
+            || signal.targeted.values().any(|t| t.requested > t.completed),
+    );
+    jni_new_string(&mut env, value.to_string())
+}
+
+/// Wait for a successful provider pass; timeout, partial errors and panic fail closed.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeWaitProviderRefresh<'a>(
+    mut env: jni::EnvUnowned<'a>,
+    _class: jni::objects::JClass<'a>,
+    account: jni::objects::JString<'a>,
+) -> jni::sys::jint {
+    let Some(account) = jni_get_string(&mut env, &account) else {
+        return 0;
+    };
+    i32::from(wait_for_targeted_refresh(
+        &account,
+        Duration::from_secs(120),
+    ))
+}
+
+/// One pass can cover all accounts; callers must check each requested outcome.
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeWaitProviderRefreshResults<
+    'a,
+>(
+    mut env: jni::EnvUnowned<'a>,
+    _class: jni::objects::JClass<'a>,
+) -> jni::sys::jstring {
+    let generation = wake_provider_refresh();
+    let (flag, wake) = provider_refresh_wakeup();
+    let guard = flag.lock().unwrap_or_else(|e| e.into_inner());
+    let (guard, _) = wake
+        .wait_timeout_while(guard, Duration::from_secs(120), |state| {
+            state.completed < generation
+        })
+        .unwrap_or_else(|e| e.into_inner());
+    let value = if guard.completed >= generation {
+        serde_json::json!({"ok":true,"accounts":guard.outcomes})
+    } else {
+        serde_json::json!({"ok":false})
+    };
+    jni_new_string(&mut env, value.to_string())
 }
 
 // ----------------------------------------------------------------- JNI surface
@@ -1392,12 +1945,14 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeAssetReq
 
 /// JNI: open a bridge push stream (#0A), returning a stream id (>0) or 0. The session
 /// token is passed explicitly (the WebView can't set headers on a native stream open).
+/// The Agent capability is a separate in-memory argument and is never part of `path`.
 #[no_mangle]
 pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStreamOpen<'local>(
     mut env: jni::EnvUnowned<'local>,
     _class: jni::objects::JClass<'local>,
     path: jni::objects::JString<'local>,
     session_token: jni::objects::JString<'local>,
+    capability_token: jni::objects::JString<'local>,
 ) -> jni::sys::jlong {
     let path = match jni_get_string(&mut env, &path) {
         Some(s) => s,
@@ -1405,7 +1960,12 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeStreamOp
     };
     let tok = jni_get_string(&mut env, &session_token).unwrap_or_default();
     let tok = if tok.is_empty() { None } else { Some(tok) };
-    std::panic::catch_unwind(AssertUnwindSafe(|| stream_open(&path, tok.as_deref()))).unwrap_or(0)
+    let cap = jni_get_string(&mut env, &capability_token).unwrap_or_default();
+    let cap = if cap.is_empty() { None } else { Some(cap) };
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        stream_open(&path, tok.as_deref(), cap.as_deref())
+    }))
+    .unwrap_or(0)
 }
 
 /// JNI: block for the next event on stream `id` (a JSON `{event,data}` object), or "" when
@@ -1819,6 +2379,177 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeArmAccou
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn targeted_refresh_results_are_account_and_generation_scoped() {
+        let mut d = TargetRefresh::default();
+        let mut e = TargetRefresh::default();
+        let first = d.register();
+        let same_pass = d.register();
+        let snapshot = d.requested;
+        let later = d.register();
+        let other = e.register();
+        d.complete(snapshot, true);
+        assert_eq!(d.waiters[&first], Some(true));
+        assert_eq!(d.waiters[&same_pass], Some(true));
+        assert_eq!(d.waiters[&later], None);
+        assert_eq!(e.waiters[&other], None);
+        d.complete(later, false);
+        assert_eq!(d.waiters[&first], Some(true));
+        assert_eq!(d.waiters[&later], Some(false));
+        e.complete(other, false);
+        assert_eq!(e.waiters[&other], Some(false));
+    }
+
+    #[test]
+    fn microsoft_sections_yield_after_each_section_and_stop_on_error() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let changed = run_microsoft_sections(
+            |index, services| {
+                let enabled = [
+                    services.mail,
+                    services.calendar,
+                    services.contacts,
+                    services.todo,
+                    services.onenote,
+                ];
+                assert_eq!(enabled.iter().filter(|value| **value).count(), 1);
+                assert!(enabled[index]);
+                events.borrow_mut().push((index, false));
+                if index == 2 {
+                    Err(())
+                } else {
+                    Ok(index == 1)
+                }
+            },
+            || events.borrow_mut().push((usize::MAX, true)),
+        );
+        assert!(changed);
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                (0, false),
+                (usize::MAX, true),
+                (1, false),
+                (usize::MAX, true),
+                (2, false),
+                (usize::MAX, true)
+            ]
+        );
+    }
+
+    #[test]
+    fn microsoft_sections_aggregate_changes_and_run_all_five() {
+        let turns = std::cell::Cell::new(0);
+        let changed =
+            run_microsoft_sections(|index, _| Ok(index == 2), || turns.set(turns.get() + 1));
+        assert!(changed);
+        assert_eq!(turns.get(), 5);
+    }
+
+    #[test]
+    fn targeted_queue_time_tracks_oldest_coalesced_and_next_pass() {
+        let mut target = TargetRefresh::default();
+        target.register();
+        let first = target.queued_at;
+        target.register();
+        assert_eq!(target.queued_at, first);
+        assert!(target.queued_at.take().is_some());
+        target.register();
+        assert!(target.queued_at.is_some());
+    }
+
+    #[test]
+    fn targeted_refresh_prioritizes_hints_without_starving_full_pass() {
+        let mut state = RefreshSignal {
+            requested: 1,
+            ..RefreshSignal::default()
+        };
+        state.targeted.entry("d".into()).or_default().register();
+        assert_eq!(state.choose_ready(false), None);
+        assert_eq!(state.requested, 1);
+        assert_eq!(state.choose_ready(false), Some(1));
+        assert_eq!(state.completed, 0);
+        state.completed = 1;
+        assert_eq!(state.choose_ready(true), None);
+        assert_eq!(state.requested, 2);
+        assert_eq!(state.choose_ready(true), Some(2));
+    }
+
+    #[test]
+    fn targeted_refresh_round_robin_covers_three_busy_accounts() {
+        let mut state = RefreshSignal::default();
+        for account in ["d", "e", "f"] {
+            state.targeted.entry(account.into()).or_default().register();
+        }
+        let mut turns = Vec::new();
+        for _ in 0..6 {
+            let (account, _) = select_targeted_refresh(&state).unwrap();
+            state.last_target_account = Some(account.clone());
+            turns.push(account);
+        }
+        assert_eq!(turns, ["d", "e", "f", "d", "e", "f"]);
+    }
+
+    #[test]
+    fn targeted_waiter_finishes_without_waiting_for_unrelated_full_pass() {
+        let signal = Arc::new((
+            Mutex::new(RefreshSignal::default()),
+            std::sync::Condvar::new(),
+        ));
+        signal.0.lock().unwrap().requested = 1; // Simulated full pass still in flight.
+        let waiter_signal = signal.clone();
+        let waiter = std::thread::spawn(move || {
+            wait_for_targeted_refresh_on(&waiter_signal, "d", Duration::from_secs(3))
+        });
+        let (lock, wake) = &*signal;
+        let state = lock.lock().unwrap();
+        let (state, result) = wake
+            .wait_timeout_while(state, Duration::from_secs(2), |s| {
+                !s.targeted.contains_key("d")
+            })
+            .unwrap();
+        assert!(!result.timed_out());
+        let generation = state.targeted["d"].requested;
+        assert_eq!(state.completed, 0);
+        drop(state);
+        finish_targeted_refresh_on(&signal, "d", generation, true);
+        assert!(waiter.join().unwrap());
+        assert_eq!(signal.0.lock().unwrap().completed, 0);
+    }
+
+    #[test]
+    fn targeted_timeout_keeps_request_and_does_not_credit_later_waiter() {
+        let signal = Arc::new((
+            Mutex::new(RefreshSignal::default()),
+            std::sync::Condvar::new(),
+        ));
+        assert!(!wait_for_targeted_refresh_on(
+            &signal,
+            "d",
+            Duration::from_millis(5)
+        ));
+        let old = signal.0.lock().unwrap().targeted["d"].requested;
+        let waiter_signal = signal.clone();
+        let waiter = std::thread::spawn(move || {
+            wait_for_targeted_refresh_on(&waiter_signal, "d", Duration::from_secs(3))
+        });
+        let (lock, wake) = &*signal;
+        let state = lock.lock().unwrap();
+        let (state, result) = wake
+            .wait_timeout_while(state, Duration::from_secs(2), |s| {
+                s.targeted["d"].requested == old
+            })
+            .unwrap();
+        assert!(!result.timed_out());
+        let later = state.targeted["d"].requested;
+        drop(state);
+        // An old in-flight pass must not acknowledge a request made after it started.
+        finish_targeted_refresh_on(&signal, "d", old, true);
+        assert_eq!(signal.0.lock().unwrap().targeted["d"].waiters[&later], None);
+        finish_targeted_refresh_on(&signal, "d", later, false);
+        assert!(!waiter.join().unwrap());
+    }
 
     #[cfg(feature = "agent-network-device-test-hooks")]
     #[test]
@@ -2436,6 +3167,18 @@ mod tests {
     }
 
     #[test]
+    fn mobile_bootstrap_does_not_replace_invalid_existing_config() {
+        let _guard = mobile_key_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("isyncyou.toml");
+        let invalid = "not valid = [";
+        std::fs::write(&path, invalid).unwrap();
+        install_test_mobile_encryption();
+        assert!(start_inner(dir.path().to_str().unwrap()).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), invalid);
+    }
+
+    #[test]
     fn mobile_start_inner_clears_legacy_plaintext_cache_but_keeps_tokens() {
         let _guard = mobile_key_test_guard();
         install_test_mobile_encryption();
@@ -3018,18 +3761,91 @@ mod tests {
         start_engine(dir.path().to_str().unwrap()).expect("engine starts");
         let tok = session_token().expect("token");
         assert_eq!(
-            stream_open("/api/v1/events", None),
+            stream_open("/api/v1/events", None, None),
             0,
             "unauthorized → no stream"
         );
         assert_eq!(
-            stream_open("/api/v1/nope", Some(&tok)),
+            stream_open("/api/v1/nope", Some(&tok), None),
             0,
             "unknown path → no stream"
         );
-        let id = stream_open("/api/v1/events", Some(&tok));
+        let id = stream_open("/api/v1/events", Some(&tok), None);
         assert!(id > 0, "authorized events stream opens");
         stream_close(id);
         assert_eq!(stream_next(id), "", "a closed stream yields nothing");
+    }
+
+    #[test]
+    fn agent_stream_bridge_requires_session_and_agent_capability() {
+        struct StreamAgent;
+
+        impl isyncyou_webui::AgentHandler for StreamAgent {
+            fn start_turn(&self, _account: &str, _prompt: &str) -> Result<String, String> {
+                Ok("turn-123".into())
+            }
+
+            fn confirm(
+                &self,
+                _command: &isyncyou_webui::AgentConfirmCommand,
+            ) -> isyncyou_webui::AgentConfirmOutcome {
+                isyncyou_webui::AgentConfirmOutcome::Rejected(
+                    isyncyou_webui::AgentClosedConfirmationCode::Invalid,
+                )
+            }
+
+            fn cancel(&self, _turn_id: &str) {}
+
+            fn open_stream(&self, _turn_id: &str) -> Option<Receiver<String>> {
+                let (_tx, rx) = std::sync::mpsc::channel();
+                Some(rx)
+            }
+        }
+
+        let router = Arc::new(
+            isyncyou_webui::Router::new(Config::default())
+                .with_agent(Arc::new(StreamAgent), "agent-capability".into())
+                .with_session_token("session".into()),
+        );
+        let path = "/api/v1/agent/stream?turn=turn-123";
+
+        let id = stream_open_with_router(
+            Arc::clone(&router),
+            path,
+            Some("session"),
+            Some("agent-capability"),
+        );
+        assert!(id > 0);
+        stream_close(id);
+
+        for (session, capability) in [
+            (None, Some("agent-capability")),
+            (Some("session"), None),
+            (Some("wrong"), Some("agent-capability")),
+            (Some("session"), Some("wrong")),
+        ] {
+            assert_eq!(
+                stream_open_with_router(Arc::clone(&router), path, session, capability),
+                0
+            );
+        }
+        assert_eq!(
+            stream_open_with_router(
+                Arc::clone(&router),
+                "/api/v1/agent/stream?turn=turn-123&_cap=agent-capability",
+                Some("session"),
+                None,
+            ),
+            0
+        );
+        assert_eq!(
+            stream_open_with_router(
+                router,
+                "/api/v1/events",
+                Some("session"),
+                Some("agent-capability"),
+            ),
+            0
+        );
     }
 }

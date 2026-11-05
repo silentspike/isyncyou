@@ -1211,43 +1211,46 @@ fn cmd_init(
     archive_root: Option<PathBuf>,
     force: bool,
 ) -> Result<(), String> {
-    if config.exists() && !force {
-        return Err(format!(
-            "{} already exists (use --force to overwrite)",
-            config.display()
-        ));
-    }
-    match (account, username, sync_root, archive_root) {
-        (Some(id), Some(user), Some(sr), Some(ar)) => {
-            let cfg = Config {
-                accounts: vec![AccountConfig {
-                    id,
-                    username: user,
-                    sync_root: sr,
-                    archive_root: ar,
-                    cache_root: Default::default(),
-                    mount_point: None,
-                }],
-                ..Default::default()
-            };
-            cfg.validate()
-                .map_err(|errs| format!("invalid config: {}", errs.join("; ")))?;
-            cfg.save(config)?;
-            println!(
-                "wrote config for account '{}' to {}",
-                cfg.accounts[0].id,
+    Config::with_config_lock(config, || {
+        if config.exists() && !force {
+            return Err(format!(
+                "{} already exists (use --force to overwrite)",
                 config.display()
-            );
+            ));
         }
-        _ => {
-            std::fs::write(config, CONFIG_TEMPLATE).map_err(|e| e.to_string())?;
-            println!(
-                "wrote a starter template to {} — edit it, then run `isyncyou check`",
-                config.display()
-            );
+        match (account, username, sync_root, archive_root) {
+            (Some(id), Some(user), Some(sr), Some(ar)) => {
+                let cfg = Config {
+                    accounts: vec![AccountConfig {
+                        id,
+                        username: user,
+                        sync_root: sr,
+                        archive_root: ar,
+                        cache_root: Default::default(),
+                        mount_point: None,
+                    }],
+                    ..Default::default()
+                };
+                cfg.validate()
+                    .map_err(|errs| format!("invalid config: {}", errs.join("; ")))?;
+                cfg.save(config)?;
+                println!(
+                    "wrote config for account '{}' to {}",
+                    cfg.accounts[0].id,
+                    config.display()
+                );
+            }
+            _ => {
+                isyncyou_core::recovery::atomic_write(config, CONFIG_TEMPLATE.as_bytes())
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "wrote a starter template to {} — edit it, then run `isyncyou check`",
+                    config.display()
+                );
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Resolve a setup field: the flag wins; in non-interactive mode a missing
@@ -1340,7 +1343,15 @@ fn cmd_setup(
     };
     cfg.validate()
         .map_err(|errs| format!("invalid config: {}", errs.join("; ")))?;
-    cfg.save(config)?;
+    Config::with_config_lock(config, || {
+        if config.exists() && !force {
+            return Err(format!(
+                "{} already exists (use --force to overwrite)",
+                config.display()
+            ));
+        }
+        cfg.save(config)
+    })?;
     println!("wrote config for account '{id}' to {}", config.display());
 
     if no_connect {
@@ -2331,77 +2342,92 @@ fn cmd_export(config: &Path, account: &str, service: &str, out: &Path) -> Result
 /// Encrypt an account's plaintext store in place (atomic temp + rename). Refuses
 /// without a configured store key — there is no silent plaintext path (#328 AC-4).
 fn cmd_migrate_encrypt_store(config: &Path, account: &str) -> Result<(), String> {
-    let cfg = load_config(config)?;
-    let path = store_path(&cfg, account)?;
-    let secret = isyncyou_store::configured_store_key()
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| {
-            format!(
-                "refusing to encrypt: no store key configured — set {}, systemd credential \
-                 '{}', or {} first, so the migrated store can be opened again",
-                isyncyou_store::STORE_KEY_FILE_ENV,
-                isyncyou_store::STORE_SYSTEMD_CREDENTIAL,
-                isyncyou_store::STORE_KEY_ENV,
-            )
-        })?;
-    match Store::migrate_to_encrypted(&path, &secret) {
-        Ok(()) => {
-            println!(
-                "store encrypted: {} (SQLCipher; opens with the configured key)",
-                path.display()
+    let config = resolve_config_path(config);
+    Config::with_config_lock(&config, || {
+        let cfg = load_config(&config)?;
+        if cfg.provider_accounts.contains_key(account) {
+            return Err(
+                "self-hosted provider stores are managed separately and already require encryption"
+                    .into(),
             );
-            Ok(())
         }
-        Err(isyncyou_store::StoreError::AlreadyEncrypted(p)) => {
-            println!("store already encrypted: {p} — nothing to do");
-            Ok(())
+        let path = store_path(&cfg, account)?;
+        let secret = isyncyou_store::configured_store_key()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| {
+                format!(
+                    "refusing to encrypt: no store key configured — set {}, systemd credential \
+                 '{}', or {} first, so the migrated store can be opened again",
+                    isyncyou_store::STORE_KEY_FILE_ENV,
+                    isyncyou_store::STORE_SYSTEMD_CREDENTIAL,
+                    isyncyou_store::STORE_KEY_ENV,
+                )
+            })?;
+        match Store::migrate_to_encrypted(&path, &secret) {
+            Ok(()) => {
+                println!(
+                    "store encrypted: {} (SQLCipher; opens with the configured key)",
+                    path.display()
+                );
+                Ok(())
+            }
+            Err(isyncyou_store::StoreError::AlreadyEncrypted(p)) => {
+                println!("store already encrypted: {p} — nothing to do");
+                Ok(())
+            }
+            Err(e) => Err(format!("encrypt store: {e}")),
         }
-        Err(e) => Err(format!("encrypt store: {e}")),
-    }
+    })
 }
 
 fn cmd_migrate(config: &Path, account: &str, new_root: &Path) -> Result<(), String> {
-    let mut cfg = load_config(config)?;
-    let old = cfg
-        .accounts
-        .iter()
-        .find(|a| a.id == account)
-        .ok_or_else(|| format!("no account '{account}' in config"))?
-        .archive_root
-        .clone();
-    let new = new_root.to_path_buf();
-
-    if new == old {
-        return Err("new archive root equals the current one".into());
-    }
-    if new.starts_with(&old) {
-        return Err("new archive root must not be inside the current one".into());
-    }
-    if !old.exists() {
-        return Err(format!(
-            "current archive root {} does not exist",
-            old.display()
-        ));
-    }
-    if new.exists() && new.read_dir().map_err(|e| e.to_string())?.next().is_some() {
-        return Err(format!("destination {} is not empty", new.display()));
-    }
-
-    move_dir(&old, &new)?;
-
-    // local_path is relative to archive_root, so only the config needs updating.
-    for a in &mut cfg.accounts {
-        if a.id == account {
-            a.archive_root = new.clone();
+    let config = resolve_config_path(config);
+    Config::with_config_lock(&config, || {
+        let mut cfg = load_config(&config)?;
+        if cfg.provider_accounts.contains_key(account) {
+            return Err("self-hosted account archive migration requires a provider key migration and is not supported yet".into());
         }
-    }
-    cfg.save(config)?;
-    println!(
-        "migrated account '{account}' archive: {} -> {}",
-        old.display(),
-        new.display()
-    );
-    Ok(())
+        let old = cfg
+            .accounts
+            .iter()
+            .find(|a| a.id == account)
+            .ok_or_else(|| format!("no account '{account}' in config"))?
+            .archive_root
+            .clone();
+        let new = new_root.to_path_buf();
+
+        if new == old {
+            return Err("new archive root equals the current one".into());
+        }
+        if new.starts_with(&old) {
+            return Err("new archive root must not be inside the current one".into());
+        }
+        if !old.exists() {
+            return Err(format!(
+                "current archive root {} does not exist",
+                old.display()
+            ));
+        }
+        if new.exists() && new.read_dir().map_err(|e| e.to_string())?.next().is_some() {
+            return Err(format!("destination {} is not empty", new.display()));
+        }
+
+        move_dir(&old, &new)?;
+
+        // local_path is relative to archive_root, so only the config needs updating.
+        for a in &mut cfg.accounts {
+            if a.id == account {
+                a.archive_root = new.clone();
+            }
+        }
+        cfg.save(&config)?;
+        println!(
+            "migrated account '{account}' archive: {} -> {}",
+            old.display(),
+            new.display()
+        );
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -3718,6 +3744,34 @@ mod tests {
         assert!(cmd_migrate(&p, "a", &other)
             .unwrap_err()
             .contains("not empty"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_preserves_self_hosted_archive_until_key_migration_supported() {
+        let dir = std::env::temp_dir().join(format!(
+            "isyncyou-cli-provider-migrate-{}",
+            std::process::id()
+        ));
+        let old = dir.join("old");
+        let new = dir.join("new");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("keep"), b"data").unwrap();
+        let config = write_config(&dir, &old);
+        let mut cfg = Config::load(&config).unwrap();
+        cfg.provider_accounts.insert(
+            "a".into(),
+            isyncyou_core::config::ProviderConfig::SelfHosted {
+                origin: "https://example.test".into(),
+                client_id: "client".into(),
+            },
+        );
+        cfg.save(&config).unwrap();
+        assert!(cmd_migrate(&config, "a", &new)
+            .unwrap_err()
+            .contains("provider key migration"));
+        assert_eq!(std::fs::read(old.join("keep")).unwrap(), b"data");
+        assert!(!new.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

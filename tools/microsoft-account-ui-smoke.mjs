@@ -50,7 +50,7 @@ async function main() {
   try {
     await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
     const origin = `http://127.0.0.1:${server.address().port}`;
-    browser = await chromium.launch();
+    browser = await chromium.launch(process.env.ISY_SMOKE_BROWSER ? { executablePath: process.env.ISY_SMOKE_BROWSER } : {});
     const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
     await page.addInitScript(() => {
       const state = { events: [], guardAvailable: true, loginSequence: 0 };
@@ -72,6 +72,10 @@ async function main() {
             } else if (msg.op === "endNetworkGuard") {
               state.events.push("native:end");
               value = { ok: true };
+            } else if (msg.op === "providerPushStatus") {
+              value = state.pushStatus;
+            } else if (msg.op === "providerQuarantineList") {
+              value = { ids: [] };
             } else if (msg.op === "pushToken") value = { ok: true };
             reply({ t: "res", id: msg.id, status: 200, body: JSON.stringify(value) });
             return;
@@ -131,7 +135,7 @@ async function main() {
     await page.getByRole("button", { name: "Open Microsoft account picker" }).click();
     await page.evaluate(() => { window.__microsoftAccountSmoke.failNextPoll = true; });
     await page.getByText("Reconnecting to the sign-in status…").waitFor({ timeout: 5000 });
-    await page.getByText("Waiting for Microsoft sign-in…").waitFor({ timeout: 5000 });
+    await page.getByText("Waiting for sign-in…", { exact: true }).waitFor({ timeout: 5000 });
     assert(report, "one transient bridge poll failure keeps the login attempt resumable",
       await page.getByRole("button", { name: "Open Microsoft account picker" }).isEnabled()
       && await page.getByRole("button", { name: "Start sign-in again" }).count() === 0);
@@ -190,6 +194,162 @@ async function main() {
       failedEvents.filter((event) => event === "request:start:reader").length === beforeGuardFailure.starts
       && failedEvents.filter((event) => event.startsWith("native:open:")).length === beforeGuardFailure.opens,
       failedEvents);
+
+    // Exercise the actual view with an intentionally held metadata response.
+    // The fixture contains no provider data or live account operations.
+    const snapshot = await page.evaluate(async () => {
+      App.accounts = [{ id: "fixture", provider: "microsoft", auth: { reader: { state: "connected" } } }];
+      App.account = "fixture";
+      let calls = 0, release, held = false;
+      const originalApi = api;
+      const item = { service: "mail", item_type: "message", remote_id: "one", name: "Snapshot fixture", body: "body sentinel", preview: { subject: "Snapshot fixture", snippet: "snippet sentinel" } };
+      api = async (url) => {
+        if (url.startsWith("/api/v1/items?") && url.includes("service=mail")) {
+          calls++;
+          if (held) await new Promise(resolve => { release = resolve; });
+          return { items: [item] };
+        }
+        return { items: [], runs: [] };
+      };
+      const wait = () => new Promise(resolve => setTimeout(resolve, 20));
+      try {
+        go("mail");
+        for (let i = 0; i < 100 && !MailSnapshot.entries.size; i++) await wait();
+        const stored = cachedMailSnapshot("fixture");
+        go("overview"); held = true; go("mail");
+        for (let i = 0; i < 100 && !release; i++) await wait();
+        const before = { rows: document.querySelectorAll("#mail-list .mail-item:not(.skel-row)").length,
+          label: document.querySelector("#mail-cache-provenance")?.textContent,
+          searchDisabled: document.querySelector("#mail-search")?.disabled, calls };
+        release();
+        for (let i = 0; i < 100 && document.querySelector("#mail-search")?.disabled; i++) await wait();
+        const after = { rows: document.querySelectorAll("#mail-list .mail-item:not(.skel-row)").length,
+          searchDisabled: document.querySelector("#mail-search")?.disabled };
+        go("overview"); release = null; held = true; go("mail");
+        for (let i = 0; i < 100 && !release; i++) await wait();
+        Mail.selected = { remote_id: "one" }; Mail.pendingSelect = "one";
+        document.querySelector("#mail-reader").textContent = "private sentinel";
+        document.querySelector("#mail-search").value = "query sentinel";
+        api = async () => ({ accounts: [{ id: "fixture", provider: "microsoft", auth: { reader: { state: "disconnected" } } }] });
+        await reloadAccounts();
+        release(); await wait();
+        const revoked = { rows: document.querySelectorAll("#mail-list .mail-item").length,
+          readerCleared: !document.querySelector("#mail-reader").textContent.includes("private sentinel"),
+          query: document.querySelector("#mail-search").value, selected: Mail.selected, pending: Mail.pendingSelect,
+          entries: MailSnapshot.entries.size };
+        rememberMailSnapshot("a", { items: [item] });
+        rememberMailSnapshot("b", { items: [item] });
+        rememberMailSnapshot("c", { items: [item] });
+        const bounded = !cachedMailSnapshot("a") && MailSnapshot.entries.size === 2;
+        rememberMailSnapshot("c", { items: [{ name: "x".repeat(1000001) }] });
+        const oversizeCleared = !cachedMailSnapshot("c");
+        rememberMailSnapshot("b", { items: [item] });
+        MailSnapshot.entries.get("b").expires = Date.now() - 1;
+        const expired = !cachedMailSnapshot("b");
+        const finishes = [];
+        api = () => new Promise(resolve => { finishes.push(resolve); });
+        const first = fetchMailSnapshot("fixture", "/one"), second = fetchMailSnapshot("fixture", "/two");
+        clearMailSnapshots();
+        const third = fetchMailSnapshot("fixture", "/three");
+        finishes[0]({ items: [] }); await first;
+        const staleSafe = MailSnapshot.inflight.get("fixture") === third && MailSnapshot.entries.size === 0;
+        finishes[1]({ items: [] }); await third;
+        return { before, after, revoked, bounded, oversizeCleared, expired,
+          deduplicated: first === second && first !== third, staleSafe,
+          noBody: stored && stored.items[0].body === undefined && stored.items[0].preview.snippet === undefined };
+      } finally { api = originalApi; clearMailSnapshots(); }
+    });
+    assert(report, "cached metadata renders before held refresh and search returns after it",
+      snapshot.before.rows === 1 && snapshot.before.calls === 2 && snapshot.before.searchDisabled
+      && snapshot.before.label === "Cached metadata · refreshing" && snapshot.after.rows === 1 && !snapshot.after.searchDisabled, snapshot);
+    assert(report, "reader loss clears visible and retained mail state",
+      snapshot.revoked.rows === 0 && snapshot.revoked.readerCleared && snapshot.revoked.query === ""
+      && snapshot.revoked.selected === null && snapshot.revoked.pending === null && snapshot.revoked.entries === 0, snapshot.revoked);
+    assert(report, "metadata snapshots are bounded, expire, omit bodies and deduplicate in-flight requests",
+      snapshot.bounded && snapshot.oversizeCleared && snapshot.expired && snapshot.deduplicated && snapshot.staleSafe && snapshot.noBody, snapshot);
+
+    const containment = await page.evaluate(async () => {
+      if (!CSS.supports("content-visibility", "auto")) return { supported: false };
+      App.accounts = [{ id: "fixture", provider: "microsoft", auth: { reader: { state: "connected" } } }]; App.account = "fixture";
+      const originalApi = api;
+      const items = Array.from({ length: 80 }, (_, i) => ({ service: "mail", item_type: "message",
+        remote_id: `fixture-${i}`, name: i === 79 ? "unique-filter-target" : `message-${i}`,
+        preview: { subject: i === 79 ? "unique-filter-target" : `message-${i}` } }));
+      api = async url => url.startsWith("/api/v1/items?") && url.includes("service=mail") ? { items } : { items: [], runs: [] };
+      try {
+        go("overview"); await new Promise(r => setTimeout(r, 50));
+        go("mail");
+        for (let i = 0; i < 300 && document.querySelectorAll("#mail-list .mail-item:not(.skel-row)").length < 80; i++) await new Promise(r => setTimeout(r, 20));
+        const list = document.querySelector("#mail-list"), rows = [...list.querySelectorAll(".mail-item:not(.skel-row)")];
+        if (rows.length !== 80) return { supported: true, count: rows.length };
+        // Control the render scheduler to verify the first viewport gets a
+        // rendering opportunity and stale deferred batches cannot append.
+        const originalFrame = window.requestAnimationFrame, originalTimeout = window.setTimeout;
+        const frames = [], tasks = [];
+        let deferred;
+        try {
+          window.requestAnimationFrame = callback => { frames.push(callback); return frames.length; };
+          window.setTimeout = (callback, delay, ...args) => {
+            if (delay === 0) { tasks.push(() => callback(...args)); return tasks.length; }
+            return originalTimeout(callback, delay, ...args);
+          };
+          const rowCount = () => list.querySelectorAll(".mail-item:not(.skel-row)").length;
+          mailRender(); const initial = rowCount();
+          frames.shift()(0); frames.shift()(16); const beforeTask = rowCount();
+          const stale = tasks.shift(); mailRender(); stale(); const afterStale = rowCount();
+          frames.shift()(32); frames.shift()(48); tasks.shift()(); const afterBatch = rowCount();
+          frames.shift()(64); const complete = rowCount();
+          deferred = { initial, beforeTask, afterStale, afterBatch, complete };
+        } finally { window.requestAnimationFrame = originalFrame; window.setTimeout = originalTimeout; }
+        const currentRows = [...list.querySelectorAll(".mail-item:not(.skel-row)")];
+        const applied = getComputedStyle(currentRows[0]).contentVisibility === "auto";
+        currentRows[0].style.minHeight = "140px"; currentRows[1].style.minHeight = "180px";
+        const heights = [currentRows[0].getBoundingClientRect().height, currentRows[1].getBoundingClientRect().height];
+        list.scrollTop = list.scrollHeight;
+        await new Promise(requestAnimationFrame); await new Promise(requestAnimationFrame);
+        const last = currentRows.at(-1), rect = last.getBoundingClientRect(), view = list.getBoundingClientRect();
+        const bottomVisible = rect.top < view.bottom && rect.bottom > view.top;
+        last.focus({ preventScroll: true }); const focus = document.activeElement === last;
+        Mail.q = "unique-filter-target"; mailRender();
+        await new Promise(requestAnimationFrame);
+        const searchRows = list.querySelectorAll(".mail-item:not(.skel-row)").length;
+        return { supported: true, count: rows.length, applied, heights, bottomVisible, focus, searchRows, deferred };
+      } finally { api = originalApi; Mail.q = ""; clearMailSnapshots(); }
+    });
+    assert(report, "mobile mail containment preserves variable-height rows, bottom focus and search",
+      !containment.supported || (containment.count === 80 && containment.applied
+        && containment.heights[0] >= 140 && containment.heights[1] >= 180
+        && containment.bottomVisible && containment.focus && containment.searchRows === 1
+        && containment.deferred.initial === 24 && containment.deferred.beforeTask === 24
+        && containment.deferred.afterStale === 24 && containment.deferred.afterBatch === 64
+        && containment.deferred.complete === 80), containment);
+    const push = await page.evaluate(async () => {
+      const body = document.createElement("div"); document.body.append(body);
+      const originalAccounts = App.accounts, originalAccount = App.account;
+      App.accounts = [{ id: "fixture", provider: "self_hosted", auth: { reader: { state: "connected" } } }];
+      App.account = "fixture";
+      const state = window.__microsoftAccountSmoke;
+      const render = async value => {
+        state.pushStatus = value;
+        renderAccountMenu(body);
+        await new Promise(resolve => setTimeout(resolve, 30));
+        return { push: body.querySelector(".acct-provider-push")?.textContent,
+          account: body.querySelector(".acct-provider-status")?.textContent };
+      };
+      try {
+        return { observed: await render({ status: "active", last_hint_at: 1700000000, last_sync_at: 1700000010, catch_up_pending: true }),
+          unknown: await render({ status: "active", last_hint_at: 0, last_sync_at: 0 }),
+          invalid: await render({ status: "unavailable", last_hint_at: 1e100, last_sync_at: "not-a-time" }) };
+      } finally { body.remove(); App.accounts = originalAccounts; App.account = originalAccount; }
+    });
+    assert(report, "push diagnostics show separate observations and preserve catch-up state",
+      push.observed.push.includes(`Last push hint: ${new Date(1700000000 * 1000).toLocaleString()}`)
+      && push.observed.push.includes(`Last push-triggered account sync: ${new Date(1700000010 * 1000).toLocaleString()}`)
+      && push.observed.push.includes("Catch-up pending") && !push.observed.push.includes("latency")
+      && push.observed.account.includes("Conflict and retry history: unknown"), push.observed);
+    assert(report, "missing and invalid push timestamps remain unknown",
+      [push.unknown, push.invalid].every(row => row.push.includes("Last push hint: unknown")
+        && row.push.includes("Last push-triggered account sync: unknown") && !row.push.includes("Invalid Date")), push);
     report.ok = true;
   } catch (error) {
     report.error = String(error && error.stack ? error.stack : error);

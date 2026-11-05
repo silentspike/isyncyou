@@ -338,6 +338,9 @@ const MOBILE = !!BRIDGE;
 let _bridgeSeq = 0;
 const BRIDGE_TIMEOUT_MS = 15000;
 const NATIVE_TIMEOUT_MS = 5000;
+const PROVIDER_NATIVE_TIMEOUT_MS = 125000;
+const providerActionsUnknown = new Set();
+let pendingProviderSignInAccount = null;
 const BIO_TIMEOUT_MS = 120000;
 const MUTATION_COMMIT_TIMEOUT_MS = 125000;
 // Provider transport permits 60s to first response and 120s of SSE read idleness.
@@ -416,7 +419,9 @@ async function nativeCall(op, payload, timeoutMs) {
   }
   const status = Number(res.status);
   if (!Number.isFinite(status) || status < 200 || status >= 300) {
-    throw new Error(body.error || body.reason || status || "Native call failed");
+    const error = new Error(body.error || body.reason || status || "Native call failed");
+    error.reason = body.reason;
+    throw error;
   }
   return body;
 }
@@ -466,33 +471,97 @@ function nativeConfirmationMessage(code) {
   if (code === "busy") return "Another confirmation is already open";
   return "Could not confirm this action";
 }
-/* A short human label for the biometric sheet from the challenge payload (#0.6). */
-function biometricServiceLabel(service) {
-  return service === "onedrive" ? "OneDrive"
-    : service === "backup" || service === "agent" ? "iSyncYou"
-    : service === "mail" ? "Mail"
-    : service === "calendar" ? "Calendar"
-    : service === "contacts" ? "Contacts"
-    : service === "todo" ? "To Do"
-    : service === "onenote" ? "OneNote"
-    : service || "Microsoft 365";
+const AGENT_SSE_FRAME_MAX_BYTES = 72 * 1024;
+const AGENT_SSE_CARRY_MAX_BYTES = 144 * 1024;
+
+function parseAgentSseFrame(frame, onEvent) {
+  if (new TextEncoder().encode(frame).byteLength > AGENT_SSE_FRAME_MAX_BYTES) {
+    throw new Error("agent_stream_frame_too_large");
+  }
+  let eventName = "message";
+  const data = [];
+  for (const line of frame.split("\n")) {
+    if (!line || line.startsWith(":")) continue;
+    if (line.startsWith("event:")) {
+      eventName = line.slice(6).replace(/^ /, "");
+    } else if (line.startsWith("data:")) {
+      data.push(line.slice(5).replace(/^ /, ""));
+    } else {
+      throw new Error("agent_stream_invalid_field");
+    }
+  }
+  if (data.length) onEvent(eventName, data.join("\n"));
 }
-function biometricLabel(d) {
-  const verb = d.op === "delete" ? "Delete" : d.op === "share" ? "Share"
-    : d.op === "backup" ? "Start backup"
-    : d.op === "restore-cloud" ? "Restore to cloud"
-    : d.op === "live-write" ? "Run Agent write"
-    : d.op === "move-out-of-protected" ? "Move out of offline folder"
-    : d.op === "mode-switch-offline-large" ? "Make folder offline"
-    : d.op === "bulk" && d.service === "todo" ? "Delete selected tasks"
-    : d.op === "bulk" ? "Bulk OneDrive change"
-    : d.op ? d.op.charAt(0).toUpperCase() + d.op.slice(1) : "Confirm";
-  const service = biometricServiceLabel(d.service);
-  return `${verb} in ${service}`;
+
+function openAgentFetchStream(path, capToken, onEvent, onError) {
+  const controller = new AbortController();
+  let closed = false;
+  let failed = false;
+  const fail = () => {
+    if (closed || failed) return;
+    failed = true;
+    controller.abort();
+    if (onError) onError();
+  };
+  void (async () => {
+    try {
+      const response = await fetch(path, {
+        method: "GET",
+        credentials: "same-origin",
+        cache: "no-store",
+        redirect: "error",
+        headers: { "X-Capability-Token": capToken },
+        signal: controller.signal,
+      });
+      const contentType = response.headers.get("Content-Type") || "";
+      const cacheControl = response.headers.get("Cache-Control") || "";
+      if (response.redirected || !response.ok
+          || !contentType.toLowerCase().startsWith("text/event-stream")
+          || !cacheControl.toLowerCase().split(",").some(v => v.trim() === "no-store")
+          || !response.body) {
+        throw new Error("agent_stream_rejected");
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      const encoder = new TextEncoder();
+      let carry = "";
+      while (!closed) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        carry += decoder.decode(chunk.value, { stream: true });
+        if (carry.includes("\u0000") || /\r(?!\n)/.test(carry.slice(0, -1))) {
+          throw new Error("agent_stream_invalid_framing");
+        }
+        carry = carry.replace(/\r\n/g, "\n");
+        if (encoder.encode(carry).byteLength > AGENT_SSE_CARRY_MAX_BYTES) {
+          throw new Error("agent_stream_buffer_too_large");
+        }
+        let boundary;
+        while ((boundary = carry.indexOf("\n\n")) >= 0) {
+          const frame = carry.slice(0, boundary);
+          carry = carry.slice(boundary + 2);
+          parseAgentSseFrame(frame, onEvent);
+        }
+      }
+      carry += decoder.decode();
+      if (carry) throw new Error("agent_stream_truncated_frame");
+      if (!closed) fail();
+    } catch (_) {
+      fail();
+    }
+  })();
+  return {
+    close() {
+      if (closed) return;
+      closed = true;
+      controller.abort();
+    }
+  };
 }
-/* Open an SSE-style stream over the active transport (#0A). Mobile bridge mode uses
-   the native stream path and never falls back to EventSource. Desktop uses EventSource. */
-function openEventStream(path, onEvent, onError) {
+
+/* Open an SSE-style stream over the active transport (#0A). Agent streams carry their
+   capability as transport metadata; the generic events stream remains session-only. */
+function openEventStream(path, onEvent, onError, capToken = null) {
   if (BRIDGE) {
     const id = "s" + (++_bridgeSeq);
     const timer = setTimeout(() => {
@@ -504,7 +573,9 @@ function openEventStream(path, onEvent, onError) {
     }, BRIDGE_STREAM_TIMEOUT_MS);
     _bridgeStreams.set(id, { onEvent, onError, timer });
     _bridgeStats.streams++;
-    try { BRIDGE.postMessage(JSON.stringify({ t: "sub", id, path })); }
+    const subscription = capToken ? { t: "sub", id, path, cap_token: capToken }
+      : { t: "sub", id, path };
+    try { BRIDGE.postMessage(JSON.stringify(subscription)); }
     catch (e) {
       clearTimeout(timer);
       _bridgeStreams.delete(id);
@@ -519,6 +590,7 @@ function openEventStream(path, onEvent, onError) {
       }
     };
   }
+  if (capToken) return openAgentFetchStream(path, capToken, onEvent, onError);
   const es = new EventSource(path);
   es.onmessage = (e) => onEvent("message", e.data);
   es.addEventListener("change", () => onEvent("change", ""));
@@ -556,7 +628,13 @@ async function request(method, path, opts) {
   if (status >= 200 && status < 300 && d && d.status === "confirmation_required"
       && d.pending_action_id && !o.perActionToken) {
     const confirmation = await runBiometricConfirm(d.pending_action_id);
-    if (!confirmation.ok) throw new Error(nativeConfirmationMessage(confirmation.code));
+    if (!confirmation.ok) {
+      const error = new Error(nativeConfirmationMessage(confirmation.code));
+      error.code = "native_confirmation_denied";
+      error.nativePromptDenied = true;
+      error.responseReceived = true;
+      throw error;
+    }
     return request(method, path, { ...o, perActionToken: d.pending_action_id });
   }
   if (!Number.isFinite(status) || status < 200 || status >= 300) {
@@ -571,12 +649,16 @@ async function api(path) { return request("GET", path); }
 const POST_NO_TRANSPORT_RETRY = new Set([
   "/api/v1/account/login/start",
   "/api/v1/agent/user-presence/start",
+  "/api/v1/agent/composer/prepare",
+  "/api/v1/agent/contact/name/prepare",
+  "/api/v1/agent/task/completion/prepare",
 ]);
-async function postJson(path, capToken, value) {
+async function postJson(path, capToken, value, timeoutMs) {
   const body = JSON.stringify(value);
   const send = () => request("POST", path, {
     capToken,
     body,
+    timeoutMs,
     headers: { "Content-Type": "application/json" },
   });
   try {
@@ -684,7 +766,7 @@ async function hashMutationSource(source) {
   }
   return hash.hex();
 }
-async function mutationPostWithTransportRetry(path, value, timeoutMs) {
+async function mutationPostWithTransportRetry(path, value, timeoutMs, retryTransport = true) {
   const send = () => request("POST", path, {
     capToken: CAP.mutationIntent,
     timeoutMs,
@@ -697,7 +779,7 @@ async function mutationPostWithTransportRetry(path, value, timeoutMs) {
     if (error && error.code === "mutation_intent_already_completed") {
       return { status: "completed" };
     }
-    if (error && error.responseReceived) throw error;
+    if (!retryTransport || (error && error.responseReceived)) throw error;
     try {
       return await send();
     } catch (retryError) {
@@ -708,9 +790,71 @@ async function mutationPostWithTransportRetry(path, value, timeoutMs) {
     }
   }
 }
-async function stageMutation(purpose, metadata, input) {
+const MAIL_INTENT_TRACKING_KEY = "isyncyou-mail-intents-v1";
+function storedMailIntents() {
+  const raw=localStorage.getItem(MAIL_INTENT_TRACKING_KEY);
+  if (!raw) return [];
+  const rows=JSON.parse(raw);
+  if (!Array.isArray(rows) || rows.length>256 || rows.some(row => !row || typeof row.account!=="string" || typeof row.intent_id!=="string" || typeof row.operation!=="string")) throw new Error("Mail status tracking unavailable");
+  return rows;
+}
+function rememberMailIntent(account, operation, intent_id) {
+  const rows=storedMailIntents();
+  if (rows.length>=256 || rows.some(row=>row.intent_id===intent_id)) throw new Error("Mail status tracking unavailable");
+  rows.push({account,operation,intent_id});
+  localStorage.setItem(MAIL_INTENT_TRACKING_KEY,JSON.stringify(rows));
+}
+function openProviderMailIntentStatus(account) {
+  if (App.account!==account) return;
+  const list=el("div",{class:"list"});
+  let rows;
+  try { rows=storedMailIntents().filter(row=>row.account===account); }
+  catch (_) { openSheet("Mail operation status",el("p",{text:"Saved operation status is unavailable."})); return; }
+  if (!rows.length) list.append(el("p",{text:"No tracked mail operations for this account."}));
+  const legacy=el("p",{class:"dim",text:"Checking older unbound operations…"});
+  list.append(legacy);
+  const recoverySubject=el("input",{class:"input", "aria-label":"Exact draft subject", placeholder:"Exact draft subject"});
+  const recoveryStatus=el("p",{class:"dim",role:"status",text:""});
+  const recover=el("button",{class:"btn sm",type:"button",onclick:async()=>{
+    if (App.account!==account || !recoverySubject.value) return;
+    recover.disabled=true;
+    try {
+      const digest=await sha256Hex(new TextEncoder().encode(recoverySubject.value));
+      const result=await request("GET","/api/v1/mutation-intent/mail-status?"+qs({account,subject_sha256:digest}),{capToken:CAP.mutationIntent,timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS});
+      if (App.account!==account) throw new Error("account_changed");
+      if (result?.state === "ambiguous") recoveryStatus.textContent="More than one bound draft matches. Status cannot be attributed safely.";
+      else if (!result?.intent_id) recoveryStatus.textContent="No uniquely bound operation was found. Its outcome remains unknown.";
+      else if (!["staged","unknown","completed","not_dispatched","rejected"].includes(result.state)) throw new Error("invalid_status");
+      else recoveryStatus.textContent=`Operation ${result.intent_id}: ${result.state === "unknown" ? "outcome unknown; do not submit again" : result.state}.` + (result.state === "completed" && typeof result.native_id === "string" ? ` Native ID: ${result.native_id}` : "");
+    } catch (_) { recoveryStatus.textContent="Status is unavailable; no operation was repeated."; }
+    finally { recover.disabled=false; }
+  }},"Find lost draft status");
+  list.append(el("p",{class:"dim",text:"Find a lost draft operation by its exact subject. Only records bound to this account and current provider identity are checked."}),recoverySubject,recover,recoveryStatus);
+  request("GET","/api/v1/mutation-intent/mail-status?"+qs({account,list:"legacy"}),{capToken:CAP.mutationIntent,timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS}).then(result=>{
+    if (App.account!==account) return;
+    if (result?.identity_binding!=="unavailable" || result?.terminal_coverage!=="unavailable" || !Number.isSafeInteger(result.staged) || result.staged<0 || !Number.isSafeInteger(result.unknown) || result.unknown<0) throw new Error("Invalid legacy status");
+    legacy.textContent=`Older unbound operations: ${result.staged} staged, ${result.unknown} unknown. They cannot be attributed to a specific operation; historical terminal status is unavailable.`;
+  }).catch(()=>{ legacy.textContent="Older unbound operation counts are unavailable."; });
+  for (const row of rows) {
+    const state=el("span",{text:"Checking…"});
+    const line=el("div",{class:"row"},el("span",{text:row.operation+" · "+row.intent_id}),state);
+    list.append(line);
+    request("GET","/api/v1/mutation-intent/mail-status?"+qs({account,intent_id:row.intent_id}),{capToken:CAP.mutationIntent,timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS}).then(result=>{
+      if (App.account!==account) return;
+      const value=result?.state;
+      if (!["staged","unknown","completed","not_dispatched","rejected"].includes(value)) throw new Error("Invalid status");
+      state.textContent=value==="unknown" ? "Outcome unknown; do not submit again." : value==="not_dispatched" ? "Not dispatched." : value==="completed" ? "Completed." + (typeof result.native_id === "string" && result.native_id.length <= 512 && !/[\u0000-\u001f\u007f]/.test(result.native_id) ? " Native ID: " + result.native_id : "") : value==="rejected" ? "Rejected by the provider." : "Staged; not yet confirmed as completed.";
+      if (value==="completed" || value==="not_dispatched" || value==="rejected") line.append(el("button",{class:"btn sm",type:"button",onclick:()=>{
+        try { const remaining=storedMailIntents().filter(item=>!(item.account===account && item.intent_id===row.intent_id)); localStorage.setItem(MAIL_INTENT_TRACKING_KEY,JSON.stringify(remaining)); line.remove(); } catch (_) { toast("Could not remove saved status.","err"); }
+      }},"Forget status"));
+    }).catch(()=>{ state.textContent="Status unavailable; no operation was repeated."; });
+  }
+  openSheet("Mail operation status",el("div",{class:"compose"},el("p",{class:"dim",text:"Checking status does not send or repeat an operation. Unknown results remain saved."}),list));
+}
+
+async function stageMutation(purpose, metadata, input, onCreated = null, knownHash = null) {
   const source = await mutationSource(input);
-  const totalHash = await hashMutationSource(source);
+  const totalHash = knownHash || await hashMutationSource(source);
   const created = await mutationPostWithTransportRetry("/api/v1/mutation-intent/create", {
     request_id: crypto.randomUUID(), purpose, metadata,
     total_bytes: source.length, sha256: totalHash,
@@ -719,6 +863,8 @@ async function stageMutation(purpose, metadata, input) {
   if (!created.intent_id || chunkBytes !== 8192) throw new Error("Invalid upload contract");
   let commitAttempted = false;
   try {
+    if (purpose === "mail_body" && (App.accounts || []).some(account => account.id === metadata.account && account.provider === "self_hosted")) rememberMailIntent(metadata.account,metadata.operation,created.intent_id);
+    if (onCreated) await onCreated({ intent_id:created.intent_id, sha256:totalHash, size:source.length });
     for (let offset = 0, index = 0; offset < source.length; offset += chunkBytes, index++) {
       const chunk = await source.read(offset, Math.min(offset + chunkBytes, source.length));
       await mutationPostWithTransportRetry("/api/v1/mutation-intent/chunk", {
@@ -728,11 +874,13 @@ async function stageMutation(purpose, metadata, input) {
       });
     }
     commitAttempted = true;
-    return await mutationPostWithTransportRetry("/api/v1/mutation-intent/commit", {
+    const committed = await mutationPostWithTransportRetry("/api/v1/mutation-intent/commit", {
       request_id: crypto.randomUUID(), intent_id: created.intent_id,
       total_bytes: source.length, sha256: totalHash,
-    }, MUTATION_COMMIT_TIMEOUT_MS);
+    }, MUTATION_COMMIT_TIMEOUT_MS, purpose !== "mail_body");
+    return { ...committed, intent_id:created.intent_id };
   } catch (error) {
+    if (error && commitAttempted) { error.mutationCommitAttempted = true; error.mutationIntentId = created.intent_id; }
     if (!commitAttempted && error && error.responseReceived) {
       await postJson("/api/v1/mutation-intent/cancel", CAP.mutationIntent, {
         request_id: crypto.randomUUID(), intent_id: created.intent_id,
@@ -862,7 +1010,17 @@ function accountDisplayLabel(account) {
   if (username
       && username !== accountId
       && !INTERNAL_ACCOUNT_LABELS.has(username.toLowerCase())) return username;
-  return "Microsoft 365 account";
+  return account && account.provider === "self_hosted" ? "Self-hosted account" : "Microsoft 365 account";
+}
+function accountSelectionLabel(account) {
+  const candidate = a => {
+    const label = accountDisplayLabel(a);
+    return App.accounts.length > 1 && label === "Self-hosted account"
+      ? String(a.username || a.id || label) : label;
+  };
+  const label = candidate(account);
+  const duplicate = App.accounts.some(other => other !== account && candidate(other) === label);
+  return duplicate && account.id ? `${label} · ${account.id}` : label;
 }
 // Per-service filter sub-items shown in the LEFT sidebar, indented under the
 // active service (NOT a separate rail). Lazy so Mail.cats is populated at call.
@@ -896,14 +1054,14 @@ function mailFolderSpecs() {
       key: "folder:" + f.remote_id,
       label: f.name || "(folder)",
       icon: mailFolderIcon(f.name),
-      count: m => m.filter(it => it.parent_remote_id === f.remote_id).length,
+      count: m => m.filter(it => (it.mailbox_ids || [it.parent_remote_id]).includes(f.remote_id)).length,
     }));
 }
 function svcFilters(service) {
   if (service === "mail") return [
-    { sec: "Mailbox" },
+    { sec: (App.accounts || []).some(a => a.id === App.account && a.provider === "self_hosted") ? "Mailbox · current page" : "Mailbox" },
     { key: "all", label: "All messages", icon: "inbox", count: m => m.length },
-    { key: "attach", label: "With attachments", icon: "paperclip", count: m => m.filter(it => (it.preview || {}).attachments > 0).length },
+    { key: "attach", label: Mail.all.some(it => (it.preview || {}).attachment_presence_unknown) ? "Attachments or unknown" : "With attachments", icon: "paperclip", count: m => m.filter(it => (it.preview || {}).attachments > 0 || (it.preview || {}).attachment_presence_unknown).length },
     { key: "restore", label: (MOBILE ? "Has content" : "Restore-ready"), icon: "rotate-ccw", count: m => m.filter(it => it.has_body).length },
     ...(Mail.folders && Mail.folders.length ? [{ sec: "Folders" }, ...mailFolderSpecs()] : []),
     { sec: "Status" },
@@ -941,7 +1099,12 @@ const svcFilter = (service) => App.svcFilter[service] || "all";
 function setSvcFilter(service, key) {
   App.svcFilter[service] = key;
   document.querySelectorAll(`#subnav-${service} .nav-subitem`).forEach(b => b.classList.toggle("active", b.dataset.k === key));
-  if (service === "mail") mailRender();
+  if (service === "mail") {
+    const provider = (App.accounts || []).some(a => a.id === App.account && a.provider === "self_hosted");
+    const mailbox = key.startsWith("folder:") ? key.slice(7) : "";
+    if (provider && mailbox !== (Mail.mailboxId || "")) { void loadLiveMailFolder(mailbox); return; }
+    mailRender();
+  }
   else if (service === "contacts") contactsRenderList();
 }
 // fill the sidebar sub-item counts once the active view has loaded its items
@@ -1234,9 +1397,32 @@ function invadersGame(canvas) {
   fit(); reset(); SFX.init(); raf = requestAnimationFrame(step);
 }
 
+const MOBILE_PRIMARY_ROUTES = ["overview", "mail", "calendar", "assistant"];
+function openMobileMore() {
+  const entries = visibleServices().filter(s => !MOBILE_PRIMARY_ROUTES.includes(s.id));
+  entries.push({ id:"search", label:"Search", icon:"search" }, { id:"settings", label:"Settings", icon:"settings" });
+  if (eggOn()) entries.push({ id:"invaders", label:"Invaders", icon:"sparkles" });
+  const grid = el("div", { class:"mobile-more-grid" }, entries.map(s =>
+    el("button", { class:"mobile-more-item" + (App.route === s.id ? " active" : ""), type:"button", dataset:{ route:s.id }, onclick:() => { closeSheet(); go(s.id); } },
+      el("span", { class:"mobile-more-icon", style:`--svc:var(--svc-${s.id}, var(--accent))` }, icon(s.icon)),
+      el("span", { class:"mobile-more-label", text:s.label }),
+      App.route === s.id ? el("span", { class:"mobile-more-current", text:"Current" }) : null)));
+  openSheet("More", el("div", { class:"body mobile-more-body" },
+    el("p", { class:"mobile-more-intro", text:"Your workspace" }), grid));
+}
+function renderMobileNavigation() {
+  const primary = MOBILE_PRIMARY_ROUTES.map(id => visibleServices().find(s => s.id === id)).filter(Boolean);
+  const secondary = !MOBILE_PRIMARY_ROUTES.includes(App.route);
+  return el("nav", { class:"mobile-nav", style:`--mobile-nav-count:${primary.length + 1}`, "aria-label":"Main navigation" },
+    primary.map(s => el("button", { type:"button", class:"mobile-nav-item" + (App.route === s.id ? " active" : ""), dataset:{ route:s.id }, "aria-current":App.route === s.id ? "page" : null, onclick:() => go(s.id) },
+      el("span", { class:"mobile-nav-icon" }, icon(s.icon)), el("span", { class:"mobile-nav-label", text:s.label }))),
+    el("button", { type:"button", class:"mobile-nav-item" + (secondary ? " active" : ""), "aria-label":secondary ? `More, current: ${routeLabel(App.route)}` : "More", onclick:openMobileMore },
+      el("span", { class:"mobile-nav-icon" }, icon("layout-dashboard")), el("span", { class:"mobile-nav-label", text:"More" }), secondary ? el("span", { class:"mobile-nav-sub", text:routeLabel(App.route) }) : null));
+}
 function renderShell() {
   const acc = App.accounts.find(a => a.id === App.account) || {};
   const accountLabel = accountDisplayLabel(acc);
+  const mobileAccountLabel = accountSelectionLabel(acc);
   const nav = el("nav", { class: "nav" },
     visibleServices().map(s => {
       const cnt = App.counts[s.id];
@@ -1277,7 +1463,7 @@ function renderShell() {
     el("div", { class: "brand" }, logoGlyph(30), el("div", { class: "wordmark", html: "iSync<b>You</b>" })),
     el("button", { class: "sb-account", onclick: openAccountSwitcher, title: "Switch account" },
       el("span", { class: "avatar", text: initials(accountLabel) }),
-      el("span", { class: "who" }, el("b", { text: accountLabel }), el("span", { class: "dim", text: "Microsoft 365" })),
+      el("span", { class: "who" }, el("b", { text: accountLabel }), el("span", { class: "dim", text: acc?.provider === "self_hosted" ? "Self-hosted" : "Microsoft 365" })),
     ),
     el("div", { class: "sb-section", text: "Library" }),
     nav,
@@ -1302,9 +1488,13 @@ function renderShell() {
       icon("search", "icon-sm"), el("span", { class: "label-text", text: "Search everything" }), el("span", { class: "kbd", text: "⌘K" })),
     el("button", { class: "topbar-btn" + (App.route === "settings" ? " active" : ""), title: "Settings", onclick: () => go("settings") }, icon("settings", "icon-sm")),
   );
-  const main = el("main", { class: "main" }, topbar, el("div", { id: "view", class: "view" }));
+  const mobileHeader = el("header", { class:"mobile-header" },
+    el("div", { class:"mobile-heading" }, el("span", { class:"mobile-eyebrow", text:"iSyncYou" }), el("h1", { class:"mobile-title", text:routeLabel(App.route) })),
+    el("button", { class:"mobile-account", type:"button", title:"Switch account", "aria-label":`Switch account: ${mobileAccountLabel}`, onclick:openAccountSwitcher },
+      el("span", { class:"avatar", text:initials(mobileAccountLabel) }), el("span", { class:"mobile-account-label", text:mobileAccountLabel }), icon("chevron-down", "icon-sm")));
+  const main = el("main", { class: "main" }, topbar, mobileHeader, el("div", { id: "view", class: "view" }));
   const app = clear($("#app"));
-  app.append(sidebar, main);
+  app.append(sidebar, main, renderMobileNavigation());
   renderSyncWidget();
 }
 
@@ -1313,12 +1503,18 @@ function renderShell() {
 // Alerts badge. Every value is real (from /sync/state, /activity, /status).
 async function renderSyncWidget() {
   const box = $("#sync-widget"); if (!box) return;
+  if (!box.getClientRects().length) return;
+  const account = App.account;
+  const current = () => box.isConnected && $("#sync-widget") === box && App.account === account;
   let st = { enabled: false, paused: false }, runs = [], status = null;
   try { st = await api("/api/v1/sync/state"); } catch {}
-  if (App.account) {
-    try { runs = (await api("/api/v1/activity?" + qs({ account: App.account, limit: 60 }))).runs || []; } catch {}
-    try { status = await api("/api/v1/status?" + qs({ account: App.account })); } catch {}
+  if (!current()) return;
+  if (account) {
+    try { runs = (await api("/api/v1/activity?" + qs({ account, limit: 60 }))).runs || []; } catch {}
+    if (!current()) return;
+    try { status = await api("/api/v1/status?" + qs({ account })); } catch {}
   }
+  if (!current()) return;
   // back-fill every service's nav count so the sidebar shows them without
   // visiting each view first (the mockup shows all counts up-front).
   if (status && Array.isArray(status.services)) {
@@ -1428,15 +1624,25 @@ async function renderOverview(view) {
     el("div", { id: "ov-body" }),
   );
   const body = $("#ov-body");
+  const account = App.account;
+  const current = () => view.isConnected && view.contains(body) && App.account === account;
   body.append(el("div", { class: "card", style: "height:64px" }, el("div", { class: "skel", style: "height:24px;width:40%" })));
   if (!App.account) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "No account configured" }))); return; }
   try {
+    const status = api("/api/v1/status?" + qs({ account }));
+    void status.then(st => {
+      if (!current()) return;
+      clear(body).append(el("div", { class:"card panel" },
+        el("div", { class:"panel-head", text:"Overview" }),
+        el("div", { class:"panel-body", text:`${(st.totals?.items ?? 0).toLocaleString()} items · ${(st.services || []).length} services · Loading activity and settings…` })));
+    }).catch(() => {});
     const [st, act, cfg, sy] = await Promise.all([
-      api("/api/v1/status?" + qs({ account: App.account })),
-      api("/api/v1/activity?" + qs({ account: App.account, limit: 200 })).catch(() => ({ runs: [] })),
+      status,
+      api("/api/v1/activity?" + qs({ account, limit: 200 })).catch(() => ({ runs: [] })),
       api("/api/v1/settings").catch(() => ({})),
       api("/api/v1/sync/state").catch(() => ({})),
     ]);
+    if (!current()) return;
     const services = (st.services || []).slice().sort((a, b) => b.items - a.items);
     services.forEach(s => { App.counts[s.service] = s.items; });
     updateNavCounts();
@@ -1535,7 +1741,7 @@ async function renderOverview(view) {
     // sync populates data). Repaints only on a real change — never per tick.
     App._ovSig = overviewSignature(st);
     App.liveUpdate = overviewLiveUpdate;
-  } catch (e) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load overview" }), el("p", { text: e.message }))); }
+  } catch (e) { if (current()) clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load overview" }), el("p", { text: e.message }))); }
 }
 function overviewSignature(st) {
   const svc = (st.services || []).map(s => s.service + ":" + s.items).join(",");
@@ -1654,7 +1860,51 @@ async function doServiceSearch(service) {
 // `offset` walks the raw /items page (which also contains mailbox folder rows);
 // `folders` accumulates the folder items we skip so the displayed count reflects
 // real messages (folders sort before messages, so the message total is exact).
-const Mail = { all: [], filter: "all", sort: "newest", q: "", selected: null };
+const Mail = { all: [], filter: "all", sort: "newest", q: "", selected: null, nextCursor: null, expanded: false };
+// Short-lived, bounded metadata only. Self-hosted/shared mail is excluded because
+// its visibility depends on live ACL checks. Never persist this snapshot.
+const MailSnapshot = { entries: new Map(), inflight: new Map(), epoch: 0 };
+function clearMailSnapshots() {
+  MailSnapshot.epoch++;
+  MailSnapshot.entries.clear();
+  MailSnapshot.inflight.clear();
+  const active = (App.accounts || []).find(a => a.id === App.account);
+  if (active && active.provider !== "self_hosted") {
+    Mail.all = []; Mail.folders = []; Mail.cats = []; Mail.selected = null; Mail.pendingSelect = null;
+    Mail.q = ""; Mail.viewGeneration = (Mail.viewGeneration || 0) + 1; Mail._renderGen = (Mail._renderGen || 0) + 1;
+    const list = $("#mail-list"); if (list) clear(list);
+    const search = $("#mail-search"); if (search) { search.value = ""; search.disabled = true; }
+    const label = $("#mail-cache-provenance"); if (label) label.textContent = "Mail unavailable · reload to refresh";
+    for (const id of ["#mail-page-prev", "#mail-load-more"]) { const button = $(id); if (button) button.disabled = true; }
+    if ($("#mail-reader")) renderMailReader(null);
+  }
+}
+function rememberMailSnapshot(account, data) {
+  MailSnapshot.entries.delete(account);
+  if (!Array.isArray(data.items) || data.items.length > 1000) return;
+  const copy = { ...data, items: data.items.map(item => {
+    const { body, content, ...metadata } = item;
+    if (metadata.preview) { const { snippet, body: previewBody, ...preview } = metadata.preview; metadata.preview = preview; }
+    return metadata;
+  }) };
+  const json = JSON.stringify(copy);
+  if (json.length > 1000000) return;
+  MailSnapshot.entries.set(account, { json, expires: Date.now() + 30000 });
+  while (MailSnapshot.entries.size > 2) MailSnapshot.entries.delete(MailSnapshot.entries.keys().next().value);
+}
+function cachedMailSnapshot(account) {
+  const entry = MailSnapshot.entries.get(account);
+  if (!entry) return null;
+  if (entry.expires <= Date.now()) { MailSnapshot.entries.delete(account); return null; }
+  return JSON.parse(entry.json);
+}
+function fetchMailSnapshot(account, url) {
+  const existing = MailSnapshot.inflight.get(account);
+  if (existing) return existing;
+  const request = api(url).finally(() => { if (MailSnapshot.inflight.get(account) === request) MailSnapshot.inflight.delete(account); });
+  MailSnapshot.inflight.set(account, request);
+  return request;
+}
 // Real Outlook categories (#563): the master-category colour map (preset0..24)
 // is built on load from the backed-up `category` items (#562) — no keyword
 // heuristic. Each message carries its real `categories` list in the preview.
@@ -1693,7 +1943,15 @@ function mailAvatarColor(it) {
 const mailDate = (it) => { const p = it.preview || {}; return toDate(p.date || it.remote_mtime) || new Date(0); };
 
 async function renderMailView(view) {
-  Mail.all = []; Mail.filter = "all"; Mail.sort = Mail.sort || "newest"; Mail.q = ""; Mail.selected = null;
+  if (Mail.scopeAccount !== App.account) { Mail.scopeAccount = App.account; Mail.activeScope = ""; App.svcFilter.mail = "all"; }
+  App.svcFilter.mail = "all";
+  const account = App.account, scope = Mail.activeScope;
+  const generation = Mail.viewGeneration = (Mail.viewGeneration || 0) + 1;
+  const current = () => view.isConnected && $("#mail-page") && view.contains($("#mail-page")) && App.account === account && Mail.activeScope === scope && Mail.viewGeneration === generation;
+  const providerMail = (App.accounts || []).some(a => a.id === account && a.provider === "self_hosted");
+  const primaryCacheOnly = !scope && providerMail;
+  Mail.all = []; Mail.folders = []; Mail.cats = []; Mail.runs = []; Mail.filter = "all"; Mail.sort = Mail.sort || "newest"; Mail.q = ""; Mail.selected = null;
+  Mail.livePage = false; Mail.liveQuery = ""; Mail.mailboxId = ""; Mail.nextCursor = null; Mail.queryState = null; Mail.pageCursor = 0; Mail.cursorStack = [];
   Mail.threaded = Mail.threaded === undefined ? true : Mail.threaded; // group by conversation (#563)
   clear(view).append(el("div", { id: "mail-page", class: "mail-page" },
     // top metric row leads (title is in the top-bar breadcrumb, counts live in the
@@ -1702,14 +1960,24 @@ async function renderMailView(view) {
     // toolbar
     el("div", { class: "mail-toolbar" },
       el("div", { class: "tb-search" }, icon("search", "icon-sm"),
-        el("input", { id: "mail-search", placeholder: "Search this mailbox…", oninput: () => { clearTimeout(Mail._qT); Mail._qT = setTimeout(() => { Mail.q = $("#mail-search").value.trim().toLowerCase(); mailRender(); }, 140); } })),
+        el("input", { id: "mail-search", placeholder: providerMail ? "Filter this page…" : "Search this mailbox…", oninput: () => { clearTimeout(Mail._qT); Mail._qT = setTimeout(() => { Mail.q = $("#mail-search").value.trim().toLowerCase(); mailRender(); }, 140); } })),
+      providerMail ? el("input", {id:"mail-server-query", class:"input", placeholder:"Search mailbox…", "aria-label":"Search selected mailbox"}) : null,
+      providerMail ? el("button", {class:"btn sm",type:"button",onclick:event=>searchLiveProviderMail(event.currentTarget)}, "Search mailbox") : null,
+      el("select", { id:"mail-scope", class:"input", style:"display:none", onchange:event => { Mail.activeScope = event.target.value; Mail.selected = null; Mail.pendingSelect = null; void renderMailView(view); } }),
+      el("span", { id: "mail-cache-provenance", class: "dim", style: "font-size:11px" }),
+      el("button", { id: "mail-page-prev", class: "btn sm", type:"button", style:"display:none", onclick: event => loadMoreProviderMail(event.currentTarget, true) }, "Previous page"),
+      el("button", { id: "mail-load-more", class: "btn sm", type:"button", style:"display:none", onclick: event => loadMoreProviderMail(event.currentTarget) }, "Next page"),
       el("div", { class: "spacer", style: "flex:1" }),
       el("label", { class: "tb-sort" }, icon("arrow-down-up", "icon-sm"),
-        el("select", { class: "input", onchange: (e) => { Mail.sort = e.target.value; mailRender(); } },
-          el("option", { value: "newest", text: "Newest first" }),
-          el("option", { value: "oldest", text: "Oldest first" }),
-          el("option", { value: "sender", text: "Sender A–Z" }))),
+        el("select", { class: "input", title:providerMail ? "Sort messages on this page" : "Sort messages", onchange: (e) => { Mail.sort = e.target.value; mailRender(); } },
+          el("option", { value: "newest", text: providerMail ? "Page: newest first" : "Newest first" }),
+          el("option", { value: "oldest", text: providerMail ? "Page: oldest first" : "Oldest first" }),
+          el("option", { value: "sender", text: providerMail ? "Page: sender A–Z" : "Sender A–Z" }))),
       el("button", { id: "mail-thread-toggle", class: "btn sm" + (Mail.threaded ? " active" : ""), title: "Group messages into conversations", onclick: (e) => { Mail.threaded = !Mail.threaded; e.currentTarget.classList.toggle("active", Mail.threaded); mailRender(); } }, icon("mail-open", "icon-sm"), "Conversations"),
+      CAP.agent && (App.accounts || []).some(account => account.id === App.account && account.provider === "self_hosted") ? el("button", { class:"btn sm", type:"button", onclick:() => {
+        openProviderRecovery(App.account,"Recovered","mail");
+      } }, "Recover…") : null,
+      CAP.mutationIntent && (App.accounts || []).some(account => account.id === App.account && account.provider === "self_hosted") ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderMailIntentStatus(App.account) }, "Operation status") : null,
       verifyButton(() => renderMailView(view)),
       CAP.mailwrite && CAP.mutationIntent ? el("button", { class: "btn sm primary", title: "Compose a new message", onclick: () => openCompose() }, icon("send", "icon-sm"), "Compose") : null,
       el("button", { class: "btn sm", title: "View sync log", onclick: () => go("overview") }, icon("clock", "icon-sm"), "Sync log")),
@@ -1720,18 +1988,70 @@ async function renderMailView(view) {
   renderMailReader(null);
   const list = $("#mail-list");
   for (let i = 0; i < 9; i++) list.append(el("div", { class: "mail-item skel-row" }, el("div", { class: "skel grow", style: "height:46px" })));
+  const snapshotEpoch = MailSnapshot.epoch;
+  const snapshotEligible = !providerMail && !scope && accountRoleStatus((App.accounts || []).find(a => a.id === account), "reader").state === "connected";
+  const snapshot = snapshotEligible ? cachedMailSnapshot(account) : null;
+  if (snapshot) {
+    Mail.all = snapshot.items.filter(it => it.item_type === "message");
+    Mail.cats = snapshot.items.filter(it => it.item_type === "category");
+    Mail.folders = snapshot.items.filter(it => it.item_type === "folder");
+    Mail.catColor = new Map(Mail.cats.map(c => [c.name, presetColor((c.preview || {}).color)]));
+    Mail.nextCursor = snapshot.next_cursor || null; Mail.pageCursor = ""; Mail.cursorStack = [];
+    App.counts.mail = Mail.all.length; updateNavCounts(); refreshMailSubnav(); fillSubnavCounts("mail", Mail.all);
+    updateMailLoadMore(); mailRenderMetrics(); mailRender();
+    const label = $("#mail-cache-provenance"); if (label) label.textContent = "Cached metadata · refreshing";
+    const search = $("#mail-search"); if (search) { search.disabled = true; search.placeholder = "Search available after refresh…"; }
+    for (const id of ["#mail-page-prev", "#mail-load-more"]) { const button = $(id); if (button) button.disabled = true; }
+  }
+  const liveRequest = providerMail ? api("/api/v1/items?" + qs({account,service:"mail",live_metadata:"1",limit:50,...(scope ? {mail_scope:scope} : {})})).catch(() => null) : null;
+  const initialPageRequest = Mail.pageRequest;
+  const applyLive = page => {
+    if (!current() || Mail.pageRequest !== initialPageRequest || Mail.selected) return false;
+    if (!page || !Array.isArray(page.items) || typeof page.query_state !== "string" || !page.query_state) {
+      if (scope) { Mail.all = []; Mail.folders = []; Mail.selected = null; renderMailReader(null); mailRender(); }
+      const label = $("#mail-cache-provenance"); if (label) label.textContent = scope ? "Shared mail access could not be verified" : "Cached messages · newest order not verified";
+      return false;
+    }
+    Mail.all = projectLiveMail(page.items, scope); Mail.livePage = true; Mail.queryState = page.query_state;
+    Mail.nextCursor = page.next_position ?? null; Mail.pageCursor = 0; Mail.cursorStack = [];
+    if (!scope && Number.isSafeInteger(page.total) && page.total >= 0) { App.counts.mail = page.total; updateNavCounts(); }
+    updateMailLoadMore(); fillSubnavCounts("mail", Mail.all); Mail._sig = mailListSignature(); mailRenderMetrics(); mailRender();
+    const label = $("#mail-cache-provenance"); if (label) label.textContent = "Live mailbox · newest first";
+    App.liveUpdate = mailLiveUpdate;
+    return true;
+  };
+  if (liveRequest) void liveRequest.then(applyLive);
   try {
-    const [d, act] = await Promise.all([
-      api("/api/v1/items?" + qs({ account: App.account, service: "mail", limit: 1000 })),
-      api("/api/v1/activity?" + qs({ account: App.account, limit: 30 })).catch(() => ({ runs: [] })),
-    ]);
-    Mail.all = (d.items || []).filter(it => it.item_type === "message");
+    const activity = api("/api/v1/activity?" + qs({ account, limit: 30 })).catch(() => ({ runs: [] }));
+    const url = "/api/v1/items?" + qs({ account, service: "mail", limit: providerMail ? 50 : 1000, ...(scope ? {mail_scope:scope} : {}), ...(primaryCacheOnly ? {primary_cache_only:"1"} : {}), ...(!providerMail ? {metadata_only:"1"} : {}) });
+    const d = await (snapshotEligible ? fetchMailSnapshot(account, url) : api(url));
+    if (!current() || Mail.pageRequest !== initialPageRequest || MailSnapshot.epoch !== snapshotEpoch) return;
+    if (snapshotEligible && accountRoleStatus((App.accounts || []).find(a => a.id === account), "reader").state === "connected") rememberMailSnapshot(account, d);
+    const search = $("#mail-search"); if (search) { search.disabled = false; search.placeholder = providerMail ? "Filter this page…" : "Search this mailbox…"; }
+    for (const id of ["#mail-page-prev", "#mail-load-more"]) { const button = $(id); if (button) button.disabled = false; }
+    const liveAlready = Mail.livePage;
+    const scopeSelect = $("#mail-scope");
+    if (scopeSelect && Array.isArray(d.scopes) && (d.scopes.length > 1 || d.scopes.some(scope => !scope.primary))) {
+      clear(scopeSelect);
+      if (!d.scopes.some(scope => scope.primary)) scopeSelect.append(el("option", {value:"", text:"Choose a shared mailbox"}));
+      for (const scope of d.scopes) scopeSelect.append(el("option", {value:scope.primary ? "" : scope.mail_scope, text:scope.primary ? "Personal mail" : `Shared mail · ${scope.mail_scope}`}));
+      scopeSelect.value = Mail.activeScope || ""; scopeSelect.style.display = "";
+    }
+    if (!liveAlready) {
+      Mail.nextCursor = providerMail ? null : (d.next_cursor || null);
+      Mail.pageCursor = providerMail ? 0 : ""; Mail.cursorStack = []; Mail.livePage = false; Mail.queryState = null;
+      Mail.expanded = false;
+      updateMailCacheProvenance(d);
+      if (providerMail) { const label = $("#mail-cache-provenance"); if (label) label.textContent = "Cached messages · newest order not verified"; }
+      updateMailLoadMore();
+      Mail.all = (d.items || []).filter(it => it.item_type === "message");
+    }
     // real Outlook categories (#562): build the displayName → colour map
     Mail.cats = (d.items || []).filter(it => it.item_type === "category");
     Mail.catColor = new Map(Mail.cats.map(c => [c.name, presetColor((c.preview || {}).color)]));
     Mail.folders = (d.items || []).filter(it => it.item_type === "folder"); // move targets (#563 B5)
-    Mail.runs = act.runs || [];
-    App.counts.mail = Mail.all.length; updateNavCounts();
+    Mail.runs = [];
+    if (!providerMail) App.counts.mail = Mail.all.length; updateNavCounts();
     refreshMailSubnav(); // rebuild the sidebar now that the real categories are known
     fillSubnavCounts("mail", Mail.all);
     mailRenderMetrics(); mailRender();
@@ -1740,36 +2060,160 @@ async function renderMailView(view) {
     // visible set actually changed.
     Mail._sig = mailListSignature();
     App.liveUpdate = mailLiveUpdate;
+    void activity.then(act => { if (current()) { Mail.runs = act.runs || []; mailRenderMetrics(); } });
+    if (primaryCacheOnly) void api("/api/v1/items?" + qs({account,service:"mail",limit:50})).then(full => {
+      if (!current()) return;
+      const select = $("#mail-scope");
+      if (select && Array.isArray(full.scopes) && full.scopes.some(item => !item.primary)) {
+        clear(select);
+        for (const item of full.scopes) select.append(el("option", {value:item.primary ? "" : item.mail_scope, text:item.primary ? "Personal mail" : `Shared mail · ${item.mail_scope}`}));
+        select.value = ""; select.style.display = "";
+      }
+      if (!Mail.livePage) updateMailCacheProvenance(full);
+    }).catch(() => {});
     // re-open the message that was selected before a live (SSE) refresh, if it survived
     if (Mail.pendingSelect) {
       const keep = Mail.all.find(x => x.remote_id === Mail.pendingSelect);
       Mail.pendingSelect = null;
       if (keep) mailSelect(keep);
     }
-  } catch (e) { clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Could not load mail" }), el("p", { text: e.message }))); }
+  } catch (e) {
+    if (!current()) return;
+    if (!providerMail && !scope) { clearMailSnapshots(); Mail.all = []; Mail.folders = []; Mail.cats = []; }
+    if (liveRequest && applyLive(await liveRequest)) return;
+    if (current()) clear(list).append(el("div", { class: "empty" }, el("h3", { text: "Could not load mail" }), el("p", { text: e.message })));
+  }
+}
+
+function projectLiveMail(items, scope) {
+  return items.map(item => ({service:"mail", item_type:"message", remote_id:item.id, name:item.subject || "", mail_scope:scope || undefined, shared:!!scope, mailbox_ids:Object.keys(item.mailboxIds || {}).filter(id => item.mailboxIds[id] === true), has_body:false, preview:{subject:item.subject, from:item.from?.[0]?.email || "", snippet:item.preview, date:item.receivedAt, isRead:!!item.keywords?.$seen, isDraft:!!item.keywords?.$draft, attachments:item.hasAttachment ? 1 : 0, attachment_count_unknown:!!item.hasAttachment}}));
+}
+
+async function loadLiveMailFolder(mailbox) {
+  const account=App.account, scope=Mail.activeScope, generation=Mail.viewGeneration;
+  const requestId=Mail.pageRequest=(Mail.pageRequest || 0)+1;
+  Mail.mailboxId=mailbox; Mail.liveQuery=""; Mail.queryState=null; Mail.nextCursor=null; Mail.cursorStack=[]; Mail.pageCursor=0;
+  Mail.all=[]; Mail.selected=null; renderMailReader(null); updateMailLoadMore(); mailRender();
+  try {
+    const page=await api("/api/v1/items?"+qs({account,service:"mail",live_metadata:"1",limit:50,...(scope ? {mail_scope:scope} : {}),...(mailbox ? {mailbox_id:mailbox} : {})}));
+    if(App.account!==account || Mail.activeScope!==scope || Mail.viewGeneration!==generation || Mail.pageRequest!==requestId || Mail.mailboxId!==mailbox) return;
+    if(!Array.isArray(page.items) || typeof page.query_state!=="string" || !page.query_state) throw new Error("invalid result");
+    Mail.livePage=true; Mail.queryState=page.query_state; Mail.nextCursor=page.next_position ?? null; Mail.all=projectLiveMail(page.items,scope);
+    updateMailLoadMore(); fillSubnavCounts("mail",Mail.all); Mail._sig=mailListSignature(); mailRenderMetrics(); mailRender();
+    const label=$("#mail-cache-provenance"); if(label) label.textContent="Live mailbox · newest first";
+  } catch (_) {
+    if(App.account===account && Mail.activeScope===scope && Mail.viewGeneration===generation && Mail.pageRequest===requestId && Mail.mailboxId===mailbox) toast("This mailbox could not be loaded.","err");
+  }
+}
+
+async function searchLiveProviderMail(button) {
+  const account=App.account, scope=Mail.activeScope, generation=Mail.viewGeneration;
+  const text=($("#mail-server-query")?.value || "").trim();
+  if (!text || text.length > 1024) { toast("Enter a search term.", "err"); return; }
+  const requestId=Mail.pageRequest=(Mail.pageRequest || 0)+1;
+  button.disabled=true;
+  try {
+    const page=await api("/api/v1/items?"+qs({account,service:"mail",live_metadata:"1",limit:50,text,...(scope ? {mail_scope:scope} : {}),...(Mail.mailboxId ? {mailbox_id:Mail.mailboxId} : {})}));
+    if (App.account!==account || Mail.activeScope!==scope || Mail.viewGeneration!==generation || Mail.pageRequest!==requestId) return;
+    if (!Array.isArray(page.items) || typeof page.query_state!=="string" || !page.query_state) throw new Error("invalid result");
+    Mail.livePage=true; Mail.liveQuery=text; Mail.queryState=page.query_state; Mail.pageCursor=0; Mail.cursorStack=[]; Mail.nextCursor=page.next_position ?? null;
+    Mail.all=projectLiveMail(page.items,scope); Mail.selected=null; renderMailReader(null); Mail.q=""; const filter=$("#mail-search"); if(filter) filter.value="";
+    updateMailLoadMore(); fillSubnavCounts("mail",Mail.all); Mail._sig=mailListSignature(); mailRenderMetrics(); mailRender();
+    const label=$("#mail-cache-provenance"); if(label) label.textContent="Live search · newest first";
+  } catch (_) {
+    if (App.account!==account || Mail.activeScope!==scope || Mail.viewGeneration!==generation || Mail.pageRequest!==requestId) return;
+    if(scope) { Mail.all=[]; Mail.folders=[]; Mail.selected=null; renderMailReader(null); mailRender(); }
+    toast("Mail search could not be completed.","err");
+  } finally { if(button.isConnected) button.disabled=false; }
+}
+
+function updateMailLoadMore() {
+  const button = $("#mail-load-more");
+  if (button) button.style.display = Mail.nextCursor && (Mail.cursorStack?.length || 0) < 100 ? "" : "none";
+  const previous = $("#mail-page-prev");
+  if (previous) previous.style.display = Mail.cursorStack?.length ? "" : "none";
+}
+async function loadMoreProviderMail(button, previous = false) {
+  const account = App.account, scope = Mail.activeScope, generation = Mail.viewGeneration;
+  const providerMail = (App.accounts || []).some(a => a.id === account && a.provider === "self_hosted");
+  const cursor = previous ? Mail.cursorStack?.at(-1) : Mail.nextCursor;
+  if (cursor == null || (!previous && !cursor) || (!previous && (Mail.cursorStack?.length || 0) >= 100)) return;
+  const pageRequest = Mail.pageRequest = (Mail.pageRequest || 0) + 1;
+  button.disabled = true;
+  try {
+    const page = Mail.livePage
+      ? await api("/api/v1/items?" + qs({account,service:"mail",live_metadata:"1",limit:50,position:cursor,query_state:Mail.queryState,...(Mail.liveQuery ? {text:Mail.liveQuery} : {}),...(Mail.mailboxId ? {mailbox_id:Mail.mailboxId} : {}),...(scope ? {mail_scope:scope} : {})}))
+      : await api("/api/v1/items?" + qs({ account, service:"mail", limit:50, after:cursor, ...(scope ? {mail_scope:scope} : {}), ...(!scope && providerMail ? {primary_cache_only:"1"} : {}) }));
+    if (App.account !== account || Mail.activeScope !== scope || Mail.viewGeneration !== generation || Mail.pageRequest !== pageRequest) return;
+    if (previous) Mail.cursorStack.pop(); else Mail.cursorStack.push(Mail.pageCursor ?? "");
+    Mail.pageCursor = cursor;
+    Mail.all = Mail.livePage ? projectLiveMail(page.items || [], scope) : (page.items || []).filter(item => item.item_type === "message");
+    Mail.selected = null; renderMailReader(null);
+    Mail.nextCursor = Mail.livePage ? (page.next_position ?? null) : (page.next_cursor || null);
+    Mail.expanded = true;
+    updateMailLoadMore();
+    if (Mail.livePage) { const label = $("#mail-cache-provenance"); if (label) label.textContent = Mail.liveQuery ? "Live search · newest first" : "Live mailbox · newest first"; }
+    else updateMailCacheProvenance(page);
+    if (!providerMail) App.counts.mail = Mail.all.length; updateNavCounts(); fillSubnavCounts("mail", Mail.all);
+    Mail._sig = mailListSignature(); mailRenderMetrics(); mailRender();
+  } catch (error) {
+    if (scope && App.account === account && Mail.activeScope === scope && Mail.viewGeneration === generation && Mail.pageRequest === pageRequest) {
+      Mail.all = []; Mail.folders = []; Mail.selected = null; renderMailReader(null); mailRender();
+    }
+    if (App.account === account && Mail.activeScope === scope && Mail.viewGeneration === generation && Mail.pageRequest === pageRequest) {
+      if (error?.code === "stale_page") { Mail.nextCursor = null; Mail.cursorStack = []; updateMailLoadMore(); }
+      toast(error?.code === "stale_page" ? "Mailbox changed. Reopen Mail to load a fresh first page." : "More messages could not be loaded.", "err");
+    }
+  }
+  finally { if (button.isConnected) button.disabled = false; }
+}
+
+function updateMailCacheProvenance(data) {
+  const label = $("#mail-cache-provenance");
+  if (!label) return;
+  let base = data.provenance === "local" ? (data.observed_at ? `Cached index · last local update ${new Date(Number(data.observed_at) * 1000).toLocaleString()} · live status unknown` : "Cached index · update time and live status unknown") : "";
+  if (data.shared_access_status === "unknown") base += (base ? " · " : "") + "Shared mail access could not be verified";
+  label.textContent = base + (base && (data.next_cursor || Mail.nextCursor) ? " · more cached messages available" : "") + (base && Mail.expanded ? " · pages may reflect different cache updates; refresh to reload" : "");
 }
 
 // Signature of the currently *visible* mailbox (ids + read state, honouring the active
 // filter/search/sort) — lets a background refresh detect whether anything on screen
 // actually changed before repainting (#0A).
 function mailListSignature() {
-  return mailFiltered().map(it => it.remote_id + (((it.preview || {}).isRead) ? "1" : "0")).join(",");
+  return JSON.stringify(mailFiltered().map(it => [it.remote_id, it.name, it.remote_mtime, it.mailbox_ids, it.preview]));
 }
 // Soft background refresh for the mailbox (#0A): re-fetch, update counts, and repaint the
 // list ONLY when the visible set changed — preserving filter/search/sort/scroll/selection
 // so a sync tick never reloads the screen.
 async function mailLiveUpdate() {
+  if (!Mail.activeScope && (Mail.livePage || Mail.pageCursor)) return;
+  const account = App.account, scope = Mail.activeScope, generation = Mail.viewGeneration, pageRequest = Mail.pageRequest, pageCursor = Mail.pageCursor;
   let d;
-  try { d = await api("/api/v1/items?" + qs({ account: App.account, service: "mail", limit: 1000 })); }
-  catch (_) { return; }
-  Mail.all = (d.items || []).filter(it => it.item_type === "message");
-  App.counts.mail = Mail.all.length; updateNavCounts(); fillSubnavCounts("mail", Mail.all);
+  const providerMail = (App.accounts || []).some(a => a.id === account && a.provider === "self_hosted");
+  try { d = await api("/api/v1/items?" + qs(Mail.livePage ? {account,service:"mail",live_metadata:"1",limit:50,mail_scope:scope,position:pageCursor,...(Mail.liveQuery ? {text:Mail.liveQuery} : {}),...(Mail.mailboxId ? {mailbox_id:Mail.mailboxId} : {}),...(pageCursor ? {query_state:Mail.queryState} : {})} : { account, service: "mail", limit: providerMail ? 50 : 1000, ...(scope ? {mail_scope:scope} : {}), ...(!scope && providerMail ? {primary_cache_only:"1"} : {}), ...(!providerMail ? {metadata_only:"1"} : {}), ...(pageCursor ? {after:pageCursor} : {}) })); }
+  catch (_) { if (App.account === account && Mail.activeScope === scope && Mail.viewGeneration === generation && Mail.pageCursor === pageCursor && Mail.pageRequest === pageRequest && scope) { Mail.all = []; Mail.folders = []; Mail.selected = null; renderMailReader(null); mailRender(); } return; }
+  if (App.account !== account || Mail.activeScope !== scope || Mail.viewGeneration !== generation || Mail.pageCursor !== pageCursor || Mail.pageRequest !== pageRequest) return;
+  if (Mail.livePage && !pageCursor) Mail.queryState = d.query_state;
+  Mail.expanded = false;
+  Mail.nextCursor = Mail.livePage ? (d.next_position ?? null) : (d.next_cursor || null);
+  if (!Mail.livePage) updateMailCacheProvenance(d);
+  updateMailLoadMore();
+  Mail.all = Mail.livePage ? projectLiveMail(d.items || [], scope) : (d.items || []).filter(it => it.item_type === "message");
+  if (!providerMail) App.counts.mail = Mail.all.length; updateNavCounts(); fillSubnavCounts("mail", Mail.all);
   const sig = mailListSignature();
   if (sig === Mail._sig) { mailRenderMetrics(); return; } // nothing on screen changed → no repaint
   Mail._sig = sig;
   const list = $("#mail-list"), view = $("#view");
   const lsc = list ? list.scrollTop : 0, vsc = view ? view.scrollTop : 0;
   mailRenderMetrics(); mailRender();
+  if (Mail.selected) {
+    const current = Mail.all.find(item => item.remote_id === Mail.selected.remote_id);
+    if (!current) { Mail.selected = null; renderMailReader(null); }
+    else if (JSON.stringify([current.name, current.preview, current.mailbox_ids]) !== JSON.stringify([Mail.selected.name, Mail.selected.preview, Mail.selected.mailbox_ids])) {
+      Mail.selected = current;
+      renderMailReader(current);
+    }
+  }
   const l2 = $("#mail-list"); if (l2) l2.scrollTop = lsc;
   const v2 = $("#view"); if (v2) v2.scrollTop = vsc;
 }
@@ -1781,10 +2225,12 @@ function fillMetrics(row, cards) {
 }
 function mailRenderMetrics() {
   const withAtt = Mail.all.filter(it => (it.preview || {}).attachments > 0).length;
+  const unknownAtt = Mail.all.filter(it => (it.preview || {}).attachment_presence_unknown).length;
   const restore = Mail.all.filter(it => it.has_body).length;
+  const providerMail = (App.accounts || []).some(a => a.id === App.account && a.provider === "self_hosted");
   fillMetrics($("#mail-metrics-row"), [
-    { icon: "inbox", value: Mail.all.length, label: "Total messages", sub: "in this mailbox" },
-    { icon: "paperclip", value: withAtt, label: "With attachments", sub: `${withAtt} of ${Mail.all.length}` },
+    { icon: "inbox", value: Mail.all.length, label: providerMail ? "Messages on this page" : "Total messages", sub: "in this mailbox" },
+    { icon: "paperclip", value: withAtt, label: "With attachments", sub: unknownAtt ? `${unknownAtt} unknown` : `${withAtt} of ${Mail.all.length}` },
     { icon: "rotate-ccw", value: restore, label: (MOBILE ? "Has content" : "Restore-ready"), sub: `${restore} with full body`, tone: "ok" },
     integrityMetric(Mail.all),
     lastActivityMetric(Mail.runs),
@@ -1793,18 +2239,18 @@ function mailRenderMetrics() {
 function mailFiltered() {
   let rows = Mail.all;
   const f = svcFilter("mail");
-  if (f === "attach") rows = rows.filter(it => (it.preview || {}).attachments > 0);
+  if (f === "attach") rows = rows.filter(it => (it.preview || {}).attachments > 0 || (it.preview || {}).attachment_presence_unknown);
   else if (f === "restore") rows = rows.filter(it => it.has_body);
   else if (STATE_KEYS.has(f)) rows = rows.filter(it => stateKey(it) === f);
   else if (f === "unread") rows = rows.filter(it => (it.preview || {}).isRead === false);
   else if (f === "flagged") rows = rows.filter(it => (it.preview || {}).flag === "flagged");
   else if (f === "high") rows = rows.filter(it => (it.preview || {}).importance === "high");
-  else if (f.startsWith("folder:")) { const fid = f.slice(7); rows = rows.filter(it => it.parent_remote_id === fid); }
+  else if (f.startsWith("folder:")) { const fid = f.slice(7); rows = rows.filter(it => (it.mailbox_ids || [it.parent_remote_id]).includes(fid)); }
   else if (f !== "all") rows = rows.filter(it => ((it.preview || {}).categories || []).includes(f));
   if (Mail.q) rows = rows.filter(it => { const p = it.preview || {}; return ((p.subject || it.name || "") + " " + (p.from || "") + " " + (p.snippet || "")).toLowerCase().includes(Mail.q); });
   const dir = Mail.sort === "oldest" ? 1 : -1;
   if (Mail.sort === "sender") rows = rows.slice().sort((a, b) => addrLabel((a.preview || {}).from).localeCompare(addrLabel((b.preview || {}).from)));
-  else rows = rows.slice().sort((a, b) => dir * (mailDate(a) - mailDate(b)));
+  else if (!(Mail.livePage && Mail.sort === "newest")) rows = rows.slice().sort((a, b) => dir * (mailDate(a) - mailDate(b)));
   return rows;
 }
 function mailRender() {
@@ -1812,13 +2258,18 @@ function mailRender() {
   const rows = mailFiltered();
   const withAtt = Mail.all.filter(it => (it.preview || {}).attachments > 0).length;
   const archived = Mail.all.filter(it => it.has_body).length;
-  const m = $("#mail-metrics"); if (m) m.textContent = `${Mail.all.length} messages · ${archived} with content · ${withAtt} with attachments`;
+  const selfHosted = (App.accounts || []).some(a => a.id === App.account && a.provider === "self_hosted");
+  const m = $("#mail-metrics"); if (m) m.textContent = `${Mail.all.length} ${selfHosted ? "cached messages loaded" : "messages"} · ${archived} ${selfHosted ? "bodies archived" : "with content"} · ${withAtt} with attachments`;
   clear(list);
   // Bump the render generation on every (re-)render so any in-flight progressive
   // batch from a previous render — including one interrupted by an early return
   // below — stops before touching this freshly cleared list.
   const gen = (Mail._renderGen = (Mail._renderGen || 0) + 1);
-  if (!Mail.all.length) { list.append(el("div", { class: "empty" }, emptyArt("empty-mail"), el("h3", { text: "No mail archived" }), el("p", { text: "Run a backup to populate your mailbox." }))); return; }
+  if (!Mail.all.length) {
+    const selfHosted = (App.accounts || []).some(a => a.id === App.account && a.provider === "self_hosted");
+    list.append(el("div", { class: "empty" }, emptyArt("empty-mail"), el("h3", { text: selfHosted ? "No cached messages" : "No mail archived" }), el("p", { text: selfHosted ? "Connect the account and synchronize to load messages." : "Run a backup to populate your mailbox." })));
+    return;
+  }
   if (!rows.length) { list.append(el("div", { class: "empty" }, icon("search", "icon-lg"), el("h3", { text: "No matches" }), el("p", { text: "Adjust the filter or search." }))); return; }
   // Conversation grouping (#563): collapse messages sharing a conversationId into
   // one row (the newest, since rows are already sorted) carrying a thread count of
@@ -1855,7 +2306,9 @@ function mailRender() {
       paint(i, i + BATCH); i += BATCH;
       if (i < display.length) requestAnimationFrame(step);
     };
-    requestAnimationFrame(step);
+    // Give the initial viewport a rendering opportunity before constructing
+    // offscreen rows. The generation guard in step also covers this delay.
+    requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(step, 0)));
   }
 }
 function mailRow(it, threadCount = 1) {
@@ -1865,11 +2318,13 @@ function mailRow(it, threadCount = 1) {
   const badges = el("div", { class: "mi-badges" });
   if (threadCount > 1) badges.append(el("span", { class: "mi-chip mi-thread", title: threadCount + " messages in this conversation" }, icon("mail-open", "icon-sm"), String(threadCount)));
   if (p.attachments > 0) badges.append(el("span", { class: "mi-chip", title: p.attachments + " attachment(s)" }, icon("paperclip", "icon-sm"), String(p.attachments)));
+  else if (p.attachment_presence_unknown) badges.append(el("span", { class: "mi-chip", title: "Attachment presence unknown" }, icon("paperclip", "icon-sm"), "?"));
   categoryChips(it).forEach(c => badges.append(c));
-  if (CAP.mailwrite) {
+  const ownProvider = (App.accounts || []).some(a => a.id === App.account && a.provider === "self_hosted");
+  if (!it.shared && CAP.mailwrite && (!ownProvider || CAP.agent)) {
     const flagged = p.flag === "flagged";
     badges.append(el("button", { class: "mi-flag" + (flagged ? " on" : ""), title: flagged ? "Clear flag" : "Flag",
-      onclick: (e) => { e.stopPropagation(); mailSetFlag(it, flagged ? "notFlagged" : "flagged"); } }, icon("flag", "icon-sm")));
+      onclick: (e) => { e.stopPropagation(); if (ownProvider && CAP.agent) void prepareProviderMailAction(App.account, it.remote_id, { kind:"set_flag", flagged:!flagged }, e.currentTarget); else if (!ownProvider) mailSetFlag(it, flagged ? "notFlagged" : "flagged"); } }, icon("flag", "icon-sm")));
   }
   return el("button", { class: "mail-item" + (sel ? " active" : "") + (p.isRead === false ? " unread" : ""), dataset: { id: it.remote_id }, onclick: () => mailSelect(it) },
     el("span", { class: "avatar mail-av", style: `--c:${mailAvatarColor(it)}`, text: initials(from || subject) }),
@@ -1894,9 +2349,41 @@ function mailBack() { Mail.selected = null; $("#mail-layout")?.classList.remove(
 // subject, bodyHtml } pre-fills it (reply/forward, B4). The body is a
 // contenteditable the user authors and which is sent to Graph — it is never
 // rendered as untrusted, so editing HTML here carries no XSS risk.
+async function providerComposerIdentities(account) {
+  const response = await postJson("/api/v1/agent/composer/identities", CAP.agent, { request_id: crypto.randomUUID(), account }, PROVIDER_NATIVE_TIMEOUT_MS);
+  if (!response || !Array.isArray(response.identities) || !response.identities.length) throw new Error("Sending identity unavailable");
+  const identities = response.identities.filter(identity => identity && typeof identity.id === "string" && identity.id && typeof identity.email === "string" && identity.email);
+  if (!identities.length) throw new Error("Sending identity unavailable");
+  return identities;
+}
+function chooseProviderIdentity(identities) {
+  if (identities.length === 1) return Promise.resolve(identities[0].id);
+  return new Promise(resolve => {
+    const select = el("select", { class: "input" }, el("option", { value:"", text:"Choose sender", selected:"selected", disabled:"disabled" }));
+    let observer;
+    const finish = value => { if (observer) observer.disconnect(); closeSheet(); resolve(value); };
+    identities.forEach(identity => select.append(el("option", { value: identity.id, text: identity.name ? `${identity.name} <${identity.email}>` : identity.email })));
+    openSheet("Choose sender", el("div", { class: "compose" }, select,
+      el("button", { class: "btn primary", onclick: () => { if (select.value) finish(select.value); else toast("Choose a sending identity.", "err"); } }, "Continue"),
+      el("button", { class: "btn", onclick: () => finish(null) }, "Cancel")));
+    observer = new MutationObserver(() => { if (!select.isConnected) { observer.disconnect(); resolve(null); } });
+    observer.observe(document.body, { childList: true, subtree: true });
+  });
+}
+
 function openCompose(opts = {}) {
   if (!CAP.mailwrite || !CAP.mutationIntent) return;
   const o = opts || {};
+  const composeAccount = App.account;
+  const ownProvider = (App.accounts || []).some(a => a.id === composeAccount && a.provider === "self_hosted");
+  const identitySel = ownProvider ? el("select", { class: "input", id: "cmp-identity", disabled: "disabled" }, el("option", { value: "", text: "Loading sending identities…" })) : null;
+  if (identitySel && CAP.agent) void providerComposerIdentities(composeAccount).then(identities => {
+    if (App.account !== composeAccount || !identitySel.isConnected) return;
+    clear(identitySel);
+    identitySel.append(el("option", { value:"", text:"Choose sender", selected:"selected", disabled:"disabled" }));
+    identities.forEach(identity => identitySel.append(el("option", { value: identity.id, text: identity.name ? `${identity.name} <${identity.email}>` : identity.email })));
+    identitySel.disabled = identities.length === 0;
+  }).catch(() => { if (identitySel.isConnected) identitySel.replaceChildren(el("option", { value:"", text:"Sending identity unavailable" })); });
   const field = (label, input) => el("label", { class: "cmp-field" }, el("span", { class: "cmp-label", text: label }), input);
   const toIn = el("input", { class: "input", id: "cmp-to", placeholder: "name@example.com, …", value: (o.to || []).join(", ") });
   const ccIn = el("input", { class: "input", id: "cmp-cc", placeholder: "Cc", value: (o.cc || []).join(", ") });
@@ -1911,14 +2398,43 @@ function openCompose(opts = {}) {
     el("option", { value: "high", text: "High importance" }),
     el("option", { value: "low", text: "Low importance" }));
   const rrChk = el("input", { type: "checkbox", id: "cmp-rr" });
-  const content = el("div", { class: "compose" },
+  const confirmedRecords=el("div",{class:"list"});
+  const manageRecords=el("button",{class:"btn ghost sm",type:"button",onclick:async()=>{
+    manageRecords.disabled=true; confirmedRecords.replaceChildren();
+    try {
+      const result=await request("GET","/api/v1/mutation-intent/attachment-status?"+qs({account:composeAccount,list:"confirmed"}),{capToken:CAP.mutationIntent,timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS});
+      if (App.account!==composeAccount) throw new Error("Account changed");
+      const items=result.items || [];
+      confirmedRecords.append(el("p",{class:"dim",text:items.length ? "These confirmed upload records can be forgotten; uploaded files are not deleted. Unknown outcomes are retained." : "No confirmed upload records."}));
+      if (result.unavailable) confirmedRecords.append(el("p",{class:"dim",text:`${result.unavailable} record(s) could not be verified and remain untouched.`}));
+      for (const item of items) {
+        const row=el("div",{class:"row"},el("span",{text:(item.filename || "Attachment")+" · "+fmtSize(item.size || 0)}));
+        const remove=el("button",{class:"btn sm",type:"button",onclick:async()=>{
+          remove.disabled=true;
+          try {
+            await postJson("/api/v1/mutation-intent/cancel",CAP.mutationIntent,{request_id:crypto.randomUUID(),intent_id:item.intent_id,account:composeAccount,release_confirmed:true});
+            for (let i=localStorage.length-1;i>=0;i--) { const key=localStorage.key(i); if (key && key.startsWith("isyncyou-mail-upload:") && localStorage.getItem(key)===item.intent_id) localStorage.removeItem(key); }
+            row.remove();
+          } catch (_) { toast("The confirmed record could not be removed.","err"); remove.disabled=false; }
+        }},"Forget record"); row.append(remove); confirmedRecords.append(row);
+      }
+      if (items.length===100) confirmedRecords.append(el("p",{class:"dim",text:"The first 100 records are shown. Refresh after removing records to see more."}));
+    } catch (_) { toast("Confirmed upload records are unavailable.","err"); }
+    finally { manageRecords.disabled=false; }
+  }},"Manage confirmed upload records");
+  const content = el("div", { class: "compose", "data-account": composeAccount },
+    identitySel ? field("From", identitySel) : null,
     field("To", el("div", { class: "cmp-to-row" }, toIn, ccToggle)),
     ccRow,
     field("Subject", subjIn),
     bodyEl,
+    ownProvider ? field("Attachments", el("input", { type:"file", id:"cmp-files", multiple:"multiple", "aria-label":"Attachments" })) : null,
+    ownProvider && CAP.mutationIntent ? manageRecords : null,
+    ownProvider && CAP.mutationIntent ? confirmedRecords : null,
+    ownProvider ? el("p", { class:"dim", text:"With attachments, the message is saved as a plain-text draft after review; open Drafts to review and send it. Files upload before draft review; a cancelled review may leave unused uploaded blobs." }) : null,
     el("div", { class: "cmp-footer" },
       el("label", { class: "cmp-opt", title: "Importance" }, icon("flag", "icon-sm"), impSel),
-      el("label", { class: "cmp-opt" }, rrChk, el("span", { text: "Read receipt" })),
+      el("label", { class: "cmp-opt" }, rrChk, el("span", { text: "Request read receipt (not guaranteed)" })),
       el("div", { class: "spacer", style: "flex:1" }),
       el("button", { class: "btn ghost", type: "button", onclick: (e) => composeSubmit(e.currentTarget, true) }, icon("archive", "icon-sm"), "Save draft"),
       el("button", { class: "btn primary", type: "button", onclick: (e) => composeSubmit(e.currentTarget, false) }, icon("send", "icon-sm"), "Send")));
@@ -1926,7 +2442,29 @@ function openCompose(opts = {}) {
   setTimeout(() => ((o.to && o.to.length) ? bodyEl : toIn).focus(), 60);
 }
 
+function splitEmails(value) {
+  return String(value || "").split(/[;,]/).map(address => address.trim()).filter(Boolean);
+}
+
+async function prepareExistingProviderDraft(account, draftId, identityId = null) {
+  if (App.account !== account) throw new Error("Account changed");
+  if (!identityId) identityId = await chooseProviderIdentity(await providerComposerIdentities(account));
+  if (!identityId || App.account !== account) throw new Error("Identity selection cancelled");
+  const sessionId = await ensureAgentSession();
+  if (App.account !== account) throw new Error("Account changed");
+  const prepared = await postJson("/api/v1/agent/composer/prepare", CAP.agent, {
+    request_id: crypto.randomUUID(), session_id: sessionId, account, email_id: draftId, identity_id: identityId,
+  }, PROVIDER_NATIVE_TIMEOUT_MS);
+  if (!prepared || !prepared.pending_id || !prepared.token || !prepared.action_hash || !prepared.turn_id) throw new Error("Confirmation unavailable");
+  const record = { ...prepared, status: "pending", cancelled_result: "The message was not submitted. The draft remains saved." };
+  AssistantState.pendingCardsById.set(record.pending_id, record);
+  closeSheet();
+  openSheet("Review message", renderAgentPendingCard(record));
+}
+
 async function composeSubmit(btn, asDraft) {
+  if (btn.closest(".compose")?.dataset.account !== App.account) { toast("The selected account changed. Reopen the composer.", "err"); return; }
+  const ownProvider = (App.accounts || []).some(a => a.id === App.account && a.provider === "self_hosted");
   const to = ($("#cmp-to").value || "").trim();
   const cc = ($("#cmp-cc").value || "").trim();
   const bcc = ($("#cmp-bcc").value || "").trim();
@@ -1934,16 +2472,85 @@ async function composeSubmit(btn, asDraft) {
   const body = $("#cmp-body").innerHTML || "";
   const importance = $("#cmp-importance").value;
   const rr = $("#cmp-rr").checked;
+  const identityId = ownProvider ? ($("#cmp-identity")?.value || "") : "";
+  const files = ownProvider ? Array.from($("#cmp-files")?.files || []) : [];
+  if (files.length) {
+    if (!CAP.agent || !to || !subject || !$("#cmp-body").innerText.trim() || cc || bcc || rr || importance !== "normal") { toast("For attachment drafts enter To, subject and plain text; Cc, Bcc, importance and receipts are not available in this flow.", "err"); return; }
+    if (files.length > 32 || files.some(file => file.size > 64 * 1024 * 1024)) { toast("Choose at most 32 files, each no larger than 64 MiB.", "err"); return; }
+    const account = App.account; const buttons = btn.closest(".compose")?.querySelectorAll("button") || []; buttons.forEach(button => { button.disabled = true; });
+    let uploadStarted = false;
+    try {
+      const sessionId = await ensureAgentSession(); if (App.account !== account) throw new Error("Account changed");
+      const uploadIds = [], uploadKeys = [];
+      for (const file of files) {
+        const contentType = file.type || "application/octet-stream";
+        const digest = await hashMutationSource(await mutationSource(file));
+        const key = `isyncyou-mail-upload:${await sha256Hex(new TextEncoder().encode(JSON.stringify([account,digest,file.name,contentType])))}`;
+        let intentId = localStorage.getItem(key);
+        if (!intentId) {
+          const pendingKeys = Array.from({length:localStorage.length}, (_, i) => localStorage.key(i)).filter(value => value && value.startsWith("isyncyou-mail-upload:"));
+          if (pendingKeys.length >= 256) throw new Error("Upload tracking capacity reached");
+          uploadStarted = true;
+          try { await stageMutation("mail_attachment", { account, filename:file.name, content_type:contentType }, file, created => { localStorage.setItem(key,created.intent_id); intentId = created.intent_id; }, digest); }
+          catch (error) { if (!intentId) throw error; }
+        }
+        if (!intentId || App.account !== account) throw new Error("Upload result unavailable");
+        const status = await request("GET", "/api/v1/mutation-intent/attachment-status?" + qs({ account, intent_id:intentId }), { capToken:CAP.mutationIntent, timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS });
+        if (status && status.status && ["staged", "staged_previous_session"].includes(status.status.state)) {
+          await postJson("/api/v1/mutation-intent/cancel", CAP.mutationIntent, { request_id:crypto.randomUUID(), intent_id:intentId, account });
+          localStorage.removeItem(key); uploadStarted = false; throw new Error("Upload was not dispatched");
+        }
+        if (status && status.status && status.status.state === "not_dispatched") { localStorage.removeItem(key); uploadStarted = false; throw new Error("Upload was not dispatched"); }
+        if (!status || !status.status || status.status.state !== "confirmed" || !status.status.blob_id || status.status.sha256 !== digest || status.status.size !== file.size || status.status.filename !== file.name || status.status.content_type !== contentType) throw new Error("Upload outcome unknown");
+        uploadIds.push(intentId);
+        uploadKeys.push(key);
+      }
+      const pending = await postJson("/api/v1/agent/mail/action/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, email_id:"new", action:{ kind:"new_draft", subject, body:$("#cmp-body").innerText, to:splitEmails(to), upload_ids:uploadIds } }, PROVIDER_NATIVE_TIMEOUT_MS);
+      if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+      const record = { ...pending, status:"pending", uploadKeys, uploadIds, uploadAccount:account, success_result:"Draft created. The message was not sent; open Drafts to review and send it.", cancelled_result:"The draft was not created. Uploaded blobs may remain unused." };
+      AssistantState.pendingCardsById.set(record.pending_id, record); closeSheet(); openSheet("Review attachment draft", renderAgentPendingCard(record));
+    } catch (error) { toast(uploadStarted ? "Upload or draft outcome could not be confirmed. Do not repeat until its status is checked." : error && error.message === "Upload was not dispatched" ? "The incomplete upload was cancelled before dispatch. You can try again." : error && error.message === "Upload tracking capacity reached" ? "Upload tracking is full; existing records must be reconciled before adding files." : "The confirmation session or upload status is unavailable.", "err"); if (!uploadStarted) buttons.forEach(button => { button.disabled = false; }); }
+    return;
+  }
+  if (ownProvider && !identityId && (rr || !asDraft)) { toast("Choose a verified sending identity.", "err"); return; }
   if (!asDraft && !to) { toast("Add at least one recipient", "err"); return; }
+  if (ownProvider && !asDraft) {
+    if (!CAP.agent) { toast("Confirmation is unavailable for this account.", "err"); return; }
+    const sendingAccount = App.account;
+    btn.disabled = true;
+    const composeButtons = btn.closest(".compose")?.querySelectorAll("button") || [];
+    composeButtons.forEach(button => { button.disabled = true; });
+    let draftStarted = false;
+    let draftCreated = false;
+    try {
+      await ensureAgentSession();
+      if (App.account !== sendingAccount) throw new Error("Account changed");
+      const recipients = splitEmails(to), ccRecipients = splitEmails(cc), bccRecipients = splitEmails(bcc);
+      const draftBody = new TextEncoder().encode(body);
+      draftStarted = true;
+      const draft = await stageMutation("mail_body", {
+        account: sendingAccount, operation: "draft", target: "", recipients, cc: ccRecipients, bcc: bccRecipients, subject,
+        importance: importance !== "normal" ? importance : null, read_receipt: rr, identity_id: identityId, all: false,
+      }, draftBody);
+      if (!draft || !draft.draft_id) throw new Error("Draft result unavailable");
+      draftCreated = true;
+      await prepareExistingProviderDraft(sendingAccount, draft.draft_id, identityId);
+    } catch (error) {
+      toast(draftCreated ? "Draft created, but confirmation could not be prepared. Review the draft before trying again." : draftStarted ? "Draft creation could not be confirmed. Check drafts before trying again." : "A confirmation session could not be opened.", "err");
+      if (!draftStarted) composeButtons.forEach(button => { button.disabled = false; });
+    }
+    return;
+  }
   btn.disabled = true;
+  let providerDraftNeedsReview = false;
   try {
     if (asDraft) {
-      await stageMutation("mail_body", {
+      const draft = await stageMutation("mail_body", {
         account: App.account, operation: "draft", target: "",
-        recipients: splitEmails(to), cc: [], bcc: [], subject,
-        importance: null, read_receipt: false, all: false,
+        recipients: splitEmails(to), cc: ownProvider ? splitEmails(cc) : [], bcc: ownProvider ? splitEmails(bcc) : [], subject,
+        importance: ownProvider && importance !== "normal" ? importance : null, read_receipt: ownProvider && rr, identity_id: ownProvider && identityId ? identityId : null, all: false,
       }, new TextEncoder().encode(body));
-      toast("Draft saved");
+      toast(draft && draft.sync_state === "pending" ? "Draft created; local synchronization is pending." : "Draft saved");
     } else {
       await stageMutation("mail_body", {
         account: App.account, operation: "send", target: "",
@@ -1955,9 +2562,13 @@ async function composeSubmit(btn, asDraft) {
     closeSheet();
     if (App.route === "mail") renderMailView($("#view"));
   } catch (e) {
-    toast((asDraft ? "Draft failed: " : "Send failed: ") + e.message, "err");
+    providerDraftNeedsReview = ownProvider && asDraft && !!(e && e.mutationCommitAttempted);
+    toast(providerDraftNeedsReview ? "Draft creation could not be confirmed. Check Drafts before trying again." : (asDraft ? "Draft failed: " : "Send failed: ") + e.message, "err");
+    if (providerDraftNeedsReview) {
+      for (const button of btn.closest(".compose")?.querySelectorAll("button") || []) button.disabled = true;
+    }
   } finally {
-    btn.disabled = false;
+    if (!providerDraftNeedsReview) btn.disabled = false;
   }
 }
 
@@ -1987,7 +2598,7 @@ function openInlineComposer(it, mode) {
       class: "cmp-tb-btn", type: "button", title: "Insert link",
       onmousedown: (e) => { e.preventDefault(); const u = prompt("Link URL:"); if (u) document.execCommand("createLink", false, u); editor.focus(); },
     }, icon("link", "icon-sm")));
-  const q = { account: App.account, service: "mail", id: it.remote_id };
+  const q = { account: App.account, service: "mail", id: it.remote_id, ...(it.shared ? {mail_scope:it.mail_scope} : {}) };
   const head = el("div", { class: "cmp-inline-head" },
     el("span", { class: "cmp-inline-title truncate" }, title + (p.subject ? " · " + p.subject : (it.name ? " · " + it.name : ""))),
     el("div", { style: "flex:1" }),
@@ -2117,9 +2728,62 @@ function openMovePicker(it) {
     rows.length ? el("div", { class: "pick-list" }, rows) : el("p", { class: "dim", text: "No folders found." }));
   openSheet("Move to folder", content);
 }
+async function prepareProviderMailAction(account, emailId, action, button) {
+  if (App.account !== account) return;
+  button.disabled = true;
+  try {
+    const sessionId = await ensureAgentSession();
+    if (App.account !== account) throw new Error("Account changed");
+    const pending = await postJson("/api/v1/agent/mail/action/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, email_id:emailId, action }, PROVIDER_NATIVE_TIMEOUT_MS);
+    if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+    const record = { ...pending, status:"pending", cancelled_result:"The email was not changed." };
+    AssistantState.pendingCardsById.set(record.pending_id, record);
+    openSheet("Review email change", renderAgentPendingCard(record));
+  } catch (_) { toast("The email change could not be prepared. Refresh mail and check permissions.", "err"); }
+  finally { button.disabled = false; }
+}
+function openProviderMailMove(account, it) {
+  const folders = (Mail.folders || []).filter(f => f.remote_id && f.remote_id !== it.parent_remote_id);
+  const rows = folders.map(folder => el("button", { class:"pick-row pick-btn", type:"button", onclick:event => {
+    closeSheet(); void prepareProviderMailAction(account, it.remote_id, { kind:"move", source_mailbox_id:it.parent_remote_id, destination_mailbox_id:folder.remote_id }, event.currentTarget);
+  } }, folder.name || folder.remote_id));
+  openSheet("Move message", el("div", { class:"compose" }, el("p", { class:"dim", text:"The selected mailbox membership is moved. Other memberships remain." }), rows.length ? el("div", { class:"pick-list" }, rows) : el("p", { text:"No destination folders are available." })));
+}
+async function openProviderRelatedDraft(account, it, kind) {
+  if (App.account !== account) return;
+  const to = el("input", { class:"input", "aria-label":"Recipients", placeholder:"Recipients, separated by commas" });
+  const subject = el("input", { class:"input", "aria-label":"Subject", value:(kind === "reply" ? "Re: " : "Fwd: ") + ((it.preview || {}).subject || it.name || "") });
+  const body = el("textarea", { class:"input", rows:"8", "aria-label":"Message", placeholder:"Write your message" });
+  const attachments = el("div", { class:"pick-list" }, el("span", { class:"dim", text:"Loading source attachments…" }));
+  const button = el("button", { class:"btn primary", type:"button", disabled:"disabled", onclick:async () => {
+    const recipients = to.value.split(",").map(value => value.trim()).filter(Boolean);
+    if (App.account !== account || !recipients.length || !subject.value.trim() || !body.value.trim()) { toast("Enter recipients, subject and message.", "err"); return; }
+    button.disabled = true;
+    try {
+      const sessionId = await ensureAgentSession();
+      if (App.account !== account) throw new Error("Account changed");
+      const selected_blob_ids = Array.from(attachments.querySelectorAll("input:checked")).map(input => input.value);
+      const pending = await postJson("/api/v1/agent/mail/action/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, email_id:it.remote_id, action:{ kind, subject:subject.value, body:body.value, to:recipients, selected_blob_ids } }, PROVIDER_NATIVE_TIMEOUT_MS);
+      if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+      const record = { ...pending, status:"pending", success_result:"Draft created. The message was not sent; open Drafts to review and send it.", cancelled_result:"The draft was not created." };
+      AssistantState.pendingCardsById.set(record.pending_id, record);
+      closeSheet(); openSheet("Review draft", renderAgentPendingCard(record));
+    } catch (_) { toast("The draft could not be prepared. Refresh the source message and check the input.", "err"); button.disabled = false; }
+  } }, "Review draft");
+  openSheet(kind === "reply" ? "Reply" : "Forward", el("div", { class:"compose" }, el("p", { class:"dim", text:"This creates a draft. Sending requires a separate review." }), to, subject, body, attachments, button));
+  try {
+    const result = await request("GET", "/api/v1/attachment?" + qs({ account, service:"mail", id:it.remote_id }), { timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS });
+    if (App.account !== account || !attachments.isConnected) return;
+    clear(attachments);
+    for (const part of result.attachments || []) if (part.blob_id) attachments.append(el("label", { class:"pick-row" }, el("input", { type:"checkbox", value:part.blob_id }), `${part.filename || "Attachment"} · ${fmtSize(part.size)}`));
+    if (!attachments.childNodes.length) attachments.append(el("span", { class:"dim", text:"No source attachments." }));
+    button.disabled = false;
+  } catch (_) { if (attachments.isConnected) { clear(attachments); attachments.append(el("span", { class:"dim", text:"Source attachments unavailable; refresh before preparing a draft." })); button.disabled = true; } }
+}
 // restrained archive-vault illustration for the empty reading pane (trusted in-code SVG)
 const VAULT_SVG = '<svg viewBox="0 0 260 180" xmlns="http://www.w3.org/2000/svg"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="40" y="34" width="120" height="84" rx="10" opacity="0.35" transform="rotate(-7 100 76)"/><rect x="64" y="44" width="120" height="84" rx="10" opacity="0.6"/><path d="M64 60h120" opacity="0.6"/><circle cx="200" cy="120" r="38" fill="color-mix(in oklab, var(--accent) 10%, transparent)"/><circle cx="200" cy="120" r="38"/><circle cx="200" cy="120" r="14"/><path d="M200 92v10M200 138v10M172 120h10M218 120h10"/></g><path d="M191 119l6 6 12-13" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 function renderMailReader(it, remoteImages = false) {
+  const selfHosted = (App.accounts || []).some(a => a.id === App.account && a.provider === "self_hosted");
   const box = $("#mail-reader"); if (!box) return; clear(box);
   if (!it) {
     const archived = Mail.all.filter(x => x.has_body).length;
@@ -2128,7 +2792,7 @@ function renderMailReader(it, remoteImages = false) {
     box.append(el("div", { class: "mail-empty" },
       el("div", { class: "vault-art", html: VAULT_SVG }),
       el("h3", { text: "Select a message to inspect it" }),
-      el("p", { class: "dim", text: "Read-only Microsoft 365 mail archive. Choose a message to read its sanitized body and metadata." }),
+      el("p", { class: "dim", text: selfHosted ? "Choose a cached message to read its live provider body and metadata." : "Read-only Microsoft 365 mail archive. Choose a message to read its sanitized body and metadata." }),
       el("div", { class: "mail-empty-metrics" },
         metricCard("download", archived, "bodies archived"),
         metricCard("paperclip", withAtt, "with attachments"),
@@ -2143,7 +2807,26 @@ function renderMailReader(it, remoteImages = false) {
   const q = { account: App.account, service: "mail", id: it.remote_id };
   const viewQ = remoteImages ? { ...q, external: "1" } : q;
   const actions = el("div", { class: "mr-actions" });
-  if (CAP.mailwrite) {
+  if (!it.shared && CAP.agent && p.isDraft && (App.accounts || []).some(a => a.id === App.account && a.provider === "self_hosted")) {
+    actions.append(el("button", { class: "btn primary sm", onclick: async e => {
+      const button = e.currentTarget;
+      button.disabled = true;
+      try { await prepareExistingProviderDraft(App.account, it.remote_id); }
+      catch (_) { toast("Draft confirmation could not be prepared. Check the draft and account status.", "err"); button.disabled = false; }
+    } }, "Review and send"));
+  }
+  if (CAP.agent && selfHosted && !it.shared) {
+    const account = App.account, flagged = p.flag === "flagged";
+    actions.append(el("button",{class:"btn sm",type:"button",onclick:event=>prepareSingleCapture(account,"mail","",it.remote_id,event.currentTarget)},"Back up message"));
+    actions.append(el("button",{class:"btn sm",type:"button",onclick:()=>openSingleCaptureStatus(account)},"Backup status"));
+    actions.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderRelatedDraft(account, it, "reply") }, "Reply"));
+    actions.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderRelatedDraft(account, it, "forward") }, "Forward"));
+    actions.append(el("button", { class:"btn ghost sm", type:"button", onclick:event => prepareProviderMailAction(account, it.remote_id, { kind:"set_read", is_read:p.isRead === false }, event.currentTarget) }, p.isRead === false ? "Mark read" : "Mark unread"));
+    actions.append(el("button", { class:"btn ghost sm", type:"button", onclick:event => prepareProviderMailAction(account, it.remote_id, { kind:"set_flag", flagged:!flagged }, event.currentTarget) }, flagged ? "Remove flag" : "Flag"));
+    if (it.parent_remote_id) actions.append(el("button", { class:"btn ghost sm", type:"button", onclick:() => openProviderMailMove(account, it) }, "Move"));
+    actions.append(el("button", { class:"btn ghost sm danger", type:"button", onclick:event => prepareProviderMailAction(account, it.remote_id, { kind:"trash" }, event.currentTarget) }, "Move to Trash"));
+  }
+  if (CAP.mailwrite && !selfHosted) {
     actions.append(
       el("button", { class: "btn primary sm", title: "Reply", onclick: () => openInlineComposer(it, "reply") }, icon("corner-up-left", "icon-sm"), "Reply"),
       el("button", { class: "btn ghost sm icon-only", title: "Reply all", onclick: () => openInlineComposer(it, "replyAll") }, icon("users", "icon-sm")),
@@ -2153,8 +2836,8 @@ function renderMailReader(it, remoteImages = false) {
   if (it.has_body) actions.append(remoteImages
     ? el("button", { class: "btn ghost sm", title: "Block external content again (privacy)", onclick: () => renderMailReader(it, false) }, icon("shield", "icon-sm"), "Hide external content")
     : el("button", { class: "btn ghost sm", title: "Load external content — images & web fonts (may notify the sender you opened it)", onclick: () => renderMailReader(it, true) }, icon("globe", "icon-sm"), "Load external content"));
-  actions.append(el("a", { class: "btn ghost sm", href: `/api/v1/view?${qs(q)}`, target: "_blank", rel: "noopener", title: "Open the archived copy in a new tab" }, icon("external-link", "icon-sm")));
-  if (CAP.mailwrite) {
+  actions.append(el("a", { class: "btn ghost sm", href: `/api/v1/view?${qs(q)}`, target: "_blank", rel: "noopener", title: selfHosted ? "Open the provider message in a new tab" : "Open the archived copy in a new tab" }, icon("external-link", "icon-sm")));
+  if (CAP.mailwrite && !selfHosted) {
     const read = (it.preview || {}).isRead !== false;
     const flagged = (it.preview || {}).flag === "flagged";
     actions.append(
@@ -2165,13 +2848,13 @@ function renderMailReader(it, remoteImages = false) {
       el("button", { class: "btn ghost sm icon-only danger", title: "Delete (to Deleted Items)", onclick: () => mailDelete(it) }, icon("trash-2", "icon-sm")),
     );
   }
-  if (CAP.restore) actions.append(el("button", { class: "btn sm", title: "Restore to cloud", onclick: (e) => doRestore(it, e.currentTarget) }, icon("rotate-ccw", "icon-sm"), "Restore"));
+  if (CAP.restore && !it.shared) actions.append(el("button", { class: "btn sm", title: "Restore to cloud", onclick: (e) => doRestore(it, e.currentTarget) }, icon("rotate-ccw", "icon-sm"), "Restore"));
   box.append(
     el("header", { class: "mail-reader-head" },
       el("button", { class: "mail-back btn ghost sm", title: "Back", onclick: mailBack }, icon("chevron-left", "icon-sm")),
       el("div", { class: "grow", style: "min-width:0" },
         el("div", { class: "mr-tags" }, categoryChips(it),
-          p.attachments > 0 ? el("span", { class: "mi-chip" }, icon("paperclip", "icon-sm"), p.attachments + (p.attachments === 1 ? " attachment" : " attachments")) : null,
+          p.attachments > 0 ? el("span", { class: "mi-chip" }, icon("paperclip", "icon-sm"), p.attachment_count_unknown ? "Attachments" : p.attachments + (p.attachments === 1 ? " attachment" : " attachments")) : null,
           (p.importance === "high" || p.importance === "low") ? el("span", { class: "mi-chip imp-" + p.importance, title: "Importance: " + p.importance }, icon("flag", "icon-sm"), p.importance === "high" ? "High" : "Low") : null,
           p.flag === "flagged" ? el("span", { class: "mi-chip flag-on", title: "Flagged for follow-up" }, icon("flag", "icon-sm"), "Flagged") : null,
           p.isRead === false ? el("span", { class: "mi-chip unread-chip", title: "Unread" }, "Unread") : null,
@@ -2238,7 +2921,47 @@ function renderMailReader(it, remoteImages = false) {
     [120, 400, 1000, 2500].forEach(t => setTimeout(fit, t));   // fallback for late reflows
   });
   const atts = p.attachment_list || [];
-  if (atts.length) {
+  if (selfHosted) {
+    const account = App.account, messageId = it.remote_id;
+    const attachments = el("div", { class:"mr-attachments" }, el("span", { class:"dim", text:"Loading attachments…" }));
+    box.append(attachments);
+    void request("GET", "/api/v1/attachment?" + qs({ account, service:"mail", id:messageId, ...(it.shared ? {mail_scope:it.mail_scope} : {}) }), { timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS }).then(async result => {
+      if (App.account !== account || !attachments.isConnected) return;
+      let scopedDownload = false;
+      if (BRIDGE && it.shared) {
+        try { scopedDownload = (await nativeCall("bridgeCapabilities", {}, NATIVE_TIMEOUT_MS))?.scoped_attachment_download === true; } catch (_) { scopedDownload = false; }
+        if (App.account !== account || !attachments.isConnected) return;
+      }
+      clear(attachments);
+      const entries = Array.isArray(result.attachments) ? result.attachments : [];
+      if (!entries.length) { attachments.remove(); return; }
+      entries.forEach(attachment => {
+        if (!attachment || typeof attachment.blob_id !== "string" || !attachment.blob_id) return;
+        const tooLarge = Number(attachment.size) > 64 * 1024 * 1024;
+        if (tooLarge) { attachments.append(el("span", { class:"dim", text:`${attachment.filename || "attachment"} · exceeds the 64 MiB download limit` })); return; }
+        const children = [icon("paperclip", "icon-sm"), el("span", { class:"truncate", text:attachment.filename || "attachment" }), el("span", { class:"dim mr-att-size", text:fmtSize(attachment.size) })];
+        if (BRIDGE && it.shared && !scopedDownload) {
+          attachments.append(el("span", {class:"dim", text:`${attachment.filename || "Attachment"} · shared attachment download unavailable on this device`}));
+        } else if (BRIDGE) {
+          attachments.append(el("button", { class:"mr-att", type:"button", onclick:async event => {
+            const button = event.currentTarget; button.disabled = true;
+            try {
+              const result = await nativeCall("downloadProviderAttachment", { account, id:messageId, blob_id:attachment.blob_id, filename:attachment.filename || "attachment", ...(it.shared ? {mail_scope:it.mail_scope} : {}) }, PROVIDER_NATIVE_TIMEOUT_MS);
+              if (!result || result.opened !== true) throw new Error("Download picker unavailable");
+              toast("Choose where to save the attachment; Android will report completion.");
+              button.disabled = false;
+            } catch (error) {
+              toast(error.message === "Bridge timeout" ? "Download outcome is unknown. Check the selected destination before retrying." : "Attachment download could not be opened.", "err");
+              if (error.message !== "Bridge timeout") button.disabled = false;
+            }
+          } }, ...children));
+        } else {
+          attachments.append(el("a", { class:"mr-att", href:`/api/v1/attachment?${qs({account, service:"mail", id:messageId, blob_id:attachment.blob_id, ...(it.shared ? {mail_scope:it.mail_scope} : {})})}`, download:attachment.filename || "attachment", rel:"noopener" }, ...children));
+        }
+      });
+    }).catch(() => { if (attachments.isConnected) { clear(attachments); attachments.append(el("span", { class:"dim", text:"Attachments are currently unavailable." })); } });
+  }
+  if (atts.length && !selfHosted) {
     box.append(el("div", { class: "mr-attachments" },
       atts.map(a => el("a", {
         class: "mr-att", target: "_blank", rel: "noopener",
@@ -2249,7 +2972,7 @@ function renderMailReader(it, remoteImages = false) {
         el("span", { class: "truncate", text: a.filename || "attachment" }),
         el("span", { class: "dim mr-att-size", text: fmtSize(a.size) })))));
   }
-  if (it.has_body) {
+  if (it.has_body || selfHosted) {
     box.append(el("div", { class: "mail-frame-scroll" }, frame));
   } else {
     // No archived body (live-only on the mobile cache, or not downloaded yet):
@@ -3106,7 +3829,535 @@ const startOfDay = (d) => { const x = new Date(d); x.setHours(0, 0, 0, 0); retur
 function startOfWeek(d) { const x = startOfDay(d); const dow = (x.getDay() + 6) % 7; x.setDate(x.getDate() - dow); return x; } // Monday
 const hhmm = (d) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
 
+function captureOperations(account) {
+  try { const value=JSON.parse(localStorage.getItem("capture-operations:"+account) || "[]"); return Array.isArray(value) ? value.filter(x => typeof x==="string").slice(0,256) : []; } catch (_) { return []; }
+}
+async function prepareSingleCapture(account,service,collection,href,button) {
+  if (App.account!==account) return;
+  button.disabled=true;
+  try {
+    const session_id=await ensureAgentSession();
+    if (App.account!==account) throw new Error("account changed");
+    const operations=captureOperations(account); if (operations.length>=256) throw new Error("capture status list full");
+    const pending=await postJson("/api/v1/agent/recovery/capture/prepare",CAP.agent,{request_id:crypto.randomUUID(),session_id,account,service,collection,href},PROVIDER_NATIVE_TIMEOUT_MS);
+    if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.operation_id) throw new Error("confirmation unavailable");
+    operations.push(pending.operation_id); localStorage.setItem("capture-operations:"+account,JSON.stringify(operations));
+    const record={...pending,status:"pending",capture_operation:true,success_result:"Capture requested. Off-node protection is not confirmed until its status says protected.",cancelled_result:"Capture was not requested."};
+    AssistantState.pendingCardsById.set(record.pending_id,record);
+    openSheet("Review fresh backup capture",renderAgentPendingCard(record));
+  } catch (_) {toast("Capture could not be prepared. Check the source and account.","err");}
+  finally {button.disabled=false;}
+}
+function openSingleCaptureStatus(account) {
+  const rows=el("div",{class:"pick-list"});
+  for (const operation_id of captureOperations(account)) {
+    const status=el("span",{class:"dim",text:"Not checked"});
+    rows.append(el("div",{class:"pick-row"},el("span",{class:"grow",text:operation_id}),status,el("button",{class:"btn sm",type:"button",onclick:async event=>{
+      event.currentTarget.disabled=true;
+      try {const session_id=await ensureAgentSession();if(App.account!==account) throw new Error("account changed");const result=await request("GET","/api/v1/agent/recovery/capture/status?"+qs({account,session_id,operation_id}),{capToken:CAP.agent,timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS});const labels={queued:"Queued",capturing:"Capturing",captured_locally:"Captured locally",awaiting_pbs:"Awaiting off-node backup",protected_off_node:"Protected off-node",failed:"Capture failed; the selected version was unavailable or changed",unknown:"Outcome unknown; do not repeat",expired:"Expired before capture"};status.textContent=labels[result.state] || "Status unavailable";}
+      catch (_) {status.textContent="Status unavailable; no retry was sent";}
+      finally {event.currentTarget.disabled=false;}
+    }},"Check")));
+  }
+  openSheet("Backup capture status",rows.childElementCount ? rows : el("p",{text:"No locally recorded capture requests."}));
+}
+function openProviderRecovery(account, collection, domain = "calendar") {
+  if (App.account !== account) return;
+  const list = el("div", { class:"list" });
+  const status = el("p", { class:"dim", text:"Loading the recovery catalog…" });
+  const choices = [];
+  const recoveryServices = domain === "contacts" ? ["contacts"] : domain === "mail" ? ["mail"] : ["calendar", "todo"];
+  // Existing recovery sheet offers status for independently approved capture requests.
+  const nextPages = Object.fromEntries(recoveryServices.map(service => [service, 0]));
+  const more = el("button",{class:"btn sm",type:"button",text:"Load more",style:"display:none",onclick:()=>void load()});
+  const saved = el("div", { class:"list" });
+  const savedStatus = el("p", {class:"dim",text:"Loading saved recovery requests…"});
+  let savedCursor="";
+  const savedMore=el("button",{class:"btn sm",type:"button",text:"Load more requests",style:"display:none",onclick:()=>void loadSaved()});
+  const appendSaved = item => { const batch_id=item.batch_id; const labels=(item.objects || []).map(object=>object.label || (object.kind === "task" ? "Untitled task" : object.kind === "contact" ? "Untitled contact" : object.kind === "mail" ? "Untitled message" : "Untitled event")); saved.append(el("div", {class:"row"}, el("span",{text:(labels.join(", ") || "Recovery request")+" · "+batch_id}), el("button", { class:"btn sm", type:"button", onclick:async event => {
+    const button=event.currentTarget; button.disabled=true;
+    try {
+      const session_id=await ensureAgentSession(); if (App.account!==account) throw new Error("Account changed");
+      const pending=await postJson("/api/v1/agent/recovery/import/prepare",CAP.agent,{request_id:crypto.randomUUID(),session_id,account,batch_id,collection},PROVIDER_NATIVE_TIMEOUT_MS);
+      if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+      const record={...pending,status:"pending",success_result:"Recovered copies created; synchronization may still be pending.",cancelled_result:"No recovered copies were imported."};
+      AssistantState.pendingCardsById.set(record.pending_id,record); closeSheet(); openSheet("Review recovered copies",renderAgentPendingCard(record));
+    } catch (_) { toast("Recovery results are not ready or this collection is unavailable. Unknown operations are not repeated.","err"); button.disabled=false; }
+  } },"Review import"),el("button",{class:"btn sm",type:"button",onclick:async event=>{
+    const button=event.currentTarget; button.disabled=true;
+    try {
+      const session_id=await ensureAgentSession(); if (App.account!==account) throw new Error("Account changed");
+      const result=await postJson("/api/v1/agent/recovery/reconcile",CAP.agent,{request_id:crypto.randomUUID(),session_id,account,batch_id},PROVIDER_NATIVE_TIMEOUT_MS);
+      if (result.state==="confirmed") toast("Recovered copies are confirmed.","ok");
+      else if (result.state==="retrieval_requested") toast("Retrieval is requested; review the import when results are ready.","ok");
+      else toast("Recovery status: "+String(result.state || "unknown")+". Completed: "+String(result.completed || 0)+".","err");
+    } catch (_) { toast("Recovery status is unavailable. No unapproved import is started.","err"); }
+    finally { button.disabled=false; }
+  }},"Check / continue approved import"))); };
+  const loadSaved=async()=>{
+    savedMore.disabled=true;
+    try {
+      const session_id=await ensureAgentSession(); if (App.account!==account) throw new Error("Account changed");
+      const page=await request("GET","/api/v1/agent/recovery/requests?"+qs({account,session_id,after:savedCursor}),{capToken:CAP.agent,timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS});
+      if (App.account!==account) throw new Error("Account changed");
+      for (const item of page.items || []) { const kinds=(item.objects || []).map(object=>object.kind); if (kinds.length && kinds.every(kind => domain === "contacts" ? kind === "contact" : domain === "mail" ? kind === "mail" : kind === "event" || kind === "task")) appendSaved(item); }
+      savedCursor=page.next || ""; savedMore.style.display=savedCursor ? "" : "none";
+      savedStatus.textContent=saved.childElementCount ? "Saved requests are stored for this account and installation." : savedCursor ? "More saved request records are available to check." : "No saved approved recovery requests.";
+    } catch (_) { savedStatus.textContent="Saved recovery requests are unavailable."; }
+    finally { savedMore.disabled=false; }
+  };
+  const load = async () => {
+    try {
+      const session_id=await ensureAgentSession(); if (App.account!==account) throw new Error("Account changed");
+      more.disabled=true;
+      for (const service of recoveryServices) {
+        let cursor=nextPages[service], pages=0;
+        if (cursor == null) continue;
+        do {
+          const page=await request("GET","/api/v1/agent/recovery/catalog?"+qs({account,session_id,service,after:cursor}),{capToken:CAP.agent,timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS});
+          if (App.account!==account) throw new Error("Account changed");
+          for (const item of page.items || []) {
+            const choice={cursor,generation:item.generation,object:item.object,version:item.version,kind:item.kind};
+            const check=el("input",{type:"checkbox","aria-label":"Select recovered object"});
+            check.addEventListener("change",()=>{ const index=choices.indexOf(choice); if (check.checked && index<0) choices.push(choice); else if (!check.checked && index>=0) choices.splice(index,1); });
+            list.append(el("label",{class:"row"},check,el("span",{text:(item.kind === "task" ? "Task: " : item.kind === "contact" ? "Contact: " : item.kind === "mail" ? "Mail: " : "Event: ")+(item.label || "Untitled historical object")})));
+          }
+          cursor=page.next; pages++;
+        } while (cursor != null && pages<10);
+        nextPages[service]=cursor;
+      }
+      const partial=recoveryServices.some(service => nextPages[service] != null);
+      more.style.display=partial ? "" : "none";
+      status.textContent="Select up to 32 historical objects. "+(domain === "calendar" ? "Related tasks must be selected together. " : "")+"The import is reviewed separately."+(partial ? " More catalog pages are available." : "");
+    } catch (_) { status.textContent="The recovery catalog is unavailable or the device is not enrolled."; }
+    finally { more.disabled=false; }
+  };
+  const prepare=el("button",{class:"btn primary",type:"button",onclick:async()=>{
+    if (!choices.length || choices.length>32 || App.account!==account) { toast("Select 1 to 32 objects in the current account.","err"); return; }
+    prepare.disabled=true;
+    try {
+      const session_id=await ensureAgentSession(); if (App.account!==account) throw new Error("Account changed");
+      const pending=await postJson("/api/v1/agent/recovery/jobs/prepare",CAP.agent,{request_id:crypto.randomUUID(),session_id,account,items:choices},PROVIDER_NATIVE_TIMEOUT_MS);
+      if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id || !pending.batch_id) throw new Error("Confirmation unavailable");
+      const record={...pending,status:"pending",success_result:"Recovery retrieval requested. Reopen recovery to review the import once results are ready.",cancelled_result:"Recovery retrieval was not requested."};
+      AssistantState.pendingCardsById.set(record.pending_id,record); closeSheet(); openSheet("Review recovery request",renderAgentPendingCard(record));
+    } catch (_) { toast("The recovery request could not be prepared.","err"); prepare.disabled=false; }
+  }},"Review retrieval");
+  openSheet(domain === "contacts" ? "Recover contacts" : domain === "mail" ? "Recover mail" : "Recover calendar and tasks",el("div",{class:"compose"},el("p",{class:"dim",text:domain === "mail" ? "The personal Recovered folder will be created if needed. Retrieval and import require separate confirmations. No message is sent." : "A personal Recovered collection will be created if needed. Retrieval and import require separate confirmations. Checking an approved import may continue its remaining objects after confirming an earlier uncertain result."}),status,list,more,prepare,el("h3",{text:"Previous recovery requests"}),savedStatus,saved,savedMore)); void loadSaved(); void load();
+}
+
+function openProviderCalendarText(account, collection, href, uid, recurrenceId, field, current) {
+  if (App.account !== account) return;
+  const input = el("input", { class:"input", maxlength:"4096", "aria-label":field === "SUMMARY" ? "New title" : "New description" });
+  input.value = current;
+  const button = el("button", { class:"btn primary", type:"button", onclick:async () => {
+    if (App.account !== account || !input.value.trim()) { toast("Check the account and value.", "err"); return; }
+    button.disabled = true;
+    try {
+      const sessionId = await ensureAgentSession();
+      if (App.account !== account) throw new Error("Account changed");
+      const pending = await postJson("/api/v1/agent/calendar/text/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, href, uid, recurrence_id:recurrenceId, field, new_value:input.value }, PROVIDER_NATIVE_TIMEOUT_MS);
+      if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+      const record = { ...pending, status:"pending", cancelled_result:"The calendar item was not changed." };
+      AssistantState.pendingCardsById.set(record.pending_id, record);
+      closeSheet(); openSheet("Review calendar change", renderAgentPendingCard(record));
+    } catch (_) { toast("The change could not be prepared. Refresh the calendar and check access.", "err"); button.disabled = false; }
+  } }, "Review change");
+  openSheet(field === "SUMMARY" ? "Change title" : "Change description", el("div", { class:"compose" }, el("p", { class:"dim", text:"Single-line text only. The exact change is shown for review before saving." }), input, button));
+}
+
+function openProviderCalendarTime(account, collection, href, uid) {
+  const mode = el("select", { class:"input", "aria-label":"Time format" }, el("option", { value:"utc", text:"UTC date and time" }), el("option", { value:"date", text:"All-day dates" }), el("option", { value:"zone", text:"Local time with IANA zone" }));
+  const start = el("input", { class:"input", placeholder:"YYYYMMDDTHHMMSSZ", "aria-label":"Start" });
+  const end = el("input", { class:"input", placeholder:"YYYYMMDDTHHMMSSZ", "aria-label":"End" });
+  const tzid = el("input", { class:"input", placeholder:"IANA time zone, e.g. Europe/Vienna", "aria-label":"Time zone", style:"display:none" });
+  mode.addEventListener("change", () => { start.placeholder = end.placeholder = mode.value === "date" ? "YYYYMMDD" : mode.value === "zone" ? "YYYYMMDDTHHMMSS" : "YYYYMMDDTHHMMSSZ"; tzid.style.display = mode.value === "zone" ? "" : "none"; });
+  const button = el("button", { class:"btn primary", type:"button", onclick:async () => {
+    if (App.account !== account) { toast("Account changed.", "err"); return; }
+    button.disabled = true;
+    try {
+      const sessionId = await ensureAgentSession();
+      if (App.account !== account) throw new Error("Account changed");
+      const pending = await postJson("/api/v1/agent/calendar/time/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, href, uid, start:start.value.trim(), end:end.value.trim(), date_only:mode.value === "date", tzid:mode.value === "zone" ? tzid.value.trim() : null }, PROVIDER_NATIVE_TIMEOUT_MS);
+      if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+      const record = { ...pending, status:"pending", cancelled_result:"The event time was not changed." };
+      AssistantState.pendingCardsById.set(record.pending_id, record);
+      closeSheet(); openSheet("Review event time", renderAgentPendingCard(record));
+    } catch (_) { toast("The time change could not be prepared. Check the dates and refresh; events with alarms, recurrence or invitations require an expanded review.", "err"); button.disabled = false; }
+  } }, "Review change");
+  openSheet("Change event time", el("div", { class:"compose" }, el("p", { class:"dim", text:"Enter UTC, local time with IANA zone, or all-day dates. For all-day events the end date is exclusive. Ambiguous or nonexistent local times are rejected." }), mode, start, end, tzid, button));
+}
+
+function openProviderTaskParent(account, collection, href, uid) {
+  const parent = el("input", {class:"input", "aria-label":"Parent task UID", placeholder:"Parent task UID, or leave empty to remove"});
+  const button = el("button", {class:"btn primary", type:"button", onclick:async () => {
+    if (App.account !== account) { toast("Account changed.","err"); return; }
+    button.disabled = true;
+    try {
+      const sessionId = await ensureAgentSession();
+      if (App.account !== account) throw new Error("Account changed");
+      const pending = await postJson("/api/v1/agent/task/parent/prepare",CAP.agent,{request_id:crypto.randomUUID(),session_id:sessionId,account,collection,href,uid,new_parent:parent.value.trim() || null},PROVIDER_NATIVE_TIMEOUT_MS);
+      if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+      const record={...pending,status:"pending",cancelled_result:"The task parent was not changed."};
+      AssistantState.pendingCardsById.set(record.pending_id,record); closeSheet(); openSheet("Review task parent",renderAgentPendingCard(record));
+    } catch (_) { toast("The parent change could not be prepared. Check the UID, collection and task graph.","err"); button.disabled=false; }
+  }},"Review change");
+  openSheet("Change task parent",el("div",{class:"compose"},el("p",{class:"dim",text:"Enter the UID of a task in this collection. Leave empty to remove the current parent. The checked change is shown before confirmation."}),parent,button));
+}
+
+function openProviderTaskAttributes(account, collection, href, uid) {
+  const priority = el("select", { class:"input", "aria-label":"Priority" }, el("option", { value:"", text:"Keep priority" }), ...Array.from({length:10}, (_, n) => el("option", { value:String(n), text:n === 0 ? "Unspecified priority (0)" : `Priority ${n}` })));
+  const due = el("input", { class:"input", "aria-label":"Due date", placeholder:"Optional due: YYYYMMDD or YYYYMMDDTHHMMSSZ" });
+  const start = el("input", { class:"input", "aria-label":"Start time", placeholder:"Optional UTC start: YYYYMMDDTHHMMSSZ" });
+  const mode = el("select", { class:"input", "aria-label":"Due format" }, el("option", { value:"date", text:"Date" }), el("option", { value:"utc", text:"UTC date and time" }));
+  const button = el("button", { class:"btn primary", type:"button", onclick:async () => {
+    if (App.account !== account || (!priority.value && !due.value.trim() && !start.value.trim())) { toast("Choose a change first.", "err"); return; }
+    button.disabled = true;
+    try {
+      const sessionId = await ensureAgentSession();
+      if (App.account !== account) throw new Error("Account changed");
+      const pending = await postJson("/api/v1/agent/task/attributes/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, href, uid, priority:priority.value === "" ? null : Number(priority.value), due:due.value.trim() || null, due_date:mode.value === "date", start:start.value.trim() || null }, PROVIDER_NATIVE_TIMEOUT_MS);
+      if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+      const record = { ...pending, status:"pending", cancelled_result:"The task was not changed." };
+      AssistantState.pendingCardsById.set(record.pending_id, record);
+      closeSheet(); openSheet("Review task change", renderAgentPendingCard(record));
+    } catch (_) { toast("The task change could not be prepared. Check the input and refresh the calendar.", "err"); button.disabled = false; }
+  } }, "Review change");
+  openSheet("Change task details", el("div", { class:"compose" }, el("p", { class:"dim", text:"Leave a field empty to keep its current value. The original and new values are shown before saving." }), priority, start, due, mode, button));
+}
+
+function openProviderOccurrenceTime(account, collection, href, uid, recurrenceId, windowStart, windowEnd) {
+  const start = el("input", { class:"input", "aria-label":"New UTC start", placeholder:"YYYYMMDDTHHMMSSZ" });
+  const end = el("input", { class:"input", "aria-label":"New UTC end", placeholder:"YYYYMMDDTHHMMSSZ" });
+  const button = el("button", { class:"btn primary", type:"button", onclick:async () => {
+    if (App.account !== account) return;
+    button.disabled = true;
+    try {
+      const sessionId = await ensureAgentSession();
+      if (App.account !== account) throw new Error("Account changed");
+      const pending = await postJson("/api/v1/agent/calendar/time/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, href, uid, start:start.value.trim(), end:end.value.trim(), date_only:false, recurrence_id:recurrenceId, window_start:windowStart, window_end:windowEnd }, PROVIDER_NATIVE_TIMEOUT_MS);
+      if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+      const record = { ...pending, status:"pending", cancelled_result:"The occurrence was not changed." };
+      AssistantState.pendingCardsById.set(record.pending_id, record);
+      closeSheet(); openSheet("Review occurrence change", renderAgentPendingCard(record));
+    } catch (_) { toast("This occurrence could not be prepared. Refresh the live month and check the UTC times.", "err"); button.disabled = false; }
+  } }, "Review occurrence");
+  openSheet("Change one occurrence", el("div", { class:"compose" }, el("p", { class:"dim", text:`Only occurrence ${recurrenceId} is changed. Its current and proposed UTC times are shown for review.` }), start, end, button));
+}
+
+async function prepareTaskOccurrence(account, collection, href, uid, recurrenceId, windowStart, windowEnd, button) {
+  if (App.account !== account) return;
+  button.disabled = true;
+  try {
+    const sessionId = await ensureAgentSession();
+    if (App.account !== account) throw new Error("Account changed");
+    const pending = await postJson("/api/v1/agent/task/occurrence/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, href, uid, recurrence_id:recurrenceId, complete:true, window_start:windowStart, window_end:windowEnd }, PROVIDER_NATIVE_TIMEOUT_MS);
+    if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+    const record = { ...pending, status:"pending", cancelled_result:"The task occurrence was not changed." };
+    AssistantState.pendingCardsById.set(record.pending_id, record);
+    openSheet("Review task occurrence", renderAgentPendingCard(record));
+  } catch (_) { toast("The occurrence could not be prepared. Refresh the live month and check access.", "err"); }
+  finally { button.disabled = false; }
+}
+
+function openProviderSeriesRule(account, collection, href, uid, start, end, oldRule) {
+  const rule = el("input", { class:"input", "aria-label":"New recurrence rule", value:oldRule, placeholder:"FREQ=WEEKLY;COUNT=10" });
+  const button = el("button", { class:"btn primary", type:"button", onclick:async () => {
+    if (App.account !== account || !rule.value.trim()) return;
+    button.disabled = true;
+    try {
+      const sessionId = await ensureAgentSession();
+      if (App.account !== account) throw new Error("Account changed");
+      const pending = await postJson("/api/v1/agent/calendar/time/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, href, uid, start, end, date_only:false, rule:rule.value.trim() }, PROVIDER_NATIVE_TIMEOUT_MS);
+      if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+      const record = { ...pending, status:"pending", cancelled_result:"The series was not changed." };
+      AssistantState.pendingCardsById.set(record.pending_id, record);
+      closeSheet(); openSheet("Review entire series", renderAgentPendingCard(record));
+    } catch (_) { toast("The series could not be prepared. A supported bounded rule and a simple UTC series are required.", "err"); button.disabled = false; }
+  } }, "Review entire series");
+  openSheet("Change recurrence", el("div", { class:"compose" }, el("p", { class:"dim", text:"This changes the entire series. Rules must include COUNT from 1 to 100. The full locally computed old and new occurrences are shown before saving." }), rule, button));
+}
+
+function openProviderAlarm(account, collection, href, uid, recurrenceId, index, oldTrigger, oldDescription) {
+  const trigger = el("input", { class:"input", "aria-label":"Reminder trigger", value:oldTrigger || "-PT15M", placeholder:"-PT15M" });
+  const description = el("input", { class:"input", "aria-label":"Reminder text", value:oldDescription || "Reminder" });
+  const delivery = el("p", { class:"dim", role:"status", text:"Reminder planning status is unknown on this device." });
+  void nativeCall("providerReminderStatus", {}, 10000).then(status => {
+    if (!status || !["idle", "planning", "ready", "unavailable", "partial_coverage", "unsupported_alarm_coverage"].includes(status.planning)
+        || !Number.isSafeInteger(status.last_checked_at) || status.last_checked_at < 0
+        || typeof status.notifications_enabled !== "boolean" || typeof status.network_validated !== "boolean") return;
+    const labels = { idle:"No completed reminder plan is reported", planning:"Reminder planning is in progress or was interrupted", ready:"The last reminder plan completed", unavailable:"Reminder planning or delivery is unavailable for this plan", partial_coverage:"Reminder coverage is incomplete; some reminders were not planned", unsupported_alarm_coverage:"Some reminders cannot be planned on this device" };
+    const checked = status.last_checked_at > 0 && Number.isFinite(new Date(status.last_checked_at).getTime())
+      ? ` Last checked: ${new Date(status.last_checked_at).toLocaleString()}.` : " Check time unknown.";
+    const network = status.network_validated ? " Network validated." : " Offline or network not validated.";
+    const permission = status.notifications_enabled ? " Notifications enabled." : " Notification permission is missing or notifications are disabled.";
+    delivery.textContent = `${labels[status.planning]}.${checked}${network}${permission} A completed plan is not proof of delivery.`;
+  }).catch(() => {});
+  const prepare = async (button, remove) => {
+    if (App.account !== account) return;
+    button.disabled = true;
+    try {
+      const sessionId = await ensureAgentSession();
+      if (App.account !== account) throw new Error("Account changed");
+      const pending = await postJson("/api/v1/agent/calendar/alarm/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, href, uid, recurrence_id:recurrenceId, alarm_index:index, trigger:remove ? null : trigger.value.trim(), description:remove ? null : description.value.trim() }, PROVIDER_NATIVE_TIMEOUT_MS);
+      if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+      const record = { ...pending, status:"pending", cancelled_result:"The reminder was not changed." };
+      AssistantState.pendingCardsById.set(record.pending_id, record);
+      closeSheet(); openSheet("Review reminder", renderAgentPendingCard(record));
+    } catch (_) { toast("Reminder could not be prepared. Refresh and check its format and access.", "err"); button.disabled = false; }
+  };
+  const save = el("button", { class:"btn primary", type:"button", onclick:event => prepare(event.currentTarget, false) }, "Review reminder");
+  const remove = index === null ? null : el("button", { class:"btn danger", type:"button", onclick:event => prepare(event.currentTarget, true) }, "Review removal");
+  openSheet("Reminder", el("div", { class:"compose" }, el("p", { class:"dim", text:"Use a negative duration before the start, such as -PT15M. Absolute, end-related and repeating reminders are not yet delivered. Existing reminders are preserved." }), delivery, trigger, description, save, remove));
+}
+
+function openProviderCollectionAccess(account, service, collection) {
+  if (App.account !== account || !collection) return;
+  const principal = el("input", { class:"input", placeholder:"DAV principal URL", "aria-label":"Principal URL" });
+  const privilege = el("select", { class:"input", "aria-label":"Access" },
+    el("option", { value:"read", text:"Read only" }), el("option", { value:"read-write", text:"Read and write" }),
+    el("option", { value:"write", text:"Write only" }), el("option", { value:"remove", text:"Remove editable grant" }));
+  const button = el("button", { class:"btn primary", type:"button", onclick:async () => {
+    if (App.account !== account || !principal.value.trim()) { toast("Check the account and principal.", "err"); return; }
+    button.disabled = true;
+    try {
+      const sessionId = await ensureAgentSession();
+      if (App.account !== account) throw new Error("Account changed");
+      const pending = await postJson("/api/v1/agent/dav/acl/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, service, collection, principal:principal.value.trim(), privilege:privilege.value === "remove" ? null : privilege.value }, PROVIDER_NATIVE_TIMEOUT_MS);
+      if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+      const record = { ...pending, status:"pending", cancelled_result:"Collection access was not changed." };
+      AssistantState.pendingCardsById.set(record.pending_id, record);
+      closeSheet(); openSheet("Review collection access", renderAgentPendingCard(record));
+    } catch (_) { toast("Access could not be prepared. Check the principal and your permissions.", "err"); button.disabled = false; }
+  } }, "Review access");
+  openSheet("Collection access", el("div", { class:"compose" }, el("p", { class:"dim", text:"This replaces the editable grant for the selected principal. The current access list and proposed effect are shown before saving." }), principal, privilege, button));
+}
+
+function openProviderInvitationResponse(account, collection, href, uid, recurrenceId, attendees) {
+  if (App.account !== account || !attendees.length) return;
+  const attendee = el("select", { class:"input", "aria-label":"Your calendar identity" }, ...attendees.map(value => el("option", { value, text:value })));
+  const response = el("select", { class:"input", "aria-label":"Response" }, el("option", { value:"accept", text:"Accept" }), el("option", { value:"tentative", text:"Tentative" }), el("option", { value:"decline", text:"Decline" }));
+  const button = el("button", { class:"btn primary", type:"button", onclick:async () => {
+    if (App.account !== account) return;
+    button.disabled = true;
+    try {
+      const sessionId = await ensureAgentSession();
+      if (App.account !== account) throw new Error("Account changed");
+      const pending = await postJson("/api/v1/agent/calendar/invitation/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, href, uid, recurrence_id:recurrenceId, attendee:attendee.value, response:response.value }, PROVIDER_NATIVE_TIMEOUT_MS);
+      if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+      const record = { ...pending, status:"pending", cancelled_result:"The invitation response was not changed." };
+      AssistantState.pendingCardsById.set(record.pending_id, record);
+      closeSheet(); openSheet("Review invitation response", renderAgentPendingCard(record));
+    } catch (_) { toast("The response could not be prepared. Select an identity belonging to this account and refresh the calendar.", "err"); button.disabled = false; }
+  } }, "Review response");
+  openSheet("Respond to invitation", el("div", { class:"compose" }, el("p", { class:"dim", text:"Select your calendar identity. The organizer and exact response are shown before saving." }), attendee, response, button));
+}
+
+async function prepareProviderDelete(account, service, collection, href, button) {
+  if (App.account !== account) return;
+  button.disabled = true;
+  try {
+    const sessionId = await ensureAgentSession();
+    if (App.account !== account) throw new Error("Account changed");
+    const pending = await postJson("/api/v1/agent/dav/delete/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, service, collection, href }, PROVIDER_NATIVE_TIMEOUT_MS);
+    if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+    const record = { ...pending, status:"pending", cancelled_result:"The item was not deleted." };
+    AssistantState.pendingCardsById.set(record.pending_id, record);
+    openSheet("Review deletion", renderAgentPendingCard(record));
+  } catch (_) { toast("Deletion could not be prepared. Complex events require their scheduling effects to be reviewed.", "err"); }
+  finally { button.disabled = false; }
+}
+async function prepareProviderCancellation(account, collection, href, uid, recurrenceId, sequence, button) {
+  if (App.account !== account) return;
+  button.disabled = true;
+  try {
+    const sessionId = await ensureAgentSession();
+    if (App.account !== account) throw new Error("Account changed");
+    const pending = await postJson("/api/v1/agent/calendar/cancel/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, href, uid, recurrence_id:recurrenceId, sequence }, PROVIDER_NATIVE_TIMEOUT_MS);
+    if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+    const record = { ...pending, status:"pending", cancelled_result:"The event was not cancelled." };
+    AssistantState.pendingCardsById.set(record.pending_id, record);
+    openSheet("Review cancellation", renderAgentPendingCard(record));
+  } catch (_) { toast("Cancellation could not be prepared. Check the organizer identity and refresh the calendar.", "err"); }
+  finally { button.disabled = false; }
+}
+
+function openProviderCreate(account, collection, kind) {
+  if (App.account !== account || !collection) return;
+  const name = el("input", { class:"input", "aria-label":kind === "contact" ? "Contact name" : "Title", placeholder:kind === "contact" ? "Contact name" : "Title" });
+  const start = el("input", { class:"input", "aria-label":"UTC start", placeholder:"Start UTC: YYYYMMDDTHHMMSSZ" });
+  const end = el("input", { class:"input", "aria-label":"UTC end", placeholder:"End UTC: YYYYMMDDTHHMMSSZ" });
+  const rule = el("input", { class:"input", "aria-label":"Task recurrence rule", placeholder:"Optional: FREQ=DAILY;COUNT=3" });
+  const organizer = el("input", { class:"input", "aria-label":"Organizer identity", placeholder:"Optional organizer, e.g. mailto:you@example.com" });
+  const attendees = el("input", { class:"input", "aria-label":"Attendees", placeholder:"Optional attendees as comma-separated mailto: addresses" });
+  const button = el("button", { class:"btn primary", type:"button", onclick:async () => {
+    if (App.account !== account || !name.value.trim()) { toast("Check the account and name.", "err"); return; }
+    if (kind === "task" && !rule.value.trim() && (start.value.trim() || end.value.trim())) { toast("Add a recurrence rule or clear the dates.", "err"); return; }
+    button.disabled = true;
+    try {
+      const sessionId = await ensureAgentSession();
+      if (App.account !== account) throw new Error("Account changed");
+      const recurringTask = kind === "task" && rule.value.trim();
+      const pending = await postJson("/api/v1/agent/dav/create/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, kind, name:name.value.trim(), start:kind === "event" || recurringTask ? start.value.trim() : null, end:kind === "event" || recurringTask ? end.value.trim() : null, rule:recurringTask || null, organizer:kind === "event" ? organizer.value.trim() || null : null, attendees:kind === "event" ? attendees.value.split(",").map(value => value.trim()).filter(Boolean) : [] }, PROVIDER_NATIVE_TIMEOUT_MS);
+      if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+      const record = { ...pending, status:"pending", cancelled_result:"The item was not created." };
+      AssistantState.pendingCardsById.set(record.pending_id, record);
+      closeSheet(); openSheet("Review new item", renderAgentPendingCard(record));
+    } catch (_) { toast("The item could not be prepared. Check the collection and input.", "err"); button.disabled = false; }
+  } }, "Review new item");
+  openSheet(`New ${kind}`, el("div", { class:"compose" }, el("p", { class:"dim", text:kind === "task" ? "For a recurring task, enter UTC start, UTC due and a rule with COUNT up to 100. All occurrences are shown before creation." : "Optional event attendees require an organizer identity belonging to this account. Invitations may be sent after confirmation." }), name, kind !== "contact" ? start : null, kind !== "contact" ? end : null, kind === "task" ? rule : null, kind === "event" ? organizer : null, kind === "event" ? attendees : null, button));
+}
+
+async function renderProviderCalendarView(view, service) {
+  const account = App.account, wanted = service === "todo" ? "VTODO" : "VEVENT";
+  clear(view);
+  const backupStatus = el("button",{class:"btn sm",type:"button",onclick:()=>openSingleCaptureStatus(account)},"Backup status");
+  const select = el("select", { class:"input" }, el("option", { value:"", text:service === "todo" ? "Choose a task list" : "Choose a calendar", selected:"selected", disabled:"disabled" }));
+  const status = el("p", { class:"dim", text:service === "todo" ? "Loading task lists…" : "Loading calendars…" });
+  const note = el("p", { class:"dim", text:"Saved items are shown here. Repeating items appear as a series until you expand them." });
+  const list = el("div", { class:"pick-list" });
+  const expanded = el("div", { class:"pick-list" });
+  const month = el("input", { type:"month", class:"input", "aria-label":"Month to expand" });
+  const now = new Date(); month.value = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2,"0")}`;
+  const expand = el("button", { class:"btn sm", type:"button", onclick:async () => {
+    const collection = select.value, match = /^(\d{4})-(\d{2})$/.exec(month.value);
+    if (!collection || !match || App.account !== account) return;
+    expand.disabled = true; clear(expanded); expanded.append(el("p", { class:"dim", text:"Loading live occurrences…" }));
+    try {
+      const result = await api("/api/v1/calendar/expanded?" + qs({ account, collection, year:match[1], month:match[2], ...(service === "todo" ? {tasks:"1"} : {}) }));
+      if (App.account !== account || select.value !== collection || month.value !== match[0] || !view.isConnected) return;
+      clear(expanded);
+      for (const item of result.items || []) for (const component of (item.view && item.view.components || [])) {
+        const props = component.properties || {}, rid = props["RECURRENCE-ID"];
+        const recurrenceId = Array.isArray(rid) && rid.length === 1 ? rid[0].value : null;
+        if (!recurrenceId || !component.uid || !item.href) continue;
+        const label = `${values(props,"SUMMARY") || "(untitled)"} · ${recurrenceId} · ${values(props,"DTSTART")}`;
+        expanded.append(el("div", { class:"pick-row" }, el("span", { class:"grow", text:label }), CAP.agent ? (service === "todo" ? el("button", { class:"btn sm", type:"button", onclick:event => prepareTaskOccurrence(account,collection,item.href,component.uid,recurrenceId,result.start,result.end,event.currentTarget) }, "Complete occurrence") : el("button", { class:"btn sm", type:"button", onclick:() => openProviderOccurrenceTime(account, collection, item.href, component.uid, recurrenceId, result.start, result.end) }, "Change occurrence")) : null));
+      }
+      if (!expanded.childNodes.length) expanded.append(el("p", { class:"dim", text:"No expanded occurrences for this month." }));
+    } catch (_) { clear(expanded); expanded.append(el("p", { class:"dim", text:"Live occurrence expansion is unavailable." })); }
+    finally { expand.disabled = false; }
+  } }, "Show live occurrences");
+  const freebusy = el("button", { class:"btn sm", type:"button", onclick:async () => {
+    const collection = select.value, match = /^(\d{4})-(\d{2})$/.exec(month.value);
+    if (!collection || !match || App.account !== account) return;
+    freebusy.disabled = true;
+    try {
+      const result = await api("/api/v1/calendar/expanded?" + qs({ account, collection, year:match[1], month:match[2], freebusy:"1" }));
+      if (App.account !== account || select.value !== collection || !view.isConnected) return;
+      const raw = String(result.content || ""), lines = raw.replace(/\r?\n[ \t]/g, "").split(/\r?\n/).filter(line => /^FREEBUSY(?:;|:)/i.test(line));
+      openSheet("Live free/busy", el("div", { class:"compose" }, el("p", { class:"dim", text:`Live result for this calendar from ${result.start} to ${result.end}. It does not aggregate other calendars or people.` }), lines.length ? el("div", { class:"pick-list" }, ...lines.map(line => el("div", { class:"pick-row", text:line }))) : el("p", { class:"dim", text:"The provider returned no FREEBUSY intervals. Inspect the original response for context." }), el("details", null, el("summary", { text:"Original provider response" }), el("pre", { text:raw }))));
+    } catch (error) { toast(error && error.code === "freebusy_access_denied" ? "Free/busy access was denied." : "Free/busy availability is unknown.", "err"); }
+    finally { freebusy.disabled = false; }
+  } }, "Show free/busy");
+  const more = el("button", { class:"btn sm", type:"button", style:"display:none" }, "Load more");
+  let cursor = null, digest = null, origin = null, selected = "";
+  const values = (properties, key) => Array.isArray(properties[key]) ? properties[key].map(entry => {
+    const params = entry.parameters && Object.keys(entry.parameters).length ? ` ${JSON.stringify(entry.parameters)}` : "";
+    return `${entry.value ?? ""}${params}`;
+  }).join(", ") : "";
+  const load = async first => {
+    const collection = select.value;
+    if (!collection || App.account !== account) return;
+    more.disabled = true;
+    try {
+      const page = await api("/api/v1/items?" + qs({ account, service, collection, after:first ? "" : cursor }));
+      if (App.account !== account || select.value !== collection || !view.isConnected) return;
+      if (!first && (page.account !== account || page.origin !== origin || page.collection !== selected || !digest || page.cursor_digest !== digest)) {
+        cursor = null; more.style.display = "none"; status.textContent = "The cached calendar changed while paging. Reload it to continue."; return;
+      }
+      if (first) { clear(list); origin = page.origin; selected = page.collection; digest = page.cursor_digest || null; }
+      const access = page.accessible === true ? "Access last observed" : page.accessible === false ? "Access unavailable at last check" : "Access status unknown";
+      const time = page.observed_at ? new Date(Number(page.observed_at) * 1000).toLocaleString() : "unknown";
+      status.textContent = `Cached calendar · local update ${time} · ${access} · live status unknown`;
+      for (const item of page.items || []) {
+        if (item.error) { list.append(el("div", { class:"pick-row", text:"A calendar resource could not be projected." })); continue; }
+        for (const component of (item.view && Array.isArray(item.view.components) ? item.view.components : [])) {
+          if (component.kind !== wanted) continue;
+          const properties = component.properties || {};
+          const title = values(properties, "SUMMARY") || (service === "todo" ? "(untitled task)" : "(untitled event)");
+          const parts = [values(properties, "DTSTART"), values(properties, "DUE"), values(properties, "STATUS")].filter(Boolean);
+          if (properties.RRULE || properties.RDATE) parts.push("Repeating series (not expanded)");
+          if (properties["RECURRENCE-ID"]) parts.push(`Exception: ${values(properties, "RECURRENCE-ID")}`);
+          const row = el("div", { class:"pick-row" }, el("span", { class:"grow" }, el("b", { text:title }), parts.length ? el("span", { class:"dim", text:` · ${parts.join(" · ")}` }) : null));
+          if (CAP.agent && page.accessible === true && typeof item.href === "string" && !properties["RECURRENCE-ID"]) row.append(el("button",{class:"btn sm",type:"button",onclick:event=>prepareSingleCapture(account,"calendar",collection,item.href,event.currentTarget)},"Back up resource"));
+          const recurrence = properties["RECURRENCE-ID"];
+          const recurrenceId = Array.isArray(recurrence) && recurrence.length === 1 ? recurrence[0].value : null;
+          if (CAP.agent && page.accessible === true && component.uid && typeof item.href === "string" && !recurrence && !properties.ORGANIZER && !properties.ATTENDEE) {
+            const startValue = values(properties,"DTSTART"), endValue = values(properties,service === "todo" ? "DUE" : "DTEND"), ruleValue = values(properties,"RRULE");
+            if (startValue && endValue) row.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderSeriesRule(account, collection, item.href, component.uid, startValue, endValue, ruleValue) }, ruleValue ? "Edit series" : "Make recurring"));
+          }
+          if (CAP.agent && page.accessible === true && component.uid && typeof item.href === "string" && (!recurrence || recurrenceId) && !properties.ORGANIZER && !properties.ATTENDEE) {
+            const alarms = (Array.isArray(component.components) ? component.components : []).filter(child => child.kind === "VALARM");
+            row.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderAlarm(account, collection, item.href, component.uid, recurrenceId, null, "", "") }, "Add reminder"));
+            alarms.forEach((alarm, index) => {
+              const p = alarm.properties || {}; const trigger = values(p,"TRIGGER"), description = values(p,"DESCRIPTION");
+              row.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderAlarm(account, collection, item.href, component.uid, recurrenceId, index, trigger, description) }, `Reminder ${index + 1}`));
+            });
+          }
+          if (service === "calendar" && CAP.agent && page.accessible === true && component.uid && typeof item.href === "string" && properties.ORGANIZER && (!recurrence || recurrenceId) && !(properties.RRULE || properties.RDATE)) {
+            const attendees = Array.isArray(properties.ATTENDEE) ? properties.ATTENDEE.map(entry => entry.value).filter(value => typeof value === "string" && value) : [];
+            if (attendees.length) row.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderInvitationResponse(account, collection, item.href, component.uid, recurrenceId, attendees) }, "Respond"));
+            const sequences = properties.SEQUENCE;
+            const previous = !sequences ? 0 : Array.isArray(sequences) && sequences.length === 1 && /^\d+$/.test(String(sequences[0].value)) ? Number(sequences[0].value) : NaN;
+            if (Number.isSafeInteger(previous) && previous >= 0 && previous < 4294967295) row.append(el("button", { class:"btn sm danger", type:"button", onclick:event => prepareProviderCancellation(account, collection, item.href, component.uid, recurrenceId, previous + 1, event.currentTarget) }, "Cancel event"));
+          }
+          if (CAP.agent && page.accessible === true && component.uid && typeof item.href === "string" && (!recurrence || recurrenceId) && !(properties.RRULE || properties.RDATE || properties.ORGANIZER || properties.ATTENDEE)) {
+            for (const field of ["SUMMARY", "DESCRIPTION"]) {
+              const entries = properties[field];
+              if (entries && (!Array.isArray(entries) || entries.length !== 1 || typeof entries[0].value !== "string" || /[\u0000-\u001f\u007f]/.test(entries[0].value))) continue;
+              row.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderCalendarText(account, collection, item.href, component.uid, recurrenceId, field, entries ? entries[0].value : "") }, field === "SUMMARY" ? "Edit title" : "Edit description"));
+            }
+            if (service === "calendar" && !recurrence) row.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderCalendarTime(account, collection, item.href, component.uid) }, "Change time"));
+            if (service === "calendar" && !recurrence) row.append(el("button", { class:"btn sm", type:"button", onclick:event => prepareProviderDelete(account, "calendar", collection, item.href, event.currentTarget) }, "Delete"));
+          }
+          if (service === "todo" && CAP.agent && page.accessible === true && component.uid && (!recurrence || recurrenceId) && !(properties.RRULE || properties.RDATE)) {
+            const complete = values(properties, "STATUS") !== "COMPLETED";
+            row.append(el("button", { class:"btn sm", type:"button", onclick:async event => {
+              if (App.account !== account || select.value !== collection) return;
+              const button = event.currentTarget;
+              button.disabled = true;
+              try {
+                const sessionId = await ensureAgentSession();
+                if (App.account !== account || select.value !== collection) throw new Error("Account changed");
+                const pending = await postJson("/api/v1/agent/task/completion/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, href:item.href, uid:component.uid, recurrence_id:recurrenceId, complete }, PROVIDER_NATIVE_TIMEOUT_MS);
+                if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+                const record = { ...pending, status:"pending", cancelled_result:"The task was not changed." };
+                AssistantState.pendingCardsById.set(record.pending_id, record);
+                openSheet("Review task change", renderAgentPendingCard(record));
+              } catch (_) { toast("Task confirmation could not be prepared. Refresh and check access; tasks with alarms or scheduling need an expanded review.", "err"); }
+              finally { button.disabled = false; }
+            } }, complete ? "Complete" : "Reopen"));
+            if (!recurrence) row.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderTaskAttributes(account, collection, item.href, component.uid) }, "Due and priority"));
+            if (!recurrence) row.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderTaskParent(account, collection, item.href, component.uid) }, "Change parent"));
+          }
+          list.append(row);
+        }
+      }
+      cursor = page.next_after || null; more.style.display = cursor && digest ? "" : "none";
+      if (cursor && !digest) status.textContent += " · paging unavailable without a cached collection version";
+    } catch (_) { status.textContent = "Cached calendar resources are unavailable."; }
+    finally { more.disabled = false; }
+  };
+  select.addEventListener("change", () => { cursor = null; clear(expanded); void load(true); });
+  month.addEventListener("change", () => clear(expanded));
+  more.addEventListener("click", () => { if (cursor) void load(false); });
+  // A sync event must refresh cached rows without rebuilding the view: the
+  // selected collection, month and server-expanded occurrences are user state.
+  App.liveUpdate = () => {
+    if (view.isConnected && App.account === account && select.value && !more.disabled) void load(true);
+  };
+  view.append(el("div", { class:"con-page provider-calendar-page" }, el("h2", { text:service === "todo" ? "Tasks" : "Calendar" }), select, backupStatus, CAP.agent ? el("button", { class:"btn sm provider-create", type:"button", onclick:() => openProviderCreate(account, select.value, service === "todo" ? "task" : "event") }, service === "todo" ? "New task" : "New event") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCollectionAccess(account, "calendar", select.value) }, "Manage collection access") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderRecovery(account,"Recovered") }, "Recover…") : null, status, note, list, more, month, expand, service === "calendar" ? freebusy : null, expanded));
+  try {
+    const result = await api("/api/v1/items?" + qs({ account, service }));
+    if (App.account !== account || !view.isConnected) return;
+    for (const collection of result.collections || []) if (typeof collection === "string") select.append(el("option", { value:collection, text:collection }));
+    status.textContent = result.collections && result.collections.length ? (service === "todo" ? "Choose a task list." : "Choose a calendar.") : (service === "todo" ? "No saved task lists. Connect and sync the account." : "No saved calendars. Connect and sync the account.");
+  } catch (_) { status.textContent = "Cached calendars are unavailable."; }
+}
+
 async function renderCalendarView(view) {
+  if ((App.accounts || []).some(account => account.id === App.account && account.provider === "self_hosted")) return renderProviderCalendarView(view, "calendar");
   Cal.events = []; Cal.cursor = new Date(); Cal.view = Cal.view || "agenda"; Cal.stateFilter = "all";
   clear(view).append(
     el("div", { id: "cal-metrics-row", class: "con-metrics-row inset" }),
@@ -3135,11 +4386,12 @@ function calNav(dir) {
 }
 async function calLoad() {
   const body = $("#cal-body"); clear(body).append(el("div", { class: "card" }, el("div", { class: "skel", style: "height:360px" })));
+  const account = App.account;
+  const current = () => body.isConnected && $("#cal-body") === body && App.account === account;
   try {
-    const [d, act] = await Promise.all([
-      api("/api/v1/items?" + qs({ account: App.account, service: "calendar", limit: 1000 })),
-      api("/api/v1/activity?" + qs({ account: App.account, limit: 30 })).catch(() => ({ runs: [] })),
-    ]);
+    const activity = api("/api/v1/activity?" + qs({ account, limit: 30 })).catch(() => ({ runs: [] }));
+    const d = await api("/api/v1/items?" + qs({ account, service: "calendar", limit: 1000 }));
+    if (!current()) return;
     const items = d.items || [];
     Cal.raw = items.filter(it => it.item_type === "event");
     // calendar colour map (#565 B5): calendar id -> hexColor, for colour-coding
@@ -3147,7 +4399,7 @@ async function calLoad() {
       items.filter(it => it.item_type === "calendar")
         .map(it => [it.remote_id, (it.preview || {}).hex_color])
         .filter(([, c]) => c));
-    Cal.runs = act.runs || [];
+    Cal.runs = [];
     Cal.events = items.filter(it => it.item_type === "event").map(it => {
       const p = it.preview || {};
       const start = evDate(p.start, p.start_tz) || (it.remote_mtime ? new Date(it.remote_mtime) : null);
@@ -3159,7 +4411,8 @@ async function calLoad() {
     }).filter(e => e.start);
     App.counts.calendar = d.total ?? Cal.events.length; updateNavCounts();
     calRenderMetrics(); calRender();
-  } catch (e) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load calendar" }), el("p", { text: e.message }))); }
+    void activity.then(act => { if (current()) { Cal.runs = act.runs || []; calRenderMetrics(); } });
+  } catch (e) { if (current()) clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load calendar" }), el("p", { text: e.message }))); }
 }
 function calRenderMetrics() {
   const now = Date.now();
@@ -3532,7 +4785,154 @@ async function deleteEvent(ev) {
 const Contacts = { all: [], selected: null, filter: "all", q: "", sort: "name", lastSync: null, runs: [], retentionDays: null };
 const conLetter = (it) => ((it.name || "#").trim()[0] || "#").toUpperCase();
 const conPrev = (it) => it.preview || {};
+function openProviderContactName(account, collection, href, oldName) {
+  if (App.account !== account) return;
+  const input = el("input", { class:"input", value:oldName, "aria-label":"New contact name" });
+  const button = el("button", { class:"btn primary", type:"button", onclick:async () => {
+    if (App.account !== account || !input.value.trim()) { toast("Check the account and contact name.", "err"); return; }
+    button.disabled = true;
+    try {
+      const sessionId = await ensureAgentSession();
+      if (App.account !== account) throw new Error("Account changed");
+      const prepared = await postJson("/api/v1/agent/contact/name/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, href, new_name:input.value }, PROVIDER_NATIVE_TIMEOUT_MS);
+      if (!prepared || !prepared.pending_id || !prepared.token || !prepared.action_hash || !prepared.turn_id) throw new Error("Confirmation unavailable");
+      const record = { ...prepared, status:"pending" };
+      AssistantState.pendingCardsById.set(record.pending_id, record);
+      closeSheet(); openSheet("Review contact change", renderAgentPendingCard(record));
+    } catch (_) { toast("The contact change could not be prepared. Reload the address book and try again.", "err"); button.disabled = false; }
+  } }, "Review change");
+  openSheet("Change contact name", el("div", { class:"compose" }, el("p", { class:"dim", text:`Current name: ${oldName}` }), input, button));
+}
+
+function openProviderContactField(account, collection, href, key, index, current) {
+  if (App.account !== account) return;
+  const input = el("input", { class:"input", value:current, maxlength:"4096", "aria-label":`New ${key}` });
+  const button = el("button", { class:"btn primary", type:"button", onclick:async () => {
+    if (App.account !== account || !input.value.trim()) { toast("Check the account and value.", "err"); return; }
+    button.disabled = true;
+    try {
+      const sessionId = await ensureAgentSession();
+      if (App.account !== account) throw new Error("Account changed");
+      const pending = await postJson("/api/v1/agent/contact/field/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, href, key, index, new_value:input.value }, PROVIDER_NATIVE_TIMEOUT_MS);
+      if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+      const record = { ...pending, status:"pending", cancelled_result:"The contact was not changed." };
+      AssistantState.pendingCardsById.set(record.pending_id, record);
+      closeSheet(); openSheet("Review contact field", renderAgentPendingCard(record));
+    } catch (_) { toast("The contact field could not be prepared. Reload the address book and check the value.", "err"); button.disabled = false; }
+  } }, "Review change");
+  openSheet(`${index == null ? "Add" : "Change"} ${key}`, el("div", { class:"compose" }, el("p", { class:"dim", text:"The field, type and exact change are shown for review before saving." }), input, button));
+}
+async function prepareProviderContactRemove(account, collection, href, key, index, button) {
+  if (App.account !== account) return;
+  button.disabled = true;
+  try {
+    const sessionId = await ensureAgentSession();
+    if (App.account !== account) throw new Error("Account changed");
+    const pending = await postJson("/api/v1/agent/contact/field/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, href, key, index, remove:true, new_value:"" }, PROVIDER_NATIVE_TIMEOUT_MS);
+    if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+    const record = { ...pending, status:"pending", cancelled_result:"The contact field was not removed." };
+    AssistantState.pendingCardsById.set(record.pending_id, record);
+    openSheet("Review field removal", renderAgentPendingCard(record));
+  } catch (_) { toast("The field removal could not be prepared. Refresh the address book.", "err"); }
+  finally { button.disabled = false; }
+}
+
+function chooseProviderContactPhoto(account,collection,href,forAssistant=false) {
+  const input=el("input",{type:"file",accept:"image/png,image/jpeg",style:"display:none"});
+  input.addEventListener("change",async()=>{
+    const file=input.files && input.files[0];input.remove();if(!file || App.account!==account)return;
+    if(!CAP.mutationIntent || !CAP.agent || !["image/png","image/jpeg"].includes(file.type) || file.size<1 || file.size>2*1024*1024) {toast("Choose a PNG or JPEG image no larger than 2 MiB.","err");return;}
+    try {
+      const session_id=await ensureAgentSession();if(App.account!==account)throw new Error("account changed");
+      const staged=await stageMutation("contact_photo",{account,collection,href,media_type:file.type},file);
+      if(!staged.stage_id || App.account!==account)throw new Error("photo stage unavailable");
+      if (forAssistant) {
+        openSheet("Photo staged for Assistant",el("div",{class:"compose"},el("p",{text:"The image is staged for this account and contact for 15 minutes. Give this identifier to the assistant; it must still ask you to confirm the exact contact and photo before changing anything."}),el("code",{text:staged.stage_id}),el("button",{class:"btn sm",type:"button",onclick:async()=>{try{await navigator.clipboard.writeText(staged.stage_id);toast("Identifier copied.");}catch(_){toast("Select and copy the identifier above.","err");}}},"Copy identifier")));
+        return;
+      }
+      const pending=await postJson("/api/v1/agent/contact/photo/prepare",CAP.agent,{request_id:crypto.randomUUID(),session_id,account,stage_id:staged.stage_id},PROVIDER_NATIVE_TIMEOUT_MS);
+      if(!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id)throw new Error("confirmation unavailable");
+      const record={...pending,status:"pending",photo_operation:true,success_result:"Contact photo updated; local synchronization may be pending.",cancelled_result:"The contact photo was not changed."};
+      AssistantState.pendingCardsById.set(record.pending_id,record);
+      const url=URL.createObjectURL(file);const picture=el("img",{src:url,alt:"Selected contact photo",style:"max-width:180px;max-height:180px;object-fit:contain"});
+      picture.addEventListener("load",()=>URL.revokeObjectURL(url),{once:true});picture.addEventListener("error",()=>URL.revokeObjectURL(url),{once:true});
+      openSheet("Review contact photo",el("div",{class:"compose"},picture,renderAgentPendingCard(record)));
+    } catch (_) {toast("The photo could not be prepared. Check the contact and try again.","err");}
+  },{once:true});document.body.append(input);input.click();
+}
+
+async function renderProviderContactsView(view) {
+  const account = App.account;
+  clear(view);
+  const backupStatus = el("button",{class:"btn sm",type:"button",onclick:()=>openSingleCaptureStatus(account)},"Backup status");
+  const select = el("select", { class:"input" }, el("option", { value:"", text:"Choose an address book", selected:"selected", disabled:"disabled" }));
+  const status = el("p", { class:"dim", text:"Loading cached address books…" });
+  const list = el("div", { class:"pick-list" });
+  const more = el("button", { class:"btn sm", type:"button", style:"display:none" }, "Load more");
+  let cursor = null, digest = null, origin = null, selected = "";
+  const textValues = fields => (Array.isArray(fields) ? fields : []).flatMap(field => Array.isArray(field.values) ? field.values : []).flat(Infinity).filter(value => typeof value === "string").join(", ");
+  const load = async first => {
+    const collection = select.value;
+    if (!collection || App.account !== account) return;
+    more.disabled = true;
+    try {
+      const page = await api("/api/v1/items?" + qs({ account, service:"contacts", collection, after:first ? "" : cursor }));
+      if (App.account !== account || select.value !== collection || !view.isConnected) return;
+      if (!first && (page.account !== account || page.origin !== origin || page.collection !== selected || !digest || page.cursor_digest !== digest)) {
+        cursor = null; more.style.display = "none"; status.textContent = "The cached address book changed while paging. Reload it to continue."; return;
+      }
+      if (first) { clear(list); origin = page.origin; selected = page.collection; digest = page.cursor_digest || null; }
+      const access = page.accessible === true ? "Access last observed" : page.accessible === false ? "Access unavailable at last check" : "Access status unknown";
+      const time = page.observed_at ? new Date(Number(page.observed_at) * 1000).toLocaleString() : "unknown";
+      status.textContent = `Cached address book · local update ${time} · ${access} · live status unknown`;
+      for (const item of page.items || []) {
+        const name = textValues(item.names) || (item.error ? "Contact could not be projected" : "(unnamed contact)");
+        const detail = [textValues(item.emails), textValues(item.phones), textValues(item.organizations)].filter(Boolean).join(" · ");
+        const row = el("div", { class:"pick-row" }, el("span", { class:"grow" }, el("b", { text:name }), detail ? el("span", { class:"dim", text:` · ${detail}` }) : null));
+        if (page.accessible === true && !item.error && typeof item.href === "string" && typeof item.collection === "string") {
+          row.append(el("button",{class:"btn sm",type:"button",onclick:event=>{
+            const button=event.currentTarget; button.disabled=true;
+            const photo=el("img",{src:"/api/v1/contact/photo?"+qs({account,collection:item.collection,href:item.href}),alt:"Contact photo",style:"max-width:96px;max-height:96px;object-fit:contain"});
+            photo.addEventListener("error",()=>{photo.remove();button.disabled=false;toast("No readable contact photo is available.","err");},{once:true});
+            row.append(photo);
+          }},"Show photo"));
+        }
+        if (CAP.agent && page.accessible === true && !item.error && typeof item.href === "string" && typeof item.collection === "string") {
+          row.append(el("button",{class:"btn sm",type:"button",onclick:event=>prepareSingleCapture(account,"contacts",item.collection,item.href,event.currentTarget)},"Back up contact"));
+          if(CAP.mutationIntent) {row.append(el("button",{class:"btn sm",type:"button",onclick:()=>chooseProviderContactPhoto(account,item.collection,item.href)},"Change photo"));row.append(el("button",{class:"btn sm",type:"button",onclick:()=>chooseProviderContactPhoto(account,item.collection,item.href,true)},"Stage photo for Assistant"));}
+          row.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderContactName(account, item.collection, item.href, name) }, "Change name"));
+          for (const [key, fields] of [["EMAIL", item.emails], ["TEL", item.phones], ["ORG", item.organizations]]) {
+            row.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderContactField(account, item.collection, item.href, key, null, "") }, `Add ${key}`));
+            if (!Array.isArray(fields)) continue;
+            fields.forEach((field, index) => {
+              const value = Array.isArray(field.values) ? field.values.flat(Infinity).find(part => typeof part === "string") : "";
+              if (value) row.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderContactField(account, item.collection, item.href, key, index, value) }, `Edit ${key}: ${value}`));
+              if (value) row.append(el("button", { class:"btn sm", type:"button", onclick:event => prepareProviderContactRemove(account, item.collection, item.href, key, index, event.currentTarget) }, `Remove ${key}: ${value}`));
+            });
+          }
+          row.append(el("button", { class:"btn sm", type:"button", onclick:event => prepareProviderDelete(account, "contacts", item.collection, item.href, event.currentTarget) }, "Delete"));
+        }
+        list.append(row);
+      }
+      cursor = page.next_after || null;
+      more.style.display = cursor && digest ? "" : "none";
+      if (cursor && !digest) status.textContent += " · paging unavailable without a cached collection version";
+    } catch (_) { status.textContent = "Cached contacts are unavailable."; }
+    finally { more.disabled = false; }
+  };
+  select.addEventListener("change", () => { cursor = null; void load(true); });
+  more.addEventListener("click", () => { if (cursor) void load(false); });
+  view.append(el("div", { class:"con-page provider-calendar-page" }, el("h2", { text:"Contacts" }), select, backupStatus, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCreate(account, select.value, "contact") }, "New contact") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCollectionAccess(account, "contacts", select.value) }, "Manage collection access") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderRecovery(account,"Recovered","contacts") }, "Recover…") : null, status, list, more));
+  try {
+    const result = await api("/api/v1/items?" + qs({ account, service:"contacts" }));
+    if (App.account !== account || !view.isConnected) return;
+    for (const collection of result.collections || []) if (typeof collection === "string") select.append(el("option", { value:collection, text:collection }));
+    status.textContent = result.collections && result.collections.length ? "Choose a cached address book." : "No cached address books. Connect and synchronize the account.";
+  } catch (_) { status.textContent = "Cached address books are unavailable."; }
+}
+
 async function renderContactsView(view) {
+  if ((App.accounts || []).some(account => account.id === App.account && account.provider === "self_hosted")) return renderProviderContactsView(view);
   Object.assign(Contacts, { all: [], selected: null, filter: "all", q: "", sort: "name", status: null });
   clear(view).append(el("div", { class: "con-page" },
     // top metric row (real data: counts + integrity from verify + sync health/activity).
@@ -4033,6 +5433,7 @@ async function renderContactDetail(it) {
 const Todo = { lists: [], tasks: [], stateFilter: "all", selecting: false, selected: new Set() };
 const TODO_STATUS = { notStarted: { icon: "circle", cls: "" }, inProgress: { icon: "clock", cls: "prog" }, completed: { icon: "check-square", cls: "done" } };
 async function renderTodoView(view) {
+  if ((App.accounts || []).some(account => account.id === App.account && account.provider === "self_hosted")) return renderProviderCalendarView(view, "todo");
   clear(view).append(el("div", { id: "todo-metrics-row", class: "con-metrics-row inset" }));
   const acts = el("div", { class: "view-actions" });
   if (CAP.todowrite) acts.append(
@@ -5344,11 +6745,19 @@ async function startAiLogin(provider, lifecycleOperationId) {
     if (!d || !d.authorize_url || !d.attempt_id) {
       throw new Error("oauth_start_invalid_response");
     }
+    const authorizationUrl = new URL(d.authorize_url);
+    if (authorizationUrl.protocol !== "https:" || authorizationUrl.username || authorizationUrl.password) {
+      throw new Error("oauth_start_invalid_url");
+    }
     clearLifecycleRequestId(requestKey);
     if (manualCodeFlow) showCodeStep();
     else showWaitingStep(provider);  // waiting UI + poll; completes when /callback fires
     toast("Opening sign-in in your browser…");
-    await openExternalAuth(d.authorize_url, "agent_authorize");
+    await openExternalAuth(d.authorize_url, "agent_authorize", { newTab:true });
+    if (!BRIDGE) {
+      const card = document.getElementById("asst-connect-card");
+      if (card) card.append(el("a", { class:"btn primary", href:d.authorize_url, target:"_blank", rel:"noopener noreferrer", text:"Open provider sign-in" }));
+    }
   } catch (e) {
     await cancelOAuthAttempt(provider);
     if (guardId) await endNetworkGuard(guardId);
@@ -5476,6 +6885,7 @@ const AssistantState = {
   activeStream: null,
   pendingCardsById: new Map(),
   pendingCardNodesById: new Map(),
+  confirmAttemptsByPendingId: new Map(),
   lastUsage: null,
   model: null,
   draft: "",
@@ -6537,6 +7947,7 @@ function pendingStatus(pending) {
   const status = pending.status || "pending";
   if (status === "pending" && pending.expires_at_ms && Date.now() >= Number(pending.expires_at_ms)) {
     updateAgentPendingStatus(pending, "expired");
+    clearAgentPendingAuthority(pending);
     return "expired";
   }
   return status;
@@ -6547,24 +7958,100 @@ function updateAgentPendingStatus(record, status) {
   if (typeof record.onDisplayStatus === "function") record.onDisplayStatus(status);
 }
 
+function clearAgentPendingAuthority(record) {
+  if (!record) return;
+  AssistantState.confirmAttemptsByPendingId.delete(record.pending_id);
+  record.token = "";
+  record.action_hash = "";
+  record.session_id = "";
+  record.turn_request_id = "";
+  record.turn_id = "";
+}
+
+function getOrCreateAgentConfirmAttempt(record) {
+  const existing = AssistantState.confirmAttemptsByPendingId.get(record.pending_id);
+  if (existing) return existing;
+  const request = Object.freeze({
+    request_id: crypto.randomUUID(),
+    session_id: record.session_id,
+    turn_request_id: record.turn_request_id,
+    turn_id: record.turn_id,
+    pending: record.pending_id,
+    token: record.token,
+    action_hash: record.action_hash,
+  });
+  const attempt = { request, phase: "prepared" };
+  AssistantState.confirmAttemptsByPendingId.set(record.pending_id, attempt);
+  return attempt;
+}
+
 async function confirmAgentPending(pendingId) {
   const record = pendingRecord(pendingId);
-  if (!record || !record.token || !record.action_hash) return;
+  if (record && typeof record.preview === "string" && record.preview.startsWith("isyncyou-recovery-review-v1\n") && !record.recoveryReviewReady) { toast("Load the complete recovery review before confirming.","err"); return; }
+  if (!record || !record.token || !record.action_hash || !record.session_id
+      || !record.turn_request_id || !record.turn_id) return;
+  const attempt = getOrCreateAgentConfirmAttempt(record);
+  attempt.phase = "submitted";
   updateAgentPendingStatus(record, "confirming");
   record.error = "";
   rerenderPendingCards(pendingId);
   try {
-    const d = await postJson("/api/v1/agent/confirm", CAP.agent, {
-      request_id: crypto.randomUUID(), pending: pendingId,
-      token: record.token, action_hash: record.action_hash,
-    });
+    await postJson("/api/v1/agent/confirm", CAP.agent, attempt.request, MUTATION_COMMIT_TIMEOUT_MS);
     updateAgentPendingStatus(record, "confirmed");
-    record.result = "Completed successfully.";
-    record.token = "";
-    record.action_hash = "";
+    if (Array.isArray(record.uploadKeys)) {
+      try {
+        for (const key of record.uploadKeys) localStorage.removeItem(key);
+        record.uploadKeys = [];
+        if (Array.isArray(record.uploadIds) && record.uploadAccount && CAP.mutationIntent) {
+          for (const intent_id of record.uploadIds) {
+            try { await postJson("/api/v1/mutation-intent/cancel",CAP.mutationIntent,{request_id:crypto.randomUUID(),intent_id,account:record.uploadAccount,release_confirmed:true}); } catch (_) { /* Retain server receipt if cleanup is unavailable. */ }
+          }
+          record.uploadIds=[];
+        }
+      } catch (_) { /* Retain tracking when browser storage is unavailable. */ }
+    }
+    record.result = record.success_result || (typeof record.preview === "string" && record.preview.startsWith("isyncyou-mail-confirm-v1\n")
+      ? "Message submitted. Delivery has not yet been verified."
+      : typeof record.preview === "string" && record.preview.startsWith("Change contact name ")
+        ? "Contact update confirmed; local synchronization may be pending."
+        : "Completed successfully.");
+    clearAgentPendingAuthority(record);
   } catch (e) {
-    updateAgentPendingStatus(record, "error");
-    record.error = agentCompactValue(e.message || e, 180);
+    if (e && e.nativePromptDenied) {
+      AssistantState.confirmAttemptsByPendingId.delete(pendingId);
+      updateAgentPendingStatus(record, "pending");
+      record.error = nativeConfirmationMessage("cancelled");
+    } else if ((record.capture_operation || record.photo_operation || (typeof record.preview === "string" && record.preview.startsWith("Change contact photo for account "))) && (!e || !e.responseReceived || e.code === "confirmation_retryable")) {
+      updateAgentPendingStatus(record, "outcome_unknown");
+      record.error = record.capture_operation ? "The capture outcome is unknown. Check its status; do not repeat the request." : "The contact photo update outcome is unknown. Check the contact before making another change.";
+      clearAgentPendingAuthority(record);
+    } else if (!e || !e.responseReceived || e.code === "confirmation_retryable") {
+      attempt.phase = "retryable";
+      updateAgentPendingStatus(record, "retryable");
+      record.error = "Confirmation was not completed. Retry uses the same request.";
+    } else if (e.code === "confirmation_outcome_unknown"
+        || e.code === "request_outcome_unknown") {
+      updateAgentPendingStatus(record, "outcome_unknown");
+      record.error = "The action outcome could not be verified.";
+      clearAgentPendingAuthority(record);
+    } else {
+      const status = e.code === "confirmation_expired" ? "expired"
+        : e.code === "confirmation_cancelled" ? "cancelled" : "failed";
+      updateAgentPendingStatus(record, status);
+      record.error = status === "expired" ? "Confirmation expired."
+        : status === "cancelled" ? "Confirmation was cancelled."
+        : e.code === "provider_submission_rejected" || e.code === "provider_action_rejected" ? "The provider rejected the action."
+        : e.code === "capture_preflight_source" ? "The source could not be read before the capture was claimed; no capture was sent."
+        : e.code === "capture_preflight_version_changed" ? "The source changed before the capture was claimed; no capture was sent. Review the current version."
+        : e.code === "capture_preflight_challenge" ? "Capture authorization could not be prepared; no capture was sent."
+        : e.code === "capture_preflight_journal" ? "The capture journal could not be prepared; no capture was sent."
+        : e.code === "mail_pre_dispatch_failed" ? "The message could not be prepared; this attempt did not submit it."
+        : e.code === "provider_conflict" ? "The item changed before the update. Review the current version."
+        : e.code === "dav_discovery_unavailable_before_write" ? "The calendar could not be reached. This attempt did not send a write."
+        : e.code === "dav_pre_dispatch_failed" ? "The update could not be prepared. This attempt did not send a write."
+        : "The action was not confirmed.";
+      clearAgentPendingAuthority(record);
+    }
   }
   rerenderPendingCards(pendingId);
 }
@@ -6589,8 +8076,7 @@ async function cancelAgentPending(pendingId) {
       action_hash: record.action_hash,
     });
     updateAgentPendingStatus(record, "cancelled");
-    record.token = "";
-    record.action_hash = "";
+    clearAgentPendingAuthority(record);
     closeAssistantStream("pending-cancel");
   } catch (e) {
     updateAgentPendingStatus(record, "error");
@@ -6615,24 +8101,39 @@ async function cancelAgentTurn(turnId) {
   }
 }
 
+function loadBoundRecoveryReview(pending) {
+  return request("GET","/api/v1/agent/recovery/review?"+qs({pending:pending.pending_id,action_hash:pending.action_hash,session_id:pending.session_id,turn_request_id:pending.turn_request_id,turn_id:pending.turn_id}),{capToken:CAP.agent,timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS});
+}
+
 function renderAgentPendingCard(pending, trackNode = true) {
   const status = pendingStatus(pending);
   const risk = pending.risk ? `Risk: ${pending.risk}` : "Review required";
-  const done = status === "confirmed" || status === "cancelled";
+  const done = ["confirmed", "cancelled", "expired", "failed", "outcome_unknown"]
+    .includes(status);
   const waiting = status === "confirming" || status === "cancelling";
   const confirmDisabled = waiting || done || status === "expired";
   const cancelDisabled = waiting || done;
   const confirm = el("button", { class: "btn primary sm", type: "button", onclick: () => confirmAgentPending(pending.pending_id), "data-agent-pending-confirm": "1" },
-    icon("check", "icon-sm"), status === "confirming" ? "Confirming…" : "Confirm");
+    icon("check", "icon-sm"), status === "confirming" ? "Confirming…"
+      : status === "retryable" ? "Retry" : "Confirm");
   const cancel = el("button", { class: "btn sm", type: "button", onclick: () => cancelAgentPending(pending.pending_id), "data-agent-pending-cancel": "1" },
     icon("x", "icon-sm"), status === "cancelling" ? "Cancelling…" : "Cancel");
   if (confirmDisabled) confirm.setAttribute("disabled", "disabled");
+  const recoveryReview = !done && typeof pending.preview === "string" && pending.preview.startsWith("isyncyou-recovery-review-v1\n");
+  if (recoveryReview && !pending.recoveryReviewReady) confirm.setAttribute("disabled","disabled");
   if (cancelDisabled) cancel.setAttribute("disabled", "disabled");
+  let mailPreview = null;
+  if (typeof pending.preview === "string" && pending.preview.startsWith("isyncyou-mail-confirm-v1\n")) {
+    try { mailPreview = JSON.parse(pending.preview.slice("isyncyou-mail-confirm-v1\n".length)); } catch (_) {}
+  }
   const title = status === "confirmed" ? "Action confirmed"
     : status === "cancelled" ? "Action cancelled"
-      : pending.preview || "Action requires confirmation";
+      : status === "expired" ? "Confirmation expired"
+        : status === "outcome_unknown" ? "Outcome needs review"
+          : status === "failed" ? "Action not confirmed"
+      : mailPreview ? "Review email before submission" : typeof pending.preview === "string" && pending.preview.includes("\n") ? "Review action" : pending.preview || "Action requires confirmation";
   const terminalResult = pending.result
-    || (status === "cancelled" ? "No changes were made." : "");
+    || (status === "cancelled" ? (pending.cancelled_result || "No changes were made.") : "");
   const card = el("div", {
     class: "asst-pending-card " + status,
     "data-agent-pending-card": "1",
@@ -6645,6 +8146,54 @@ function renderAgentPendingCard(pending, trackNode = true) {
     terminalResult ? el("div", { class: "asst-pending-result", text: terminalResult }) : null,
     pending.error ? el("div", { class: "asst-pending-error", text: pending.error }) : null,
     done ? null : el("div", { class: "asst-pending-actions" }, confirm, cancel));
+  if (!done && mailPreview) {
+    const details = el("div", { class: "asst-pending-mail", style: "max-height:28rem;overflow:auto;white-space:pre-wrap" });
+    details.append(el("p", { text: String(mailPreview.summary || "") }), el("p", { text: `Account: ${mailPreview.account || ""}\nSubject: ${mailPreview.subject || ""}\nSource: live provider` }));
+    const addresses = values => Array.isArray(values) ? values.map(value => value && value.email || "").filter(Boolean).join(", ") : "";
+    details.append(el("p", { text: `From: ${addresses(mailPreview.from)}\nSender: ${addresses(mailPreview.sender)}\nReply-To: ${addresses(mailPreview.reply_to)}\nTo: ${addresses(mailPreview.to)}\nCc: ${addresses(mailPreview.cc)}\nBcc: ${addresses(mailPreview.bcc)}\nImportance: ${mailPreview.importance_observed ? (mailPreview.importance || "not specified") : "not returned"}\nRead receipt requested from: ${mailPreview.read_receipt_observed ? (addresses(mailPreview.read_receipt) || "none") : "not returned"}` }));
+    for (const part of Array.isArray(mailPreview.bodies) ? mailPreview.bodies : []) {
+      if (part.kind === "html") {
+        const frame = el("iframe", { title: "Sanitized email content", sandbox: "", style: "width:100%;height:18rem;border:1px solid currentColor" });
+        frame.srcdoc = '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; img-src data:; style-src \'unsafe-inline\'">' + String(part.content || "");
+        details.append(frame);
+      } else details.append(el("pre", { style: "white-space:pre-wrap;overflow-wrap:anywhere", text: String(part.content || "") }));
+    }
+    const attachments = Array.isArray(mailPreview.attachments) ? mailPreview.attachments : [];
+    details.append(el("p", { text: attachments.length ? `Attachments (${attachments.length}):` : "Attachments: none" }));
+    for (const attachment of attachments) details.append(el("p", { text: `${attachment.name} · ${attachment.type} · ${attachment.size} bytes · ${attachment.blob_id}` }));
+    card.insertBefore(details, card.querySelector(".asst-pending-actions"));
+  }
+  if (!done && !mailPreview && !recoveryReview && typeof pending.preview === "string" && pending.preview.includes("\n")) {
+    const text=pending.preview.startsWith("isyncyou-recovery-jobs-v1\n") ? pending.preview.split("\n").slice(2).join("\n") : pending.preview;
+    const details = el("pre", { class: "asst-pending-meta", style: "max-height:28rem;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere", text, tabindex: "0" });
+    card.insertBefore(details, card.querySelector(".asst-pending-actions"));
+  }
+  if (recoveryReview) {
+    const details=el("div",{class:"asst-pending-meta"},el("p",{text:"Loading the bound recovery review…"}));
+    card.insertBefore(details,card.querySelector(".asst-pending-actions"));
+    const show=effect=>{
+      details.replaceChildren(el("p",{text:`Destination: ${effect.origin || ""} · ${effect.collection || ""}. ${effect.effects || ""}`}));
+      if (effect.collection_creation) {
+        const plan=effect.collection_creation.intent || {};
+        details.append(el("p",{text:`A personal Recovered collection may be created before import. Account: ${plan.account_id || ""}; service: ${plan.service || ""}; principal: ${plan.principal || ""}; home: ${plan.home || ""}; target: ${plan.target || ""}; operation: ${plan.operation_id || ""}.`}));
+      }
+      const order=Array.isArray(effect.execution_order) ? effect.execution_order : [];
+      const objects=Array.isArray(effect.objects) ? effect.objects : [];
+      const projections=Array.isArray(effect.projections) ? effect.projections : [];
+      if (!order.length || order.length!==projections.length || order.length!==objects.length) { details.append(el("p",{text:"The recovery review is incomplete."})); return; }
+      order.forEach((operation,index)=>{
+        const source=objects.find(item=>item.operation_id===operation);
+        if (!source) return;
+        const group=el("details",{open:"open"},el("summary",{text:`${index+1}. ${source.kind}: ${source.label || "Untitled historical object"}`}));
+        if (projections[index]?.preview_truncated === true) group.append(el("p",{text:"The contact preview is incomplete. Additional properties or photos are not shown; the complete original remains bound to the displayed digest."}));
+        group.append(el("pre",{style:"white-space:pre-wrap;overflow-wrap:anywhere",text:JSON.stringify(projections[index],null,2)})); details.append(group);
+      });
+      if (order.some(operation=>!objects.some(item=>item.operation_id===operation))) { details.append(el("p",{text:"The recovery review is incomplete."})); return; }
+      pending.recoveryReviewReady=true; pending.recoveryReview=effect; if (!confirmDisabled) confirm.removeAttribute("disabled");
+    };
+    if (pending.recoveryReviewReady && pending.recoveryReview) show(pending.recoveryReview);
+    else loadBoundRecoveryReview(pending).then(show).catch(()=>{details.replaceChildren(el("p",{text:"The bound recovery review could not be loaded. Confirmation remains unavailable."}));});
+  }
   if (trackNode && pending.pending_id) {
     const nodes = AssistantState.pendingCardNodesById.get(pending.pending_id) || new Set();
     nodes.add(card);
@@ -6701,6 +8250,20 @@ function agentSafeErrorCopy(code) {
     provider_response_read_failed: "The provider response could not be read.",
     provider_response_incomplete: "The AI account stopped before finishing. Try again.",
     provider_transport_failed: "The provider connection failed.",
+    pending_registration_unavailable: "Confirmation is temporarily unavailable.",
+    pending_owner_mismatch: "Confirmation is temporarily unavailable.",
+    pending_policy_mismatch: "Confirmation is temporarily unavailable.",
+    pending_registration_invalid: "Confirmation is temporarily unavailable.",
+    pending_capacity_unavailable: "Confirmation is temporarily unavailable.",
+    pending_registration_conflict: "Confirmation is temporarily unavailable.",
+    pending_maintenance_unavailable: "Confirmation is temporarily unavailable.",
+    pending_seal_unavailable: "Confirmation is temporarily unavailable.",
+    pending_quota_unavailable: "Confirmation is temporarily unavailable.",
+    pending_database_unavailable: "Confirmation is temporarily unavailable.",
+    pending_commit_unavailable: "Confirmation is temporarily unavailable.",
+    pending_action_invalid: "This action could not be prepared safely.",
+    pending_projection_unavailable: "Confirmation is temporarily unavailable.",
+    pending_transition_unavailable: "Confirmation is temporarily unavailable.",
     confirmation_unavailable: "Confirmation is temporarily unavailable.",
     session_busy: "This shared session is still in use. Try again shortly.",
     session_store_unavailable: "Shared session state is temporarily unavailable. Try again.",
@@ -7372,7 +8935,9 @@ async function handleAgentEvent(message, turnState) {
         preview: d.preview || "Action requires confirmation",
         risk: d.risk || "",
         expires_at_ms: d.expires_at_ms || null,
-        turn_id: turnState.turnId || "",
+        session_id: turnState.ownerProof?.session_id || "",
+        turn_request_id: turnState.ownerProof?.turn_request_id || "",
+        turn_id: turnState.ownerProof?.turn_id || turnState.turnId || "",
         status: "pending",
         result: "",
         error: "",
@@ -7427,7 +8992,7 @@ async function ensureAgentSession() {
   if (AssistantState.selectedSessionId && AssistantState.selectedSessionAccount === App.account) {
     return AssistantState.selectedSessionId;
   }
-  const page = await request("GET", "/api/v1/agent/session/list?limit=100", {
+  const page = await request("GET", "/api/v1/agent/session/list?" + qs({ limit: 100, account: App.account }), {
     capToken: CAP.agent,
   });
   const sessions = Array.isArray(page.sessions) ? page.sessions : [];
@@ -7437,6 +9002,7 @@ async function ensureAgentSession() {
     const created = await postJson("/api/v1/agent/session/create", CAP.agent, {
       request_id: crypto.randomUUID(),
       display_name: "Assistant",
+      account: App.account,
     });
     session = created && created.session;
   }
@@ -7464,6 +9030,8 @@ function sessionRecordsToTranscript(records) {
       completed: "Action completed.",
       cancelled: "Action cancelled. No changes were made.",
       failed: "Action did not complete.",
+      provider_rejected: "The provider rejected the action.",
+      provider_conflict: "The item changed before the update. Review the current version.",
       outcome_unknown: "The action outcome could not be verified.",
     };
     return copy[code] || "Action status updated.";
@@ -8147,6 +9715,7 @@ async function agentSend(text) {
     },
     isCurrent: isCurrentTurn,
     turnId: turn,
+    ownerProof: activityIdentity,
     finish,
     reconcileRequestStatus,
   };
@@ -8210,7 +9779,7 @@ async function agentSend(text) {
       if (AssistantState.activeMessage !== asst || AssistantState.activeTurnId !== turn) return;
       finish("⚠ connection lost");
     })();
-  });
+  }, CAP.agent);
   stream = openTurnStream();
   AssistantState.activeStream = stream;
   AssistantState.turnStreamReady = true;
@@ -8223,18 +9792,33 @@ const ACCOUNT_ROLE_META = Object.freeze({
 });
 function accountRoleStatus(a, role) {
   const value = a && a.auth && a.auth[role];
-  return value && ["connected", "disconnected", "reconnect_required"].includes(value.state)
+  return value && ["connected", "disconnected", "reconnect_required", "permission_denied", "access_unknown", "service_unreachable", "provider_response_invalid"].includes(value.state)
     ? value : { state: "disconnected", identity_verified: false };
 }
 function accountRoleStateLabel(status) {
-  if (status.state === "connected") return status.identity_verified ? "Connected" : "Connected · verification pending";
-  if (status.state === "reconnect_required") return "Reconnect required";
+  if (status.state === "connected") return status.identity_verified ? "Connected" : "Connected · last access observed; identity verification pending";
+  if (status.state === "reconnect_required") return "Sign-in required";
+  if (status.state === "permission_denied") return "Access denied · check account permissions";
+  if (status.state === "access_unknown") return "Access could not be verified";
+  if (status.state === "service_unreachable") return "Mail service unreachable";
+  if (status.state === "provider_response_invalid") return "Mail service response invalid or unsupported";
   return "Not connected";
 }
 async function reloadAccounts() {
   const current = App.account;
   const data = await api("/api/v1/accounts");
-  App.accounts = data.accounts || [];
+  const nextAccounts = data.accounts || [];
+  const previously = (App.accounts || []).find(account => account.id === current);
+  const next = nextAccounts.find(account => account.id === current);
+  const lostReader = previously && previously.provider !== "self_hosted" &&
+    accountRoleStatus(previously, "reader").state === "connected" &&
+    (!next || accountRoleStatus(next, "reader").state !== "connected");
+  const cachedReaderLost = [...MailSnapshot.entries.keys(), ...MailSnapshot.inflight.keys()].some(id => {
+    const account = nextAccounts.find(item => item.id === id);
+    return !account || account.provider === "self_hosted" || accountRoleStatus(account, "reader").state !== "connected";
+  });
+  if (lostReader || cachedReaderLost) clearMailSnapshots();
+  App.accounts = nextAccounts;
   App.account = App.accounts.some((account) => account.id === current)
     ? current : (App.accounts[0] && App.accounts[0].id) || null;
 }
@@ -8243,15 +9827,156 @@ function renderAccountMenu(body) {
   clear(body);
   App.accounts.forEach(a => {
     const active = a.id === App.account;
-    const accountLabel = accountDisplayLabel(a);
+    const accountLabel = accountSelectionLabel(a);
     const row = el("div", { class: "acct-row" + (active ? " active" : "") });
     row.append(el("div", { class: "acct-main" },
       el("span", { class: "avatar mail-av", style: "--c:var(--accent)", text: initials(accountLabel) }),
-      el("button", { class: "acct-pick grow", title: "Switch to this account", onclick: () => { if (!active) { App.account = a.id; toast("Switched to " + accountLabel); closeAccountMenu(); onRoute(); } } },
+      el("button", { class: "acct-pick grow", title: "Switch to this account", onclick: () => { if (!active) { App.account = a.id; App.counts = {}; toast("Switched to " + accountLabel); } closeAccountMenu(); if (!active) onRoute(); } },
         el("div", { class: "truncate", text: accountLabel }),
-        el("div", { class: "dim", style: "font-size:11px", text: active ? "Currently selected" : "Microsoft 365 account" })),
+        el("div", { class: "dim", style: "font-size:11px", text: active ? "Currently selected" : (a.provider === "self_hosted" ? "Self-hosted account" : "Microsoft 365 account") })),
       active ? icon("check", "icon-sm") : null));
-    if (CAP.account) {
+    if (CAP.account && a.provider === "self_hosted") {
+      const providerStatus = accountRoleStatus(a, "reader");
+      const connected = ["connected", "permission_denied", "access_unknown", "service_unreachable", "provider_response_invalid"].includes(providerStatus.state);
+      const controls = el("div", { class: "acct-acts" });
+      const connectButton = el("button", { class: "btn sm", disabled: providerActionsUnknown.has(a.id) || (BRIDGE && !connected) ? "disabled" : null, onclick: () => providerAccountAction(a, body, connected) }, connected ? "Disconnect" : "Connect");
+      controls.append(connectButton);
+      if (BRIDGE && !connected) {
+        const logoutRecovery = el("button", { class:"btn sm", type:"button", style:"display:none", onclick:() => providerAccountAction(a, body, true) }, "Continue disconnect");
+        const logoutNotice = el("span", { class:"dim", style:"display:none" });
+        controls.append(logoutRecovery, logoutNotice);
+        const resolveButton = el("button", { class:"btn sm", type:"button", style:providerActionsUnknown.has(a.id) ? "" : "display:none", onclick:async () => {
+        try {
+          const result = await nativeCall("providerAuthResolve", { account:a.id }, PROVIDER_NATIVE_TIMEOUT_MS);
+          if (result && result.status === "cleared") { providerActionsUnknown.delete(a.id); await reloadAccounts(); renderAccountMenu(body); toast("Local waiting state cleared. The server grant was not checked or revoked."); }
+          else toast("The local waiting state was kept.");
+        } catch (_) { toast("The sign-in state could not be resolved. No server grant status was established.", "err"); }
+        } }, "Resolve sign-in");
+        controls.append(resolveButton);
+        const cancelPendingButton = el("button", { class:"btn sm", type:"button", style:"display:none", onclick:async event => {
+          const button=event.currentTarget; button.disabled=true;
+          try {
+            const result=await nativeCall("providerAuthCancelPending",{account:a.id},PROVIDER_NATIVE_TIMEOUT_MS);
+            if (result && result.cancelled === true) { await reloadAccounts(); renderAccountMenu(body); toast("Pending browser sign-in cancelled."); }
+            else { toast("The pending sign-in was not cancelled.","err"); button.disabled=false; }
+          } catch (_) { toast("The sign-in state changed or could not be cancelled.","err"); button.disabled=false; }
+        } }, "Cancel pending sign-in");
+        controls.append(cancelPendingButton);
+        void nativeCall("providerStatus", { account:a.id }, NATIVE_TIMEOUT_MS).then(status => {
+          if (!controls.isConnected) return;
+          if (!status || status.logout_recovery !== "none") {
+            connectButton.disabled = true;
+            if (status && status.logout_recovery === "resume") { logoutRecovery.style.display = ""; logoutNotice.textContent = "Disconnect needs completion."; }
+            else { logoutNotice.textContent = "Disconnect needs manual recovery."; }
+            logoutNotice.style.display = "";
+          } else if (status.auth_state === "outcome_unknown") { providerActionsUnknown.add(a.id); connectButton.disabled = true; resolveButton.style.display = ""; }
+          else if (status.auth_state === "pending" && !providerActionsUnknown.has(a.id)) { connectButton.disabled=true; cancelPendingButton.style.display=""; }
+          else if (status.auth_state === "idle" && !providerActionsUnknown.has(a.id)) connectButton.disabled = false;
+        }).catch(() => {});
+      }
+      row.append(el("div", { class: "acct-role acct-provider-status" },
+        el("span", { class: "acct-role-copy" }, el("b", { text: "Self-hosted account" }),
+          el("span", { class: "dim", text: accountRoleStateLabel(providerStatus) }),
+          el("span", { class: "dim", text: "Conflict and retry history: unknown" })), controls));
+      {
+        const listQuarantine = BRIDGE
+          ? nativeCall("providerQuarantineList", { account: a.id }, NATIVE_TIMEOUT_MS)
+          : postJson("/api/v1/account/provider/quarantine/list", CAP.account, { request_id: crypto.randomUUID(), account: a.id });
+        void listQuarantine.then(result => {
+          if (!result || !Array.isArray(result.ids) || !result.ids.length) return;
+          const notice = el("div", { class: "acct-role acct-provider-notice" }, el("span", { class: "acct-role-copy", text: "A rejected sign-in has a grant whose revocation is pending." }));
+          result.ids.forEach(id => {
+            if (typeof id !== "string" || !/^[a-f0-9]{64}$/.test(id)) return;
+            notice.append(el("button", { class: "btn sm", text: "Retry revocation", onclick: async e => {
+              const button = e.currentTarget;
+              button.disabled = true;
+              try {
+                const outcome = BRIDGE
+                  ? await nativeCall("providerQuarantineRevoke", { account: a.id, recovery_id: id }, PROVIDER_NATIVE_TIMEOUT_MS)
+                  : await postJson("/api/v1/account/provider/quarantine/revoke", CAP.account, { request_id: crypto.randomUUID(), account: a.id, recovery_id: id });
+                if (!outcome || outcome.revoked !== true) throw new Error("revocation_unconfirmed");
+                toast("Grant revocation confirmed.");
+                renderAccountMenu(body);
+              } catch (_) { toast("Grant revocation is unconfirmed. Check status before taking further action.", "err"); }
+            } }));
+          });
+          row.append(notice);
+        }).catch(() => {});
+      }
+      if (BRIDGE && connected) {
+        const pushStatus = el("span", { class: "dim", text: "Checking push setup…" });
+        const setup = el("button", {class:"btn sm",type:"button"}, "Set up");
+        const reconcile = el("button", {class:"btn sm",type:"button",style:"display:none"}, "Resolve uncertain setup");
+        const detach = el("button", {class:"btn sm",type:"button",style:"display:none"}, "Remove local connector");
+        const replacement = el("button", {class:"btn sm",type:"button",style:"display:none"}, "Register replacement");
+        const retryReplacement = el("button", {class:"btn sm",type:"button",style:"display:none"}, "Review replacement retry");
+        const showPush = result => {
+          const state = result && result.status;
+          const labels = { not_registered: "Not configured", configuration_required: "Configuration required", registering: "Registering", endpoint_received: "Endpoint received", credentials_ready: "Configure distributor", credentials_expired: "Push preparation expired", awaiting_proof: "Awaiting verification", verification_pending: "Verification pending", active: "Registered", degraded: "Delayed", account_changed: "Push configuration must be reviewed", create_unknown: "Enrollment outcome unknown", delivery_unknown: "Verification outcome unknown", prepare_unknown: "Push setup outcome unknown", prepare_cancel_unknown: "Setup cancellation outcome unknown", prepare_cancelled: "Uncertain preparation cancelled", prepare_cancel_conflict: "A server binding remains; review required", distributor_detached: "Local connector removed; distributor acknowledgement unknown", distributor_unregister_unknown: "Local connector removal outcome unknown", replacement_revoke_retry_ready: "Previous replacement revoke can be retried", broker_bound_logout: "Push remains bound; sign out again to finish removal", broker_revoked_logout: "Push revoked; sign out again to finish local cleanup", unavailable: "Unavailable" };
+          const uncertain = state === "prepare_unknown" || state === "prepare_cancel_unknown" || state === "credentials_expired";
+          setup.disabled = !state || uncertain || ["prepare_cancel_conflict","prepare_cancelled","distributor_detached","distributor_unregister_unknown","replacement_revoke_retry_ready","broker_bound_logout","broker_revoked_logout"].includes(state);
+          reconcile.style.display = uncertain ? "" : "none";
+          detach.style.display = state === "prepare_cancelled" ? "" : "none";
+          replacement.style.display = state === "distributor_detached" ? "" : "none";
+          retryReplacement.style.display = state === "replacement_revoke_retry_ready" ? "" : "none";
+          const observedTime = value => {
+            const seconds = typeof value === "number" ? value : NaN;
+            const date = new Date(seconds * 1000);
+            return Number.isFinite(seconds) && seconds > 0 && Number.isFinite(date.getTime()) ? date.toLocaleString() : "unknown";
+          };
+          const lastHint = observedTime(result && result.last_hint_at);
+          const lastSync = observedTime(result && result.last_sync_at);
+          pushStatus.textContent = (labels[state] || "Status unavailable") + (result && result.endpoint_change_pending === true ? " · A distributor endpoint change is pending review" : "") + (result && result.catch_up_pending ? " · Catch-up pending" : "") + ` · Last push hint: ${lastHint} · Last push-triggered account sync: ${lastSync}`;
+        };
+        const refreshPush = () => nativeCall("providerPushStatus", { account: a.id }, NATIVE_TIMEOUT_MS).then(showPush).catch(() => showPush(null));
+        setup.addEventListener("click",async () => {
+          setup.disabled=true;
+          try { showPush(await nativeCall("providerPushSetup", { account: a.id }, PROVIDER_NATIVE_TIMEOUT_MS)); }
+          catch (_) { toast("Push setup outcome could not be confirmed. Check its status before taking further action.", "err"); await refreshPush(); }
+        });
+        reconcile.addEventListener("click",() => {
+          const explanation=el("div",{class:"compose"},el("p",{text:"The push preparation has expired or its server outcome is unknown. This action asks the server to cancel the preparation and checks whether a binding remains. It does not remove an existing binding or sign you out."}));
+          explanation.append(el("button",{class:"btn sm",type:"button",onclick:async event=>{
+            const button=event.currentTarget;button.disabled=true;reconcile.disabled=true;
+            try {
+              const outcome=await nativeCall("providerPushCancelPrepare",{account:a.id},PROVIDER_NATIVE_TIMEOUT_MS);
+              if (outcome && outcome.status==="cancelled") toast("Uncertain setup cancelled; no server binding remains.");
+              else if (outcome && outcome.status==="binding_present") toast("A server binding remains. Review it before setting up push again.","err");
+              else throw new Error("unconfirmed");
+              closeSheet();await refreshPush();
+            } catch (_) {toast("The result remains unknown. No automatic retry was sent; check status before deciding what to do.","err");await refreshPush();}
+            finally {reconcile.disabled=false;}
+          }},"Confirm cancellation and check"));
+          openSheet("Resolve uncertain push setup",explanation);
+        });
+        detach.addEventListener("click",()=>{
+          const content=el("div",{class:"compose"},el("p",{text:"Remove this local connector and send an unregister broadcast. This does not prove the distributor or server acknowledged removal."}));
+          content.append(el("button",{class:"btn sm",type:"button",onclick:async event=>{event.currentTarget.disabled=true;detach.disabled=true;try {const result=await nativeCall("providerPushDetachCancelled",{account:a.id},PROVIDER_NATIVE_TIMEOUT_MS);if(!result || result.status!=="detached") throw new Error("unconfirmed");toast("Local connector removed; distributor acknowledgement is not known.");closeSheet();await refreshPush();} catch (_) {toast("Connector removal outcome is unknown. No automatic retry was sent.","err");await refreshPush();} finally {detach.disabled=false;}}},"Confirm local removal"));
+          openSheet("Remove local connector",content);
+        });
+        replacement.addEventListener("click",()=>{
+          const content=el("div",{class:"compose"},el("p",{text:"After configuring the distributor, explicitly request a replacement connector. Registration starts now; a new endpoint must be received and verified separately."}));
+          content.append(el("button",{class:"btn sm",type:"button",onclick:async event=>{event.currentTarget.disabled=true;replacement.disabled=true;try {const result=await nativeCall("providerPushRegisterReplacement",{account:a.id},PROVIDER_NATIVE_TIMEOUT_MS);if(!result || result.status!=="registering") throw new Error("unconfirmed");toast("Replacement registration requested; endpoint not yet received.");closeSheet();await refreshPush();} catch (_) {toast("Registration result is unknown. No automatic retry was sent.","err");await refreshPush();} finally {replacement.disabled=false;}}},"Confirm replacement registration"));
+          openSheet("Register replacement",content);
+        });
+        retryReplacement.addEventListener("click",()=>{
+          const content=el("div",{class:"compose"},el("p",{text:"Retry removal of the previous push binding before handling the changed distributor endpoint. This is a separate action and does not establish delivery."}));
+          content.append(el("button",{class:"btn sm",type:"button",onclick:async event=>{
+            if (App.account!==a.id) return;
+            event.currentTarget.disabled=true;retryReplacement.disabled=true;
+            try {
+              const result=await nativeCall("providerPushRetryReplacement",{account:a.id},PROVIDER_NATIVE_TIMEOUT_MS);
+              if (!result || result.status!=="endpoint_changed") throw new Error("unconfirmed");
+              toast("Retry scheduled; check status for the result.");closeSheet();await refreshPush();
+            } catch (_) { toast("The retry result could not be confirmed. Check status before any further action.","err");await refreshPush(); }
+            finally { retryReplacement.disabled=false; }
+          }},"Confirm retry"));
+          closeAccountMenu();
+          openSheet("Retry previous binding removal",content);
+        });
+        void refreshPush();
+        row.append(el("div", { class: "acct-role acct-provider-push" }, el("span", { class: "acct-role-copy" }, el("b", { text: "Push updates" }), pushStatus), el("div", { class:"acct-acts" }, setup, reconcile, detach, replacement, retryReplacement)));
+      }    } else if (CAP.account) {
       const roles = el("div", { class: "acct-roles" });
       for (const role of ["reader", "writer"]) {
         const meta = ACCOUNT_ROLE_META[role], status = accountRoleStatus(a, role);
@@ -8271,21 +9996,97 @@ function renderAccountMenu(body) {
     }
     body.append(row);
   });
+  if (CAP.account) body.append(el("button", { class: "btn sm", type: "button", onclick: openProviderAccountSetup }, icon("plus", "icon-sm"), "Add self-hosted account"));
   body.append(el("div", { class: "acct-note dim" }, CAP.account
-    ? "Reader and Writer are connected separately for each Microsoft account."
+    ? "Microsoft accounts connect Reader and Writer separately."
     : "Read-only server — account switching only."));
 }
+function openProviderAccountSetup() {
+  closeAccountMenu();
+  const account = el("input", { class: "input", placeholder: "Account identifier" });
+  const username = el("input", { class: "input", placeholder: "Provider username or email" });
+  const origin = el("input", { class: "input", placeholder: "https://provider.example" });
+  const client = el("input", { class: "input", placeholder: "OAuth client ID" });
+  const form = el("div", { class: "compose" },
+    el("p", { class: "dim", text: "Enter the exact provider username or email, provider origin and registered public OAuth client ID. Linux requires an available, unlocked system keyring. No password is stored here." }),
+    account, username, origin, client,
+    el("button", { class: "btn primary", type: "button", onclick: async e => {
+      const button = e.currentTarget;
+      button.disabled = true;
+      const values = { account: account.value.trim(), username: username.value.trim(), origin: origin.value.trim(), client_id: client.value.trim() };
+      try {
+        const result = BRIDGE
+          ? await nativeCall("providerCreateAccount", values, PROVIDER_NATIVE_TIMEOUT_MS)
+          : await postJson("/api/v1/account/provider/create", CAP.account, { request_id: crypto.randomUUID(), ...values });
+        if (!result || result.created !== true) throw new Error("account_setup_failed");
+        await reloadAccounts();
+        closeSheet();
+        toast("Account added. Connect it to sign in.");
+      } catch (error) {
+        if (error.message === "Bridge timeout") {
+          toast("Account creation outcome is unknown. Check the account list before taking further action.", "err");
+          return;
+        }
+        toast("Account could not be added. Check the details and try again.", "err");
+      }
+      button.disabled = false;
+    } }, "Add account"));
+  openSheet("Add self-hosted account", form);
+}
+async function providerAccountAction(a, body, connected) {
+  clearMailSnapshots();
+  if (!BRIDGE) {
+    if (connected) return accountSignOut(a, "reader", body);
+    return startAccountLogin(a, "reader", body);
+  }
+  if (!connected) pendingProviderSignInAccount = a.id;
+  try {
+    const result = await nativeCall(connected ? "providerSignOut" : "providerSignIn", { account: a.id }, PROVIDER_NATIVE_TIMEOUT_MS);
+    if (connected && result && result.connected === false) {
+      await reloadAccounts();
+      toast("Provider account disconnected");
+      renderAccountMenu(body);
+    } else if (!connected && result && result.opened) {
+      toast("Complete sign-in in your browser.");
+    } else throw new Error("provider_auth_unavailable");
+  } catch (error) {
+    if (error.message === "Bridge timeout" || error.reason === "provider_auth_outcome_unknown") {
+      providerActionsUnknown.add(a.id);
+      renderAccountMenu(body);
+      toast(connected ? "The disconnect result is unknown. Check account status before taking further action." : "The sign-in result is unknown. Use Resolve sign-in to inspect the local waiting state.", "err");
+    } else toast("Provider account action failed.", "err");
+  }
+}
+if (typeof window !== "undefined") window.addEventListener("isy-provider-auth", async event => {
+  if (event.detail === "connected") {
+    if (pendingProviderSignInAccount) providerActionsUnknown.delete(pendingProviderSignInAccount);
+    pendingProviderSignInAccount = null;
+    try { await reloadAccounts(); } catch (_) {}
+    toast("Provider account connected");
+  } else if (event.detail === "revocation_pending") toast("Sign-in was rejected and grant revocation is pending. Open the account menu to review it.", "err");
+  else if (event.detail === "revocation_unrecoverable") toast("Sign-in was rejected; revocation is unconfirmed and local recovery is unavailable.", "err");
+  else if (event.detail === "outcome_unknown") { if (pendingProviderSignInAccount) providerActionsUnknown.add(pendingProviderSignInAccount); toast("The sign-in result is unknown. Open the account menu to resolve the local waiting state.", "err"); }
+  else if (event.detail === "failed") toast("Provider sign-in failed.", "err");
+});
 async function accountSignOut(a, role, body) {
+  clearMailSnapshots();
   try {
     const d = await postJson("/api/v1/account/signout", CAP.account, { request_id: crypto.randomUUID(), account: a.id, role });
     await reloadAccounts();
     toast(d.message || `${ACCOUNT_ROLE_META[role].label} disconnected`);
   }
-  catch (_) { toast("Disconnect failed. Try again.", "err"); }
+  catch (_) {
+    if (a.provider === "self_hosted") {
+      providerActionsUnknown.add(a.id);
+      toast("Disconnect outcome is unknown. Check account status before taking further action.", "err");
+    } else toast("Disconnect failed. Try again.", "err");
+  }
   renderAccountMenu(body);
 }
 async function startAccountLogin(a, role, body) {
-  const roleMeta = ACCOUNT_ROLE_META[role];
+  clearMailSnapshots();
+  const ownProvider = a.provider === "self_hosted";
+  const roleMeta = ownProvider ? { label: "Self-hosted account" } : ACCOUNT_ROLE_META[role];
   if (!roleMeta) return;
   await accountMenuCancelPromise.catch(() => false);
   if (accountMenuLogin) {
@@ -8338,19 +10139,19 @@ async function startAccountLogin(a, role, body) {
     try {
       await openExternalAuth(login.authorization_uri, "account_authorize", { newTab: true });
     } catch (_) {
-      toast("Could not open the Microsoft sign-in page.", "err");
+      toast("Could not open the sign-in page.", "err");
     }
   };
-  const status = el("div", { class: "acct-dc-status dim", text: "Waiting for Microsoft sign-in…" });
-  pickerButton = el("button", { class: "btn sm primary", type: "button", onclick: openAccountPicker }, icon("external-link", "icon-sm"), "Open Microsoft account picker");
+  const status = el("div", { class: "acct-dc-status dim", text: ownProvider ? "Waiting for provider sign-in…" : "Waiting for Microsoft sign-in…" });
+  pickerButton = el("button", { class: "btn sm primary", type: "button", onclick: openAccountPicker }, icon("external-link", "icon-sm"), ownProvider ? "Open provider sign-in" : "Open Microsoft account picker");
   clear(body).append(el("div", { class: "acct-dc" },
     el("div", { class: "acct-dc-title", text: `Connect ${roleMeta.label}` }),
-    el("p", { class: "dim", text: "Microsoft will show the available accounts and an option to use another one." }),
+    el("p", { class: "dim", text: ownProvider ? "Complete sign-in with your provider." : "Microsoft will show the available accounts and an option to use another one." }),
     pickerButton,
     status,
     el("button", { class: "btn ghost sm", style: "margin-top:8px", onclick: async () => {
       if (await cancelAccountLogin()) renderAccountMenu(body);
-      else status.textContent = "Completing Microsoft sign-in…";
+      else status.textContent = "Completing sign-in…";
     } }, "Cancel")));
   let consecutivePollFailures = 0;
   const schedulePoll = () => {
@@ -8363,7 +10164,7 @@ async function startAccountLogin(a, role, body) {
     let r;
     try {
       r = await postJson("/api/v1/account/login/poll", CAP.account, { request_id: crypto.randomUUID(), id: login.login_id });
-      if (consecutivePollFailures > 0) status.textContent = "Waiting for Microsoft sign-in…";
+      if (consecutivePollFailures > 0) status.textContent = "Waiting for sign-in…";
       consecutivePollFailures = 0;
     } catch (_) {
       consecutivePollFailures += 1;
@@ -8381,10 +10182,16 @@ async function startAccountLogin(a, role, body) {
       pickerButton.disabled = true;
       await finishAccountLoginGuard(login.login_id);
       await reloadAccounts();
+      if (ownProvider && CAP.sync) {
+        await postJson("/api/v1/sync/now", CAP.sync, { request_id: crypto.randomUUID() }).catch(() => {});
+      }
       toast(`${roleMeta.label} connected`);
       renderAccountMenu(body);
     } else if (r.state === "error") {
       const message = r.code === "account_login_expired" ? "Sign-in expired."
+        : r.code === "account_keyring_unavailable" ? "The system keyring is unavailable. Unlock or configure it, then try again."
+        : r.code === "account_revocation_pending" ? "Sign-in was rejected and grant revocation is still pending."
+        : r.code === "account_revocation_unrecoverable" ? "Sign-in was rejected; revocation is unconfirmed and local recovery is unavailable."
         : r.code === "account_identity_mismatch" ? "Reader and Writer must use the same Microsoft account."
           : r.code === "account_identity_unverified" ? "The Microsoft account could not be verified. Reconnect the other role first."
             : "Sign-in failed.";

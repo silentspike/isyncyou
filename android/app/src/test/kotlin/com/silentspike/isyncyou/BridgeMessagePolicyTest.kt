@@ -8,6 +8,59 @@ import org.junit.Test
 
 class BridgeMessagePolicyTest {
     @Test
+    fun bridgeCapabilitiesRequiresEmptyPayload() {
+        fun envelope(payload: JSONObject): String = JSONObject().put("t", "native").put("id", "d1")
+            .put("op", "bridgeCapabilities").put("payload", payload).toString()
+        assertValid(BridgeMessagePolicy.validateEnvelope(envelope(JSONObject())), "native", "d1")
+        assertInvalid(BridgeMessagePolicy.validateEnvelope(envelope(JSONObject().put("unexpected", true))), "invalid_capabilities_request")
+    }
+
+    @Test
+    fun providerDownloadAcceptsOnlyValidOptionalMailScope() {
+        fun envelope(scope: Any): String = JSONObject().put("t", "native").put("id", "d1")
+            .put("op", "downloadProviderAttachment").put("payload", JSONObject().put("account", "me")
+                .put("id", "m1").put("blob_id", "b1").put("filename", "file.txt").put("mail_scope", scope)).toString()
+        assertValid(BridgeMessagePolicy.validateEnvelope(envelope("shared/account")), "native", "d1")
+        assertInvalid(BridgeMessagePolicy.validateEnvelope(envelope("")), "invalid_attachment")
+        assertInvalid(BridgeMessagePolicy.validateEnvelope(envelope("bad\u0001scope")), "invalid_attachment")
+        assertInvalid(BridgeMessagePolicy.validateEnvelope(envelope(42)), "invalid_attachment")
+    }
+
+    @Test
+    fun providerDownloadRejectsUnknownFieldsAndUnsafeAccount() {
+        fun envelope(account: String, extra: Boolean = false): String {
+            val payload = JSONObject().put("account", account).put("id", "m1")
+                .put("blob_id", "b1").put("filename", "file.txt")
+            if (extra) payload.put("url", "https://example.test")
+            return JSONObject().put("t", "native").put("id", "d1")
+                .put("op", "downloadProviderAttachment").put("payload", payload).toString()
+        }
+        assertValid(BridgeMessagePolicy.validateEnvelope(envelope("me")), "native", "d1")
+        assertInvalid(BridgeMessagePolicy.validateEnvelope(envelope("../bad")), "invalid_attachment")
+        assertInvalid(BridgeMessagePolicy.validateEnvelope(envelope("me", true)), "invalid_attachment")
+    }
+    @Test
+    fun providerOperationsAcceptOnlyAccountIdentifiers() {
+        for (op in listOf("providerSignIn", "providerStatus", "providerSignOut", "providerPushSetup", "providerPushStatus", "providerPushCancelPrepare", "providerPushDetachCancelled", "providerPushRegisterReplacement", "providerPushRetryReplacement", "providerQuarantineList", "providerAuthResolve", "providerAuthCancelPending")) {
+            fun envelope(payload: JSONObject) = JSONObject().put("t", "native").put("id", "p1")
+                .put("op", op).put("payload", payload).toString()
+            assertValid(BridgeMessagePolicy.validateEnvelope(envelope(JSONObject().put("account", "me"))), "native", "p1")
+            assertInvalid(BridgeMessagePolicy.validateEnvelope(envelope(JSONObject().put("account", "../other"))), "invalid_account")
+            assertInvalid(BridgeMessagePolicy.validateEnvelope(envelope(JSONObject().put("account", "me").put("url", "https://evil.test"))), "invalid_account")
+        }
+        fun revoke(recovery: String) = JSONObject().put("t", "native").put("id", "r1")
+            .put("op", "providerQuarantineRevoke")
+            .put("payload", JSONObject().put("account", "me").put("recovery_id", recovery)).toString()
+        assertValid(BridgeMessagePolicy.validateEnvelope(revoke("a".repeat(64))), "native", "r1")
+        assertInvalid(BridgeMessagePolicy.validateEnvelope(revoke("bad")), "invalid_recovery")
+    }
+    @Test fun reminderStatusRequiresEmptyPayload() {
+        fun envelope(payload: JSONObject) = JSONObject().put("t", "native").put("id", "s1")
+            .put("op", "providerReminderStatus").put("payload", payload).toString()
+        assertValid(BridgeMessagePolicy.validateEnvelope(envelope(JSONObject())), "native", "s1")
+        assertInvalid(BridgeMessagePolicy.validateEnvelope(envelope(JSONObject().put("account", "me"))), "unknown_field")
+    }
+    @Test
     fun android_bridge_forwards_only_bounded_public_progress_projection() {
         val event = JSONObject()
             .put("event", "stage_progress")
@@ -122,6 +175,18 @@ class BridgeMessagePolicyTest {
             "s1",
         )
         assertValid(
+            BridgeMessagePolicy.validateEnvelope(
+                JSONObject()
+                    .put("t", "sub")
+                    .put("id", "s2")
+                    .put("path", "/api/v1/agent/stream?turn=turn-1")
+                    .put("cap_token", "a".repeat(32))
+                    .toString(),
+            ),
+            "sub",
+            "s2",
+        )
+        assertValid(
             BridgeMessagePolicy.validateEnvelope(JSONObject().put("t", "unsub").put("id", "u1").toString()),
             "unsub",
             "u1",
@@ -137,6 +202,33 @@ class BridgeMessagePolicyTest {
             BridgeMessagePolicy.validateEnvelope(JSONObject().put("t", "bio").put("id", "b2").toString()),
             "missing_pat",
         )
+    }
+
+    @Test
+    fun android_agent_stream_subscription_requires_cap_and_never_logs_or_reflects_it() {
+        val agent = JSONObject()
+            .put("t", "sub")
+            .put("id", "agent")
+            .put("path", "/api/v1/agent/stream?turn=turn-1")
+        assertInvalid(BridgeMessagePolicy.validateEnvelope(agent.toString()), "invalid_capability")
+        agent.put("cap_token", "A".repeat(32))
+        assertInvalid(BridgeMessagePolicy.validateEnvelope(agent.toString()), "invalid_capability")
+        agent.put("cap_token", "a".repeat(31))
+        assertInvalid(BridgeMessagePolicy.validateEnvelope(agent.toString()), "invalid_capability")
+        agent.put("cap_token", "0".repeat(32))
+        assertValid(BridgeMessagePolicy.validateEnvelope(agent.toString()), "sub", "agent")
+
+        val events = JSONObject()
+            .put("t", "sub")
+            .put("id", "events")
+            .put("path", "/api/v1/events")
+            .put("cap_token", "0".repeat(32))
+        assertInvalid(
+            BridgeMessagePolicy.validateEnvelope(events.toString()),
+            "unexpected_capability",
+        )
+        val accepted = BridgeMessagePolicy.validateEnvelope(agent.toString())
+        assertFalse(accepted.toString().contains("0".repeat(32)))
     }
 
     @Test

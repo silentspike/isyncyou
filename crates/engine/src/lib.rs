@@ -22,17 +22,29 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod calendar_live;
 mod contacts_live;
+pub mod dav_live;
+pub mod dav_write;
 mod mail_live;
 mod mail_restore;
 mod onedrive_live;
 mod onedrive_write;
 mod onenote_live;
+#[cfg(unix)]
+pub mod onenote_mobile_refresh;
+pub mod provider_auth;
+pub mod provider_credential;
+pub mod provider_push;
+pub mod provider_push_broker;
+pub mod provider_setup;
+pub mod provider_store;
 mod restore_calendar;
 mod restore_contacts;
 mod restore_key;
 mod restore_onenote;
 mod restore_recovery;
 mod restore_todo;
+pub mod self_hosted_mail;
+pub mod self_hosted_mail_restore;
 mod task_live;
 mod verify;
 pub use calendar_live::{calendar_writer, CalendarWriter};
@@ -185,6 +197,7 @@ pub mod auth {
     /// refreshing silently. Errors (rather than blocking) when no token is cached —
     /// the daemon then skips that account until the user runs `login`/`setup`.
     pub fn resolve_cached_read_token(cfg: &Config, account: &str) -> Result<String, String> {
+        require_microsoft(cfg, account)?;
         let cache = read_token_cache_path(cfg, account)
             .ok_or_else(|| format!("no account '{account}' in config"))?;
         if !cache.exists() {
@@ -216,6 +229,7 @@ pub mod auth {
     /// Resolve a read+write file token for unattended **bidirectional** sync from
     /// the cached `login --write`, refreshing silently. Errors (skip) when absent.
     pub fn resolve_cached_sync_token(cfg: &Config, account: &str) -> Result<String, String> {
+        require_microsoft(cfg, account)?;
         let cache = write_token_cache_path(cfg, account)
             .ok_or_else(|| format!("no account '{account}' in config"))?;
         if !cache.exists() {
@@ -246,6 +260,7 @@ pub mod auth {
     /// Resolve a full write token (restore scopes) from the cached `login --write`,
     /// refreshing silently. Used by the daemon's web-UI restore action.
     pub fn resolve_cached_restore_token(cfg: &Config, account: &str) -> Result<String, String> {
+        require_microsoft(cfg, account)?;
         let cache = write_token_cache_path(cfg, account)
             .ok_or_else(|| format!("no account '{account}' in config"))?;
         if !cache.exists() {
@@ -262,6 +277,13 @@ pub mod auth {
     /// is never substituted for a missing Reader connection.
     pub fn resolve_cache_refresh_token(cfg: &Config, account: &str) -> Result<String, String> {
         resolve_cached_read_token(cfg, account)
+    }
+
+    fn require_microsoft(cfg: &Config, account: &str) -> Result<(), String> {
+        if cfg.provider_accounts.contains_key(account) {
+            return Err("Microsoft authentication is unavailable for this provider".into());
+        }
+        Ok(())
     }
 
     fn remove_cached_token(path: Option<PathBuf>) -> Result<usize, String> {
@@ -545,6 +567,9 @@ fn refresh_cache_account_filtered_with_policy(
     services: RefreshServices,
     strict: bool,
 ) -> Result<RefreshCounts, RefreshFailure> {
+    if cfg.provider_accounts.contains_key(account) {
+        return Err(RefreshFailure::internal());
+    }
     let acc = cfg
         .accounts
         .iter()
@@ -965,6 +990,9 @@ pub fn sync_once(
     map: &mut MappingTable,
     host: &str,
 ) -> Result<SyncReport, String> {
+    if cfg.provider_accounts.contains_key(account) {
+        return Err("Microsoft synchronization is unavailable for this provider".into());
+    }
     use isyncyou_connectors as connectors;
     let mut out = SyncReport::default();
     let now = unix_now();

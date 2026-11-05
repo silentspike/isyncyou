@@ -56,7 +56,7 @@ requirements:
       - test: confirm_rejects_action_hash_mismatch_without_consuming
       - test: confirm_rejects_token_from_another_pending
       - test: expired_confirmation_token_is_rejected_and_swept
-      - test: agent_confirm_audits_once_and_calls_executor_once
+      - test: agent_confirm_typed_success_reaches_existing_executor_and_router_response
       - test: agent_confirm_replay_rejected_and_executor_not_called_twice
       - test: daemon_agent_confirm_runs_executor_once_and_replay_fails
   - id: REQ-AGENT-004
@@ -146,8 +146,8 @@ requirements:
       - test: daemon_agent_unopened_stream_is_swept
       - test: agent_chat_alias_and_legacy_turn_query_are_rejected
       - test: mobile_agent_routes_require_session_token_even_with_cap_token
-      - test: agent_stream_sse_requires_session_token_on_mobile
-      - test: open_bridge_stream_gates_events_and_agent
+      - test: http_agent_stream_requires_session_and_agent_cap_before_opening_handler
+      - test: bridge_agent_stream_requires_separate_session_and_agent_cap_before_opening_handler
   - id: REQ-AGENT-008
     title: Provider policy — Claude/Codex app OAuth product path, FakeProvider CI fallback
     statement: >
@@ -332,8 +332,8 @@ requirements:
       - test: agent_live_write_mail_set_read_routes_existing_writer
       - test: agent_share_link_confirm_routes_through_ledger_handler
       - test: agent_confirm_mobile_policy_refuses_before_mutation
-      - test: agent_confirm_revalidates_action_before_execution
-      - test: agent_confirm_result_summary_is_json_and_redacted
+      - test: agent_confirm_revalidates_policy_immediately_before_executor
+      - test: agent_confirm_response_hides_internal_executor_summary
       - file: docs/evidence/issue-624-manifest.json
   - id: REQ-AGENT-013
     title: Network-critical product OAuth and streamed turns remain diagnosable on Android

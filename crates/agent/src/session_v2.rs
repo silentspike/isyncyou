@@ -1346,22 +1346,36 @@ impl<T: SessionV2Transport> SessionV2Store<T> {
         if entries.len() as u64 != current.manifest.visible_record_count {
             return Err(SessionV2Error::InvalidRecord);
         }
-        let objects = self.load_indexed_objects_bounded(
-            session_id,
-            SessionObjectClass::VisibleRecord,
-            &entries,
-        )?;
-        if objects.len() != entries.len() {
+        let object_ids = entries
+            .iter()
+            .map(|entry| entry.object_id.clone())
+            .collect::<Vec<_>>();
+        let sealed_objects = self
+            .transport
+            .load_immutable_batch(SessionObjectClass::VisibleRecord, &object_ids)?;
+        if sealed_objects.len() != entries.len() {
             return Err(SessionV2Error::InvalidRecord);
         }
 
         let mut expected_head = None;
         let mut plaintext_bytes = 0u64;
         let mut matching = Vec::new();
-        for (entry, bytes) in entries.iter().zip(objects) {
-            if !valid_index_entry(entry) {
+        for (entry, sealed) in entries.iter().zip(sealed_objects) {
+            if !valid_index_entry(entry)
+                || bytes_digest(&sealed) != entry.object_sha256
+                || sealed.len() as u64 != entry.encrypted_bytes
+            {
                 return Err(SessionV2Error::InvalidRecord);
             }
+            let bytes = self
+                .object_crypto
+                .open(
+                    session_id,
+                    SessionObjectClass::VisibleRecord,
+                    &entry.object_id,
+                    &sealed,
+                )
+                .map_err(|_| SessionV2Error::InvalidRecord)?;
             plaintext_bytes = plaintext_bytes
                 .checked_add(u64::try_from(bytes.len()).map_err(|_| SessionV2Error::SessionLimit)?)
                 .ok_or(SessionV2Error::SessionLimit)?;
@@ -7166,6 +7180,18 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].request_id, RID);
         assert_eq!(records[0].turn_id, ULID_A);
+        // A nonmatching record remains part of the authenticated chain: a
+        // batched read must not silently skip corruption outside the request.
+        let mut state = transport.inner.lock().unwrap();
+        let other = state
+            .objects
+            .get_mut(&(SessionObjectClass::VisibleRecord, ULID_B.to_owned()))
+            .unwrap();
+        other[0] ^= 1;
+        drop(state);
+        assert!(store
+            .visible_records_for_request_from_manifest(&snapshot, RID, ULID_A)
+            .is_err());
     }
 
     #[test]
