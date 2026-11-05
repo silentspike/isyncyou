@@ -4,7 +4,7 @@
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -467,6 +467,102 @@ pub fn put(root: &Path, bytes: &[u8]) -> io::Result<String> {
     Ok(hash)
 }
 
+#[derive(Serialize)]
+struct DomainSummary {
+    collections: u64,
+    complete: u64,
+    oldest_at: u64,
+    objects: u64,
+    object_bytes: u64,
+}
+
+// This optional projection is not part of the manifest or PBS protection ABI.
+// A missing projection is unknown; publication must remain independent of it.
+fn write_summary(root: &Path, generation: &str, manifest: &Manifest) -> io::Result<()> {
+    let mut domains: BTreeMap<&str, DomainSummary> = BTreeMap::new();
+    for c in &manifest.collections {
+        if !matches!(
+            c.service.as_str(),
+            "calendar" | "contacts" | "mail" | "mailbox"
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown summary domain",
+            ));
+        }
+        let d = domains.entry(c.service.as_str()).or_insert(DomainSummary {
+            collections: 0,
+            complete: 0,
+            oldest_at: c.observed_at,
+            objects: 0,
+            object_bytes: 0,
+        });
+        d.collections = d
+            .collections
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("summary overflow"))?;
+        d.complete = d
+            .complete
+            .checked_add(u64::from(c.complete))
+            .ok_or_else(|| io::Error::other("summary overflow"))?;
+        d.oldest_at = d.oldest_at.min(c.observed_at);
+    }
+    for object in &manifest.objects {
+        let d = domains
+            .get_mut(object.service.as_str())
+            .ok_or_else(|| io::Error::other("summary domain missing"))?;
+        d.objects = d
+            .objects
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("summary overflow"))?;
+        d.object_bytes = d
+            .object_bytes
+            .checked_add(object.size)
+            .ok_or_else(|| io::Error::other("summary overflow"))?;
+    }
+    let bytes = serde_json::to_vec(
+        &serde_json::json!({"schema": 1, "generation": generation, "domains": domains}),
+    )
+    .map_err(io::Error::other)?;
+    if bytes.len() > 4096 {
+        return Err(io::Error::other("summary too large"));
+    }
+    let dir = root.join("summaries");
+    if dir
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return Err(io::Error::other("summary directory symlink"));
+    }
+    fs::create_dir_all(&dir)?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    sync_dir(root)?;
+    let path = dir.join(generation);
+    // Invalidate any old projection before attempting its replacement.
+    match fs::remove_file(&path) {
+        Ok(()) => sync_dir(&dir)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+    }
+    let tmp = dir.join(".staging");
+    match fs::remove_file(&tmp) {
+        Ok(()) => (),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+    }
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    f.write_all(&bytes)?;
+    f.sync_all()?;
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o400))?;
+    f.sync_all()?;
+    fs::rename(&tmp, &path)?;
+    sync_dir(&dir)
+}
+
 /// Publish a full manifest atomically. Incomplete collection observations cannot
 /// become the current generation. The generation ID is the manifest digest.
 pub fn publish(root: &Path, manifest: &Manifest) -> io::Result<String> {
@@ -627,6 +723,8 @@ pub fn publish(root: &Path, manifest: &Manifest) -> io::Result<String> {
         f.sync_all()?;
         sync_dir(&manifests)?;
     }
+    // Observability is optional and cannot hold back a valid recovery generation.
+    let _ = write_summary(root, &generation, manifest);
     let tmp = root.join("current.tmp");
     let mut f = OpenOptions::new()
         .write(true)
@@ -809,6 +907,25 @@ mod tests {
             events: vec![],
         };
         let old = publish(root, &manifest).unwrap();
+        let summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("summaries").join(&old)).unwrap()).unwrap();
+        assert_eq!(summary["generation"], old);
+        assert_eq!(summary["domains"]["calendar"]["collections"], 1);
+        assert_eq!(summary["domains"]["calendar"]["complete"], 1);
+        assert_eq!(summary["domains"]["calendar"]["oldest_at"], 100);
+        assert_eq!(summary["domains"]["calendar"]["objects"], 1);
+        assert_eq!(summary["domains"]["calendar"]["object_bytes"], 8);
+        assert!(!summary.to_string().contains("https://example.test"));
+        // A broken optional sidecar must never block a valid generation.
+        let other = tempfile::tempdir().unwrap();
+        put(other.path(), b"original").unwrap();
+        std::os::unix::fs::symlink("/nonexistent", other.path().join("summaries")).unwrap();
+        let published = publish(other.path(), &manifest).unwrap();
+        assert_eq!(
+            fs::read_to_string(other.path().join("current")).unwrap(),
+            published
+        );
+        assert!(!other.path().join("summaries").join(published).exists());
         manifest.collections[0].complete = false;
         assert!(publish(root, &manifest).is_err());
         assert_eq!(fs::read_to_string(root.join("current")).unwrap(), old);

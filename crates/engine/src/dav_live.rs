@@ -300,7 +300,15 @@ impl Drop for DetachedStage<'_> {
 
 fn sync_detached(cfg: &Config, client: &DavClient, scope: &ProviderScope) -> Result<usize, String> {
     let _lease = collection_sync_lease(cfg, scope)?;
-    let snapshot = match crate::provider_store::open_readonly(cfg, &scope.account_id) {
+    let started = std::time::Instant::now();
+    let snapshot = crate::provider_store::open_readonly(cfg, &scope.account_id);
+    isyncyou_connectors::dav::diagnostic_timing(
+        "scope_snapshot_open",
+        0,
+        started,
+        if snapshot.is_ok() { "ok" } else { "error" },
+    );
+    let snapshot = match snapshot {
         Ok(store) => store,
         Err(error) if error == "Provider cache is not initialized" => {
             drop(crate::provider_store::open_for_session(
@@ -326,7 +334,15 @@ fn sync_detached(cfg: &Config, client: &DavClient, scope: &ProviderScope) -> Res
                 > 0);
     drop(snapshot);
     let _staging_lease = crate::provider_store::sync_staging_lease(cfg, &scope.account_id)?;
-    let store = crate::provider_store::open_sync(cfg, &scope.account_id)?;
+    let started = std::time::Instant::now();
+    let store = crate::provider_store::open_sync(cfg, &scope.account_id);
+    isyncyou_connectors::dav::diagnostic_timing(
+        "scope_sync_open",
+        0,
+        started,
+        if store.is_ok() { "ok" } else { "error" },
+    );
+    let store = store?;
     let mut stage = DetachedStage {
         store,
         scope,
@@ -355,7 +371,15 @@ fn sync_detached(cfg: &Config, client: &DavClient, scope: &ProviderScope) -> Res
         }
         Err(error) => return Err(error.to_string()),
     };
-    let store = crate::provider_store::open_for_session(cfg, &scope.account_id)?;
+    let started = std::time::Instant::now();
+    let store = crate::provider_store::open_for_session(cfg, &scope.account_id);
+    isyncyou_connectors::dav::diagnostic_timing(
+        "scope_backfill_open",
+        0,
+        started,
+        if store.is_ok() { "ok" } else { "error" },
+    );
+    let store = store?;
     store
         .backfill_provider_dav_search(scope, 100)
         .map_err(|e| e.to_string())?;

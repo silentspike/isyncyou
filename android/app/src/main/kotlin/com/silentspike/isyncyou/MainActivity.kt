@@ -503,24 +503,40 @@ class MainActivity : FragmentActivity() {
             android.util.Log.i(TAG, "bridge active: first message t=$t")
         }
         when (t) {
-            "req" -> dispatchBridge {
-                if (sessionToken.isBlank()) {
-                    postBridgeError(reply, validation.id, 503, "session_not_ready", "session_not_ready")
-                    return@dispatchBridge
+            "req" -> {
+                val path = obj.optString("path", "")
+                val traceMail = obj.optString("method", "").equals("GET", ignoreCase = true) &&
+                    path.substringBefore('?') == "/api/v1/items" &&
+                    path.substringAfter('?', "").split('&').contains("service=mail") &&
+                    path.substringAfter('?', "").split('&').contains("metadata_only=1")
+                val receivedAt = if (traceMail) android.os.SystemClock.elapsedRealtimeNanos() else 0L
+                dispatchBridge {
+                    val dispatchedAt = if (traceMail) android.os.SystemClock.elapsedRealtimeNanos() else 0L
+                    if (sessionToken.isBlank()) {
+                        postBridgeError(reply, validation.id, 503, "session_not_ready", "session_not_ready")
+                        return@dispatchBridge
+                    }
+                    val requestJson = sanitizedBridgeRequest(obj)
+                    val nativeStart = if (traceMail) android.os.SystemClock.elapsedRealtimeNanos() else 0L
+                    val resp = try {
+                        NativeEngine.nativeBridgeRequest(requestJson)
+                    } catch (_: Exception) {
+                        android.util.Log.w(TAG, "bridge_request_failed")
+                        BridgeMessagePolicy.responseJson(
+                            validation.id,
+                            500,
+                            JSONObject().put("error", "internal_error"),
+                        )
+                    }
+                    val nativeEnd = if (traceMail) android.os.SystemClock.elapsedRealtimeNanos() else 0L
+                    reconcileMobileJobsAfterSuccess(obj, resp)
+                    val reconcileEnd = if (traceMail) android.os.SystemClock.elapsedRealtimeNanos() else 0L
+                    reply.postMessage(resp)
+                    if (traceMail) {
+                        val replyEnd = android.os.SystemClock.elapsedRealtimeNanos()
+                        android.util.Log.i(TAG, "mail_bridge queue_us=${(dispatchedAt - receivedAt) / 1000} request_us=${(nativeStart - dispatchedAt) / 1000} native_us=${(nativeEnd - nativeStart) / 1000} reconcile_us=${(reconcileEnd - nativeEnd) / 1000} reply_us=${(replyEnd - reconcileEnd) / 1000} response_chars=${resp.length}")
+                    }
                 }
-                val requestJson = sanitizedBridgeRequest(obj)
-                val resp = try {
-                    NativeEngine.nativeBridgeRequest(requestJson)
-                } catch (_: Exception) {
-                    android.util.Log.w(TAG, "bridge_request_failed")
-                    BridgeMessagePolicy.responseJson(
-                        validation.id,
-                        500,
-                        JSONObject().put("error", "internal_error"),
-                    )
-                }
-                reconcileMobileJobsAfterSuccess(obj, resp)
-                reply.postMessage(resp)
             }
             "sub" -> {
                 val jsId = validation.id
@@ -550,8 +566,9 @@ class MainActivity : FragmentActivity() {
     private fun reconcileMobileJobsAfterSuccess(request: JSONObject, response: String) {
         val method = request.optString("method", "")
         val path = request.optString("path", "")
-        val status = runCatching { JSONObject(response).optInt("status", -1) }.getOrDefault(-1)
-        if (MobileJobWakeupPolicy.shouldReconcile(method, path, status)) {
+        if (MobileJobWakeupPolicy.shouldReconcileResponse(method, path) {
+                runCatching { JSONObject(response).optInt("status", -1) }.getOrDefault(-1)
+            }) {
             MobileJobScheduler.reconcile(this)
         }
     }
