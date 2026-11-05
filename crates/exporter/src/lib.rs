@@ -9,6 +9,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
+use std::time::Instant;
 
 /// Copy one bounded page of the shared provider's transactional capture outbox.
 /// Returning a page is not a PBS acknowledgement or a complete generation.
@@ -484,6 +485,8 @@ fn write_summary(
     manifest: &Manifest,
     baseline_generation: Option<&str>,
     previous: &HashSet<(String, u64)>,
+    previous_objects: &HashSet<(String, String, String, String, String, String)>,
+    started: Instant,
 ) -> io::Result<()> {
     let mut domains: BTreeMap<&str, DomainSummary> = BTreeMap::new();
     for c in &manifest.collections {
@@ -550,10 +553,30 @@ fn write_summary(
         ),
         None => None,
     };
+    // Count changed version entries, including removed entries. This is not a
+    // count of globally unique logical objects.
+    let current_objects: HashSet<_> = manifest.objects.iter().map(object_identity).collect();
+    let changed_object_count = if baseline_generation.is_some() {
+        Some(
+            u64::try_from(
+                current_objects
+                    .symmetric_difference(previous_objects)
+                    .count(),
+            )
+            .map_err(|_| io::Error::other("summary overflow"))?,
+        )
+    } else {
+        None
+    };
+    // Stops before the summary and current-pointer writes and their fsyncs.
+    let capture_to_summary_ms = u64::try_from(started.elapsed().as_millis())
+        .map_err(|_| io::Error::other("summary overflow"))?;
     let bytes = serde_json::to_vec(
         &serde_json::json!({"schema": 1, "generation": generation, "domains": domains,
                             "payload_bytes": payload_bytes, "baseline_generation": baseline_generation,
-                            "changed_payload_bytes": changed_payload_bytes}),
+                            "changed_payload_bytes": changed_payload_bytes,
+                            "changed_object_count": changed_object_count,
+                            "capture_to_summary_ms": capture_to_summary_ms}),
     )
     .map_err(io::Error::other)?;
     if bytes.len() > 4096 {
@@ -599,6 +622,22 @@ fn write_summary(
 /// Publish a full manifest atomically. Incomplete collection observations cannot
 /// become the current generation. The generation ID is the manifest digest.
 pub fn publish(root: &Path, manifest: &Manifest) -> io::Result<String> {
+    publish_started(root, manifest, Instant::now())
+}
+
+fn object_identity(o: &Object) -> (String, String, String, String, String, String) {
+    (
+        o.account.clone(),
+        o.origin.clone(),
+        o.service.clone(),
+        o.collection.clone(),
+        o.id.clone(),
+        o.version.clone(),
+    )
+}
+
+/// Publish using the monotonic start of the enclosing capture run.
+pub fn publish_started(root: &Path, manifest: &Manifest, started: Instant) -> io::Result<String> {
     if manifest.schema != 1
         || manifest.capture_highwater < 0
         || manifest.event_highwater < 0
@@ -637,6 +676,7 @@ pub fn publish(root: &Path, manifest: &Manifest) -> io::Result<String> {
     lock.lock_exclusive()?;
     let current = root.join("current");
     let mut previous = HashSet::new();
+    let mut previous_objects = HashSet::new();
     let mut baseline_generation = None;
     if current.exists() {
         let generation = fs::read_to_string(current)?;
@@ -660,6 +700,7 @@ pub fn publish(root: &Path, manifest: &Manifest) -> io::Result<String> {
         let old: Manifest = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
         baseline_generation = Some(generation);
         for o in old.objects {
+            previous_objects.insert(object_identity(&o));
             previous.insert((o.digest, o.size));
             previous.extend(o.related_blobs.into_iter().map(|b| (b.digest, b.size)));
         }
@@ -765,6 +806,8 @@ pub fn publish(root: &Path, manifest: &Manifest) -> io::Result<String> {
         manifest,
         baseline_generation.as_deref(),
         &previous,
+        &previous_objects,
+        started,
     );
     let tmp = root.join("current.tmp");
     let mut f = OpenOptions::new()
@@ -954,6 +997,8 @@ mod tests {
         assert_eq!(summary["payload_bytes"], 8);
         assert!(summary["baseline_generation"].is_null());
         assert!(summary["changed_payload_bytes"].is_null());
+        assert!(summary["changed_object_count"].is_null());
+        assert!(summary["capture_to_summary_ms"].as_u64().is_some());
         assert_eq!(summary["domains"]["calendar"]["collections"], 1);
         assert_eq!(summary["domains"]["calendar"]["complete"], 1);
         assert_eq!(summary["domains"]["calendar"]["oldest_at"], 100);
@@ -1061,7 +1106,7 @@ mod tests {
                 observed_at: 100,
                 complete: true,
             }],
-            objects: vec![make(a, a_data.len() as u64, "one")],
+            objects: vec![make(a.clone(), a_data.len() as u64, "one")],
             events: vec![],
         };
         let baseline = publish(root, &manifest).unwrap();
@@ -1073,6 +1118,8 @@ mod tests {
                 .unwrap();
         assert_eq!(summary["baseline_generation"], baseline);
         assert_eq!(summary["changed_payload_bytes"], b_data.len() as u64);
+        assert_eq!(summary["changed_object_count"], 1);
+        assert!(summary["capture_to_summary_ms"].as_u64().is_some());
         assert_eq!(
             summary["payload_bytes"],
             (a_data.len() + b_data.len()) as u64 + 18
@@ -1083,6 +1130,18 @@ mod tests {
             fs::read(root.join("summaries").join(&baseline)).unwrap(),
             original_summary
         );
+        // Both a removed version and an added version count, even for one ID.
+        manifest.objects = vec![removed.clone()];
+        let replacement = publish(root, &manifest).unwrap();
+        let replacement_summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("summaries").join(replacement)).unwrap())
+                .unwrap();
+        assert_eq!(replacement_summary["changed_object_count"], 2);
+        assert_eq!(
+            publish(root, &manifest).unwrap(),
+            replacement_summary["generation"].as_str().unwrap()
+        );
+        manifest.objects = vec![make(a.clone(), a_data.len() as u64, "one")];
         manifest.objects.push(removed);
         manifest.objects[1].related_blobs[0].digest = "f".repeat(64);
         assert!(publish(root, &manifest).is_err());

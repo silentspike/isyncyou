@@ -3659,7 +3659,7 @@ fn prepare_approved_submission(
         let submission_state = field(&submission, "state")?.to_string();
         let creation_id = format!("op_{:x}", Sha256::digest(approved.operation_id.as_bytes()));
         let mut recorded_intent: Value =
-            serde_json::from_str(&intent).map_err(|_| "Invalid submission")?;
+            serde_json::from_str(intent).map_err(|_| "Invalid submission")?;
         recorded_intent["submission_state"] = Value::String(submission_state.clone());
         let op = ProviderSubmission {
             scope: scope.clone(),

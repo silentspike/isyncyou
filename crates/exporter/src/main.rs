@@ -12,6 +12,7 @@ use std::error::Error;
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use url::Url;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -64,6 +65,7 @@ fn credential(name: &str) -> Result<Vec<u8>> {
 }
 
 fn run(config: Config, stage: &Cell<&'static str>) -> Result<()> {
+    let started = Instant::now();
     stage.set("configuration");
     let origin = Url::parse(&config.origin)?;
     let loopback = match origin.host() {
@@ -375,7 +377,7 @@ fn run(config: Config, stage: &Cell<&'static str>) -> Result<()> {
         &config.identity_origin,
     )?;
     stage.set("generation-publication");
-    let generation = isyncyou_exporter::publish(&config.archive, &manifest)?;
+    let generation = isyncyou_exporter::publish_started(&config.archive, &manifest, started)?;
     println!("{{\"state\":\"captured_locally\",\"generation\":\"{generation}\"}}");
     Ok(())
 }

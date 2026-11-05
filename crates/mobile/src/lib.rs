@@ -1216,12 +1216,15 @@ impl RefreshSignal {
 struct TargetRefresh {
     requested: u64,
     completed: u64,
+    // First registration since the previous dispatch, for monotonic queue timing only.
+    queued_at: Option<std::time::Instant>,
     // A result is retained for each waiting generation until its waiter reads it.
     waiters: HashMap<u64, Option<bool>>,
 }
 
 impl TargetRefresh {
     fn register(&mut self) -> u64 {
+        self.queued_at.get_or_insert_with(std::time::Instant::now);
         self.requested = self.requested.saturating_add(1);
         let generation = self.requested;
         self.waiters.insert(generation, None);
@@ -1264,8 +1267,21 @@ fn take_targeted_refresh() -> Option<(String, u64)> {
     let (flag, _) = provider_refresh_wakeup();
     let mut state = flag.lock().unwrap_or_else(|e| e.into_inner());
     let selected = select_targeted_refresh(&state);
-    if let Some((account, _)) = &selected {
+    let queued_at = if let Some((account, _)) = &selected {
         state.last_target_account = Some(account.clone());
+        state
+            .targeted
+            .get_mut(account)
+            .and_then(|target| target.queued_at.take())
+    } else {
+        None
+    };
+    drop(state);
+    if let Some(queued_at) = queued_at {
+        android_info(&format!(
+            "provider_refresh_timing phase=target_queue_wait elapsed_ms={}",
+            queued_at.elapsed().as_millis()
+        ));
     }
     selected
 }
@@ -2317,6 +2333,18 @@ mod tests {
         assert_eq!(d.waiters[&later], Some(false));
         e.complete(other, false);
         assert_eq!(e.waiters[&other], Some(false));
+    }
+
+    #[test]
+    fn targeted_queue_time_tracks_oldest_coalesced_and_next_pass() {
+        let mut target = TargetRefresh::default();
+        target.register();
+        let first = target.queued_at;
+        target.register();
+        assert_eq!(target.queued_at, first);
+        assert!(target.queued_at.take().is_some());
+        target.register();
+        assert!(target.queued_at.is_some());
     }
 
     #[test]
