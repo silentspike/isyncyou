@@ -1587,11 +1587,18 @@ function onRoute() {
     // Leaving the assistant: close any live token stream so it can't leak across routes.
     if (prevRoute === "assistant") closeAssistantStream("route-exit");
   }
+  // Overlap the primary self-hosted cache read with the shell rebuild. A
+  // different account or a shared scope is never eligible for this prefetch.
+  const account = App.account;
+  const primeMail = App.route === "mail"
+    && (Mail.scopeAccount !== account || !Mail.activeScope)
+    && (App.accounts || []).some(a => a.id === account && a.provider === "self_hosted")
+    ? { account, request: startPrimaryMailCache(account) } : null;
   renderShell();
   const view = $("#view");
   let p;
   if (App.route === "overview") p = renderOverview(view);
-  else if (App.route === "mail") p = renderMailView(view);
+  else if (App.route === "mail") p = renderMailView(view, primeMail);
   else if (App.route === "onedrive") p = renderOnedriveView(view);
   else if (App.route === "calendar") p = renderCalendarView(view);
   else if (App.route === "contacts") p = renderContactsView(view);
@@ -1942,7 +1949,14 @@ function mailAvatarColor(it) {
 }
 const mailDate = (it) => { const p = it.preview || {}; return toDate(p.date || it.remote_mtime) || new Date(0); };
 
-async function renderMailView(view) {
+function startPrimaryMailCache(account) {
+  // Handle rejection immediately: shell construction is synchronous and the
+  // route may be replaced before its cache request completes.
+  return api("/api/v1/items?" + qs({account, service:"mail", limit:50, primary_cache_only:"1"}))
+    .then(value => ({ ok:true, value }), error => ({ ok:false, error }));
+}
+
+async function renderMailView(view, primeMail = null) {
   if (Mail.scopeAccount !== App.account) { Mail.scopeAccount = App.account; Mail.activeScope = ""; App.svcFilter.mail = "all"; }
   App.svcFilter.mail = "all";
   const account = App.account, scope = Mail.activeScope;
@@ -1950,6 +1964,9 @@ async function renderMailView(view) {
   const current = () => view.isConnected && $("#mail-page") && view.contains($("#mail-page")) && App.account === account && Mail.activeScope === scope && Mail.viewGeneration === generation;
   const providerMail = (App.accounts || []).some(a => a.id === account && a.provider === "self_hosted");
   const primaryCacheOnly = !scope && providerMail;
+  const primaryCacheRequest = primaryCacheOnly
+    ? (primeMail?.account === account ? primeMail.request : startPrimaryMailCache(account))
+    : null;
   Mail.all = []; Mail.folders = []; Mail.cats = []; Mail.runs = []; Mail.filter = "all"; Mail.sort = Mail.sort || "newest"; Mail.q = ""; Mail.selected = null;
   Mail.livePage = false; Mail.liveQuery = ""; Mail.mailboxId = ""; Mail.nextCursor = null; Mail.queryState = null; Mail.pageCursor = 0; Mail.cursorStack = [];
   Mail.threaded = Mail.threaded === undefined ? true : Mail.threaded; // group by conversation (#563)
@@ -2026,7 +2043,9 @@ async function renderMailView(view) {
   try {
     const activity = api("/api/v1/activity?" + qs({ account, limit: 30 })).catch(() => ({ runs: [] }));
     const url = "/api/v1/items?" + qs({ account, service: "mail", limit: providerMail ? 50 : 1000, ...(scope ? {mail_scope:scope} : {}), ...(primaryCacheOnly ? {primary_cache_only:"1"} : {}), ...(!providerMail ? {metadata_only:"1"} : {}) });
-    const d = await (snapshotEligible ? fetchMailSnapshot(account, url) : api(url));
+    const cacheResult = primaryCacheRequest ? await primaryCacheRequest : null;
+    if (cacheResult && !cacheResult.ok) throw cacheResult.error;
+    const d = cacheResult ? cacheResult.value : await (snapshotEligible ? fetchMailSnapshot(account, url) : api(url));
     if (!current() || Mail.pageRequest !== initialPageRequest || MailSnapshot.epoch !== snapshotEpoch) return;
     // A later cache response must not restore shared rows after live access failed.
     if (scope && sharedLiveFailed) return;
