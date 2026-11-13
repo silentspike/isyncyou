@@ -57,6 +57,12 @@ The desktop service exposes the local UI at `http://127.0.0.1:8765/`; launch
 the tray using the application menu. For a non-desktop Unix-socket deployment,
 remove the `--tcp --bind` options and use an appropriate local socket client.
 
+If port 8765 is already in use, choose a free loopback port in the user service's
+`--bind` argument and use the same address for the tray, for example
+`isyncyou-statusbar --api 127.0.0.1:33506`. To use the application menu with that
+port, adjust the user-local desktop launcher's `Exec` line to the same command.
+Do not stop or replace the service that already owns the port.
+
 ## Verify checksums
 
 ```sh

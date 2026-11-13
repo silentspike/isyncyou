@@ -47,6 +47,7 @@ pub enum SyncState {
     Syncing,
     Throttled { wait_secs: u32 },
     Paused,
+    TransferUnknown { paused: bool },
     Error { reason: String },
 }
 
@@ -311,6 +312,13 @@ pub fn render_with(view: &StatusView, fs: &mut FontSystem, sc: &mut SwashCache) 
             col(0xcc, 0xcc, 0xcc),
             "Paused".to_string(),
         ),
+        SyncState::TransferUnknown { .. } => (
+            col(0x44, 0x22, 0x06),
+            col(0xa1, 0x62, 0x07),
+            col(0xf5, 0x9e, 0x0b),
+            col(0xfb, 0xbf, 0x24),
+            "Unknown".to_string(),
+        ),
         SyncState::Error { .. } => (
             col(0x45, 0x0a, 0x0a),
             col(0xb9, 0x1c, 0x1c),
@@ -351,6 +359,11 @@ pub fn render_with(view: &StatusView, fs: &mut FontSystem, sc: &mut SwashCache) 
             col(0x45, 0x0a, 0x0a),
             col(0xfc, 0xa5, 0xa5),
             format!("\u{26a0} {reason}"),
+        )),
+        SyncState::TransferUnknown { .. } => Some((
+            col(0x44, 0x22, 0x06),
+            col(0xfb, 0xbf, 0x24),
+            "Transfer status unavailable".to_string(),
         )),
         _ => None,
     };
@@ -418,7 +431,11 @@ pub fn render_with(view: &StatusView, fs: &mut FontSystem, sc: &mut SwashCache) 
         py,
         13.0,
         col(0x34, 0xd3, 0x99),
-        &format!("\u{2193} {:.1} MB/s", view.down_mbps),
+        &if matches!(view.state, SyncState::TransferUnknown { .. }) {
+            "\u{2193} unknown".to_string()
+        } else {
+            format!("\u{2193} {:.1} MB/s", view.down_mbps)
+        },
     );
     text(
         &mut pm,
@@ -428,7 +445,11 @@ pub fn render_with(view: &StatusView, fs: &mut FontSystem, sc: &mut SwashCache) 
         py,
         13.0,
         col(0x38, 0xbd, 0xf8),
-        &format!("\u{2191} {:.1} MB/s", view.up_mbps),
+        &if matches!(view.state, SyncState::TransferUnknown { .. }) {
+            "\u{2191} unknown".to_string()
+        } else {
+            format!("\u{2191} {:.1} MB/s", view.up_mbps)
+        },
     );
     text(
         &mut pm,
@@ -438,14 +459,21 @@ pub fn render_with(view: &StatusView, fs: &mut FontSystem, sc: &mut SwashCache) 
         py,
         13.0,
         col(0x8e, 0x9d, 0xb3),
-        &format!("{} in Queue", view.queue),
+        &if matches!(view.state, SyncState::TransferUnknown { .. }) {
+            "Queue unknown".to_string()
+        } else {
+            format!("{} in Queue", view.queue)
+        },
     );
 
     // action buttons — Pause/Resume + open the full UI. Their rects live in
     // PAUSE_BTN / BROWSER_BTN so hit_test always matches what's drawn here.
     let pause_label = if matches!(view.state, SyncState::Error { .. }) {
         "Unavailable"
-    } else if matches!(view.state, SyncState::Paused) {
+    } else if matches!(
+        view.state,
+        SyncState::Paused | SyncState::TransferUnknown { paused: true }
+    ) {
         "Resume"
     } else {
         "Pause"
@@ -604,6 +632,19 @@ mod tests {
             reddish,
             "error state must paint a prominent red pill/banner"
         );
+    }
+
+    #[test]
+    fn unknown_transfers_render_a_warning_and_keep_pause_state() {
+        let mut v = sample();
+        for paused in [false, true] {
+            v.state = SyncState::TransferUnknown { paused };
+            assert_eq!((render(&v).width(), render(&v).height()), (WIDTH, HEIGHT));
+            assert_eq!(
+                matches!(v.state, SyncState::TransferUnknown { paused: true }),
+                paused
+            );
+        }
     }
 
     #[test]
