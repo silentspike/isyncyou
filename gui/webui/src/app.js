@@ -1423,6 +1423,45 @@ function renderMobileNavigation() {
     el("button", { type:"button", class:"mobile-nav-item" + (secondary ? " active" : ""), "aria-label":secondary ? `More, current: ${routeLabel(App.route)}` : "More", onclick:openMobileMore },
       el("span", { class:"mobile-nav-icon" }, icon("layout-dashboard")), el("span", { class:"mobile-nav-label", text:"More" }), secondary ? el("span", { class:"mobile-nav-sub", text:routeLabel(App.route) }) : null));
 }
+let renderedShellIdentity = null;
+let syncWidgetGeneration = 0;
+function shellIdentity() {
+  const acc = (App.accounts || []).find(a => a.id === App.account) || {};
+  return JSON.stringify([App.account, acc.provider, accountDisplayLabel(acc), accountSelectionLabel(acc),
+    visibleServices().map(s => [s.id, App.counts[s.id] ?? null]), MOBILE, eggOn()]);
+}
+function reuseMailRouteShell(previousRoute) {
+  // Only this same-account primary-mail transition has a reuse contract. Other
+  // routes and any account, scope, navigation or layout change rebuild normally.
+  if (!((previousRoute === "overview" && App.route === "mail") ||
+        (previousRoute === "mail" && App.route === "overview")) || Mail.activeScope ||
+      !(App.accounts || []).some(a => a.id === App.account && a.provider === "self_hosted") ||
+      renderedShellIdentity !== shellIdentity()) return false;
+  const nav = document.querySelector(".sidebar > .nav:not(.sys-nav)");
+  const button = nav?.querySelector(`.nav-item[data-service="${App.route}"]`);
+  const mobile = document.querySelector("#app > .mobile-nav");
+  const crumb = document.querySelector(".topbar .crumbs b");
+  const mobileTitle = document.querySelector(".mobile-header .mobile-title");
+  if (!nav || !button || !mobile || !crumb || !mobileTitle || !$("#view")) return false;
+  nav.querySelectorAll(".nav-item[data-service]").forEach(item => item.classList.toggle("active", item === button));
+  nav.querySelectorAll(":scope > .nav-sub").forEach(item => item.remove());
+  if (App.route === "mail") {
+    const sub = el("div", { class:"nav-sub", id:"subnav-mail" });
+    button.after(sub);
+    rebuildSubnav("mail");
+  }
+  crumb.textContent = routeLabel(App.route);
+  mobileTitle.textContent = routeLabel(App.route);
+  mobile.replaceWith(renderMobileNavigation());
+  // Refresh retained health state without blocking the route's first render.
+  // Invalidate older in-flight responses immediately, even before the frame.
+  const scheduledGeneration = ++syncWidgetGeneration;
+  const box = $("#sync-widget"), account = App.account;
+  requestAnimationFrame(() => {
+    if (syncWidgetGeneration === scheduledGeneration && box?.isConnected && $("#sync-widget") === box && App.account === account) void renderSyncWidget();
+  });
+  return true;
+}
 function renderShell() {
   const acc = App.accounts.find(a => a.id === App.account) || {};
   const accountLabel = accountDisplayLabel(acc);
@@ -1499,6 +1538,7 @@ function renderShell() {
   const main = el("main", { class: "main" }, topbar, mobileHeader, el("div", { id: "view", class: "view" }));
   const app = clear($("#app"));
   app.append(sidebar, main, renderMobileNavigation());
+  renderedShellIdentity = shellIdentity();
   renderSyncWidget();
 }
 
@@ -1508,8 +1548,8 @@ function renderShell() {
 async function renderSyncWidget() {
   const box = $("#sync-widget"); if (!box) return;
   if (!box.getClientRects().length) return;
-  const account = App.account;
-  const current = () => box.isConnected && $("#sync-widget") === box && App.account === account;
+  const account = App.account, generation = ++syncWidgetGeneration;
+  const current = () => box.isConnected && $("#sync-widget") === box && App.account === account && syncWidgetGeneration === generation;
   let st = { enabled: false, paused: false }, runs = [], status = null;
   try { st = await api("/api/v1/sync/state"); } catch {}
   if (!current()) return;
@@ -1603,7 +1643,7 @@ function onRoute() {
   // Yield the decorative canvas briefly while navigation builds the mail view.
   if (primaryProviderMail) Net.deferAnimation(250);
   const primeMail = primaryProviderMail ? { account, request: startPrimaryMailCache(account) } : null;
-  renderShell();
+  if (!reuseMailRouteShell(prevRoute)) renderShell();
   const view = $("#view");
   let p;
   if (App.route === "overview") p = renderOverview(view);

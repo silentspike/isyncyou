@@ -171,6 +171,55 @@ check("account refresh invalidates pending provider reads",
   providerRefresh.aborted === 1 && providerRefresh.blocked && providerRefresh.epochAdvanced &&
   providerRefresh.rejected && providerRefresh.refreshCleared && providerRefresh.empty);
 
+// Reuse shell only for the same primary self-hosted account; never across identity or shared scope.
+const shellReuse = await page.evaluate(() => {
+  const saved = {accounts:App.accounts, account:App.account, counts:App.counts, route:App.route,
+    scope:Mail.activeScope, scopeAccount:Mail.scopeAccount};
+  try {
+    App.accounts = [{id:"synthetic-a", username:"synthetic-a", provider:"self_hosted"}];
+    App.account = "synthetic-a"; App.counts = {}; App.route = "overview";
+    Mail.activeScope = ""; Mail.scopeAccount = App.account;
+    renderShell();
+    const original = document.querySelector(".sidebar");
+    App.route = "mail";
+    const reused = reuseMailRouteShell("overview");
+    const routeUpdated = !!document.querySelector('.nav-item[data-service="mail"].active') &&
+      !!document.querySelector("#subnav-mail") && document.querySelector(".topbar .crumbs b")?.textContent === "Mail";
+    Mail.activeScope = "synthetic-shared";
+    const sharedRejected = !reuseMailRouteShell("overview");
+    Mail.activeScope = ""; App.account = "synthetic-b";
+    const accountRejected = !reuseMailRouteShell("overview");
+    return {reused, same:original === document.querySelector(".sidebar"), routeUpdated, sharedRejected, accountRejected};
+  } finally {
+    App.accounts = saved.accounts; App.account = saved.account; App.counts = saved.counts; App.route = saved.route;
+    Mail.activeScope = saved.scope; Mail.scopeAccount = saved.scopeAccount;
+    onRoute();
+  }
+});
+check("primary mail shell reuse stays account and scope bound",
+  shellReuse.reused && shellReuse.same && shellReuse.routeUpdated && shellReuse.sharedRejected && shellReuse.accountRejected);
+
+// Older health responses must not overwrite a newer route's status.
+await page.setViewportSize({width:1280, height:900});
+const healthRace = await page.evaluate(async () => {
+  const original = window.api, savedCounts = {...App.counts}, starts = [];
+  let statusCalls = 0;
+  window.api = (url, opts) => {
+    if (url === "/api/v1/sync/state") return new Promise(resolve => starts.push(resolve));
+    if (url.startsWith("/api/v1/activity?")) return Promise.resolve({runs:[]});
+    if (url.startsWith("/api/v1/status?")) { statusCalls++; return Promise.resolve({services:[{service:"mail",items:42}]}); }
+    return original(url, opts);
+  };
+  try {
+    const old = renderSyncWidget(), fresh = renderSyncWidget();
+    if (starts.length !== 2) return false;
+    starts[1]({enabled:false,paused:false}); await fresh;
+    starts[0]({enabled:false,paused:false}); await old;
+    return statusCalls === 1 && App.counts.mail === 42;
+  } finally { window.api = original; App.counts = savedCounts; }
+});
+check("stale health responses cannot overwrite newer state", healthRace);
+
 // --- boot health: no uncaught console errors while exercising the UI ---
 check("no console errors on boot", consoleErrors.length === 0, `(${consoleErrors.slice(0, 3).join(" | ")})`);
 
