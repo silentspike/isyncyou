@@ -89,7 +89,10 @@ object NativeEngine {
     external fun nativeProviderQuarantineRevoke(filesDir: String, account: String, id: String): Int
     external fun nativeProviderStatus(filesDir: String, account: String): Int
     external fun nativeProviderLogoutRecovery(filesDir: String, account: String): Int
+    external fun nativeProviderRefreshRecovery(filesDir: String, account: String): Int
     external fun nativeProviderLogout(filesDir: String, account: String): Int
+    external fun nativeProviderGrantGeneration(filesDir: String, account: String): String
+    external fun nativeProviderLogoutGeneration(filesDir: String, account: String, generation: String): Int
     external fun nativeProviderCancel()
     external fun nativeProviderCancelPending(base: String, account: String): Int
     external fun nativeWakeProviderRefresh()

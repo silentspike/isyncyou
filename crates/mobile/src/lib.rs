@@ -1054,6 +1054,21 @@ fn refresh_self_hosted_data(
     (changed, outcomes)
 }
 
+fn finish_onenote_refresh(
+    result: Result<isyncyou_engine::onenote_mobile_refresh::RefreshOutcome, String>,
+    notify: impl FnOnce(),
+) -> Result<bool, ()> {
+    notify();
+    result
+        .map(|outcome| {
+            if outcome.partial {
+                android_info("provider_refresh_partial phase=onenote_archive");
+            }
+            outcome.changed
+        })
+        .map_err(|_| ())
+}
+
 fn refresh_loop(
     mut cfg: Config,
     base: PathBuf,
@@ -1111,7 +1126,7 @@ fn refresh_loop(
                     |index, services| {
                         if index == 4 {
                             let started = std::time::Instant::now();
-                            let result = isyncyou_engine::onenote_mobile_refresh::refresh(
+                            let result = finish_onenote_refresh(isyncyou_engine::onenote_mobile_refresh::refresh(
                                 &gate,
                                 ACCOUNT,
                                 &mut onenote_cursor,
@@ -1126,7 +1141,7 @@ fn refresh_loop(
                                 },
                                 || { run_one_targeted_refresh(&cfg, &base, &gate, &events); },
                                 || { events.notify(); },
-                            ).map_err(|_| ());
+                            ), || { events.notify(); });
                             android_info(&format!("provider_refresh_timing phase=microsoft_section index={} elapsed_ms={}", index, started.elapsed().as_millis()));
                             return result;
                         }
@@ -2379,6 +2394,20 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeArmAccou
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wp16_onenote_noop_completion_notifies_intermediate_view() {
+        let count = std::cell::Cell::new(0);
+        let result = finish_onenote_refresh(
+            Ok(isyncyou_engine::onenote_mobile_refresh::RefreshOutcome {
+                changed: false,
+                partial: false,
+            }),
+            || count.set(count.get() + 1),
+        );
+        assert_eq!(result, Ok(false));
+        assert_eq!(count.get(), 1);
+    }
 
     #[test]
     fn targeted_refresh_results_are_account_and_generation_scoped() {

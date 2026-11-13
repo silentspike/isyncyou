@@ -48,13 +48,13 @@ internal fun readReminderRecords(keys: List<String>, read: (String) -> JSONObjec
     return records to unreadable
 }
 
-internal fun invalidReminderScope(record: JSONObject, key: String, account: String, completed: Set<String>): Boolean {
+internal fun obsoleteReminder(record: JSONObject, key: String, account: String, reconciled: Set<String>, currentTags: Set<String>): Boolean {
     val fields = setOf("account", "collection", "href", "occurrence_start", "occurrence_end", "window_start", "window_end", "floating_tzid", "uid", "recurrence_id", "alarm_id", "trigger_at", "notification_tag")
     if (record.keys().asSequence().toSet() != fields) return false
     if (record.optString("notification_tag") != key.removePrefix("r_")) return false
     if (record.optString("account") != account) return false
     val collection = record.optString("collection")
-    return collection.isNotEmpty() && collection !in completed
+    return collection.isNotEmpty() && collection in reconciled && key.removePrefix("r_") !in currentTags
 }
 
 internal object ReminderPlanningGate {
@@ -122,19 +122,6 @@ class ReminderPlanningWorker(context: Context, params: WorkerParameters) : Corou
                 val completed = if (ok) result.getJSONArray("completed_collections").let { values ->
                     (0 until values.length()).map(values::getString).toSet()
                 } else emptySet()
-                // Remove obsolete records before cancelling their work. A worker already
-                // running still rechecks live access and identity before notification.
-                val (oldRecords, unreadableRecord) = readReminderRecords(
-                    PushEnrollmentStore.reminderKeys(applicationContext)
-                ) { key -> PushEnrollmentStore.get(applicationContext, key) }
-                for ((key, old) in oldRecords) {
-                    if (!invalidReminderScope(old, key, account, completed)) continue
-                    if (PushEnrollmentStore.removeIf(applicationContext, key) { current ->
-                            invalidReminderScope(current, key, account, completed)
-                        }) {
-                        wm.cancelUniqueWork("calendar-reminder:${key.removePrefix("r_")}").result.get()
-                    }
-                }
                 if (!ok) {
                     val reason = result.optString("reason").takeIf { it in setOf("reminder_window", "reminder_changed", "reminder_config", "reminder_client", "reminder_discovery", "reminder_sync", "reminder_cache", "reminder_events_report", "reminder_tasks_report", "reminder_read", "reminder_access_check", "reminder_access_denied", "reminder_resource_get", "reminder_plan") } ?: ""
                     ReminderAccountOutcome(false, reason = reason)
@@ -142,8 +129,23 @@ class ReminderPlanningWorker(context: Context, params: WorkerParameters) : Corou
                   val unsupported = result.getInt("unsupported_count")
                   require(unsupported >= 0)
                   val records = result.getJSONArray("records")
-                  for (j in 0 until records.length()) {
-                    val record = records.getJSONObject(j)
+                  val reconciled = result.optJSONArray("reconciled_collections")?.let { values ->
+                      (0 until values.length()).map(values::getString).toSet()
+                  } ?: emptySet()
+                  require(reconciled.all { it in completed })
+                  val planned = (0 until records.length()).map { records.getJSONObject(it) }
+                  for (record in planned) {
+                    require(record.getString("account") == account)
+                    require(record.getString("collection") in completed)
+                    require(record.getString("notification_tag").matches(Regex("[0-9a-f]{64}")))
+                    require(record.getLong("trigger_at") in (now - 86400)..(now + 86400))
+                  }
+                  val currentTags = planned.map { it.getString("notification_tag") }.toSet()
+                  require(currentTags.size == planned.size)
+                  val (oldRecords, unreadableRecord) = readReminderRecords(
+                      PushEnrollmentStore.reminderKeys(applicationContext)
+                  ) { key -> PushEnrollmentStore.get(applicationContext, key) }
+                  for (record in planned) {
                     val tag = record.getString("notification_tag")
                     require(tag.matches(Regex("[0-9a-f]{64}")))
                     val trigger = record.getLong("trigger_at")
@@ -154,6 +156,16 @@ class ReminderPlanningWorker(context: Context, params: WorkerParameters) : Corou
                         .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
                         .setInitialDelay((trigger - now).coerceAtLeast(0), TimeUnit.SECONDS).build()
                     wm.enqueueUniqueWork("calendar-reminder:$tag", ExistingWorkPolicy.KEEP, work).result.get()
+                  }
+                  // Only complete, supported collection plans establish absence.
+                  // Preserve a concurrently changed record and recheck before firing.
+                  for ((key, old) in oldRecords) {
+                    if (!obsoleteReminder(old, key, account, reconciled, currentTags)) continue
+                    if (PushEnrollmentStore.removeIf(applicationContext, key) { current ->
+                            current.toString() == old.toString() && obsoleteReminder(current, key, account, reconciled, currentTags)
+                        }) {
+                        wm.cancelUniqueWork("calendar-reminder:${key.removePrefix("r_")}").result.get()
+                    }
                   }
                   val failed = result.getInt("failed_collections")
                   require(failed >= 0)

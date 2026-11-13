@@ -7,6 +7,11 @@ use isyncyou_store::Store;
 #[cfg(feature = "encrypted-store")]
 use sha2::{Digest, Sha256};
 
+#[cfg(all(test, feature = "encrypted-store"))]
+thread_local! {
+    pub(crate) static TEST_PROVIDER_STORE: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Open the account/origin-bound provider store. Existing data is never replaced
 /// when its platform-protected key is unavailable.
 #[cfg(feature = "encrypted-store")]
@@ -23,6 +28,10 @@ pub fn open_for_session(cfg: &Config, account: &str) -> Result<Store, String> {
 
 #[cfg(feature = "encrypted-store")]
 fn open_inner(cfg: &Config, account: &str, recover_staging: bool) -> Result<Store, String> {
+    #[cfg(test)]
+    if let Some(path) = TEST_PROVIDER_STORE.with(|slot| slot.borrow().clone()) {
+        return Store::open_encrypted(path, b"isolated-test-key").map_err(|e| e.to_string());
+    }
     #[cfg(debug_assertions)]
     let open_start = std::time::Instant::now();
     let path = location(cfg, account)?;

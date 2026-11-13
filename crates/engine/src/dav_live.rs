@@ -142,6 +142,48 @@ fn collection_lease_error(error: &std::io::Error) -> &'static str {
     }
 }
 
+// Discovery and all visibility updates derived from it form one observation.
+// Serialize that whole observation across processes, including single-collection
+// passes; a cursor comparison cannot detect a visibility ABA with equal cursors.
+pub(crate) fn discovery_sync_lease(
+    cfg: &Config,
+    account_id: &str,
+    origin: &str,
+) -> Result<std::fs::File, String> {
+    use fs2::FileExt;
+    use sha2::{Digest, Sha256};
+    let account = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == account_id)
+        .ok_or("Account missing")?;
+    std::fs::create_dir_all(&account.archive_root)
+        .map_err(|_| "DAV archive directory unavailable")?;
+    let mut h = Sha256::new();
+    for value in [account_id, origin] {
+        h.update((value.len() as u64).to_be_bytes());
+        h.update(value.as_bytes());
+    }
+    let path = account
+        .archive_root
+        .join(format!(".isyncyou-dav-discovery-{:x}.lock", h.finalize()));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|_| "DAV discovery lease unavailable")?;
+    file.try_lock_exclusive().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            "DAV discovery sync already active"
+        } else {
+            "DAV discovery lease unavailable"
+        }
+    })?;
+    Ok(file)
+}
+
 /// One cross-process lease per account/origin/collection keeps two detached
 /// network observations from racing; it is independent of the provider writer.
 fn collection_sync_lease(cfg: &Config, scope: &ProviderScope) -> Result<std::fs::File, String> {
@@ -529,6 +571,11 @@ fn sync_all_inner(
     credentials: Option<&dyn ProviderCredentialStore>,
 ) -> Result<SyncPass, String> {
     let origin = configured_origin(cfg, account)?;
+    let _discovery_lease = discovery_sync_lease(cfg, account, &origin)?;
+    #[cfg(all(test, feature = "encrypted-store"))]
+    if let Some(result) = fixture_sync_all(cfg, account, entry, &origin) {
+        return result;
+    }
     let started = std::time::Instant::now();
     let pass = open_dav_pass_store(cfg, account, credentials)?;
     isyncyou_connectors::dav::diagnostic_timing(
@@ -549,9 +596,27 @@ fn sync_all_inner(
         if client.is_ok() { "ok" } else { "error" },
     );
     let client = client?;
-    if let Some(pass) = pass.as_ref() {
-        pass.validate()?;
-    }
+    sync_all_observation(
+        account,
+        entry,
+        &origin,
+        &client,
+        || pass.as_ref().map_or(Ok(()), DavPassStore::validate),
+        |scope| sync_detached_inner(cfg, &client, scope, pass.as_ref()),
+        || crate::provider_store::open_for_session(cfg, account),
+    )
+}
+
+fn sync_all_observation(
+    account: &str,
+    entry: &str,
+    origin: &str,
+    client: &DavClient,
+    validate: impl Fn() -> Result<(), String>,
+    sync_scope: impl Fn(&ProviderScope) -> Result<usize, String>,
+    open_store: impl FnOnce() -> Result<Store, String>,
+) -> Result<SyncPass, String> {
+    validate()?;
     let started = std::time::Instant::now();
     let collections = client.discover(entry);
     isyncyou_connectors::dav::diagnostic_timing(
@@ -561,9 +626,7 @@ fn sync_all_inner(
         if collections.is_ok() { "ok" } else { "error" },
     );
     let collections = collections.map_err(|e| e.to_string())?;
-    if let Some(pass) = pass.as_ref() {
-        pass.validate()?;
-    }
+    validate()?;
     let mut report = SyncPass::default();
     let mut present = std::collections::HashSet::new();
     for (index, collection) in collections.into_iter().enumerate() {
@@ -578,15 +641,13 @@ fn sync_all_inner(
             present.insert((service.to_owned(), collection.url.clone()));
             let scope = ProviderScope {
                 account_id: account.into(),
-                origin: origin.clone(),
+                origin: origin.into(),
                 service: service.into(),
                 collection: collection.url.clone(),
             };
             let started = std::time::Instant::now();
-            let result = sync_detached_inner(cfg, &client, &scope, pass.as_ref());
-            if let Some(pass) = pass.as_ref() {
-                pass.validate()?;
-            }
+            let result = sync_scope(&scope);
+            validate()?;
             isyncyou_connectors::dav::diagnostic_timing(
                 if service == "calendar" {
                     "sync_calendar"
@@ -605,13 +666,11 @@ fn sync_all_inner(
             }
         }
     }
-    if let Some(pass) = pass.as_ref() {
-        pass.validate()?;
-    }
-    let store = crate::provider_store::open_for_session(cfg, account)?;
+    validate()?;
+    let store = open_store()?;
     for service in ["calendar", "contacts"] {
         for scope in store
-            .provider_scopes(account, &origin, service)
+            .provider_scopes(account, origin, service)
             .map_err(|e| e.to_string())?
         {
             if !present.contains(&(service.to_owned(), scope.collection.clone())) {
@@ -622,6 +681,57 @@ fn sync_all_inner(
         }
     }
     Ok(report)
+}
+
+#[cfg(all(test, feature = "encrypted-store"))]
+thread_local! {
+    static DAV_FIXTURE_STORE: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+// Test-only injection retains the production entry, lease, discovery and
+// visibility algorithm. The fixture uses an isolated encrypted store and the
+// same staged DAV transport, with no platform credential or keyring.
+#[cfg(all(test, feature = "encrypted-store"))]
+fn fixture_sync_all(
+    cfg: &Config,
+    account: &str,
+    entry: &str,
+    origin: &str,
+) -> Option<Result<SyncPass, String>> {
+    let path = DAV_FIXTURE_STORE.with(|value| value.borrow().clone())?;
+    Some((|| {
+        let client = isyncyou_connectors::dav::test_loopback_client(origin)
+            .map_err(|error| error.to_string())?;
+        let open = || Store::open_encrypted(&path, b"isolated-test-key").map_err(|e| e.to_string());
+        sync_all_observation(
+            account,
+            entry,
+            origin,
+            &client,
+            || Ok(()),
+            |scope| {
+                let _scope_lease = collection_sync_lease(cfg, scope)?;
+                let store = open()?;
+                let cursor = store.provider_cursor(scope).map_err(|e| e.to_string())?;
+                let accessible = store
+                    .provider_accessible(scope)
+                    .map_err(|e| e.to_string())?;
+                let mut stage = DetachedStage {
+                    store: &store,
+                    binding: None,
+                    scope,
+                    generation: None,
+                    cursor: cursor.clone(),
+                    accessible,
+                    full: false,
+                };
+                client
+                    .sync_detached_staged(scope, cursor, accessible, false, None, &mut stage)
+                    .map_err(|e| e.to_string())
+            },
+            open,
+        )
+    })())
 }
 
 fn sync_collection_inner(
@@ -636,6 +746,7 @@ fn sync_collection_inner(
         return Err("Unsupported DAV service".into());
     }
     let origin = configured_origin(cfg, account)?;
+    let _discovery_lease = discovery_sync_lease(cfg, account, &origin)?;
     let client = match credentials {
         Some(credentials) => client_with_store(cfg, account, &origin, credentials)?,
         None => client(cfg, account, &origin)?,
@@ -1076,6 +1187,8 @@ pub struct ReminderAccountPlan {
     pub records: Vec<serde_json::Value>,
     pub unsupported_count: usize,
     pub completed_collections: Vec<String>,
+    /// Collections whose complete alarm set can be reconciled safely.
+    pub reconciled_collections: Vec<String>,
     pub failed_collections: usize,
     pub failure_reason: Option<String>,
 }
@@ -1092,6 +1205,9 @@ fn finish_reminder_collection(
         Ok(()) => {
             plan.records.extend(records);
             plan.unsupported_count += unsupported;
+            if unsupported == 0 {
+                plan.reconciled_collections.push(collection.clone());
+            }
             plan.completed_collections.push(collection);
         }
         Err(reason) => {
@@ -1173,6 +1289,8 @@ pub fn plan_account_reminders_with_store(
         return Err("reminder_window".into());
     }
     let origin = configured_origin(cfg, account).map_err(|_| "reminder_config")?;
+    let _discovery_lease =
+        discovery_sync_lease(cfg, account, &origin).map_err(|_| "reminder_sync")?;
     let client =
         client_with_store(cfg, account, &origin, credentials).map_err(|_| "reminder_client")?;
     let collections = client.discover(entry).map_err(|_| "reminder_discovery")?;
@@ -1180,6 +1298,7 @@ pub fn plan_account_reminders_with_store(
         records: Vec::new(),
         unsupported_count: 0,
         completed_collections: Vec::new(),
+        reconciled_collections: Vec::new(),
         failed_collections: 0,
         failure_reason: None,
     };
@@ -1352,6 +1471,7 @@ pub fn reminder_account_revision_with_store(
     credentials: &dyn ProviderCredentialStore,
 ) -> Result<String, String> {
     let origin = configured_origin(cfg, account)?;
+    let _discovery_lease = discovery_sync_lease(cfg, account, &origin)?;
     let client = client_with_store(cfg, account, &origin, credentials)?;
     let mut collections: Vec<_> = client
         .discover(entry)
@@ -4559,6 +4679,255 @@ pub fn cached_live_objects(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "encrypted-store")]
+    #[test]
+    fn overlapping_real_discovery_passes_preserve_recovered_visibility_and_revocation() {
+        use isyncyou_core::config::AccountConfig;
+        use std::io::{Read, Write};
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap());
+        let scope = ProviderScope {
+            account_id: "fixture".into(),
+            origin: origin.clone(),
+            service: "calendar".into(),
+            collection: format!("{origin}cal/"),
+        };
+        let path = dir.path().join("fixture.db");
+        {
+            let store = Store::open_encrypted(&path, b"isolated-test-key").unwrap();
+            store
+                .apply_provider_page(
+                    &scope,
+                    &[isyncyou_store::ProviderChange::Upsert(ProviderObject {
+                        remote_id: format!("{origin}cal/a.ics"),
+                        etag: Some("\"v1\"".into()),
+                        raw: b"fixture raw".to_vec(),
+                    })],
+                    "unchanged",
+                )
+                .unwrap();
+        }
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            for index in 0..10 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0; 2048];
+                loop {
+                    let n = socket.read(&mut buf).unwrap();
+                    assert_ne!(n, 0);
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let len = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let wire = String::from_utf8(request).unwrap();
+                let item = match index {
+                    0 | 3 | 7 => {
+                        assert!(wire.starts_with("PROPFIND /entry "));
+                        "<d:response><d:href>/entry</d:href><d:propstat><d:prop><d:current-user-principal><d:href>/principal/</d:href></d:current-user-principal></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>".to_owned()
+                    }
+                    1 | 4 | 8 => {
+                        assert!(wire.starts_with("PROPFIND /principal/ "));
+                        "<d:response><d:href>/principal/</d:href><d:propstat><d:prop><c:calendar-home-set><d:href>/home/</d:href></c:calendar-home-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat><d:propstat><d:prop><a:addressbook-home-set/></d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat></d:response>".to_owned()
+                    }
+                    2 | 5 | 9 => {
+                        assert!(wire.starts_with("PROPFIND /home/ "));
+                        if index == 2 || index == 5 {
+                            observed_tx.send(()).unwrap();
+                            release_rx
+                                .recv_timeout(std::time::Duration::from_secs(10))
+                                .unwrap();
+                        }
+                        let collection = if index == 5 {
+                            "<d:response><d:href>/cal/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+                        } else {
+                            ""
+                        };
+                        format!("<d:response><d:href>/home/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>{collection}")
+                    }
+                    6 => {
+                        assert!(wire.starts_with("REPORT /cal/ "));
+                        "<d:response><d:href>/cal/a.ics</d:href><d:propstat><d:prop><d:getetag>&quot;v1&quot;</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:sync-token>unchanged</d:sync-token>".to_owned()
+                    }
+                    _ => unreachable!(),
+                };
+                let body = format!("<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\" xmlns:a=\"urn:ietf:params:xml:ns:carddav\">{item}</d:multistatus>");
+                write!(socket, "HTTP/1.1 207 Multi-Status\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let mut cfg = Config::default();
+        cfg.accounts.push(AccountConfig {
+            id: "fixture".into(),
+            username: "fixture".into(),
+            sync_root: dir.path().join("sync"),
+            archive_root: dir.path().join("archive"),
+            cache_root: dir.path().join("cache"),
+            mount_point: None,
+        });
+        cfg.provider_accounts.insert(
+            "fixture".into(),
+            ProviderConfig::SelfHosted {
+                origin: origin.clone(),
+                client_id: "fixture".into(),
+            },
+        );
+        let old_cfg = cfg.clone();
+        let old_path = path.clone();
+        let old = std::thread::spawn(move || {
+            DAV_FIXTURE_STORE.with(|slot| *slot.borrow_mut() = Some(old_path));
+            sync_all(&old_cfg, "fixture", "/entry")
+        });
+        observed_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        DAV_FIXTURE_STORE.with(|slot| *slot.borrow_mut() = Some(path.clone()));
+        assert_eq!(
+            sync_all(&cfg, "fixture", "/entry").unwrap_err(),
+            "DAV discovery sync already active"
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(old.join().unwrap().unwrap().failed, 0);
+        let recovery_cfg = cfg.clone();
+        let recovery_path = path.clone();
+        let recovery = std::thread::spawn(move || {
+            DAV_FIXTURE_STORE.with(|slot| *slot.borrow_mut() = Some(recovery_path));
+            sync_all(&recovery_cfg, "fixture", "/entry")
+        });
+        observed_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(
+            sync_all(&cfg, "fixture", "/entry").unwrap_err(),
+            "DAV discovery sync already active"
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(recovery.join().unwrap().unwrap().failed, 0);
+        {
+            let store = Store::open_encrypted(&path, b"isolated-test-key").unwrap();
+            assert_eq!(
+                store.provider_cursor(&scope).unwrap().as_deref(),
+                Some("unchanged")
+            );
+            assert_eq!(store.provider_accessible(&scope).unwrap(), Some(true));
+            assert_eq!(
+                store
+                    .provider_object(&scope, &format!("{origin}cal/a.ics"))
+                    .unwrap()
+                    .unwrap()
+                    .raw,
+                b"fixture raw"
+            );
+        }
+        assert_eq!(sync_all(&cfg, "fixture", "/entry").unwrap().failed, 0);
+        let store = Store::open_encrypted(&path, b"isolated-test-key").unwrap();
+        assert_eq!(store.provider_accessible(&scope).unwrap(), Some(false));
+        assert_eq!(
+            store.provider_cursor(&scope).unwrap().as_deref(),
+            Some("unchanged")
+        );
+        assert!(store
+            .provider_accessible_dav_objects_page(&scope, "", 10)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .provider_object(&scope, &format!("{origin}cal/a.ics"))
+            .unwrap()
+            .is_some());
+        DAV_FIXTURE_STORE.with(|slot| *slot.borrow_mut() = None);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn discovery_lease_guards_sync_entry_points_and_is_account_scoped() {
+        use crate::provider_credential::ProviderCredential;
+        use isyncyou_core::config::AccountConfig;
+
+        struct NoCredentials;
+        impl ProviderCredentialStore for NoCredentials {
+            fn load(&self, _: &str, _: &str) -> Result<Option<ProviderCredential>, String> {
+                panic!("a busy pass must not access credentials")
+            }
+            fn replace(&self, _: &str, _: &str, _: &ProviderCredential) -> Result<(), String> {
+                panic!("unexpected credential write")
+            }
+            fn delete(&self, _: &str, _: &str) -> Result<(), String> {
+                panic!("unexpected credential deletion")
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let origin = "https://example.test/";
+        let mut cfg = Config::default();
+        for id in ["one", "two"] {
+            cfg.accounts.push(AccountConfig {
+                id: id.into(),
+                username: id.into(),
+                sync_root: dir.path().join(id).join("sync"),
+                archive_root: dir.path().join(id).join("archive"),
+                cache_root: dir.path().join(id).join("cache"),
+                mount_point: None,
+            });
+            cfg.provider_accounts.insert(
+                id.into(),
+                ProviderConfig::SelfHosted {
+                    origin: origin.into(),
+                    client_id: "fixture".into(),
+                },
+            );
+        }
+        let lease = discovery_sync_lease(&cfg, "one", origin).unwrap();
+        assert_eq!(
+            sync_all_with_store(&cfg, "one", "/", &NoCredentials).unwrap_err(),
+            "DAV discovery sync already active"
+        );
+        assert_eq!(
+            sync_collection_with_store(&cfg, "one", "/", "/cal/", "calendar", &NoCredentials)
+                .unwrap_err(),
+            "DAV discovery sync already active"
+        );
+        assert_eq!(
+            reminder_account_revision_with_store(&cfg, "one", "/", &NoCredentials).unwrap_err(),
+            "DAV discovery sync already active"
+        );
+        assert_eq!(
+            plan_account_reminders_with_store(
+                &cfg,
+                "one",
+                "/",
+                "20240101T000000Z",
+                "20290101T000000Z",
+                1767225600,
+                1767312000,
+                None,
+                &NoCredentials,
+            )
+            .err()
+            .unwrap(),
+            "reminder_sync"
+        );
+        assert!(discovery_sync_lease(&cfg, "two", origin).is_ok());
+        assert!(discovery_sync_lease(&cfg, "one", "https://other.test/").is_ok());
+        drop(lease);
+        assert!(discovery_sync_lease(&cfg, "one", origin).is_ok());
+    }
+
     #[test]
     fn recovery_readback_only_accepts_exact_rfc_line_folding() {
         let prepared = b"BEGIN:VCALENDAR\r\nRELATED-TO:parent-uid\r\nEND:VCALENDAR\r\n";
@@ -5049,6 +5418,7 @@ mod tests {
             records: vec![],
             unsupported_count: 0,
             completed_collections: vec![],
+            reconciled_collections: vec![],
             failed_collections: 0,
             failure_reason: None,
         };
@@ -5066,11 +5436,13 @@ mod tests {
             0,
             Ok(()),
         );
+        finish_reminder_collection(&mut plan, "unsupported".into(), vec![], 1, Ok(()));
         assert_eq!(plan.records, vec![serde_json::json!("valid")]);
-        assert_eq!(plan.completed_collections, vec!["good"]);
+        assert_eq!(plan.completed_collections, vec!["good", "unsupported"]);
+        assert_eq!(plan.reconciled_collections, vec!["good"]);
         assert_eq!(plan.failed_collections, 1);
         assert_eq!(plan.failure_reason.as_deref(), Some("reminder_sync"));
-        assert_eq!(plan.unsupported_count, 0);
+        assert_eq!(plan.unsupported_count, 1);
     }
 
     #[test]
@@ -5081,6 +5453,7 @@ mod tests {
             records: Vec::new(),
             unsupported_count: 0,
             completed_collections: Vec::new(),
+            reconciled_collections: Vec::new(),
             failed_collections: 0,
             failure_reason: None,
         };

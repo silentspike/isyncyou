@@ -8,6 +8,23 @@ use sha2::{Digest, Sha256};
 // rebuilt incrementally before coverage can become complete again.
 const DAV_SEARCH_INDEX_VERSION: i64 = 1;
 
+// The trigger runs in the same transaction as every capture insertion. The
+// checkpoint survives deletion of all rows and is scoped to the source.
+pub(super) const MIGRATION_V23: &str = r#"
+CREATE TABLE provider_capture_checkpoints (
+ account_id TEXT NOT NULL, origin TEXT NOT NULL, highwater INTEGER NOT NULL,
+ PRIMARY KEY(account_id,origin)
+);
+INSERT INTO provider_capture_checkpoints(account_id,origin,highwater)
+ SELECT account_id,origin,MAX(sequence) FROM provider_capture_outbox GROUP BY account_id,origin;
+CREATE TRIGGER provider_capture_checkpoint_insert AFTER INSERT ON provider_capture_outbox
+ BEGIN
+  INSERT INTO provider_capture_checkpoints(account_id,origin,highwater)
+   VALUES(NEW.account_id,NEW.origin,NEW.sequence)
+   ON CONFLICT(account_id,origin) DO UPDATE SET highwater=MAX(highwater,excluded.highwater);
+ END;
+"#;
+
 pub type ProviderMutationIntentRecord = (String, String, String, String, Option<String>);
 pub type ProviderMailUploadIntentRecord = (ProviderScope, String, String, Option<String>);
 type DavIndexFields<'a> = (bool, Option<&'a str>, Option<&'a str>, Option<&'a str>);
@@ -244,6 +261,15 @@ pub struct ProviderCapture {
     pub version_key: String,
 }
 
+/// Exact locally observed capture identity covered by a verified manifest.
+#[derive(Debug, Clone)]
+pub struct ProviderProtectedCapture {
+    pub scope: ProviderScope,
+    pub remote_id: String,
+    pub version_key: String,
+    pub digest: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderEvent {
     pub sequence: i64,
@@ -427,7 +453,9 @@ impl Store {
                 "INSERT OR IGNORE INTO provider_session_quotas(account_id,origin) VALUES (?1,?2)",
                 params![scope.account_id, scope.origin],
             )?;
-            if tx.execute("UPDATE provider_session_quotas SET session_count=session_count+1 WHERE account_id=?1 AND origin=?2 AND session_count<100",params![scope.account_id,scope.origin])? != 1 { return Err(StoreError::ProviderObjectTooLarge); }
+            // Match the product's 128-session index limit. Its separate 512
+            // request-receipt limit does not increase session capacity.
+            if tx.execute("UPDATE provider_session_quotas SET session_count=session_count+1 WHERE account_id=?1 AND origin=?2 AND session_count<128",params![scope.account_id,scope.origin])? != 1 { return Err(StoreError::IllegalTransition("provider_session_limit_reached".into())); }
         }
         if !inserted {
             let existing:Vec<u8> = tx.query_row("SELECT manifest FROM provider_sessions WHERE account_id=?1 AND origin=?2 AND session_id=?3",params![scope.account_id,scope.origin,session],|r| r.get(0))?;
@@ -1346,6 +1374,105 @@ impl Store {
         query: &str,
         limit: usize,
     ) -> Result<(Vec<ProviderObject>, bool)> {
+        self.search_provider_dav_inner(scope, query, limit, 8 * 1024 * 1024)
+    }
+
+    /// Bound DAV FTS work and result bytes. The callback is removed before the
+    /// connection can be reused, including when SQLite interrupts a statement.
+    pub fn search_provider_dav_bounded(
+        &mut self,
+        scope: &ProviderScope,
+        query: &str,
+        limit: usize,
+        max_bytes: usize,
+        should_interrupt: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<(Vec<ProviderObject>, bool)> {
+        if limit == 0 || limit > 12 || max_bytes == 0 || max_bytes > 8 * 1024 * 1024 {
+            return Err(StoreError::InvalidProgressiveSearch(
+                "invalid DAV search budget".into(),
+            ));
+        }
+        if should_interrupt() {
+            return Err(StoreError::InvalidProgressiveSearch(
+                "DAV search interrupted".into(),
+            ));
+        }
+        let busy_timeout: u32 = self
+            .conn
+            .pragma_query_value(None, "busy_timeout", |r| r.get(0))?;
+        self.conn.busy_timeout(std::time::Duration::ZERO)?;
+        let callback = should_interrupt.clone();
+        if let Err(error) = self.conn.progress_handler(
+            super::PROGRESSIVE_QUERY_OP_INTERVAL,
+            Some(move || callback()),
+        ) {
+            self.conn
+                .busy_timeout(std::time::Duration::from_millis(u64::from(busy_timeout)))?;
+            return Err(error.into());
+        }
+        let result = self.search_provider_dav_inner(scope, query, limit, max_bytes);
+        let cleanup = self.conn.progress_handler::<fn() -> bool>(0, None);
+        let restore = self
+            .conn
+            .busy_timeout(std::time::Duration::from_millis(u64::from(busy_timeout)));
+        cleanup?;
+        restore?;
+        let result = result?;
+        if should_interrupt() {
+            return Err(StoreError::InvalidProgressiveSearch(
+                "DAV search interrupted".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    /// Read collection state with the same cancellation contract as bounded FTS.
+    pub fn provider_dav_state_bounded(
+        &mut self,
+        scope: &ProviderScope,
+        should_interrupt: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<Option<(Option<String>, bool)>> {
+        if should_interrupt() {
+            return Err(StoreError::InvalidProgressiveSearch(
+                "DAV search interrupted".into(),
+            ));
+        }
+        let busy_timeout: u32 = self
+            .conn
+            .pragma_query_value(None, "busy_timeout", |r| r.get(0))?;
+        self.conn.busy_timeout(std::time::Duration::ZERO)?;
+        let callback = should_interrupt.clone();
+        if let Err(error) = self.conn.progress_handler(
+            super::PROGRESSIVE_QUERY_OP_INTERVAL,
+            Some(move || callback()),
+        ) {
+            self.conn
+                .busy_timeout(std::time::Duration::from_millis(u64::from(busy_timeout)))?;
+            return Err(error.into());
+        }
+        let result = self.conn.query_row("SELECT cursor,accessible FROM provider_collections WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4", params![scope.account_id,scope.origin,scope.service,scope.collection], |r| Ok((r.get(0)?,r.get(1)?))).optional();
+        let cleanup = self.conn.progress_handler::<fn() -> bool>(0, None);
+        let restore = self
+            .conn
+            .busy_timeout(std::time::Duration::from_millis(u64::from(busy_timeout)));
+        cleanup?;
+        restore?;
+        let result = result?;
+        if should_interrupt() {
+            return Err(StoreError::InvalidProgressiveSearch(
+                "DAV search interrupted".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    fn search_provider_dav_inner(
+        &self,
+        scope: &ProviderScope,
+        query: &str,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<ProviderObject>, bool)> {
         if !matches!(scope.service.as_str(), "calendar" | "contacts")
             || query.is_empty()
             || query.len() > 1024
@@ -1363,7 +1490,7 @@ impl Store {
         }
         let progress: Option<(i64,i64,i64)> = self.conn.query_row("SELECT object_count,indexed_count,invalid_count FROM provider_dav_search_progress WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4",params![scope.account_id,scope.origin,scope.service,scope.collection],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         let stale: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_dav_search_indexed WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND index_version<?5) OR EXISTS(SELECT 1 FROM provider_dav_search_indexed WHERE account_id=?1 AND origin=?2 AND service=?3 AND collection=?4 AND index_version>?5)",params![scope.account_id,scope.origin,scope.service,scope.collection,DAV_SEARCH_INDEX_VERSION],|r| r.get(0))?;
-        let incomplete = stale
+        let mut incomplete = stale
             || progress.is_some_and(|(objects, indexed, invalid)| {
                 objects < 0 || indexed != objects || invalid != 0
             });
@@ -1381,13 +1508,14 @@ impl Store {
         let mut bytes = 0usize;
         while let Some(r) = rows.next()? {
             let size = r.get::<_, i64>(3)? as usize;
-            if size > 8 * 1024 * 1024 {
+            if size > max_bytes {
                 if output.is_empty() {
                     return Err(StoreError::ProviderObjectTooLarge);
                 }
                 break;
             }
-            if bytes + size > 8 * 1024 * 1024 {
+            if bytes + size > max_bytes {
+                incomplete = true;
                 break;
             }
             bytes += size;
@@ -1424,7 +1552,7 @@ impl Store {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
-        let capture_highwater = tx.query_row("SELECT COALESCE(MAX(sequence),0) FROM provider_capture_outbox WHERE account_id=?1 AND origin=?2", params![account,origin], |r| r.get(0))?;
+        let capture_highwater = tx.query_row("SELECT COALESCE((SELECT highwater FROM provider_capture_checkpoints WHERE account_id=?1 AND origin=?2),0)", params![account,origin], |r| r.get(0))?;
         let event_highwater = tx.query_row("SELECT COALESCE(MAX(sequence),0) FROM provider_events WHERE account_id=?1 AND origin=?2", params![account,origin], |r| r.get(0))?;
         tx.commit()?;
         Ok(ProviderExportSnapshot {
@@ -1758,6 +1886,50 @@ impl Store {
             });
         }
         Ok(output)
+    }
+
+    /// Release exact, superseded captures after the caller has independently
+    /// established current PBS protection and excluded all relevant pins.
+    /// This method does not authenticate protection evidence on its own.
+    pub fn release_protected_captures(
+        &self,
+        account: &str,
+        origin: &str,
+        highwater: i64,
+        items: &[ProviderProtectedCapture],
+    ) -> Result<Vec<ProviderProtectedCapture>> {
+        if highwater < 0
+            || items.len() > 200_000
+            || items
+                .iter()
+                .any(|item| item.scope.account_id != account || item.scope.origin != origin)
+        {
+            return Err(StoreError::InvalidProgressiveSearch(
+                "invalid protected capture scope".into(),
+            ));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let checkpoint: i64 = tx.query_row("SELECT COALESCE((SELECT highwater FROM provider_capture_checkpoints WHERE account_id=?1 AND origin=?2),0)", params![account,origin], |r| r.get(0))?;
+        let staged: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM provider_stage_runs WHERE account_id=?1 AND origin=?2)",
+            params![account, origin],
+            |r| r.get(0),
+        )?;
+        if highwater > checkpoint || staged {
+            return Err(StoreError::InvalidProgressiveSearch(
+                "capture checkpoint or staging unavailable".into(),
+            ));
+        }
+        let mut released = Vec::new();
+        for item in items {
+            let s = &item.scope;
+            let changed = tx.execute("DELETE FROM provider_capture_outbox AS old WHERE old.account_id=?1 AND old.origin=?2 AND old.service=?3 AND old.collection=?4 AND old.remote_id=?5 AND old.version_key=?6 AND old.digest=?7 AND old.sequence<=?8 AND EXISTS(SELECT 1 FROM provider_objects p WHERE p.account_id=old.account_id AND p.origin=old.origin AND p.service=old.service AND p.collection=old.collection AND p.remote_id=old.remote_id AND (p.etag IS NOT old.etag OR p.raw<>old.raw))", params![account,origin,s.service,s.collection,item.remote_id,item.version_key,item.digest,highwater])?;
+            if changed == 1 {
+                released.push(item.clone());
+            }
+        }
+        tx.commit()?;
+        Ok(released)
     }
 
     /// Ordered scoped membership changes; `None` denotes removal from scope.
@@ -2799,6 +2971,268 @@ fn capture_observation(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bounded_dav_search_interrupts_and_cleans_up_connection() {
+        use super::*;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .busy_timeout(std::time::Duration::from_millis(5000))
+            .unwrap();
+        let scope = ProviderScope {
+            account_id: "a".into(),
+            origin: "https://example.test".into(),
+            service: "contacts".into(),
+            collection: "/contacts/".into(),
+        };
+        let objects: Vec<_> = (0..400)
+            .map(|i| ProviderObject {
+                remote_id: i.to_string(),
+                etag: None,
+                raw: format!("BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Searchable {i}\r\nEND:VCARD\r\n")
+                    .into_bytes(),
+            })
+            .collect();
+        store
+            .reconcile_provider_snapshot(&scope, &objects, "cursor")
+            .unwrap();
+        assert_eq!(
+            store
+                .provider_dav_state_bounded(&scope, Arc::new(|| false))
+                .unwrap(),
+            Some((Some("cursor".into()), true))
+        );
+        assert!(store
+            .provider_dav_state_bounded(&scope, Arc::new(|| true))
+            .is_err());
+        assert!(matches!(
+            store.search_provider_dav_bounded(&scope, "Searchable", 12, 1, Arc::new(|| false)),
+            Err(StoreError::ProviderObjectTooLarge)
+        ));
+        let (one, covered) = store
+            .search_provider_dav_bounded(
+                &scope,
+                "Searchable",
+                12,
+                objects[0].raw.len() + 1,
+                Arc::new(|| false),
+            )
+            .unwrap();
+        assert_eq!(one.len(), 1);
+        assert!(!covered);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let result = store.search_provider_dav_bounded(
+            &scope,
+            "Searchable",
+            12,
+            4096,
+            Arc::new(move || counter.fetch_add(1, Ordering::SeqCst) > 0),
+        );
+        assert!(
+            matches!(result, Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(e, _))) if e.code == rusqlite::ErrorCode::OperationInterrupted)
+        );
+        let timeout: u32 = store
+            .conn
+            .pragma_query_value(None, "busy_timeout", |r| r.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5000);
+        assert!(calls.load(Ordering::SeqCst) > 1);
+        assert_eq!(
+            store
+                .search_provider_dav_bounded(&scope, "Searchable", 2, 4096, Arc::new(|| false))
+                .unwrap()
+                .0
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn protected_release_matches_exact_version_and_preserves_current_and_unprotected() {
+        use super::*;
+        let store = Store::open_in_memory().unwrap();
+        let scope = ProviderScope {
+            account_id: "a".into(),
+            origin: "https://one.example".into(),
+            service: "calendar".into(),
+            collection: "c".into(),
+        };
+        let write = |raw: &[u8]| {
+            store
+                .apply_provider_bundle(&[(
+                    &scope,
+                    &[ProviderChange::Upsert(ProviderObject {
+                        remote_id: "id".into(),
+                        etag: Some(String::from_utf8_lossy(raw).into()),
+                        raw: raw.to_vec(),
+                    })],
+                    "cursor",
+                )])
+                .unwrap()
+        };
+        write(b"old");
+        write(b"new");
+        let before = store
+            .provider_captures_for("a", "https://one.example", 0, 10)
+            .unwrap();
+        assert_eq!(before.len(), 2);
+        let exact = |c: &ProviderCapture| ProviderProtectedCapture {
+            scope: c.scope.clone(),
+            remote_id: c.object.remote_id.clone(),
+            version_key: c.version_key.clone(),
+            digest: c.digest.clone(),
+        };
+        let mut forged = exact(&before[0]);
+        forged.digest = "forged".into();
+        assert_eq!(
+            store
+                .release_protected_captures(
+                    "a",
+                    "https://one.example",
+                    before[1].sequence,
+                    &[forged, exact(&before[1])]
+                )
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            store
+                .provider_captures_for("a", "https://one.example", 0, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .release_protected_captures(
+                    "a",
+                    "https://one.example",
+                    before[0].sequence,
+                    &[exact(&before[0])]
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+        let retained = store
+            .provider_captures_for("a", "https://one.example", 0, 10)
+            .unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].version_key, before[1].version_key);
+        assert_eq!(
+            store
+                .provider_export_snapshot("a", "https://one.example")
+                .unwrap()
+                .capture_highwater,
+            before[1].sequence
+        );
+    }
+
+    #[test]
+    fn capture_checkpoint_survives_deletion_restart_and_rollback() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let scope = ProviderScope {
+            account_id: "a".into(),
+            origin: "https://one.example".into(),
+            service: "calendar".into(),
+            collection: "c".into(),
+        };
+        let store = Store::open_encrypted(&path, b"checkpoint-test").unwrap();
+        let add = |store: &Store, value: &[u8]| {
+            store
+                .apply_provider_bundle(&[(
+                    &scope,
+                    &[ProviderChange::Upsert(ProviderObject {
+                        remote_id: "id".into(),
+                        etag: Some(String::from_utf8_lossy(value).into()),
+                        raw: value.to_vec(),
+                    })],
+                    "cursor",
+                )])
+                .unwrap();
+        };
+        add(&store, b"first");
+        let first = store
+            .provider_export_snapshot("a", "https://one.example")
+            .unwrap()
+            .capture_highwater;
+        assert!(first > 0);
+        store
+            .conn
+            .execute("DELETE FROM provider_capture_outbox", [])
+            .unwrap();
+        assert_eq!(
+            store
+                .provider_export_snapshot("a", "https://one.example")
+                .unwrap()
+                .capture_highwater,
+            first
+        );
+        assert_eq!(
+            store
+                .provider_export_snapshot("a", "https://other.example")
+                .unwrap()
+                .capture_highwater,
+            0
+        );
+        drop(store);
+        let store = Store::open_encrypted(&path, b"checkpoint-test").unwrap();
+        assert_eq!(
+            store
+                .provider_export_snapshot("a", "https://one.example")
+                .unwrap()
+                .capture_highwater,
+            first
+        );
+        add(&store, b"second");
+        let second = store
+            .provider_export_snapshot("a", "https://one.example")
+            .unwrap()
+            .capture_highwater;
+        assert!(second > first);
+        store.conn.execute_batch("BEGIN; INSERT INTO provider_capture_outbox(account_id,origin,service,collection,remote_id,digest,version_key,raw) VALUES('a','https://one.example','calendar','c','other','d','v',X'00'); ROLLBACK;").unwrap();
+        assert_eq!(
+            store
+                .provider_export_snapshot("a", "https://one.example")
+                .unwrap()
+                .capture_highwater,
+            second
+        );
+    }
+
+    #[test]
+    fn capture_checkpoint_migration_backfills_existing_scopes() {
+        use super::*;
+        let store = Store::open_in_memory().unwrap();
+        store.conn.execute("INSERT INTO provider_capture_outbox(account_id,origin,service,collection,remote_id,digest,version_key,raw) VALUES('a','one','calendar','c','id','d','v',X'00')", []).unwrap();
+        store.conn.execute_batch("DROP TRIGGER provider_capture_checkpoint_insert; DROP TABLE provider_capture_checkpoints; PRAGMA user_version=22;").unwrap();
+        super::super::migrate(&store.conn).unwrap();
+        let high = store
+            .provider_export_snapshot("a", "one")
+            .unwrap()
+            .capture_highwater;
+        assert!(high > 0);
+        store
+            .conn
+            .execute("DELETE FROM provider_capture_outbox", [])
+            .unwrap();
+        assert_eq!(
+            store
+                .provider_export_snapshot("a", "one")
+                .unwrap()
+                .capture_highwater,
+            high
+        );
+    }
+
     #[test]
     fn mail_window_is_bounded_atomic_and_preserves_historical_objects() {
         use super::*;
@@ -4355,6 +4789,36 @@ mod tests {
             .provider_alarm_candidates_page(&scope, "", 10)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn wp16_review_gap_local_session_capacity_matches_product_index_and_preserves_existing_sessions(
+    ) {
+        let store = Store::open_in_memory().unwrap();
+        let scope = ProviderScope {
+            account_id: "a".into(),
+            origin: "https://one.example".into(),
+            service: "agent".into(),
+            collection: "".into(),
+        };
+        for i in 0..128 {
+            assert!(store
+                .local_session_create(&scope, &format!("s{i}"), b"sealed")
+                .unwrap());
+        }
+        assert!(!store.local_session_create(&scope, "s0", b"sealed").unwrap());
+        assert!(matches!(
+            store.local_session_create(&scope, "overflow", b"sealed"),
+            Err(StoreError::IllegalTransition(ref reason)) if reason == "provider_session_limit_reached"
+        ));
+        assert!(store
+            .local_session_manifest(&scope, "overflow")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .local_session_manifest(&scope, "s0")
+            .unwrap()
+            .is_some());
     }
 
     #[test]

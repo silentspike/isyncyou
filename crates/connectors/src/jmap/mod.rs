@@ -121,8 +121,14 @@ impl LoopbackJmapReader {
 }
 
 fn body(response: Response, max: u64) -> Result<Vec<u8>, JmapError> {
+    struct SearchReader(Response);
+    impl Read for SearchReader {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            crate::request_budget::search_read(&mut self.0, out)
+        }
+    }
     let mut bytes = Vec::new();
-    response
+    SearchReader(response)
         .take(max + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| JmapError::Transport)?;
@@ -159,10 +165,11 @@ fn fetch_session(
         if !visited.insert(current.clone()) {
             return Err(JmapError::InvalidUrl);
         }
-        let response = http
+        let request = http
             .get(current.clone())
-            .bearer_auth(token)
-            .send()
+            .bearer_auth(token);
+        let response = crate::request_budget::search_request(request)
+            .map_err(|_| JmapError::Transport)?.send()
             .map_err(|_| JmapError::Transport)?;
         if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
             return Ok(response);
@@ -509,7 +516,7 @@ impl JmapClient {
         }
         let http = builder.build().map_err(|_| JmapError::Transport)?;
         let gate = origin_gate(&origin);
-        let discovery_permit = gate.acquire(false);
+        let discovery_permit = gate.acquire_search(false).map_err(|_| JmapError::Transport)?;
         let response = fetch_session(&http, &origin, &token, public.as_ref())?;
         if !response.status().is_success() {
             return Err(JmapError::Http(response.status().as_u16()));
@@ -866,7 +873,7 @@ impl JmapClient {
         if mutation && self.read_only {
             return Err(JmapError::Unsupported);
         }
-        let _permit = self.gate.acquire(false);
+        let _permit = self.gate.acquire_search(false).map_err(|_| JmapError::Transport)?;
         {
             let mut metrics = self
                 .metrics
@@ -903,12 +910,13 @@ impl JmapClient {
         {
             return Err(JmapError::InvalidResponse);
         }
-        let response = self
+        let request = self
             .http
             .post(self.api.clone())
             .bearer_auth(&self.token)
-            .json(&request)
-            .send()
+            .json(&request);
+        let response = crate::request_budget::search_request(request)
+            .map_err(|_| JmapError::Transport)?.send()
             .map_err(|_| {
                 if mutation {
                     JmapError::OutcomeUnknown

@@ -131,12 +131,17 @@ impl ProductSessionTransport {
                 let empty = SessionManifestV1::empty(&t.session_id);
                 let sealed = t.seal(&empty)?;
                 let store = t.store()?;
-                if store
-                    .local_session_create(&t.scope, &t.session_id, &sealed)
-                    .is_err()
-                {
-                    drop(store);
-                    return t.load_manifest(&t.session_id);
+                match store.local_session_create(&t.scope, &t.session_id, &sealed) {
+                    Err(isyncyou_store::StoreError::IllegalTransition(reason))
+                        if reason == "provider_session_limit_reached" =>
+                    {
+                        return Err(SessionV2Error::SessionLimit);
+                    }
+                    Err(_) => {
+                        drop(store);
+                        return t.load_manifest(&t.session_id);
+                    }
+                    Ok(_) => {}
                 }
                 drop(store);
                 t.load_manifest(&t.session_id)
@@ -582,6 +587,60 @@ impl SessionV2Transport for ProductSessionTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "encrypted-store")]
+    #[test]
+    fn wp16_review_gap_local_session_capacity_surfaces_the_product_session_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.accounts.push(isyncyou_core::AccountConfig {
+            id: "a".into(),
+            username: "a".into(),
+            sync_root: root.path().join("sync"),
+            archive_root: root.path().into(),
+            cache_root: root.path().join("cache"),
+            mount_point: None,
+        });
+        cfg.provider_accounts.insert(
+            "a".into(),
+            ProviderConfig::SelfHosted {
+                origin: "https://example.invalid".into(),
+                client_id: "client".into(),
+            },
+        );
+        let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let pairing =
+            isyncyou_agent::PairingPayload::generate(isyncyou_agent::SessionId::new(id).unwrap())
+                .unwrap();
+        let crypto =
+            SessionObjectCrypto::new(pairing.pairing_secret(), pairing.crypto_config().unwrap())
+                .unwrap();
+        let db = root.path().join("session.db");
+        let key = b"test-only-sqlcipher-key";
+        let scope = ProviderScope {
+            account_id: "a".into(),
+            origin: "https://example.invalid".into(),
+            service: "agent-session".into(),
+            collection: "local".into(),
+        };
+        {
+            let store = isyncyou_store::Store::open_encrypted(&db, key).unwrap();
+            for i in 0..128 {
+                store
+                    .local_session_create(&scope, &format!("existing-{i}"), b"sealed")
+                    .unwrap();
+            }
+        }
+        let mut transport = ProductSessionTransport::new(Some(&cfg), "a", "", id).unwrap();
+        if let ProductSessionTransport::Local(local) = &mut transport {
+            local.test_store = Some((db, key.to_vec()));
+        }
+        transport.bind_manifest_crypto(crypto).unwrap();
+        assert!(matches!(
+            transport.create_session(),
+            Err(SessionV2Error::SessionLimit)
+        ));
+    }
+
     #[test]
     fn local_session_lock_is_shared_by_clones_and_fences_other_openers() {
         let root = tempfile::tempdir().unwrap();

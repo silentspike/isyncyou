@@ -61,7 +61,7 @@ class ReminderBatchPolicyTest {
         assertEquals(listOf("good"), records.map { it.first })
     }
 
-    @Test fun invalidateOnlyOwnedIncompleteCollections() {
+    @Test fun onlyObsoleteRecordsInCompletelyReconciledCollectionsAreRemoved() {
         val tag = "a".repeat(64)
         val key = "r_$tag"
         fun record(account: String, collection: String) = JSONObject()
@@ -70,12 +70,15 @@ class ReminderBatchPolicyTest {
             .put("window_start", 1).put("window_end", 2).put("floating_tzid", JSONObject.NULL)
             .put("uid", "u").put("recurrence_id", "r").put("alarm_id", "a")
             .put("trigger_at", 1).put("notification_tag", tag)
-        assertTrue(invalidReminderScope(record("a", "revoked"), key, "a", setOf("good")))
-        assertFalse(invalidReminderScope(record("a", "good"), key, "a", setOf("good")))
-        assertFalse(invalidReminderScope(record("b", "revoked"), key, "a", setOf("good")))
-        assertFalse(invalidReminderScope(record("a", ""), key, "a", setOf("good")))
-        assertFalse(invalidReminderScope(record("a", "revoked").put("new_field", true), key, "a", setOf("good")))
-        assertFalse(invalidReminderScope(record("a", "revoked"), "r_" + "b".repeat(64), "a", setOf("good")))
+        // Total failure, busy, and a failed partial collection have no authority to delete.
+        assertFalse(obsoleteReminder(record("a", "good"), key, "a", emptySet(), emptySet()))
+        assertFalse(obsoleteReminder(record("a", "failed"), key, "a", setOf("good"), emptySet()))
+        assertTrue(obsoleteReminder(record("a", "good"), key, "a", setOf("good"), emptySet()))
+        assertFalse(obsoleteReminder(record("a", "good"), key, "a", setOf("good"), setOf(tag)))
+        assertFalse(obsoleteReminder(record("b", "good"), key, "a", setOf("good"), emptySet()))
+        assertFalse(obsoleteReminder(record("a", ""), key, "a", setOf("good"), emptySet()))
+        assertFalse(obsoleteReminder(record("a", "good").put("new_field", true), key, "a", setOf("good"), emptySet()))
+        assertFalse(obsoleteReminder(record("a", "good"), "r_" + "b".repeat(64), "a", setOf("good"), emptySet()))
     }
 
     @Test fun periodicAndForegroundPassesCannotOverlap() {

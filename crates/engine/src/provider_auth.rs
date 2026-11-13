@@ -152,6 +152,7 @@ pub fn import_android_auth_attempt(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthFinishError {
     Failed(String),
+    ExchangeUnknown,
     RevocationPending,
     RevocationUnrecoverable,
 }
@@ -159,6 +160,7 @@ impl std::fmt::Display for AuthFinishError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Failed(message) => f.write_str(message),
+            Self::ExchangeUnknown => f.write_str("OAuth exchange outcome unknown"),
             Self::RevocationPending => f.write_str("Grant revocation pending"),
             Self::RevocationUnrecoverable => {
                 f.write_str("Grant revocation unconfirmed and local recovery unavailable")
@@ -316,18 +318,9 @@ pub fn start_self_hosted_auth(
         return Err("Previous grant revocation requires recovery before signing in again".into());
     }
     let (origin, client_id, cache_path) = account(cfg, id)?;
-    #[cfg(target_os = "android")]
-    ensure_no_logout_marker(id, &origin, crate::provider_credential::platform_store()?)?;
-    #[cfg(not(target_os = "android"))]
-    ensure_no_logout_marker(
-        id,
-        &origin,
-        &DesktopCredentialStore {
-            path: cache_path.clone(),
-            account: id.into(),
-            origin: origin.clone(),
-        },
-    )?;
+    with_platform_credential_store(cfg, id, |store| {
+        ensure_auth_allowed_with_store(cfg, id, store)
+    })?;
     let expected_username = cfg
         .accounts
         .iter()
@@ -407,12 +400,11 @@ pub fn finish_self_hosted_auth_detailed_with_store(
     callback: &str,
     store: &dyn ProviderCredentialStore,
 ) -> Result<(), AuthFinishError> {
-    {
-        let _lock = lock(&attempt.cache_path)?;
-        ensure_no_logout_marker(&attempt.account_id, &attempt.origin, store)?;
-    }
     let code = callback_code(&attempt, callback)?.ok_or("Authorization rejected")?;
-    let response = client()?
+    let http = client()?;
+    let claim_key = exchange_pending_key(&attempt.account_id);
+    claim_exchange(&attempt, store)?;
+    let response = http
         .post(&attempt.token_endpoint)
         .form(&[
             ("grant_type", "authorization_code"),
@@ -422,13 +414,27 @@ pub fn finish_self_hosted_auth_detailed_with_store(
             ("code_verifier", &attempt.verifier),
         ])
         .budgeted_send_auto()
-        .map_err(|_| "OAuth exchange unavailable")?;
-    let token: TokenResponse = serde_json::from_value(json_response(response)?)
-        .map_err(|_| "Invalid OAuth token response")?;
+        .map_err(|_| AuthFinishError::ExchangeUnknown)?;
+    let value = json_response(response).map_err(|_| AuthFinishError::ExchangeUnknown)?;
+    let token = parse_exchange_response(value);
     if token.access_token.is_empty() || token.refresh_token.as_deref().is_none_or(str::is_empty) {
-        return Err(AuthFinishError::Failed(
-            "Incomplete OAuth token response".into(),
-        ));
+        if token
+            .refresh_token
+            .as_deref()
+            .is_some_and(|v| !v.is_empty())
+        {
+            let _lock = lock(&attempt.cache_path)?;
+            return match revoke_unaccepted_grant(&attempt, store, &token) {
+                Ok(()) => {
+                    store.delete(&claim_key, &attempt.origin)?;
+                    Err(AuthFinishError::Failed(
+                        "Incomplete OAuth token response".into(),
+                    ))
+                }
+                Err(error) => Err(error),
+            };
+        }
+        return Err(AuthFinishError::ExchangeUnknown);
     }
     let subject = verify_userinfo(
         &attempt.origin,
@@ -439,9 +445,12 @@ pub fn finish_self_hosted_auth_detailed_with_store(
     let _lock = lock(&attempt.cache_path)?;
     if ensure_no_logout_marker(&attempt.account_id, &attempt.origin, store).is_err() {
         return match revoke_unaccepted_grant(&attempt, store, &token) {
-            Ok(()) => Err(AuthFinishError::Failed(
-                "Provider logout requires recovery".into(),
-            )),
+            Ok(()) => {
+                store.delete(&claim_key, &attempt.origin)?;
+                Err(AuthFinishError::Failed(
+                    "Provider logout requires recovery".into(),
+                ))
+            }
             Err(recovery) => Err(recovery),
         };
     }
@@ -453,12 +462,36 @@ pub fn finish_self_hosted_auth_detailed_with_store(
         Ok(subject) => subject,
         Err(error) => {
             return match revoke_unaccepted_grant(&attempt, store, &token) {
-                Ok(()) => Err(AuthFinishError::Failed(error)),
+                Ok(()) => {
+                    store.delete(&claim_key, &attempt.origin)?;
+                    Err(AuthFinishError::Failed(error))
+                }
                 Err(recovery) => Err(recovery),
             };
         }
     };
     let cache = TokenCache::from_response(&token, now());
+    if random()
+        .and_then(|value| {
+            save_internal(
+                store,
+                &grant_generation_key(&attempt.account_id),
+                &attempt.origin,
+                value,
+            )
+        })
+        .is_err()
+    {
+        return match revoke_unaccepted_grant(&attempt, store, &token) {
+            Ok(()) => {
+                store.delete(&claim_key, &attempt.origin)?;
+                Err(AuthFinishError::Failed(
+                    "Provider credential storage failed".into(),
+                ))
+            }
+            Err(error) => Err(error),
+        };
+    }
     let saved = store.replace(
         &attempt.account_id,
         &attempt.origin,
@@ -470,14 +503,61 @@ pub fn finish_self_hosted_auth_detailed_with_store(
         },
     );
     match saved {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            store.delete(&claim_key, &attempt.origin)?;
+            Ok(())
+        }
         Err(_) => match revoke_unaccepted_grant(&attempt, store, &token) {
-            Ok(()) => Err(AuthFinishError::Failed(
-                "Provider credential storage failed".into(),
-            )),
+            Ok(()) => {
+                store.delete(&claim_key, &attempt.origin)?;
+                Err(AuthFinishError::Failed(
+                    "Provider credential storage failed".into(),
+                ))
+            }
             Err(recovery) => Err(recovery),
         },
     }
+}
+
+fn parse_exchange_response(value: Value) -> TokenResponse {
+    match serde_json::from_value(value.clone()) {
+        Ok(token) => token,
+        Err(_) => TokenResponse {
+            access_token: String::new(),
+            refresh_token: value
+                .get("refresh_token")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            expires_in: 0,
+        },
+    }
+}
+
+fn claim_exchange(
+    attempt: &AuthAttempt,
+    store: &dyn ProviderCredentialStore,
+) -> Result<(), AuthFinishError> {
+    let _lock = lock(&attempt.cache_path)?;
+    ensure_no_logout_marker(&attempt.account_id, &attempt.origin, store)?;
+    let key = exchange_pending_key(&attempt.account_id);
+    if store.load(&key, &attempt.origin)?.is_some() {
+        return Err(AuthFinishError::ExchangeUnknown);
+    }
+    if store.load(&attempt.account_id, &attempt.origin)?.is_some() {
+        return Err(AuthFinishError::Failed(
+            "Provider already signed in; sign out first".into(),
+        ));
+    }
+    if !load_quarantine(store, &attempt.account_id, &attempt.origin)?.is_empty() {
+        return Err(AuthFinishError::Failed(
+            "Previous grant revocation requires recovery".into(),
+        ));
+    }
+    let claim = serde_json::json!({"version":1,"account":attempt.account_id,
+        "origin":attempt.origin,"client_id":attempt.client_id,
+        "nonce_sha256":format!("{:x}",Sha256::digest(attempt.state.as_bytes()))});
+    save_internal(store, &key, &attempt.origin, claim.to_string())?;
+    Ok(())
 }
 
 fn quarantine_key(account: &str) -> String {
@@ -493,6 +573,60 @@ fn revocation_pending_key(account: &str) -> String {
     )
 }
 
+fn exchange_pending_key(account: &str) -> String {
+    format!(
+        "isyncyou-internal:exchange-pending:{:x}",
+        Sha256::digest(account.as_bytes())
+    )
+}
+
+fn refresh_pending_key(account: &str) -> String {
+    format!(
+        "isyncyou-internal:refresh-pending:{:x}",
+        Sha256::digest(account.as_bytes())
+    )
+}
+
+fn refresh_candidate_key(account: &str, operation: &str) -> String {
+    format!(
+        "isyncyou-internal:refresh-candidate:{:x}:{operation}",
+        Sha256::digest(account.as_bytes())
+    )
+}
+
+fn grant_generation_key(account: &str) -> String {
+    format!(
+        "isyncyou-internal:grant-generation:{:x}",
+        Sha256::digest(account.as_bytes())
+    )
+}
+
+fn logout_complete_key(account: &str, generation: &str) -> String {
+    format!(
+        "isyncyou-internal:logout-complete:{:x}:{:x}",
+        Sha256::digest(account.as_bytes()),
+        Sha256::digest(generation.as_bytes())
+    )
+}
+
+fn save_internal(
+    store: &dyn ProviderCredentialStore,
+    key: &str,
+    origin: &str,
+    value: String,
+) -> Result<(), String> {
+    store.replace(
+        key,
+        origin,
+        &ProviderCredential {
+            access_token: value,
+            refresh_token: None,
+            expires_at: 0,
+            subject: None,
+        },
+    )
+}
+
 fn ensure_no_logout_marker(
     account: &str,
     origin: &str,
@@ -503,6 +637,9 @@ fn ensure_no_logout_marker(
         .is_some()
     {
         return Err("Provider logout requires recovery before sign-in".into());
+    }
+    if store.load(&refresh_pending_key(account), origin)?.is_some() {
+        return Err("OAuth refresh requires recovery".into());
     }
     Ok(())
 }
@@ -515,7 +652,17 @@ pub fn ensure_auth_allowed_with_store(
 ) -> Result<(), String> {
     let (origin, _, path) = account(cfg, account_id)?;
     let _lock = lock(&path)?;
-    ensure_no_logout_marker(account_id, &origin, store)
+    ensure_no_logout_marker(account_id, &origin, store)?;
+    if store
+        .load(&exchange_pending_key(account_id), &origin)?
+        .is_some()
+    {
+        return Err("OAuth exchange outcome unknown".into());
+    }
+    if store.load(account_id, &origin)?.is_some() {
+        return Err("Provider already signed in; sign out first".into());
+    }
+    Ok(())
 }
 
 fn load_quarantine(
@@ -645,7 +792,16 @@ pub fn revoke_quarantined_grant_with_store(
         return Err("Grant revocation unconfirmed".into());
     }
     map.remove(recovery_id);
-    save_quarantine(store, account_id, &origin, &map)
+    save_quarantine(store, account_id, &origin, &map)?;
+    if let Some(claim) = store.load(&exchange_pending_key(account_id), &origin)? {
+        let value: Value = serde_json::from_str(&claim.access_token)
+            .map_err(|_| "OAuth exchange claim invalid")?;
+        if value.get("nonce_sha256").and_then(Value::as_str) != Some(recovery_id) {
+            return Err("OAuth exchange claim mismatch".into());
+        }
+        store.delete(&exchange_pending_key(account_id), &origin)?;
+    }
+    Ok(())
 }
 
 pub fn revoke_quarantined_grant(
@@ -912,10 +1068,14 @@ fn access_token_locked(
     client_id: &str,
     store: &dyn ProviderCredentialStore,
 ) -> Result<String, String> {
+    if store.load(&exchange_pending_key(id), origin)?.is_some() {
+        return Err("OAuth exchange outcome unknown".into());
+    }
     if store.load(&revocation_pending_key(id), origin)?.is_some() {
         return Err("Provider revocation pending; sign in again after recovery".into());
     }
-    let mut cached = store.load(id, origin)?.ok_or("Provider login required")?;
+    recover_refresh(id, origin, client_id, store)?;
+    let cached = store.load(id, origin)?.ok_or("Provider login required")?;
     if cached.subject.as_deref().is_none_or(str::is_empty) {
         return Err("Provider account identity must be verified by signing in again".into());
     }
@@ -932,35 +1092,232 @@ fn access_token_locked(
     if !cached.access_token.is_empty() && now() < cached.expires_at {
         return Ok(cached.access_token);
     }
+    let (_, endpoint, _) = metadata(origin)?;
+    let http = client()?;
+    refresh_locked(id, origin, client_id, store, cached, |refresh| {
+        let response = http
+            .post(endpoint)
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", client_id),
+                ("refresh_token", refresh),
+            ])
+            .budgeted_send_auto()
+            .map_err(|_| "OAuth refresh outcome unknown")?;
+        Ok(parse_exchange_response(json_response(response)?))
+    })
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefreshClaim {
+    version: u8,
+    account: String,
+    origin: String,
+    client_id: String,
+    generation: String,
+    operation: String,
+    original_digest: String,
+    installed_digest: Option<String>,
+}
+
+// A transient storage outage must not discard a successor while this process
+// remains alive. After process death only the durable claim remains, so the
+// result is unknown and must never be sent again.
+fn volatile_refresh_candidates(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, ProviderCredential>> {
+    static VALUES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, ProviderCredential>>,
+    > = std::sync::OnceLock::new();
+    VALUES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn save_refresh_claim(
+    store: &dyn ProviderCredentialStore,
+    id: &str,
+    origin: &str,
+    claim: &RefreshClaim,
+) -> Result<(), String> {
+    save_internal(
+        store,
+        &refresh_pending_key(id),
+        origin,
+        serde_json::to_string(claim).map_err(|_| "Invalid refresh recovery state")?,
+    )
+}
+
+/// Read only the bounded recovery state; never return token material.
+pub fn refresh_recovery_state_with_store(
+    cfg: &Config,
+    id: &str,
+    store: &dyn ProviderCredentialStore,
+) -> Result<&'static str, String> {
+    let (origin, client_id, path) = account(cfg, id)?;
+    let _lock = lock(&path)?;
+    let Some(record) = store.load(&refresh_pending_key(id), &origin)? else {
+        return Ok("none");
+    };
+    let claim: RefreshClaim =
+        serde_json::from_str(&record.access_token).map_err(|_| "Invalid refresh recovery state")?;
+    if claim.version != 1
+        || claim.account != id
+        || claim.origin != origin
+        || claim.client_id != client_id
+        || !valid_recovery_id(&claim.operation)
+        || store
+            .load(&grant_generation_key(id), &origin)?
+            .map(|value| value.access_token)
+            != Some(claim.generation)
+    {
+        return Err("Refresh recovery binding changed".into());
+    }
+    let key = refresh_candidate_key(id, &claim.operation);
+    let volatile = volatile_refresh_candidates()
+        .lock()
+        .map_err(|_| "Refresh recovery unavailable")?;
+    if claim.installed_digest.is_some()
+        || volatile.contains_key(&key)
+        || store.load(&key, &origin)?.is_some()
+    {
+        Ok("successor_pending")
+    } else {
+        Ok("outcome_unknown")
+    }
+}
+
+pub fn refresh_recovery_state(cfg: &Config, id: &str) -> Result<&'static str, String> {
+    with_platform_credential_store(cfg, id, |store| {
+        refresh_recovery_state_with_store(cfg, id, store)
+    })
+}
+
+fn recover_refresh(
+    id: &str,
+    origin: &str,
+    client_id: &str,
+    store: &dyn ProviderCredentialStore,
+) -> Result<(), String> {
+    let Some(record) = store.load(&refresh_pending_key(id), origin)? else {
+        return Ok(());
+    };
+    let mut claim: RefreshClaim =
+        serde_json::from_str(&record.access_token).map_err(|_| "Invalid refresh recovery state")?;
+    if claim.version != 1
+        || claim.account != id
+        || claim.origin != origin
+        || claim.client_id != client_id
+        || !valid_recovery_id(&claim.operation)
+        || store
+            .load(&grant_generation_key(id), origin)?
+            .map(|x| x.access_token)
+            != Some(claim.generation.clone())
+    {
+        return Err("Refresh recovery binding changed".into());
+    }
+    let current = store
+        .load(id, origin)?
+        .ok_or("Refresh recovery credential missing")?;
+    let candidate_key = refresh_candidate_key(id, &claim.operation);
+    {
+        let mut volatile = volatile_refresh_candidates()
+            .lock()
+            .map_err(|_| "Refresh recovery unavailable")?;
+        if let Some(candidate) = volatile.get(&candidate_key) {
+            store.replace(&candidate_key, origin, candidate)?;
+            volatile.remove(&candidate_key);
+        }
+    }
+    if let Some(digest) = &claim.installed_digest {
+        if credential_digest(&current) != *digest {
+            return Err("Refresh recovery credential changed".into());
+        }
+    } else {
+        let candidate = store
+            .load(&candidate_key, origin)?
+            .ok_or("OAuth refresh outcome unknown")?;
+        if candidate.subject != current.subject
+            || candidate.access_token.is_empty()
+            || candidate.refresh_token.as_deref().is_none_or(str::is_empty)
+        {
+            return Err("Invalid refresh recovery credential".into());
+        }
+        let current_digest = credential_digest(&current);
+        let next_digest = credential_digest(&candidate);
+        if current_digest == claim.original_digest {
+            store.replace(id, origin, &candidate)?;
+        } else if current_digest != next_digest {
+            return Err("Refresh recovery credential changed".into());
+        }
+        claim.installed_digest = Some(next_digest);
+        save_refresh_claim(store, id, origin, &claim)?;
+    }
+    if store.load(&candidate_key, origin)?.is_some() {
+        store.delete(&candidate_key, origin)?;
+    }
+    store.delete(&refresh_pending_key(id), origin)
+}
+
+fn refresh_locked(
+    id: &str,
+    origin: &str,
+    client_id: &str,
+    store: &dyn ProviderCredentialStore,
+    cached: ProviderCredential,
+    dispatch: impl FnOnce(&str) -> Result<TokenResponse, String>,
+) -> Result<String, String> {
     let refresh = cached
         .refresh_token
         .as_deref()
+        .filter(|v| !v.is_empty())
         .ok_or("Provider login required")?;
-    let (_, endpoint, _) = metadata(origin)?;
-    let response = client()?
-        .post(endpoint)
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("client_id", client_id),
-            ("refresh_token", refresh),
-        ])
-        .budgeted_send_auto()
-        .map_err(|_| "OAuth refresh unavailable")?;
-    let token: TokenResponse = serde_json::from_value(json_response(response)?)
-        .map_err(|_| "Invalid OAuth refresh response")?;
-    if token.access_token.is_empty() || token.refresh_token.as_deref() == Some("") {
-        return Err("Invalid OAuth refresh response".into());
+    let generation = provider_generation_locked(store, id, origin)?;
+    let operation = format!("{:x}", Sha256::digest(random()?.as_bytes()));
+    let claim = RefreshClaim {
+        version: 1,
+        account: id.into(),
+        origin: origin.into(),
+        client_id: client_id.into(),
+        generation,
+        operation: operation.clone(),
+        original_digest: credential_digest(&cached),
+        installed_digest: None,
+    };
+    save_refresh_claim(store, id, origin, &claim)?;
+    let token = dispatch(refresh).map_err(|_| "OAuth refresh outcome unknown")?;
+    if token.refresh_token.as_deref() == Some("")
+        || (token.access_token.is_empty() && token.refresh_token.is_none())
+    {
+        return Err("OAuth refresh outcome unknown".into());
     }
-    let previous = cached.refresh_token.take();
+    let incomplete = token.access_token.is_empty();
     let cache = TokenCache::from_response(&token, now());
-    cached = ProviderCredential {
-        access_token: cache.access_token,
-        refresh_token: cache.refresh_token.or(previous),
-        expires_at: cache.expires_at,
+    let candidate = ProviderCredential {
+        access_token: if incomplete {
+            if cached.access_token.is_empty() {
+                "unavailable".into()
+            } else {
+                cached.access_token.clone()
+            }
+        } else {
+            cache.access_token
+        },
+        refresh_token: cache.refresh_token.or(cached.refresh_token),
+        expires_at: if incomplete { 0 } else { cache.expires_at },
         subject: cached.subject,
     };
-    store.replace(id, origin, &cached)?;
-    Ok(cached.access_token)
+    let candidate_key = refresh_candidate_key(id, &operation);
+    if store.replace(&candidate_key, origin, &candidate).is_err() {
+        volatile_refresh_candidates()
+            .lock()
+            .map_err(|_| "Refresh recovery unavailable")?
+            .insert(candidate_key, candidate);
+        return Err("OAuth refresh successor storage unavailable".into());
+    }
+    recover_refresh(id, origin, client_id, store)?;
+    if incomplete {
+        return Err("OAuth refresh response incomplete; successor preserved".into());
+    }
+    Ok(candidate.access_token)
 }
 
 /// Internal engine-only seam for a bounded native dispatch that must be
@@ -1126,6 +1483,37 @@ impl DesktopCredentialStore {
         if account == revocation_pending_key(&self.account) {
             return Ok(self.path.with_extension("revocation-pending.json"));
         }
+        if account == exchange_pending_key(&self.account) {
+            return Ok(self.path.with_extension("exchange-pending.json"));
+        }
+        if account == grant_generation_key(&self.account) {
+            return Ok(self.path.with_extension("grant-generation.json"));
+        }
+        if account == refresh_pending_key(&self.account) {
+            return Ok(self.path.with_extension("refresh-pending.json"));
+        }
+        let refresh_prefix = format!(
+            "isyncyou-internal:refresh-candidate:{:x}:",
+            Sha256::digest(self.account.as_bytes())
+        );
+        if let Some(suffix) = account.strip_prefix(&refresh_prefix) {
+            if valid_recovery_id(suffix) {
+                return Ok(self
+                    .path
+                    .with_extension(format!("refresh-candidate-{suffix}.json")));
+            }
+        }
+        let prefix = format!(
+            "isyncyou-internal:logout-complete:{:x}:",
+            Sha256::digest(self.account.as_bytes())
+        );
+        if let Some(suffix) = account.strip_prefix(&prefix) {
+            if valid_recovery_id(suffix) {
+                return Ok(self
+                    .path
+                    .with_extension(format!("logout-complete-{suffix}.json")));
+            }
+        }
         Err("Credential account mismatch".into())
     }
 }
@@ -1168,7 +1556,10 @@ impl ProviderCredentialStore for DesktopCredentialStore {
         }
         .save_to_keyring(&path)
         .map_err(|_| "System keyring unavailable".to_string())?;
-        if account == revocation_pending_key(&self.account) {
+        if account == revocation_pending_key(&self.account)
+            || account == refresh_pending_key(&self.account)
+            || account.starts_with("isyncyou-internal:refresh-candidate:")
+        {
             std::fs::File::open(&path)
                 .and_then(|file| file.sync_all())
                 .map_err(|_| "Revocation marker durability unavailable")?;
@@ -1183,8 +1574,11 @@ impl ProviderCredentialStore for DesktopCredentialStore {
     }
     fn delete(&self, account: &str, origin: &str) -> Result<(), String> {
         let path = self.path_for(account, origin)?;
-        delete_desktop_credential(&path, account == revocation_pending_key(&self.account))?;
-        if account == revocation_pending_key(&self.account) {
+        let durable = account == revocation_pending_key(&self.account)
+            || account == refresh_pending_key(&self.account)
+            || account.starts_with("isyncyou-internal:refresh-candidate:");
+        delete_desktop_credential(&path, durable)?;
+        if durable {
             let parent = path
                 .parent()
                 .ok_or("Revocation marker directory unavailable")?;
@@ -1259,8 +1653,9 @@ pub fn self_hosted_auth_status_with_store(
     id: &str,
     store: &dyn ProviderCredentialStore,
 ) -> Result<bool, String> {
-    let (origin, _, path) = account(cfg, id)?;
+    let (origin, client_id, path) = account(cfg, id)?;
     let _lock = lock(&path)?;
+    recover_refresh(id, &origin, &client_id, store)?;
     Ok(verified_subject_locked(store, id, &origin)?.is_some())
 }
 
@@ -1301,6 +1696,9 @@ fn verified_subject_locked(
     id: &str,
     origin: &str,
 ) -> Result<Option<String>, String> {
+    if store.load(&exchange_pending_key(id), origin)?.is_some() {
+        return Ok(None);
+    }
     if store.load(&revocation_pending_key(id), origin)?.is_some() {
         return Ok(None);
     }
@@ -1372,6 +1770,75 @@ pub fn with_locked_provider_subject_with_store<T>(
     action(subject.as_deref())
 }
 
+/// Return a stable, non-secret grant identity under the credential lock.
+/// Legacy connected accounts acquire an identity on first use; normal token
+/// refresh preserves it, whereas a new authorization creates a new identity.
+pub fn with_locked_provider_grant<T>(
+    cfg: &Config,
+    id: &str,
+    action: impl FnOnce(&str, &str) -> Result<T, String>,
+) -> Result<T, String> {
+    with_platform_credential_store(cfg, id, |store| {
+        with_locked_provider_grant_with_store(cfg, id, store, action)
+    })
+}
+
+pub fn with_locked_provider_grant_with_store<T>(
+    cfg: &Config,
+    id: &str,
+    store: &dyn ProviderCredentialStore,
+    action: impl FnOnce(&str, &str) -> Result<T, String>,
+) -> Result<T, String> {
+    let (origin, _, path) = account(cfg, id)?;
+    let _lock = lock(&path)?;
+    let subject = verified_subject_locked(store, id, &origin)?.ok_or("Provider login required")?;
+    let generation = provider_generation_locked(store, id, &origin)?;
+    action(&subject, &generation)
+}
+
+fn provider_generation_locked(
+    store: &dyn ProviderCredentialStore,
+    id: &str,
+    origin: &str,
+) -> Result<String, String> {
+    let key = grant_generation_key(id);
+    let generation = match store.load(&key, origin)? {
+        Some(value) => value.access_token,
+        None => {
+            let value = random()?;
+            save_internal(store, &key, origin, value.clone())?;
+            value
+        }
+    };
+    if generation.len() != 43
+        || !URL_SAFE_NO_PAD
+            .decode(&generation)
+            .is_ok_and(|v| v.len() == 32)
+    {
+        return Err("Provider grant generation invalid".into());
+    }
+    Ok(generation)
+}
+
+/// Run a bounded provider operation with a current token under the account lock.
+/// Refresh may perform discovery and token I/O; the callback must not reacquire
+/// the lock or persist, log, or expose the token.
+pub fn with_locked_provider_current_token<T>(
+    cfg: &Config,
+    id: &str,
+    action: impl FnOnce(&str, &str, &str) -> Result<T, String>,
+) -> Result<T, String> {
+    with_platform_credential_store(cfg, id, |store| {
+        let (origin, client_id, path) = account(cfg, id)?;
+        let _lock = lock(&path)?;
+        let token = access_token_locked(id, &origin, &client_id, store)?;
+        let subject =
+            verified_subject_locked(store, id, &origin)?.ok_or("Provider login required")?;
+        let generation = provider_generation_locked(store, id, &origin)?;
+        action(&subject, &generation, &token)
+    })
+}
+
 /// Revoke the installation grant first, then remove its local keyring entry.
 /// An unknown network result keeps the credential for explicit recovery.
 pub fn logout_self_hosted(cfg: &Config, id: &str) -> Result<(), String> {
@@ -1394,8 +1861,77 @@ pub fn logout_self_hosted_with_store(
     id: &str,
     store: &dyn ProviderCredentialStore,
 ) -> Result<(), String> {
+    logout_self_hosted_bound_with_store(cfg, id, store, None)
+}
+
+/// Revoke only the grant named by an existing cleanup original. The identity
+/// comparison and revocation dispatch share the normal cross-process lock.
+pub fn logout_self_hosted_if_generation_with_store(
+    cfg: &Config,
+    id: &str,
+    store: &dyn ProviderCredentialStore,
+    expected_generation: &str,
+) -> Result<(), String> {
+    logout_self_hosted_bound_with_store(cfg, id, store, Some(expected_generation))
+}
+
+fn logout_self_hosted_bound_with_store(
+    cfg: &Config,
+    id: &str,
+    store: &dyn ProviderCredentialStore,
+    expected_generation: Option<&str>,
+) -> Result<(), String> {
     let (origin, client_id, path) = account(cfg, id)?;
     let _lock = lock(&path)?;
+    if let Some(expected) = expected_generation {
+        if expected.len() != 43
+            || !URL_SAFE_NO_PAD
+                .decode(expected)
+                .is_ok_and(|v| v.len() == 32)
+        {
+            return Err("Provider grant generation invalid".into());
+        }
+        let complete_key = logout_complete_key(id, expected);
+        if let Some(complete) = store.load(&complete_key, &origin)? {
+            let record: Value = serde_json::from_str(&complete.access_token)
+                .map_err(|_| "Logout receipt invalid")?;
+            if record
+                != serde_json::json!({"version":1,"account":id,"origin":origin,"client_id":client_id,"generation":expected})
+            {
+                return Err("Logout receipt binding changed".into());
+            }
+            if let Some(pending) = store.load(&revocation_pending_key(id), &origin)? {
+                let pending: LogoutMarker = serde_json::from_str(&pending.access_token)
+                    .map_err(|_| "Revocation binding changed; recovery required")?;
+                if pending.grant_generation.as_deref() == Some(expected)
+                    && pending.state == "revoked"
+                    && store.load(id, &origin)?.is_none()
+                {
+                    store.delete(&revocation_pending_key(id), &origin)?;
+                }
+            }
+            return Ok(());
+        }
+        let marker = store.load(&revocation_pending_key(id), &origin)?;
+        let pending = marker.is_some();
+        let cache_present = store.load(id, &origin)?.is_some();
+        let resumed_revoked = if let Some(marker) = marker {
+            let marker: LogoutMarker = serde_json::from_str(&marker.access_token)
+                .map_err(|_| "Revocation binding changed; recovery required")?;
+            if marker.grant_generation.as_deref() != Some(expected) {
+                return Err("Provider grant generation changed".into());
+            }
+            marker.state == "revoked" && !cache_present
+        } else {
+            false
+        };
+        if store.load(&exchange_pending_key(id), &origin)?.is_some()
+            || (!pending && verified_subject_locked(store, id, &origin)?.is_none())
+            || (!resumed_revoked && provider_generation_locked(store, id, &origin)? != expected)
+        {
+            return Err("Provider grant generation changed".into());
+        }
+    }
     logout_bound(
         id,
         &origin,
@@ -1431,6 +1967,8 @@ struct LogoutMarker {
     client_id: String,
     endpoint: String,
     credential_digest: String,
+    #[serde(default)]
+    grant_generation: Option<String>,
 }
 
 /// Report whether an explicitly requested logout can safely be continued.
@@ -1482,6 +2020,10 @@ fn logout_bound(
     discover: impl FnOnce() -> Result<String, String>,
     revoke: impl FnOnce(&str, &str) -> Result<(), String>,
 ) -> Result<(), String> {
+    recover_refresh(id, origin, client_id, store)?;
+    if store.load(&exchange_pending_key(id), origin)?.is_some() {
+        return Err("OAuth exchange outcome unknown".into());
+    }
     let key = revocation_pending_key(id);
     let existing = store.load(&key, origin)?;
     let cache = store.load(id, origin)?;
@@ -1519,6 +2061,7 @@ fn logout_bound(
             client_id: client_id.into(),
             endpoint,
             credential_digest: credential_digest(cache),
+            grant_generation: Some(provider_generation_locked(store, id, origin)?),
         };
         save_logout_marker(store, &key, origin, &marker)?;
         marker
@@ -1542,6 +2085,16 @@ fn logout_bound(
     if cache.is_some() {
         store.delete(id, origin)?;
     }
+    if let Some(generation) = &marker.grant_generation {
+        let receipt = serde_json::json!({"version":1,"account":id,"origin":origin,"client_id":client_id,"generation":generation});
+        save_internal(
+            store,
+            &logout_complete_key(id, generation),
+            origin,
+            receipt.to_string(),
+        )?;
+    }
+    save_internal(store, &grant_generation_key(id), origin, random()?)?;
     store.delete(&key, origin)
 }
 
@@ -1650,6 +2203,90 @@ mod tests {
     use super::*;
 
     #[test]
+    fn incomplete_exchange_retains_known_refresh_for_revocation() {
+        for value in [
+            serde_json::json!({"access_token":"","refresh_token":"refresh"}),
+            serde_json::json!({"refresh_token":"refresh"}),
+        ] {
+            let token = parse_exchange_response(value);
+            assert!(token.access_token.is_empty());
+            assert_eq!(token.refresh_token.as_deref(), Some("refresh"));
+        }
+    }
+
+    #[test]
+    fn exchange_claim_rejects_existing_grant_and_never_replays_unknown() {
+        struct Keys(
+            std::sync::Mutex<std::collections::HashMap<(String, String), ProviderCredential>>,
+        );
+        impl ProviderCredentialStore for Keys {
+            fn load(&self, a: &str, o: &str) -> Result<Option<ProviderCredential>, String> {
+                Ok(self.0.lock().unwrap().get(&(a.into(), o.into())).cloned())
+            }
+            fn replace(&self, a: &str, o: &str, c: &ProviderCredential) -> Result<(), String> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .insert((a.into(), o.into()), c.clone());
+                Ok(())
+            }
+            fn delete(&self, a: &str, o: &str) -> Result<(), String> {
+                self.0.lock().unwrap().remove(&(a.into(), o.into()));
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let attempt = AuthAttempt {
+            authorization_uri: String::new(),
+            origin: "https://example.test".into(),
+            client_id: "client".into(),
+            token_endpoint: "https://example.test/token".into(),
+            revocation_endpoint: "https://example.test/revoke".into(),
+            redirect_uri: "http://127.0.0.1:53682/oauth/callback".into(),
+            verifier: "verifier".into(),
+            state: "nonce".into(),
+            cache_path: dir.path().join("cache"),
+            account_id: "a".into(),
+            expected_username: "user".into(),
+            account_config: Config::default(),
+            started_at: now(),
+        };
+        let keys = Keys(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let credential = ProviderCredential {
+            access_token: "access".into(),
+            refresh_token: Some("refresh".into()),
+            expires_at: 1,
+            subject: Some("subject".into()),
+        };
+        keys.replace("a", &attempt.origin, &credential).unwrap();
+        assert!(matches!(
+            claim_exchange(&attempt, &keys),
+            Err(AuthFinishError::Failed(_))
+        ));
+        assert!(keys
+            .load(&exchange_pending_key("a"), &attempt.origin)
+            .unwrap()
+            .is_none());
+        keys.delete("a", &attempt.origin).unwrap();
+        let outcomes = std::thread::scope(|scope| {
+            let first = scope.spawn(|| claim_exchange(&attempt, &keys));
+            let second = scope.spawn(|| claim_exchange(&attempt, &keys));
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| matches!(result, Err(AuthFinishError::ExchangeUnknown)))
+                .count(),
+            1
+        );
+        assert!(verified_subject_locked(&keys, "a", &attempt.origin)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn event_stream_lease_is_exclusive_and_released() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config::default();
@@ -1725,6 +2362,45 @@ mod tests {
         let binding = format!("isyncyou-internal:subject:{:x}", Sha256::digest(b"a"));
         keys.replace(&binding, "https://example.test", &credential)
             .unwrap();
+        let generation =
+            with_locked_provider_grant_with_store(&cfg, "a", &keys, |_, generation| {
+                Ok(generation.to_owned())
+            })
+            .unwrap();
+        assert_eq!(
+            generation,
+            with_locked_provider_grant_with_store(&cfg, "a", &keys, |_, generation| Ok(
+                generation.to_owned()
+            ))
+            .unwrap()
+        );
+        let mut refreshed = credential.clone();
+        refreshed.access_token = "refreshed-access".into();
+        keys.replace("a", "https://example.test", &refreshed)
+            .unwrap();
+        assert_eq!(
+            generation,
+            with_locked_provider_grant_with_store(&cfg, "a", &keys, |_, generation| Ok(
+                generation.to_owned()
+            ))
+            .unwrap()
+        );
+        let replacement_generation = random().unwrap();
+        save_internal(
+            &keys,
+            &grant_generation_key("a"),
+            "https://example.test",
+            replacement_generation.clone(),
+        )
+        .unwrap();
+        assert!(
+            logout_self_hosted_if_generation_with_store(&cfg, "a", &keys, &generation).is_err()
+        );
+        assert!(keys.load("a", "https://example.test").unwrap().is_some());
+        assert!(keys
+            .load(&revocation_pending_key("a"), "https://example.test")
+            .unwrap()
+            .is_none());
         assert_eq!(
             with_locked_provider_subject_with_store(&cfg, "a", &keys, |subject| Ok(
                 subject.map(str::to_owned)
@@ -1739,6 +2415,7 @@ mod tests {
             &credential,
         )
         .unwrap();
+        assert!(with_locked_provider_grant_with_store(&cfg, "a", &keys, |_, _| Ok(())).is_err());
         assert_eq!(
             with_locked_provider_subject_with_store(&cfg, "a", &keys, |subject| Ok(
                 subject.map(str::to_owned)
@@ -1892,6 +2569,7 @@ mod tests {
             client_id: "client".into(),
             endpoint: "https://example.test/auth/revoke".into(),
             credential_digest: credential_digest(&original),
+            grant_generation: None,
         };
         save_logout_marker(
             &keys,
@@ -1910,6 +2588,55 @@ mod tests {
         )
         .unwrap();
         assert!(ensure_no_logout_marker("a", "https://example.test", &keys).is_ok());
+        let old_generation = random().unwrap();
+        let recovered = LogoutMarker {
+            grant_generation: Some(old_generation.clone()),
+            ..marker
+        };
+        save_logout_marker(
+            &keys,
+            &revocation_pending_key("a"),
+            "https://example.test",
+            &recovered,
+        )
+        .unwrap();
+        save_internal(
+            &keys,
+            &grant_generation_key("a"),
+            "https://example.test",
+            random().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            logout_self_hosted_if_generation_with_store(&cfg, "a", &keys, "wrong-generation")
+                .is_err()
+        );
+        logout_self_hosted_if_generation_with_store(&cfg, "a", &keys, &old_generation).unwrap();
+        assert!(ensure_no_logout_marker("a", "https://example.test", &keys).is_ok());
+        let replacement = ProviderCredential {
+            access_token: "new-access".into(),
+            refresh_token: Some("new-refresh".into()),
+            expires_at: 0,
+            subject: Some("subject".into()),
+        };
+        keys.replace("a", "https://example.test", &replacement)
+            .unwrap();
+        save_internal(
+            &keys,
+            &grant_generation_key("a"),
+            "https://example.test",
+            random().unwrap(),
+        )
+        .unwrap();
+        logout_self_hosted_if_generation_with_store(&cfg, "a", &keys, &old_generation).unwrap();
+        assert_eq!(
+            keys.load("a", "https://example.test")
+                .unwrap()
+                .unwrap()
+                .refresh_token
+                .as_deref(),
+            Some("new-refresh")
+        );
     }
 
     #[test]
@@ -2189,6 +2916,26 @@ mod tests {
             store.path_for(&quarantine, "https://example.test").unwrap(),
             token_path
         );
+        assert_ne!(
+            store
+                .path_for(&exchange_pending_key("a"), "https://example.test")
+                .unwrap(),
+            token_path
+        );
+        assert_ne!(
+            store
+                .path_for(&grant_generation_key("a"), "https://example.test")
+                .unwrap(),
+            token_path
+        );
+        assert_ne!(
+            store
+                .path_for(&grant_generation_key("a"), "https://example.test")
+                .unwrap(),
+            store
+                .path_for(&exchange_pending_key("a"), "https://example.test")
+                .unwrap()
+        );
         assert!(store.path_for(&binding, "https://other.test").is_err());
         assert!(store.path_for("other", "https://example.test").is_err());
     }
@@ -2196,7 +2943,11 @@ mod tests {
     struct FakeStore(std::sync::Mutex<Option<ProviderCredential>>);
     impl ProviderCredentialStore for FakeStore {
         fn load(&self, account: &str, origin: &str) -> Result<Option<ProviderCredential>, String> {
-            if account == revocation_pending_key("a") && origin == "https://example.test" {
+            if (account == revocation_pending_key("a")
+                || account == exchange_pending_key("a")
+                || account == refresh_pending_key("a"))
+                && origin == "https://example.test"
+            {
                 return Ok(None);
             }
             if (account != "a"
@@ -2226,6 +2977,351 @@ mod tests {
             *self.0.lock().unwrap() = None;
             Ok(())
         }
+    }
+
+    #[derive(Default)]
+    struct RefreshTestStore {
+        data: std::sync::Mutex<std::collections::HashMap<(String, String), ProviderCredential>>,
+        fail_account_replace: std::sync::atomic::AtomicBool,
+        fail_claim: std::sync::atomic::AtomicBool,
+        fail_candidate: std::sync::atomic::AtomicBool,
+        fail_candidate_delete: std::sync::atomic::AtomicBool,
+    }
+    impl ProviderCredentialStore for RefreshTestStore {
+        fn load(&self, a: &str, o: &str) -> Result<Option<ProviderCredential>, String> {
+            Ok(self
+                .data
+                .lock()
+                .unwrap()
+                .get(&(a.into(), o.into()))
+                .cloned())
+        }
+        fn replace(&self, a: &str, o: &str, c: &ProviderCredential) -> Result<(), String> {
+            if (a == "a"
+                && self
+                    .fail_account_replace
+                    .load(std::sync::atomic::Ordering::SeqCst))
+                || (a == refresh_pending_key("a")
+                    && self.fail_claim.load(std::sync::atomic::Ordering::SeqCst))
+                || (a.starts_with("isyncyou-internal:refresh-candidate:")
+                    && self
+                        .fail_candidate
+                        .load(std::sync::atomic::Ordering::SeqCst))
+            {
+                return Err("injected storage failure".into());
+            }
+            self.data
+                .lock()
+                .unwrap()
+                .insert((a.into(), o.into()), c.clone());
+            Ok(())
+        }
+        fn delete(&self, a: &str, o: &str) -> Result<(), String> {
+            if a.starts_with("isyncyou-internal:refresh-candidate:")
+                && self
+                    .fail_candidate_delete
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err("injected deletion failure".into());
+            }
+            self.data.lock().unwrap().remove(&(a.into(), o.into()));
+            Ok(())
+        }
+    }
+
+    fn old_refresh_credential() -> ProviderCredential {
+        ProviderCredential {
+            access_token: "old-access".into(),
+            refresh_token: Some("old-refresh".into()),
+            expires_at: 1,
+            subject: Some("subject".into()),
+        }
+    }
+
+    #[test]
+    fn refresh_response_loss_keeps_original_claim_and_never_replays() {
+        let store = RefreshTestStore::default();
+        let old = old_refresh_credential();
+        store.replace("a", "https://example.test", &old).unwrap();
+        let mut calls = 0;
+        let mut provider_token = "old-refresh".to_string();
+        assert!(refresh_locked(
+            "a",
+            "https://example.test",
+            "client",
+            &store,
+            old.clone(),
+            |token| {
+                assert_eq!(token, provider_token);
+                calls += 1;
+                provider_token = "server-rotated-refresh".into();
+                Err("accepted response lost".into())
+            }
+        )
+        .is_err());
+        let claim = store
+            .load(&refresh_pending_key("a"), "https://example.test")
+            .unwrap()
+            .unwrap()
+            .access_token;
+        let restarted = RefreshTestStore {
+            data: std::sync::Mutex::new(store.data.lock().unwrap().clone()),
+            ..Default::default()
+        };
+        assert!(
+            recover_refresh("a", "https://example.test", "client", &restarted)
+                .unwrap_err()
+                .contains("unknown")
+        );
+        assert!(
+            access_token_locked("a", "https://example.test", "client", &restarted)
+                .unwrap_err()
+                .contains("unknown")
+        );
+        assert_eq!(
+            claim,
+            restarted
+                .load(&refresh_pending_key("a"), "https://example.test")
+                .unwrap()
+                .unwrap()
+                .access_token
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(provider_token, "server-rotated-refresh");
+        assert_eq!(
+            store
+                .load("a", "https://example.test")
+                .unwrap()
+                .unwrap()
+                .refresh_token,
+            old.refresh_token
+        );
+    }
+
+    #[test]
+    fn refresh_successor_survives_primary_store_failure_and_restart() {
+        use std::sync::atomic::Ordering;
+        let store = RefreshTestStore::default();
+        let old = old_refresh_credential();
+        store.replace("a", "https://example.test", &old).unwrap();
+        store
+            .replace("other", "https://example.test", &old)
+            .unwrap();
+        store.fail_account_replace.store(true, Ordering::SeqCst);
+        assert!(refresh_locked(
+            "a",
+            "https://example.test",
+            "client",
+            &store,
+            old.clone(),
+            |_| {
+                Ok(TokenResponse {
+                    access_token: "new-access".into(),
+                    refresh_token: Some("new-refresh".into()),
+                    expires_in: 3600,
+                })
+            }
+        )
+        .is_err());
+        let generation = store
+            .load(&grant_generation_key("a"), "https://example.test")
+            .unwrap()
+            .unwrap()
+            .access_token;
+        assert!(store
+            .load(&refresh_pending_key("a"), "https://example.test")
+            .unwrap()
+            .is_some());
+        let restarted = RefreshTestStore {
+            data: std::sync::Mutex::new(store.data.lock().unwrap().clone()),
+            ..Default::default()
+        };
+        recover_refresh("a", "https://example.test", "client", &restarted).unwrap();
+        assert_eq!(
+            restarted
+                .load("a", "https://example.test")
+                .unwrap()
+                .unwrap()
+                .refresh_token
+                .as_deref(),
+            Some("new-refresh")
+        );
+        assert_eq!(
+            restarted
+                .load("other", "https://example.test")
+                .unwrap()
+                .unwrap()
+                .refresh_token,
+            old.refresh_token
+        );
+        assert_eq!(
+            restarted
+                .load(&grant_generation_key("a"), "https://example.test")
+                .unwrap()
+                .unwrap()
+                .access_token,
+            generation
+        );
+        assert!(restarted
+            .load(&refresh_pending_key("a"), "https://example.test")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn refresh_never_dispatches_when_claim_cannot_be_persisted() {
+        use std::sync::atomic::Ordering;
+        let store = RefreshTestStore::default();
+        store.fail_claim.store(true, Ordering::SeqCst);
+        let mut calls = 0;
+        assert!(refresh_locked(
+            "a",
+            "https://example.test",
+            "client",
+            &store,
+            old_refresh_credential(),
+            |_| {
+                calls += 1;
+                Err("not reached".into())
+            }
+        )
+        .is_err());
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn refresh_recovery_status_reports_unknown_without_mutating_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.accounts.push(isyncyou_core::AccountConfig {
+            id: "a".into(),
+            username: "user".into(),
+            sync_root: PathBuf::new(),
+            archive_root: dir.path().into(),
+            cache_root: PathBuf::new(),
+            mount_point: None,
+        });
+        cfg.provider_accounts.insert(
+            "a".into(),
+            ProviderConfig::SelfHosted {
+                origin: "https://example.test".into(),
+                client_id: "client".into(),
+            },
+        );
+        let store = RefreshTestStore::default();
+        let old = old_refresh_credential();
+        store.replace("a", "https://example.test", &old).unwrap();
+        assert_eq!(
+            refresh_recovery_state_with_store(&cfg, "a", &store).unwrap(),
+            "none"
+        );
+        assert!(
+            refresh_locked("a", "https://example.test", "client", &store, old, |_| Err(
+                "response lost".into()
+            ))
+            .is_err()
+        );
+        let before = store
+            .load(&refresh_pending_key("a"), "https://example.test")
+            .unwrap()
+            .unwrap()
+            .access_token;
+        assert_eq!(
+            refresh_recovery_state_with_store(&cfg, "a", &store).unwrap(),
+            "outcome_unknown"
+        );
+        assert_eq!(
+            before,
+            store
+                .load(&refresh_pending_key("a"), "https://example.test")
+                .unwrap()
+                .unwrap()
+                .access_token
+        );
+    }
+
+    #[test]
+    fn refresh_successor_is_retained_during_transient_candidate_store_failure() {
+        use std::sync::atomic::Ordering;
+        let store = RefreshTestStore::default();
+        let old = old_refresh_credential();
+        store.replace("a", "https://example.test", &old).unwrap();
+        store.fail_candidate.store(true, Ordering::SeqCst);
+        assert!(
+            refresh_locked("a", "https://example.test", "client", &store, old, |_| {
+                Ok(TokenResponse {
+                    access_token: "new-access".into(),
+                    refresh_token: Some("new-refresh".into()),
+                    expires_in: 3600,
+                })
+            })
+            .is_err()
+        );
+        store.fail_candidate.store(false, Ordering::SeqCst);
+        recover_refresh("a", "https://example.test", "client", &store).unwrap();
+        assert_eq!(
+            store
+                .load("a", "https://example.test")
+                .unwrap()
+                .unwrap()
+                .refresh_token
+                .as_deref(),
+            Some("new-refresh")
+        );
+    }
+
+    #[test]
+    fn incomplete_refresh_response_preserves_known_successor_without_using_old_token() {
+        let store = RefreshTestStore::default();
+        let old = old_refresh_credential();
+        store.replace("a", "https://example.test", &old).unwrap();
+        let err = refresh_locked("a", "https://example.test", "client", &store, old, |_| {
+            Ok(parse_exchange_response(
+                serde_json::json!({"refresh_token":"new-refresh"}),
+            ))
+        })
+        .unwrap_err();
+        assert!(err.contains("successor preserved"));
+        let saved = store.load("a", "https://example.test").unwrap().unwrap();
+        assert_eq!(saved.refresh_token.as_deref(), Some("new-refresh"));
+        assert_eq!(saved.expires_at, 0);
+    }
+
+    #[test]
+    fn refresh_resumes_after_primary_replacement_before_marker_cleanup() {
+        use std::sync::atomic::Ordering;
+        let store = RefreshTestStore::default();
+        let old = old_refresh_credential();
+        store.replace("a", "https://example.test", &old).unwrap();
+        store.fail_candidate_delete.store(true, Ordering::SeqCst);
+        assert!(
+            refresh_locked("a", "https://example.test", "client", &store, old, |_| {
+                Ok(TokenResponse {
+                    access_token: "new-access".into(),
+                    refresh_token: Some("new-refresh".into()),
+                    expires_in: 3600,
+                })
+            })
+            .is_err()
+        );
+        let restarted = RefreshTestStore {
+            data: std::sync::Mutex::new(store.data.lock().unwrap().clone()),
+            ..Default::default()
+        };
+        recover_refresh("a", "https://example.test", "client", &restarted).unwrap();
+        assert_eq!(
+            restarted
+                .load("a", "https://example.test")
+                .unwrap()
+                .unwrap()
+                .refresh_token
+                .as_deref(),
+            Some("new-refresh")
+        );
+        assert!(restarted
+            .load(&refresh_pending_key("a"), "https://example.test")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

@@ -38,7 +38,7 @@ const FIXTURE_TERMINAL_TURNS = new Set();
 function startSse(res) {
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
-    "cache-control": "no-cache, no-transform",
+    "cache-control": "no-store, no-transform",
     connection: "keep-alive",
   });
 }
@@ -467,6 +467,20 @@ async function main() {
       accountLabels.labels[2] === "person@example.invalid");
     check(report, "account switcher never renders internal account aliases",
       !accountLabels.rendered.includes("controlled") && !accountLabels.rendered.includes("me"));
+
+    const providerStages = await page.evaluate(async () => {
+      const identity = { session_id: "s", turn_request_id: "r", turn_id: "t", stream_id: "x" };
+      const mk = (stage,status) => ({ event:"stage_progress", schema_version:1, activity_id:"abcdefghijklmnopqrstuv", activity_kind:"provider_search", stage,status, scanned:0,total:null,hits:0,current_item:null,coverage_complete:null,budget_reached:null,continuation_available:null });
+      let state=createAssistantActivityState(identity);
+      for (const [stage,status] of [["names","queued"],["names","running"],["names","complete"],["bodies","queued"],["bodies","running"],["bodies","complete"],["deep","queued"],["deep","running"],["deep","complete"]]) {
+        const normalized=await normalizeAssistantActivityEvent(identity,mk(stage,status));
+        state=reduceAssistantActivity(state,normalized);
+        if (state.lastDisposition !== "accept") return {ok:false, stage, status, disposition:state.lastDisposition};
+      }
+      return {ok:state.activities.get("abcdefghijklmnopqrstuv")?.stages.get("deep")?.status === "complete"};
+    });
+    if (!providerStages.ok) console.error("provider stage diagnostic", providerStages);
+    check(report, "provider search stages use the accepted typed UI contract", providerStages.ok);
 
     let lifecycle;
     if (SCENARIO === "containment") {

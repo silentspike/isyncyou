@@ -519,7 +519,7 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeConnecte
     jni_new_string(&mut env, value.to_string())
 }
 
-fn logout(base: &Path, account: &str) -> Result<(), String> {
+fn logout(base: &Path, account: &str, expected_generation: Option<&str>) -> Result<(), String> {
     let mut attempt = attempts().lock().map_err(|_| "Authorization unavailable")?;
     let cfg = config(base)?;
     let store = AndroidProviderCredentialStore::new(base)?;
@@ -530,11 +530,81 @@ fn logout(base: &Path, account: &str) -> Result<(), String> {
             if journal["stage"] != "pending" {
                 return Err("Authorization outcome unknown".into());
             }
+            if expected_generation.is_some() {
+                return Err("Authorization pending".into());
+            }
+        }
+    }
+    if let Some(generation) = expected_generation {
+        provider_auth::logout_self_hosted_if_generation_with_store(
+            &cfg, account, &store, generation,
+        )?;
+    } else {
+        provider_auth::logout_self_hosted_with_store(&cfg, account, &store)?;
+    }
+    if let Some(raw) = store.read_auth_journal()? {
+        let journal: serde_json::Value =
+            serde_json::from_slice(&raw).map_err(|_| "Authorization recovery unavailable")?;
+        if journal["account"].as_str() == Some(account) && journal["stage"] == "pending" {
             store.delete_auth_journal()?;
             *attempt = None;
         }
     }
-    provider_auth::logout_self_hosted_with_store(&cfg, account, &store)
+    Ok(())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeProviderGrantGeneration<
+    'a,
+>(
+    mut env: jni::EnvUnowned<'a>,
+    _class: jni::objects::JClass<'a>,
+    base: jni::objects::JString<'a>,
+    account: jni::objects::JString<'a>,
+) -> jni::sys::jstring {
+    let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || -> Result<String, String> {
+            let base = jni_get_string(&mut env, &base).ok_or("Invalid request")?;
+            let account = jni_get_string(&mut env, &account).ok_or("Invalid request")?;
+            let cfg = config(Path::new(&base))?;
+            let store = AndroidProviderCredentialStore::new(Path::new(&base))?;
+            provider_auth::with_locked_provider_grant_with_store(
+                &cfg,
+                &account,
+                &store,
+                |_, generation| Ok(generation.to_owned()),
+            )
+        },
+    ))
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default();
+    jni_new_string(&mut env, value)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeProviderLogoutGeneration<
+    'a,
+>(
+    mut env: jni::EnvUnowned<'a>,
+    _class: jni::objects::JClass<'a>,
+    base: jni::objects::JString<'a>,
+    account: jni::objects::JString<'a>,
+    generation: jni::objects::JString<'a>,
+) -> jni::sys::jint {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(base) = jni_get_string(&mut env, &base) else {
+            return 0;
+        };
+        let Some(account) = jni_get_string(&mut env, &account) else {
+            return 0;
+        };
+        let Some(generation) = jni_get_string(&mut env, &generation) else {
+            return 0;
+        };
+        i32::from(logout(Path::new(&base), &account, Some(&generation)).is_ok())
+    }))
+    .unwrap_or(0)
 }
 
 #[no_mangle]
@@ -684,6 +754,34 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeProvider
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeProviderRefreshRecovery<
+    'a,
+>(
+    mut env: jni::EnvUnowned<'a>,
+    _class: jni::objects::JClass<'a>,
+    base: jni::objects::JString<'a>,
+    account: jni::objects::JString<'a>,
+) -> jni::sys::jint {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let base = jni_get_string(&mut env, &base).ok_or(())?;
+        let account = jni_get_string(&mut env, &account).ok_or(())?;
+        let cfg = config(Path::new(&base)).map_err(|_| ())?;
+        let store = AndroidProviderCredentialStore::new(Path::new(&base)).map_err(|_| ())?;
+        match provider_auth::refresh_recovery_state_with_store(&cfg, &account, &store)
+            .map_err(|_| ())?
+        {
+            "none" => Ok::<i32, ()>(0),
+            "outcome_unknown" => Ok(1),
+            "successor_pending" => Ok(2),
+            _ => Err(()),
+        }
+    }))
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or(-1)
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeProviderLogoutRecovery<
     'a,
 >(
@@ -724,7 +822,7 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeProvider
         let Some(account) = jni_get_string(&mut env, &account) else {
             return 0;
         };
-        i32::from(logout(Path::new(&base), &account).is_ok())
+        i32::from(logout(Path::new(&base), &account, None).is_ok())
     }))
     .unwrap_or(0)
 }

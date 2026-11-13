@@ -155,6 +155,22 @@ fn bounded_mail_metadata(value: &Value) -> Result<Value, String> {
     Ok(result)
 }
 
+/// A shared message may belong to both visible and hidden mailboxes. Expose
+/// only currently readable memberships, and reject a message with none left.
+fn retain_live_page_readable_memberships(
+    item: &mut Value,
+    allowed: &[String],
+) -> Result<(), String> {
+    let memberships = item["mailboxIds"]
+        .as_object_mut()
+        .ok_or("provider_scope_unavailable")?;
+    memberships.retain(|id, yes| yes.as_bool() == Some(true) && allowed.contains(id));
+    if memberships.is_empty() {
+        return Err("provider_scope_unavailable".into());
+    }
+    Ok(())
+}
+
 /// Fetch one page from the provider, bound to its native query state.
 /// The query is repeated after fetching to reject changes while a page is read.
 pub fn live_mail_metadata_page(
@@ -190,6 +206,25 @@ pub fn live_mail_metadata_search_page(
     limit: usize,
     expected_query_state: Option<&str>,
 ) -> Result<LiveMailPage, String> {
+    live_mail_metadata_search_with_client(cfg, account, native_account, mailbox_id, text, position, limit, expected_query_state, || client(cfg, account), || client(cfg, account))
+}
+
+/// Search using an already verified, short-lived provider token. The caller
+/// owns its binding and must not persist or expose it.
+#[allow(clippy::too_many_arguments)]
+pub fn live_mail_metadata_search_with_token(
+    cfg: &Config, account: &str, token: &str, native_account: Option<&str>, mailbox_id: Option<&str>,
+    text: Option<&str>, position: usize, limit: usize, expected_query_state: Option<&str>,
+) -> Result<LiveMailPage, String> {
+    live_mail_metadata_search_with_client(cfg, account, native_account, mailbox_id, text, position, limit, expected_query_state, || client_with_token(cfg, account, token), || client_with_token(cfg, account, token))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn live_mail_metadata_search_with_client(
+    cfg: &Config, account: &str, native_account: Option<&str>, mailbox_id: Option<&str>, text: Option<&str>,
+    position: usize, limit: usize, expected_query_state: Option<&str>, open_client: impl FnOnce() -> Result<SelfHostedClient, String>,
+    fresh_client: impl FnOnce() -> Result<SelfHostedClient, String>,
+) -> Result<LiveMailPage, String> {
     if limit == 0
         || limit > 50
         || position > 1_000_000
@@ -208,7 +243,7 @@ pub fn live_mail_metadata_search_page(
     {
         return Err("invalid_page".into());
     }
-    let provider = client(cfg, account)?;
+    let provider = open_client()?;
     let primary = provider.client.primary_account_id();
     let native = native_account.unwrap_or(primary);
     let shared = native != primary;
@@ -313,7 +348,7 @@ pub fn live_mail_metadata_search_page(
         return Err("stale_page".into());
     }
     if let Some(initial_rights) = &rights {
-        let fresh = client(cfg, account)?;
+        let fresh = fresh_client()?;
         let fresh_rights = shared_mail_readable_mailboxes(cfg, account, &fresh, native)?;
         if fresh_rights.is_empty()
             || mailbox_id.is_some_and(|id| !fresh_rights.iter().any(|v| v == id))
@@ -321,16 +356,8 @@ pub fn live_mail_metadata_search_page(
         {
             return Err("provider_scope_unavailable".into());
         }
-        for item in values.values() {
-            let memberships = item["mailboxIds"]
-                .as_object()
-                .ok_or("provider_scope_unavailable")?;
-            if !memberships
-                .iter()
-                .any(|(id, yes)| yes.as_bool() == Some(true) && fresh_rights.contains(id))
-            {
-                return Err("provider_scope_unavailable".into());
-            }
+        for item in values.values_mut() {
+            retain_live_page_readable_memberships(item, &fresh_rights)?;
         }
     }
     let confirm = selected
@@ -452,6 +479,24 @@ pub fn client(cfg: &Config, account: &str) -> Result<SelfHostedClient, String> {
         origin: origin.clone(),
     })
 }
+
+/// Open from an already bound in-memory grant; no credential refresh occurs.
+pub fn client_with_token(cfg: &Config, account: &str, token: &str) -> Result<SelfHostedClient, String> {
+    let origin = match cfg.provider_accounts.get(account) {
+        Some(ProviderConfig::SelfHosted { origin, .. }) => origin,
+        None => return Err("Not a self-hosted account".into()),
+    };
+    #[cfg(test)]
+    let client = if SEARCH_LOOPBACK_FIXTURE.with(|flag| flag.get()) {
+        JmapClient::test_loopback(origin)
+    } else { JmapClient::discover(origin, token.to_owned()) }.map_err(discovery_failure)?;
+    #[cfg(not(test))]
+    let client = JmapClient::discover(origin, token.to_owned()).map_err(discovery_failure)?;
+    Ok(SelfHostedClient { client, account: account.into(), origin: origin.clone() })
+}
+
+#[cfg(test)]
+thread_local! { pub(crate) static SEARCH_LOOPBACK_FIXTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 /// Open one account-bound JMAP event stream. Each connection calls `on_change`
 /// before reading hints so callers reconcile persisted cursors after reconnect.
@@ -2835,6 +2880,27 @@ mod recipient_tests {
             super::mail_access_observation(&cfg, "observation-test"),
             super::MailAccessObservation::Unknown
         );
+    }
+
+    #[test]
+    fn wp16_review_gap_shared_live_page_exposes_only_currently_readable_memberships() {
+        let source = json!({
+            "id": "message",
+            "receivedAt": "2026-01-01T00:00:00Z",
+            "mailboxIds": {"visible": true, "hidden": true, "not_member": false}
+        });
+        let mut projected = super::bounded_mail_metadata(&source).unwrap();
+        super::retain_live_page_readable_memberships(&mut projected, &["visible".into()]).unwrap();
+        assert_eq!(projected["mailboxIds"], json!({"visible": true}));
+        // Projection must not alter the original provider response used elsewhere.
+        assert_eq!(source["mailboxIds"]["hidden"], true);
+
+        let mut after_revocation = super::bounded_mail_metadata(&source).unwrap();
+        assert!(super::retain_live_page_readable_memberships(
+            &mut after_revocation,
+            &["another".into()]
+        )
+        .is_err());
     }
 
     #[test]

@@ -19,6 +19,10 @@ mod account_lifecycle;
 ))]
 mod agent_control_store;
 mod agent_ops;
+#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+mod provider_progressive;
+#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
+mod provider_dispatch;
 #[cfg(feature = "agent-subscription-experimental")]
 mod local_cli_fallback;
 mod mobile_jobs;
@@ -267,6 +271,7 @@ fn provider_contact_search_names(view: &serde_json::Value) -> Vec<serde_json::Va
     feature = "agent-subscription-experimental"
 ))]
 struct ProviderMailExecutor {
+    progressive: Mutex<provider_dispatch::Dispatch>,
     cfg: Config,
     account: String,
     config_path: Arc<std::sync::RwLock<Option<PathBuf>>>,
@@ -1844,51 +1849,20 @@ impl isyncyou_agent::ToolExecutor for ProviderMailExecutor {
         action: &isyncyou_agent::ToolAction,
         context: isyncyou_agent::ReadExecutionContext<'_, '_>,
     ) -> Result<isyncyou_agent::ReadExecutionOutputV2, isyncyou_agent::AgentError> {
+        if matches!(action, isyncyou_agent::ToolAction::Search { .. } | isyncyou_agent::ToolAction::DeepSearch { .. }) {
+            return self.progressive_read(action, context);
+        }
         let content = self.execute_read(action)?;
         context.input_budget.charge(&content)?;
-        if matches!(action, isyncyou_agent::ToolAction::Search { .. }) {
-            use base64::Engine as _;
-            use ring::rand::SecureRandom as _;
-            let mut id = [0u8; 16];
-            ring::rand::SystemRandom::new().fill(&mut id).map_err(|_| {
-                isyncyou_agent::AgentError::Provider("search identity unavailable".into())
-            })?;
-            let value: serde_json::Value = serde_json::from_str(&content).map_err(|_| {
-                isyncyou_agent::AgentError::Provider("provider search unavailable".into())
-            })?;
-            let rows = value["results"].as_array().ok_or_else(|| {
-                isyncyou_agent::AgentError::Provider("provider search unavailable".into())
-            })?;
-            let count = rows.len();
-            let sources = provider_mail_sources(rows);
-            let public_sources = sources.iter().take(3).cloned().collect();
-            Ok(isyncyou_agent::ReadExecutionOutputV2::Search(
-                isyncyou_agent::SeparatedSearchOutputV2 {
-                    provider_content: content,
-                    public_projection: isyncyou_agent::PublicToolResultV1 {
-                        schema_version: isyncyou_agent::activity::ACTIVITY_SCHEMA_VERSION,
-                        operation: "search".into(),
-                        activity_id: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id),
-                        visible_hits: count as u32,
-                        coverage_complete: false,
-                        budget_reached: true,
-                        continuation_available: false,
-                        sources: public_sources,
-                    },
-                    assistant_sources: sources,
-                },
-            ))
+        let output = isyncyou_agent::ExistingSharedReadOutputV2 {
+            content,
+            untrusted: true,
+            assistant_sources: Vec::new(),
+        };
+        if matches!(action, isyncyou_agent::ToolAction::List { .. }) {
+            Ok(isyncyou_agent::ReadExecutionOutputV2::List(output))
         } else {
-            let output = isyncyou_agent::ExistingSharedReadOutputV2 {
-                content,
-                untrusted: true,
-                assistant_sources: Vec::new(),
-            };
-            if matches!(action, isyncyou_agent::ToolAction::List { .. }) {
-                Ok(isyncyou_agent::ReadExecutionOutputV2::List(output))
-            } else {
-                Ok(isyncyou_agent::ReadExecutionOutputV2::Read(output))
-            }
+            Ok(isyncyou_agent::ReadExecutionOutputV2::Read(output))
         }
     }
 }
@@ -1909,6 +1883,7 @@ fn make_account_executor(
     }
     if cfg.provider_accounts.contains_key(account) {
         Box::new(ProviderMailExecutor {
+            progressive: Mutex::new(provider_dispatch::Dispatch::default()),
             cfg: cfg.clone(),
             account: account.into(),
             config_path,
@@ -12921,6 +12896,9 @@ impl DaemonAgent {
                             agent_ops::bind_provider_task_completion(&executor_cfg, action)
                         })
                         .and_then(|action| {
+                            agent_ops::bind_provider_task_delete(&executor_cfg, action)
+                        })
+                        .and_then(|action| {
                             agent_ops::bind_provider_task_parent(&executor_cfg, action)
                         })
                         .and_then(|action| {
@@ -15347,6 +15325,95 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
             let proposed = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":"calendar", "target":request.href,
                 "change":{"verb":"calendar_cancel", "collection":request.collection, "uid":request.uid, "recurrence_id":request.recurrence_id, "sequence":request.sequence}})).map_err(|_| "confirmation_unavailable")?;
             let action = agent_ops::bind_provider_cancellation(&cfg, proposed)?;
+            let preview = agent_ops::preview_for_pending_action_with_config(&cfg, &action)?;
+            let turn_id = turn_id_from_request_id(&request.request_id)?;
+            let owner = isyncyou_agent::PendingOwnerBinding {
+                account: request.account.clone(),
+                session_id: request.session_id.clone(),
+                request_id: request.request_id.clone(),
+                turn_id: turn_id.clone(),
+            };
+            let (pending, token) = self
+                .pending
+                .register_bound(
+                    action,
+                    preview.text,
+                    unix_now_ms(),
+                    AGENT_CONFIRM_TTL_MS,
+                    owner.clone(),
+                )
+                .map_err(|_| "confirmation_unavailable")?;
+            let result = (|| {
+                let installation = account_lifecycle_repository(&self.oauth_dir)?
+                    .load_existing()
+                    .map_err(|_| "lifecycle_unavailable")?
+                    .ok_or("lifecycle_unavailable")?;
+                let transport_token = session_transport_token(&cfg, &request.account)?;
+                registry.append_user_pending(
+                    &transport_token,
+                    &owner,
+                    installation.principal(),
+                    unix_now_ms(),
+                )
+            })();
+            if let Err(error) = result {
+                let _ = self
+                    .pending
+                    .cancel(&pending.id, &pending.action_hash, unix_now_ms());
+                if let (Ok(repository), Ok(transport_token)) = (
+                    account_lifecycle_repository(&self.oauth_dir),
+                    session_transport_token(&cfg, &request.account),
+                ) {
+                    if let Ok(Some(installation)) = repository.load_existing() {
+                        let _ = registry.append_pending_cancelled(
+                            &transport_token,
+                            &owner,
+                            installation.principal(),
+                            unix_now_ms(),
+                        );
+                    }
+                }
+                return Err(error);
+            }
+            Ok(
+                serde_json::json!({"pending_id":pending.id,"token":token,"action_hash":pending.action_hash,"preview":pending.preview,"risk":pending.risk,"expires_at_ms":pending.expires_at_ms,"session_id":request.session_id,"turn_request_id":request.request_id,"turn_id":turn_id}),
+            )
+        }
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
+        {
+            let _ = request;
+            Err("confirmation_unavailable".into())
+        }
+    }
+    fn prepare_task_delete(
+        &self,
+        request: &isyncyou_webui::AgentTaskDeletePrepareRequest,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            if !self.pending.is_persistent() {
+                return Err("confirmation_unavailable".into());
+            }
+            let cfg = self.runtime_config();
+            if !cfg.provider_accounts.contains_key(&request.account) {
+                return Err("provider_unavailable".into());
+            }
+            let credentials =
+                agent_credential_store(&self.oauth_dir).map_err(|_| "session_store_unavailable")?;
+            let registry =
+                product_session::ProductSessionRegistry::new(&credentials).with_config(&cfg);
+            if registry.account_for(&request.session_id)? != request.account {
+                return Err("session_account_mismatch".into());
+            }
+            let proposed = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":request.account, "service":"calendar", "target":request.href,
+                "change":{"verb":"task_delete", "collection":request.collection, "uid":request.uid}})).map_err(|_| "confirmation_unavailable")?;
+            let action = agent_ops::bind_provider_task_delete(&cfg, proposed)?;
             let preview = agent_ops::preview_for_pending_action_with_config(&cfg, &action)?;
             let turn_id = turn_id_from_request_id(&request.request_id)?;
             let owner = isyncyou_agent::PendingOwnerBinding {
@@ -18026,6 +18093,9 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                                 })
                                 .and_then(|action| {
                                     agent_ops::bind_provider_task_completion(&executor_cfg, action)
+                                })
+                                .and_then(|action| {
+                                    agent_ops::bind_provider_task_delete(&executor_cfg, action)
                                 })
                                 .and_then(|action| {
                                     agent_ops::bind_provider_task_parent(&executor_cfg, action)
@@ -21452,11 +21522,15 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
         if cfg.provider_accounts.contains_key(account) {
             let connected = isyncyou_engine::provider_auth::self_hosted_auth_status(&cfg, account)
                 .unwrap_or(false);
+            let refresh = isyncyou_engine::provider_auth::refresh_recovery_state(&cfg, account);
+            let state = match refresh.as_deref() {
+                Ok("outcome_unknown") => isyncyou_webui::AccountAuthState::RefreshOutcomeUnknown,
+                Ok("successor_pending") => isyncyou_webui::AccountAuthState::RefreshRecoveryPending,
+                Ok("none") => provider_mail_role_state(connected, isyncyou_engine::self_hosted_mail::mail_access_observation(&cfg, account)),
+                _ => isyncyou_webui::AccountAuthState::AccessUnknown,
+            };
             let status = isyncyou_webui::AccountRoleStatus {
-                state: provider_mail_role_state(
-                    connected,
-                    isyncyou_engine::self_hosted_mail::mail_access_observation(&cfg, account),
-                ),
+                state,
                 // A locally available refresh grant is not proof of current server identity.
                 identity_verified: false,
             };
@@ -21488,7 +21562,11 @@ impl DaemonAccountAuth {
             .map_err(|_| "account_callback_unavailable".to_string())?;
         let attempt =
             isyncyou_engine::provider_auth::start_self_hosted_auth(cfg, account, CALLBACK)
-                .map_err(|_| "provider_sign_in_unavailable".to_string())?;
+                .map_err(|error| match error.as_str() {
+                    "OAuth exchange outcome unknown" => "account_exchange_outcome_unknown".to_string(),
+                    "Provider already signed in; sign out first" => "account_already_connected".to_string(),
+                    _ => "provider_sign_in_unavailable".to_string(),
+                })?;
         let authorization_uri = attempt.authorization_uri.clone();
         let id = LOGIN_SEQ.fetch_add(1, Ordering::SeqCst);
         let state = Arc::new(Mutex::new(LoginState {
@@ -21617,6 +21695,9 @@ fn provider_callback_serve(
                 state.done = true;
             } else {
                 state.error_code = Some(match result.as_ref().err() {
+                    Some(isyncyou_engine::provider_auth::AuthFinishError::ExchangeUnknown) => {
+                        "account_exchange_outcome_unknown"
+                    }
                     Some(isyncyou_engine::provider_auth::AuthFinishError::RevocationPending) => {
                         "account_revocation_pending"
                     }

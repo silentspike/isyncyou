@@ -99,14 +99,14 @@ fn bounded_fts_snippet(value: String) -> String {
 }
 
 /// Current schema version. Bump + add a migration step when the schema changes.
-pub const SCHEMA_VERSION: i64 = 22;
+pub const SCHEMA_VERSION: i64 = 23;
 
 mod provider;
 pub use provider::{
     capture_identity, capture_version, mail_capture_object, ProviderAlarmIdentity,
     ProviderAlarmIndex, ProviderCapture, ProviderChange, ProviderCollectionSnapshot,
     ProviderDavIndex, ProviderDavIndexEntry, ProviderEvent, ProviderExportSnapshot, ProviderObject,
-    ProviderScope, ProviderSubmission,
+    ProviderProtectedCapture, ProviderScope, ProviderSubmission,
 };
 pub use provider::{ProviderMailUploadIntentRecord, ProviderMutationIntentRecord};
 
@@ -3245,6 +3245,9 @@ fn migrate(conn: &Connection) -> Result<()> {
     }
     if v < 22 {
         conn.execute_batch(provider::MIGRATION_V22)?;
+    }
+    if v < 23 {
+        conn.execute_batch(provider::MIGRATION_V23)?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;

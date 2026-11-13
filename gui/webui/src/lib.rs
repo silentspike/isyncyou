@@ -414,6 +414,7 @@ product_post_routes! {
     AgentMailActionPrepare => ("/api/v1/agent/mail/action/prepare", 8 * 1024, Agent),
     AgentTaskAttributesPrepare => ("/api/v1/agent/task/attributes/prepare", 8 * 1024, Agent),
     AgentTaskParentPrepare => ("/api/v1/agent/task/parent/prepare", 8 * 1024, Agent),
+    AgentTaskDeletePrepare => ("/api/v1/agent/task/delete/prepare", 8 * 1024, Agent),
     AgentCancellationPrepare => ("/api/v1/agent/calendar/cancel/prepare", 8 * 1024, Agent),
     AgentContactPhotoPrepare => ("/api/v1/agent/contact/photo/prepare", 8 * 1024, Agent),
     AgentSingleCapturePrepare => ("/api/v1/agent/recovery/capture/prepare", 8 * 1024, Agent),
@@ -474,6 +475,7 @@ impl ProductPostRoute {
             | AgentMailActionPrepare
             | AgentTaskAttributesPrepare
             | AgentTaskParentPrepare
+            | AgentTaskDeletePrepare
             | AgentCancellationPrepare
             | AgentContactPhotoPrepare
             | AgentSingleCapturePrepare
@@ -1414,6 +1416,7 @@ fn scalar_product_fields(route: ProductPostRoute) -> Option<&'static [&'static s
         | AgentMailActionPrepare
         | AgentTaskAttributesPrepare
         | AgentTaskParentPrepare
+        | AgentTaskDeletePrepare
         | AgentCancellationPrepare
         | AgentContactPhotoPrepare
         | AgentSingleCapturePrepare
@@ -1858,6 +1861,7 @@ fn canonicalize_scalar_product_payload(
         | AgentMailActionPrepare
         | AgentTaskAttributesPrepare
         | AgentTaskParentPrepare
+        | AgentTaskDeletePrepare
         | AgentCancellationPrepare
         | AgentContactPhotoPrepare
         | AgentSingleCapturePrepare
@@ -1963,6 +1967,7 @@ fn canonicalize_product_payload(
         AgentMailActionPrepare => canonical_typed!(AgentMailActionPrepareRequest),
         AgentTaskAttributesPrepare => canonical_typed!(AgentTaskAttributesPrepareRequest),
         AgentTaskParentPrepare => canonical_typed!(AgentTaskParentPrepareRequest),
+        AgentTaskDeletePrepare => canonical_typed!(AgentTaskDeletePrepareRequest),
         AgentCancellationPrepare => canonical_typed!(AgentCancellationPrepareRequest),
         AgentContactPhotoPrepare => canonical_typed!(AgentContactPhotoPrepareRequest),
         AgentSingleCapturePrepare => canonical_typed!(AgentSingleCapturePrepareRequest),
@@ -2300,6 +2305,12 @@ fn validate_typed_product_request(
                 && (r.priority.is_some() || r.due.is_some() || r.start.is_some()))
             .then_some(())
             .ok_or_else(|| no_store_json_error(400, "invalid product request"))
+        }
+        AgentTaskDeletePrepare => {
+            let r = serde_json::from_value::<AgentTaskDeletePrepareRequest>(value.clone())
+                .map_err(|_| no_store_json_error(400, "invalid product request"))?;
+            (valid_opaque_agent_id(&r.session_id) && !r.account.is_empty() && !r.collection.is_empty() && !r.href.is_empty() && !r.uid.is_empty())
+                .then_some(()).ok_or_else(|| no_store_json_error(400, "invalid product request"))
         }
         AgentTaskParentPrepare => {
             let r = serde_json::from_value::<AgentTaskParentPrepareRequest>(value.clone())
@@ -3368,6 +3379,12 @@ pub struct AgentTaskParentPrepareRequest {
 }
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct AgentTaskDeletePrepareRequest {
+    pub request_id: String, pub session_id: String, pub account: String,
+    pub collection: String, pub href: String, pub uid: String,
+}
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentCancellationPrepareRequest {
     pub request_id: String,
     pub session_id: String,
@@ -3523,6 +3540,9 @@ pub trait AgentHandler: Send + Sync {
         &self,
         _request: &AgentMailActionPrepareRequest,
     ) -> Result<Value, String> {
+        Err("confirmation_unavailable".into())
+    }
+    fn prepare_task_delete(&self, _request: &AgentTaskDeletePrepareRequest) -> Result<Value, String> {
         Err("confirmation_unavailable".into())
     }
     fn prepare_task_parent(
@@ -4875,6 +4895,8 @@ pub enum AccountAuthState {
     AccessUnknown,
     ServiceUnreachable,
     ProviderResponseInvalid,
+    RefreshOutcomeUnknown,
+    RefreshRecoveryPending,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -6127,6 +6149,7 @@ impl Router {
                     self.agent_task_attributes_prepare(req)
                 }
                 ProductPostRoute::AgentTaskParentPrepare => self.agent_task_parent_prepare(req),
+                ProductPostRoute::AgentTaskDeletePrepare => self.agent_task_delete_prepare(req),
                 ProductPostRoute::AgentCancellationPrepare => self.agent_cancellation_prepare(req),
                 ProductPostRoute::AgentContactPhotoPrepare => self.agent_contact_photo_prepare(req),
                 ProductPostRoute::AgentSingleCapturePrepare => {
@@ -9273,6 +9296,7 @@ impl Router {
         };
         match h.start_login(account, role) {
             Ok(v) => ApiResponse::ok_json(&v),
+            Err(code) if matches!(code.as_str(), "account_exchange_outcome_unknown" | "account_already_connected") => ApiResponse::error(409, &code),
             Err(_) => ApiResponse::error(502, "account_login_unavailable"),
         }
     }
@@ -9848,6 +9872,14 @@ impl Router {
         }
     }
 
+    fn agent_task_delete_prepare(&self, req: &ApiRequest) -> ApiResponse {
+        let handler = match self.agent_gate(req) { Ok(handler) => handler, Err(error) => return with_no_store(error) };
+        let r: AgentTaskDeletePrepareRequest = match parse_agent_strict_json(req, "task delete prepare") { Ok(request) => request, Err(error) => return error };
+        if !valid_client_request_id(&r.request_id) || !valid_opaque_agent_id(&r.session_id) || r.account.is_empty() || r.collection.is_empty() || r.href.is_empty() || r.uid.is_empty() {
+            return no_store_json_error(400, "invalid task request");
+        }
+        match handler.prepare_task_delete(&r) { Ok(value) => with_no_store(ApiResponse::ok_json(&value)), Err(_) => no_store_json_error(409, "task_prepare_unavailable") }
+    }
     fn agent_task_parent_prepare(&self, req: &ApiRequest) -> ApiResponse {
         let handler = match self.agent_gate(req) {
             Ok(handler) => handler,
@@ -11356,7 +11388,7 @@ impl Router {
                     .and_then(|a| a.first())
                     .and_then(|a| a["email"].as_str())
                     .unwrap_or("");
-                items.push(json!({"service":"mail","mail_scope":scope.collection,"shared":false,"item_type":"message","remote_id":object.remote_id,"name":value["subject"].as_str().unwrap_or(""),"mailbox_ids":mailboxes,"has_body":false,"preview":{"subject":value["subject"],"from":from,"snippet":value["preview"],"date":value["receivedAt"],"isRead":value["keywords"]["$seen"].as_bool().unwrap_or(false),"isDraft":value["keywords"]["$draft"].as_bool().unwrap_or(false),"attachments":if value["hasAttachment"].as_bool().unwrap_or(false) {1} else {0}}}));
+                items.push(json!({"service":"mail","mail_scope":scope.collection,"shared":false,"item_type":"message","remote_id":object.remote_id,"name":value["subject"].as_str().unwrap_or(""),"mailbox_ids":mailboxes,"has_body":false,"preview":{"subject":value["subject"],"from":from,"snippet":value["preview"],"date":value["receivedAt"],"isRead":value["keywords"]["$seen"].as_bool().unwrap_or(false),"isDraft":value["keywords"]["$draft"].as_bool().unwrap_or(false),"flag":match value["keywords"].as_object() { Some(keywords) => match keywords.get("$flagged") { Some(Value::Bool(true)) => "flagged", None | Some(Value::Bool(false)) => "notFlagged", _ => "unknown" }, None => "unknown" },"attachments":if value["hasAttachment"].as_bool().unwrap_or(false) {1} else {0}}}));
             }
             return ApiResponse::ok_json(
                 &json!({"count":items.len(),"items":items,"scopes":[{"mail_scope":scope.collection,"primary":true}],"shared_access_status":"unknown","total":total,"window_limit":window_limit,"provenance":"local","observed_at":observed_at}),
@@ -11508,7 +11540,7 @@ impl Router {
                 .and_then(|a| a.first())
                 .and_then(|a| a["email"].as_str())
                 .unwrap_or("");
-            items.push(json!({"service":"mail","mail_scope":scope.collection,"shared":is_shared,"item_type":"message","remote_id":object.remote_id,"name":value["subject"].as_str().unwrap_or(""),"mailbox_ids":mailboxes,"has_body":false,"preview":{"subject":value["subject"],"from":from,"snippet":value["preview"],"date":value["receivedAt"],"isRead":value["keywords"]["$seen"].as_bool().unwrap_or(false),"isDraft":value["keywords"]["$draft"].as_bool().unwrap_or(false),"attachments":if value["hasAttachment"].as_bool().unwrap_or(false) {1} else {0}}}));
+            items.push(json!({"service":"mail","mail_scope":scope.collection,"shared":is_shared,"item_type":"message","remote_id":object.remote_id,"name":value["subject"].as_str().unwrap_or(""),"mailbox_ids":mailboxes,"has_body":false,"preview":{"subject":value["subject"],"from":from,"snippet":value["preview"],"date":value["receivedAt"],"isRead":value["keywords"]["$seen"].as_bool().unwrap_or(false),"isDraft":value["keywords"]["$draft"].as_bool().unwrap_or(false),"flag":match value["keywords"].as_object() { Some(keywords) => match keywords.get("$flagged") { Some(Value::Bool(true)) => "flagged", None | Some(Value::Bool(false)) => "notFlagged", _ => "unknown" }, None => "unknown" },"attachments":if value["hasAttachment"].as_bool().unwrap_or(false) {1} else {0}}}));
         }
         ApiResponse::ok_json(
             &json!({"count":items.len(),"items":items,"scopes":available,"shared_access_status":shared_access_status,"mail_scope":scope.collection,"shared":is_shared,"total":total,"window_limit":window_limit,"provenance":"local","observed_at":observed_at}),
@@ -11915,7 +11947,11 @@ impl Router {
                                     (archive_root.as_ref(), it.local_path.as_ref())
                                 {
                                     let disk_started = std::time::Instant::now();
-                                    if let Some(bytes) = if metadata_only {
+                                    if !metadata_only && service == "onenote" {
+                                        // Pages are HTML, not JSON sidecars; keep the
+                                        // listing on the bounded OneNote preview path.
+                                        v["preview"] = onenote_preview(it, root);
+                                    } else if let Some(bytes) = if metadata_only {
                                         None
                                     } else {
                                         read_under_root(root, rel)
@@ -11923,10 +11959,6 @@ impl Router {
                                         if service == "mail" {
                                             disk_parses += 1;
                                             mail_preview_enrichment(&mut v, it, root, rel, &bytes);
-                                        } else if service == "onenote" {
-                                            // a page's local_path is the .html body, not JSON —
-                                            // onenote_preview reads the _pagemeta_ / flank sidecar.
-                                            v["preview"] = onenote_preview(it, root);
                                         } else if let Ok(o) =
                                             serde_json::from_slice::<Value>(&bytes)
                                         {
@@ -13007,8 +13039,8 @@ fn todo_preview(it: &Item, o: &Value, root: &std::path::Path) -> Value {
 /// Build a OneNote item's `preview` (#568). A page exposes the metadata from its
 /// `_pagemeta_<id>` sidecar (the page's `local_path` is the `.html` body, not JSON) —
 /// createdDateTime, level/order, userTags, the OneNote web/client links, its section
-/// and notebook names, plus `has_resources` (whether a `<page>.resources.json`
-/// manifest exists). A notebook/section/section-group exposes a few fields from its
+/// and notebook names, plus generation-bound local resource availability. This
+/// availability check does not establish resource byte integrity. A notebook/section/section-group exposes a few fields from its
 /// flank JSON sidecar. All best-effort.
 fn onenote_preview(it: &Item, root: &std::path::Path) -> Value {
     if it.item_type == "page" {
@@ -13022,11 +13054,19 @@ fn onenote_preview(it: &Item, root: &std::path::Path) -> Value {
         )
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
         .unwrap_or_else(|| json!({}));
-        let has_resources = it
-            .local_path
-            .as_deref()
-            .map(|rel| root.join(rel).with_extension("resources.json").exists())
-            .unwrap_or(false);
+        let (archive_state, has_resources) = onenote_archive_state(it, root);
+        let refresh_state = read_under_root(
+            root,
+            isyncyou_connectors::archive::ONENOTE_MOBILE_REFRESH_STATE_FILE,
+        )
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v.get("state").and_then(Value::as_str).map(str::to_owned))
+        .filter(|s| matches!(s.as_str(), "partial" | "complete"));
+        let archive_state = if refresh_state.as_deref() == Some("partial") {
+            "partial"
+        } else {
+            archive_state
+        };
         return json!({
             "created": meta.get("createdDateTime").and_then(Value::as_str),
             "level": meta.get("level"),
@@ -13038,6 +13078,8 @@ fn onenote_preview(it: &Item, root: &std::path::Path) -> Value {
             "notebook_id": meta.pointer("/parentNotebook/id").and_then(Value::as_str),
             "notebook_name": meta.pointer("/parentNotebook/displayName").and_then(Value::as_str),
             "has_resources": has_resources,
+            "archive_state": archive_state,
+            "refresh_state": refresh_state,
         });
     }
     // notebook / section / section-group: a few fields from the flank JSON sidecar
@@ -13052,6 +13094,48 @@ fn onenote_preview(it: &Item, root: &std::path::Path) -> Value {
         "web_url": o.pointer("/links/oneNoteWebUrl/href").and_then(Value::as_str),
         "created": o.get("createdDateTime").and_then(Value::as_str),
     })
+}
+
+fn onenote_archive_state(it: &Item, root: &std::path::Path) -> (&'static str, bool) {
+    let Some(rel) = it.local_path.as_deref() else {
+        return ("partial", false);
+    };
+    // A list request must not read large bodies or every embedded part for each
+    // row. Larger pages remain unverified until a dedicated background check.
+    match root.join(rel).metadata() {
+        Ok(m) if m.len() > 256 * 1024 + 4096 => return ("unverified", false),
+        Err(_) => return ("partial", false),
+        _ => {}
+    }
+    let Some(html) = read_under_root(root, rel) else {
+        return ("partial", false);
+    };
+    if !isyncyou_connectors::archive::onenote_html_has_resources(&html) {
+        return ("complete", false);
+    }
+    let manifest_rel = std::path::Path::new(rel).with_extension("resources.json");
+    let Some(manifest_rel) = manifest_rel.to_str() else {
+        return ("unverified", false);
+    };
+    match root.join(manifest_rel).metadata() {
+        Ok(m) if m.len() > 64 * 1024 + 4096 => return ("unverified", true),
+        Err(_) => return ("partial", false),
+        _ => {}
+    }
+    let Some(manifest) =
+        read_under_root(root, manifest_rel).and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+    else {
+        return ("partial", false);
+    };
+    if manifest.get("html_sha256").is_none() {
+        return ("unverified", false);
+    }
+    if !isyncyou_connectors::archive::onenote_manifest_matches(&html, &manifest) {
+        return ("partial", false);
+    }
+    // Manifest binding alone does not verify part bytes. The bounded list path
+    // reports their presence without claiming completeness.
+    ("unverified", true)
 }
 
 /// Build a OneDrive item's `preview` from its archived DriveItem JSON sidecar
@@ -13522,7 +13606,7 @@ mod tests {
             service: "mail".into(),
             collection: "remote".into(),
         };
-        let object = ProviderObject { remote_id:"m1".into(), etag:None, raw:serde_json::to_vec(&json!({"id":"m1","subject":"Hello","from":[{"email":"sender@example.invalid"}],"mailboxIds":{"inbox":true,"archive":true},"keywords":{"$seen":true,"$draft":true}})).unwrap() };
+        let object = ProviderObject { remote_id:"m1".into(), etag:None, raw:serde_json::to_vec(&json!({"id":"m1","subject":"Hello","from":[{"email":"sender@example.invalid"}],"mailboxIds":{"inbox":true,"archive":true},"keywords":{"$seen":true,"$draft":true,"$flagged":true}})).unwrap() };
         assert!(store
             .publish_provider_mail_window(
                 &scope,
@@ -13548,6 +13632,12 @@ mod tests {
             .apply_provider_page(&folders, &[ProviderChange::Upsert(folder)], "state-2")
             .unwrap();
         let router = Router::new(Config::default());
+        let primary = body_json(&router.provider_mail_items(
+            &store, "a", "https://example.invalid",
+            &ApiRequest::get("/api/v1/items?account=a&service=mail&primary_cache_only=1"),
+        ));
+        let primary_mail = primary["items"].as_array().unwrap().iter().find(|v| v["remote_id"] == "m1").unwrap();
+        assert_eq!(primary_mail["preview"]["flag"], "flagged");
         let response = router.provider_mail_items(
             &store,
             "a",
@@ -13564,6 +13654,7 @@ mod tests {
         let mail = rows.iter().find(|v| v["remote_id"] == "m1").unwrap();
         assert_eq!(mail["preview"]["subject"], "Hello");
         assert_eq!(mail["preview"]["isDraft"], true);
+        assert_eq!(mail["preview"]["flag"], "flagged");
         assert_eq!(mail["mailbox_ids"].as_array().unwrap().len(), 2);
         assert_eq!(mail["has_body"], false);
         let second = ProviderObject {
@@ -13758,7 +13849,7 @@ mod tests {
         let window = [
             object(
                 "same",
-                json!({"subject":"allowed","mailboxIds":{"visible":true,"hidden":true}}),
+                json!({"subject":"allowed","mailboxIds":{"visible":true,"hidden":true},"keywords":{"$flagged":true}}),
             ),
             object(
                 "secret",
@@ -13779,6 +13870,7 @@ mod tests {
         let rows = result["items"].as_array().unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1]["mailbox_ids"], json!(["visible"]));
+        assert_eq!(rows[1]["preview"]["flag"], "flagged");
         assert_eq!(result["shared_access_status"], "observed");
         assert_eq!(
             handler
@@ -13846,6 +13938,15 @@ mod tests {
                 .status,
             503
         );
+    }
+
+    #[test]
+    fn task_delete_prepare_route_is_agent_bound_and_rejects_extra_fields() {
+        assert_eq!(product_post_route("/api/v1/agent/task/delete/prepare").map(|spec| spec.route), Some(ProductPostRoute::AgentTaskDeletePrepare));
+        let good = json!({"request_id":"request-1","session_id":"session-1","account":"a","collection":"/cal/","href":"/cal/a.ics","uid":"a"});
+        assert!(serde_json::from_value::<AgentTaskDeletePrepareRequest>(good.clone()).is_ok());
+        let mut bad = good; bad["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<AgentTaskDeletePrepareRequest>(bad).is_err());
     }
 
     #[test]
@@ -21033,7 +21134,7 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         for needle in [
             "async function normalizeAssistantActivityEvent(identity, event)",
             "event.schema_version !== 1",
-            "event.activity_kind !== \"archive_search\"",
+            "[\"archive_search\", \"provider_search\"].includes(event.activity_kind)",
             "event.items.some(item => !validAgentPublicResult(item))",
         ] {
             assert!(
@@ -22758,6 +22859,77 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert_eq!(p["section_name"], "Ideas");
         assert_eq!(p["notebook_name"], "Personal");
         assert_eq!(p["has_resources"], false);
+    }
+
+    #[test]
+    fn wp16_onenote_preview_reports_stale_and_partial_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let url = "https://graph.microsoft.com/v1.0/me/onenote/resources/r1/content";
+        let old = format!("<p>old</p><img src=\"{url}\">");
+        let new = format!("<p>new</p><img src=\"{url}\">");
+        let mut page = Item::new("a", "onenote", "p", "page", "page");
+        page.local_path = Some("p.html".into());
+        std::fs::write(root.join("p.html"), &old).unwrap();
+        std::fs::write(root.join("resource"), b"image").unwrap();
+        let manifest = json!({"html_sha256": isyncyou_connectors::archive::onenote_html_sha256(old.as_bytes()), "resources": [{"source_url":url,"local_path":"resource", "sha256": isyncyou_connectors::archive::onenote_html_sha256(b"image")}]});
+        std::fs::write(
+            root.join("p.resources.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(onenote_preview(&page, root)["archive_state"], "unverified");
+        std::fs::write(root.join("p.html"), &new).unwrap();
+        assert_eq!(onenote_preview(&page, root)["archive_state"], "partial");
+        std::fs::write(root.join("p.html"), &old).unwrap();
+        std::fs::write(
+            root.join("resource"),
+            isyncyou_core::envelope::seal(b"data", &[0x93; 32], u32::MAX),
+        )
+        .unwrap();
+        assert_eq!(onenote_preview(&page, root)["archive_state"], "unverified");
+        std::fs::write(
+            root.join(isyncyou_connectors::archive::ONENOTE_MOBILE_REFRESH_STATE_FILE),
+            br#"{"state":"partial"}"#,
+        )
+        .unwrap();
+        assert_eq!(onenote_preview(&page, root)["archive_state"], "partial");
+        std::fs::remove_file(
+            root.join(isyncyou_connectors::archive::ONENOTE_MOBILE_REFRESH_STATE_FILE),
+        )
+        .unwrap();
+        std::fs::write(root.join("p.html"), vec![b'x'; 256 * 1024 + 4097]).unwrap();
+        assert_eq!(onenote_preview(&page, root)["archive_state"], "unverified");
+    }
+
+    #[test]
+    fn wp16_onenote_items_large_body_uses_bounded_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        let mut oversized = isyncyou_core::envelope::seal(b"body", &[0x93; 32], u32::MAX);
+        oversized.resize(256 * 1024 + 4097, 0);
+        std::fs::write(arch.join("p.html"), oversized).unwrap();
+        let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+        let mut page = Item::new("a", "onenote", "p", "page", "page");
+        page.local_path = Some("p.html".into());
+        store.upsert_item(&page).unwrap();
+        drop(store);
+        let cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "fixture".into(),
+                sync_root: dir.path().join("sync"),
+                archive_root: arch,
+                cache_root: Default::default(),
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let body = body_json(
+            &Router::new(cfg).route(&ApiRequest::get("/api/v1/items?account=a&service=onenote")),
+        );
+        assert_eq!(body["items"][0]["preview"]["archive_state"], "unverified");
     }
 
     struct OkVerify;

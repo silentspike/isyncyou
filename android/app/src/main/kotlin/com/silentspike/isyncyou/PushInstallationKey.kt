@@ -19,6 +19,13 @@ internal object PushInstallationKey {
     data class Identity(val installation: String, val publicKey: String)
 
     @Synchronized
+    fun matchesOrAbsent(context: Context, account: String, expected: String): Boolean {
+        require(account.matches(Regex("[A-Za-z0-9._-]{1,128}")))
+        val saved = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(digest(account), null)
+        return saved == null || saved == expected
+    }
+
+    @Synchronized
     fun existing(context: Context, account: String): Identity? {
         require(account.matches(Regex("[A-Za-z0-9._-]{1,128}")))
         val installation = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(digest(account), null)
@@ -93,6 +100,19 @@ internal object PushInstallationKey {
         val installation = prefs.getString(slot, null) ?: return
         KeyStore.getInstance("AndroidKeyStore").apply { load(null); deleteEntry(PREFIX + installation) }
         check(prefs.edit().remove(slot).commit())
+    }
+
+    /** Resume safely even if the alias was already deleted before a crash. */
+    @Synchronized
+    fun deleteAfterRevoke(context: Context, account: String, expected: String) {
+        require(account.matches(Regex("[A-Za-z0-9._-]{1,128}")))
+        require(expected.matches(Regex("[A-Za-z0-9_-]{16,128}")))
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val slot = digest(account)
+        val saved = prefs.getString(slot, null)
+        check(saved == null || saved == expected) { "Installation changed" }
+        KeyStore.getInstance("AndroidKeyStore").apply { load(null); deleteEntry(PREFIX + expected) }
+        if (saved != null) check(prefs.edit().remove(slot).commit())
     }
 
     private fun digest(value: String) = encode(MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8)))

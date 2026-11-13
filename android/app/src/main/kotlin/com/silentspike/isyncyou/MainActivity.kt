@@ -684,8 +684,13 @@ class MainActivity : FragmentActivity() {
             "providerPushStatus" -> dispatchBridge {
                 val account = payload.optString("account")
                 val result = runCatching {
-                    val identity = PushInstallationKey.getOrCreate(this, account)
-                    val state = PushEnrollmentStore.get(this, identity.installation)
+                    val marker = PushLogoutCleanup.get(this, account)
+                    if (marker != null) return@runCatching JSONObject().put("status",
+                        if (marker.optString("distributor") == "unknown") "cleanup_unknown" else "cleanup_pending")
+                    if (PushLogoutCleanup.getLogout(this, account) != null)
+                        return@runCatching JSONObject().put("status", "cleanup_pending")
+                    val identity = PushInstallationKey.existing(this, account)
+                    val state = identity?.let { PushEnrollmentStore.get(this, it.installation) }
                     val stage = state?.optString("stage", "not_registered") ?: "not_registered"
                     val expiry = state?.optString("expires", "")?.let(PushJmap::expiryMillis)
                     val origin = NativeEngine.nativeProviderOrigin(filesDir.absolutePath, account)
@@ -707,22 +712,29 @@ class MainActivity : FragmentActivity() {
             }
             "providerStatus", "providerSignOut" -> dispatchBridge {
                 val account = payload.optString("account")
+                val refreshRecovery = if (op == "providerStatus")
+                    NativeEngine.nativeProviderRefreshRecovery(filesDir.absolutePath, account) else 0
                 val result = if (op == "providerStatus") {
                     NativeEngine.nativeProviderStatus(filesDir.absolutePath, account)
                 } else {
                     synchronized(providerScheduleLock) {
                         val journalStatus = NativeEngine.nativeProviderAuthJournalStatus(filesDir.absolutePath)
-                        val signedOut = if (journalStatus in 0..1 && revokePushBeforeLogout(account))
-                            NativeEngine.nativeProviderLogout(filesDir.absolutePath, account) else 0
+                        val signedOut = if (journalStatus in 0..1) signOutBoundProvider(account) else 0
                         if (signedOut == 1) reconcileProviderCatchUp()
                         signedOut
                     }
                 }
-                if (result < 0 || (op == "providerSignOut" && result != 1)) {
+                if ((result < 0 && refreshRecovery !in 1..2) || (op == "providerSignOut" && result != 1)) {
                     postBridgeError(reply, id, 503, "unavailable", "provider_operation_failed")
                 } else {
                     val body = JSONObject().put("connected", op == "providerStatus" && result == 1)
                     if (op == "providerStatus") {
+                        body.put("refresh_recovery", when (refreshRecovery) {
+                            0 -> "none"
+                            1 -> "outcome_unknown"
+                            2 -> "successor_pending"
+                            else -> "unavailable"
+                        })
                         val authState = when (NativeEngine.nativeProviderAuthJournalAccountStatus(filesDir.absolutePath, account)) {
                             0 -> "idle"
                             1 -> "pending"
@@ -973,7 +985,10 @@ class MainActivity : FragmentActivity() {
             runOnUiThread {
                 org.unifiedpush.android.connector.UnifiedPush.tryUseCurrentOrDefaultDistributor(this) { selected ->
                     if (!selected) { postBridgeError(reply, id, 503, "unavailable", "push_distributor_unavailable"); return@tryUseCurrentOrDefaultDistributor }
-                    try {
+                    dispatchBridge { synchronized(providerScheduleLock) { try {
+                        check(PushLogoutCleanup.get(this, account) == null)
+                        check(PushLogoutCleanup.getLogout(this, account) == null)
+                        check(PushInstallationKey.existing(this, account) == identity)
                         val claimed = PushEnrollmentStore.update(this, identity.installation) {
                             if (it.optString("account") != account || it.optString("origin") != origin ||
                                 it.optString("endpoint") != endpoint || !PushCancelPolicy.canRegisterReplacement(it.optString("stage"))) return@update false
@@ -983,7 +998,7 @@ class MainActivity : FragmentActivity() {
                         check(claimed)
                         org.unifiedpush.android.connector.UnifiedPush.register(this, identity.installation, "iSyncYou", vapid, WebPushKeyManager(this))
                         postBridgeResponse(reply, id, 200, JSONObject().put("status", "registering"))
-                    } catch (_: Exception) { postBridgeError(reply, id, 503, "unavailable", "push_registration_unconfirmed") }
+                    } catch (_: Exception) { postBridgeError(reply, id, 503, "unavailable", "push_registration_unconfirmed") } } }
                 }
             }
         }
@@ -1032,8 +1047,16 @@ class MainActivity : FragmentActivity() {
 
     private fun providerPushSetup(account: String, id: String, reply: JavaScriptReplyProxy) {
         dispatchBridge {
-            val identity = runCatching { PushInstallationKey.getOrCreate(this, account) }.getOrNull()
-            if (identity == null || NativeEngine.nativeProviderStatus(filesDir.absolutePath, account) != 1) {
+            val identity = runCatching { synchronized(providerScheduleLock) {
+                check(PushLogoutCleanup.get(this, account) == null)
+                check(PushLogoutCleanup.getLogout(this, account) == null)
+                PushInstallationKey.getOrCreate(this, account)
+            } }.getOrNull()
+            if (identity == null) {
+                postBridgeError(reply, id, 409, "unavailable", "push_cleanup_pending")
+                return@dispatchBridge
+            }
+            if (NativeEngine.nativeProviderStatus(filesDir.absolutePath, account) != 1) {
                 postBridgeError(reply, id, 503, "unavailable", "provider_login_required")
                 return@dispatchBridge
             }
@@ -1150,7 +1173,12 @@ class MainActivity : FragmentActivity() {
                     if (!selected) {
                         postBridgeError(reply, id, 503, "unavailable", "push_distributor_unavailable")
                     } else {
-                        try {
+                        dispatchBridge { synchronized(providerScheduleLock) { try {
+                            check(PushLogoutCleanup.get(this, account) == null)
+                            check(PushLogoutCleanup.getLogout(this, account) == null)
+                            check(PushInstallationKey.existing(this, account) == identity)
+                            check(NativeEngine.nativeProviderStatus(filesDir.absolutePath, account) == 1)
+                            check(PushEnrollmentStore.get(this, identity.installation) == null)
                             PushEnrollmentStore.put(this, identity.installation,
                                 JSONObject().put("account", account).put("origin", origin).put("stage", "registering")
                                     .put("vapid", vapid ?: JSONObject.NULL).put("session_state", metadata.getString("session_state")))
@@ -1160,20 +1188,74 @@ class MainActivity : FragmentActivity() {
                             postBridgeResponse(reply, id, 200, JSONObject().put("status", "registering"))
                         } catch (_: Exception) {
                             postBridgeError(reply, id, 503, "unavailable", "push_registration_failed")
-                        }
+                        } } }
                     }
                 }
             }
         }
     }
 
-    private fun revokePushBeforeLogout(account: String): Boolean = runCatching {
+    private fun signOutBoundProvider(account: String): Int = runCatching {
+        val existing = PushLogoutCleanup.getLogout(this, account)
+        val origin = NativeEngine.nativeProviderOrigin(filesDir.absolutePath, account)
+        check(origin.isNotEmpty())
+        val logout = existing ?: run {
+            val generation = NativeEngine.nativeProviderGrantGeneration(filesDir.absolutePath, account)
+            check(generation.matches(Regex("[A-Za-z0-9_-]{43}")))
+            JSONObject().put("account", account).put("origin", origin).put("generation", generation).also {
+                PushLogoutCleanup.putLogout(this, account, it)
+            }
+        }
+        check(logout.getString("account") == account && logout.getString("origin") == origin)
+        val generation = logout.getString("generation")
+        check(generation.matches(Regex("[A-Za-z0-9_-]{43}")))
+        PushLogoutCleanup.resumeLogout(logout, { PushLogoutCleanup.putLogout(this, account, it) }, {
+            check(revokePushBeforeLogout(account, generation))
+        }, {
+            check(NativeEngine.nativeProviderLogoutGeneration(filesDir.absolutePath, account, generation) == 1)
+        }, {
+            val cleanup = PushLogoutCleanup.get(this, account)
+            if (cleanup != null && cleanup.optString("generation") == generation) {
+                cleanup.put("logout_done", true)
+                PushLogoutCleanup.put(this, account, cleanup)
+                if (cleanup.optString("distributor") == "submitted") PushLogoutCleanup.archive(this, account, cleanup)
+            }
+            PushLogoutCleanup.finishLogout(this, account)
+        })
+        1
+    }.getOrDefault(0)
+
+    private fun revokePushBeforeLogout(account: String, generation: String): Boolean = runCatching {
+        val pending = PushLogoutCleanup.get(this, account)
+        if (pending != null) {
+            if (pending.optBoolean("logout_done")) return true
+            check(pending.getString("generation") == generation)
+            if (!pending.optBoolean("local_done")) {
+                check(NativeEngine.nativeProviderGrantGeneration(filesDir.absolutePath, account) == generation)
+            }
+            finishPushLogoutCleanup(account, pending)
+            return true
+        }
+        val currentGeneration = NativeEngine.nativeProviderGrantGeneration(filesDir.absolutePath, account)
+        check(currentGeneration.matches(Regex("[A-Za-z0-9_-]{43}")))
+        check(currentGeneration == generation)
         val identity = PushInstallationKey.existing(this, account) ?: return true
         val state = PushEnrollmentStore.get(this, identity.installation)
         if (state != null) {
             val origin = NativeEngine.nativeProviderOrigin(filesDir.absolutePath, account)
-            check(origin.isNotEmpty() && state.optString("origin") == origin)
+            check(origin.isNotEmpty() && state.optString("origin") == origin && state.optString("account") == account)
             val initialStage = state.optString("stage")
+            val enrollmentGeneration = state.optString("logout_generation", "").ifEmpty {
+                check(initialStage !in setOf("destroy_unknown", "revoke_unknown", "broker_revoked_logout"))
+                check(PushEnrollmentStore.update(this, identity.installation) {
+                    if (it.optString("account") != account || it.optString("origin") != origin ||
+                        it.optString("stage") != initialStage || it.has("logout_generation")) return@update false
+                    it.put("logout_generation", currentGeneration); true
+                })
+                currentGeneration
+            }
+            check(enrollmentGeneration.matches(Regex("[A-Za-z0-9_-]{43}")))
+            check(enrollmentGeneration == generation)
             if (initialStage in setOf("destroy_unknown", "revoke_unknown", "replacement_destroy_unknown", "replacement_revoke_unknown", "confirm_unknown")) {
                 PushScheduler.enqueue(this, identity.installation)
                 return false
@@ -1201,19 +1283,48 @@ class MainActivity : FragmentActivity() {
                 })
                 val result = PushBroker.operation(this, account, state.getString("endpoint"), "revoke", operationId = operationId)
                 check(result.optString("status") == "revoked")
+                check(PushEnrollmentStore.update(this, identity.installation) {
+                    if (it.optString("account") != account || it.optString("stage") != "revoke_unknown" ||
+                        it.optString("revoke_operation_id") != operationId || it.optString("endpoint") != state.optString("endpoint")) return@update false
+                    it.put("stage", "broker_revoked_logout"); true
+                })
             }
-            check(PushEnrollmentStore.removeIf(this, identity.installation) {
-                it.optString("stage") in setOf("revoke_unknown", "broker_revoked_logout") && it.optString("endpoint") == state.optString("endpoint")
-            })
-            org.unifiedpush.android.connector.UnifiedPush.unregister(this, identity.installation, WebPushKeyManager(this))
-            PushScheduler.cancel(this, identity.installation)
-            state.optString("expires", "").takeIf { it.isNotEmpty() }?.let {
-                androidx.work.WorkManager.getInstance(this).cancelUniqueWork("provider-push-renew:${identity.installation}:$it")
-            }
+            val marker = JSONObject().put("account", account).put("installation", identity.installation)
+                .put("origin", origin).put("generation", generation)
+                .put("expires", state.optString("expires", "")).put("distributor", "ready")
+            PushLogoutCleanup.put(this, account, marker)
+            finishPushLogoutCleanup(account, marker)
+            return true
         }
-        PushInstallationKey.deleteAfterRevoke(this, account)
+        // A missing enrollment without a cleanup marker is not evidence of revocation.
         true
     }.getOrDefault(false)
+
+    private fun finishPushLogoutCleanup(account: String, marker: JSONObject) {
+        check(marker.getString("account") == account)
+        val origin = marker.getString("origin")
+        check(origin.isNotEmpty() && NativeEngine.nativeProviderOrigin(filesDir.absolutePath, account) == origin)
+        val instance = marker.getString("installation")
+        require(instance.matches(Regex("[A-Za-z0-9_-]{16,128}")))
+        check(PushInstallationKey.matchesOrAbsent(this, account, instance))
+        PushLogoutCleanup.resume(marker, { PushLogoutCleanup.put(this, account, it) }, {
+            org.unifiedpush.android.connector.UnifiedPush.unregister(this, instance, WebPushKeyManager(this))
+        }, {
+            val state = PushEnrollmentStore.get(this, instance)
+            if (state != null) check(PushEnrollmentStore.removeIf(this, instance) {
+                it.optString("account") == account && it.optString("stage") == "broker_revoked_logout"
+            })
+            val wm = androidx.work.WorkManager.getInstance(this)
+            wm.cancelUniqueWork("provider-push-catch-up:$instance").result.get()
+            wm.cancelUniqueWork("provider-push:$instance").result.get()
+            wm.cancelAllWorkByTag(PushJmap.renewalTag(instance)).result.get()
+            marker.optString("expires", "").takeIf { it.isNotEmpty() }?.let {
+                wm.cancelUniqueWork("provider-push-renew:$instance:$it").result.get()
+            }
+            WebPushKeyManager(this).delete(instance)
+            PushInstallationKey.deleteAfterRevoke(this, account, instance)
+        }, {})
+    }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)

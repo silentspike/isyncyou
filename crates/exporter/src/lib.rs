@@ -638,6 +638,25 @@ fn object_identity(o: &Object) -> (String, String, String, String, String, Strin
 
 /// Publish using the monotonic start of the enclosing capture run.
 pub fn publish_started(root: &Path, manifest: &Manifest, started: Instant) -> io::Result<String> {
+    publish_impl(root, manifest, started, false)
+}
+
+/// Publish while the trusted management gateway holds `publish.lock` for the
+/// complete pin check and release operation. Never call without that lock.
+pub fn publish_with_external_lock(
+    root: &Path,
+    manifest: &Manifest,
+    started: Instant,
+) -> io::Result<String> {
+    publish_impl(root, manifest, started, true)
+}
+
+fn publish_impl(
+    root: &Path,
+    manifest: &Manifest,
+    started: Instant,
+    externally_locked: bool,
+) -> io::Result<String> {
     if manifest.schema != 1
         || manifest.capture_highwater < 0
         || manifest.event_highwater < 0
@@ -668,12 +687,17 @@ pub fn publish_started(root: &Path, manifest: &Manifest, started: Instant) -> io
         ));
     }
     fs::create_dir_all(root)?;
-    let lock = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(root.join("publish.lock"))?;
-    lock.lock_exclusive()?;
+    let _lock = if externally_locked {
+        None
+    } else {
+        let lock = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join("publish.lock"))?;
+        lock.lock_exclusive()?;
+        Some(lock)
+    };
     let current = root.join("current");
     let mut previous = HashSet::new();
     let mut previous_objects = HashSet::new();

@@ -35,6 +35,7 @@ pub mod provider_auth;
 pub mod provider_credential;
 pub mod provider_push;
 pub mod provider_push_broker;
+pub mod provider_search;
 pub mod provider_setup;
 pub mod provider_store;
 mod restore_calendar;

@@ -656,6 +656,7 @@ const POST_NO_TRANSPORT_RETRY = new Set([
   "/api/v1/agent/composer/prepare",
   "/api/v1/agent/contact/name/prepare",
   "/api/v1/agent/task/completion/prepare",
+  "/api/v1/agent/task/delete/prepare",
 ]);
 async function postJson(path, capToken, value, timeoutMs) {
   const body = JSON.stringify(value);
@@ -1017,14 +1018,11 @@ function accountDisplayLabel(account) {
   return account && account.provider === "self_hosted" ? "Self-hosted account" : "Microsoft 365 account";
 }
 function accountSelectionLabel(account) {
-  const candidate = a => {
-    const label = accountDisplayLabel(a);
-    return App.accounts.length > 1 && label === "Self-hosted account"
-      ? String(a.username || a.id || label) : label;
-  };
-  const label = candidate(account);
-  const duplicate = App.accounts.some(other => other !== account && candidate(other) === label);
-  return duplicate && account.id ? `${label} · ${account.id}` : label;
+  const label = accountDisplayLabel(account);
+  const matching = App.accounts.filter(other => accountDisplayLabel(other) === label);
+  const position = matching.indexOf(account);
+  if (matching.length < 2 || position < 0) return label;
+  return `${label} ${position + 1}`;
 }
 // Per-service filter sub-items shown in the LEFT sidebar, indented under the
 // active service (NOT a separate rail). Lazy so Mail.cats is populated at call.
@@ -2216,7 +2214,7 @@ async function renderMailView(view, primeMail = null) {
 }
 
 function projectLiveMail(items, scope) {
-  return items.map(item => ({service:"mail", item_type:"message", remote_id:item.id, name:item.subject || "", mail_scope:scope || undefined, shared:!!scope, mailbox_ids:Object.keys(item.mailboxIds || {}).filter(id => item.mailboxIds[id] === true), has_body:false, preview:{subject:item.subject, from:item.from?.[0]?.email || "", snippet:item.preview, date:item.receivedAt, isRead:!!item.keywords?.$seen, isDraft:!!item.keywords?.$draft, attachments:item.hasAttachment ? 1 : 0, attachment_count_unknown:!!item.hasAttachment}}));
+  return items.map(item => ({service:"mail", item_type:"message", remote_id:item.id, name:item.subject || "", mail_scope:scope || undefined, shared:!!scope, mailbox_ids:Object.keys(item.mailboxIds || {}).filter(id => item.mailboxIds[id] === true), has_body:false, preview:{subject:item.subject, from:item.from?.[0]?.email || "", snippet:item.preview, date:item.receivedAt, isRead:!!item.keywords?.$seen, isDraft:!!item.keywords?.$draft, flag:item.keywords && typeof item.keywords === "object" && !Array.isArray(item.keywords) && (item.keywords.$flagged === undefined || typeof item.keywords.$flagged === "boolean") ? (item.keywords.$flagged === true ? "flagged" : "notFlagged") : "unknown", attachments:item.hasAttachment ? 1 : 0, attachment_count_unknown:!!item.hasAttachment}}));
 }
 
 async function loadLiveMailFolder(mailbox) {
@@ -2900,11 +2898,20 @@ async function prepareProviderMailAction(account, emailId, action, button) {
   finally { button.disabled = false; }
 }
 function openProviderMailMove(account, it) {
-  const folders = (Mail.folders || []).filter(f => f.remote_id && f.remote_id !== it.parent_remote_id);
-  const rows = folders.map(folder => el("button", { class:"pick-row pick-btn", type:"button", onclick:event => {
-    closeSheet(); void prepareProviderMailAction(account, it.remote_id, { kind:"move", source_mailbox_id:it.parent_remote_id, destination_mailbox_id:folder.remote_id }, event.currentTarget);
-  } }, folder.name || folder.remote_id));
-  openSheet("Move message", el("div", { class:"compose" }, el("p", { class:"dim", text:"The selected mailbox membership is moved. Other memberships remain." }), rows.length ? el("div", { class:"pick-list" }, rows) : el("p", { text:"No destination folders are available." })));
+  const memberships = [...new Set((it.mailbox_ids || []).filter(id => typeof id === "string" && id))];
+  const folders = (Mail.folders || []).filter(f => f.remote_id);
+  const chooseDestination = source => {
+    const rows = folders.filter(folder => folder.remote_id !== source).map(folder => el("button", { class:"pick-row pick-btn", type:"button", onclick:event => {
+      closeSheet(); void prepareProviderMailAction(account, it.remote_id, { kind:"move", source_mailbox_id:source, destination_mailbox_id:folder.remote_id }, event.currentTarget);
+    } }, folder.name || folder.remote_id));
+    openSheet("Move message", el("div", { class:"compose" }, el("p", { class:"dim", text:"The selected mailbox membership is moved. Other memberships remain." }), rows.length ? el("div", { class:"pick-list" }, rows) : el("p", { text:"No destination folders are available." })));
+  };
+  const filter = svcFilter("mail");
+  const current = filter.startsWith("folder:") ? filter.slice(7) : "";
+  if (memberships.includes(current)) return chooseDestination(current);
+  if (memberships.length === 1) return chooseDestination(memberships[0]);
+  const sources = memberships.map(id => el("button", { class:"pick-row pick-btn", type:"button", onclick:() => chooseDestination(id) }, folders.find(folder => folder.remote_id === id)?.name || id));
+  openSheet("Choose source folder", el("div", { class:"compose" }, el("p", { text:"Choose which folder membership to move." }), ...sources));
 }
 async function openProviderRelatedDraft(account, it, kind) {
   if (App.account !== account) return;
@@ -2979,8 +2986,8 @@ function renderMailReader(it, remoteImages = false) {
     actions.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderRelatedDraft(account, it, "reply") }, "Reply"));
     actions.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderRelatedDraft(account, it, "forward") }, "Forward"));
     actions.append(el("button", { class:"btn ghost sm", type:"button", onclick:event => prepareProviderMailAction(account, it.remote_id, { kind:"set_read", is_read:p.isRead === false }, event.currentTarget) }, p.isRead === false ? "Mark read" : "Mark unread"));
-    actions.append(el("button", { class:"btn ghost sm", type:"button", onclick:event => prepareProviderMailAction(account, it.remote_id, { kind:"set_flag", flagged:!flagged }, event.currentTarget) }, flagged ? "Remove flag" : "Flag"));
-    if (it.parent_remote_id) actions.append(el("button", { class:"btn ghost sm", type:"button", onclick:() => openProviderMailMove(account, it) }, "Move"));
+    if (p.flag === "flagged" || p.flag === "notFlagged") actions.append(el("button", { class:"btn ghost sm", type:"button", onclick:event => prepareProviderMailAction(account, it.remote_id, { kind:"set_flag", flagged:!flagged }, event.currentTarget) }, flagged ? "Remove flag" : "Flag"));
+    if (it.mailbox_ids?.length) actions.append(el("button", { class:"btn ghost sm", type:"button", onclick:() => openProviderMailMove(account, it) }, "Move"));
     actions.append(el("button", { class:"btn ghost sm danger", type:"button", onclick:event => prepareProviderMailAction(account, it.remote_id, { kind:"trash" }, event.currentTarget) }, "Move to Trash"));
   }
   if (CAP.mailwrite && !selfHosted) {
@@ -4379,10 +4386,11 @@ async function renderProviderCalendarView(view, service) {
   const expand = el("button", { class:"btn sm", type:"button", onclick:async () => {
     const collection = select.value, match = /^(\d{4})-(\d{2})$/.exec(month.value);
     if (!collection || !match || App.account !== account) return;
+    const generation = requestGeneration;
     expand.disabled = true; clear(expanded); expanded.append(el("p", { class:"dim", text:"Loading live occurrences…" }));
     try {
       const result = await api("/api/v1/calendar/expanded?" + qs({ account, collection, year:match[1], month:match[2], ...(service === "todo" ? {tasks:"1"} : {}) }));
-      if (App.account !== account || select.value !== collection || month.value !== match[0] || !view.isConnected) return;
+      if (generation !== requestGeneration || App.account !== account || select.value !== collection || month.value !== match[0] || !view.isConnected) return;
       clear(expanded);
       for (const item of result.items || []) for (const component of (item.view && item.view.components || [])) {
         const props = component.properties || {}, rid = props["RECURRENCE-ID"];
@@ -4392,7 +4400,7 @@ async function renderProviderCalendarView(view, service) {
         expanded.append(el("div", { class:"pick-row" }, el("span", { class:"grow", text:label }), CAP.agent ? (service === "todo" ? el("button", { class:"btn sm", type:"button", onclick:event => prepareTaskOccurrence(account,collection,item.href,component.uid,recurrenceId,result.start,result.end,event.currentTarget) }, "Complete occurrence") : el("button", { class:"btn sm", type:"button", onclick:() => openProviderOccurrenceTime(account, collection, item.href, component.uid, recurrenceId, result.start, result.end) }, "Change occurrence")) : null));
       }
       if (!expanded.childNodes.length) expanded.append(el("p", { class:"dim", text:"No expanded occurrences for this month." }));
-    } catch (_) { clear(expanded); expanded.append(el("p", { class:"dim", text:"Live occurrence expansion is unavailable." })); }
+    } catch (_) { if (generation === requestGeneration && App.account === account && select.value === collection && month.value === match[0] && view.isConnected) { clear(expanded); expanded.append(el("p", { class:"dim", text:"Live occurrence expansion is unavailable." })); } }
     finally { expand.disabled = false; }
   } }, "Show live occurrences");
   const freebusy = el("button", { class:"btn sm", type:"button", onclick:async () => {
@@ -4408,7 +4416,7 @@ async function renderProviderCalendarView(view, service) {
     finally { freebusy.disabled = false; }
   } }, "Show free/busy");
   const more = el("button", { class:"btn sm", type:"button", style:"display:none" }, "Load more");
-  let cursor = null, digest = null, origin = null, selected = "";
+  let cursor = null, digest = null, origin = null, selected = "", requestGeneration = 0;
   const values = (properties, key) => Array.isArray(properties[key]) ? properties[key].map(entry => {
     const params = entry.parameters && Object.keys(entry.parameters).length ? ` ${JSON.stringify(entry.parameters)}` : "";
     return `${entry.value ?? ""}${params}`;
@@ -4416,12 +4424,17 @@ async function renderProviderCalendarView(view, service) {
   const load = async first => {
     const collection = select.value;
     if (!collection || App.account !== account) return;
+    const generation = ++requestGeneration;
+    const current = () => generation === requestGeneration && App.account === account && select.value === collection && view.isConnected;
+    if (first) { cursor = digest = origin = null; selected = ""; clear(list); clear(expanded); more.style.display = "none"; status.textContent = "Loading cached calendar resources…"; }
     more.disabled = true;
     try {
       const page = await api("/api/v1/items?" + qs({ account, service, collection, after:first ? "" : cursor }));
-      if (App.account !== account || select.value !== collection || !view.isConnected) return;
+      if (!current()) return;
+      if (page.account !== account || page.collection !== collection) throw new Error("Collection mismatch");
+      if (!first && page.accessible !== true) { clear(list); cursor = digest = origin = null; selected = ""; more.style.display = "none"; status.textContent = "Collection access is unavailable or unknown. Reload to inspect cached items."; return; }
       if (!first && (page.account !== account || page.origin !== origin || page.collection !== selected || !digest || page.cursor_digest !== digest)) {
-        cursor = null; more.style.display = "none"; status.textContent = "The cached calendar changed while paging. Reload it to continue."; return;
+        clear(list); cursor = digest = origin = null; selected = ""; more.style.display = "none"; status.textContent = "The cached calendar changed while paging. Reload it to continue."; return;
       }
       if (first) { clear(list); origin = page.origin; selected = page.collection; digest = page.cursor_digest || null; }
       const access = page.accessible === true ? "Access last observed" : page.accessible === false ? "Access unavailable at last check" : "Access status unknown";
@@ -4487,16 +4500,31 @@ async function renderProviderCalendarView(view, service) {
             } }, complete ? "Complete" : "Reopen"));
             if (!recurrence) row.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderTaskAttributes(account, collection, item.href, component.uid) }, "Due and priority"));
             if (!recurrence) row.append(el("button", { class:"btn sm", type:"button", onclick:() => openProviderTaskParent(account, collection, item.href, component.uid) }, "Change parent"));
+            if (!recurrence && typeof item.href === "string") row.append(el("button", { class:"btn sm danger", type:"button", onclick:async event => {
+              if (App.account !== account || select.value !== collection) return;
+              const button = event.currentTarget; button.disabled = true;
+              try {
+                const sessionId = await ensureAgentSession();
+                if (App.account !== account || select.value !== collection) throw new Error("Collection changed");
+                const pending = await postJson("/api/v1/agent/task/delete/prepare", CAP.agent, { request_id:crypto.randomUUID(), session_id:sessionId, account, collection, href:item.href, uid:component.uid }, PROVIDER_NATIVE_TIMEOUT_MS);
+                if (!pending.pending_id || !pending.token || !pending.action_hash || !pending.turn_id) throw new Error("Confirmation unavailable");
+                if (App.account !== account || select.value !== collection || !button.isConnected) throw new Error("Collection changed");
+                const record = { ...pending, status:"pending", cancelled_result:"The task was not deleted." };
+                AssistantState.pendingCardsById.set(record.pending_id, record);
+                openSheet("Review task deletion", renderAgentPendingCard(record));
+              } catch (_) { toast("Task deletion could not be prepared. Refresh and check access and child tasks.", "err"); }
+              finally { button.disabled = false; }
+            } }, "Delete"));
           }
           list.append(row);
         }
       }
       cursor = page.next_after || null; more.style.display = cursor && digest ? "" : "none";
       if (cursor && !digest) status.textContent += " · paging unavailable without a cached collection version";
-    } catch (_) { status.textContent = "Cached calendar resources are unavailable."; }
-    finally { more.disabled = false; }
+    } catch (_) { if (current()) { clear(list); cursor = digest = origin = null; selected = ""; more.style.display = "none"; status.textContent = "Cached calendar resources are unavailable."; } }
+    finally { if (current()) more.disabled = false; }
   };
-  select.addEventListener("change", () => { cursor = null; clear(expanded); void load(true); });
+  select.addEventListener("change", () => { ++requestGeneration; cursor = digest = origin = null; selected = ""; clear(list); clear(expanded); more.style.display = "none"; void load(true); });
   month.addEventListener("change", () => clear(expanded));
   more.addEventListener("click", () => { if (cursor) void load(false); });
   // A sync event must refresh cached rows without rebuilding the view: the
@@ -5026,17 +5054,22 @@ async function renderProviderContactsView(view) {
   const status = el("p", { class:"dim", text:"Loading cached address books…" });
   const list = el("div", { class:"pick-list" });
   const more = el("button", { class:"btn sm", type:"button", style:"display:none" }, "Load more");
-  let cursor = null, digest = null, origin = null, selected = "";
+  let cursor = null, digest = null, origin = null, selected = "", requestGeneration = 0;
   const textValues = fields => (Array.isArray(fields) ? fields : []).flatMap(field => Array.isArray(field.values) ? field.values : []).flat(Infinity).filter(value => typeof value === "string").join(", ");
   const load = async first => {
     const collection = select.value;
     if (!collection || App.account !== account) return;
+    const generation = ++requestGeneration;
+    const current = () => generation === requestGeneration && App.account === account && select.value === collection && view.isConnected;
+    if (first) { cursor = digest = origin = null; selected = ""; clear(list); more.style.display = "none"; status.textContent = "Loading cached contacts…"; }
     more.disabled = true;
     try {
       const page = await api("/api/v1/items?" + qs({ account, service:"contacts", collection, after:first ? "" : cursor }));
-      if (App.account !== account || select.value !== collection || !view.isConnected) return;
+      if (!current()) return;
+      if (page.account !== account || page.collection !== collection) throw new Error("Collection mismatch");
+      if (!first && page.accessible !== true) { clear(list); cursor = digest = origin = null; selected = ""; more.style.display = "none"; status.textContent = "Collection access is unavailable or unknown. Reload to inspect cached items."; return; }
       if (!first && (page.account !== account || page.origin !== origin || page.collection !== selected || !digest || page.cursor_digest !== digest)) {
-        cursor = null; more.style.display = "none"; status.textContent = "The cached address book changed while paging. Reload it to continue."; return;
+        clear(list); cursor = digest = origin = null; selected = ""; more.style.display = "none"; status.textContent = "The cached address book changed while paging. Reload it to continue."; return;
       }
       if (first) { clear(list); origin = page.origin; selected = page.collection; digest = page.cursor_digest || null; }
       const access = page.accessible === true ? "Access last observed" : page.accessible === false ? "Access unavailable at last check" : "Access status unknown";
@@ -5074,10 +5107,10 @@ async function renderProviderContactsView(view) {
       cursor = page.next_after || null;
       more.style.display = cursor && digest ? "" : "none";
       if (cursor && !digest) status.textContent += " · paging unavailable without a cached collection version";
-    } catch (_) { status.textContent = "Cached contacts are unavailable."; }
-    finally { more.disabled = false; }
+    } catch (_) { if (current()) { clear(list); cursor = digest = origin = null; selected = ""; more.style.display = "none"; status.textContent = "Cached contacts are unavailable."; } }
+    finally { if (current()) more.disabled = false; }
   };
-  select.addEventListener("change", () => { cursor = null; void load(true); });
+  select.addEventListener("change", () => { ++requestGeneration; cursor = digest = origin = null; selected = ""; clear(list); more.style.display = "none"; void load(true); });
   more.addEventListener("click", () => { if (cursor) void load(false); });
   view.append(el("div", { class:"con-page provider-calendar-page" }, el("h2", { text:"Contacts" }), select, backupStatus, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCreate(account, select.value, "contact") }, "New contact") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCollectionAccess(account, "contacts", select.value) }, "Manage collection access") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderRecovery(account,"Recovered","contacts") }, "Recover…") : null, status, list, more));
   try {
@@ -6085,6 +6118,11 @@ function renderNoteReader(it) {
   if (p.has_resources) chip("paperclip", "Has embedded resources");
   meta.append(coverageBadge(it));
   if (p.web_url && /^https?:\/\//i.test(p.web_url)) meta.append(el("a", { class: "note-meta-chip", href: p.web_url, target: "_blank", rel: "noopener noreferrer" }, icon("external-link", "icon-sm"), el("span", { text: "Open in OneNote" })));
+  const archiveNotice = p.archive_state === "partial" || (it.has_body && p.archive_state !== "complete")
+    ? el("p", { role: "status", class: "note-archive-notice", style: "padding:12px;border-left:3px solid var(--warning,#d29922)", text: p.archive_state === "partial"
+      ? "Partial archive: page content or embedded resources are incomplete."
+      : "Archive completeness is unverified. Embedded resources may be missing." })
+    : null;
   // has_body=false (live_only) pages have no archived content — show a native dark
   // card instead of pointing the iframe at /view (which would 404 with raw JSON).
   let bodyEl;
@@ -6115,12 +6153,13 @@ function renderNoteReader(it) {
   } else {
     bodyEl = el("div", { class: "empty note-empty", style: "margin:auto;text-align:center;padding:48px" },
       icon("cloud", "icon-lg"),
-      el("h3", { text: "Not backed up yet" }),
-      el("p", { class: "dim", text: "This page is in the cloud but its content isn't archived yet. Run a backup to read it here." }));
+      el("h3", { text: p.archive_state === "partial" ? "Page content unavailable" : "Not backed up yet" }),
+      el("p", { class: "dim", text: p.archive_state === "partial" ? "The archived page content is unavailable or incomplete." : "This page is in the cloud but its content isn't archived yet. Run a backup to read it here." }));
   }
   box.append(
     el("header", { class: "note-reader-head" }, el("h2", { class: "grow truncate", text: it.name || "(untitled)" }), actions),
     meta,
+    archiveNotice,
     bodyEl);
 }
 // #568: live OneNote write — create page (section picker) / delete / best-effort append, cap-gated
@@ -8584,7 +8623,7 @@ async function normalizeAssistantActivityEvent(identity, event) {
       "scanned", "total", "hits", "current_item", "coverage_complete",
       "budget_reached", "continuation_available",
     ]);
-    if (!hasOnlyAgentKeys(event, allowed) || event.activity_kind !== "archive_search"
+    if (!hasOnlyAgentKeys(event, allowed) || !["archive_search", "provider_search"].includes(event.activity_kind)
         || !AGENT_PROGRESS_STAGES.includes(event.stage) || !AGENT_PROGRESS_STATUS.has(event.status)
         || !Number.isInteger(event.scanned) || event.scanned < 0 || event.scanned > 1000000
         || (event.total !== null && (!Number.isInteger(event.total) || event.total < 0 || event.total > 1000000))
@@ -9949,13 +9988,15 @@ const ACCOUNT_ROLE_META = Object.freeze({
 });
 function accountRoleStatus(a, role) {
   const value = a && a.auth && a.auth[role];
-  return value && ["connected", "disconnected", "reconnect_required", "permission_denied", "access_unknown", "service_unreachable", "provider_response_invalid"].includes(value.state)
+  return value && ["connected", "disconnected", "reconnect_required", "permission_denied", "access_unknown", "service_unreachable", "provider_response_invalid", "refresh_outcome_unknown", "refresh_recovery_pending"].includes(value.state)
     ? value : { state: "disconnected", identity_verified: false };
 }
 function accountRoleStateLabel(status) {
   if (status.state === "connected") return status.identity_verified ? "Connected" : "Connected · last access observed; identity verification pending";
   if (status.state === "reconnect_required") return "Sign-in required";
   if (status.state === "permission_denied") return "Access denied · check account permissions";
+  if (status.state === "refresh_outcome_unknown") return "Token refresh outcome unknown; the provider grant needs recovery";
+  if (status.state === "refresh_recovery_pending") return "Token refresh recovery pending";
   if (status.state === "access_unknown") return "Access could not be verified";
   if (status.state === "service_unreachable") return "Mail service unreachable";
   if (status.state === "provider_response_invalid") return "Mail service response invalid or unsupported";
@@ -10003,7 +10044,7 @@ function renderAccountMenu(body) {
       const providerStatus = accountRoleStatus(a, "reader");
       const connected = ["connected", "permission_denied", "access_unknown", "service_unreachable", "provider_response_invalid"].includes(providerStatus.state);
       const controls = el("div", { class: "acct-acts" });
-      const connectButton = el("button", { class: "btn sm", disabled: providerActionsUnknown.has(a.id) || (BRIDGE && !connected) ? "disabled" : null, onclick: () => providerAccountAction(a, body, connected) }, connected ? "Disconnect" : "Connect");
+      const connectButton = el("button", { class: "btn sm", disabled: providerActionsUnknown.has(a.id) || ["refresh_outcome_unknown", "refresh_recovery_pending"].includes(providerStatus.state) || (BRIDGE && !connected) ? "disabled" : null, onclick: () => providerAccountAction(a, body, connected) }, connected ? "Disconnect" : "Connect");
       controls.append(connectButton);
       if (BRIDGE && !connected) {
         const logoutRecovery = el("button", { class:"btn sm", type:"button", style:"display:none", onclick:() => providerAccountAction(a, body, true) }, "Continue disconnect");
@@ -10028,14 +10069,18 @@ function renderAccountMenu(body) {
         controls.append(cancelPendingButton);
         void nativeCall("providerStatus", { account:a.id }, NATIVE_TIMEOUT_MS).then(status => {
           if (!controls.isConnected) return;
-          if (!status || status.logout_recovery !== "none") {
+          if (status && ["outcome_unknown", "successor_pending"].includes(status.refresh_recovery)) {
+            connectButton.disabled = true;
+            logoutNotice.textContent = status.refresh_recovery === "outcome_unknown" ? "Token refresh outcome unknown; the provider grant needs recovery." : "Token refresh recovery pending.";
+            logoutNotice.style.display = "";
+          } else if (!status || status.logout_recovery !== "none") {
             connectButton.disabled = true;
             if (status && status.logout_recovery === "resume") { logoutRecovery.style.display = ""; logoutNotice.textContent = "Disconnect needs completion."; }
             else { logoutNotice.textContent = "Disconnect needs manual recovery."; }
             logoutNotice.style.display = "";
           } else if (status.auth_state === "outcome_unknown") { providerActionsUnknown.add(a.id); connectButton.disabled = true; resolveButton.style.display = ""; }
           else if (status.auth_state === "pending" && !providerActionsUnknown.has(a.id)) { connectButton.disabled=true; cancelPendingButton.style.display=""; }
-          else if (status.auth_state === "idle" && !providerActionsUnknown.has(a.id)) connectButton.disabled = false;
+          else if (status.auth_state === "idle" && !providerActionsUnknown.has(a.id) && !["refresh_outcome_unknown", "refresh_recovery_pending"].includes(providerStatus.state) && status.refresh_recovery === "none") connectButton.disabled = false;
         }).catch(() => {});
       }
       row.append(el("div", { class: "acct-role acct-provider-status" },
@@ -10076,9 +10121,9 @@ function renderAccountMenu(body) {
         const retryReplacement = el("button", {class:"btn sm",type:"button",style:"display:none"}, "Review replacement retry");
         const showPush = result => {
           const state = result && result.status;
-          const labels = { not_registered: "Not configured", configuration_required: "Configuration required", registering: "Registering", endpoint_received: "Endpoint received", credentials_ready: "Configure distributor", credentials_expired: "Push preparation expired", awaiting_proof: "Awaiting verification", verification_pending: "Verification pending", active: "Registered", degraded: "Delayed", account_changed: "Push configuration must be reviewed", create_unknown: "Enrollment outcome unknown", delivery_unknown: "Verification outcome unknown", prepare_unknown: "Push setup outcome unknown", prepare_cancel_unknown: "Setup cancellation outcome unknown", prepare_cancelled: "Uncertain preparation cancelled", prepare_cancel_conflict: "A server binding remains; review required", distributor_detached: "Local connector removed; distributor acknowledgement unknown", distributor_unregister_unknown: "Local connector removal outcome unknown", replacement_revoke_retry_ready: "Previous replacement revoke can be retried", broker_bound_logout: "Push remains bound; sign out again to finish removal", broker_revoked_logout: "Push revoked; sign out again to finish local cleanup", unavailable: "Unavailable" };
+          const labels = { not_registered: "Not configured", configuration_required: "Configuration required", registering: "Registering", endpoint_received: "Endpoint received", credentials_ready: "Configure distributor", credentials_expired: "Push preparation expired", awaiting_proof: "Awaiting verification", verification_pending: "Verification pending", active: "Registered", degraded: "Delayed", account_changed: "Push configuration must be reviewed", create_unknown: "Enrollment outcome unknown", delivery_unknown: "Verification outcome unknown", prepare_unknown: "Push setup outcome unknown", prepare_cancel_unknown: "Setup cancellation outcome unknown", prepare_cancelled: "Uncertain preparation cancelled", prepare_cancel_conflict: "A server binding remains; review required", distributor_detached: "Local connector removed; distributor acknowledgement unknown", distributor_unregister_unknown: "Local connector removal outcome unknown", replacement_revoke_retry_ready: "Previous replacement revoke can be retried", broker_bound_logout: "Push remains bound; sign out again to finish removal", broker_revoked_logout: "Push revoked; sign out again to finish local cleanup", cleanup_unknown: "Push revoked; distributor removal outcome unknown; setup unavailable", cleanup_pending: "Push revoked; local cleanup pending; sign out again", unavailable: "Unavailable" };
           const uncertain = state === "prepare_unknown" || state === "prepare_cancel_unknown" || state === "credentials_expired";
-          setup.disabled = !state || uncertain || ["prepare_cancel_conflict","prepare_cancelled","distributor_detached","distributor_unregister_unknown","replacement_revoke_retry_ready","broker_bound_logout","broker_revoked_logout"].includes(state);
+          setup.disabled = !state || uncertain || ["prepare_cancel_conflict","prepare_cancelled","distributor_detached","distributor_unregister_unknown","replacement_revoke_retry_ready","broker_bound_logout","broker_revoked_logout","cleanup_unknown","cleanup_pending"].includes(state);
           reconcile.style.display = uncertain ? "" : "none";
           detach.style.display = state === "prepare_cancelled" ? "" : "none";
           replacement.style.display = state === "distributor_detached" ? "" : "none";
@@ -10271,7 +10316,7 @@ async function startAccountLogin(a, role, body) {
   }
   let login;
   try { login = await postJson("/api/v1/account/login/start", CAP.account, { request_id: crypto.randomUUID(), account: a.id, role }); }
-  catch (_) { await endNetworkGuard(guardId); toast("Sign-in could not be started. Try again.", "err"); renderAccountMenu(body); return; }
+  catch (error) { await endNetworkGuard(guardId); toast(error?.code === "account_exchange_outcome_unknown" ? "The previous sign-in outcome is unknown. Reconcile it before starting another." : error?.code === "account_already_connected" ? "Sign out before starting a new sign-in." : "Sign-in could not be started.", "err"); renderAccountMenu(body); return; }
   if (login.flow !== "authorization_code_pkce" || login.role !== role || !login.authorization_uri || !login.login_id) {
     await endNetworkGuard(guardId);
     toast("Sign-in could not be started. Try again.", "err");
@@ -10284,13 +10329,13 @@ async function startAccountLogin(a, role, body) {
   let retryButton = null;
   let pickerButton = null;
   const attemptIsActive = () => !attemptEnded && accountMenuLogin === login.login_id;
-  const endAttempt = async (message, releaseGuard) => {
+  const endAttempt = async (message, releaseGuard, allowRetry = true) => {
     attemptEnded = true;
     if (accountMenuLogin === login.login_id) accountMenuLogin = null;
     if (pickerButton) pickerButton.disabled = true;
     if (releaseGuard) await finishAccountLoginGuard(login.login_id);
     status.textContent = message;
-    if (!retryButton) {
+    if (allowRetry && !retryButton) {
       retryButton = el("button", { class: "btn sm primary", type: "button", onclick: () => startAccountLogin(a, role, body) }, "Start sign-in again");
       status.after(retryButton);
     }
@@ -10353,13 +10398,14 @@ async function startAccountLogin(a, role, body) {
       renderAccountMenu(body);
     } else if (r.state === "error") {
       const message = r.code === "account_login_expired" ? "Sign-in expired."
+        : r.code === "account_exchange_outcome_unknown" ? "Sign-in outcome is unknown. Do not start another sign-in until the original exchange is reconciled."
         : r.code === "account_keyring_unavailable" ? "The system keyring is unavailable. Unlock or configure it, then try again."
         : r.code === "account_revocation_pending" ? "Sign-in was rejected and grant revocation is still pending."
         : r.code === "account_revocation_unrecoverable" ? "Sign-in was rejected; revocation is unconfirmed and local recovery is unavailable."
         : r.code === "account_identity_mismatch" ? "Reader and Writer must use the same Microsoft account."
           : r.code === "account_identity_unverified" ? "The Microsoft account could not be verified. Reconnect the other role first."
             : "Sign-in failed.";
-      await endAttempt(message, true);
+      await endAttempt(message, true, r.code !== "account_exchange_outcome_unknown");
     } else {
       schedulePoll();
     }

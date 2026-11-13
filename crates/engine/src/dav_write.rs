@@ -916,6 +916,9 @@ pub fn execute_task_attributes_with_start_classified(
     {
         return Err(DavWriteExecutionError::DispatchUncertain);
     }
+    // Preview and dispatch each reopen the provider store. Keep the initial
+    // claim read bounded; the dispatch path rechecks the journal before use.
+    drop(store);
     let preview = crate::dav_live::prepare_task_attributes_with_start_preview(
         cfg,
         &op.account_id,
@@ -1236,6 +1239,11 @@ fn execute_inner_classified(
     classify_execution(result, entered.get(), stage.get())
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_TASK_DISPATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn classify_execution(
     result: Result<WriteOutcome, String>,
     entered: bool,
@@ -1317,15 +1325,31 @@ fn execute_inner_impl(
     #[cfg(debug_assertions)]
     let auth_start = std::time::Instant::now();
     stage.set(DavPreDispatchStage::Credentials);
-    let token = match credentials {
-        Some(credentials) => crate::provider_auth::self_hosted_access_token_with_store(
-            cfg,
-            &op.account_id,
-            credentials,
-        )?,
-        None => crate::provider_auth::self_hosted_access_token(cfg, &op.account_id)?,
+    #[cfg(test)]
+    let fixture_client = TEST_TASK_DISPATCH.with(|flag| flag.get());
+    #[cfg(not(test))]
+    let fixture_client = false;
+    let token = if fixture_client {
+        "fixture".to_owned()
+    } else {
+        match credentials {
+            Some(credentials) => crate::provider_auth::self_hosted_access_token_with_store(
+                cfg,
+                &op.account_id,
+                credentials,
+            )?,
+            None => crate::provider_auth::self_hosted_access_token(cfg, &op.account_id)?,
+        }
     };
     stage.set(DavPreDispatchStage::Client);
+    #[cfg(test)]
+    let client = if fixture_client {
+        isyncyou_connectors::dav::test_loopback_client(origin)
+    } else {
+        DavClient::new(origin, token)
+    }
+    .map_err(|e| e.to_string())?;
+    #[cfg(not(test))]
     let client = DavClient::new(origin, token).map_err(|e| e.to_string())?;
     #[cfg(debug_assertions)]
     eprintln!(
@@ -1455,6 +1479,7 @@ fn execute_inner_impl(
         privilege_start.elapsed().as_millis()
     );
     if let Some((uid, parent)) = parent_change {
+        let _discovery_lease = crate::dav_live::discovery_sync_lease(cfg, &op.account_id, origin)?;
         entered.set(true);
         return client
             .with_locked_collection(&scope, |token| {
@@ -1491,6 +1516,7 @@ fn execute_inner_impl(
             });
     }
     if let Some(uid) = task_delete {
+        let _discovery_lease = crate::dav_live::discovery_sync_lease(cfg, &op.account_id, origin)?;
         entered.set(true);
         return client
             .with_locked_collection(&scope, |token| {
@@ -1528,6 +1554,19 @@ fn execute_inner_impl(
     #[cfg(debug_assertions)]
     let dispatch_start = std::time::Instant::now();
     entered.set(true);
+    #[cfg(test)]
+    if fixture_client {
+        return dispatch(
+            &store,
+            &FixtureTaskTransport {
+                store: &store,
+                operation: &op.operation_id,
+            },
+            &scope,
+            op,
+            &target,
+        );
+    }
     let result = dispatch(&store, &client, &scope, op, &target);
     #[cfg(debug_assertions)]
     eprintln!(
@@ -1536,6 +1575,34 @@ fn execute_inner_impl(
         perf_start.elapsed().as_millis()
     );
     result
+}
+
+#[cfg(test)]
+struct FixtureTaskTransport<'a> {
+    store: &'a Store,
+    operation: &'a str,
+}
+
+#[cfg(test)]
+impl WriteTransport for FixtureTaskTransport<'_> {
+    fn put(
+        &self,
+        scope: &ProviderScope,
+        _: &str,
+        _: Vec<u8>,
+        _: Option<&str>,
+        _: Option<&str>,
+    ) -> Result<Option<String>, DavError> {
+        assert!(self
+            .store
+            .provider_mutation(scope, self.operation)
+            .unwrap()
+            .is_some());
+        Err(DavError::Transport("fixture outcome unknown".into()))
+    }
+    fn delete(&self, _: &ProviderScope, _: &str, _: &str) -> Result<(), DavError> {
+        panic!("unexpected delete")
+    }
 }
 
 #[cfg(test)]
@@ -1586,6 +1653,149 @@ mod tests {
             raw: Some(b"original bytes".to_vec()),
         };
         (scope, op)
+    }
+
+    #[cfg(feature = "encrypted-store")]
+    #[test]
+    fn classified_task_preview_releases_real_store_before_dispatch_and_preserves_prior_claim() {
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider.db");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap());
+        let (mut scope, mut op) = fixture();
+        scope.origin = origin.clone();
+        scope.collection = format!("{origin}cal/");
+        op.origin = origin.clone();
+        op.collection = scope.collection.clone();
+        op.href = format!("{origin}cal/a.ics");
+        let server = std::thread::spawn(move || {
+            for index in 0..4 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0; 2048];
+                loop {
+                    let n = socket.read(&mut buf).unwrap();
+                    assert_ne!(n, 0);
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let len = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let wire = String::from_utf8(request).unwrap();
+                let item = match index {
+                    0 => {
+                        assert!(wire.starts_with("PROPFIND /entry "));
+                        "<d:response><d:href>/entry</d:href><d:propstat><d:prop><d:current-user-principal><d:href>/principal/</d:href></d:current-user-principal></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+                    }
+                    1 => {
+                        assert!(wire.starts_with("PROPFIND /principal/ "));
+                        "<d:response><d:href>/principal/</d:href><d:propstat><d:prop><c:calendar-home-set><d:href>/home/</d:href></c:calendar-home-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat><d:propstat><d:prop><a:addressbook-home-set/></d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat></d:response>"
+                    }
+                    2 => {
+                        assert!(wire.starts_with("PROPFIND /home/ "));
+                        "<d:response><d:href>/home/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/cal/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+                    }
+                    3 => {
+                        assert!(wire.starts_with("PROPFIND /cal/a.ics "));
+                        "<d:response><d:href>/cal/a.ics</d:href><d:propstat><d:prop><d:current-user-privilege-set><d:privilege><d:write-content/></d:privilege></d:current-user-privilege-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+                    }
+                    _ => unreachable!(),
+                };
+                let body = format!("<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\" xmlns:a=\"urn:ietf:params:xml:ns:carddav\">{item}</d:multistatus>");
+                write!(socket, "HTTP/1.1 207 Multi-Status\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let original = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//fixture//EN\r\nBEGIN:VTODO\r\nUID:task-1\r\nDTSTAMP:20261001T100000Z\r\nSUMMARY:Task\r\nPRIORITY:1\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        {
+            let store = Store::open_encrypted(&path, b"isolated-test-key").unwrap();
+            store
+                .apply_provider_page(
+                    &scope,
+                    &[isyncyou_store::ProviderChange::Upsert(
+                        isyncyou_store::ProviderObject {
+                            remote_id: op.href.clone(),
+                            etag: op.expected_etag.clone(),
+                            raw: original.to_vec(),
+                        },
+                    )],
+                    "cursor",
+                )
+                .unwrap();
+        }
+        let mut cfg = Config::default();
+        cfg.provider_accounts.insert(
+            op.account_id.clone(),
+            ProviderConfig::SelfHosted {
+                origin: op.origin.clone(),
+                client_id: "fixture".into(),
+            },
+        );
+        crate::provider_store::TEST_PROVIDER_STORE
+            .with(|slot| *slot.borrow_mut() = Some(path.clone()));
+        let preview = crate::dav_live::prepare_task_attributes_with_start_preview(
+            &cfg,
+            &op.account_id,
+            &op.collection,
+            &op.href,
+            "task-1",
+            Some(3),
+            None,
+            None,
+        )
+        .unwrap();
+        op.raw = Some(preview.edit.raw);
+        TEST_TASK_DISPATCH.with(|flag| flag.set(true));
+        assert_eq!(
+            execute_task_attributes_with_start_classified(
+                &cfg,
+                "/entry",
+                &op,
+                "task-1",
+                Some(3),
+                None,
+                None,
+                None
+            ),
+            Ok(WriteOutcome::Unknown)
+        );
+        {
+            let store = Store::open_encrypted(&path, b"isolated-test-key").unwrap();
+            assert!(store
+                .provider_mutation(&scope, &op.operation_id)
+                .unwrap()
+                .is_some());
+        }
+        assert_eq!(
+            execute_task_attributes_with_start_classified(
+                &cfg,
+                "/entry",
+                &op,
+                "task-1",
+                Some(3),
+                None,
+                None,
+                None
+            ),
+            Err(DavWriteExecutionError::DispatchUncertain)
+        );
+        TEST_TASK_DISPATCH.with(|flag| flag.set(false));
+        crate::provider_store::TEST_PROVIDER_STORE.with(|slot| *slot.borrow_mut() = None);
+        server.join().unwrap();
     }
 
     #[test]
