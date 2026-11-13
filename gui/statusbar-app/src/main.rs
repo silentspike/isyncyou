@@ -16,7 +16,7 @@
 //! Headless smoke-run: set `ISYNCYOU_STATUSBAR_EXIT_MS=<n>` to auto-exit after
 //! `n` ms (used to screenshot the window/tray under Xvfb / on a live session).
 
-use isyncyou_statusbar::{apply, hit_test, render, StatusView, SyncState, Transfer, HEIGHT, WIDTH};
+use isyncyou_statusbar::{hit_test, render, StatusView, SyncState, Transfer, HEIGHT, WIDTH};
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -34,29 +34,18 @@ enum UserEvent {
         x: i32,
         y: i32,
     },
+    Update(StatusView),
+    ActionComplete(StatusView),
+    TogglePause,
     Quit,
 }
 
-/// A representative view to render on screen.
-fn sample_view() -> StatusView {
+/// Honest fallback when the daemon cannot be queried.
+fn unavailable_view() -> StatusView {
     StatusView {
-        account: "testuser@example.com".into(),
-        state: SyncState::Syncing,
-        transfers: vec![
-            Transfer {
-                name: "IMG_2024.jpg".into(),
-                up: false,
-                percent: 71,
-            },
-            Transfer {
-                name: "invoice.pdf".into(),
-                up: true,
-                percent: 88,
-            },
-        ],
-        down_mbps: 12.2,
-        up_mbps: 3.2,
-        queue: 14,
+        account: "Status unavailable".into(),
+        state: SyncState::Error { reason: "Daemon status unavailable".into() },
+        transfers: vec![], down_mbps: 0.0, up_mbps: 0.0, queue: 0,
     }
 }
 
@@ -77,9 +66,25 @@ struct App {
     /// gated on this so the panel doesn't vanish instantly when it opens unfocused
     /// (e.g. under focus-stealing prevention).
     popup_was_focused: bool,
+    proxy: EventLoopProxy<UserEvent>,
+    action_pending: bool,
 }
 
 impl App {
+    fn toggle_pause(&mut self) {
+        if self.action_pending || matches!(self.view.state, SyncState::Error { .. }) { return; }
+        self.action_pending = true;
+        let api = self.api.clone();
+        let proxy = self.proxy.clone();
+        let paused = matches!(self.view.state, SyncState::Paused);
+        std::thread::spawn(move || {
+            let view = match set_paused(&api, !paused) {
+                Ok(()) => live_view(&api).unwrap_or_else(|_| unavailable_view()),
+                Err(_) => StatusView { state: SyncState::Error { reason: "Sync change failed".into() }, ..unavailable_view() },
+            };
+            let _ = proxy.send_event(UserEvent::ActionComplete(view));
+        });
+    }
     /// Place the flyout near the tray icon at screen `(x, y)` (from SNI Activate),
     /// flipped above/below and clamped so it stays fully on the primary monitor.
     /// `(0, 0)` (menu entry, no coordinates) auto-places it top-right under the panel.
@@ -156,6 +161,15 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::ShowPopup { x, y } => self.ensure_window(el, x, y),
+            UserEvent::Update(view) => {
+                if !self.action_pending { self.view = view; if let Some(w) = &self.window { w.request_redraw(); } }
+            }
+            UserEvent::ActionComplete(view) => {
+                self.action_pending = false;
+                self.view = view;
+                if let Some(w) = &self.window { w.request_redraw(); }
+            }
+            UserEvent::TogglePause => self.toggle_pause(),
             UserEvent::Quit => el.exit(),
         }
     }
@@ -186,11 +200,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // actions just update the view and trigger a redraw.
                     if matches!(action, isyncyou_statusbar::Action::OpenBrowser) {
                         open_web_ui(&self.api);
-                    } else if apply(&mut self.view, action) {
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
-                        }
-                    }
+                    } else if matches!(action, isyncyou_statusbar::Action::TogglePause) { self.toggle_pause(); }
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -285,6 +295,12 @@ impl ksni::Tray for StatusTray {
             }
             .into(),
             StandardItem {
+                label: if self.state_label == "Paused" { "Resume sync".into() } else { "Pause sync".into() },
+                enabled: matches!(self.state_label.as_str(), "Paused" | "Idle") || self.state_label.starts_with("Syncing ("),
+                activate: Box::new(|t: &mut StatusTray| { let _ = t.proxy.send_event(UserEvent::TogglePause); }),
+                ..Default::default()
+            }.into(),
+            StandardItem {
                 label: "Open in browser (mail restore, search, …)".into(),
                 icon_name: "internet-web-browser".into(),
                 activate: Box::new(|t: &mut StatusTray| open_web_ui(&t.api)),
@@ -313,7 +329,10 @@ fn compute_label(api: &str) -> String {
         Ok(s) => s,
         Err(_) => return "Offline".into(),
     };
-    if state["paused"].as_bool().unwrap_or(false) {
+    let Some(enabled) = state["enabled"].as_bool() else { return "Offline".into(); };
+    if !enabled { return "Sync off".into(); }
+    let Some(paused) = state["paused"].as_bool() else { return "Offline".into(); };
+    if paused {
         return "Paused".into();
     }
     let hyd = http_get_json(api, "/api/v1/hydrations").unwrap_or(serde_json::json!({}));
@@ -321,7 +340,7 @@ fn compute_label(api: &str) -> String {
     if n > 0 {
         format!("Syncing ({n})")
     } else {
-        "Synced".into()
+        "Idle".into()
     }
 }
 
@@ -342,7 +361,7 @@ fn run_tray(proxy: EventLoopProxy<UserEvent>, api: String) {
     };
     rt.block_on(async move {
         let tray = StatusTray {
-            proxy,
+            proxy: proxy.clone(),
             state_label: "…".into(),
             api: api.clone(),
         };
@@ -358,6 +377,9 @@ fn run_tray(proxy: EventLoopProxy<UserEvent>, api: String) {
                     handle
                         .update(|t: &mut StatusTray| t.state_label = label.clone())
                         .await;
+                    let api2 = api.clone();
+                    let view = tokio::task::spawn_blocking(move || live_view(&api2)).await.ok().and_then(Result::ok).unwrap_or_else(unavailable_view);
+                    let _ = proxy.send_event(UserEvent::Update(view));
                     tokio::time::sleep(Duration::from_secs(3)).await;
                 }
             }
@@ -368,14 +390,20 @@ fn run_tray(proxy: EventLoopProxy<UserEvent>, api: String) {
 
 /// Minimal HTTP/1.1 GET over loopback TCP (the local API is loopback-only and
 /// plaintext, so no client library is needed). Returns the parsed JSON body.
-fn http_get_json(addr: &str, path: &str) -> Result<serde_json::Value, String> {
+fn http_request(addr: &str, method: &str, path: &str, cookie: Option<&str>, cap: Option<&str>) -> Result<(String, Vec<u8>), String> {
     use std::io::{Read, Write};
-    let mut sock =
-        std::net::TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
-    sock.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    let target: std::net::SocketAddr = addr.parse().map_err(|_| "invalid loopback address")?;
+    if !target.ip().is_loopback() { return Err("non-loopback address rejected".into()); }
+    let mut sock = std::net::TcpStream::connect_timeout(&target, Duration::from_secs(2)).map_err(|_| "daemon unavailable")?;
+    sock.set_read_timeout(Some(Duration::from_secs(3))).ok();
+    sock.set_write_timeout(Some(Duration::from_secs(3))).ok();
+    let body = if method == "POST" { format!("{{\"request_id\":\"{}\"}}", new_request_id()?) } else { String::new() };
+    let cookie_header = cookie.map(|c| format!("Cookie: isy_session={c}\r\n")).unwrap_or_default();
+    let cap_header = cap.map(|c| format!("X-Capability-Token: {c}\r\n")).unwrap_or_default();
+    let origin = if method == "POST" { format!("Origin: http://{addr}\r\nContent-Type: application/json\r\n") } else { String::new() };
     write!(
         sock,
-        "GET {path} HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{cookie_header}{cap_header}{origin}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
     )
     .map_err(|e| e.to_string())?;
     // Read the head byte-wise up to the terminator, then exactly Content-Length
@@ -394,6 +422,7 @@ fn http_get_json(addr: &str, path: &str) -> Result<serde_json::Value, String> {
         }
     }
     let head_text = String::from_utf8_lossy(&head);
+    if !head_text.lines().next().is_some_and(|line| line.starts_with("HTTP/1.1 200 ") || line.starts_with("HTTP/1.0 200 ")) { return Err("daemon request failed".into()); }
     let len: usize = head_text
         .lines()
         .find_map(|l| {
@@ -403,10 +432,48 @@ fn http_get_json(addr: &str, path: &str) -> Result<serde_json::Value, String> {
         })
         .and_then(|v| v.trim().parse().ok())
         .ok_or("response without Content-Length")?;
+    if len > 4 * 1024 * 1024 { return Err("oversized response".into()); }
     let mut body = vec![0u8; len];
     sock.read_exact(&mut body)
         .map_err(|e| format!("read body: {e}"))?;
-    serde_json::from_slice(&body).map_err(|e| format!("parse {path}: {e}"))
+    Ok((head_text.into_owned(), body))
+}
+
+fn new_request_id() -> Result<String, String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut bytes)).map_err(|_| "request identity unavailable")?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}", bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]))
+}
+
+fn session_cookie(addr: &str) -> Result<String, String> {
+    let (head, _) = http_request(addr, "GET", "/", None, None)?;
+    let value = head.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        if !key.eq_ignore_ascii_case("set-cookie") { return None; }
+        value.trim().strip_prefix("isy_session=")?.split(';').next()
+    }).ok_or("session unavailable")?;
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') { return Err("invalid session".into()); }
+    Ok(value.to_owned())
+}
+
+fn http_get_json(addr: &str, path: &str) -> Result<serde_json::Value, String> {
+    let cookie = session_cookie(addr)?;
+    let (_, body) = http_request(addr, "GET", path, Some(&cookie), None)?;
+    serde_json::from_slice(&body).map_err(|_| "invalid daemon response".into())
+}
+
+fn set_paused(addr: &str, paused: bool) -> Result<(), String> {
+    let cookie = session_cookie(addr)?;
+    let (_, js) = http_request(addr, "GET", "/app.js", Some(&cookie), None)?;
+    let js = std::str::from_utf8(&js).map_err(|_| "invalid shell")?;
+    let cap = js.split_once("sync: \"").and_then(|(_, tail)| tail.split_once('"')).map(|(cap, _)| cap).ok_or("sync control unavailable")?;
+    if cap.is_empty() || !cap.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') { return Err("sync control unavailable".into()); }
+    let path = if paused { "/api/v1/sync/pause" } else { "/api/v1/sync/resume" };
+    http_request(addr, "POST", path, Some(&cookie), Some(cap))?;
+    Ok(())
 }
 
 /// Build a [`StatusView`] from the **live daemon** via its local API: the first
@@ -420,7 +487,8 @@ fn live_view(api: &str) -> Result<StatusView, String> {
         .ok_or("daemon reports no accounts")?;
     let username = acc["username"].as_str().unwrap_or("?").to_string();
     let state = http_get_json(api, "/api/v1/sync/state")?;
-    let paused = state["paused"].as_bool().unwrap_or(false);
+    if state["enabled"].as_bool() != Some(true) { return Ok(StatusView { account: username, state: SyncState::Error { reason: "Scheduled sync is off".into() }, ..unavailable_view() }); }
+    let paused = state["paused"].as_bool().ok_or("invalid sync state")?;
 
     // In-flight FUSE placeholder downloads (best-effort; absent on a daemon
     // without a mount). Active hydrations show as downloads + flip state to
@@ -512,17 +580,19 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
     let tray_api = api.clone();
-    std::thread::spawn(move || run_tray(proxy, tray_api));
-    // The optional status window shows live daemon data when reachable, else a
-    // representative sample (it is a preview; the tray label is the live status).
+    let tray_proxy = proxy.clone();
+    std::thread::spawn(move || run_tray(tray_proxy, tray_api));
+    // The flyout and tray refresh live state; never substitute sample data.
     let mut app = App {
-        view: live_view(&api).unwrap_or_else(|_| sample_view()),
+        view: live_view(&api).unwrap_or_else(|_| unavailable_view()),
         window: None,
         surface: None,
         cursor: (0.0, 0.0),
         deadline,
         api: api.clone(),
         popup_was_focused: false,
+        proxy,
+        action_pending: false,
     };
     event_loop.run_app(&mut app).expect("run app");
 }
@@ -537,8 +607,8 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         std::thread::spawn(move || {
-            // live_view queries /accounts, /sync/state and /hydrations
-            for _ in 0..3 {
+            // Each API request first obtains the local shell session.
+            for _ in 0..6 {
                 let (mut sock, _) = listener.accept().unwrap();
                 use std::io::{Read, Write};
                 let mut head = Vec::new();
@@ -547,16 +617,21 @@ mod tests {
                     head.push(b[0]);
                 }
                 let head = String::from_utf8_lossy(&head).to_string();
-                let body = if head.contains("/api/v1/accounts") {
+                let shell = head.starts_with("GET / HTTP/1.1\r\n");
+                let body = if shell {
+                    "shell".to_string()
+                } else if head.contains("/api/v1/accounts") {
+                    assert!(head.contains("Cookie: isy_session=fixture-session"));
                     r#"{"accounts":[{"id":"a","username":"live@example.com"}]}"#.to_string()
                 } else if head.contains("/api/v1/hydrations") {
                     r#"{"count":0,"active":[]}"#.to_string()
                 } else {
                     format!(r#"{{"enabled":true,"paused":{paused}}}"#)
                 };
+                let cookie = if shell { "Set-Cookie: isy_session=fixture-session; HttpOnly; Path=/api/v1\r\n" } else { "" };
                 write!(
                     sock,
-                    "HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    "HTTP/1.0 200 OK\r\n{cookie}Content-Length: {}\r\n\r\n{}",
                     body.len(),
                     body
                 )
@@ -591,5 +666,40 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
         drop(listener);
         assert!(live_view(&addr).is_err());
+        assert!(matches!(unavailable_view().state, SyncState::Error { .. }));
+    }
+
+    #[test]
+    fn pause_uses_shell_session_capability_and_origin() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let expected = addr.clone();
+        let server = std::thread::spawn(move || {
+            for step in 0..3 {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut bytes = Vec::new(); let mut byte = [0];
+                while !bytes.ends_with(b"\r\n\r\n") { sock.read_exact(&mut byte).unwrap(); bytes.push(byte[0]); }
+                let head = String::from_utf8(bytes).unwrap();
+                let (extra, body) = match step {
+                    0 => { assert!(head.starts_with("GET / HTTP/1.1\r\n")); ("Set-Cookie: isy_session=fixture-session; HttpOnly\r\n", "shell") },
+                    1 => { assert!(head.starts_with("GET /app.js ")); ("", "sync: \"fixture-cap\"") },
+                    _ => {
+                        assert!(head.starts_with("POST /api/v1/sync/pause "));
+                        assert!(head.contains("Cookie: isy_session=fixture-session\r\n"));
+                        assert!(head.contains("X-Capability-Token: fixture-cap\r\n"));
+                        assert!(head.contains(&format!("Origin: http://{expected}\r\n")));
+                        let length: usize = head.lines().find_map(|line| line.strip_prefix("Content-Length: ")).unwrap().parse().unwrap();
+                        let mut body = vec![0; length]; sock.read_exact(&mut body).unwrap();
+                        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let id = body["request_id"].as_str().unwrap(); assert_eq!(id.len(), 36); assert_eq!(&id[14..15], "4");
+                        ("", "{\"paused\":true}")
+                    }
+                };
+                write!(sock, "HTTP/1.0 200 OK\r\n{extra}Content-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        set_paused(&addr, true).unwrap(); server.join().unwrap();
+        assert!(http_request("192.0.2.1:8765", "GET", "/", None, None).is_err());
     }
 }

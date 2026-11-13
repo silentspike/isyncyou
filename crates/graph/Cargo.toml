@@ -18,10 +18,10 @@ httpdate = { version = "1", optional = true }
 rustls = { version = "0.23", default-features = false, optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
-zbus-secret-service-keyring-store = { version = "1", features = ["rt-tokio-crypto-rust"], optional = true }
+dbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust", "vendored"], optional = true }
 
 [features]
 # Live HTTP transport (reqwest + rustls). Off by default so the pure-logic build
 # stays fast and dependency-light; enable for live tests / the daemon.
 http = ["dep:reqwest", "dep:httpdate", "dep:rustls"]
-desktop-keyring = ["dep:keyring-core", "dep:zbus-secret-service-keyring-store"]
+desktop-keyring = ["dep:keyring-core", "dep:dbus-secret-service-keyring-store"]

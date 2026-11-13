@@ -3,13 +3,14 @@
 How iSyncYou is split into shippable pieces (plan §15, §22, §24), and the current
 state of each.
 
-## Two binaries, neither needs a browser engine
+## Desktop and service binaries
 
 | Binary | Role | Dependencies |
 |---|---|---|
 | `isyncyoud` | engine **daemon** — serves the local web UI/API, runs background work | pure Rust (graph/store/connectors/webui); **no webkit, no GTK** |
 | `isyncyou` | full CLI (init/check/status/sync/backup/search/restore/export/migrate/serve/login) | same pure-Rust stack |
 | `isyncyou-doctor` | standalone health/recovery checker | minimal (core + fs2) |
+| `isyncyou-statusbar` | native tray and status flyout, with browser entry point | winit, softbuffer, tiny-skia, cosmic-text, SNI |
 
 The **web UI is served by the daemon** over a localhost socket and opened in the
 user's **own browser** — there is no embedded browser engine (plan §25). The
@@ -20,9 +21,9 @@ and the GUI has no browser-engine runtime dependency.
 
 ## Daemon deployment (implemented)
 
-`isyncyoud --config <toml>` validates the config, serves the web UI/API on the
-default owner-only Unix socket, and logs a periodic liveness heartbeat. TCP is
-available only as an explicit loopback opt-in (`--tcp --bind 127.0.0.1:8765`). It
+`isyncyoud --config <toml>` validates the config and defaults to an owner-only
+Unix socket. The supplied desktop user service explicitly opts into loopback TCP
+(`--tcp --bind 127.0.0.1:8765`) for the tray and the user's browser. It
 is run as a **systemd `--user` service** (`packaging/isyncyoud.service`, hardened
 per §11) so it starts on login and restarts on failure. The daemon never holds a
 store's single-instance lock open (the web UI opens stores per request), so it
@@ -37,8 +38,8 @@ implemented; only the initial device-code login needs a human — see
 
 `.github/workflows/release.yml` builds release binaries on a GitHub-hosted
 `ubuntu-latest` runner (self-hosted runners are forbidden in the public repo) and
-bundles **`isyncyou-linux-x86_64.tar.gz`** = the three binaries + `SHA256SUMS` +
-the documented `isyncyou.toml.sample` + `isyncyoud.service` + a README. The same
+bundles **`isyncyou-linux-x86_64.tar.gz`** = the four binaries + `SHA256SUMS` +
+the documented `isyncyou.toml.sample`, `isyncyoud.service`, desktop launcher and README. The same
 workflow builds the AppImage and Windows zip, builds the **signed Android APK**
 once in the `android-apk` job and attaches `isyncyou-android-arm64.apk` (see
 [`android-distribution.md`](android-distribution.md)), generates

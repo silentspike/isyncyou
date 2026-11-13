@@ -7,9 +7,7 @@
 #   # EDIT ReadWritePaths below to match your sync_root + archive_root, then:
 #   systemctl --user daemon-reload && systemctl --user enable --now isyncyoud
 #
-# The local API is served on the default owner-only Unix socket
-# ($XDG_RUNTIME_DIR/isyncyou.sock). Add `--tcp --bind 127.0.0.1:8765` to
-# ExecStart only when a browser/TCP transport is explicitly needed. Every account
+# The desktop tray and browser use the loopback-only TCP endpoint below. Every account
 # with a cached `isyncyou login --write` token is synced every 5 minutes
 # (--sync-secs).
 
@@ -21,7 +19,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/isyncyoud --config %h/.config/isyncyou/isyncyou.toml --sync-secs 300
+ExecStart=%h/.local/bin/isyncyoud --config %h/.config/isyncyou/isyncyou.toml --tcp --bind 127.0.0.1:8765 --sync-secs 300
 Restart=on-failure
 RestartSec=5
 

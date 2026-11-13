@@ -990,7 +990,7 @@ impl Store {
     /// interrupts the current statement with `SQLITE_INTERRUPT`; callers map that to their
     /// closed cancellation/deadline code.
     pub fn begin_progressive_search<F>(
-        self,
+        mut self,
         account: impl Into<String>,
         services: Vec<String>,
         should_interrupt: F,
@@ -2672,7 +2672,7 @@ impl ProgressiveSearchSnapshot {
 
     /// End the snapshot and return the underlying read handle with no progress callback.
     pub fn finish(mut self) -> Result<Store> {
-        let store = self
+        let mut store = self
             .store
             .take()
             .expect("progressive snapshot store exists until finish");
@@ -2684,7 +2684,7 @@ impl ProgressiveSearchSnapshot {
 
 impl Drop for ProgressiveSearchSnapshot {
     fn drop(&mut self) {
-        if let Some(store) = self.store.take() {
+        if let Some(mut store) = self.store.take() {
             let _ = store.conn.progress_handler::<fn() -> bool>(0, None);
             let _ = store.conn.execute_batch("ROLLBACK");
         }
@@ -4456,6 +4456,7 @@ mod tests {
         store.backup_to(&snap).unwrap();
     }
 
+    #[cfg(feature = "encrypted-store")]
     #[test]
     fn encrypted_store_hides_plaintext_and_requires_key() {
         let dir = tempfile::tempdir().unwrap();
@@ -4535,6 +4536,7 @@ mod tests {
 
     /// Build a plaintext store with data in every copy-relevant shape: items,
     /// FTS-indexed bodies, and a delta cursor.
+    #[cfg(feature = "encrypted-store")]
     fn seeded_plain_store(path: &Path) {
         let store = Store::open(path).unwrap();
         store
@@ -4554,6 +4556,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(feature = "encrypted-store")]
     #[test]
     fn migrate_to_encrypted_preserves_rows_and_fts() {
         let dir = tempfile::tempdir().unwrap();
@@ -4594,6 +4597,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "encrypted-store")]
     #[test]
     fn migrate_refuses_empty_secret_and_leaves_store_untouched() {
         let dir = tempfile::tempdir().unwrap();
@@ -4610,6 +4614,7 @@ mod tests {
         assert!(store.get_item("a", "mail", "m1").unwrap().is_some());
     }
 
+    #[cfg(feature = "encrypted-store")]
     #[test]
     fn migrate_already_encrypted_store_is_a_detectable_noop() {
         let dir = tempfile::tempdir().unwrap();
@@ -4623,6 +4628,7 @@ mod tests {
         Store::open_encrypted(&path, b"k1").unwrap();
     }
 
+    #[cfg(feature = "encrypted-store")]
     #[test]
     fn migrate_recovers_from_stale_tmp_of_a_crashed_run() {
         let dir = tempfile::tempdir().unwrap();
@@ -4645,6 +4651,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "encrypted-store")]
     #[test]
     fn encrypted_backup_to_keeps_snapshot_encrypted() {
         let dir = tempfile::tempdir().unwrap();
@@ -4692,6 +4699,7 @@ mod tests {
         assert!(matches!(err, StoreError::InvalidStoreSecret(_)));
     }
 
+    #[cfg(feature = "encrypted-store")]
     fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         haystack
             .windows(needle.len())

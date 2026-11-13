@@ -272,7 +272,7 @@ fn ensure_desktop_keyring_store() -> std::io::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
         keyring_core::set_default_store(
-            zbus_secret_service_keyring_store::Store::new().map_err(map_keyring_error)?,
+            dbus_secret_service_keyring_store::Store::new().map_err(map_keyring_error)?,
         );
         Ok(())
     }

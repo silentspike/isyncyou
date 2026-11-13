@@ -288,7 +288,7 @@ pub fn render_with(view: &StatusView, fs: &mut FontSystem, sc: &mut SwashCache) 
             col(0x15, 0x7f, 0x4e),
             col(0x22, 0xc5, 0x5e),
             col(0x4a, 0xde, 0x80),
-            "Synced".to_string(),
+            "Idle".to_string(),
         ),
         SyncState::Syncing => (
             col(0x10, 0x24, 0x40),
@@ -443,7 +443,9 @@ pub fn render_with(view: &StatusView, fs: &mut FontSystem, sc: &mut SwashCache) 
 
     // action buttons — Pause/Resume + open the full UI. Their rects live in
     // PAUSE_BTN / BROWSER_BTN so hit_test always matches what's drawn here.
-    let pause_label = if matches!(view.state, SyncState::Paused) {
+    let pause_label = if matches!(view.state, SyncState::Error { .. }) {
+        "Unavailable"
+    } else if matches!(view.state, SyncState::Paused) {
         "Resume"
     } else {
         "Pause"
