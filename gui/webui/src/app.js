@@ -2316,19 +2316,46 @@ function mailListSignature() {
 // list ONLY when the visible set changed — preserving filter/search/sort/scroll/selection
 // so a sync tick never reloads the screen.
 async function mailLiveUpdate() {
-  if (!Mail.activeScope && (Mail.livePage || Mail.pageCursor)) return;
-  const account = App.account, scope = Mail.activeScope, generation = Mail.viewGeneration, pageRequest = Mail.pageRequest, pageCursor = Mail.pageCursor;
+  // Coalesce event bursts: one bounded read and at most one follow-up. Old
+  // responses are never shared with a different view or authorization epoch.
+  if (Mail.liveUpdateRunning) { Mail.liveUpdatePending = true; return; }
+  Mail.liveUpdateRunning = true;
+  try { await mailLiveUpdateOnce(); }
+  finally {
+    Mail.liveUpdateRunning = false;
+    const pending = Mail.liveUpdatePending;
+    Mail.liveUpdatePending = false;
+    if (pending && App.route === "mail") void mailLiveUpdate();
+  }
+}
+async function mailLiveUpdateOnce() {
+  // The first primary page must refresh on provider change notifications.
+  // Keep later pages stable until the user explicitly navigates them.
+  if ((!Mail.activeScope && Mail.pageCursor) || providerAccountsRefreshing) return;
+  const account = App.account, scope = Mail.activeScope, generation = Mail.viewGeneration, pageRequest = Mail.pageRequest, pageCursor = Mail.pageCursor, livePage = Mail.livePage, epoch = MailSnapshot.epoch;
+  const updateGeneration = Mail.liveUpdateGeneration = (Mail.liveUpdateGeneration || 0) + 1;
   let d;
   const providerMail = (App.accounts || []).some(a => a.id === account && a.provider === "self_hosted");
-  try { d = await api("/api/v1/items?" + qs(Mail.livePage ? {account,service:"mail",live_metadata:"1",limit:50,mail_scope:scope,position:pageCursor,...(Mail.liveQuery ? {text:Mail.liveQuery} : {}),...(Mail.mailboxId ? {mailbox_id:Mail.mailboxId} : {}),...(pageCursor ? {query_state:Mail.queryState} : {})} : { account, service: "mail", limit: providerMail ? 50 : 1000, ...(scope ? {mail_scope:scope} : {}), ...(!scope && providerMail ? {primary_cache_only:"1"} : {}), ...(!providerMail ? {metadata_only:"1"} : {}), ...(pageCursor ? {after:pageCursor} : {}) })); }
-  catch (_) { if (App.account === account && Mail.activeScope === scope && Mail.viewGeneration === generation && Mail.pageCursor === pageCursor && Mail.pageRequest === pageRequest && scope) { Mail.all = []; Mail.folders = []; Mail.selected = null; renderMailReader(null); mailRender(); } return; }
-  if (App.account !== account || Mail.activeScope !== scope || Mail.viewGeneration !== generation || Mail.pageCursor !== pageCursor || Mail.pageRequest !== pageRequest) return;
-  if (Mail.livePage && !pageCursor) Mail.queryState = d.query_state;
+  const controller = !BRIDGE ? new AbortController() : null;
+  const timeout = controller ? setTimeout(() => controller.abort(), 120000) : null;
+  try { d = await api("/api/v1/items?" + qs(livePage ? {account,service:"mail",live_metadata:"1",limit:50,...(scope ? {mail_scope:scope} : {}),position:pageCursor,...(Mail.liveQuery ? {text:Mail.liveQuery} : {}),...(Mail.mailboxId ? {mailbox_id:Mail.mailboxId} : {}),...(pageCursor ? {query_state:Mail.queryState} : {})} : { account, service: "mail", limit: providerMail ? 50 : 1000, ...(scope ? {mail_scope:scope} : {}), ...(!scope && providerMail ? {primary_cache_only:"1"} : {}), ...(!providerMail ? {metadata_only:"1"} : {}), ...(pageCursor ? {after:pageCursor} : {}) }), controller ? {signal:controller.signal} : undefined); }
+  catch (_) { if (App.account === account && Mail.activeScope === scope && Mail.viewGeneration === generation && Mail.pageCursor === pageCursor && Mail.livePage === livePage && Mail.pageRequest === pageRequest && Mail.liveUpdateGeneration === updateGeneration && MailSnapshot.epoch === epoch && scope) { Mail.all = []; Mail.folders = []; Mail.selected = null; renderMailReader(null); mailRender(); } return; }
+  finally { if (timeout) clearTimeout(timeout); }
+  if (App.account !== account || Mail.activeScope !== scope || Mail.viewGeneration !== generation || Mail.pageCursor !== pageCursor || Mail.livePage !== livePage || Mail.pageRequest !== pageRequest || Mail.liveUpdateGeneration !== updateGeneration || MailSnapshot.epoch !== epoch) return;
+  const invalidItems = !d || !Array.isArray(d.items) || d.items.some(item =>
+    !item || typeof item !== "object" || Array.isArray(item) || (livePage && (typeof item.id !== "string" || !item.id)));
+  if (invalidItems || (livePage && (typeof d.query_state !== "string" || !d.query_state))) {
+    // Do not turn an invalid successful response into an empty primary mailbox.
+    // Shared content remains fail-closed if its current access cannot be verified.
+    if (scope) { Mail.all = []; Mail.folders = []; Mail.selected = null; renderMailReader(null); mailRender(); }
+    return;
+  }
+  if (livePage && !pageCursor) Mail.queryState = d.query_state;
   Mail.expanded = false;
-  Mail.nextCursor = Mail.livePage ? (d.next_position ?? null) : (d.next_cursor || null);
-  if (!Mail.livePage) updateMailCacheProvenance(d);
+  Mail.nextCursor = livePage ? (d.next_position ?? null) : (d.next_cursor || null);
+  if (!livePage) updateMailCacheProvenance(d);
   updateMailLoadMore();
-  Mail.all = Mail.livePage ? projectLiveMail(d.items || [], scope) : (d.items || []).filter(it => it.item_type === "message");
+  Mail.all = livePage ? projectLiveMail(d.items, scope) : d.items.filter(it => it.item_type === "message");
   if (!providerMail) App.counts.mail = Mail.all.length; updateNavCounts(); fillSubnavCounts("mail", Mail.all);
   const sig = mailListSignature();
   if (sig === Mail._sig) { mailRenderMetrics(); return; } // nothing on screen changed → no repaint

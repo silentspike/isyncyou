@@ -220,6 +220,75 @@ const healthRace = await page.evaluate(async () => {
 });
 check("stale health responses cannot overwrite newer state", healthRace);
 
+// Provider change notifications refresh the first primary page and preserve shared scopes.
+await nav("mail");
+const providerLiveRefresh = await page.evaluate(async () => {
+  const original = window.api, savedAccounts = App.accounts, savedAccount = App.account, savedMail = {...Mail}, calls = [];
+  App.accounts = [{id:"synthetic-live", username:"synthetic-live", provider:"self_hosted"}];
+  App.account = "synthetic-live";
+  window.api = async (url, opts) => {
+    if (!url.includes("live_metadata=1")) return original(url, opts);
+    calls.push(url);
+    return {items:[{id:"synthetic-delta",subject:"synthetic-delta-visible",mailboxIds:{},keywords:{}}],query_state:"synthetic-state",total:1};
+  };
+  try {
+    Mail.activeScope = ""; Mail.pageCursor = 0; Mail.livePage = true;
+    await mailLiveUpdate();
+    const primaryVisible = !!document.querySelector("#mail-list")?.textContent.includes("synthetic-delta-visible");
+    const primaryNoScope = !!calls[0] && !new URL(calls[0], location.href).searchParams.has("mail_scope");
+    Mail.pageCursor = 50; await mailLiveUpdate();
+    const laterPageProtected = calls.length === 1;
+    Mail.pageCursor = 0; Mail.activeScope = "synthetic-shared"; await mailLiveUpdate();
+    const sharedScope = !!calls[1] && new URL(calls[1], location.href).searchParams.get("mail_scope") === "synthetic-shared";
+    const scopeCallsCorrect = calls.length === 2;
+    const resolvers = [];
+    window.api = () => new Promise((resolve, reject) => resolvers.push({resolve, reject}));
+    Mail.activeScope = ""; Mail.pageCursor = 0; Mail.livePage = true;
+    const older = mailLiveUpdate(), second = mailLiveUpdate(), third = mailLiveUpdate();
+    const page = subject => ({items:[{id:subject,subject,mailboxIds:{},keywords:{}}],query_state:subject,total:1});
+    const oneInflight = resolvers.length === 1;
+    await Promise.all([second, third]);
+    resolvers[0].resolve(page("synthetic-oldest")); await older;
+    const oneFollowup = resolvers.length === 2;
+    if (oneFollowup) resolvers[1].resolve(page("synthetic-newest"));
+    for (let i = 0; i < 20 && Mail.liveUpdateRunning; i++) await Promise.resolve();
+    const newestWins = document.querySelector("#mail-list")?.textContent.includes("synthetic-newest") &&
+      !document.querySelector("#mail-list")?.textContent.includes("synthetic-oldest") && Mail.queryState === "synthetic-newest";
+    const late = mailLiveUpdate();
+    clearMailSnapshots();
+    resolvers[2].resolve(page("synthetic-invalidated")); await late;
+    const invalidatedIgnored = document.querySelector("#mail-list")?.textContent.includes("synthetic-newest") &&
+      !document.querySelector("#mail-list")?.textContent.includes("synthetic-invalidated");
+    Mail.activeScope = "synthetic-shared";
+    const staleError = mailLiveUpdate();
+    clearMailSnapshots();
+    resolvers[3].reject(new Error("synthetic-error")); await staleError;
+    const staleErrorIgnored = Mail.all.some(item => item.name === "synthetic-newest");
+    let resolveCache;
+    window.api = () => new Promise(resolve => { resolveCache = resolve; });
+    Mail.activeScope = ""; Mail.livePage = false;
+    const cacheRefresh = mailLiveUpdate();
+    Mail.livePage = true;
+    resolveCache({items:[{item_type:"message",remote_id:"synthetic-old-cache",name:"synthetic-old-cache"}]});
+    await cacheRefresh;
+    const modeRaceIgnored = Mail.all.some(item => item.name === "synthetic-newest");
+    window.api = async () => ({});
+    const priorState = Mail.queryState; await mailLiveUpdate();
+    const invalidPrimaryPreserved = Mail.all.some(item => item.name === "synthetic-newest") && Mail.queryState === priorState;
+    window.api = async () => ({items:[null],query_state:"invalid"});
+    await mailLiveUpdate();
+    const malformedPrimaryPreserved = Mail.all.some(item => item.name === "synthetic-newest");
+    Mail.activeScope = "synthetic-shared"; await mailLiveUpdate();
+    const invalidSharedHidden = Mail.all.length === 0;
+    return primaryVisible && primaryNoScope && laterPageProtected && sharedScope && scopeCallsCorrect &&
+      oneInflight && oneFollowup && newestWins && invalidatedIgnored && staleErrorIgnored && modeRaceIgnored &&
+      invalidPrimaryPreserved && malformedPrimaryPreserved && invalidSharedHidden;
+  } finally {
+    window.api = original; App.accounts = savedAccounts; App.account = savedAccount; Object.assign(Mail, savedMail);
+  }
+});
+check("provider first-page live updates preserve scope and pagination", providerLiveRefresh);
+
 // --- boot health: no uncaught console errors while exercising the UI ---
 check("no console errors on boot", consoleErrors.length === 0, `(${consoleErrors.slice(0, 3).join(" | ")})`);
 
