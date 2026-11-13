@@ -91,7 +91,7 @@ else
 fi
 
 cd "$ROOT"
-native_status=$(git status --porcelain --untracked-files=all -- Cargo.toml Cargo.lock crates gui/webui)
+native_status=$(git status --porcelain --untracked-files=all -- Cargo.toml Cargo.lock crates gui/webui vendor/ksni)
 [[ -z $native_status ]] || die "Rust/WebUI inputs are dirty; commit them before producing a bound APK artifact"
 source_commit=$(git rev-parse HEAD)
 snapshot=''
@@ -106,7 +106,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 if [[ $BUILDER == remote-v2-api24 ]]; then
-  native_status=$(git status --porcelain --untracked-files=all -- Cargo.toml Cargo.lock rust-toolchain.toml crates bin gui)
+  native_status=$(git status --porcelain --untracked-files=all -- Cargo.toml Cargo.lock rust-toolchain.toml crates bin gui vendor/ksni)
   [[ -z $native_status ]] || die "archived native inputs are dirty; commit them before building"
   [[ $(git rev-parse HEAD) == "$source_commit" ]] || die "HEAD changed before the native snapshot"
   [[ $ABIS == arm64-v8a ]] || die "the audited V2 API-24 profile supports arm64-v8a only"
@@ -115,7 +115,7 @@ if [[ $BUILDER == remote-v2-api24 ]]; then
   snapshot=$(mktemp -d "${TMPDIR:-/tmp}/isyncyou-android-source.XXXXXXXX")
   # Export tracked native inputs from the same commit that will bind the receipt.
   # This is an isolated build input, not a worktree or a project migration.
-  git archive "$source_commit" -- Cargo.toml Cargo.lock rust-toolchain.toml crates bin gui | \
+  git archive "$source_commit" -- Cargo.toml Cargo.lock rust-toolchain.toml crates bin gui vendor/ksni | \
     tar -xf - -C "$snapshot"
   find "$snapshot" -type d -name TESTING-PRIVATE -prune -exec rm -rf -- {} +
   find "$snapshot" -type f \( -name AGENTS.md -o -name TESTING-PRIVATE \) -delete
@@ -194,7 +194,7 @@ done
 
 if [[ $BUILDER == remote-v2-api24 ]]; then
   [[ $(git rev-parse HEAD) == "$source_commit" ]] || die "HEAD changed during the native build"
-  native_status=$(git status --porcelain --untracked-files=all -- Cargo.toml Cargo.lock rust-toolchain.toml crates bin gui)
+  native_status=$(git status --porcelain --untracked-files=all -- Cargo.toml Cargo.lock rust-toolchain.toml crates bin gui vendor/ksni)
   [[ -z $native_status ]] || die "archived native inputs changed during the native build"
 fi
 
