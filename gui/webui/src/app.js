@@ -186,7 +186,7 @@ const Net = (() => {
     const elapsed = now - last;
     if (document.hidden) {
       last = now;                                   // don't bank a huge dt while hidden
-    } else if (!workSuppressed && now >= priorityUntil && elapsed >= FRAME_MS) { // preserve the main thread for active work
+    } else if (!workSuppressed && elapsed >= FRAME_MS && now >= priorityUntil) { // preserve the main thread for active work
       const dt = Math.min(4, elapsed / 16.67); last = now;
       for (const layer of layers) {
         if (!layer.canvas.isConnected) { layers.delete(layer); continue; }   // self-heal
