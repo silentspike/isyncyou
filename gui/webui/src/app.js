@@ -619,6 +619,7 @@ async function request(method, path, opts) {
     d = {}; try { d = res.body ? JSON.parse(res.body) : {}; } catch (_) { d = {}; }
   } else {
     const init = { method, headers };
+    if (o.signal) init.signal = o.signal;
     if (o.body !== undefined) init.body = o.body;
     const r = await fetch(path, init);
     status = r.status;
@@ -648,7 +649,7 @@ async function request(method, path, opts) {
   }
   return d;
 }
-async function api(path) { return request("GET", path); }
+async function api(path, opts) { return request("GET", path, opts); }
 const POST_NO_TRANSPORT_RETRY = new Set([
   "/api/v1/account/login/start",
   "/api/v1/agent/user-presence/start",
@@ -1568,6 +1569,9 @@ function go(route) { location.hash = "#/" + route; }
 const EXTRA_ROUTES = { search: "Search", settings: "Settings", invaders: "Invaders" };
 const routeLabel = (r) => (visibleServices().find(s => s.id === r) || {}).label || EXTRA_ROUTES[r] || "iSyncYou";
 function onRoute() {
+  // Shared scopes need a fresh server ACL check for each view.
+  Mail.sharedReadController?.abort();
+  Mail.sharedReadController = null;
   // Each navigation rebuilds the view from scratch; the view's render re-registers its
   // own live-update handler (or leaves it null). Reset it here so a stale handler from
   // the previous route can't run against the new DOM (#0A soft refresh).
@@ -1873,10 +1877,64 @@ async function doServiceSearch(service) {
 // `folders` accumulates the folder items we skip so the displayed count reflects
 // real messages (folders sort before messages, so the message total is exact).
 const Mail = { all: [], filter: "all", sort: "newest", q: "", selected: null, nextCursor: null, expanded: false };
+// Only pending reads are shared. This bounds stale provider requests during
+// repeated route changes without caching completed data or bypassing ACL checks.
+const ProviderMailReads = new Map();
+const ProviderSharedReads = new Set();
+let providerAccountsRefreshing = 0;
+function clearProviderMailReads() {
+  Mail.sharedReadController?.abort();
+  Mail.sharedReadController = null;
+  for (const entry of ProviderMailReads.values()) {
+    entry.controller.abort();
+    entry.waiter?.reject(new Error("provider_read_invalidated"));
+    entry.waiter = null;
+  }
+  for (const entry of ProviderSharedReads) entry.controller.abort();
+  ProviderMailReads.clear();
+  ProviderSharedReads.clear();
+}
+function providerMailRead(account, scope, kind, url, signal, stillCurrent = () => true) {
+  if (BRIDGE) return api(url);
+  if (providerAccountsRefreshing) return Promise.reject(new Error("provider_accounts_refreshing"));
+  const key = JSON.stringify([account, scope, kind]);
+  // Shared reads must always perform a fresh server ACL check per view.
+  const existing = !scope && ProviderMailReads.get(key);
+  if (existing) {
+    // Never reuse the old result: at most the newest view waits for it to finish,
+    // then starts a freshly authorized read if its identity is still current.
+    existing.waiter?.reject(new Error("provider_read_superseded"));
+    return new Promise((resolve, reject) => {
+      existing.waiter = {resolve, reject, stillCurrent, account, scope, kind, url};
+    });
+  }
+  if (ProviderMailReads.size + ProviderSharedReads.size >= 4) return Promise.reject(new Error("provider_read_busy"));
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal?.aborted) abort(); else signal?.addEventListener("abort", abort, {once:true});
+  const timer = setTimeout(abort, 120000);
+  const entry = {controller, promise:null, waiter:null};
+  const promise = api(url, {signal:controller.signal}).finally(() => {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+    if (scope) ProviderSharedReads.delete(entry);
+    else if (ProviderMailReads.get(key) === entry) ProviderMailReads.delete(key);
+    const waiter = entry.waiter;
+    entry.waiter = null;
+    if (waiter) {
+      if (!waiter.stillCurrent() || providerAccountsRefreshing) waiter.reject(new Error("provider_read_superseded"));
+      else waiter.resolve(providerMailRead(waiter.account, waiter.scope, waiter.kind, waiter.url, undefined, waiter.stillCurrent));
+    }
+  });
+  entry.promise = promise;
+  if (scope) ProviderSharedReads.add(entry); else ProviderMailReads.set(key, entry);
+  return promise;
+}
 // Short-lived, bounded metadata only. Self-hosted/shared mail is excluded because
 // its visibility depends on live ACL checks. Never persist this snapshot.
 const MailSnapshot = { entries: new Map(), inflight: new Map(), epoch: 0 };
 function clearMailSnapshots() {
+  clearProviderMailReads();
   MailSnapshot.epoch++;
   MailSnapshot.entries.clear();
   MailSnapshot.inflight.clear();
@@ -1962,6 +2020,8 @@ function startPrimaryMailCache(account) {
 }
 
 async function renderMailView(view, primeMail = null) {
+  Mail.sharedReadController?.abort();
+  Mail.sharedReadController = null;
   if (Mail.scopeAccount !== App.account) { Mail.scopeAccount = App.account; Mail.activeScope = ""; App.svcFilter.mail = "all"; }
   App.svcFilter.mail = "all";
   const account = App.account, scope = Mail.activeScope;
@@ -2025,11 +2085,13 @@ async function renderMailView(view, primeMail = null) {
     const search = $("#mail-search"); if (search) { search.disabled = true; search.placeholder = "Search available after refresh…"; }
     for (const id of ["#mail-page-prev", "#mail-load-more"]) { const button = $(id); if (button) button.disabled = true; }
   }
-  const liveRequest = providerMail ? api("/api/v1/items?" + qs({account,service:"mail",live_metadata:"1",limit:50,...(scope ? {mail_scope:scope} : {})})).catch(() => null) : null;
+  const sharedController = providerMail && scope && !BRIDGE ? new AbortController() : null;
+  Mail.sharedReadController = sharedController;
+  const liveRequest = providerMail ? providerMailRead(account, scope, "live", "/api/v1/items?" + qs({account,service:"mail",live_metadata:"1",limit:50,...(scope ? {mail_scope:scope} : {})}), sharedController?.signal, () => current() && MailSnapshot.epoch === snapshotEpoch).catch(() => null) : null;
   const initialPageRequest = Mail.pageRequest;
   let sharedLiveFailed = false;
   const applyLive = page => {
-    if (!current() || Mail.pageRequest !== initialPageRequest) return false;
+    if (!current() || Mail.pageRequest !== initialPageRequest || MailSnapshot.epoch !== snapshotEpoch) return false;
     if (!page || !Array.isArray(page.items) || typeof page.query_state !== "string" || !page.query_state) {
       if (scope) { sharedLiveFailed = true; Mail.all = []; Mail.folders = []; Mail.selected = null; Mail.pendingSelect = null; renderMailReader(null); mailRender(); }
       const label = $("#mail-cache-provenance"); if (label) label.textContent = scope ? "Shared mail access could not be verified" : "Cached messages · newest order not verified";
@@ -2089,8 +2151,8 @@ async function renderMailView(view, primeMail = null) {
     Mail._sig = mailListSignature();
     App.liveUpdate = mailLiveUpdate;
     void activity.then(act => { if (current()) { Mail.runs = act.runs || []; mailRenderMetrics(); } });
-    if (primaryCacheOnly) void api("/api/v1/items?" + qs({account,service:"mail",limit:50})).then(full => {
-      if (!current()) return;
+    if (primaryCacheOnly) void providerMailRead(account, scope, "scopes", "/api/v1/items?" + qs({account,service:"mail",limit:50}), undefined, () => current() && MailSnapshot.epoch === snapshotEpoch).then(full => {
+      if (!current() || MailSnapshot.epoch !== snapshotEpoch) return;
       const select = $("#mail-scope");
       if (select && Array.isArray(full.scopes) && full.scopes.some(item => !item.primary)) {
         clear(select);
@@ -9833,6 +9895,12 @@ function accountRoleStateLabel(status) {
   return "Not connected";
 }
 async function reloadAccounts() {
+  // The account API does not expose a stable provider credential generation.
+  // Invalidate pending reads and fail closed until all overlapping reloads finish.
+  providerAccountsRefreshing++;
+  clearProviderMailReads();
+  MailSnapshot.epoch++;
+  try {
   const current = App.account;
   const data = await api("/api/v1/accounts");
   const nextAccounts = data.accounts || [];
@@ -9849,6 +9917,7 @@ async function reloadAccounts() {
   App.accounts = nextAccounts;
   App.account = App.accounts.some((account) => account.id === current)
     ? current : (App.accounts[0] && App.accounts[0].id) || null;
+  } finally { providerAccountsRefreshing--; }
 }
 function renderAccountMenu(body) {
   if (accountMenuPoll) { clearInterval(accountMenuPoll); accountMenuPoll = null; }

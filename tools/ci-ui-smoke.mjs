@@ -87,6 +87,90 @@ const minBtn = await page.evaluate(() => {
 });
 check(`min interactive target >= 28px (measured ${minBtn}px)`, minBtn >= 28);
 
+// Pending self-hosted mail reads are bounded and isolated by account/scope.
+// Use synthetic pending requests: no account or provider operation is changed.
+const providerRead = await page.evaluate(async () => {
+  const original = window.api;
+  let started = 0, aborted = 0;
+  window.api = (url, opts) => {
+    if (!url.startsWith("/synthetic-provider-")) return original(url, opts);
+    started++;
+    return new Promise((resolve, reject) => {
+      opts.signal.addEventListener("abort", () => { aborted++; reject(new Error("aborted")); });
+    });
+  };
+  try {
+    const sharedController = new AbortController();
+    const a = providerMailRead("a", "", "live", "/synthetic-provider-live");
+    const same = providerMailRead("a", "", "live", "/synthetic-provider-live");
+    const superseded = same.then(() => false, () => true);
+    const newest = providerMailRead("a", "", "live", "/synthetic-provider-live");
+    const account = providerMailRead("b", "", "live", "/synthetic-provider-live");
+    const shared = providerMailRead("a", "shared", "live", "/synthetic-provider-live", sharedController.signal);
+    const sharedAgain = providerMailRead("a", "shared", "live", "/synthetic-provider-live", sharedController.signal);
+    const busy = providerMailRead("a", "", "scopes", "/synthetic-provider-scopes").then(() => false, () => true);
+    const settled = Promise.allSettled([a, newest, account, shared, sharedAgain]);
+    const identity = a !== same && same !== newest && a !== account && shared !== sharedAgain;
+    clearProviderMailReads(); sharedController.abort();
+    return { identity, started, aborted, busy: await busy, superseded: await superseded,
+      rejected: (await settled).every(x => x.status === "rejected"), empty: ProviderMailReads.size === 0 && ProviderSharedReads.size === 0 };
+  } finally { window.api = original; }
+});
+check("pending provider mail reads stay bounded and account-scoped",
+  providerRead.identity && providerRead.started === 4 && providerRead.aborted === 4 &&
+  providerRead.busy && providerRead.superseded && providerRead.rejected && providerRead.empty);
+
+// A later view waits for an old read but must issue its own authorized request.
+const providerBarrier = await page.evaluate(async () => {
+  const original = window.api, resolvers = [];
+  window.api = (url, opts) => {
+    if (url !== "/synthetic-provider-barrier") return original(url, opts);
+    return new Promise((resolve, reject) => {
+      resolvers.push(resolve);
+      opts.signal.addEventListener("abort", () => reject(new Error("aborted")));
+    });
+  };
+  try {
+    const old = providerMailRead("a", "", "live", "/synthetic-provider-barrier");
+    const next = providerMailRead("a", "", "live", "/synthetic-provider-barrier", undefined, () => true);
+    resolvers[0]("old");
+    await old;
+    for (let i = 0; i < 10 && resolvers.length < 2; i++) await Promise.resolve();
+    if (resolvers.length !== 2) return false;
+    resolvers[1]("fresh");
+    return await next === "fresh";
+  } finally { clearProviderMailReads(); window.api = original; }
+});
+check("later provider view obtains a fresh read", providerBarrier);
+
+// An account refresh revokes pending reads before account identity can change.
+const providerRefresh = await page.evaluate(async () => {
+  const original = window.api, accounts = App.accounts;
+  let resolveAccounts, aborted = 0;
+  window.api = (url, opts) => {
+    if (url === "/api/v1/accounts") return new Promise(resolve => { resolveAccounts = resolve; });
+    if (url === "/synthetic-provider-refresh") return new Promise((resolve, reject) => {
+      opts.signal.addEventListener("abort", () => { aborted++; reject(new Error("aborted")); });
+    });
+    return original(url, opts);
+  };
+  try {
+    const epoch = MailSnapshot.epoch;
+    const pending = providerMailRead("a", "", "live", "/synthetic-provider-refresh");
+    const settled = Promise.allSettled([pending]);
+    const reload = reloadAccounts();
+    const blocked = await providerMailRead("a", "", "live", "/synthetic-provider-refresh").then(() => false, () => true);
+    resolveAccounts({accounts});
+    await reload;
+    return { aborted, blocked, epochAdvanced: MailSnapshot.epoch > epoch,
+      rejected: (await settled)[0].status === "rejected", refreshCleared: providerAccountsRefreshing === 0,
+      empty: ProviderMailReads.size === 0 };
+  } finally { window.api = original; }
+});
+check("account refresh invalidates pending provider reads",
+  providerRefresh.aborted === 1 && providerRefresh.blocked && providerRefresh.epochAdvanced &&
+  providerRefresh.rejected && providerRefresh.refreshCleared && providerRefresh.empty);
+
 // --- boot health: no uncaught console errors while exercising the UI ---
 check("no console errors on boot", consoleErrors.length === 0, `(${consoleErrors.slice(0, 3).join(" | ")})`);
 
