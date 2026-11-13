@@ -630,7 +630,10 @@ fn onenote_resource_key(page: &str, html_hash: &str, url: &str) -> String {
 }
 
 #[cfg(unix)]
-fn onenote_file_identity(path: &Path) -> std::io::Result<(u64, u64, u64, i64, i64)> {
+type OneNoteFileIdentity = (u64, u64, u64, i64, i64);
+
+#[cfg(unix)]
+fn onenote_file_identity(path: &Path) -> std::io::Result<OneNoteFileIdentity> {
     use std::os::unix::fs::MetadataExt;
     let m = std::fs::symlink_metadata(path)?;
     if !m.is_file() {
@@ -643,7 +646,7 @@ fn onenote_file_identity(path: &Path) -> std::io::Result<(u64, u64, u64, i64, i6
 pub struct PreparedOneNoteManifest {
     target: std::path::PathBuf,
     bytes: Vec<u8>,
-    files: Vec<(std::path::PathBuf, (u64, u64, u64, i64, i64))>,
+    files: Vec<(std::path::PathBuf, OneNoteFileIdentity)>,
 }
 
 #[cfg(unix)]
@@ -653,7 +656,7 @@ pub struct PlannedOneNoteResource {
     root: std::path::PathBuf,
     target: std::path::PathBuf,
     html_path: std::path::PathBuf,
-    html_identity: (u64, u64, u64, i64, i64),
+    html_identity: OneNoteFileIdentity,
 }
 
 /// Inspect one page outside the store gate. The caller revalidates the page

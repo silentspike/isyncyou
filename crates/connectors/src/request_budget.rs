@@ -337,10 +337,7 @@ pub(crate) fn search_read(reader: &mut impl Read, out: &mut [u8]) -> io::Result<
             let mut state = budget.inner.lock().unwrap_or_else(|e| e.into_inner());
             if state.bytes == 0 && !out.is_empty() {
                 state.exhausted = true;
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "search byte budget exhausted",
-                ));
+                return Err(io::Error::other("search byte budget exhausted"));
             }
             let len = out.len().min(state.bytes);
             state.bytes -= len;

@@ -90,6 +90,9 @@ pub enum DavError {
     Store(String),
 }
 
+/// Resource href/ETag pairs, a private continuation token and a more-results flag.
+pub type SearchMetadataPage = (Vec<(String, String)>, String, bool);
+
 /// Disk-backed generation operations. Implementations must not retain a writer
 /// across calls: network requests occur between these operations.
 pub trait DetachedSyncStage {
@@ -1498,7 +1501,7 @@ impl DavClient {
         scope: &ProviderScope,
         token: Option<&str>,
         limit: usize,
-    ) -> Result<(Vec<(String, String)>, String, bool), DavError> {
+    ) -> Result<SearchMetadataPage, DavError> {
         if !(1..=12).contains(&limit)
             || token.is_some_and(|s| s.len() > 4096 || s.chars().any(char::is_control))
         {
