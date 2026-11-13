@@ -165,11 +165,10 @@ fn fetch_session(
         if !visited.insert(current.clone()) {
             return Err(JmapError::InvalidUrl);
         }
-        let request = http
-            .get(current.clone())
-            .bearer_auth(token);
+        let request = http.get(current.clone()).bearer_auth(token);
         let response = crate::request_budget::search_request(request)
-            .map_err(|_| JmapError::Transport)?.send()
+            .map_err(|_| JmapError::Transport)?
+            .send()
             .map_err(|_| JmapError::Transport)?;
         if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
             return Ok(response);
@@ -516,7 +515,9 @@ impl JmapClient {
         }
         let http = builder.build().map_err(|_| JmapError::Transport)?;
         let gate = origin_gate(&origin);
-        let discovery_permit = gate.acquire_search(false).map_err(|_| JmapError::Transport)?;
+        let discovery_permit = gate
+            .acquire_search(false)
+            .map_err(|_| JmapError::Transport)?;
         let response = fetch_session(&http, &origin, &token, public.as_ref())?;
         if !response.status().is_success() {
             return Err(JmapError::Http(response.status().as_u16()));
@@ -873,7 +874,10 @@ impl JmapClient {
         if mutation && self.read_only {
             return Err(JmapError::Unsupported);
         }
-        let _permit = self.gate.acquire_search(false).map_err(|_| JmapError::Transport)?;
+        let _permit = self
+            .gate
+            .acquire_search(false)
+            .map_err(|_| JmapError::Transport)?;
         {
             let mut metrics = self
                 .metrics
@@ -916,7 +920,8 @@ impl JmapClient {
             .bearer_auth(&self.token)
             .json(&request);
         let response = crate::request_budget::search_request(request)
-            .map_err(|_| JmapError::Transport)?.send()
+            .map_err(|_| JmapError::Transport)?
+            .send()
             .map_err(|_| {
                 if mutation {
                     JmapError::OutcomeUnknown

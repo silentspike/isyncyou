@@ -637,8 +637,13 @@ mod tests {
     }
     #[test]
     fn provider_search_activity_is_typed_without_archive_claim() {
-        assert_eq!(serde_json::to_value(ActivityKind::ProviderSearch).unwrap(), "provider_search");
-        assert_eq!(serde_json::from_value::<ActivityKind>(serde_json::json!("provider_search")).unwrap(), ActivityKind::ProviderSearch);
+        assert_eq!(
+            serde_json::to_value(ActivityKind::ProviderSearch).unwrap(),
+            "provider_search"
+        );
+        assert_eq!(
+            serde_json::from_value::<ActivityKind>(serde_json::json!("provider_search")).unwrap(),
+            ActivityKind::ProviderSearch
+        );
     }
-
 }

@@ -305,29 +305,69 @@ fn execute_bound_task_delete(
         return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
     };
     let Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskDelete {
-        target, origin, collection, uid, summary, parent, etag, checkpoint,
-    })) = validate_live_write_action(action) else {
+        target,
+        origin,
+        collection,
+        uid,
+        summary,
+        parent,
+        etag,
+        checkpoint,
+    })) = validate_live_write_action(action)
+    else {
         return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected);
     };
     let account = action.account();
     let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
-    let prepared = match isyncyou_engine::dav_live::prepare_task_delete_preview(cfg, account, &collection, &target, &uid) {
+    let prepared = match isyncyou_engine::dav_live::prepare_task_delete_preview(
+        cfg,
+        account,
+        &collection,
+        &target,
+        &uid,
+    ) {
         Ok(value) => value,
         Err(_) => return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected),
     };
-    if prepared.origin != origin || prepared.href != target || prepared.uid != uid
-        || prepared.summary != summary || prepared.parent != parent || prepared.expected_etag != etag
-        || prepared.expected_collection_token != checkpoint {
+    if prepared.origin != origin
+        || prepared.href != target
+        || prepared.uid != uid
+        || prepared.summary != summary
+        || prepared.parent != parent
+        || prepared.expected_etag != etag
+        || prepared.expected_collection_token != checkpoint
+    {
         return ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderConflict);
     }
     let op = isyncyou_engine::dav_write::ApprovedDavWrite {
-        operation_id, account_id: account.into(), origin, collection, service: "calendar".into(),
-        href: target, expected_etag: Some(etag), expected_collection_token: Some(checkpoint), raw: None,
+        operation_id,
+        account_id: account.into(),
+        origin,
+        collection,
+        service: "calendar".into(),
+        href: target,
+        expected_etag: Some(etag),
+        expected_collection_token: Some(checkpoint),
+        raw: None,
     };
-    match isyncyou_engine::dav_write::execute_task_delete(cfg, "/.well-known/caldav", &op, &uid, None) {
-        Ok(isyncyou_engine::dav_write::WriteOutcome::Confirmed(_)) => ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new("Task deleted; local synchronization pending")),
-        Ok(isyncyou_engine::dav_write::WriteOutcome::Conflict) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderConflict),
-        Ok(isyncyou_engine::dav_write::WriteOutcome::Rejected) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderActionRejected),
+    match isyncyou_engine::dav_write::execute_task_delete(
+        cfg,
+        "/.well-known/caldav",
+        &op,
+        &uid,
+        None,
+    ) {
+        Ok(isyncyou_engine::dav_write::WriteOutcome::Confirmed(_)) => {
+            ConfirmedExecutionOutcome::Completed(ConfirmedActionResult::new(
+                "Task deleted; local synchronization pending",
+            ))
+        }
+        Ok(isyncyou_engine::dav_write::WriteOutcome::Conflict) => {
+            ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderConflict)
+        }
+        Ok(isyncyou_engine::dav_write::WriteOutcome::Rejected) => {
+            ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ProviderActionRejected)
+        }
         _ => ConfirmedExecutionOutcome::OutcomeUnknown,
     }
 }
@@ -2894,8 +2934,14 @@ enum CalendarLiveWrite {
         raw_sha256: String,
     },
     TaskDelete {
-        target: String, origin: String, collection: String, uid: String,
-        summary: String, parent: Option<String>, etag: String, checkpoint: String,
+        target: String,
+        origin: String,
+        collection: String,
+        uid: String,
+        summary: String,
+        parent: Option<String>,
+        etag: String,
+        checkpoint: String,
     },
     TaskParent {
         target: String,
@@ -3397,7 +3443,9 @@ impl LiveWriteRuntime for LiveLiveWriteRuntime {
                     CalendarLiveWrite::InvitationResponse { .. } => {
                         Err("bound_confirmation_required".into())
                     }
-                    CalendarLiveWrite::TaskDelete { .. } => Err("bound_confirmation_required".into()),
+                    CalendarLiveWrite::TaskDelete { .. } => {
+                        Err("bound_confirmation_required".into())
+                    }
                     CalendarLiveWrite::TaskParent { .. } => {
                         Err("bound_confirmation_required".into())
                     }
@@ -3870,12 +3918,18 @@ fn validate_live_write_action(
                 raw_sha256: required_change_str(change, "raw_sha256")?,
             },
         )),
-        ("calendar", "task_delete") => Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskDelete {
-            target: required_target(target, change)?, origin: required_change_str(change, "origin")?,
-            collection: required_change_str(change, "collection")?, uid: required_change_str(change, "uid")?,
-            summary: required_change_str(change, "summary")?, parent: optional_change_str(change, "parent")?,
-            etag: required_change_str(change, "etag")?, checkpoint: required_change_str(change, "checkpoint")?,
-        })),
+        ("calendar", "task_delete") => Ok(AgentLiveWriteIntent::Calendar(
+            CalendarLiveWrite::TaskDelete {
+                target: required_target(target, change)?,
+                origin: required_change_str(change, "origin")?,
+                collection: required_change_str(change, "collection")?,
+                uid: required_change_str(change, "uid")?,
+                summary: required_change_str(change, "summary")?,
+                parent: optional_change_str(change, "parent")?,
+                etag: required_change_str(change, "etag")?,
+                checkpoint: required_change_str(change, "checkpoint")?,
+            },
+        )),
         ("calendar", "task_parent") => Ok(AgentLiveWriteIntent::Calendar(
             CalendarLiveWrite::TaskParent {
                 target: required_target(target, change)?,
@@ -5330,13 +5384,34 @@ pub(crate) fn bind_provider_task_delete(
     cfg: &Config,
     mut action: isyncyou_agent::ToolAction,
 ) -> Result<isyncyou_agent::ToolAction, String> {
-    let isyncyou_agent::ToolAction::LiveWrite { account, service, target, change, .. } = &mut action else { return Ok(action); };
-    if service != "calendar" || change.get("verb").and_then(serde_json::Value::as_str) != Some("task_delete") { return Ok(action); }
+    let isyncyou_agent::ToolAction::LiveWrite {
+        account,
+        service,
+        target,
+        change,
+        ..
+    } = &mut action
+    else {
+        return Ok(action);
+    };
+    if service != "calendar"
+        || change.get("verb").and_then(serde_json::Value::as_str) != Some("task_delete")
+    {
+        return Ok(action);
+    }
     let collection = required_change_str(change, "collection")?;
     let uid = required_change_str(change, "uid")?;
     let href = required_target(target, change)?;
-    let prepared = isyncyou_engine::dav_live::prepare_task_delete_preview(cfg, account, &collection, &href, &uid)?;
-    if prepared.href != href || prepared.uid != uid { return Err("provider_task_prepare_invalid".into()); }
+    let prepared = isyncyou_engine::dav_live::prepare_task_delete_preview(
+        cfg,
+        account,
+        &collection,
+        &href,
+        &uid,
+    )?;
+    if prepared.href != href || prepared.uid != uid {
+        return Err("provider_task_prepare_invalid".into());
+    }
     *target = Some(href);
     *change = serde_json::json!({"verb":"task_delete","origin":prepared.origin,"collection":collection,"uid":uid,"summary":prepared.summary,"parent":prepared.parent,"etag":prepared.expected_etag,"checkpoint":prepared.expected_collection_token});
     Ok(action)
@@ -6122,7 +6197,16 @@ pub(crate) fn preview_for_pending_action(
             {
                 return Ok(PendingOperationPreview::destructive(format!("Respond to invitation UID {uid}, occurrence {}, in account {} at {origin}, calendar {collection}, resource {target}. Attendee: {attendee}; organizer: {organizer}. Previous response: {old_response}; new response: {response}. This may notify the organizer.", recurrence_id.as_deref().unwrap_or("single event"), action.account())));
             }
-            if let AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskDelete { target, origin, collection, uid, summary, parent, .. }) = &intent {
+            if let AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskDelete {
+                target,
+                origin,
+                collection,
+                uid,
+                summary,
+                parent,
+                ..
+            }) = &intent
+            {
                 return Ok(PendingOperationPreview::destructive(format!("Delete task ‘{summary}’ (UID {uid}) in account {} at {origin}, collection {collection}, resource {target}. Parent UID: {}. Deletion is rejected if the task has children or the graph changed.", action.account(), parent.as_deref().unwrap_or("none"))));
             }
             if let AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskParent {
@@ -7469,7 +7553,12 @@ impl AgentConfirmedActionExecutor for DesktopAgentOperations {
                 Err(_) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected),
             };
         }
-        if matches!(validate_live_write_action(action), Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskDelete { .. }))) {
+        if matches!(
+            validate_live_write_action(action),
+            Ok(AgentLiveWriteIntent::Calendar(
+                CalendarLiveWrite::TaskDelete { .. }
+            ))
+        ) {
             return match self.current_config() {
                 Ok(cfg) => execute_bound_task_delete(&cfg, action, pending_id, &self.gate),
                 Err(_) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected),
@@ -7928,7 +8017,12 @@ impl AgentConfirmedActionExecutor for MobileFullNodeAgentOperations {
                 Err(_) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected),
             };
         }
-        if matches!(validate_live_write_action(action), Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskDelete { .. }))) {
+        if matches!(
+            validate_live_write_action(action),
+            Ok(AgentLiveWriteIntent::Calendar(
+                CalendarLiveWrite::TaskDelete { .. }
+            ))
+        ) {
             return match self.current_config() {
                 Ok(cfg) => execute_bound_task_delete(&cfg, action, pending_id, &self.gate),
                 Err(_) => ConfirmedExecutionOutcome::Failed(ClosedExecutionCode::ExecutorRejected),
@@ -8540,9 +8634,18 @@ mod tests {
     fn task_delete_preview_binds_graph_checkpoint_and_identity() {
         let action = isyncyou_agent::parse_action(&serde_json::json!({"op":"live-write", "account":"a", "service":"calendar", "target":"/cal/task.ics",
             "change":{"verb":"task_delete","origin":"https://example.test","collection":"/cal/","uid":"child","summary":"Review","parent":"parent","etag":"\"v1\"","checkpoint":"state-1"}})).unwrap();
-        assert!(matches!(validate_live_write_action(&action), Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskDelete { .. }))));
+        assert!(matches!(
+            validate_live_write_action(&action),
+            Ok(AgentLiveWriteIntent::Calendar(
+                CalendarLiveWrite::TaskDelete { .. }
+            ))
+        ));
         let preview = preview_for_pending_action(&action).unwrap();
-        assert!(preview.text.contains("Review") && preview.text.contains("child") && preview.text.contains("parent"));
+        assert!(
+            preview.text.contains("Review")
+                && preview.text.contains("child")
+                && preview.text.contains("parent")
+        );
         assert!(preview.text.contains("children") && preview.text.contains("graph"));
     }
 

@@ -1499,15 +1499,28 @@ impl DavClient {
         token: Option<&str>,
         limit: usize,
     ) -> Result<(Vec<(String, String)>, String, bool), DavError> {
-        if !(1..=12).contains(&limit) || token.is_some_and(|s| s.len() > 4096 || s.chars().any(char::is_control)) {
+        if !(1..=12).contains(&limit)
+            || token.is_some_and(|s| s.len() > 4096 || s.chars().any(char::is_control))
+        {
             return Err(DavError::InvalidResponse);
         }
         let collection = self.collection(scope)?;
         let body = format!("<?xml version=\"1.0\"?><d:sync-collection xmlns:d=\"DAV:\"><d:sync-token>{}</d:sync-token><d:sync-level>1</d:sync-level><d:prop><d:getetag/></d:prop><d:limit><d:nresults>{limit}</d:nresults></d:limit></d:sync-collection>", escape_xml(token.unwrap_or("")));
-        let response = self.http.request(reqwest::Method::from_bytes(b"REPORT").map_err(|_| DavError::InvalidResponse)?, collection.clone())
-            .bearer_auth(&self.token).header("Depth", "0").header(CONTENT_TYPE, "application/xml; charset=utf-8").body(body)
-            .budgeted_send(&self.origin).map_err(|_| DavError::Transport("DAV metadata unavailable".into()))?;
-        if response.status().as_u16() != 207 { return Err(DavError::Http(response.status().as_u16())); }
+        let response = self
+            .http
+            .request(
+                reqwest::Method::from_bytes(b"REPORT").map_err(|_| DavError::InvalidResponse)?,
+                collection.clone(),
+            )
+            .bearer_auth(&self.token)
+            .header("Depth", "0")
+            .header(CONTENT_TYPE, "application/xml; charset=utf-8")
+            .body(body)
+            .budgeted_send(&self.origin)
+            .map_err(|_| DavError::Transport("DAV metadata unavailable".into()))?;
+        if response.status().as_u16() != 207 {
+            return Err(DavError::Http(response.status().as_u16()));
+        }
         let page = parse_page(&bounded_body(response)?)?;
         let mut more = false;
         let mut saw_self = false;
@@ -1515,16 +1528,36 @@ impl DavClient {
         let mut seen = HashSet::new();
         for entry in page.entries {
             let candidate = self.checked_from(&collection, &entry.href)?;
-            if candidate == collection && entry.status == Some(507) { more = true; continue; }
-            if candidate == collection { accept_collection_self(&entry, &mut saw_self)?; continue; }
-            if entry.status == Some(404) { continue; }
-            if entry.status.is_some_and(|status| status != 200) || entry.propstats != 1 || entry.prop_status != Some(200) { return Err(DavError::InvalidResponse); }
+            if candidate == collection && entry.status == Some(507) {
+                more = true;
+                continue;
+            }
+            if candidate == collection {
+                accept_collection_self(&entry, &mut saw_self)?;
+                continue;
+            }
+            if entry.status == Some(404) {
+                continue;
+            }
+            if entry.status.is_some_and(|status| status != 200)
+                || entry.propstats != 1
+                || entry.prop_status != Some(200)
+            {
+                return Err(DavError::InvalidResponse);
+            }
             let href = self.resource(&collection, &entry.href)?.to_string();
-            let etag = entry.etag.filter(|v| !v.is_empty()).ok_or(DavError::InvalidResponse)?;
-            if !seen.insert(href.clone()) || items.len() >= limit { return Err(DavError::InvalidResponse); }
+            let etag = entry
+                .etag
+                .filter(|v| !v.is_empty())
+                .ok_or(DavError::InvalidResponse)?;
+            if !seen.insert(href.clone()) || items.len() >= limit {
+                return Err(DavError::InvalidResponse);
+            }
             items.push((href, etag));
         }
-        if page.token.is_empty() || (more && token == Some(page.token.as_str())) { return Err(DavError::InvalidResponse); }
+        if page.token.is_empty() || (more && token == Some(page.token.as_str())) {
+            return Err(DavError::InvalidResponse);
+        }
         Ok((items, page.token, more))
     }
 
@@ -2879,34 +2912,63 @@ mod tests {
         let server = std::thread::spawn(move || {
             for i in 0..2 {
                 let (mut stream, _) = listener.accept().unwrap();
-                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
                 let mut raw = Vec::new();
                 let mut buf = [0; 2048];
                 loop {
                     let n = stream.read(&mut buf).unwrap();
-                    assert_ne!(n, 0); raw.extend_from_slice(&buf[..n]);
+                    assert_ne!(n, 0);
+                    raw.extend_from_slice(&buf[..n]);
                     if let Some(end) = raw.windows(4).position(|v| v == b"\r\n\r\n") {
                         let headers = String::from_utf8_lossy(&raw[..end]);
-                        let len = headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok())).unwrap_or(0);
-                        if raw.len() >= end + 4 + len { break; }
+                        let len = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if raw.len() >= end + 4 + len {
+                            break;
+                        }
                     }
                 }
                 let request = String::from_utf8(raw).unwrap();
                 assert!(request.starts_with("REPORT /cal/ "));
                 assert!(request.contains("<d:nresults>1</d:nresults>"));
-                if i == 1 { assert!(request.contains("<d:sync-token>page1</d:sync-token>")); }
-                let marker = if i == 0 { "<d:response><d:href>/cal/</d:href><d:status>HTTP/1.1 507 Insufficient Storage</d:status></d:response>" } else { "" };
+                if i == 1 {
+                    assert!(request.contains("<d:sync-token>page1</d:sync-token>"));
+                }
+                let marker = if i == 0 {
+                    "<d:response><d:href>/cal/</d:href><d:status>HTTP/1.1 507 Insufficient Storage</d:status></d:response>"
+                } else {
+                    ""
+                };
                 let token = if i == 0 { "page1" } else { "final" };
                 let body = format!("<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/cal/{i}.ics</d:href><d:propstat><d:prop><d:getetag>&quot;v1&quot;</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>{marker}<d:sync-token>{token}</d:sync-token></d:multistatus>");
                 write!(stream, "HTTP/1.1 207 Multi-Status\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
         });
         let reader = super::LoopbackDavReader::new(&origin, "fixture".into()).unwrap();
-        let scope = isyncyou_store::ProviderScope { account_id: "fixture".into(), origin: origin.clone(), service: "calendar".into(), collection: format!("{origin}cal/") };
+        let scope = isyncyou_store::ProviderScope {
+            account_id: "fixture".into(),
+            origin: origin.clone(),
+            service: "calendar".into(),
+            collection: format!("{origin}cal/"),
+        };
         let (first, cursor, more) = reader.0.search_metadata_page(&scope, None, 1).unwrap();
-        assert!(more); assert_eq!(first, vec![(format!("{origin}cal/0.ics"), "\"v1\"".into())]);
-        let (second, cursor, more) = reader.0.search_metadata_page(&scope, Some(&cursor), 1).unwrap();
-        assert!(!more); assert_eq!(cursor, "final"); assert_eq!(second.len(), 1);
+        assert!(more);
+        assert_eq!(first, vec![(format!("{origin}cal/0.ics"), "\"v1\"".into())]);
+        let (second, cursor, more) = reader
+            .0
+            .search_metadata_page(&scope, Some(&cursor), 1)
+            .unwrap();
+        assert!(!more);
+        assert_eq!(cursor, "final");
+        assert_eq!(second.len(), 1);
         server.join().unwrap();
     }
 

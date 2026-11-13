@@ -19,10 +19,6 @@ mod account_lifecycle;
 ))]
 mod agent_control_store;
 mod agent_ops;
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-mod provider_progressive;
-#[cfg(any(feature = "agent-oauth-providers", feature = "agent-subscription-experimental"))]
-mod provider_dispatch;
 #[cfg(feature = "agent-subscription-experimental")]
 mod local_cli_fallback;
 mod mobile_jobs;
@@ -31,6 +27,16 @@ mod mobile_jobs;
     feature = "agent-subscription-experimental"
 ))]
 mod product_session;
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+mod provider_dispatch;
+#[cfg(any(
+    feature = "agent-oauth-providers",
+    feature = "agent-subscription-experimental"
+))]
+mod provider_progressive;
 #[cfg(any(
     feature = "agent-oauth-providers",
     feature = "agent-subscription-experimental"
@@ -1849,7 +1855,11 @@ impl isyncyou_agent::ToolExecutor for ProviderMailExecutor {
         action: &isyncyou_agent::ToolAction,
         context: isyncyou_agent::ReadExecutionContext<'_, '_>,
     ) -> Result<isyncyou_agent::ReadExecutionOutputV2, isyncyou_agent::AgentError> {
-        if matches!(action, isyncyou_agent::ToolAction::Search { .. } | isyncyou_agent::ToolAction::DeepSearch { .. }) {
+        if matches!(
+            action,
+            isyncyou_agent::ToolAction::Search { .. }
+                | isyncyou_agent::ToolAction::DeepSearch { .. }
+        ) {
             return self.progressive_read(action, context);
         }
         let content = self.execute_read(action)?;
@@ -21526,7 +21536,10 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
             let state = match refresh.as_deref() {
                 Ok("outcome_unknown") => isyncyou_webui::AccountAuthState::RefreshOutcomeUnknown,
                 Ok("successor_pending") => isyncyou_webui::AccountAuthState::RefreshRecoveryPending,
-                Ok("none") => provider_mail_role_state(connected, isyncyou_engine::self_hosted_mail::mail_access_observation(&cfg, account)),
+                Ok("none") => provider_mail_role_state(
+                    connected,
+                    isyncyou_engine::self_hosted_mail::mail_access_observation(&cfg, account),
+                ),
                 _ => isyncyou_webui::AccountAuthState::AccessUnknown,
             };
             let status = isyncyou_webui::AccountRoleStatus {
@@ -21563,8 +21576,12 @@ impl DaemonAccountAuth {
         let attempt =
             isyncyou_engine::provider_auth::start_self_hosted_auth(cfg, account, CALLBACK)
                 .map_err(|error| match error.as_str() {
-                    "OAuth exchange outcome unknown" => "account_exchange_outcome_unknown".to_string(),
-                    "Provider already signed in; sign out first" => "account_already_connected".to_string(),
+                    "OAuth exchange outcome unknown" => {
+                        "account_exchange_outcome_unknown".to_string()
+                    }
+                    "Provider already signed in; sign out first" => {
+                        "account_already_connected".to_string()
+                    }
                     _ => "provider_sign_in_unavailable".to_string(),
                 })?;
         let authorization_uri = attempt.authorization_uri.clone();

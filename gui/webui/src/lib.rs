@@ -2309,8 +2309,13 @@ fn validate_typed_product_request(
         AgentTaskDeletePrepare => {
             let r = serde_json::from_value::<AgentTaskDeletePrepareRequest>(value.clone())
                 .map_err(|_| no_store_json_error(400, "invalid product request"))?;
-            (valid_opaque_agent_id(&r.session_id) && !r.account.is_empty() && !r.collection.is_empty() && !r.href.is_empty() && !r.uid.is_empty())
-                .then_some(()).ok_or_else(|| no_store_json_error(400, "invalid product request"))
+            (valid_opaque_agent_id(&r.session_id)
+                && !r.account.is_empty()
+                && !r.collection.is_empty()
+                && !r.href.is_empty()
+                && !r.uid.is_empty())
+            .then_some(())
+            .ok_or_else(|| no_store_json_error(400, "invalid product request"))
         }
         AgentTaskParentPrepare => {
             let r = serde_json::from_value::<AgentTaskParentPrepareRequest>(value.clone())
@@ -3380,8 +3385,12 @@ pub struct AgentTaskParentPrepareRequest {
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentTaskDeletePrepareRequest {
-    pub request_id: String, pub session_id: String, pub account: String,
-    pub collection: String, pub href: String, pub uid: String,
+    pub request_id: String,
+    pub session_id: String,
+    pub account: String,
+    pub collection: String,
+    pub href: String,
+    pub uid: String,
 }
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -3542,7 +3551,10 @@ pub trait AgentHandler: Send + Sync {
     ) -> Result<Value, String> {
         Err("confirmation_unavailable".into())
     }
-    fn prepare_task_delete(&self, _request: &AgentTaskDeletePrepareRequest) -> Result<Value, String> {
+    fn prepare_task_delete(
+        &self,
+        _request: &AgentTaskDeletePrepareRequest,
+    ) -> Result<Value, String> {
         Err("confirmation_unavailable".into())
     }
     fn prepare_task_parent(
@@ -9296,7 +9308,14 @@ impl Router {
         };
         match h.start_login(account, role) {
             Ok(v) => ApiResponse::ok_json(&v),
-            Err(code) if matches!(code.as_str(), "account_exchange_outcome_unknown" | "account_already_connected") => ApiResponse::error(409, &code),
+            Err(code)
+                if matches!(
+                    code.as_str(),
+                    "account_exchange_outcome_unknown" | "account_already_connected"
+                ) =>
+            {
+                ApiResponse::error(409, &code)
+            }
             Err(_) => ApiResponse::error(502, "account_login_unavailable"),
         }
     }
@@ -9873,12 +9892,28 @@ impl Router {
     }
 
     fn agent_task_delete_prepare(&self, req: &ApiRequest) -> ApiResponse {
-        let handler = match self.agent_gate(req) { Ok(handler) => handler, Err(error) => return with_no_store(error) };
-        let r: AgentTaskDeletePrepareRequest = match parse_agent_strict_json(req, "task delete prepare") { Ok(request) => request, Err(error) => return error };
-        if !valid_client_request_id(&r.request_id) || !valid_opaque_agent_id(&r.session_id) || r.account.is_empty() || r.collection.is_empty() || r.href.is_empty() || r.uid.is_empty() {
+        let handler = match self.agent_gate(req) {
+            Ok(handler) => handler,
+            Err(error) => return with_no_store(error),
+        };
+        let r: AgentTaskDeletePrepareRequest =
+            match parse_agent_strict_json(req, "task delete prepare") {
+                Ok(request) => request,
+                Err(error) => return error,
+            };
+        if !valid_client_request_id(&r.request_id)
+            || !valid_opaque_agent_id(&r.session_id)
+            || r.account.is_empty()
+            || r.collection.is_empty()
+            || r.href.is_empty()
+            || r.uid.is_empty()
+        {
             return no_store_json_error(400, "invalid task request");
         }
-        match handler.prepare_task_delete(&r) { Ok(value) => with_no_store(ApiResponse::ok_json(&value)), Err(_) => no_store_json_error(409, "task_prepare_unavailable") }
+        match handler.prepare_task_delete(&r) {
+            Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+            Err(_) => no_store_json_error(409, "task_prepare_unavailable"),
+        }
     }
     fn agent_task_parent_prepare(&self, req: &ApiRequest) -> ApiResponse {
         let handler = match self.agent_gate(req) {
@@ -13633,10 +13668,17 @@ mod tests {
             .unwrap();
         let router = Router::new(Config::default());
         let primary = body_json(&router.provider_mail_items(
-            &store, "a", "https://example.invalid",
+            &store,
+            "a",
+            "https://example.invalid",
             &ApiRequest::get("/api/v1/items?account=a&service=mail&primary_cache_only=1"),
         ));
-        let primary_mail = primary["items"].as_array().unwrap().iter().find(|v| v["remote_id"] == "m1").unwrap();
+        let primary_mail = primary["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["remote_id"] == "m1")
+            .unwrap();
         assert_eq!(primary_mail["preview"]["flag"], "flagged");
         let response = router.provider_mail_items(
             &store,
@@ -13942,10 +13984,14 @@ mod tests {
 
     #[test]
     fn task_delete_prepare_route_is_agent_bound_and_rejects_extra_fields() {
-        assert_eq!(product_post_route("/api/v1/agent/task/delete/prepare").map(|spec| spec.route), Some(ProductPostRoute::AgentTaskDeletePrepare));
+        assert_eq!(
+            product_post_route("/api/v1/agent/task/delete/prepare").map(|spec| spec.route),
+            Some(ProductPostRoute::AgentTaskDeletePrepare)
+        );
         let good = json!({"request_id":"request-1","session_id":"session-1","account":"a","collection":"/cal/","href":"/cal/a.ics","uid":"a"});
         assert!(serde_json::from_value::<AgentTaskDeletePrepareRequest>(good.clone()).is_ok());
-        let mut bad = good; bad["unexpected"] = json!(true);
+        let mut bad = good;
+        bad["unexpected"] = json!(true);
         assert!(serde_json::from_value::<AgentTaskDeletePrepareRequest>(bad).is_err());
     }
 

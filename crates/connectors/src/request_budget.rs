@@ -37,18 +37,33 @@ pub(crate) struct Permit {
     counts_request: bool,
 }
 impl Gate {
-    pub(crate) fn acquire_search(self: &Arc<Self>, attachment: bool) -> Result<Permit, BudgetSendError> {
-        let Some(budget) = current_search_budget() else { return Ok(self.acquire(attachment)); };
+    pub(crate) fn acquire_search(
+        self: &Arc<Self>,
+        attachment: bool,
+    ) -> Result<Permit, BudgetSendError> {
+        let Some(budget) = current_search_budget() else {
+            return Ok(self.acquire(attachment));
+        };
         let mut c = self.counts.lock().unwrap_or_else(|e| e.into_inner());
         while c.requests >= c.request_limit || (attachment && c.attachments >= c.attachment_limit) {
             let remaining = budget.remaining()?;
-            let (next, _) = self.changed.wait_timeout(c, remaining.min(Duration::from_millis(50))).unwrap_or_else(|e| e.into_inner());
+            let (next, _) = self
+                .changed
+                .wait_timeout(c, remaining.min(Duration::from_millis(50)))
+                .unwrap_or_else(|e| e.into_inner());
             c = next;
         }
         budget.remaining()?;
         c.requests += 1;
-        if attachment { c.attachments += 1; }
-        Ok(Permit { gate: self.clone(), attachment, stream: false, counts_request: true })
+        if attachment {
+            c.attachments += 1;
+        }
+        Ok(Permit {
+            gate: self.clone(),
+            attachment,
+            stream: false,
+            counts_request: true,
+        })
     }
     pub(crate) fn acquire(self: &Arc<Self>, attachment: bool) -> Permit {
         let mut c = self.counts.lock().unwrap_or_else(|e| e.into_inner());
@@ -163,8 +178,16 @@ pub enum BudgetSendError {
     Cancelled,
 }
 impl BudgetSendError {
-    pub fn is_timeout(&self) -> bool { match self { Self::Exhausted => true, Self::Transport(e) => e.is_timeout(), _ => false } }
-    pub fn is_connect(&self) -> bool { matches!(self, Self::Transport(e) if e.is_connect()) }
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            Self::Exhausted => true,
+            Self::Transport(e) => e.is_timeout(),
+            _ => false,
+        }
+    }
+    pub fn is_connect(&self) -> bool {
+        matches!(self, Self::Transport(e) if e.is_connect())
+    }
 }
 
 /// Shared, turn-scoped network budget. Values and credentials are never logged.
@@ -174,26 +197,57 @@ pub struct SearchBudget {
     deadline: Instant,
     cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
 }
-struct SearchBudgetState { requests: usize, bytes: usize, body_reads: usize, exhausted: bool }
+struct SearchBudgetState {
+    requests: usize,
+    bytes: usize,
+    body_reads: usize,
+    exhausted: bool,
+}
 impl SearchBudget {
-    pub fn new(deadline: Instant, cancelled: Arc<dyn Fn() -> bool + Send + Sync>, max_requests: usize, max_bytes: usize, max_body_reads: usize) -> Self {
-        Self { inner: Arc::new(Mutex::new(SearchBudgetState { requests: max_requests.min(128), bytes: max_bytes.min(8 * 1024 * 1024), body_reads: max_body_reads.min(40), exhausted: false })), deadline: deadline.min(Instant::now() + Duration::from_secs(10)), cancelled }
+    pub fn new(
+        deadline: Instant,
+        cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+        max_requests: usize,
+        max_bytes: usize,
+        max_body_reads: usize,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(SearchBudgetState {
+                requests: max_requests.min(128),
+                bytes: max_bytes.min(8 * 1024 * 1024),
+                body_reads: max_body_reads.min(40),
+                exhausted: false,
+            })),
+            deadline: deadline.min(Instant::now() + Duration::from_secs(10)),
+            cancelled,
+        }
     }
     pub fn remaining(&self) -> Result<Duration, BudgetSendError> {
-        if (self.cancelled)() { return Err(BudgetSendError::Cancelled); }
-        self.deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()).ok_or(BudgetSendError::Exhausted)
+        if (self.cancelled)() {
+            return Err(BudgetSendError::Cancelled);
+        }
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or(BudgetSendError::Exhausted)
     }
     fn request(&self) -> Result<(), BudgetSendError> {
         self.remaining()?;
         let mut s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if s.requests == 0 { s.exhausted = true; return Err(BudgetSendError::Exhausted); }
+        if s.requests == 0 {
+            s.exhausted = true;
+            return Err(BudgetSendError::Exhausted);
+        }
         s.requests -= 1;
         Ok(())
     }
     fn reserve_bytes(&self, count: usize) -> Result<(), BudgetSendError> {
         self.remaining()?;
         let mut s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if count > s.bytes { s.exhausted = true; return Err(BudgetSendError::Exhausted); }
+        if count > s.bytes {
+            s.exhausted = true;
+            return Err(BudgetSendError::Exhausted);
+        }
         s.bytes -= count;
         Ok(())
     }
@@ -201,12 +255,18 @@ impl SearchBudget {
     /// returned once, only through the associated reservation.
     pub fn reserve_output(&self, count: usize) -> Result<SearchOutputReservation, BudgetSendError> {
         self.reserve_bytes(count)?;
-        Ok(SearchOutputReservation { budget: self.clone(), reserved: count })
+        Ok(SearchOutputReservation {
+            budget: self.clone(),
+            reserved: count,
+        })
     }
     pub fn body_read(&self) -> Result<(), BudgetSendError> {
         self.remaining()?;
         let mut s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if s.body_reads == 0 { s.exhausted = true; return Err(BudgetSendError::Exhausted); }
+        if s.body_reads == 0 {
+            s.exhausted = true;
+            return Err(BudgetSendError::Exhausted);
+        }
         s.body_reads -= 1;
         Ok(())
     }
@@ -215,13 +275,21 @@ impl SearchBudget {
         (s.requests, s.bytes, s.body_reads)
     }
     pub fn was_exhausted(&self) -> bool {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).exhausted
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .exhausted
     }
 }
-pub struct SearchOutputReservation { budget: SearchBudget, reserved: usize }
+pub struct SearchOutputReservation {
+    budget: SearchBudget,
+    reserved: usize,
+}
 impl SearchOutputReservation {
     pub fn finish(self, used: usize) -> Result<(), BudgetSendError> {
-        if used > self.reserved { return Err(BudgetSendError::Exhausted); }
+        if used > self.reserved {
+            return Err(BudgetSendError::Exhausted);
+        }
         let mut state = self.budget.inner.lock().unwrap_or_else(|e| e.into_inner());
         state.bytes += self.reserved - used;
         Ok(())
@@ -230,27 +298,50 @@ impl SearchOutputReservation {
 thread_local! { static SEARCH_BUDGET: std::cell::RefCell<Option<SearchBudget>> = const { std::cell::RefCell::new(None) }; }
 pub fn with_search_budget<T>(budget: &SearchBudget, f: impl FnOnce() -> T) -> T {
     struct Reset(Option<SearchBudget>);
-    impl Drop for Reset { fn drop(&mut self) { SEARCH_BUDGET.with(|b| *b.borrow_mut() = self.0.take()); } }
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SEARCH_BUDGET.with(|b| *b.borrow_mut() = self.0.take());
+        }
+    }
     let old = SEARCH_BUDGET.with(|b| b.borrow_mut().replace(budget.clone()));
     let _reset = Reset(old);
     f()
 }
-fn current_search_budget() -> Option<SearchBudget> { SEARCH_BUDGET.with(|b| b.borrow().clone()) }
+fn current_search_budget() -> Option<SearchBudget> {
+    SEARCH_BUDGET.with(|b| b.borrow().clone())
+}
 pub(crate) fn search_request(request: RequestBuilder) -> Result<RequestBuilder, BudgetSendError> {
     if let Some(budget) = current_search_budget() {
-        let prepared = request.try_clone().ok_or(BudgetSendError::Uncloneable)?.build().map_err(BudgetSendError::Transport)?;
-        let body = match prepared.body() { Some(body) => body.as_bytes().ok_or(BudgetSendError::Uncloneable)?.len(), None => 0 };
+        let prepared = request
+            .try_clone()
+            .ok_or(BudgetSendError::Uncloneable)?
+            .build()
+            .map_err(BudgetSendError::Transport)?;
+        let body = match prepared.body() {
+            Some(body) => body.as_bytes().ok_or(BudgetSendError::Uncloneable)?.len(),
+            None => 0,
+        };
         budget.reserve_bytes(body)?;
         budget.request()?;
         Ok(request.timeout(budget.remaining()?))
-    } else { Ok(request) }
+    } else {
+        Ok(request)
+    }
 }
 pub(crate) fn search_read(reader: &mut impl Read, out: &mut [u8]) -> io::Result<usize> {
     if let Some(budget) = current_search_budget() {
-        budget.remaining().map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "search budget exhausted"))?;
+        budget
+            .remaining()
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "search budget exhausted"))?;
         let len = {
             let mut state = budget.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if state.bytes == 0 && !out.is_empty() { state.exhausted = true; return Err(io::Error::new(io::ErrorKind::Other, "search byte budget exhausted")); }
+            if state.bytes == 0 && !out.is_empty() {
+                state.exhausted = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "search byte budget exhausted",
+                ));
+            }
             let len = out.len().min(state.bytes);
             state.bytes -= len;
             len
@@ -259,9 +350,13 @@ pub(crate) fn search_read(reader: &mut impl Read, out: &mut [u8]) -> io::Result<
         let mut state = budget.inner.lock().unwrap_or_else(|e| e.into_inner());
         state.bytes += len - n;
         drop(state);
-        budget.remaining().map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "search budget exhausted"))?;
+        budget
+            .remaining()
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "search budget exhausted"))?;
         Ok(n)
-    } else { reader.read(out) }
+    } else {
+        reader.read(out)
+    }
 }
 pub trait BudgetedSend {
     fn budgeted_send(self, origin: &Url) -> Result<BudgetResponse, BudgetSendError>;
@@ -270,7 +365,9 @@ pub trait BudgetedSend {
 impl BudgetedSend for RequestBuilder {
     fn budgeted_send(self, origin: &Url) -> Result<BudgetResponse, BudgetSendError> {
         let permit = origin_gate(origin).acquire_search(false)?;
-        let inner = search_request(self)?.send().map_err(BudgetSendError::Transport)?;
+        let inner = search_request(self)?
+            .send()
+            .map_err(BudgetSendError::Transport)?;
         Ok(BudgetResponse {
             inner,
             _permit: permit,
@@ -302,10 +399,23 @@ mod tests {
             let _ = stream.read(&mut buf);
             std::thread::sleep(Duration::from_millis(350));
         });
-        let budget = SearchBudget::new(Instant::now() + Duration::from_millis(100), Arc::new(|| false), 2, 1000, 1);
-        let http = reqwest::blocking::Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().unwrap();
+        let budget = SearchBudget::new(
+            Instant::now() + Duration::from_millis(100),
+            Arc::new(|| false),
+            2,
+            1000,
+            1,
+        );
+        let http = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
         let start = Instant::now();
-        assert!(with_search_budget(&budget, || http.get(origin.clone()).budgeted_send(&origin)).is_err());
+        assert!(
+            with_search_budget(&budget, || http.get(origin.clone()).budgeted_send(&origin))
+                .is_err()
+        );
         assert!(start.elapsed() < Duration::from_millis(300));
         assert_eq!(budget.remaining_limits(), (1, 1000, 1));
         server.join().unwrap();
@@ -315,7 +425,13 @@ mod tests {
     fn search_budget_counts_chunks_and_honors_cancel_before_next_read() {
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let check = cancelled.clone();
-        let budget = SearchBudget::new(Instant::now() + Duration::from_secs(2), Arc::new(move || check.load(std::sync::atomic::Ordering::SeqCst)), 2, 4, 1);
+        let budget = SearchBudget::new(
+            Instant::now() + Duration::from_secs(2),
+            Arc::new(move || check.load(std::sync::atomic::Ordering::SeqCst)),
+            2,
+            4,
+            1,
+        );
         let mut source = &b"abcdef"[..];
         let mut out = [0; 8];
         with_search_budget(&budget, || {
@@ -331,7 +447,13 @@ mod tests {
         let origin = Url::parse("http://127.0.0.1:39219/").unwrap();
         let gate = origin_gate(&origin);
         let permits: Vec<_> = (0..4).map(|_| gate.acquire(false)).collect();
-        let budget = SearchBudget::new(Instant::now() + Duration::from_millis(80), Arc::new(|| false), 1, 100, 1);
+        let budget = SearchBudget::new(
+            Instant::now() + Duration::from_millis(80),
+            Arc::new(|| false),
+            1,
+            100,
+            1,
+        );
         let start = Instant::now();
         assert!(with_search_budget(&budget, || gate.acquire_search(false)).is_err());
         assert!(start.elapsed() < Duration::from_millis(300));
@@ -341,7 +463,13 @@ mod tests {
 
     #[test]
     fn search_budget_caps_cannot_be_increased_by_reservation_return() {
-        let budget = SearchBudget::new(Instant::now() + Duration::from_secs(100), Arc::new(|| false), usize::MAX, usize::MAX, usize::MAX);
+        let budget = SearchBudget::new(
+            Instant::now() + Duration::from_secs(100),
+            Arc::new(|| false),
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+        );
         assert_eq!(budget.remaining_limits(), (128, 8 * 1024 * 1024, 40));
         let reservation = budget.reserve_output(100).unwrap();
         assert_eq!(budget.remaining_limits().1, 8 * 1024 * 1024 - 100);
@@ -354,8 +482,20 @@ mod tests {
 
     #[test]
     fn nested_search_budget_restores_outer_context_after_panic() {
-        let outer = SearchBudget::new(Instant::now() + Duration::from_secs(2), Arc::new(|| false), 2, 1000, 1);
-        let inner = SearchBudget::new(Instant::now() + Duration::from_secs(2), Arc::new(|| false), 1, 1000, 1);
+        let outer = SearchBudget::new(
+            Instant::now() + Duration::from_secs(2),
+            Arc::new(|| false),
+            2,
+            1000,
+            1,
+        );
+        let inner = SearchBudget::new(
+            Instant::now() + Duration::from_secs(2),
+            Arc::new(|| false),
+            1,
+            1000,
+            1,
+        );
         let client = reqwest::blocking::Client::new();
         with_search_budget(&outer, || {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

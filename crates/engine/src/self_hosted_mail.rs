@@ -206,23 +206,59 @@ pub fn live_mail_metadata_search_page(
     limit: usize,
     expected_query_state: Option<&str>,
 ) -> Result<LiveMailPage, String> {
-    live_mail_metadata_search_with_client(cfg, account, native_account, mailbox_id, text, position, limit, expected_query_state, || client(cfg, account), || client(cfg, account))
+    live_mail_metadata_search_with_client(
+        cfg,
+        account,
+        native_account,
+        mailbox_id,
+        text,
+        position,
+        limit,
+        expected_query_state,
+        || client(cfg, account),
+        || client(cfg, account),
+    )
 }
 
 /// Search using an already verified, short-lived provider token. The caller
 /// owns its binding and must not persist or expose it.
 #[allow(clippy::too_many_arguments)]
 pub fn live_mail_metadata_search_with_token(
-    cfg: &Config, account: &str, token: &str, native_account: Option<&str>, mailbox_id: Option<&str>,
-    text: Option<&str>, position: usize, limit: usize, expected_query_state: Option<&str>,
+    cfg: &Config,
+    account: &str,
+    token: &str,
+    native_account: Option<&str>,
+    mailbox_id: Option<&str>,
+    text: Option<&str>,
+    position: usize,
+    limit: usize,
+    expected_query_state: Option<&str>,
 ) -> Result<LiveMailPage, String> {
-    live_mail_metadata_search_with_client(cfg, account, native_account, mailbox_id, text, position, limit, expected_query_state, || client_with_token(cfg, account, token), || client_with_token(cfg, account, token))
+    live_mail_metadata_search_with_client(
+        cfg,
+        account,
+        native_account,
+        mailbox_id,
+        text,
+        position,
+        limit,
+        expected_query_state,
+        || client_with_token(cfg, account, token),
+        || client_with_token(cfg, account, token),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn live_mail_metadata_search_with_client(
-    cfg: &Config, account: &str, native_account: Option<&str>, mailbox_id: Option<&str>, text: Option<&str>,
-    position: usize, limit: usize, expected_query_state: Option<&str>, open_client: impl FnOnce() -> Result<SelfHostedClient, String>,
+    cfg: &Config,
+    account: &str,
+    native_account: Option<&str>,
+    mailbox_id: Option<&str>,
+    text: Option<&str>,
+    position: usize,
+    limit: usize,
+    expected_query_state: Option<&str>,
+    open_client: impl FnOnce() -> Result<SelfHostedClient, String>,
     fresh_client: impl FnOnce() -> Result<SelfHostedClient, String>,
 ) -> Result<LiveMailPage, String> {
     if limit == 0
@@ -481,7 +517,11 @@ pub fn client(cfg: &Config, account: &str) -> Result<SelfHostedClient, String> {
 }
 
 /// Open from an already bound in-memory grant; no credential refresh occurs.
-pub fn client_with_token(cfg: &Config, account: &str, token: &str) -> Result<SelfHostedClient, String> {
+pub fn client_with_token(
+    cfg: &Config,
+    account: &str,
+    token: &str,
+) -> Result<SelfHostedClient, String> {
     let origin = match cfg.provider_accounts.get(account) {
         Some(ProviderConfig::SelfHosted { origin, .. }) => origin,
         None => return Err("Not a self-hosted account".into()),
@@ -489,10 +529,17 @@ pub fn client_with_token(cfg: &Config, account: &str, token: &str) -> Result<Sel
     #[cfg(test)]
     let client = if SEARCH_LOOPBACK_FIXTURE.with(|flag| flag.get()) {
         JmapClient::test_loopback(origin)
-    } else { JmapClient::discover(origin, token.to_owned()) }.map_err(discovery_failure)?;
+    } else {
+        JmapClient::discover(origin, token.to_owned())
+    }
+    .map_err(discovery_failure)?;
     #[cfg(not(test))]
     let client = JmapClient::discover(origin, token.to_owned()).map_err(discovery_failure)?;
-    Ok(SelfHostedClient { client, account: account.into(), origin: origin.clone() })
+    Ok(SelfHostedClient {
+        client,
+        account: account.into(),
+        origin: origin.clone(),
+    })
 }
 
 #[cfg(test)]
