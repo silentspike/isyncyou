@@ -468,11 +468,21 @@ pub fn backup_onenote_resources_excluding<F: BytesFetcher>(
         store,
         account,
         archive_root,
-        limit,
-        excluded,
-        None,
-        false,
+        OneNoteResourceOptions {
+            limit,
+            excluded,
+            after: None,
+            bounded: false,
+        },
     )
+}
+
+/// Bounds and continuation state for a OneNote resource archive pass.
+pub struct OneNoteResourceOptions<'a> {
+    pub limit: usize,
+    pub excluded: &'a HashSet<(String, String)>,
+    pub after: Option<(&'a str, &'a str)>,
+    pub bounded: bool,
 }
 
 pub fn backup_onenote_resources_after<F: BytesFetcher>(
@@ -480,11 +490,14 @@ pub fn backup_onenote_resources_after<F: BytesFetcher>(
     store: &Store,
     account: &str,
     archive_root: &Path,
-    limit: usize,
-    excluded: &HashSet<(String, String)>,
-    after: Option<(&str, &str)>,
-    bounded: bool,
+    options: OneNoteResourceOptions<'_>,
 ) -> Result<OneNoteResourceReport, SyncError> {
+    let OneNoteResourceOptions {
+        limit,
+        excluded,
+        after,
+        bounded,
+    } = options;
     let mut report = OneNoteResourceReport::default();
     for page in store.items_by_type(account, "onenote", "page")? {
         let Some(local_path) = page.local_path.as_deref() else {

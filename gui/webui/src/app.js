@@ -2005,13 +2005,15 @@ async function renderMailView(view) {
   }
   const liveRequest = providerMail ? api("/api/v1/items?" + qs({account,service:"mail",live_metadata:"1",limit:50,...(scope ? {mail_scope:scope} : {})})).catch(() => null) : null;
   const initialPageRequest = Mail.pageRequest;
+  let sharedLiveFailed = false;
   const applyLive = page => {
-    if (!current() || Mail.pageRequest !== initialPageRequest || Mail.selected) return false;
+    if (!current() || Mail.pageRequest !== initialPageRequest) return false;
     if (!page || !Array.isArray(page.items) || typeof page.query_state !== "string" || !page.query_state) {
-      if (scope) { Mail.all = []; Mail.folders = []; Mail.selected = null; renderMailReader(null); mailRender(); }
+      if (scope) { sharedLiveFailed = true; Mail.all = []; Mail.folders = []; Mail.selected = null; Mail.pendingSelect = null; renderMailReader(null); mailRender(); }
       const label = $("#mail-cache-provenance"); if (label) label.textContent = scope ? "Shared mail access could not be verified" : "Cached messages · newest order not verified";
       return false;
     }
+    if (Mail.selected) return false;
     Mail.all = projectLiveMail(page.items, scope); Mail.livePage = true; Mail.queryState = page.query_state;
     Mail.nextCursor = page.next_position ?? null; Mail.pageCursor = 0; Mail.cursorStack = [];
     if (!scope && Number.isSafeInteger(page.total) && page.total >= 0) { App.counts.mail = page.total; updateNavCounts(); }
@@ -2026,6 +2028,8 @@ async function renderMailView(view) {
     const url = "/api/v1/items?" + qs({ account, service: "mail", limit: providerMail ? 50 : 1000, ...(scope ? {mail_scope:scope} : {}), ...(primaryCacheOnly ? {primary_cache_only:"1"} : {}), ...(!providerMail ? {metadata_only:"1"} : {}) });
     const d = await (snapshotEligible ? fetchMailSnapshot(account, url) : api(url));
     if (!current() || Mail.pageRequest !== initialPageRequest || MailSnapshot.epoch !== snapshotEpoch) return;
+    // A later cache response must not restore shared rows after live access failed.
+    if (scope && sharedLiveFailed) return;
     if (snapshotEligible && accountRoleStatus((App.accounts || []).find(a => a.id === account), "reader").state === "connected") rememberMailSnapshot(account, d);
     const search = $("#mail-search"); if (search) { search.disabled = false; search.placeholder = providerMail ? "Filter this page…" : "Search this mailbox…"; }
     for (const id of ["#mail-page-prev", "#mail-load-more"]) { const button = $(id); if (button) button.disabled = false; }
@@ -3853,10 +3857,10 @@ function openSingleCaptureStatus(account) {
   for (const operation_id of captureOperations(account)) {
     const status=el("span",{class:"dim",text:"Not checked"});
     rows.append(el("div",{class:"pick-row"},el("span",{class:"grow",text:operation_id}),status,el("button",{class:"btn sm",type:"button",onclick:async event=>{
-      event.currentTarget.disabled=true;
-      try {const session_id=await ensureAgentSession();if(App.account!==account) throw new Error("account changed");const result=await request("GET","/api/v1/agent/recovery/capture/status?"+qs({account,session_id,operation_id}),{capToken:CAP.agent,timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS});const labels={queued:"Queued",capturing:"Capturing",captured_locally:"Captured locally",awaiting_pbs:"Awaiting off-node backup",protected_off_node:"Protected off-node",failed:"Capture failed; the selected version was unavailable or changed",unknown:"Outcome unknown; do not repeat",expired:"Expired before capture"};status.textContent=labels[result.state] || "Status unavailable";}
+      const button=event.currentTarget; button.disabled=true;
+      try {const session_id=await ensureAgentSession();if(App.account!==account) throw new Error("account changed");const result=await request("GET","/api/v1/agent/recovery/capture/status?"+qs({account,session_id,operation_id}),{capToken:CAP.agent,timeoutMs:PROVIDER_NATIVE_TIMEOUT_MS});const labels={queued:"Queued",capturing:"Capturing",captured_locally:"Captured locally",awaiting_pbs:"Awaiting off-node backup",protected_off_node:"Protected off-node",protection_expired:"Previously backed up; this version is no longer protected or available for restore",failed:"Capture failed; the selected version was unavailable or changed",unknown:"Outcome unknown; do not repeat",expired:"Expired before capture"};status.textContent=labels[result.state] || "Status unavailable";}
       catch (_) {status.textContent="Status unavailable; no retry was sent";}
-      finally {event.currentTarget.disabled=false;}
+      finally {button.disabled=false;}
     }},"Check")));
   }
   openSheet("Backup capture status",rows.childElementCount ? rows : el("p",{text:"No locally recorded capture requests."}));

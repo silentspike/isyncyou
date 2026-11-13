@@ -14315,17 +14315,8 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                             .get("state")
                             .and_then(serde_json::Value::as_str)
                             .filter(|s| {
-                                matches!(
-                                    *s,
-                                    "unknown"
-                                        | "queued"
-                                        | "capturing"
-                                        | "captured_locally"
-                                        | "awaiting_pbs"
-                                        | "protected_off_node"
-                                        | "expired"
-                                        | "failed"
-                                )
+                                *s == "unknown"
+                                    || isyncyou_engine::self_hosted_mail_restore::is_broker_capture_state(s)
                             });
                         let id = status
                             .get("id")

@@ -994,7 +994,7 @@ pub(crate) fn with_locked_provider_identity<T>(
 }
 
 #[cfg(not(target_os = "android"))]
-fn load_keyring(path: &std::path::Path) -> Result<TokenCache, String> {
+fn load_keyring(path: &std::path::Path) -> Result<Option<TokenCache>, String> {
     let marker: Value =
         serde_json::from_slice(&std::fs::read(path).map_err(|_| "Provider login required")?)
             .map_err(|_| "Invalid credential marker")?;
@@ -1004,7 +1004,11 @@ fn load_keyring(path: &std::path::Path) -> Result<TokenCache, String> {
     {
         return Err("System keyring required".into());
     }
-    TokenCache::load(path).map_err(|_| "System keyring unavailable".into())
+    match TokenCache::load(path) {
+        Ok(token) => Ok(Some(token)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("System keyring unavailable".into()),
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -1132,7 +1136,16 @@ impl ProviderCredentialStore for DesktopCredentialStore {
         if !path.exists() {
             return Ok(None);
         }
-        let token = load_keyring(&path)?;
+        let Some(token) = load_keyring(&path)? else {
+            // A missing account secret can be the interrupted cleanup of a
+            // confirmed revocation. A missing internal marker is ambiguous and
+            // must continue to fail closed.
+            return if account == self.account {
+                Ok(None)
+            } else {
+                Err("System keyring unavailable".into())
+            };
+        };
         Ok(Some(ProviderCredential {
             access_token: token.access_token,
             refresh_token: token.refresh_token,
@@ -1170,7 +1183,7 @@ impl ProviderCredentialStore for DesktopCredentialStore {
     }
     fn delete(&self, account: &str, origin: &str) -> Result<(), String> {
         let path = self.path_for(account, origin)?;
-        delete_desktop_credential(&path)?;
+        delete_desktop_credential(&path, account == revocation_pending_key(&self.account))?;
         if account == revocation_pending_key(&self.account) {
             let parent = path
                 .parent()
@@ -1184,20 +1197,40 @@ impl ProviderCredentialStore for DesktopCredentialStore {
 }
 
 #[cfg(all(feature = "desktop-keyring", not(target_os = "android")))]
-fn delete_desktop_credential(path: &std::path::Path) -> Result<(), String> {
+fn delete_desktop_credential(path: &std::path::Path, marker: bool) -> Result<(), String> {
     let entry = keyring_core::Entry::new(
         "org.silentspike.isyncyou.token-cache",
         &path.to_string_lossy(),
     )
     .map_err(|_| "System keyring unavailable")?;
-    entry
-        .delete_credential()
-        .map_err(|_| "Grant revoked but local keyring cleanup failed")?;
-    std::fs::remove_file(path).map_err(|_| "Grant revoked but local marker cleanup failed")?;
+    // A revocation marker is deleted only after the grant and its credential
+    // are gone. Removing its file first avoids an unreadable marker after a
+    // crash between keyring and file removal; any orphaned keyring entry holds
+    // only the already-completed marker, not the grant.
+    if marker {
+        std::fs::remove_file(path).map_err(|_| "Grant revoked but local marker cleanup failed")?;
+        let parent = path
+            .parent()
+            .ok_or("Revocation marker directory unavailable")?;
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| "Revocation marker durability unavailable")?;
+    }
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring_core::Error::NoEntry) => {}
+        Err(_) => return Err("Grant revoked but local keyring cleanup failed".into()),
+    }
+    if !marker {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("Grant revoked but local marker cleanup failed".into()),
+        }
+    }
     Ok(())
 }
 #[cfg(all(not(feature = "desktop-keyring"), not(target_os = "android")))]
-fn delete_desktop_credential(_path: &std::path::Path) -> Result<(), String> {
+fn delete_desktop_credential(_path: &std::path::Path, _marker: bool) -> Result<(), String> {
     Err("System keyring unavailable".into())
 }
 

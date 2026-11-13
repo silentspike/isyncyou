@@ -1696,24 +1696,36 @@ pub fn read_single_capture_status_with_store(
             .map_err(|_| "Capture status unavailable")?;
         let value: Value = serde_json::from_slice(&RecoveryBroker::bounded(response, 16384)?)
             .map_err(|_| "Invalid capture status")?;
-        if value.get("id").and_then(Value::as_str) != Some(id.as_str())
-            || !value.get("state").and_then(Value::as_str).is_some_and(|x| {
-                matches!(
-                    x,
-                    "queued"
-                        | "capturing"
-                        | "captured_locally"
-                        | "awaiting_pbs"
-                        | "protected_off_node"
-                        | "expired"
-                        | "failed"
-                )
-            })
-        {
-            return Err("Invalid capture status".into());
-        }
-        Ok(value)
+        validate_single_capture_status(value, &id)
     })
+}
+
+fn validate_single_capture_status(value: Value, id: &str) -> Result<Value, String> {
+    if value.get("id").and_then(Value::as_str) != Some(id)
+        || !value
+            .get("state")
+            .and_then(Value::as_str)
+            .is_some_and(is_broker_capture_state)
+    {
+        return Err("Invalid capture status".into());
+    }
+    Ok(value)
+}
+
+/// States returned by the recovery broker. Expired protection records a
+/// historical capture whose exact off-node binding is no longer available.
+pub fn is_broker_capture_state(state: &str) -> bool {
+    matches!(
+        state,
+        "queued"
+            | "capturing"
+            | "captured_locally"
+            | "awaiting_pbs"
+            | "protected_off_node"
+            | "protection_expired"
+            | "expired"
+            | "failed"
+    )
 }
 
 /// Persist this exact discovery and operation identity in the encrypted host
@@ -4080,6 +4092,21 @@ fn execute_inner(
 mod tests {
     use super::*;
     use std::cell::Cell;
+    #[test]
+    fn capture_status_preserves_expired_protection_and_checks_identity() {
+        let status =
+            json!({"id":"capture", "state":"protection_expired", "generation":"historical"});
+        assert_eq!(
+            validate_single_capture_status(status.clone(), "capture").unwrap(),
+            status
+        );
+        assert!(validate_single_capture_status(status, "different").is_err());
+        assert!(validate_single_capture_status(
+            json!({"id":"capture", "state":"future"}),
+            "capture"
+        )
+        .is_err());
+    }
     #[test]
     fn capture_subject_is_checked_inside_token_lock_before_effects() {
         use crate::provider_credential::ProviderCredential;

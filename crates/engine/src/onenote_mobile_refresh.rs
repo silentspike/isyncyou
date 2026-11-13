@@ -343,10 +343,12 @@ pub fn refresh(
                 &store,
                 account,
                 &guard.account.archive_root,
-                1,
-                &deferred_resources,
-                None,
-                true,
+                archive::OneNoteResourceOptions {
+                    limit: 1,
+                    excluded: &deferred_resources,
+                    after: None,
+                    bounded: true,
+                },
             )
             .map_err(|_| "OneNote manifest commit failed")?;
             break;
@@ -400,10 +402,12 @@ pub fn refresh(
             &store,
             account,
             &guard.account.archive_root,
-            1,
-            &deferred_resources,
-            after,
-            true,
+            archive::OneNoteResourceOptions {
+                limit: 1,
+                excluded: &deferred_resources,
+                after,
+                bounded: true,
+            },
         )
         .map_err(|_| "OneNote resource commit failed")?;
         changed |= report.resources > 0;

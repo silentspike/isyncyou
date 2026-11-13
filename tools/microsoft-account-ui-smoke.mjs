@@ -268,6 +268,68 @@ async function main() {
     assert(report, "metadata snapshots are bounded, expire, omit bodies and deduplicate in-flight requests",
       snapshot.bounded && snapshot.oversizeCleared && snapshot.expired && snapshot.deduplicated && snapshot.staleSafe && snapshot.noBody, snapshot);
 
+    const sharedFailure = await page.evaluate(async () => {
+      const originalApi = api;
+      App.accounts = [{ id: "fixture", provider: "self_hosted" }]; App.account = "fixture";
+      let releaseCache;
+      api = async url => {
+        if (url.includes("service=mail") && url.includes("live_metadata=1")) throw new Error("access unavailable");
+        if (url.includes("service=mail")) return new Promise(resolve => { releaseCache = resolve; });
+        return { items: [], runs: [] };
+      };
+      try {
+        go("overview"); Mail.scopeAccount = "fixture"; Mail.activeScope = "shared-fixture"; go("mail");
+        for (let i = 0; i < 100 && !releaseCache; i++) await new Promise(resolve => setTimeout(resolve, 20));
+        await new Promise(resolve => setTimeout(resolve, 20));
+        releaseCache({ items: [{ item_type: "message", remote_id: "shared", name: "shared sentinel" }] });
+        await new Promise(resolve => setTimeout(resolve, 50));
+        const delayedCache = { rows: Mail.all.length, label: document.querySelector("#mail-cache-provenance")?.textContent };
+        let rejectLive;
+        api = async url => {
+          if (url.includes("service=mail") && url.includes("live_metadata=1")) return new Promise((_, reject) => { rejectLive = reject; });
+          if (url.includes("service=mail")) return { items: [{ item_type: "message", remote_id: "shared", name: "shared sentinel" }] };
+          return { items: [], runs: [] };
+        };
+        go("overview"); go("mail");
+        for (let i = 0; i < 100 && (!rejectLive || !Mail.all.length); i++) await new Promise(resolve => setTimeout(resolve, 20));
+        Mail.selected = Mail.all[0];
+        rejectLive(new Error("access unavailable"));
+        await new Promise(resolve => setTimeout(resolve, 50));
+        return { delayedCache, selected: Mail.selected, rows: Mail.all.length, label: document.querySelector("#mail-cache-provenance")?.textContent };
+      } finally { api = originalApi; Mail.activeScope = ""; }
+    });
+    assert(report, "failed shared live access cannot be overwritten by a delayed cache response",
+      sharedFailure.delayedCache.rows === 0 && sharedFailure.delayedCache.label === "Shared mail access could not be verified"
+      && sharedFailure.rows === 0 && sharedFailure.selected === null && sharedFailure.label === "Shared mail access could not be verified", sharedFailure);
+
+    const captureStatus = await page.evaluate(async () => {
+      const originalRequest = request, originalSession = ensureAgentSession;
+      const key = "capture-operations:fixture", previous = localStorage.getItem(key);
+      let state = "protection_expired";
+      App.account = "fixture"; localStorage.setItem(key, JSON.stringify(["fixture-capture"]));
+      request = async () => ({ state, generation: "historical-generation" });
+      ensureAgentSession = async () => "fixture-session";
+      try {
+        openSingleCaptureStatus("fixture");
+        const row = [...document.querySelectorAll(".pick-row")].find(item => item.textContent.includes("fixture-capture"));
+        const button = row.querySelector("button");
+        button.click(); await new Promise(resolve => setTimeout(resolve, 20));
+        const expired = row.textContent;
+        state = "protected_off_node"; button.click(); await new Promise(resolve => setTimeout(resolve, 20));
+        const protectedText = row.textContent;
+        state = "expired"; button.click(); await new Promise(resolve => setTimeout(resolve, 20));
+        return { expired, protectedText, expiredBeforeCapture: row.textContent };
+      } finally {
+        request = originalRequest; ensureAgentSession = originalSession;
+        if (previous === null) localStorage.removeItem(key); else localStorage.setItem(key, previous);
+        closeSheet();
+      }
+    });
+    assert(report, "expired protection remains distinct from current protection and capture expiry",
+      captureStatus.expired.includes("Previously backed up; this version is no longer protected or available for restore")
+      && captureStatus.protectedText.includes("Protected off-node")
+      && captureStatus.expiredBeforeCapture.includes("Expired before capture"), captureStatus);
+
     const containment = await page.evaluate(async () => {
       if (!CSS.supports("content-visibility", "auto")) return { supported: false };
       App.accounts = [{ id: "fixture", provider: "microsoft", auth: { reader: { state: "connected" } } }]; App.account = "fixture";
