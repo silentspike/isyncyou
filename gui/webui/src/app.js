@@ -136,7 +136,7 @@ function rng(seed) { let s = seed >>> 0; return () => { s = s + 0x6D2B79F5 | 0; 
 // layers whose canvas left the DOM (e.g. a closed sheet).
 const Net = (() => {
   const layers = new Set();
-  let raf = 0, last = 0, workSuppressed = false;
+  let raf = 0, last = 0, workSuppressed = false, priorityUntil = 0;
   const reduce = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
   const TWO_PI = Math.PI * 2;
   // Frame throttle: the constellation drifts slowly, so 60 fps is wasted work — every redraw
@@ -186,7 +186,7 @@ const Net = (() => {
     const elapsed = now - last;
     if (document.hidden) {
       last = now;                                   // don't bank a huge dt while hidden
-    } else if (!workSuppressed && elapsed >= FRAME_MS) { // preserve the main thread for active work
+    } else if (!workSuppressed && now >= priorityUntil && elapsed >= FRAME_MS) { // preserve the main thread for active work
       const dt = Math.min(4, elapsed / 16.67); last = now;
       for (const layer of layers) {
         if (!layer.canvas.isConnected) { layers.delete(layer); continue; }   // self-heal
@@ -216,7 +216,10 @@ const Net = (() => {
     workSuppressed = value === true;
     if (!workSuppressed) last = 0;
   };
-  return { register, resize, reduce, setWorkSuppressed, _layers: layers };
+  // A brief navigation priority window composes with the separate assistant
+  // suppression flag and expires even if a request or view is abandoned.
+  const deferAnimation = (ms) => { priorityUntil = Math.max(priorityUntil, performance.now() + ms); };
+  return { register, resize, reduce, setWorkSuppressed, deferAnimation, _layers: layers };
 })();
 let _bgLayer = null;
 function paintBackdrop() {
@@ -1590,10 +1593,12 @@ function onRoute() {
   // Overlap the primary self-hosted cache read with the shell rebuild. A
   // different account or a shared scope is never eligible for this prefetch.
   const account = App.account;
-  const primeMail = App.route === "mail"
+  const primaryProviderMail = App.route === "mail"
     && (Mail.scopeAccount !== account || !Mail.activeScope)
-    && (App.accounts || []).some(a => a.id === account && a.provider === "self_hosted")
-    ? { account, request: startPrimaryMailCache(account) } : null;
+    && (App.accounts || []).some(a => a.id === account && a.provider === "self_hosted");
+  // Yield the decorative canvas briefly while navigation builds the mail view.
+  if (primaryProviderMail) Net.deferAnimation(250);
+  const primeMail = primaryProviderMail ? { account, request: startPrimaryMailCache(account) } : null;
   renderShell();
   const view = $("#view");
   let p;
