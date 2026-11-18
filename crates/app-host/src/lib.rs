@@ -23093,6 +23093,16 @@ impl isyncyou_webui::MutationIntentHandler for DaemonMutationIntents {
                     } else {
                         self.mail.provider_create_draft(&account, intent_id, &subject, body, &recipients, &cc, &bcc, importance.as_deref(), read_receipt, identity_id.as_deref(), None)
                     }
+                } else if operation == "draft"
+                    && cc.is_empty()
+                    && bcc.is_empty()
+                    && importance.is_none()
+                    && !read_receipt
+                    && identity_id.is_none()
+                {
+                    self.mail
+                        .create_draft(&account, &subject, body, &recipients)
+                        .map(|draft_id| serde_json::json!({ "ok": true, "draft_id": draft_id }))
                 } else { match operation.as_str() {
                     "send" => self.mail.send(
                         &account,
@@ -23106,10 +23116,6 @@ impl isyncyou_webui::MutationIntentHandler for DaemonMutationIntents {
                     ),
                     "reply" => self.mail.reply_html(&account, &target, body, all),
                     "forward" => self.mail.forward_html(&account, &target, body, &recipients),
-                    "draft" if cc.is_empty() && bcc.is_empty() && importance.is_none() && !read_receipt && identity_id.is_none() => self
-                        .mail
-                        .create_draft(&account, &subject, body, &recipients)
-                        .map(|_| ()),
                     _ => Err("mutation_intent_invalid".into()),
                 }
                 .map(|()| serde_json::json!({ "ok": true })) }
