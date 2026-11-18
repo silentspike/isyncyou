@@ -1429,7 +1429,7 @@ function shellIdentity() {
     visibleServices().map(s => [s.id, App.counts[s.id] ?? null]), MOBILE, eggOn()]);
 }
 const PROVIDER_DESKTOP_ROUTES = new Set(["overview", "mail", "calendar", "todo"]);
-function reuseProviderRouteShell(previousRoute) {
+function reuseProviderRouteShell(previousRoute, overviewReads) {
   const primaryMailTransition = (previousRoute === "overview" && App.route === "mail") ||
         (previousRoute === "mail" && App.route === "overview");
   const desktopTransition = !MOBILE && previousRoute !== App.route &&
@@ -1460,11 +1460,11 @@ function reuseProviderRouteShell(previousRoute) {
   const scheduledGeneration = ++syncWidgetGeneration;
   const box = $("#sync-widget"), account = App.account;
   requestAnimationFrame(() => {
-    if (syncWidgetGeneration === scheduledGeneration && box?.isConnected && $("#sync-widget") === box && App.account === account) void renderSyncWidget();
+    if (syncWidgetGeneration === scheduledGeneration && box?.isConnected && $("#sync-widget") === box && App.account === account) void renderSyncWidget(overviewReads);
   });
   return true;
 }
-function renderShell() {
+function renderShell(overviewReads = null) {
   const acc = App.accounts.find(a => a.id === App.account) || {};
   const accountLabel = accountDisplayLabel(acc);
   const mobileAccountLabel = accountSelectionLabel(acc);
@@ -1541,24 +1541,25 @@ function renderShell() {
   const app = clear($("#app"));
   app.append(sidebar, main, renderMobileNavigation());
   renderedShellIdentity = shellIdentity();
-  renderSyncWidget();
+  renderSyncWidget(overviewReads);
 }
 
 // Sidebar "System health" card: real health, activity sparkline, last-sync,
 // sync controls — and it back-fills ALL per-service nav counts up-front + the
 // Alerts badge. Every value is real (from /sync/state, /activity, /status).
-async function renderSyncWidget() {
+async function renderSyncWidget(overviewReads = null) {
   const box = $("#sync-widget"); if (!box) return;
   if (!box.getClientRects().length) return;
   const account = App.account, generation = ++syncWidgetGeneration;
+  const shared = overviewReads?.account === account ? overviewReads : null;
   const current = () => box.isConnected && $("#sync-widget") === box && App.account === account && syncWidgetGeneration === generation;
   let st = { enabled: false, paused: false }, runs = [], status = null, activityKnown = false;
-  try { st = await api("/api/v1/sync/state"); } catch {}
+  try { st = await (shared?.sync ?? api("/api/v1/sync/state")); } catch {}
   if (!current()) return;
   if (account) {
     try { const activity = await api("/api/v1/activity?" + qs({ account, limit: 60 })); if (Array.isArray(activity.runs)) { runs = activity.runs; activityKnown = true; } } catch {}
     if (!current()) return;
-    try { status = await api("/api/v1/status?" + qs({ account })); } catch {}
+    try { status = await (shared?.status ?? api("/api/v1/status?" + qs({ account }))); } catch {}
   }
   if (!current()) return;
   // back-fill every service's nav count so the sidebar shows them without
@@ -1645,10 +1646,16 @@ function onRoute() {
   // Yield the decorative canvas briefly while navigation builds the mail view.
   if (primaryProviderMail) Net.deferAnimation(250);
   const primeMail = primaryProviderMail ? { account, request: startPrimaryMailCache(account) } : null;
-  if (!reuseProviderRouteShell(prevRoute)) renderShell();
+  // These reads have identical request semantics in the dashboard and sidebar.
+  // Share only within this desktop navigation, never across account switches.
+  const overviewReads = !MOBILE && account && App.route === "overview"
+    && !Mail.activeScope && (App.accounts || []).some(a => a.id === account && a.provider === "self_hosted")
+    ? { account, status: api("/api/v1/status?" + qs({ account })), sync: api("/api/v1/sync/state") }
+    : null;
+  if (!reuseProviderRouteShell(prevRoute, overviewReads)) renderShell(overviewReads);
   const view = $("#view");
   let p;
-  if (App.route === "overview") p = renderOverview(view);
+  if (App.route === "overview") p = renderOverview(view, overviewReads);
   else if (App.route === "mail") p = renderMailView(view, primeMail);
   else if (App.route === "onedrive") p = renderOnedriveView(view);
   else if (App.route === "calendar") p = renderCalendarView(view);
@@ -1675,7 +1682,7 @@ const SVC_COLOR = {
 // canonical service display names (consistent everywhere — no "Onedrive"/"Todo")
 const SVC_LABEL = { overview: "Overview", mail: "Mail", onedrive: "OneDrive", calendar: "Calendar", contacts: "Contacts", todo: "To Do", onenote: "OneNote" };
 const svcLabel = (id) => SVC_LABEL[id] || id;
-async function renderOverview(view) {
+async function renderOverview(view, overviewReads = null) {
   clear(view).append(
     el("h1", { class: "view-title", text: MOBILE ? "Microsoft 365 on this device" : "Microsoft 365 archive overview" }),
     el("p", { class: "view-sub", text: MOBILE ? "Your live view, cached on this device. Backups live on your computer." : "Backup health, activity and connected services at a glance." }),
@@ -1683,11 +1690,12 @@ async function renderOverview(view) {
   );
   const body = $("#ov-body");
   const account = App.account;
+  const shared = overviewReads?.account === account ? overviewReads : null;
   const current = () => view.isConnected && view.contains(body) && App.account === account;
   body.append(el("div", { class: "card", style: "height:64px" }, el("div", { class: "skel", style: "height:24px;width:40%" })));
   if (!App.account) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "No account configured" }))); return; }
   try {
-    const status = api("/api/v1/status?" + qs({ account }));
+    const status = shared?.status ?? api("/api/v1/status?" + qs({ account }));
     void status.then(st => {
       if (!current()) return;
       clear(body).append(el("div", { class:"card panel" },
@@ -1698,7 +1706,7 @@ async function renderOverview(view) {
       status,
       api("/api/v1/activity?" + qs({ account, limit: 200 })).catch(() => null),
       api("/api/v1/settings").catch(() => ({})),
-      api("/api/v1/sync/state").catch(() => ({})),
+      (shared?.sync ?? api("/api/v1/sync/state")).catch(() => ({})),
     ]);
     if (!current()) return;
     const services = (st.services || []).slice().sort((a, b) => b.items - a.items);
