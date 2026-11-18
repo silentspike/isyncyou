@@ -688,7 +688,7 @@ fn sync_loop(
                 Err(e) => eprintln!("isyncyoud: sync {} skipped: {e}", acc.id),
             }
             if current.provider_accounts.contains_key(&acc.id)
-                && sync_provider_dav(&current, &acc.id).is_err()
+                && !sync_provider_dav(&current, &acc.id).is_ok_and(|result| result.failed == 0)
             {
                 eprintln!("isyncyoud: provider DAV synchronization incomplete");
             }
@@ -922,6 +922,7 @@ fn provider_domain_worker(
 ) {
     let ProviderDomain { dirty, mail } = domain;
     let mut last: Option<std::time::Instant> = None;
+    let mut dav_started: Option<std::time::Instant> = None;
     let mut retry_secs = 5u64;
     while !stop.load(Ordering::Relaxed) {
         let mut flags = dirty.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -938,7 +939,10 @@ fn provider_domain_worker(
             continue;
         }
         if is_dirty {
-            if let Some(delay) = last
+            // Bound start frequency for DAV without adding a full cooldown
+            // after a long pass when newer hints are already waiting.
+            let debounce_at = if mail { last } else { dav_started };
+            if let Some(delay) = debounce_at
                 .map(|time| Duration::from_secs(1).saturating_sub(time.elapsed()))
                 .filter(|delay| !delay.is_zero())
             {
@@ -965,7 +969,18 @@ fn provider_domain_worker(
         let ok = if mail {
             sync_account(&cfg, &identity.account, &gate, &local_host()).is_ok()
         } else {
-            sync_provider_dav(&cfg, &identity.account).is_ok()
+            dav_started = Some(std::time::Instant::now());
+            match sync_provider_dav(&cfg, &identity.account) {
+                Ok(result) => {
+                    if result.failed != 0 {
+                        // A partial pass can commit objects and access loss.
+                        // Invalidate cached views before retrying failures.
+                        events.notify();
+                    }
+                    result.failed == 0
+                }
+                Err(_) => false,
+            }
         };
         last = Some(std::time::Instant::now());
         if ok {
@@ -994,13 +1009,11 @@ fn provider_domain_worker(
     }
 }
 
-fn sync_provider_dav(cfg: &Config, account: &str) -> Result<(), ()> {
-    let result =
-        isyncyou_engine::dav_live::sync_all(cfg, account, "/.well-known/caldav").map_err(|_| ())?;
-    if result.failed != 0 {
-        return Err(());
-    }
-    Ok(())
+fn sync_provider_dav(
+    cfg: &Config,
+    account: &str,
+) -> Result<isyncyou_engine::dav_live::SyncPass, ()> {
+    isyncyou_engine::dav_live::sync_all(cfg, account, "/.well-known/caldav").map_err(|_| ())
 }
 
 /// Event-driven accelerator (#331): one change-source watcher thread per account.
