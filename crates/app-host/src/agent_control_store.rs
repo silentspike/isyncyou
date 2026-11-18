@@ -1540,6 +1540,52 @@ impl AgentControlStore {
         }
     }
 
+    /// Read the closed projection only for its original owner and installation.
+    /// A busy store is unavailable, never evidence of a completed effect.
+    pub(crate) fn confirmation_status(
+        &self,
+        pending_id: &str,
+        owner: &isyncyou_webui::AgentPendingOwnerProof,
+        now_ms: u64,
+    ) -> Result<Option<&'static str>, String> {
+        let connection = self
+            .connection
+            .try_lock()
+            .map_err(|_| "confirmation_status_unavailable")?;
+        let code: Option<String> = connection
+            .query_row(
+                "SELECT p.code FROM pending_confirm_projections p
+             JOIN confirmation_intents c ON c.intent_id=p.pending_id
+             WHERE p.pending_id=?1 AND p.owner_binding=?2 AND c.owner_binding=?2
+               AND p.session_id=?3 AND c.session_id=?3
+               AND p.request_id=?4 AND c.request_id=?4
+               AND p.turn_id=?5 AND c.turn_id=?5
+               AND p.account_id=c.account_id AND c.state='consumed'
+               AND c.terminal_expires_at_ms>?6",
+                params![
+                    pending_id,
+                    self.installation_binding,
+                    owner.session_id,
+                    owner.turn_request_id,
+                    owner.turn_id,
+                    u64_to_i64(now_ms)?
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| "confirmation_status_unavailable")?;
+        match code.as_deref() {
+            Some("executing") => Ok(Some("executing")),
+            Some("outcome_unknown") => Ok(Some("outcome_unknown")),
+            Some("completed") => Ok(Some("completed")),
+            Some("failed") => Ok(Some("failed")),
+            Some("provider_rejected") => Ok(Some("provider_rejected")),
+            Some("provider_conflict") => Ok(Some("provider_conflict")),
+            None => Ok(None),
+            _ => Err("confirmation_status_unavailable".into()),
+        }
+    }
+
     /// Owner/account scoped read of data only; a fresh provider preview is required.
     #[allow(dead_code)]
     pub(crate) fn task_conflict_draft(
@@ -12361,6 +12407,18 @@ mod tests {
         let (pending, token) = registry
             .register_bound(action, "task", 1_000, 60_000, owner())
             .unwrap();
+        let proof = owner_proof();
+        let query_owner = isyncyou_webui::AgentPendingOwnerProof {
+            session_id: proof.session_id.clone(),
+            turn_request_id: proof.turn_request_id.clone(),
+            turn_id: proof.turn_id.clone(),
+        };
+        assert_eq!(
+            persistence
+                .confirmation_status(&pending.id, &query_owner, 1_000)
+                .unwrap(),
+            None
+        );
         assert!(matches!(
             registry.confirm(
                 &pending.id,
@@ -12371,6 +12429,41 @@ mod tests {
             ),
             PendingConfirmOutcome::Confirmed(_)
         ));
+        assert_eq!(
+            persistence
+                .confirmation_status(&pending.id, &query_owner, 1_001)
+                .unwrap(),
+            Some("executing")
+        );
+        let mut wrong = query_owner.clone();
+        wrong.session_id = "other-session".into();
+        assert_eq!(
+            persistence
+                .confirmation_status(&pending.id, &wrong, 1_001)
+                .unwrap(),
+            None
+        );
+        wrong = query_owner.clone();
+        wrong.turn_id = "other-turn".into();
+        assert_eq!(
+            persistence
+                .confirmation_status(&pending.id, &wrong, 1_001)
+                .unwrap(),
+            None
+        );
+        wrong = query_owner.clone();
+        wrong.turn_request_id = "other-request".into();
+        assert_eq!(
+            persistence
+                .confirmation_status(&pending.id, &wrong, 1_001)
+                .unwrap(),
+            None
+        );
+        let locked = persistence.connection.lock().unwrap();
+        assert!(persistence
+            .confirmation_status(&pending.id, &query_owner, 1_001)
+            .is_err());
+        drop(locked);
         assert!(persistence
             .task_conflict_draft(&pending.id, "controlled")
             .unwrap()
@@ -12378,6 +12471,12 @@ mod tests {
         persistence
             .finish_pending_confirmation(&pending.id, "provider_conflict", 1_002)
             .unwrap();
+        assert_eq!(
+            persistence
+                .confirmation_status(&pending.id, &query_owner, 1_003)
+                .unwrap(),
+            Some("provider_conflict")
+        );
         assert!(persistence
             .task_conflict_draft(&pending.id, "other")
             .unwrap()

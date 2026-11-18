@@ -17178,6 +17178,42 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
         }
     }
 
+    fn confirmation_status(
+        &self,
+        owner: &isyncyou_webui::AgentPendingOwnerProof,
+        pending: &str,
+    ) -> Result<serde_json::Value, String> {
+        #[cfg(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        ))]
+        {
+            let store = self
+                .control_store
+                .as_ref()
+                .ok_or("confirmation_status_unavailable")?;
+            let phase = store
+                .confirmation_status(pending, owner, unix_now_ms())?
+                .ok_or("request_not_found")?;
+            let state = if phase == "executing" {
+                "outcome_unknown"
+            } else {
+                phase
+            };
+            Ok(
+                serde_json::json!({"state": state, "recorded_phase": phase, "terminal": state != "outcome_unknown", "resume_allowed": false}),
+            )
+        }
+        #[cfg(not(any(
+            feature = "agent-oauth-providers",
+            feature = "agent-subscription-experimental"
+        )))]
+        {
+            let _ = (owner, pending);
+            Err("product_sessions_unavailable".into())
+        }
+    }
+
     fn request_status(
         &self,
         session_id: &str,

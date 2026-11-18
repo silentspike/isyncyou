@@ -3724,6 +3724,14 @@ pub trait AgentHandler: Send + Sync {
         Err("product request status is not enabled on this server".into())
     }
 
+    fn confirmation_status(
+        &self,
+        _owner: &AgentPendingOwnerProof,
+        _pending: &str,
+    ) -> Result<serde_json::Value, String> {
+        Err("product request status is not enabled on this server".into())
+    }
+
     fn session_archive(
         &self,
         _request: AgentSessionArchiveRequest,
@@ -10353,6 +10361,51 @@ impl Router {
             Ok(handler) => handler,
             Err(error) => return with_no_store(error),
         };
+        if req.q("route") == Some("agent_confirm") {
+            const CONFIRM_FIELDS: [&str; 5] = [
+                "session_id",
+                "route",
+                "turn_request_id",
+                "turn_id",
+                "pending",
+            ];
+            if req.query.len() != CONFIRM_FIELDS.len()
+                || CONFIRM_FIELDS
+                    .iter()
+                    .any(|field| req.query.iter().filter(|(name, _)| name == field).count() != 1)
+                || req
+                    .query
+                    .iter()
+                    .any(|(name, _)| !CONFIRM_FIELDS.contains(&name.as_str()))
+            {
+                return no_store_json_error(400, "invalid agent request status query");
+            }
+            let Some(session_id) = req.q("session_id").filter(|id| valid_opaque_agent_id(id))
+            else {
+                return no_store_json_error(400, "invalid agent request status query");
+            };
+            let Some(turn_request_id) = req
+                .q("turn_request_id")
+                .filter(|id| valid_client_request_id(id))
+            else {
+                return no_store_json_error(400, "invalid agent request status query");
+            };
+            let Some(turn_id) = req.q("turn_id").filter(|id| valid_opaque_agent_id(id)) else {
+                return no_store_json_error(400, "invalid agent request status query");
+            };
+            let Some(pending) = req.q("pending").filter(|id| valid_exact_base64url(id, 22)) else {
+                return no_store_json_error(400, "invalid agent request status query");
+            };
+            let owner = AgentPendingOwnerProof {
+                session_id: session_id.into(),
+                turn_request_id: turn_request_id.into(),
+                turn_id: turn_id.into(),
+            };
+            return match handler.confirmation_status(&owner, pending) {
+                Ok(value) => with_no_store(ApiResponse::ok_json(&value)),
+                Err(error) => agent_session_error_response(&error),
+            };
+        }
         const FIELDS: [&str; 3] = ["session_id", "route", "request_id"];
         if req.query.len() != FIELDS.len()
             || FIELDS
@@ -15408,6 +15461,22 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
                 "resume_allowed": false,
             }))
         }
+        fn confirmation_status(
+            &self,
+            owner: &AgentPendingOwnerProof,
+            pending: &str,
+        ) -> Result<serde_json::Value, String> {
+            if owner.session_id != "01JSESSION00000000000000000"
+                || owner.turn_request_id != "123e4567-e89b-42d3-a456-426614174000"
+                || owner.turn_id != "01JTURN0000000000000000000"
+                || pending != TEST_CONFIRM_PENDING_ID
+            {
+                return Err("request_not_found".into());
+            }
+            Ok(
+                json!({"state":"outcome_unknown","recorded_phase":"executing","terminal":false,"resume_allowed":false}),
+            )
+        }
         fn session_archive(
             &self,
             request: AgentSessionArchiveRequest,
@@ -16031,6 +16100,41 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         assert!(request_status.headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("cache-control") && value == "no-store"
         }));
+        let confirm_status_path = format!("/api/v1/agent/request/status?session_id={SESSION_ID}&route=agent_confirm&turn_request_id={REQUEST_ID}&turn_id=01JTURN0000000000000000000&pending={TEST_CONFIRM_PENDING_ID}");
+        assert_eq!(
+            router
+                .route(&ApiRequest::new("GET", &confirm_status_path))
+                .status,
+            401
+        );
+        let confirmation =
+            router.route(&authenticated(ApiRequest::new("GET", &confirm_status_path)));
+        assert_eq!(confirmation.status, 200);
+        assert_eq!(
+            body_json(&confirmation),
+            json!({"state":"outcome_unknown","recorded_phase":"executing","terminal":false,"resume_allowed":false})
+        );
+        assert!(
+            confirmation
+                .headers
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("cache-control")
+                    && value == "no-store")
+        );
+        let wrong_session = confirm_status_path.replace(SESSION_ID, "01JOTHER0000000000000000000");
+        assert_eq!(
+            router
+                .route(&authenticated(ApiRequest::new("GET", &wrong_session)))
+                .status,
+            404
+        );
+        let duplicate = format!("{confirm_status_path}&pending={TEST_CONFIRM_PENDING_ID}");
+        assert_eq!(
+            router
+                .route(&authenticated(ApiRequest::new("GET", &duplicate)))
+                .status,
+            400
+        );
         for query in [
             format!(
                 "/api/v1/agent/request/status?session_id={SESSION_ID}&route=unknown&request_id={REQUEST_ID}"
