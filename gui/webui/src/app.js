@@ -7602,6 +7602,23 @@ function renderAssistantWizard(body, st) {
 }
 
 // The chat surface (shown once connected). Streams tokens over the per-turn SSE.
+function renderTaskConflictDrafts() {
+  const sessionId = AssistantState.selectedSessionId;
+  const drafts = AssistantState.taskConflictDraftsSession === sessionId ? AssistantState.taskConflictDrafts || [] : [];
+  if (AssistantState.taskConflictDraftsSession !== sessionId) return null;
+  if (!AssistantState.taskConflictDraftsAvailable) return el("p", { class:"dim", text:"Saved task conflict drafts are temporarily unavailable." });
+  if (!drafts.length) return null;
+  const panel = el("div", { class:"compose", "data-testid":"task-conflict-drafts" },
+    el("p", { text:"A task changed on another device. The original requested values were saved for review. Open the task in its list to prepare a new change against its current version." }));
+  for (const item of drafts) {
+    const d = item.draft || {};
+    if (item.account !== App.account) continue;
+    const details = `Task ${d.name || d.uid || ""} · list ${d.collection || ""} · priority ${d.priority ?? "unchanged"} · start ${d.start || "unchanged"} · due ${d.due || "unchanged"}${d.due ? (d.due_date ? " (date)" : " (date/time)") : ""}`;
+    panel.append(el("div", { class:"pick-row" }, el("span", { class:"grow", text:details })));
+  }
+  return panel;
+}
+
 function renderAssistantChat(body, st) {
   const provider = agentActiveProvider(st);
   const hasConsent = agentPrivacyConsentAccepted(provider);
@@ -7635,6 +7652,8 @@ function renderAssistantChat(body, st) {
   if (diagnostic) body.append(diagnostic);
   const lifecycleControls = renderAssistantLifecycleControls(st);
   if (lifecycleControls) body.append(lifecycleControls);
+  const conflictDrafts = renderTaskConflictDrafts();
+  if (conflictDrafts) chatNodes.splice(1, 0, conflictDrafts);
   body.append(...chatNodes);
   const log = $("#asst-log");
   bindAssistantFollowController(log, jumpToLatest);
@@ -9282,6 +9301,8 @@ async function hydrateAgentSession(sessionId) {
   const hydration = (async () => {
     let cursor = null;
     const records = [];
+    let taskConflictDrafts = [];
+    let taskConflictDraftsAvailable = false;
     const deadline = Date.now() + 60_000;
     while (records.length < 10000) {
       const path = "/api/v1/agent/session/history?" + qs({
@@ -9298,6 +9319,8 @@ async function hydrateAgentSession(sessionId) {
       }
       AssistantState.sessionHistoryRefreshing = false;
       if (Array.isArray(page.records)) records.push(...page.records);
+      if (Array.isArray(page.task_conflict_drafts)) taskConflictDrafts = page.task_conflict_drafts;
+      taskConflictDraftsAvailable = page.task_conflict_drafts_available === true;
       cursor = page.next_cursor || null;
       if (!cursor) break;
     }
@@ -9305,6 +9328,9 @@ async function hydrateAgentSession(sessionId) {
         || AssistantState.selectedSessionId !== sessionId
         || AssistantState.busy) return;
     AssistantState.transcript = sessionRecordsToTranscript(records);
+    AssistantState.taskConflictDrafts = taskConflictDrafts;
+    AssistantState.taskConflictDraftsAvailable = taskConflictDraftsAvailable;
+    AssistantState.taskConflictDraftsSession = sessionId;
     AssistantState.sessionHydratedId = sessionId;
   })();
   AssistantState.sessionHydrationId = sessionId;

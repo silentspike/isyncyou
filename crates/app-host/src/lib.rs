@@ -17103,11 +17103,26 @@ impl isyncyou_webui::AgentHandler for DaemonAgent {
                 limit,
             );
             match self.hot_session_history.lookup_or_start(&key) {
-                HotSessionHistoryLookup::Ready(page) => Ok(serde_json::json!({
-                    "records": page.records,
-                    "next_cursor": page.next_cursor,
-                    "refreshing": false,
-                })),
+                HotSessionHistoryLookup::Ready(page) => {
+                    let drafts = (|| -> Result<Vec<serde_json::Value>, String> {
+                        let credentials = agent_credential_store(&self.oauth_dir)
+                            .map_err(|_| "session_store_unavailable")?;
+                        let cfg = self.runtime_config();
+                        let account = product_session::ProductSessionRegistry::new(&credentials)
+                            .with_config(&cfg)
+                            .account_for(session_id)?;
+                        self.control_store
+                            .as_ref()
+                            .ok_or("control_store_unavailable")?
+                            .session_task_conflict_drafts(&account, session_id, unix_now_ms())
+                    })();
+                    let available = drafts.is_ok();
+                    Ok(serde_json::json!({
+                        "records": page.records, "next_cursor": page.next_cursor,
+                        "refreshing": false, "task_conflict_drafts": drafts.unwrap_or_default(),
+                        "task_conflict_drafts_available": available,
+                    }))
+                }
                 HotSessionHistoryLookup::Start(attempt) => {
                     let cache = Arc::clone(&self.hot_session_history);
                     let worker_key = key.clone();

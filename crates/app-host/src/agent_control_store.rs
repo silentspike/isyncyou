@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use zeroize::Zeroizing;
 
-const SCHEMA_VERSION: i64 = 22;
+const SCHEMA_VERSION: i64 = 23;
 const CONTROL_KEY_DOMAIN: &[u8] = b"isyncyou-agent-control-store-root/v1";
 const CONTROL_SUBKEY_SALT: &[u8] = b"isyncyou-agent-control-store-subkeys/v1";
 const SQLCIPHER_KEY_INFO: &[u8] = b"isyncyou-agent-control-sqlcipher/v1";
@@ -706,6 +706,13 @@ impl AgentControlStore {
                  );
                  CREATE INDEX IF NOT EXISTS confirmation_expiry
                    ON confirmation_intents(state, expires_at_ms);
+                 CREATE TABLE IF NOT EXISTS task_conflict_drafts (
+                   pending_id TEXT PRIMARY KEY NOT NULL, account_id TEXT NOT NULL,
+                   owner_binding TEXT NOT NULL, sealed_draft BLOB NOT NULL,
+                   conflict INTEGER NOT NULL DEFAULT 0 CHECK(conflict IN (0,1)),
+                   logical_bytes INTEGER NOT NULL,
+                   FOREIGN KEY(pending_id) REFERENCES confirmation_intents(intent_id) ON DELETE CASCADE
+                 );
                  CREATE TABLE IF NOT EXISTS pending_cancel_projections (
                    pending_id TEXT PRIMARY KEY NOT NULL,
                    account_id TEXT NOT NULL,
@@ -1493,11 +1500,25 @@ impl AgentControlStore {
         ) {
             return Err("control_store_unavailable".into());
         }
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .map_err(|_| "control_store_unavailable")?;
-        let changed = connection
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| "control_store_unavailable")?;
+        if code == "provider_conflict" {
+            transaction.execute("UPDATE task_conflict_drafts SET conflict=1 WHERE pending_id=?1 AND owner_binding=?2",
+                params![pending_id, self.installation_binding]).map_err(|_| "control_store_unavailable")?;
+        } else {
+            transaction
+                .execute(
+                    "DELETE FROM task_conflict_drafts WHERE pending_id=?1 AND owner_binding=?2",
+                    params![pending_id, self.installation_binding],
+                )
+                .map_err(|_| "control_store_unavailable")?;
+        }
+        let changed = transaction
             .execute(
                 "UPDATE pending_confirm_projections
                  SET code=?3,created_at_ms=?4
@@ -1511,10 +1532,70 @@ impl AgentControlStore {
             )
             .map_err(|_| "control_store_unavailable")?;
         if changed == 1 {
-            Ok(())
+            transaction
+                .commit()
+                .map_err(|_| "control_store_unavailable".into())
         } else {
             Err("confirmation_outcome_unknown".into())
         }
+    }
+
+    /// Owner/account scoped read of data only; a fresh provider preview is required.
+    #[allow(dead_code)]
+    pub(crate) fn task_conflict_draft(
+        &self,
+        pending_id: &str,
+        account: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "control_store_unavailable")?;
+        let sealed: Option<Vec<u8>> = connection.query_row(
+            "SELECT sealed_draft FROM task_conflict_drafts WHERE pending_id=?1 AND account_id=?2 AND owner_binding=?3 AND conflict=1",
+            params![pending_id, account, self.installation_binding], |row| row.get(0)
+        ).optional().map_err(|_| "control_store_unavailable")?;
+        sealed
+            .map(|v| {
+                let plain = open_row(&self.row_wrap_key, "task-conflict-draft", pending_id, &v)?;
+                serde_json::from_slice(&plain).map_err(|_| "control_store_unavailable".into())
+            })
+            .transpose()
+    }
+
+    /// Return only the selected account and session's unexpired conflicts.
+    pub(crate) fn session_task_conflict_drafts(
+        &self,
+        account: &str,
+        session: &str,
+        now_ms: u64,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "control_store_unavailable")?;
+        let mut statement = connection.prepare("SELECT d.pending_id,d.sealed_draft FROM task_conflict_drafts d JOIN confirmation_intents c ON c.intent_id=d.pending_id WHERE d.account_id=?1 AND d.owner_binding=?2 AND c.account_id=?1 AND c.owner_binding=?2 AND c.session_id=?3 AND c.terminal_expires_at_ms>?4 AND d.conflict=1 ORDER BY c.terminal_expires_at_ms DESC LIMIT 32")
+            .map_err(|_| "control_store_unavailable")?;
+        let rows = statement
+            .query_map(
+                params![
+                    account,
+                    self.installation_binding,
+                    session,
+                    u64_to_i64(now_ms)?
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .map_err(|_| "control_store_unavailable")?;
+        let mut drafts = Vec::new();
+        for row in rows {
+            let (id, sealed) = row.map_err(|_| "control_store_unavailable")?;
+            let plain = open_row(&self.row_wrap_key, "task-conflict-draft", &id, &sealed)?;
+            let draft: serde_json::Value =
+                serde_json::from_slice(&plain).map_err(|_| "control_store_unavailable")?;
+            drafts.push(serde_json::json!({"pending_id":id,"account":account,"draft":draft}));
+        }
+        Ok(drafts)
     }
 
     pub(crate) fn pending_confirm_projections(
@@ -6784,6 +6865,28 @@ impl PendingPersistence for AgentControlStore {
         let Ok(terminal_expires_at_ms) = control_tombstone_expiry(now_ms) else {
             return PendingConfirmOutcome::RetainedRetryable;
         };
+        // Save only non-authorizing user input in the same transaction that
+        // consumes the approval. It becomes readable only on provider conflict.
+        if let Some(draft) = crate::agent_ops::task_conflict_draft(&pending.action) {
+            let Ok(plain) = serde_json::to_vec(&draft) else {
+                return PendingConfirmOutcome::RetainedRetryable;
+            };
+            let Ok(sealed) = seal_row(
+                &self.row_wrap_key,
+                "task-conflict-draft",
+                pending_id,
+                &plain,
+            ) else {
+                return PendingConfirmOutcome::RetainedRetryable;
+            };
+            let Ok(bytes) = i64::try_from(sealed.len().saturating_add(256)) else {
+                return PendingConfirmOutcome::RetainedRetryable;
+            };
+            if enforce_control_quota(&transaction, bytes).is_err() || transaction.execute(
+                "INSERT INTO task_conflict_drafts(pending_id,account_id,owner_binding,sealed_draft,logical_bytes) VALUES(?1,?2,?3,?4,?5)",
+                params![pending_id, account, self.installation_binding, sealed, bytes],
+            ).is_err() { return PendingConfirmOutcome::RetainedRetryable; }
+        }
         let changed = match transaction.execute(
             "UPDATE confirmation_intents
                  SET state='consumed',sealed_payload=NULL,terminal_expires_at_ms=?3,
@@ -8262,7 +8365,7 @@ fn initialize_metadata(
         }
         match schema.parse::<i64>() {
             Ok(SCHEMA_VERSION) => {}
-            Ok(1..=21) if SCHEMA_VERSION == 22 => {
+            Ok(1..=22) if SCHEMA_VERSION == 23 => {
                 connection
                     .execute(
                         "UPDATE control_metadata SET value=?1 WHERE key='schema_version'",
@@ -8364,6 +8467,7 @@ fn enforce_control_quota(connection: &Connection, additional_bytes: i64) -> Resu
             "SELECT
                COALESCE((SELECT SUM(logical_bytes) FROM confirmation_intents),0) +
                COALESCE((SELECT SUM(logical_bytes) FROM pending_cancel_projections),0) +
+               COALESCE((SELECT SUM(logical_bytes) FROM task_conflict_drafts),0) +
                COALESCE((SELECT SUM(logical_bytes) FROM pending_confirm_projections),0) +
                COALESCE((SELECT SUM(logical_bytes) FROM user_presence_intents),0) +
                COALESCE((SELECT SUM(logical_bytes) FROM pairing_sources),0) +
@@ -12245,6 +12349,79 @@ mod tests {
     }
 
     #[test]
+    fn task_conflict_draft_survives_restart_without_authorization() {
+        let root = temp_root("task-conflict-draft");
+        let credentials = credential_store(&root);
+        let persistence = Arc::new(
+            AgentControlStore::open(&root, &credentials, INSTALLATION_PRINCIPAL, 1).unwrap(),
+        );
+        let registry = PendingRegistry::with_persistence(persistence.clone());
+        let action = parse_action(&json!({"op":"live-write", "account":"controlled", "service":"calendar", "target":"/cal/task.ics",
+            "change":{"verb":"task_attributes", "origin":"https://example.test", "collection":"/cal/", "uid":"task-1", "name":"Review", "priority":7, "due":null, "due_date":false, "old_priority":"5", "old_due":null, "etag":"old-etag", "raw_sha256":"digest"}})).unwrap();
+        let (pending, token) = registry
+            .register_bound(action, "task", 1_000, 60_000, owner())
+            .unwrap();
+        assert!(matches!(
+            registry.confirm(
+                &pending.id,
+                &token,
+                &pending.action_hash,
+                &owner_proof(),
+                1_001
+            ),
+            PendingConfirmOutcome::Confirmed(_)
+        ));
+        assert!(persistence
+            .task_conflict_draft(&pending.id, "controlled")
+            .unwrap()
+            .is_none());
+        persistence
+            .finish_pending_confirmation(&pending.id, "provider_conflict", 1_002)
+            .unwrap();
+        assert!(persistence
+            .task_conflict_draft(&pending.id, "other")
+            .unwrap()
+            .is_none());
+        drop(registry);
+        drop(persistence);
+        let reopened =
+            AgentControlStore::open(&root, &credentials, INSTALLATION_PRINCIPAL, 1).unwrap();
+        let draft = reopened
+            .task_conflict_draft(&pending.id, "controlled")
+            .unwrap()
+            .unwrap();
+        assert_eq!(draft["priority"], 7);
+        assert_eq!(
+            reopened
+                .session_task_conflict_drafts("controlled", "session-v2", 1_003)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(reopened
+            .session_task_conflict_drafts("controlled", "other-session", 1_003)
+            .unwrap()
+            .is_empty());
+        assert!(reopened
+            .session_task_conflict_drafts("other", "session-v2", 1_003)
+            .unwrap()
+            .is_empty());
+        assert!(reopened
+            .session_task_conflict_drafts(
+                "controlled",
+                "session-v2",
+                1_001 + CONTROL_TOMBSTONE_TTL_MS
+            )
+            .unwrap()
+            .is_empty());
+        assert!(draft.get("etag").is_none());
+        assert!(draft.get("raw_sha256").is_none());
+        assert!(draft.get("token").is_none());
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn pending_confirmation_persists_provider_rejection_distinct_from_unknown() {
         let root = temp_root("confirm-provider-rejection");
         let credentials = credential_store(&root);
@@ -15963,6 +16140,7 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE confirmation_intents(logical_bytes INTEGER NOT NULL);
+                 CREATE TABLE task_conflict_drafts(logical_bytes INTEGER NOT NULL);
                  CREATE TABLE pending_cancel_projections(logical_bytes INTEGER NOT NULL);
                  CREATE TABLE pending_confirm_projections(logical_bytes INTEGER NOT NULL);
                  CREATE TABLE user_presence_intents(logical_bytes INTEGER NOT NULL);

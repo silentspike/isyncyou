@@ -455,6 +455,32 @@ fn execute_bound_task_parent(
     }
 }
 
+/// Extract only user-editable task fields. This is data, not an approval or a
+/// replayable provider request; a caller must prepare a fresh preview.
+pub(crate) fn task_conflict_draft(
+    action: &isyncyou_agent::ToolAction,
+) -> Option<serde_json::Value> {
+    let Ok(AgentLiveWriteIntent::Calendar(CalendarLiveWrite::TaskAttributes {
+        target,
+        origin,
+        collection,
+        uid,
+        name,
+        priority,
+        due,
+        due_date,
+        start,
+        ..
+    })) = validate_live_write_action(action)
+    else {
+        return None;
+    };
+    Some(
+        serde_json::json!({"target":target,"origin":origin,"collection":collection,
+        "uid":uid,"name":name,"priority":priority,"due":due,"due_date":due_date,"start":start}),
+    )
+}
+
 fn execute_bound_task_attributes(
     cfg: &Config,
     action: &isyncyou_agent::ToolAction,
