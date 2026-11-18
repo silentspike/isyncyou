@@ -1649,7 +1649,7 @@ function onRoute() {
   const primeMail = primaryProviderMail ? { account, request: startPrimaryMailCache(account) } : null;
   // These reads have identical request semantics in the dashboard and sidebar.
   // Share only within this desktop navigation, never across account switches.
-  const overviewReads = !MOBILE && account && App.route === "overview"
+  const overviewReads = !MOBILE && !providerAccountsRefreshing && account && App.route === "overview"
     && !Mail.activeScope && (App.accounts || []).some(a => a.id === account && a.provider === "self_hosted")
     ? { account, status: api("/api/v1/status?" + qs({ account })), sync: api("/api/v1/sync/state") }
     : null;
@@ -1685,7 +1685,7 @@ const SVC_LABEL = { overview: "Overview", mail: "Mail", onedrive: "OneDrive", ca
 const svcLabel = (id) => SVC_LABEL[id] || id;
 // One short-lived, non-sensitive summary for the active account only. Full
 // dashboard data is always reloaded; shared mailbox contents are never cached.
-let overviewSnapshot = null, overviewGeneration = 0;
+let overviewSnapshot = null, overviewGeneration = 0, accountReloadGeneration = 0;
 function rememberOverviewSnapshot(account, st) {
   const items = st.totals?.items;
   if (!account || !Number.isSafeInteger(items) || items < 0 || !Array.isArray(st.services)) { overviewSnapshot = null; return; }
@@ -1711,6 +1711,12 @@ async function renderOverview(view, overviewReads = null) {
     el("div", { class:"status-facts", text:`Previously: ${snapshot.items.toLocaleString()} items · ${snapshot.services} services` })));
   else body.append(el("div", { class: "card", style: "height:64px" }, el("div", { class: "skel", style: "height:24px;width:40%" })));
   if (!App.account) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "No account configured" }))); return; }
+  // Account credentials may change during a reload; do not start or reuse
+  // overview data until all overlapping reloads have settled.
+  if (providerAccountsRefreshing) {
+    clear(body).append(el("div", { class:"card panel", text:"Refreshing account…" }));
+    return;
+  }
   try {
     const status = shared?.status ?? api("/api/v1/status?" + qs({ account }));
     void status.then(st => {
@@ -10071,6 +10077,7 @@ async function reloadAccounts() {
   // The account API does not expose a stable provider credential generation.
   // Invalidate pending reads and fail closed until all overlapping reloads finish.
   providerAccountsRefreshing++;
+  const reloadGeneration = ++accountReloadGeneration;
   overviewGeneration++;
   overviewSnapshot = null;
   clearProviderMailReads();
@@ -10078,6 +10085,8 @@ async function reloadAccounts() {
   try {
   const current = App.account;
   const data = await api("/api/v1/accounts");
+  // A slower, older reload cannot replace a later account result.
+  if (reloadGeneration !== accountReloadGeneration) return;
   const nextAccounts = data.accounts || [];
   const previously = (App.accounts || []).find(account => account.id === current);
   const next = nextAccounts.find(account => account.id === current);
@@ -10092,7 +10101,15 @@ async function reloadAccounts() {
   App.accounts = nextAccounts;
   App.account = App.accounts.some((account) => account.id === current)
     ? current : (App.accounts[0] && App.accounts[0].id) || null;
-  } finally { providerAccountsRefreshing--; }
+  } finally {
+    providerAccountsRefreshing--;
+    // A reload invalidates any current overview request. Rebuild exactly once
+    // after the final overlapping reload, only if that view is still active.
+    if (!providerAccountsRefreshing && App.route === "overview") {
+      const view = $("#view");
+      if (view?.isConnected && view.contains($("#ov-body"))) void renderOverview(view);
+    }
+  }
 }
 function renderAccountMenu(body) {
   if (accountMenuPoll) { clearInterval(accountMenuPoll); accountMenuPoll = null; }

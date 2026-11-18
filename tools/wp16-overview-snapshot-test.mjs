@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 const src=readFileSync(new URL('../gui/webui/src/app.js',import.meta.url),'utf8');
-const start=src.indexOf('let overviewSnapshot = null, overviewGeneration = 0;'), end=src.indexOf('async function renderOverview(',start);
+const start=src.indexOf('let overviewSnapshot = null, overviewGeneration = 0, accountReloadGeneration = 0;'), end=src.indexOf('async function renderOverview(',start);
 assert.ok(start>=0&&end>start);
 let now=1000;
 const ctx=vm.createContext({Date:{now:()=>now},Number,Array});
