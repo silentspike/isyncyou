@@ -688,7 +688,6 @@ pub fn event_time_zoned(
     end: &str,
     tzid: &str,
 ) -> Result<Vec<u8>, String> {
-    use chrono::{LocalResult, NaiveDateTime, TimeZone};
     if uid.is_empty()
         || tzid.is_empty()
         || tzid.len() > 128
@@ -698,20 +697,17 @@ pub fn event_time_zoned(
     {
         return Err("Invalid event timezone".into());
     }
-    let zone: chrono_tz::Tz = tzid.parse().map_err(|_| "Unknown event timezone")?;
-    let parse_local = |value: &str| -> Result<(NaiveDateTime, i64), String> {
+    let zone = super::time::zone(tzid).map_err(|_| "Unknown event timezone")?;
+    let parse_local = |value: &str| -> Result<i64, String> {
         if value.len() != 15 {
             return Err("Invalid local event time".into());
         }
-        let civil = NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%S")
-            .map_err(|_| "Invalid local event time")?;
-        match zone.from_local_datetime(&civil) {
-            LocalResult::Single(instant) => Ok((civil, instant.timestamp())),
-            _ => Err("Local event time is ambiguous or nonexistent".into()),
-        }
+        let civil = super::time::parse(value).map_err(|_| "Invalid local event time")?;
+        super::time::instant(&zone, civil, false)
+            .map_err(|_| "Local event time is ambiguous or nonexistent".into())
     };
-    let (_, start_utc) = parse_local(start)?;
-    let (_, end_utc) = parse_local(end)?;
+    let start_utc = parse_local(start)?;
+    let end_utc = parse_local(end)?;
     if end_utc <= start_utc {
         return Err("Invalid event time range".into());
     }
@@ -901,7 +897,6 @@ fn exception_native_times(
     end_key: &str,
     times: &[&str],
 ) -> Result<Vec<(String, Option<String>)>, String> {
-    use chrono::{LocalResult, NaiveDateTime, TimeZone};
     let field = |key: &str| -> Result<(String, Option<String>), String> {
         let lines: Vec<_> = master
             .items
@@ -942,7 +937,7 @@ fn exception_native_times(
     {
         return Err("Invalid recurrence timezone".into());
     }
-    let zone: chrono_tz::Tz = tzid.parse().map_err(|_| "Unknown recurrence timezone")?;
+    let zone = super::time::zone(&tzid).map_err(|_| "Unknown recurrence timezone")?;
     let mut validation = tree.clone();
     for entry in &mut validation.items {
         if let IcalItem::Component(component) = entry {
@@ -970,12 +965,9 @@ fn exception_native_times(
         if value.len() != 15 {
             return Err("Invalid native recurrence time".into());
         }
-        let local = NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%S")
-            .map_err(|_| "Invalid native recurrence time")?;
-        let instant = match zone.from_local_datetime(&local) {
-            LocalResult::Single(v) => v.timestamp(),
-            _ => return Err("Native recurrence time is ambiguous or nonexistent".into()),
-        };
+        let local = super::time::parse(value).map_err(|_| "Invalid native recurrence time")?;
+        let instant = super::time::instant(&zone, local, false)
+            .map_err(|_| "Native recurrence time is ambiguous or nonexistent")?;
         if let Some(ref embedded) = embedded {
             let civil = ical::recur::IcalRecurDateTime::parse(value)
                 .map_err(|_| "Invalid native recurrence time")?;
@@ -986,19 +978,22 @@ fn exception_native_times(
     }
     let mut output = Vec::with_capacity(times.len());
     for value in times {
-        let instant = NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%SZ")
+        if value.len() != 16 || !value.ends_with('Z') {
+            return Err("Invalid UTC occurrence time".into());
+        }
+        let instant = ical::recur::IcalRecurDateTime::parse(value)
             .map_err(|_| "Invalid UTC occurrence time")?
-            .and_utc();
-        let local = instant.with_timezone(&zone).naive_local();
-        if !matches!(zone.from_local_datetime(&local),LocalResult::Single(v) if v.timestamp()==instant.timestamp())
-        {
+            .seconds();
+        let local =
+            super::time::local(&zone, instant).map_err(|_| "Invalid UTC occurrence time")?;
+        if super::time::instant(&zone, local, false).ok() != Some(instant) {
             return Err("Occurrence time is ambiguous or nonexistent".into());
         }
-        let text = local.format("%Y%m%dT%H%M%S").to_string();
+        let text = super::time::format(local);
         if let Some(ref embedded) = embedded {
             let civil = ical::recur::IcalRecurDateTime::parse(&text)
                 .map_err(|_| "Invalid local occurrence time")?;
-            if embedded.resolve(civil).instant(civil) != Some(instant.timestamp()) {
+            if embedded.resolve(civil).instant(civil) != Some(instant) {
                 return Err("Embedded timezone differs from recurrence timezone".into());
             }
         }
@@ -1858,12 +1853,11 @@ pub fn edit_unique_contact_name(raw: &[u8], value: &str) -> Result<(String, Vec<
 
 /// Capture a UTC completion timestamp once for an effect-bound approval.
 pub fn current_task_completion_time() -> Result<String, String> {
-    use chrono::Datelike;
-    let now = chrono::Utc::now();
-    if !(0..=9999).contains(&now.year()) {
-        return Err("System clock is outside the supported calendar range".into());
-    }
-    Ok(now.format("%Y%m%dT%H%M%SZ").to_string())
+    let now = jiff::Timestamp::now();
+    Ok(format!(
+        "{}Z",
+        super::time::format(jiff::tz::TimeZone::UTC.to_datetime(now))
+    ))
 }
 
 /// Complete or reopen one VTODO. The timestamp is explicitly supplied so the
@@ -2019,7 +2013,7 @@ pub fn preview_task_completion(
                         _ => None,
                     })
                     .collect();
-                if masters.len()!=1 || zone.parse::<chrono_tz::Tz>().is_err() || !masters[0].items.iter().any(|entry| matches!(entry,IcalItem::Prop(start) if start.name.get().eq_ignore_ascii_case("DTSTART") && start.params.len()==1 && start.params[0].name.get().eq_ignore_ascii_case("TZID") && start.params[0].values.len()==1 && start.params[0].values[0].get().trim_matches('"')==zone)) { return Err("Task recurrence timezone is ambiguous".into()); }
+                if masters.len()!=1 || super::time::zone(zone).is_err() || !masters[0].items.iter().any(|entry| matches!(entry,IcalItem::Prop(start) if start.name.get().eq_ignore_ascii_case("DTSTART") && start.params.len()==1 && start.params[0].name.get().eq_ignore_ascii_case("TZID") && start.params[0].values.len()==1 && start.params[0].values[0].get().trim_matches('"')==zone)) { return Err("Task recurrence timezone is ambiguous".into()); }
             }
         }
     }

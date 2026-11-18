@@ -4,7 +4,6 @@
 //! closed; callers must re-check access and use idempotent native notification
 //! identities before dispatch.
 
-use chrono::{Datelike, LocalResult, NaiveDate, NaiveDateTime, TimeZone};
 use ical::tree::cst::{IcalCst, IcalItem};
 use ical::tree::line::IcalLine;
 
@@ -200,7 +199,7 @@ pub fn is_standalone(raw: &[u8]) -> Result<bool, String> {
 }
 
 fn local_instant(
-    local: NaiveDateTime,
+    local: jiff::civil::DateTime,
     tzid: &str,
     calendar: &ical::ical::Ical<'_>,
 ) -> Result<i64, String> {
@@ -208,20 +207,16 @@ fn local_instant(
         if zone.observances.is_empty() {
             return Err("Calendar timezone has no transitions".into());
         }
-        let civil =
-            ical::recur::IcalRecurDateTime::parse(&local.format("%Y%m%dT%H%M%S").to_string())
-                .map_err(|_| "Invalid local alarm time")?;
+        let civil = ical::recur::IcalRecurDateTime::parse(&super::time::format(local))
+            .map_err(|_| "Invalid local alarm time")?;
         return zone
             .resolve(civil)
             .instant(civil)
             .ok_or_else(|| "Alarm time falls in a timezone gap".into());
     }
-    let zone: chrono_tz::Tz = tzid.parse().map_err(|_| "Unknown alarm timezone")?;
-    match zone.from_local_datetime(&local) {
-        LocalResult::Single(value) => Ok(value.timestamp()),
-        LocalResult::Ambiguous(a, b) => Ok(a.timestamp().min(b.timestamp())),
-        LocalResult::None => Err("Alarm time falls in a timezone gap".into()),
-    }
+    let zone = super::time::zone(tzid).map_err(|_| "Unknown alarm timezone")?;
+    super::time::instant(&zone, local, true)
+        .map_err(|_| "Alarm time falls in a timezone gap".into())
 }
 
 fn event_time(
@@ -237,15 +232,10 @@ fn event_time(
         return Ok((date.seconds(), false));
     }
     let date_only = value.len() == 8;
-    let local = if date_only {
-        NaiveDate::parse_from_str(value, "%Y%m%d")
-            .map_err(|_| "Invalid all-day alarm anchor")?
-            .and_hms_opt(0, 0, 0)
-            .ok_or("Invalid all-day alarm anchor")?
-    } else {
-        NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%S")
-            .map_err(|_| "Invalid local alarm anchor")?
-    };
+    if !date_only && value.len() != 15 {
+        return Err("Invalid local alarm anchor".into());
+    }
+    let local = super::time::parse(value).map_err(|_| "Invalid local alarm anchor")?;
     let tzid = parameter(line, "TZID")?
         .or_else(|| fallback_tzid.map(str::to_owned))
         .ok_or("Alarm timezone unavailable")?;
@@ -274,22 +264,17 @@ fn offset_time(
             .checked_add(offset)
             .ok_or_else(|| "Alarm timestamp overflow".into());
     }
-    let local = if raw.len() == 8 {
-        NaiveDate::parse_from_str(&raw, "%Y%m%d")
-            .map_err(|_| "Invalid all-day alarm anchor")?
-            .and_hms_opt(0, 0, 0)
-            .ok_or("Invalid all-day alarm anchor")?
-    } else {
-        NaiveDateTime::parse_from_str(&raw, "%Y%m%dT%H%M%S")
-            .map_err(|_| "Invalid local alarm anchor")?
-    };
+    if raw.len() != 8 && raw.len() != 15 {
+        return Err("Invalid local alarm anchor".into());
+    }
+    let local = super::time::parse(&raw).map_err(|_| "Invalid local alarm anchor")?;
     let tzid = parameter(line, "TZID")?
         .or_else(|| fallback_tzid.map(str::to_owned))
         .ok_or("Alarm timezone unavailable")?;
     let remainder = offset - days * 86400;
     let shifted = local
-        .checked_add_signed(chrono::Duration::days(days))
-        .ok_or("Alarm timestamp overflow")?;
+        .checked_add(jiff::SignedDuration::from_secs(days * 86400))
+        .map_err(|_| "Alarm timestamp overflow")?;
     local_instant(shifted, &tzid, calendar)?
         .checked_add(remainder)
         .ok_or_else(|| "Alarm timestamp overflow".into())
@@ -313,9 +298,14 @@ pub fn plan(
     {
         return Err("Invalid reminder planning window".into());
     }
-    let window_year = chrono::DateTime::from_timestamp(window_start, 0)
-        .ok_or("Invalid reminder planning timestamp")?
-        .year();
+    let window_year = i32::from(
+        jiff::tz::TimeZone::UTC
+            .to_datetime(
+                jiff::Timestamp::from_second(window_start)
+                    .map_err(|_| "Invalid reminder planning timestamp")?,
+            )
+            .year(),
+    );
     let original_tree = IcalCst::parse(original).map_err(|_| "Invalid original calendar")?;
     if original_tree.to_bytes() != original {
         return Err("Original calendar is incomplete".into());
@@ -330,7 +320,7 @@ pub fn plan(
                 component.items.retain(|item| !matches!(item,IcalItem::Component(child) if kind(child).as_deref() == Some("VALARM")));
                 // The model validator requires every referenced TZID to have
                 // an embedded VTIMEZONE. This planner also supports IANA TZIDs
-                // via chrono-tz, so validate the remaining calendar structure
+                // via the bundled IANA database, so validate the remaining calendar structure
                 // without those references; event_time independently resolves
                 // every anchor against the preserved original TZID and fails
                 // closed for unknown zones and nonexistent local times.

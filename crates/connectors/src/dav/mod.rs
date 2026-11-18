@@ -6,6 +6,7 @@
 pub mod edit;
 pub mod projection;
 pub mod reminders;
+mod time;
 
 use crate::request_budget::{BudgetResponse, BudgetedSend};
 use isyncyou_store::{
