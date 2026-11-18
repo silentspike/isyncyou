@@ -3245,25 +3245,55 @@ pub fn preview_series_rule(raw: &[u8], uid: &str, rule: &str) -> Result<SeriesRu
         if rule.contains(['\r', '\n']) {
             return Err("Invalid recurrence rule".into());
         }
-        let set: icalendar::RRuleSet = format!("DTSTART:{start}\nRRULE:{rule}")
-            .parse()
-            .map_err(|_| "Invalid recurrence rule")?;
-        if set.get_rrule().len() != 1
-            || !set.get_rrule()[0]
-                .get_count()
-                .is_some_and(|count| (1..=100).contains(&count))
-        {
+        // A preview must not silently omit unknown or malformed rule parts.
+        let mut names = std::collections::HashSet::new();
+        for part in rule.split(';') {
+            let (name, value) = part.split_once('=').ok_or("Invalid recurrence rule")?;
+            let name = name.to_ascii_uppercase();
+            if !matches!(
+                name.as_str(),
+                "FREQ"
+                    | "COUNT"
+                    | "INTERVAL"
+                    | "BYSECOND"
+                    | "BYMINUTE"
+                    | "BYHOUR"
+                    | "BYDAY"
+                    | "BYMONTHDAY"
+                    | "BYYEARDAY"
+                    | "BYWEEKNO"
+                    | "BYMONTH"
+                    | "BYSETPOS"
+                    | "WKST"
+            ) || !names.insert(name)
+                || value.split(',').any(str::is_empty)
+            {
+                return Err("Invalid recurrence rule".into());
+            }
+        }
+        let parsed =
+            ical::recur::IcalRecurRule::parse(rule).map_err(|_| "Invalid recurrence rule")?;
+        let count = parsed.count.filter(|count| (1..=100).contains(count));
+        if count.is_none() {
             return Err("Series must have a finite count of at most 100".into());
         }
-        let result = set.all(101);
-        if result.limited || result.dates.is_empty() {
+        if !parsed.problems().is_empty() {
+            return Err("Invalid recurrence rule".into());
+        }
+        let civil =
+            ical::recur::IcalRecurDateTime::parse(&start).map_err(|_| "Invalid series start")?;
+        let dates: Vec<String> = ical::recur::expand::IcalRecurExpand::new(parsed, civil)
+            .take(101)
+            .map(|date| {
+                format!(
+                    "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+                    date.year, date.month, date.day, date.hour, date.minute, date.second
+                )
+            })
+            .collect();
+        if dates.len() != count.unwrap() as usize {
             return Err("Series expansion is incomplete".into());
         }
-        let dates: Vec<String> = result
-            .dates
-            .iter()
-            .map(|date| date.format("%Y%m%dT%H%M%SZ").to_string())
-            .collect();
         if dates.first() != Some(&start) {
             return Err("Start does not match the recurrence rule".into());
         }
@@ -3797,6 +3827,23 @@ mod tests {
         let created = preview_series_rule(single, "event", "FREQ=DAILY;COUNT=2").unwrap();
         assert!(created.old_rule.is_empty());
         assert_eq!(created.old_occurrences, vec!["20261101T100000Z"]);
+    }
+
+    #[test]
+    fn series_rule_preview_expands_monthly_rules_and_rejects_incomplete_results() {
+        let raw = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Planning\r\nDTSTART:20261101T100000Z\r\nDTEND:20261101T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let preview = preview_series_rule(raw, "event", "FREQ=MONTHLY;COUNT=3;BYDAY=1SU").unwrap();
+        assert_eq!(
+            preview.new_occurrences,
+            vec!["20261101T100000Z", "20261206T100000Z", "20270103T100000Z"]
+        );
+        assert!(preview_series_rule(raw, "event", "FREQ=MONTHLY;COUNT=3;BYDAY=1MO").is_err());
+        assert!(preview_series_rule(raw, "event", "FREQ=DAILY;COUNT=101").is_err());
+        assert!(preview_series_rule(raw, "event", "FREQ=DAILY;COUNT=2;COUNT=3").is_err());
+        assert!(preview_series_rule(raw, "event", "FREQ=DAILY;COUNT=2;X-UNKNOWN=1").is_err());
+        assert!(preview_series_rule(raw, "event", "FREQ=DAILY;COUNT=2;BYDAY=MO,").is_err());
+        let last_year = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:Planning\r\nDTSTART:99991231T100000Z\r\nDTEND:99991231T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert!(preview_series_rule(last_year, "event", "FREQ=DAILY;COUNT=2").is_err());
     }
 
     #[test]
