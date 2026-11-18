@@ -1640,6 +1640,7 @@ function onRoute() {
   // Overlap the primary self-hosted cache read with the shell rebuild. A
   // different account or a shared scope is never eligible for this prefetch.
   const account = App.account;
+  if (overviewSnapshot && overviewSnapshot.account !== account) { overviewSnapshot = null; overviewGeneration++; }
   const primaryProviderMail = App.route === "mail"
     && (Mail.scopeAccount !== account || !Mail.activeScope)
     && (App.accounts || []).some(a => a.id === account && a.provider === "self_hosted");
@@ -1682,6 +1683,17 @@ const SVC_COLOR = {
 // canonical service display names (consistent everywhere — no "Onedrive"/"Todo")
 const SVC_LABEL = { overview: "Overview", mail: "Mail", onedrive: "OneDrive", calendar: "Calendar", contacts: "Contacts", todo: "To Do", onenote: "OneNote" };
 const svcLabel = (id) => SVC_LABEL[id] || id;
+// One short-lived, non-sensitive summary for the active account only. Full
+// dashboard data is always reloaded; shared mailbox contents are never cached.
+let overviewSnapshot = null, overviewGeneration = 0;
+function rememberOverviewSnapshot(account, st) {
+  const items = st.totals?.items;
+  if (!account || !Number.isSafeInteger(items) || items < 0 || !Array.isArray(st.services)) { overviewSnapshot = null; return; }
+  overviewSnapshot = { account, items, services: st.services.length, expires: Date.now() + 30000 };
+}
+function cachedOverviewSnapshot(account) {
+  return overviewSnapshot?.account === account && overviewSnapshot.expires > Date.now() ? overviewSnapshot : null;
+}
 async function renderOverview(view, overviewReads = null) {
   clear(view).append(
     el("h1", { class: "view-title", text: MOBILE ? "Microsoft 365 on this device" : "Microsoft 365 archive overview" }),
@@ -1691,13 +1703,18 @@ async function renderOverview(view, overviewReads = null) {
   const body = $("#ov-body");
   const account = App.account;
   const shared = overviewReads?.account === account ? overviewReads : null;
-  const current = () => view.isConnected && view.contains(body) && App.account === account;
-  body.append(el("div", { class: "card", style: "height:64px" }, el("div", { class: "skel", style: "height:24px;width:40%" })));
+  const generation = overviewGeneration;
+  const current = () => view.isConnected && view.contains(body) && App.account === account && overviewGeneration === generation;
+  const snapshot = cachedOverviewSnapshot(account);
+  if (snapshot) body.append(el("div", { class:"status-bar" },
+    el("span", { class:"status-health" }, el("span", { class:"chip warn", text:"Refreshing overview" })),
+    el("div", { class:"status-facts", text:`Previously: ${snapshot.items.toLocaleString()} items · ${snapshot.services} services` })));
+  else body.append(el("div", { class: "card", style: "height:64px" }, el("div", { class: "skel", style: "height:24px;width:40%" })));
   if (!App.account) { clear(body).append(el("div", { class: "empty" }, el("h3", { text: "No account configured" }))); return; }
   try {
     const status = shared?.status ?? api("/api/v1/status?" + qs({ account }));
     void status.then(st => {
-      if (!current()) return;
+      if (!current() || snapshot) return;
       clear(body).append(el("div", { class:"card panel" },
         el("div", { class:"panel-head", text:"Overview" }),
         el("div", { class:"panel-body", text:`${(st.totals?.items ?? 0).toLocaleString()} items · ${(st.services || []).length} services · Loading activity and settings…` })));
@@ -1709,6 +1726,7 @@ async function renderOverview(view, overviewReads = null) {
       (shared?.sync ?? api("/api/v1/sync/state")).catch(() => ({})),
     ]);
     if (!current()) return;
+    rememberOverviewSnapshot(account, st);
     const services = (st.services || []).slice().sort((a, b) => b.items - a.items);
     services.forEach(s => { App.counts[s.service] = s.items; });
     updateNavCounts();
@@ -1809,7 +1827,7 @@ async function renderOverview(view, overviewReads = null) {
     // sync populates data). Repaints only on a real change — never per tick.
     App._ovSig = overviewSignature(st);
     App.liveUpdate = overviewLiveUpdate;
-  } catch (e) { if (current()) clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load overview" }), el("p", { text: e.message }))); }
+  } catch (e) { if (current()) { overviewSnapshot = null; clear(body).append(el("div", { class: "empty" }, el("h3", { text: "Could not load overview" }), el("p", { text: e.message }))); } }
 }
 function overviewSignature(st) {
   const svc = (st.services || []).map(s => s.service + ":" + s.items).join(",");
@@ -10053,6 +10071,8 @@ async function reloadAccounts() {
   // The account API does not expose a stable provider credential generation.
   // Invalidate pending reads and fail closed until all overlapping reloads finish.
   providerAccountsRefreshing++;
+  overviewGeneration++;
+  overviewSnapshot = null;
   clearProviderMailReads();
   MailSnapshot.epoch++;
   try {
