@@ -182,22 +182,28 @@ const shellReuse = await page.evaluate(() => {
     renderShell();
     const original = document.querySelector(".sidebar");
     App.route = "mail";
-    const reused = reuseMailRouteShell("overview");
+    const reused = reuseProviderRouteShell("overview");
     const routeUpdated = !!document.querySelector('.nav-item[data-service="mail"].active') &&
       !!document.querySelector("#subnav-mail") && document.querySelector(".topbar .crumbs b")?.textContent === "Mail";
+    App.route = "calendar";
+    const calendar = reuseProviderRouteShell("mail") && !document.querySelector("#subnav-mail") &&
+      !!document.querySelector('.nav-item[data-service="calendar"].active') &&
+      document.querySelector(".topbar .crumbs b")?.textContent === "Calendar";
+    App.route = "todo";
+    const todo = reuseProviderRouteShell("calendar") && !!document.querySelector('.nav-item[data-service="todo"].active');
     Mail.activeScope = "synthetic-shared";
-    const sharedRejected = !reuseMailRouteShell("overview");
+    const sharedRejected = !reuseProviderRouteShell("calendar");
     Mail.activeScope = ""; App.account = "synthetic-b";
-    const accountRejected = !reuseMailRouteShell("overview");
-    return {reused, same:original === document.querySelector(".sidebar"), routeUpdated, sharedRejected, accountRejected};
+    const accountRejected = !reuseProviderRouteShell("calendar");
+    return {reused, same:original === document.querySelector(".sidebar"), routeUpdated, calendar, todo, sharedRejected, accountRejected};
   } finally {
     App.accounts = saved.accounts; App.account = saved.account; App.counts = saved.counts; App.route = saved.route;
     Mail.activeScope = saved.scope; Mail.scopeAccount = saved.scopeAccount;
     onRoute();
   }
 });
-check("primary mail shell reuse stays account and scope bound",
-  shellReuse.reused && shellReuse.same && shellReuse.routeUpdated && shellReuse.sharedRejected && shellReuse.accountRejected);
+check("retained provider shell updates routes and stays account and scope bound",
+  shellReuse.reused && shellReuse.same && shellReuse.routeUpdated && shellReuse.calendar && shellReuse.todo && shellReuse.sharedRejected && shellReuse.accountRejected);
 
 // Older health responses must not overwrite a newer route's status.
 await page.setViewportSize({width:1280, height:900});

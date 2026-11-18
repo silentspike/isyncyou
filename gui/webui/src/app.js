@@ -1428,11 +1428,15 @@ function shellIdentity() {
   return JSON.stringify([App.account, acc.provider, accountDisplayLabel(acc), accountSelectionLabel(acc),
     visibleServices().map(s => [s.id, App.counts[s.id] ?? null]), MOBILE, eggOn()]);
 }
-function reuseMailRouteShell(previousRoute) {
-  // Only this same-account primary-mail transition has a reuse contract. Other
-  // routes and any account, scope, navigation or layout change rebuild normally.
-  if (!((previousRoute === "overview" && App.route === "mail") ||
-        (previousRoute === "mail" && App.route === "overview")) || Mail.activeScope ||
+const PROVIDER_DESKTOP_ROUTES = new Set(["overview", "mail", "calendar", "todo"]);
+function reuseProviderRouteShell(previousRoute) {
+  const primaryMailTransition = (previousRoute === "overview" && App.route === "mail") ||
+        (previousRoute === "mail" && App.route === "overview");
+  const desktopTransition = !MOBILE && previousRoute !== App.route &&
+      PROVIDER_DESKTOP_ROUTES.has(previousRoute) && PROVIDER_DESKTOP_ROUTES.has(App.route);
+  // Retain the shell across common self-hosted routes for the same account.
+  // Shared mail and account, service or layout changes rebuild normally.
+  if (!(primaryMailTransition || desktopTransition) || Mail.activeScope ||
       !(App.accounts || []).some(a => a.id === App.account && a.provider === "self_hosted") ||
       renderedShellIdentity !== shellIdentity()) return false;
   const nav = document.querySelector(".sidebar > .nav:not(.sys-nav)");
@@ -1443,10 +1447,10 @@ function reuseMailRouteShell(previousRoute) {
   if (!nav || !button || !mobile || !crumb || !mobileTitle || !$("#view")) return false;
   nav.querySelectorAll(".nav-item[data-service]").forEach(item => item.classList.toggle("active", item === button));
   nav.querySelectorAll(":scope > .nav-sub").forEach(item => item.remove());
-  if (App.route === "mail") {
-    const sub = el("div", { class:"nav-sub", id:"subnav-mail" });
+  if (svcFilters(App.route)) {
+    const sub = el("div", { class:"nav-sub", id:`subnav-${App.route}` });
     button.after(sub);
-    rebuildSubnav("mail");
+    rebuildSubnav(App.route);
   }
   crumb.textContent = routeLabel(App.route);
   mobileTitle.textContent = routeLabel(App.route);
@@ -1641,7 +1645,7 @@ function onRoute() {
   // Yield the decorative canvas briefly while navigation builds the mail view.
   if (primaryProviderMail) Net.deferAnimation(250);
   const primeMail = primaryProviderMail ? { account, request: startPrimaryMailCache(account) } : null;
-  if (!reuseMailRouteShell(prevRoute)) renderShell();
+  if (!reuseProviderRouteShell(prevRoute)) renderShell();
   const view = $("#view");
   let p;
   if (App.route === "overview") p = renderOverview(view);
