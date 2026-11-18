@@ -1629,16 +1629,19 @@ impl ProviderCredentialStore for DesktopCredentialStore {
         }
         .save_to_keyring(&path)
         .map_err(|_| "System keyring unavailable".to_string())?;
-        if self.is_durable_marker(account) {
+        // A completed exchange may remove its durable claim immediately after
+        // this returns. Persist the account marker first as well as recovery
+        // markers, so that claim removal cannot outrun the local marker.
+        if account == self.account || self.is_durable_marker(account) {
             std::fs::File::open(&path)
                 .and_then(|file| file.sync_all())
-                .map_err(|_| "Revocation marker durability unavailable")?;
+                .map_err(|_| "Credential marker durability unavailable")?;
             let parent = path
                 .parent()
-                .ok_or("Revocation marker directory unavailable")?;
+                .ok_or("Credential marker directory unavailable")?;
             std::fs::File::open(parent)
                 .and_then(|file| file.sync_all())
-                .map_err(|_| "Revocation marker durability unavailable")?;
+                .map_err(|_| "Credential marker durability unavailable")?;
         }
         Ok(())
     }
@@ -2447,6 +2450,20 @@ mod tests {
         store.delete(&key, &attempt.origin).unwrap();
         assert!(!path.exists());
         claim_exchange(&attempt, &store).unwrap();
+        let credential = ProviderCredential {
+            access_token: "test-access".into(),
+            refresh_token: Some("test-refresh".into()),
+            expires_at: 1,
+            subject: Some("test-subject".into()),
+        };
+        store.replace("a", &attempt.origin, &credential).unwrap();
+        assert!(attempt.cache_path.is_file());
+        store.delete(&key, &attempt.origin).unwrap();
+        assert!(store.load("a", &attempt.origin).unwrap().is_some());
+        assert!(matches!(
+            claim_exchange(&attempt, &store),
+            Err(AuthFinishError::Failed(_))
+        ));
     }
 
     #[test]
