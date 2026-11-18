@@ -55,6 +55,8 @@ impl<T: Clone> ProviderProgressiveState<T> {
     pub fn remove(&mut self, id: &str) {
         self.activities.remove(id);
     }
+    // Keep the independently checked authority and provider bindings explicit.
+    #[allow(clippy::too_many_arguments)]
     pub fn issue(
         &mut self,
         authority: &dyn ProgressiveSearchAuthority,
@@ -143,6 +145,7 @@ impl<T: Clone> ProviderProgressiveState<T> {
         Ok((activity_id, continuation, metadata))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn consume(
         &mut self,
         authority: &dyn ProgressiveSearchAuthority,
@@ -199,6 +202,7 @@ impl<T: Clone> ProviderProgressiveState<T> {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn next_page(
         &mut self,
         authority: &dyn ProgressiveSearchAuthority,

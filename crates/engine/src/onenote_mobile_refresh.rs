@@ -669,7 +669,7 @@ mod tests {
     #[test]
     fn wp16_onenote_resource_page_cursor_reaches_beyond_fifty_and_missing_page() {
         let mut pages: Vec<_> = (0..52)
-            .map(|n| Item::new("a", "onenote", &format!("p{n:03}"), "page", "page"))
+            .map(|n| Item::new("a", "onenote", format!("p{n:03}"), "page", "page"))
             .collect();
         let mut cursor = None;
         for index in 0..50 {
@@ -743,7 +743,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         for n in 0..9 {
             store
-                .upsert_item(&Item::new("a", "onenote", &format!("p{n}"), "page", "page"))
+                .upsert_item(&Item::new("a", "onenote", format!("p{n}"), "page", "page"))
                 .unwrap();
         }
         store

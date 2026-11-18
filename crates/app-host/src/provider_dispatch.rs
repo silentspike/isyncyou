@@ -948,7 +948,6 @@ mod tests {
             &mut context,
         )
         .unwrap();
-        drop(context);
         let stages: Vec<_> = events
             .iter()
             .filter_map(|event| match event {
