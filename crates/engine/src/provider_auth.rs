@@ -1526,6 +1526,13 @@ pub fn probe_jmap_admin_boundary(cfg: &Config, id: &str) -> Result<&'static str,
 }
 #[cfg(not(target_os = "android"))]
 impl DesktopCredentialStore {
+    fn is_durable_marker(&self, account: &str) -> bool {
+        account == revocation_pending_key(&self.account)
+            || account == exchange_pending_key(&self.account)
+            || account == refresh_pending_key(&self.account)
+            || account.starts_with("isyncyou-internal:refresh-candidate:")
+    }
+
     fn path_for(&self, account: &str, origin: &str) -> Result<PathBuf, String> {
         if origin != self.origin {
             return Err("Credential account mismatch".into());
@@ -1622,10 +1629,7 @@ impl ProviderCredentialStore for DesktopCredentialStore {
         }
         .save_to_keyring(&path)
         .map_err(|_| "System keyring unavailable".to_string())?;
-        if account == revocation_pending_key(&self.account)
-            || account == refresh_pending_key(&self.account)
-            || account.starts_with("isyncyou-internal:refresh-candidate:")
-        {
+        if self.is_durable_marker(account) {
             std::fs::File::open(&path)
                 .and_then(|file| file.sync_all())
                 .map_err(|_| "Revocation marker durability unavailable")?;
@@ -1640,9 +1644,7 @@ impl ProviderCredentialStore for DesktopCredentialStore {
     }
     fn delete(&self, account: &str, origin: &str) -> Result<(), String> {
         let path = self.path_for(account, origin)?;
-        let durable = account == revocation_pending_key(&self.account)
-            || account == refresh_pending_key(&self.account)
-            || account.starts_with("isyncyou-internal:refresh-candidate:");
+        let durable = self.is_durable_marker(account);
         delete_desktop_credential(&path, durable)?;
         if durable {
             let parent = path
@@ -1663,8 +1665,8 @@ fn delete_desktop_credential(path: &std::path::Path, marker: bool) -> Result<(),
         &path.to_string_lossy(),
     )
     .map_err(|_| "System keyring unavailable")?;
-    // A revocation marker is deleted only after the grant and its credential
-    // are gone. Removing its file first avoids an unreadable marker after a
+    // A completed operation's marker can be removed only after its outcome is
+    // resolved. Removing its file first avoids an unreadable marker after a
     // crash between keyring and file removal; any orphaned keyring entry holds
     // only the already-completed marker, not the grant.
     if marker {
@@ -2385,6 +2387,66 @@ mod tests {
         assert!(verified_subject_locked(&keys, "a", &attempt.origin)
             .unwrap()
             .is_none());
+    }
+
+    #[cfg(all(feature = "desktop-keyring", not(target_os = "android")))]
+    #[test]
+    fn desktop_exchange_claim_persists_and_fails_closed_when_secret_is_missing() {
+        const CHILD: &str = "ISYNCYOU_EXCHANGE_DURABILITY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("provider_auth::tests::desktop_exchange_claim_persists_and_fails_closed_when_secret_is_missing")
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let attempt = AuthAttempt {
+            authorization_uri: String::new(),
+            origin: "https://example.test".into(),
+            client_id: "client".into(),
+            token_endpoint: "https://example.test/token".into(),
+            revocation_endpoint: "https://example.test/revoke".into(),
+            redirect_uri: "http://127.0.0.1:53682/oauth/callback".into(),
+            verifier: "verifier".into(),
+            state: "nonce".into(),
+            cache_path: dir.path().join("cache.json"),
+            account_id: "a".into(),
+            expected_username: "user".into(),
+            account_config: Config::default(),
+            started_at: now(),
+        };
+        let store = DesktopCredentialStore {
+            path: attempt.cache_path.clone(),
+            account: attempt.account_id.clone(),
+            origin: attempt.origin.clone(),
+        };
+        let key = exchange_pending_key("a");
+        assert!(store.is_durable_marker(&key));
+        claim_exchange(&attempt, &store).unwrap();
+        let path = store.path_for(&key, &attempt.origin).unwrap();
+        assert!(path.is_file());
+        assert!(matches!(
+            claim_exchange(&attempt, &store),
+            Err(AuthFinishError::ExchangeUnknown)
+        ));
+        let claim = store.load(&key, &attempt.origin).unwrap().unwrap();
+        keyring_core::Entry::new(
+            "org.silentspike.isyncyou.token-cache",
+            &path.to_string_lossy(),
+        )
+        .unwrap()
+        .delete_credential()
+        .unwrap();
+        assert!(claim_exchange(&attempt, &store).is_err());
+        store.replace(&key, &attempt.origin, &claim).unwrap();
+        store.delete(&key, &attempt.origin).unwrap();
+        assert!(!path.exists());
+        claim_exchange(&attempt, &store).unwrap();
     }
 
     #[test]
