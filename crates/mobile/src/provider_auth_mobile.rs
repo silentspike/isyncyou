@@ -423,7 +423,7 @@ fn finish(base: &Path, callback: &str) -> Result<(), provider_auth::AuthFinishEr
 fn status(base: &Path, account: &str) -> Result<bool, String> {
     let cfg = config(base)?;
     let store = AndroidProviderCredentialStore::new(base)?;
-    provider_auth::self_hosted_auth_status_with_store(&cfg, account, &store)
+    provider_auth::try_self_hosted_auth_status_with_store(&cfg, account, &store)
 }
 
 #[no_mangle]
@@ -767,7 +767,7 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeProvider
         let account = jni_get_string(&mut env, &account).ok_or(())?;
         let cfg = config(Path::new(&base)).map_err(|_| ())?;
         let store = AndroidProviderCredentialStore::new(Path::new(&base)).map_err(|_| ())?;
-        match provider_auth::refresh_recovery_state_with_store(&cfg, &account, &store)
+        match provider_auth::try_refresh_recovery_state_with_store(&cfg, &account, &store)
             .map_err(|_| ())?
         {
             "none" => Ok::<i32, ()>(0),
@@ -795,7 +795,7 @@ pub extern "system" fn Java_com_silentspike_isyncyou_NativeEngine_nativeProvider
         let account = jni_get_string(&mut env, &account).ok_or(())?;
         let cfg = config(Path::new(&base)).map_err(|_| ())?;
         let store = AndroidProviderCredentialStore::new(Path::new(&base)).map_err(|_| ())?;
-        match provider_auth::logout_recovery_state_with_store(&cfg, &account, &store)
+        match provider_auth::try_logout_recovery_state_with_store(&cfg, &account, &store)
             .map_err(|_| ())?
         {
             "none" => Ok::<i32, ()>(0),

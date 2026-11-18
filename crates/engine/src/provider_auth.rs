@@ -1018,6 +1018,21 @@ fn lock(path: &std::path::Path) -> Result<std::fs::File, String> {
     Ok(lock)
 }
 
+// Status endpoints must not wait behind a sync, login, or refresh holding the
+// account lock during network I/O. A busy lock means the state is unknown.
+fn try_status_lock(path: &std::path::Path) -> Result<std::fs::File, String> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))
+        .map_err(|_| "Credential lock unavailable")?;
+    file.try_lock_exclusive()
+        .map_err(|_| "Credential status busy")?;
+    Ok(file)
+}
+
 /// Cross-process lease for the one event stream of a configured account.
 pub(crate) fn try_event_stream_lease(cfg: &Config, id: &str) -> Result<std::fs::File, String> {
     let (_, _, path) = account(cfg, id)?;
@@ -1154,7 +1169,16 @@ pub fn refresh_recovery_state_with_store(
 ) -> Result<&'static str, String> {
     let (origin, client_id, path) = account(cfg, id)?;
     let _lock = lock(&path)?;
-    let Some(record) = store.load(&refresh_pending_key(id), &origin)? else {
+    refresh_recovery_state_locked(id, &origin, &client_id, store)
+}
+
+fn refresh_recovery_state_locked(
+    id: &str,
+    origin: &str,
+    client_id: &str,
+    store: &dyn ProviderCredentialStore,
+) -> Result<&'static str, String> {
+    let Some(record) = store.load(&refresh_pending_key(id), origin)? else {
         return Ok("none");
     };
     let claim: RefreshClaim =
@@ -1165,19 +1189,20 @@ pub fn refresh_recovery_state_with_store(
         || claim.client_id != client_id
         || !valid_recovery_id(&claim.operation)
         || store
-            .load(&grant_generation_key(id), &origin)?
+            .load(&grant_generation_key(id), origin)?
             .map(|value| value.access_token)
             != Some(claim.generation)
     {
         return Err("Refresh recovery binding changed".into());
     }
     let key = refresh_candidate_key(id, &claim.operation);
-    let volatile = volatile_refresh_candidates()
+    let candidate_in_memory = volatile_refresh_candidates()
         .lock()
-        .map_err(|_| "Refresh recovery unavailable")?;
+        .map_err(|_| "Refresh recovery unavailable")?
+        .contains_key(&key);
     if claim.installed_digest.is_some()
-        || volatile.contains_key(&key)
-        || store.load(&key, &origin)?.is_some()
+        || candidate_in_memory
+        || store.load(&key, origin)?.is_some()
     {
         Ok("successor_pending")
     } else {
@@ -1185,10 +1210,51 @@ pub fn refresh_recovery_state_with_store(
     }
 }
 
+/// Read the local grant and refresh state together without waiting for another
+/// operation and without advancing a pending refresh. Errors mean unknown.
+pub fn try_self_hosted_status_with_store(
+    cfg: &Config,
+    id: &str,
+    store: &dyn ProviderCredentialStore,
+) -> Result<(bool, &'static str), String> {
+    let (origin, client_id, path) = account(cfg, id)?;
+    let _lock = try_status_lock(&path)?;
+    let refresh = refresh_recovery_state_locked(id, &origin, &client_id, store)?;
+    if refresh != "none" {
+        return Ok((false, refresh));
+    }
+    if store.load(&exchange_pending_key(id), &origin)?.is_some()
+        || store.load(&revocation_pending_key(id), &origin)?.is_some()
+    {
+        return Err("Provider authentication outcome unknown".into());
+    }
+    Ok((
+        verified_subject_locked(store, id, &origin)?.is_some(),
+        refresh,
+    ))
+}
+
+pub fn try_self_hosted_status(cfg: &Config, id: &str) -> Result<(bool, &'static str), String> {
+    with_platform_credential_store(cfg, id, |store| {
+        try_self_hosted_status_with_store(cfg, id, store)
+    })
+}
+
 pub fn refresh_recovery_state(cfg: &Config, id: &str) -> Result<&'static str, String> {
     with_platform_credential_store(cfg, id, |store| {
         refresh_recovery_state_with_store(cfg, id, store)
     })
+}
+
+/// Nonblocking variant for status-only consumers; never advances recovery.
+pub fn try_refresh_recovery_state_with_store(
+    cfg: &Config,
+    id: &str,
+    store: &dyn ProviderCredentialStore,
+) -> Result<&'static str, String> {
+    let (origin, client_id, path) = account(cfg, id)?;
+    let _lock = try_status_lock(&path)?;
+    refresh_recovery_state_locked(id, &origin, &client_id, store)
 }
 
 fn recover_refresh(
@@ -1659,6 +1725,21 @@ pub fn self_hosted_auth_status_with_store(
     Ok(verified_subject_locked(store, id, &origin)?.is_some())
 }
 
+/// Preserve the status reader's grant semantics while avoiding a wait behind
+/// network-bearing credential operations. Pending refresh remains unknown.
+pub fn try_self_hosted_auth_status_with_store(
+    cfg: &Config,
+    id: &str,
+    store: &dyn ProviderCredentialStore,
+) -> Result<bool, String> {
+    let (origin, client_id, path) = account(cfg, id)?;
+    let _lock = try_status_lock(&path)?;
+    if refresh_recovery_state_locked(id, &origin, &client_id, store)? != "none" {
+        return Err("Provider refresh outcome unknown".into());
+    }
+    Ok(verified_subject_locked(store, id, &origin)?.is_some())
+}
+
 /// Return only the locally bound provider subject when the current installation
 /// still holds a matching refresh grant. This performs no token refresh or I/O
 /// to the provider; the subject is sensitive account metadata, never a token.
@@ -1980,13 +2061,33 @@ pub fn logout_recovery_state_with_store(
 ) -> Result<&'static str, String> {
     let (origin, client_id, path) = account(cfg, id)?;
     let _lock = lock(&path)?;
-    let Some(value) = store.load(&revocation_pending_key(id), &origin)? else {
+    logout_recovery_state_locked(id, &origin, &client_id, store)
+}
+
+/// Status-only lookup: a concurrent account operation must not block the UI.
+pub fn try_logout_recovery_state_with_store(
+    cfg: &Config,
+    id: &str,
+    store: &dyn ProviderCredentialStore,
+) -> Result<&'static str, String> {
+    let (origin, client_id, path) = account(cfg, id)?;
+    let _lock = try_status_lock(&path)?;
+    logout_recovery_state_locked(id, &origin, &client_id, store)
+}
+
+fn logout_recovery_state_locked(
+    id: &str,
+    origin: &str,
+    client_id: &str,
+    store: &dyn ProviderCredentialStore,
+) -> Result<&'static str, String> {
+    let Some(value) = store.load(&revocation_pending_key(id), origin)? else {
         return Ok("none");
     };
     let Ok(marker) = serde_json::from_str::<LogoutMarker>(&value.access_token) else {
         return Ok("unbound");
     };
-    let cache = store.load(id, &origin)?;
+    let cache = store.load(id, origin)?;
     if marker.version != 1
         || marker.account != id
         || marker.origin != origin
@@ -1999,7 +2100,7 @@ pub fn logout_recovery_state_with_store(
     {
         return Ok("unbound");
     }
-    let base = reqwest::Url::parse(&origin).map_err(|_| "Invalid provider origin")?;
+    let base = reqwest::Url::parse(origin).map_err(|_| "Invalid provider origin")?;
     if same_origin(&base, &marker.endpoint).is_err() {
         return Ok("unbound");
     }
@@ -3036,6 +3137,127 @@ mod tests {
             expires_at: 1,
             subject: Some("subject".into()),
         }
+    }
+
+    #[test]
+    fn account_status_does_not_wait_for_active_credential_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.accounts.push(isyncyou_core::AccountConfig {
+            id: "a".into(),
+            username: "user".into(),
+            sync_root: PathBuf::new(),
+            archive_root: dir.path().into(),
+            cache_root: PathBuf::new(),
+            mount_point: None,
+        });
+        cfg.provider_accounts.insert(
+            "a".into(),
+            ProviderConfig::SelfHosted {
+                origin: "https://example.test".into(),
+                client_id: "client".into(),
+            },
+        );
+        let store = RefreshTestStore::default();
+        let (_, _, path) = account(&cfg, "a").unwrap();
+        let held = lock(&path).unwrap();
+        let started = std::time::Instant::now();
+        assert!(try_self_hosted_status_with_store(&cfg, "a", &store).is_err());
+        assert!(try_self_hosted_auth_status_with_store(&cfg, "a", &store).is_err());
+        assert!(try_refresh_recovery_state_with_store(&cfg, "a", &store).is_err());
+        assert!(try_logout_recovery_state_with_store(&cfg, "a", &store).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(store.data.lock().unwrap().is_empty());
+        drop(held);
+        assert_eq!(
+            try_self_hosted_status_with_store(&cfg, "a", &store).unwrap(),
+            (false, "none")
+        );
+        assert_eq!(
+            try_logout_recovery_state_with_store(&cfg, "a", &store).unwrap(),
+            "none"
+        );
+        assert!(!try_self_hosted_auth_status_with_store(&cfg, "a", &store).unwrap());
+        assert_eq!(
+            try_refresh_recovery_state_with_store(&cfg, "a", &store).unwrap(),
+            "none"
+        );
+        let marker = LogoutMarker {
+            version: 1,
+            state: "revoked".into(),
+            account: "a".into(),
+            origin: "https://example.test".into(),
+            client_id: "client".into(),
+            endpoint: "https://example.test/auth/revoke".into(),
+            credential_digest: credential_digest(&old_refresh_credential()),
+            grant_generation: None,
+        };
+        save_logout_marker(
+            &store,
+            &revocation_pending_key("a"),
+            "https://example.test",
+            &marker,
+        )
+        .unwrap();
+        let before_logout = store
+            .load(&revocation_pending_key("a"), "https://example.test")
+            .unwrap()
+            .unwrap()
+            .access_token;
+        assert_eq!(
+            try_logout_recovery_state_with_store(&cfg, "a", &store).unwrap(),
+            "resume"
+        );
+        assert!(!try_self_hosted_auth_status_with_store(&cfg, "a", &store).unwrap());
+        assert_eq!(
+            try_refresh_recovery_state_with_store(&cfg, "a", &store).unwrap(),
+            "none"
+        );
+        assert_eq!(
+            logout_recovery_state_with_store(&cfg, "a", &store).unwrap(),
+            "resume"
+        );
+        assert_eq!(
+            store
+                .load(&revocation_pending_key("a"), "https://example.test")
+                .unwrap()
+                .unwrap()
+                .access_token,
+            before_logout
+        );
+        store
+            .delete(&revocation_pending_key("a"), "https://example.test")
+            .unwrap();
+        let old = old_refresh_credential();
+        store.replace("a", "https://example.test", &old).unwrap();
+        assert!(
+            refresh_locked("a", "https://example.test", "client", &store, old, |_| {
+                Err("response lost".into())
+            })
+            .is_err()
+        );
+        let original = store
+            .load(&refresh_pending_key("a"), "https://example.test")
+            .unwrap()
+            .unwrap()
+            .access_token;
+        assert_eq!(
+            try_self_hosted_status_with_store(&cfg, "a", &store).unwrap(),
+            (false, "outcome_unknown")
+        );
+        assert!(try_self_hosted_auth_status_with_store(&cfg, "a", &store).is_err());
+        assert_eq!(
+            try_refresh_recovery_state_with_store(&cfg, "a", &store).unwrap(),
+            "outcome_unknown"
+        );
+        assert_eq!(
+            store
+                .load(&refresh_pending_key("a"), "https://example.test")
+                .unwrap()
+                .unwrap()
+                .access_token,
+            original
+        );
     }
 
     #[test]

@@ -21530,13 +21530,15 @@ impl isyncyou_webui::AccountAuthHandler for DaemonAccountAuth {
     fn status(&self, account: &str) -> isyncyou_webui::AccountAuthStatus {
         let cfg = self.current_config().unwrap_or_else(|| self.cfg.clone());
         if cfg.provider_accounts.contains_key(account) {
-            let connected = isyncyou_engine::provider_auth::self_hosted_auth_status(&cfg, account)
-                .unwrap_or(false);
-            let refresh = isyncyou_engine::provider_auth::refresh_recovery_state(&cfg, account);
-            let state = match refresh.as_deref() {
-                Ok("outcome_unknown") => isyncyou_webui::AccountAuthState::RefreshOutcomeUnknown,
-                Ok("successor_pending") => isyncyou_webui::AccountAuthState::RefreshRecoveryPending,
-                Ok("none") => provider_mail_role_state(
+            let local = isyncyou_engine::provider_auth::try_self_hosted_status(&cfg, account);
+            let state = match local {
+                Ok((_, "outcome_unknown")) => {
+                    isyncyou_webui::AccountAuthState::RefreshOutcomeUnknown
+                }
+                Ok((_, "successor_pending")) => {
+                    isyncyou_webui::AccountAuthState::RefreshRecoveryPending
+                }
+                Ok((connected, "none")) => provider_mail_role_state(
                     connected,
                     isyncyou_engine::self_hosted_mail::mail_access_observation(&cfg, account),
                 ),
