@@ -6,6 +6,7 @@ use isyncyou_connectors::dav::{
 };
 use isyncyou_core::{config::ProviderConfig, Config};
 use isyncyou_store::{ProviderObject, ProviderScope, Store};
+use std::collections::HashSet;
 
 fn configured_origin(cfg: &Config, account: &str) -> Result<String, String> {
     match cfg.provider_accounts.get(account) {
@@ -603,7 +604,15 @@ fn sync_all_inner(
         &client,
         || pass.as_ref().map_or(Ok(()), DavPassStore::validate),
         |scope| sync_detached_inner(cfg, &client, scope, pass.as_ref()),
-        || crate::provider_store::open_for_session(cfg, account),
+        |present| {
+            if let Some(pass) = &pass {
+                pass.validate()?;
+                reconcile_missing_collections(&pass.store, account, &origin, present)
+            } else {
+                let store = crate::provider_store::open_for_session(cfg, account)?;
+                reconcile_missing_collections(&store, account, &origin, present)
+            }
+        },
     )
 }
 
@@ -614,7 +623,7 @@ fn sync_all_observation(
     client: &DavClient,
     validate: impl Fn() -> Result<(), String>,
     sync_scope: impl Fn(&ProviderScope) -> Result<usize, String>,
-    open_store: impl FnOnce() -> Result<Store, String>,
+    reconcile_access: impl FnOnce(&HashSet<(String, String)>) -> Result<(), String>,
 ) -> Result<SyncPass, String> {
     validate()?;
     let started = std::time::Instant::now();
@@ -628,7 +637,7 @@ fn sync_all_observation(
     let collections = collections.map_err(|e| e.to_string())?;
     validate()?;
     let mut report = SyncPass::default();
-    let mut present = std::collections::HashSet::new();
+    let mut present = HashSet::new();
     for (index, collection) in collections.into_iter().enumerate() {
         for (enabled, service) in [
             (collection.calendar, "calendar"),
@@ -667,7 +676,16 @@ fn sync_all_observation(
         }
     }
     validate()?;
-    let store = open_store()?;
+    reconcile_access(&present)?;
+    Ok(report)
+}
+
+fn reconcile_missing_collections(
+    store: &Store,
+    account: &str,
+    origin: &str,
+    present: &HashSet<(String, String)>,
+) -> Result<(), String> {
     for service in ["calendar", "contacts"] {
         for scope in store
             .provider_scopes(account, origin, service)
@@ -680,7 +698,7 @@ fn sync_all_observation(
             }
         }
     }
-    Ok(report)
+    Ok(())
 }
 
 #[cfg(all(test, feature = "encrypted-store"))]
@@ -729,7 +747,7 @@ fn fixture_sync_all(
                     .sync_detached_staged(scope, cursor, accessible, false, None, &mut stage)
                     .map_err(|e| e.to_string())
             },
-            open,
+            |present| reconcile_missing_collections(&open()?, account, origin, present),
         )
     })())
 }
