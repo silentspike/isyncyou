@@ -798,11 +798,28 @@ mod tests {
     #[test]
     fn wp16_onenote_partial_survives_process_restart() {
         const MARKER: &str = "ISYNCYOU_ONENOTE_STATUS_TEST_ROOT";
+        const PHASE: &str = "ISYNCYOU_ONENOTE_STATUS_TEST_PHASE";
+        const KEY_ID: u32 = 916_001;
+        const KEY: [u8; 32] = [41; 32];
         if let Some(root) = std::env::var_os(MARKER) {
-            let raw = isyncyou_core::envelope::read_body(
-                &PathBuf::from(root).join(archive::ONENOTE_MOBILE_REFRESH_STATE_FILE),
-            )
-            .unwrap();
+            let root = PathBuf::from(root);
+            let path = root.join(archive::ONENOTE_MOBILE_REFRESH_STATE_FILE);
+            if std::env::var(PHASE).unwrap() == "write" {
+                isyncyou_core::envelope::set_body_key(KEY_ID, KEY);
+                persist_refresh_state(&root, true).unwrap();
+                let sealed = std::fs::read(&path).unwrap();
+                assert_eq!(isyncyou_core::envelope::blob_key_id(&sealed), Some(KEY_ID));
+                return;
+            }
+            assert_eq!(std::env::var(PHASE).unwrap(), "read");
+            assert_eq!(
+                isyncyou_core::envelope::read_body(&path)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            isyncyou_core::envelope::set_body_key(KEY_ID, KEY);
+            let raw = isyncyou_core::envelope::read_body(&path).unwrap();
             assert_eq!(
                 serde_json::from_slice::<Value>(&raw).unwrap()["state"],
                 "partial"
@@ -810,15 +827,17 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        persist_refresh_state(dir.path(), true).unwrap();
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("--exact")
-            .arg("onenote_mobile_refresh::tests::wp16_onenote_partial_survives_process_restart")
-            .arg("--test-threads=1")
-            .env(MARKER, dir.path())
-            .status()
-            .unwrap();
-        assert!(status.success());
+        for phase in ["write", "read"] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("onenote_mobile_refresh::tests::wp16_onenote_partial_survives_process_restart")
+                .arg("--test-threads=1")
+                .env(MARKER, dir.path())
+                .env(PHASE, phase)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{phase} subprocess failed");
+        }
     }
 
     #[test]
