@@ -58,6 +58,30 @@ for (const service of ["calendar", "todo", "contacts"]) {
   select.value = "B"; select.fire("change"); pending.shift().resolve(page("B", "Revoked", false)); await tick();
   assert.ok(walk(list).some(x => x.text === "Revoked"));
   assert.equal(walk(list).filter(x => x.tag === "button").length, 0, `${service}: revoked cache is read-only`);
+  if (service !== "contacts") {
+    select.value = "A"; select.fire("change"); const inFlight = pending.shift();
+    App.liveUpdate(); App.liveUpdate();
+    assert.equal(pending.length, 0, `${service}: events coalesce while loading`);
+    inFlight.resolve(page("A", "Before update")); await tick();
+    assert.equal(pending.length, 1, `${service}: one pending refresh follows load`);
+    pending.shift().resolve(page("A", "After update")); await tick();
+    assert.ok(walk(list).some(x => x.text === "After update"));
+    assert.equal(pending.length, 0, `${service}: no unsolicited refresh loop`);
+    select.value = "A"; select.fire("change"); const stale = pending.shift();
+    App.liveUpdate(); select.value = "B"; select.fire("change"); const fresh = pending.shift();
+    stale.resolve(page("A", "Wrong scope")); await tick();
+    assert.equal(pending.length, 0, `${service}: scope change drops obsolete pending refresh`);
+    fresh.resolve(page("B", "Current scope", false)); await tick();
+    assert.equal(walk(list).filter(x => x.tag === "button").length, 0, `${service}: access gating survives refresh`);
+    select.value = "A"; select.fire("change"); const detached = pending.shift();
+    App.liveUpdate(); view.isConnected = false; detached.resolve(page("A", "Detached")); await tick();
+    assert.equal(pending.length, 0, `${service}: detached route does not refresh`);
+    view.isConnected = true;
+    select.value = "A"; select.fire("change"); const wrongAccount = pending.shift();
+    App.liveUpdate(); App.account = "other"; wrongAccount.resolve(page("A", "Old account")); await tick();
+    assert.equal(pending.length, 0, `${service}: account switch prevents refresh`);
+    App.account = "a";
+  }
 }
 const projected = ctx.project([{id:"m", mailboxIds:{a:true,b:true,c:false}, keywords:{$flagged:true}}], "");
 assert.equal(projected[0].preview.flag, "flagged");

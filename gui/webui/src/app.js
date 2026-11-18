@@ -4416,7 +4416,7 @@ async function renderProviderCalendarView(view, service) {
     finally { freebusy.disabled = false; }
   } }, "Show free/busy");
   const more = el("button", { class:"btn sm", type:"button", style:"display:none" }, "Load more");
-  let cursor = null, digest = null, origin = null, selected = "", requestGeneration = 0;
+  let cursor = null, digest = null, origin = null, selected = "", requestGeneration = 0, pendingRefresh = false;
   const values = (properties, key) => Array.isArray(properties[key]) ? properties[key].map(entry => {
     const params = entry.parameters && Object.keys(entry.parameters).length ? ` ${JSON.stringify(entry.parameters)}` : "";
     return `${entry.value ?? ""}${params}`;
@@ -4522,15 +4522,22 @@ async function renderProviderCalendarView(view, service) {
       cursor = page.next_after || null; more.style.display = cursor && digest ? "" : "none";
       if (cursor && !digest) status.textContent += " · paging unavailable without a cached collection version";
     } catch (_) { if (current()) { clear(list); cursor = digest = origin = null; selected = ""; more.style.display = "none"; status.textContent = "Cached calendar resources are unavailable."; } }
-    finally { if (current()) more.disabled = false; }
+    finally {
+      if (current()) {
+        more.disabled = false;
+        if (pendingRefresh) { pendingRefresh = false; void load(true); }
+      }
+    }
   };
-  select.addEventListener("change", () => { ++requestGeneration; cursor = digest = origin = null; selected = ""; clear(list); clear(expanded); more.style.display = "none"; void load(true); });
+  select.addEventListener("change", () => { pendingRefresh = false; ++requestGeneration; cursor = digest = origin = null; selected = ""; clear(list); clear(expanded); more.style.display = "none"; void load(true); });
   month.addEventListener("change", () => clear(expanded));
   more.addEventListener("click", () => { if (cursor) void load(false); });
   // A sync event must refresh cached rows without rebuilding the view: the
   // selected collection, month and server-expanded occurrences are user state.
   App.liveUpdate = () => {
-    if (view.isConnected && App.account === account && select.value && !more.disabled) void load(true);
+    if (!view.isConnected || App.account !== account || !select.value) return;
+    if (more.disabled) { pendingRefresh = true; return; }
+    void load(true);
   };
   view.append(el("div", { class:"con-page provider-calendar-page" }, el("h2", { text:service === "todo" ? "Tasks" : "Calendar" }), select, backupStatus, CAP.agent ? el("button", { class:"btn sm provider-create", type:"button", onclick:() => openProviderCreate(account, select.value, service === "todo" ? "task" : "event") }, service === "todo" ? "New task" : "New event") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderCollectionAccess(account, "calendar", select.value) }, "Manage collection access") : null, CAP.agent ? el("button", { class:"btn sm", type:"button", onclick:() => openProviderRecovery(account,"Recovered") }, "Recover…") : null, status, note, list, more, month, expand, service === "calendar" ? freebusy : null, expanded));
   try {
