@@ -69,14 +69,23 @@ pub struct Budget<'a> {
     pub reserve: u64,
 }
 impl Budget<'_> {
-    fn admit(&mut self, bytes: usize) -> Result<()> {
-        let required = (bytes as u64).saturating_mul(4);
-        if required > self.remaining
-            || fs2::available_space(self.path)? < required.saturating_add(self.reserve)
-        {
+    fn admit(&mut self, bytes: usize, logical_factor: u64) -> Result<()> {
+        let logical = (bytes as u64).saturating_mul(logical_factor);
+        // A single immutable MIME is charged once to the cumulative logical
+        // limit; keep the original fourfold physical free-space guard for each
+        // write, independently of that accounting.
+        let physical_guard = (bytes as u64).saturating_mul(4);
+        if logical > self.remaining {
             return Err("export storage capacity unavailable".into());
         }
-        self.remaining -= required;
+        self.admit_available(logical, physical_guard, fs2::available_space(self.path)?)
+    }
+
+    fn admit_available(&mut self, logical: u64, physical_guard: u64, available: u64) -> Result<()> {
+        if logical > self.remaining || available < physical_guard.saturating_add(self.reserve) {
+            return Err("export storage capacity unavailable".into());
+        }
+        self.remaining -= logical;
         Ok(())
     }
 }
@@ -145,14 +154,14 @@ fn capture_objects(
                 if mime.len() > MAX_ENVELOPE {
                     return Err(invalid());
                 }
-                budget.admit(mime.len())?;
+                budget.admit(mime.len(), 1)?;
                 let digest = isyncyou_exporter::put(budget.path, &mime)?;
                 (digest, mime.len() as u64)
             }
         };
         let captured = isyncyou_store::mail_capture_object(object, &mime_digest, mime_size)
             .map_err(|_| invalid())?;
-        budget.admit(captured.raw.len())?;
+        budget.admit(captured.raw.len(), 4)?;
         changes.push(ProviderChange::Upsert(captured));
     }
     Ok(changes)
@@ -395,6 +404,32 @@ mod tests {
             service: "mail".into(),
             collection: "a".into(),
         }
+    }
+
+    #[test]
+    fn mime_logical_charge_preserves_metadata_and_free_space_guards() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut budget = Budget {
+            path: dir.path(),
+            remaining: 1000,
+            reserve: 0,
+        };
+        // 800 bytes exceeds the old fourfold cumulative allowance, but the
+        // immutable blob occupies one logical copy in the archive.
+        budget.admit(800, 1).unwrap();
+        assert_eq!(budget.remaining, 200);
+        assert!(budget.admit(51, 4).is_err());
+        assert_eq!(budget.remaining, 200);
+        budget.admit(50, 4).unwrap();
+        assert_eq!(budget.remaining, 0);
+        assert!(budget.admit(1, 1).is_err());
+        let mut guarded = Budget {
+            path: dir.path(),
+            remaining: 1000,
+            reserve: 997,
+        };
+        assert!(guarded.admit_available(1, 4, 1000).is_err());
+        assert_eq!(guarded.remaining, 1000);
     }
 
     #[test]
