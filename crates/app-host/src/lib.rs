@@ -38776,7 +38776,27 @@ fn provider_setup_reloads_account_without_cross_account_fallback() {
 fn self_hosted_account_never_reports_microsoft_status() {
     use isyncyou_webui::{AccountAuthHandler, AccountAuthState};
 
+    let root = tempfile::tempdir().unwrap();
     let mut cfg = Config::default();
+    cfg.accounts.push(isyncyou_core::AccountConfig {
+        id: "account-slot".into(),
+        username: "account-slot".into(),
+        sync_root: root.path().join("sync"),
+        archive_root: root.path().to_path_buf(),
+        cache_root: root.path().join("cache"),
+        mount_point: None,
+    });
+    // A Microsoft fallback would report reconnect required for these invalid caches.
+    std::fs::write(
+        root.path().join(isyncyou_engine::auth::READ_CACHE_FILE),
+        b"invalid",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join(isyncyou_engine::auth::WRITE_CACHE_FILE),
+        b"invalid",
+    )
+    .unwrap();
     cfg.provider_accounts.insert(
         "account-slot".into(),
         isyncyou_core::config::ProviderConfig::SelfHosted {
@@ -38794,6 +38814,18 @@ fn self_hosted_account_never_reports_microsoft_status() {
     assert_eq!(status.reader.state, AccountAuthState::Disconnected);
     assert_eq!(status.writer.state, AccountAuthState::Disconnected);
     assert!(auth.logins.lock().unwrap().is_empty());
+
+    let mut incomplete = auth.cfg.clone();
+    incomplete.accounts.clear();
+    let auth = DaemonAccountAuth {
+        cfg: incomplete,
+        config_path: None,
+        credential_commit_gate: None,
+        logins: Mutex::new(std::collections::HashMap::new()),
+    };
+    let status = auth.status("account-slot");
+    assert_eq!(status.reader.state, AccountAuthState::AccessUnknown);
+    assert_eq!(status.writer.state, AccountAuthState::AccessUnknown);
 }
 
 #[cfg(test)]
