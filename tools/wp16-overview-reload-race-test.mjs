@@ -18,7 +18,9 @@ const defer=(path)=>new Promise((resolve,reject)=>pending.push({path,resolve,rej
 const take=path=>{const i=pending.findIndex(p=>p.path.startsWith(path));assert.notEqual(i,-1,`missing ${path}`);return pending.splice(i,1)[0]};
 const App={account:'a',accounts:[{id:'a',provider:'self_hosted'}],route:'overview',counts:{}};
 const api=path=>defer(path);
+const frames=new Map();let frameSeq=0;
 const ctx=vm.createContext({App,api,qs:o=>new URLSearchParams(o).toString(),Date,Number,Array,Map,Set,URLSearchParams,
+ document:{hidden:false},requestAnimationFrame(fn){const id=++frameSeq;frames.set(id,fn);return id},cancelAnimationFrame(id){frames.delete(id)},setTimeout,clearTimeout,
  providerAccountsRefreshing:0,clearProviderMailReads(){},MailSnapshot:{epoch:0,entries:new Map(),inflight:new Map()},clearMailSnapshots(){},accountRoleStatus:()=>({state:'connected'}),
  $:selector=>selector==='#view'?view:find(view,selector.slice(1)),el:(tag,props,...children)=>new Node(tag,props,...children),clear:n=>{n.children=[];return n},
  MOBILE:false,CAP:{},icon:()=>null,updateNavCounts(){},activityChart:()=>null,fmtFullDate:()=>'',fmtDate:()=>'',accountDisplayLabel:()=>'',connItem:()=>null,
@@ -65,4 +67,13 @@ await tick();assert.equal(App.account,'a');assert.equal(shellLabel.text,'Beta');
 take('/api/v1/accounts').resolve({accounts:[{id:'b',provider:'self_hosted',label:'Beta'}]});
 await Promise.all([older,newer]);await tick();assert.equal(shellRenders,1);assert.equal(shellLabel.text,'Alpha');
 overviewResponses(21);await tick();assert.equal(ctx.snapshot('a').items,21);assert.match(text(view),/Archive healthy/);
+// A ready refresh cannot replace the cached summary within the first frame.
+const warm=ctx.render(view);overviewResponses(22);await tick();assert.match(text(view),/Previously: 21/);
+assert.equal(frames.size,1);
+[...frames.values()][0]();assert.match(text(view),/Previously: 21/);
+await warm;assert.match(text(view),/Archive healthy/);assert.equal(ctx.snapshot('a').items,22);
+// Hidden tabs do not depend on requestAnimationFrame firing again.
+ctx.document.hidden=true;
+const hidden=ctx.render(view);overviewResponses(23);await hidden;
+assert.equal(frames.size,0);assert.equal(ctx.snapshot('a').items,23);
 console.log('Overview reload races: pending gating, overlapping reloads, fresh DOM, snapshot isolation and inactive route passed');

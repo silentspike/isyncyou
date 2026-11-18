@@ -1694,6 +1694,22 @@ function rememberOverviewSnapshot(account, st) {
 function cachedOverviewSnapshot(account) {
   return overviewSnapshot?.account === account && overviewSnapshot.expires > Date.now() ? overviewSnapshot : null;
 }
+function afterOverviewFrame() {
+  if (document.hidden) return Promise.resolve();
+  return new Promise(resolve => {
+    const finish = () => {
+      cancelAnimationFrame(frame);
+      clearTimeout(deadline);
+      resolve();
+    };
+    const frame = requestAnimationFrame(() => {
+      // A task after the frame lets the cached summary reach rendering.
+      clearTimeout(deadline);
+      setTimeout(finish, 0);
+    });
+    const deadline = setTimeout(finish, 500);
+  });
+}
 async function renderOverview(view, overviewReads = null) {
   clear(view).append(
     el("h1", { class: "view-title", text: MOBILE ? "Microsoft 365 on this device" : "Microsoft 365 archive overview" }),
@@ -1717,6 +1733,7 @@ async function renderOverview(view, overviewReads = null) {
     clear(body).append(el("div", { class:"card panel", text:"Refreshing account…" }));
     return;
   }
+  const cachedFrame = snapshot ? afterOverviewFrame() : null;
   try {
     const status = shared?.status ?? api("/api/v1/status?" + qs({ account }));
     void status.then(st => {
@@ -1731,6 +1748,7 @@ async function renderOverview(view, overviewReads = null) {
       api("/api/v1/settings").catch(() => ({})),
       (shared?.sync ?? api("/api/v1/sync/state")).catch(() => ({})),
     ]);
+    if (cachedFrame) await cachedFrame;
     if (!current()) return;
     rememberOverviewSnapshot(account, st);
     const services = (st.services || []).slice().sort((a, b) => b.items - a.items);
