@@ -970,22 +970,16 @@ fn provider_domain_worker(
             sync_account(&cfg, &identity.account, &gate, &local_host()).is_ok()
         } else {
             dav_started = Some(std::time::Instant::now());
-            match sync_provider_dav(&cfg, &identity.account) {
-                Ok(result) => {
-                    if result.failed != 0 {
-                        // A partial pass can commit objects and access loss.
-                        // Invalidate cached views before retrying failures.
-                        events.notify();
-                    }
-                    result.failed == 0
-                }
-                Err(_) => false,
-            }
+            sync_provider_dav(&cfg, &identity.account).is_ok_and(|result| result.failed == 0)
         };
         last = Some(std::time::Instant::now());
+        // A DAV pass can commit objects and access loss before a later error.
+        // Refresh cached views without marking the failed pass successful.
+        if ok || !mail {
+            events.notify();
+        }
         if ok {
             retry_secs = 5;
-            events.notify();
         } else {
             if mail {
                 eprintln!("isyncyoud: provider mail delta incomplete");
