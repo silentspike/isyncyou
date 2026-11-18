@@ -1685,7 +1685,7 @@ const SVC_LABEL = { overview: "Overview", mail: "Mail", onedrive: "OneDrive", ca
 const svcLabel = (id) => SVC_LABEL[id] || id;
 // One short-lived, non-sensitive summary for the active account only. Full
 // dashboard data is always reloaded; shared mailbox contents are never cached.
-let overviewSnapshot = null, overviewGeneration = 0, accountReloadGeneration = 0;
+let overviewSnapshot = null, overviewGeneration = 0, accountReloadGeneration = 0, accountReloadNeedsRoute = false;
 function rememberOverviewSnapshot(account, st) {
   const items = st.totals?.items;
   if (!account || !Number.isSafeInteger(items) || items < 0 || !Array.isArray(st.services)) { overviewSnapshot = null; return; }
@@ -10083,10 +10083,11 @@ async function reloadAccounts() {
   clearProviderMailReads();
   MailSnapshot.epoch++;
   try {
-  const current = App.account;
   const data = await api("/api/v1/accounts");
   // A slower, older reload cannot replace a later account result.
   if (reloadGeneration !== accountReloadGeneration) return;
+  // Preserve a manual account switch made while the request was pending.
+  const current = App.account;
   const nextAccounts = data.accounts || [];
   const previously = (App.accounts || []).find(account => account.id === current);
   const next = nextAccounts.find(account => account.id === current);
@@ -10101,13 +10102,19 @@ async function reloadAccounts() {
   App.accounts = nextAccounts;
   App.account = App.accounts.some((account) => account.id === current)
     ? current : (App.accounts[0] && App.accounts[0].id) || null;
+  if (App.account !== current) { App.counts = {}; accountReloadNeedsRoute = true; }
   } finally {
     providerAccountsRefreshing--;
     // A reload invalidates any current overview request. Rebuild exactly once
     // after the final overlapping reload, only if that view is still active.
-    if (!providerAccountsRefreshing && App.route === "overview") {
+    if (!providerAccountsRefreshing) {
       const view = $("#view");
-      if (view?.isConnected && view.contains($("#ov-body"))) void renderOverview(view);
+      if (accountReloadNeedsRoute) {
+        accountReloadNeedsRoute = false;
+        if (view?.isConnected) onRoute();
+      } else if (App.route === "overview" && view?.isConnected && view.contains($("#ov-body"))) {
+        void renderOverview(view);
+      }
     }
   }
 }

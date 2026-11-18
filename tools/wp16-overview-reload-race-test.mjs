@@ -9,6 +9,8 @@ class Node {
  contains(x){return this===x||this.children.some(c=>c instanceof Node&&c.contains(x))}
 }
 const view=new Node('div',{id:'view'});
+const shellLabel=new Node('b',{id:'shell-label',text:'Alpha'});
+let shellRenders=0;
 const find=(node,id)=>node.id===id?node:node.children.filter(c=>c instanceof Node).map(c=>find(c,id)).find(Boolean);
 const text=node=>node instanceof Node?[node.text||'',...node.children.map(text)].join(' '):String(node);
 const pending=[];
@@ -20,8 +22,13 @@ const ctx=vm.createContext({App,api,qs:o=>new URLSearchParams(o).toString(),Date
  providerAccountsRefreshing:0,clearProviderMailReads(){},MailSnapshot:{epoch:0,entries:new Map(),inflight:new Map()},clearMailSnapshots(){},accountRoleStatus:()=>({state:'connected'}),
  $:selector=>selector==='#view'?view:find(view,selector.slice(1)),el:(tag,props,...children)=>new Node(tag,props,...children),clear:n=>{n.children=[];return n},
  MOBILE:false,CAP:{},icon:()=>null,updateNavCounts(){},activityChart:()=>null,fmtFullDate:()=>'',fmtDate:()=>'',accountDisplayLabel:()=>'',connItem:()=>null,
- overviewSignature:()=>'',overviewLiveUpdate(){},syncCmd(){},go(){}});
-vm.runInContext(section('const SVC_COLOR =', 'function overviewSignature(')+section('async function reloadAccounts()', 'function renderAccountMenu')+'\nthis.render=renderOverview;this.reload=reloadAccounts;this.snapshot=cachedOverviewSnapshot;',ctx);
+ overviewSignature:()=>'',overviewLiveUpdate(){},syncCmd(){},go(){},
+ location:{hash:'#/overview'},Mail:{activeScope:'',scopeAccount:'a',sharedReadController:null},
+ visibleServices:()=>[{id:'overview'}],EXTRA_ROUTES:{},eggOn:()=>false,closeSheet(){},closePalette(){},closeAssistantStream(){},
+ reuseProviderRouteShell:()=>false,renderShell(){shellRenders++;shellLabel.text=(App.accounts.find(a=>a.id===App.account)||{}).label||''},
+ Net:{deferAnimation(){}},startPrimaryMailCache(){throw Error('unexpected mail prefetch')},
+ });
+vm.runInContext(section('const SVC_COLOR =', 'function overviewSignature(')+section('async function reloadAccounts()', 'function renderAccountMenu')+section('function onRoute()', '/* ---------------------------------------------------------------- overview')+'\nthis.render=renderOverview;this.reload=reloadAccounts;this.snapshot=cachedOverviewSnapshot;',ctx);
 const tick=()=>new Promise(r=>setImmediate(r));
 const overviewResponses=(items)=>{
  take('/api/v1/status').resolve({totals:{items},services:[{service:'mail',items,archived:0}]});
@@ -44,4 +51,18 @@ assert.match(text(view),/Archive healthy/);assert.equal(ctx.snapshot('a').items,
 // An inactive route is never rebuilt on reload completion.
 const last=ctx.reload();App.route='mail';take('/api/v1/accounts').resolve({accounts:[{id:'a',provider:'self_hosted'}]});await last;
 assert.equal(pending.length,0,'no overview request on inactive route');
+// A manual switch during an outstanding account request remains selected.
+App.route='overview';App.account='a';App.accounts=[{id:'a',provider:'self_hosted',label:'Alpha'},{id:'b',provider:'self_hosted',label:'Beta'}];
+const manual=ctx.reload(); App.account='b'; shellLabel.text='Beta';
+take('/api/v1/accounts').resolve({accounts:[{id:'a',provider:'self_hosted',label:'Alpha'},{id:'b',provider:'self_hosted',label:'Beta'}]});
+await manual;await tick();assert.equal(App.account,'b');assert.equal(shellLabel.text,'Beta');overviewResponses(12);await tick();
+// Removing the selected account while overlapping reloads are pending rebuilds
+// the whole route once, after the last request, with the fallback shell label.
+const older=ctx.reload(), newer=ctx.reload();
+const newerIndex=pending.map(x=>x.path).lastIndexOf('/api/v1/accounts');
+pending.splice(newerIndex,1)[0].resolve({accounts:[{id:'a',provider:'self_hosted',label:'Alpha'}]});
+await tick();assert.equal(App.account,'a');assert.equal(shellLabel.text,'Beta');assert.equal(shellRenders,0);
+take('/api/v1/accounts').resolve({accounts:[{id:'b',provider:'self_hosted',label:'Beta'}]});
+await Promise.all([older,newer]);await tick();assert.equal(shellRenders,1);assert.equal(shellLabel.text,'Alpha');
+overviewResponses(21);await tick();assert.equal(ctx.snapshot('a').items,21);assert.match(text(view),/Archive healthy/);
 console.log('Overview reload races: pending gating, overlapping reloads, fresh DOM, snapshot isolation and inactive route passed');
