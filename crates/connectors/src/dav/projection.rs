@@ -3,42 +3,93 @@
 //! These projections never replace the stored source bytes. An edit must use a
 //! native-preserving editor and a conditional write, not serialize this view.
 
-use icalendar::{Calendar, CalendarComponent, Component, Property};
+use ical::tree::cst::{IcalCst, IcalItem};
 use serde_json::{json, Map, Value};
 
-fn property(value: &Property) -> Value {
-    let params: Map<String, Value> = value
-        .params()
-        .iter()
-        .map(|(name, param)| (name.clone(), Value::String(param.value().to_owned())))
-        .collect();
-    json!({"value":value.value(),"parameters":params})
-}
-
-fn component<T: Component>(item: &T, depth: usize) -> Result<Value, String> {
+fn cst_component(item: &IcalCst<'_>, depth: usize) -> Result<Value, String> {
     if depth > 16 {
         return Err("Calendar nesting exceeds limit".into());
     }
-    let mut properties = Map::new();
-    for (name, value) in item.properties() {
-        properties.insert(name.clone(), Value::Array(vec![property(value)]));
+    let kind = item
+        .begin
+        .as_ref()
+        .ok_or("Calendar component has no beginning")?
+        .raw_value_str();
+    if item
+        .end
+        .as_ref()
+        .map(|line| line.raw_value_str())
+        .as_deref()
+        != Some(kind.as_ref())
+    {
+        return Err("Calendar component is incomplete".into());
     }
-    for (name, values) in item.multi_properties() {
-        let list = properties
-            .entry(name.clone())
-            .or_insert_with(|| Value::Array(Vec::new()));
-        if let Value::Array(list) = list {
-            list.extend(values.iter().map(property));
+    let mut properties = Map::new();
+    let mut children = Vec::new();
+    for entry in &item.items {
+        match entry {
+            IcalItem::Prop(line) => {
+                let name = line.name.get();
+                let params: Map<String, Value> = line
+                    .params
+                    .iter()
+                    .map(|p| {
+                        (
+                            p.name.get().to_owned(),
+                            Value::String(
+                                p.values
+                                    .iter()
+                                    .map(|v| {
+                                        v.get()
+                                            .strip_prefix('"')
+                                            .and_then(|v| v.strip_suffix('"'))
+                                            .unwrap_or(v.get())
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                            ),
+                        )
+                    })
+                    .collect();
+                let value = json!({"value":line.value.decode(), "parameters":params});
+                let multiple = matches!(
+                    name,
+                    "ATTACH"
+                        | "ATTENDEE"
+                        | "CATEGORIES"
+                        | "COMMENT"
+                        | "CONTACT"
+                        | "EXDATE"
+                        | "FREEBUSY"
+                        | "IANA-PROP"
+                        | "RDATE"
+                        | "RELATED"
+                        | "RESOURCES"
+                        | "RSTATUS"
+                        | "X-PROP"
+                );
+                if multiple {
+                    let list = properties
+                        .entry(name.to_owned())
+                        .or_insert_with(|| Value::Array(Vec::new()));
+                    if let Value::Array(list) = list {
+                        list.push(value);
+                    }
+                } else {
+                    properties.insert(name.to_owned(), Value::Array(vec![value]));
+                }
+            }
+            IcalItem::Component(child) => children.push(cst_component(child, depth + 1)?),
+            IcalItem::Opaque(_) => return Err("Invalid calendar component".into()),
         }
     }
-    let children: Vec<Value> = item
-        .components()
-        .iter()
-        .map(|child| component(child, depth + 1))
-        .collect::<Result<_, _>>()?;
-    Ok(
-        json!({"kind":item.component_kind(), "uid":item.get_uid(), "properties":properties,"components":children}),
-    )
+    let uid = properties
+        .get("UID")
+        .and_then(|p| p.get(0))
+        .and_then(|p| p.get("value"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    Ok(json!({"kind":kind, "uid":uid, "properties":properties, "components":children}))
 }
 
 /// Project VEVENT/VTODO components including recurrence IDs, rules, attendee
@@ -49,17 +100,39 @@ pub fn calendar(raw: &[u8]) -> Result<Value, String> {
         return Err("Calendar resource is too large".into());
     }
     let tree = ical::tree::cst::IcalCst::parse(raw).map_err(|_| "Invalid calendar resource")?;
-    if tree.to_bytes() != raw {
+    if tree.to_bytes() != raw
+        || tree
+            .begin
+            .as_ref()
+            .map(|line| line.raw_value_str())
+            .as_deref()
+            != Some("VCALENDAR")
+        || tree
+            .end
+            .as_ref()
+            .map(|line| line.raw_value_str())
+            .as_deref()
+            != Some("VCALENDAR")
+        || tree
+            .items
+            .iter()
+            .any(|item| matches!(item, IcalItem::Opaque(_)))
+    {
         return Err("Calendar must be a single complete resource".into());
     }
     let jcal = tree.decode().to_jcal();
-    let text = std::str::from_utf8(raw).map_err(|_| "Calendar resource is not UTF-8")?;
-    let calendar: Calendar = text.parse().map_err(|_| "Invalid calendar resource")?;
+    std::str::from_utf8(raw).map_err(|_| "Calendar resource is not UTF-8")?;
     let mut components = Vec::new();
-    for item in &calendar.components {
+    for item in &tree.items {
         match item {
-            CalendarComponent::Event(event) => components.push(component(event, 0)?),
-            CalendarComponent::Todo(todo) => components.push(component(todo, 0)?),
+            IcalItem::Component(child)
+                if matches!(
+                    child.begin.as_ref().map(|b| b.raw_value_str()).as_deref(),
+                    Some("VEVENT" | "VTODO")
+                ) =>
+            {
+                components.push(cst_component(child, 0)?)
+            }
             _ => {}
         }
     }
@@ -82,6 +155,62 @@ pub fn contact(raw: &[u8]) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cst_projection_matches_existing_calendar_projection() {
+        let raw = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//fixture//EN\r\nBEGIN:VEVENT\r\nUID:event\r\nSUMMARY:First\r\nSUMMARY:Second\\, folded\r\n line\r\nATTENDEE;CN=Person;ROLE=REQ-PARTICIPANT:mailto:a@example.test\r\nATTENDEE;CN=Other:mailto:b@example.test\r\nEXDATE:20261102T100000Z\r\nEXDATE:20261103T100000Z\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\nEND:VEVENT\r\nBEGIN:VTODO\r\nUID:task\r\nRELATED-TO:parent\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let view = calendar(raw).unwrap();
+        assert_eq!(
+            view["components"][0]["properties"]["SUMMARY"][0]["value"],
+            "Second, foldedline"
+        );
+        assert_eq!(
+            view["components"][0]["properties"]["ATTENDEE"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            view["components"][0]["properties"]["EXDATE"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(view["components"][0]["components"][0]["kind"], "VALARM");
+        assert_eq!(view["components"][1]["uid"], "task");
+    }
+
+    #[test]
+    fn cst_projection_matches_parameter_and_list_values() {
+        let raw = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//fixture//EN\r\nBEGIN:VEVENT\r\nUID:event\r\nDTSTART;TZID=Europe/Vienna:20261101T100000\r\nCATEGORIES:ONE,TWO\r\nATTENDEE;CN=\"Person, Example\":mailto:x@example.test\r\nATTACH:https://example.test/a;b,c\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let view = calendar(raw).unwrap();
+        let properties = &view["components"][0]["properties"];
+        assert_eq!(
+            properties["ATTENDEE"][0]["parameters"]["CN"],
+            "Person, Example"
+        );
+        assert_eq!(
+            properties["DTSTART"][0]["parameters"]["TZID"],
+            "Europe/Vienna"
+        );
+        assert_eq!(properties["CATEGORIES"][0]["value"], "ONE,TWO");
+        assert_eq!(
+            properties["ATTACH"][0]["value"],
+            "https://example.test/a;b,c"
+        );
+    }
+
+    #[test]
+    fn calendar_projection_rejects_incomplete_components() {
+        assert!(
+            calendar(b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VCALENDAR\r\n").is_err()
+        );
+        assert!(
+            calendar(b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:event\r\nEND:VEVENT\r\n").is_err()
+        );
+    }
 
     #[test]
     fn calendar_view_keeps_native_task_parentage_and_recurrence() {
