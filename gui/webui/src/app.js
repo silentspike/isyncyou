@@ -1548,11 +1548,11 @@ async function renderSyncWidget() {
   if (!box.getClientRects().length) return;
   const account = App.account, generation = ++syncWidgetGeneration;
   const current = () => box.isConnected && $("#sync-widget") === box && App.account === account && syncWidgetGeneration === generation;
-  let st = { enabled: false, paused: false }, runs = [], status = null;
+  let st = { enabled: false, paused: false }, runs = [], status = null, activityKnown = false;
   try { st = await api("/api/v1/sync/state"); } catch {}
   if (!current()) return;
   if (account) {
-    try { runs = (await api("/api/v1/activity?" + qs({ account, limit: 60 }))).runs || []; } catch {}
+    try { const activity = await api("/api/v1/activity?" + qs({ account, limit: 60 })); if (Array.isArray(activity.runs)) { runs = activity.runs; activityKnown = true; } } catch {}
     if (!current()) return;
     try { status = await api("/api/v1/status?" + qs({ account })); } catch {}
   }
@@ -1565,9 +1565,9 @@ async function renderSyncWidget() {
   }
   // alerts = failed sync/backup runs (real); reflect in the Alerts nav badge.
   const failed = runs.filter(r => /sync|backup/i.test(r.kind || "") && r.status === "error").length;
-  const ab = $("#alerts-badge"); if (ab) ab.textContent = String(failed);
+  const ab = $("#alerts-badge"); if (ab) ab.textContent = activityKnown ? String(failed) : "?";
   $("#nav-alerts")?.classList.toggle("has-alerts", failed > 0);
-  const last = runs.find(r => /sync|backup/i.test(r.kind || "")) || runs[0];
+  const last = runs.find(r => /sync|backup/i.test(r.kind || ""));
   const healthy = !failed;
   // daily run volume → sparkline (last 14 days)
   const days = 14, now = Date.now(), buckets = new Array(days).fill(0);
@@ -1584,10 +1584,10 @@ async function renderSyncWidget() {
   const syncNodes = [
     syncHead,
     el("div", { class: "sw-health " + (runs.length ? (healthy ? "ok" : "warn") : "") },
-      el("span", { class: "dot" }), el("b", { text: !runs.length ? "Ready" : healthy ? "Healthy" : `${failed} alert${failed > 1 ? "s" : ""}` })),
+      el("span", { class: "dot" }), el("b", { text: !activityKnown ? "Activity unavailable" : !runs.length ? "Ready" : healthy ? "Healthy" : `${failed} alert${failed > 1 ? "s" : ""}` })),
   ];
   if (runs.length) syncNodes.push(el("div", { class: "sw-spark " + (healthy ? "ok" : "warn") }, sparkline(buckets, 32)));
-  syncNodes.push(el("div", { class: "sw-meta dim", text: last ? "Last sync " + fmtDate(last.finished_at) : "No syncs yet" }));
+  syncNodes.push(el("div", { class: "sw-meta dim", text: !activityKnown ? "Sync history unavailable" : last ? "Last sync " + fmtDate(last.finished_at) : "No syncs yet" }));
   box.append(...syncNodes);
 }
 async function syncCmd(cmd) {
@@ -1692,7 +1692,7 @@ async function renderOverview(view) {
     }).catch(() => {});
     const [st, act, cfg, sy] = await Promise.all([
       status,
-      api("/api/v1/activity?" + qs({ account, limit: 200 })).catch(() => ({ runs: [] })),
+      api("/api/v1/activity?" + qs({ account, limit: 200 })).catch(() => null),
       api("/api/v1/settings").catch(() => ({})),
       api("/api/v1/sync/state").catch(() => ({})),
     ]);
@@ -1700,24 +1700,26 @@ async function renderOverview(view) {
     const services = (st.services || []).slice().sort((a, b) => b.items - a.items);
     services.forEach(s => { App.counts[s.service] = s.items; });
     updateNavCounts();
-    const runs = act.runs || [];
+    const activityKnown = !!act && Array.isArray(act.runs);
+    const runs = activityKnown ? act.runs : [];
     const failed = runs.filter(r => r.status === "error").length;
-    const lastRun = runs[0], lastOk = runs.find(r => r.status === "ok");
+    const lastRun = runs.find(r => /sync|backup/i.test(r.kind || ""));
+    const lastOk = runs.find(r => /sync|backup/i.test(r.kind || "") && r.status === "ok");
     const items = st.totals?.items ?? 0, archived = st.totals?.archived ?? 0;
     const sync = cfg.sync || {}, acc = (cfg.accounts || []).find(a => a.id === App.account) || {};
-    const healthy = failed === 0;
+    const healthy = activityKnown && failed === 0;
     clear(body);
 
     // ---- status header (the most important line)
     body.append(el("div", { class: "status-bar" },
       el("span", { class: "status-health" },
-        el("span", { class: "chip " + (healthy ? "ok" : "warn") }, el("span", { class: "dot" }), healthy ? (MOBILE ? "Connected" : "Archive healthy") : "Attention needed")),
+        el("span", { class: "chip " + (healthy ? "ok" : "warn") }, el("span", { class: "dot" }), !activityKnown ? "Activity unavailable" : healthy ? (MOBILE ? "Connected" : "Archive healthy") : "Attention needed")),
       el("div", { class: "status-facts" },
         el("span", {}, el("b", { text: String(services.length) }), " services connected"),
         el("span", { class: "sep", text: "·" }),
-        el("span", {}, "Last sync ", el("b", { text: lastRun ? fmtFullDate(lastRun.finished_at) : "never" })),
+        el("span", {}, "Last sync ", el("b", { text: !activityKnown ? "unknown" : lastRun ? fmtFullDate(lastRun.finished_at) : "never" })),
         el("span", { class: "sep", text: "·" }),
-        el("span", {}, el("b", { text: String(failed) }), failed === 1 ? " failed run" : " failed runs"),
+        el("span", {}, el("b", { text: activityKnown ? String(failed) : "—" }), failed === 1 ? " failed run" : " failed runs"),
         el("span", { class: "sep", text: "·" }),
         el("span", {}, el("b", { text: items.toLocaleString() }), MOBILE ? " items cached" : " items protected")),
       el("div", { class: "spacer" }),
@@ -1734,7 +1736,7 @@ async function renderOverview(view) {
     kpi.append(
       kpiCard("layout-dashboard", MOBILE ? "Items cached" : "Items protected", items.toLocaleString(), "", el("div", { class: "kpi-ctx", text: `across ${services.length} services` })),
       kpiCard("download", MOBILE ? "Cached bodies" : "Archived bodies", archived.toLocaleString(), "", el("div", { class: "kpi-ctx", text: items ? `${Math.round(archived / items * 100)}% have content` : "—" })),
-      kpiCard("rotate-ccw", "Failed runs", failed, "", el("div", { class: "kpi-ctx" }, el("span", { class: "chip " + (failed ? "err" : "ok") }, failed ? "needs review" : "all clear"))),
+      kpiCard("rotate-ccw", "Failed runs", activityKnown ? failed : "—", "", el("div", { class: "kpi-ctx" }, el("span", { class: "chip " + (!activityKnown ? "warn" : failed ? "err" : "ok") }, !activityKnown ? "activity unavailable" : failed ? "needs review" : "all clear"))),
       kpiCard("clock", "Trash retention", sync.trash_retention_days ?? "—", "days", el("div", { class: "kpi-ctx", text: sync.body_index ? "full-text index on" : "index off" })));
     body.append(kpi);
 
@@ -1743,8 +1745,8 @@ async function renderOverview(view) {
     body.append(grid);
     grid.append(el("div", { class: "card panel" },
       el("div", { class: "panel-head" }, icon("clock", "icon-sm"), "Sync activity", el("div", { class: "spacer" }),
-        el("span", { class: "dim", style: "font-size:12px;text-transform:none;letter-spacing:0", text: `${runs.length} runs · 14 days` })),
-      el("div", { class: "panel-body" }, activityChart(runs, 14))));
+        el("span", { class: "dim", style: "font-size:12px;text-transform:none;letter-spacing:0", text: activityKnown ? `${runs.length} runs · 14 days` : "Activity unavailable" })),
+      el("div", { class: "panel-body" }, activityKnown ? activityChart(runs, 14) : "Activity unavailable")));
     // service breakdown table
     const tbl = el("table", { class: "svc-table" },
       el("thead", {}, el("tr", {}, el("th", { text: "Service" }), el("th", { class: "num", text: "Items" }), el("th", { class: "num", text: "Archived" }))),
@@ -1777,7 +1779,7 @@ async function renderOverview(view) {
           el("div", { class: "run-sum truncate", text: r.summary || "" })),
         el("span", { class: "dim tnum", style: "font-size:12px;white-space:nowrap", text: fmtDate(r.finished_at) })));
     });
-    else runsPanel.append(el("div", { class: "run-row dim", text: "No runs recorded yet." }));
+    else runsPanel.append(el("div", { class: "run-row dim", text: activityKnown ? "No runs recorded yet." : "Activity unavailable." }));
     body.append(runsPanel);
 
     // ---- connection & policy (trust signals — real data only)

@@ -11209,6 +11209,39 @@ impl Router {
             .filter(|n| *n > 0)
             .unwrap_or(50)
             .min(500);
+        if let Some(origin) = self.provider_origin(account) {
+            let archive = match self.with_archive_reader_result(account, |store| {
+                store
+                    .recent_runs(account, limit)
+                    .map_err(|_| ApiResponse::error(500, "store_query_failed"))
+            }) {
+                Ok(runs) => runs,
+                Err(error) => return error,
+            };
+            let Some(handler) = self.mail_write.as_ref() else {
+                return ApiResponse::error(503, "provider_store_unavailable");
+            };
+            return handler.with_provider_cache(account, &origin, &mut |store| {
+                let provider = match store.recent_runs(account, limit) {
+                    Ok(runs) => runs,
+                    Err(_) => return ApiResponse::error(503, "provider_store_unavailable"),
+                };
+                let mut runs: Vec<_> = archive.iter().map(|run| (run, "archive"))
+                    .chain(provider.iter().map(|run| (run, "provider"))).collect();
+                // Both writers use Unix seconds; IDs are local to each database.
+                // Unknown timestamps remain in stable source order after dated runs.
+                runs.sort_by(|(a, _), (b, _)| {
+                    let time = |run: &isyncyou_store::Run| run.finished_at.parse::<u64>()
+                        .ok().or_else(|| run.started_at.parse::<u64>().ok());
+                    time(b).cmp(&time(a))
+                });
+                let arr: Vec<Value> = runs.into_iter().take(limit as usize).map(|(r, source)| json!({
+                    "id":r.id, "source":source, "kind":r.kind, "started_at":r.started_at,
+                    "finished_at":r.finished_at, "status":r.status, "summary":r.summary,
+                })).collect();
+                ApiResponse::ok_json(&json!({"runs":arr,"count":arr.len()}))
+            }).unwrap_or_else(|_| ApiResponse::error(503, "provider_store_unavailable"));
+        }
         self.with_archive_reader(account, |store| match store.recent_runs(account, limit) {
             Ok(runs) => {
                 let arr: Vec<Value> = runs
@@ -17894,6 +17927,9 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
     /// Records the last mail-write op so the routing + param parsing is checkable.
     #[derive(Default)]
     struct RecordMailWrite(std::sync::Mutex<Vec<String>>);
+    thread_local! {
+        static TEST_ACTIVITY_PROVIDER_CACHE: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
     impl RecordMailWrite {
         fn last(&self) -> String {
             self.0.lock().unwrap().last().cloned().unwrap_or_default()
@@ -18092,6 +18128,22 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
         }
     }
     impl MailWriteHandler for RecordMailWrite {
+        fn with_provider_cache(
+            &self,
+            account: &str,
+            origin: &str,
+            f: &mut dyn FnMut(&Store) -> ApiResponse,
+        ) -> Result<ApiResponse, String> {
+            if account != "a" || origin != "https://example.invalid" {
+                return Err("wrong binding".into());
+            }
+            TEST_ACTIVITY_PROVIDER_CACHE.with(|path| {
+                let path = path.borrow();
+                let store = Store::open_readonly(path.as_ref().ok_or("unavailable")?)
+                    .map_err(|_| "unavailable")?;
+                Ok(f(&store))
+            })
+        }
         fn provider_live_mail_page(
             &self,
             account: &str,
@@ -24572,6 +24624,74 @@ Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--B--\r\n";
             router.route(&ApiRequest::get("/api/v1/activity")).status,
             400
         );
+    }
+
+    #[test]
+    fn provider_activity_merges_bound_cache_and_archive_without_hiding_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = dir.path().join("arch");
+        std::fs::create_dir_all(&arch).unwrap();
+        let provider = dir.path().join("provider.db");
+        {
+            let store = Store::open(arch.join(".isyncyou-store.db")).unwrap();
+            store
+                .add_run("a", "restore", "100", "101", "ok", "archive")
+                .unwrap();
+            store
+                .add_run("a", "verify", "300", "301", "ok", "archive")
+                .unwrap();
+            let store = Store::open(&provider).unwrap();
+            store
+                .add_run("a", "sync", "200", "201", "ok", "provider")
+                .unwrap();
+            store
+                .add_run("b", "sync", "400", "401", "ok", "other account")
+                .unwrap();
+        }
+        let mut cfg = Config {
+            accounts: vec![AccountConfig {
+                id: "a".into(),
+                username: "a".into(),
+                sync_root: dir.path().join("sync"),
+                archive_root: arch,
+                cache_root: Default::default(),
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        cfg.provider_accounts.insert(
+            "a".into(),
+            isyncyou_core::config::ProviderConfig::SelfHosted {
+                origin: "https://example.invalid".into(),
+                client_id: "test".into(),
+            },
+        );
+        TEST_ACTIVITY_PROVIDER_CACHE.with(|path| *path.borrow_mut() = Some(provider.clone()));
+        let router = Router::new(cfg).with_mail_write(
+            std::sync::Arc::new(RecordMailWrite::default()),
+            "cap".into(),
+        );
+        let response = router.route(&ApiRequest::get("/api/v1/activity?account=a"));
+        assert_eq!(response.status, 200);
+        let value = body_json(&response);
+        assert_eq!(value["count"], 3);
+        assert_eq!(value["runs"][0]["kind"], "verify");
+        assert_eq!(value["runs"][1]["kind"], "sync");
+        assert_eq!(value["runs"][1]["source"], "provider");
+        assert_eq!(value["runs"][2]["kind"], "restore");
+        assert_eq!(value["runs"][1]["id"], value["runs"][2]["id"]); // IDs belong to different stores.
+        let limited =
+            body_json(&router.route(&ApiRequest::get("/api/v1/activity?account=a&limit=2")));
+        assert_eq!(limited["count"], 2);
+        assert_eq!(limited["runs"][1]["kind"], "sync");
+        std::fs::remove_file(provider).unwrap();
+        assert_eq!(
+            router
+                .route(&ApiRequest::get("/api/v1/activity?account=a"))
+                .status,
+            503
+        );
+        TEST_ACTIVITY_PROVIDER_CACHE.with(|path| *path.borrow_mut() = None);
     }
 
     #[test]

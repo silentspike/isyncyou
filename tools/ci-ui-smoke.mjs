@@ -220,6 +220,45 @@ const healthRace = await page.evaluate(async () => {
 });
 check("stale health responses cannot overwrite newer state", healthRace);
 
+const unavailableActivity = await page.evaluate(async () => {
+  const original = window.api;
+  window.api = (url, opts) => {
+    if (url.startsWith("/api/v1/activity?")) return Promise.reject(new Error("unavailable"));
+    if (url.startsWith("/api/v1/status?")) return Promise.resolve({services:[], totals:{items:0,archived:0}});
+    if (url === "/api/v1/sync/state") return Promise.resolve({enabled:false,paused:false});
+    if (url === "/api/v1/settings") return Promise.resolve({sync:{},accounts:[]});
+    return original(url, opts);
+  };
+  try {
+    await renderSyncWidget();
+    const widget = document.querySelector("#sync-widget")?.textContent || "";
+    await renderOverview(document.querySelector("#view"));
+    const overview = document.querySelector("#ov-body")?.textContent || "";
+    return widget.includes("Activity unavailable") && overview.includes("Activity unavailable") &&
+      !overview.includes("Archive healthy") && !overview.includes("all clear");
+  } finally { window.api = original; }
+});
+check("unavailable activity is never shown as healthy", unavailableActivity);
+
+const auditOnlyActivity = await page.evaluate(async () => {
+  const original = window.api;
+  window.api = (url, opts) => {
+    if (url.startsWith("/api/v1/activity?")) return Promise.resolve({runs:[{kind:"audit:agent-account-lifecycle",status:"ok",finished_at:"1700000000"}]});
+    if (url.startsWith("/api/v1/status?")) return Promise.resolve({services:[], totals:{items:0,archived:0}});
+    if (url === "/api/v1/sync/state") return Promise.resolve({enabled:false,paused:false});
+    if (url === "/api/v1/settings") return Promise.resolve({sync:{},accounts:[]});
+    return original(url, opts);
+  };
+  try {
+    await renderSyncWidget();
+    const widget = document.querySelector("#sync-widget")?.textContent || "";
+    await renderOverview(document.querySelector("#view"));
+    const overview = document.querySelector("#ov-body")?.textContent || "";
+    return widget.includes("No syncs yet") && overview.includes("Last sync never");
+  } finally { window.api = original; }
+});
+check("audit activity is not reported as a sync", auditOnlyActivity);
+
 // Provider change notifications refresh the first primary page and preserve shared scopes.
 await nav("mail");
 const providerLiveRefresh = await page.evaluate(async () => {
