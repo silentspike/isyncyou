@@ -4732,7 +4732,9 @@ mod tests {
             ];
             for item in responses {
                 let (mut socket, _) = listener.accept().unwrap();
-                socket.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
                 let mut request = Vec::new();
                 let mut buf = [0; 2048];
                 loop {
@@ -4741,11 +4743,17 @@ mod tests {
                     request.extend_from_slice(&buf[..n]);
                     if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
                         let headers = String::from_utf8_lossy(&request[..end]);
-                        let len = headers.lines().find_map(|line| {
-                            line.to_ascii_lowercase().strip_prefix("content-length:")
-                                .and_then(|v| v.trim().parse::<usize>().ok())
-                        }).unwrap_or(0);
-                        if request.len() >= end + 4 + len { break; }
+                        let len = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + len {
+                            break;
+                        }
                     }
                 }
                 let body = format!("<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\" xmlns:a=\"urn:ietf:params:xml:ns:carddav\">{item}</d:multistatus>");
@@ -4756,7 +4764,11 @@ mod tests {
         let calls = Cell::new(0);
         let notifications = Cell::new(0);
         let report = sync_all_observation(
-            "fixture", "/entry", &origin, &client, || Ok(()),
+            "fixture",
+            "/entry",
+            &origin,
+            &client,
+            || Ok(()),
             |_| {
                 let index = calls.get();
                 calls.set(index + 1);
@@ -4769,9 +4781,13 @@ mod tests {
             },
             &mut || notifications.set(notifications.get() + 1),
             |_| Ok(()),
-        ).unwrap();
+        )
+        .unwrap();
         server.join().unwrap();
-        assert_eq!((report.collections, report.changes, report.failed), (2, 1, 1));
+        assert_eq!(
+            (report.collections, report.changes, report.failed),
+            (2, 1, 1)
+        );
         assert_eq!(notifications.get(), 1);
     }
 
