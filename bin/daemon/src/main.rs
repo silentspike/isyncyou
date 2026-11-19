@@ -923,6 +923,7 @@ fn provider_domain_worker(
     let ProviderDomain { dirty, mail } = domain;
     let mut last: Option<std::time::Instant> = None;
     let mut dav_started: Option<std::time::Instant> = None;
+    let mut dav_store = isyncyou_engine::dav_live::DavWorkerStore::default();
     let mut retry_secs = 5u64;
     while !stop.load(Ordering::Relaxed) {
         let mut flags = dirty.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -974,6 +975,7 @@ fn provider_domain_worker(
                 &cfg,
                 &identity.account,
                 "/.well-known/caldav",
+                &mut dav_store,
                 || {
                     if !stop.load(Ordering::Relaxed) {
                         events.notify();

@@ -127,12 +127,32 @@ pub fn sync_all_with_store(
     entry: &str,
     credentials: &dyn ProviderCredentialStore,
 ) -> Result<SyncPass, String> {
-    sync_all_inner(cfg, account, entry, Some(credentials), &mut || {})
+    sync_all_inner(
+        cfg,
+        account,
+        entry,
+        Some(credentials),
+        &mut DavWorkerStore::default(),
+        &mut || {},
+    )
 }
 
 /// Desktop variant using the configured system keyring.
 pub fn sync_all(cfg: &Config, account: &str, entry: &str) -> Result<SyncPass, String> {
-    sync_all_with_progress(cfg, account, entry, || {})
+    sync_all_with_progress(cfg, account, entry, &mut DavWorkerStore::default(), || {})
+}
+
+/// One idle connection per desktop DAV worker. It is revalidated before
+/// reuse and owns neither a transaction nor the provider's writer lease.
+#[derive(Default)]
+pub struct DavWorkerStore(Option<DavWorkerConnection>);
+
+struct DavWorkerConnection {
+    store: Store,
+    account: String,
+    origin: String,
+    identity: crate::provider_store::ReadonlyCacheIdentity,
+    subject: String,
 }
 
 /// Notify after a successful collection pass that reports changes.
@@ -141,9 +161,10 @@ pub fn sync_all_with_progress(
     cfg: &Config,
     account: &str,
     entry: &str,
+    cached: &mut DavWorkerStore,
     mut on_commit: impl FnMut(),
 ) -> Result<SyncPass, String> {
-    sync_all_inner(cfg, account, entry, None, &mut on_commit)
+    sync_all_inner(cfg, account, entry, None, cached, &mut on_commit)
 }
 
 fn collection_lease_error(error: &std::io::Error) -> &'static str {
@@ -268,8 +289,11 @@ impl DavPassStore<'_> {
 fn open_dav_pass_store<'a>(
     cfg: &'a Config,
     account: &'a str,
+    origin: &str,
     credentials: Option<&'a dyn ProviderCredentialStore>,
+    cached: &mut DavWorkerStore,
 ) -> Result<Option<DavPassStore<'a>>, String> {
+    let previous = cached.0.take();
     let Ok(identity) = crate::provider_store::readonly_cache_identity(cfg, account) else {
         return Ok(None);
     };
@@ -284,7 +308,24 @@ fn open_dav_pass_store<'a>(
     let Some(subject) = subject else {
         return Ok(None);
     };
-    let store = crate::provider_store::open_sync(cfg, account)?;
+    let store = match previous {
+        Some(entry)
+            if entry.account == account
+                && entry.origin == origin
+                && entry.identity == identity
+                && entry.subject == subject =>
+        {
+            let version = entry
+                .store
+                .schema_version()
+                .map_err(|error| error.to_string())?;
+            if version > isyncyou_store::SCHEMA_VERSION {
+                return Err("DAV store schema changed".into());
+            }
+            entry.store
+        }
+        _ => crate::provider_store::open_sync(cfg, account)?,
+    };
     let pass = DavPassStore {
         store,
         cfg,
@@ -581,16 +622,18 @@ fn sync_all_inner(
     account: &str,
     entry: &str,
     credentials: Option<&dyn ProviderCredentialStore>,
+    cached: &mut DavWorkerStore,
     on_commit: &mut dyn FnMut(),
 ) -> Result<SyncPass, String> {
-    let origin = configured_origin(cfg, account)?;
-    let _discovery_lease = discovery_sync_lease(cfg, account, &origin)?;
+    let origin = configured_origin(cfg, account).inspect_err(|_| cached.0 = None)?;
+    let _discovery_lease =
+        discovery_sync_lease(cfg, account, &origin).inspect_err(|_| cached.0 = None)?;
     #[cfg(all(test, feature = "encrypted-store"))]
     if let Some(result) = fixture_sync_all(cfg, account, entry, &origin, on_commit) {
         return result;
     }
     let started = std::time::Instant::now();
-    let pass = open_dav_pass_store(cfg, account, credentials)?;
+    let pass = open_dav_pass_store(cfg, account, &origin, credentials, cached)?;
     isyncyou_connectors::dav::diagnostic_timing(
         "pass_store_open",
         0,
@@ -609,7 +652,7 @@ fn sync_all_inner(
         if client.is_ok() { "ok" } else { "error" },
     );
     let client = client?;
-    sync_all_observation(
+    let report = sync_all_observation(
         account,
         entry,
         &origin,
@@ -626,7 +669,20 @@ fn sync_all_inner(
                 reconcile_missing_collections(&store, account, &origin, present)
             }
         },
-    )
+    )?;
+    if report.failed == 0 {
+        if let Some(pass) = pass {
+            pass.validate()?;
+            cached.0 = Some(DavWorkerConnection {
+                store: pass.store,
+                account: account.into(),
+                origin,
+                identity: pass.identity,
+                subject: pass.subject,
+            });
+        }
+    }
+    Ok(report)
 }
 
 fn sync_all_observation(
