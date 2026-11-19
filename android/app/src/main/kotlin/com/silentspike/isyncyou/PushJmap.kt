@@ -69,6 +69,27 @@ internal object PushJmap {
         return result
     }
 
+    /** A full authenticated get must be complete and contain no subscription for this installation. */
+    fun noInstallation(response: JSONObject, instance: String): Boolean {
+        val methods = response.getJSONArray("methodResponses")
+        require(methods.length() == 1)
+        val method = methods.getJSONArray(0)
+        require(method.length() == 3 && method.getString(0) == "PushSubscription/get")
+        val result = method.getJSONObject(1)
+        require(result.getString("state").isNotEmpty())
+        val missing = result.getJSONArray("notFound")
+        require(missing.length() == 0)
+        val list = result.getJSONArray("list")
+        for (i in 0 until list.length()) {
+            val item = list.getJSONObject(i)
+            require(item.getString("id").isNotEmpty())
+            val owner = item.getString("deviceClientId")
+            require(owner.isNotEmpty())
+            if (owner == instance) return false
+        }
+        return true
+    }
+
     /** Absence is accepted only from an explicit, single-ID authenticated notFound. */
     fun lookup(context: Context, account: String, instance: String, id: String): Lookup {
         val response = call(context, account, "get", JSONObject().put("id", id))

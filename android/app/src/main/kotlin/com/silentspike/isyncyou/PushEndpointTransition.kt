@@ -133,3 +133,23 @@ internal object PushCreateGuard {
         return true
     }
 }
+
+/** Reopen creation only after both authenticated absence checks and exact local CAS. */
+internal object PushExpiredRenewal {
+    fun recover(state: JSONObject, snapshot: JSONObject, account: String, origin: String, endpoint: String,
+                now: Long, absent: Boolean, noInstallation: Boolean): Boolean {
+        val expiry = PushJmap.expiryMillis(snapshot.optString("expires", "")) ?: return false
+        if (!absent || !noInstallation || expiry >= now || snapshot.optString("stage") != "renew_unknown" ||
+            snapshot.optString("subscription_id").isEmpty() || snapshot.has("replacement")) return false
+        for (key in listOf("stage", "subscription_id", "expires", "account", "origin", "endpoint")) {
+            if (state.optString(key) != snapshot.optString(key)) return false
+        }
+        if (state.optString("account") != account || state.optString("origin") != origin ||
+            state.optString("endpoint") != endpoint || state.has("replacement")) return false
+        state.put("expired_subscription_id", state.getString("subscription_id"))
+        state.put("expired_subscription_expires", state.getString("expires"))
+        state.remove("subscription_id")
+        state.put("stage", "broker_bound")
+        return true
+    }
+}

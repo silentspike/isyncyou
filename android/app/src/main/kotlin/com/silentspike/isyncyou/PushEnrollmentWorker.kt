@@ -251,6 +251,17 @@ class PushEnrollmentWorker(context: Context, params: WorkerParameters) : Corouti
             val expiry = PushJmap.expiryMillis(expires)
             if (active.optString("stage") == "renew_unknown" && expiry != null) {
                 val id = active.getString("subscription_id")
+                if (expiry < System.currentTimeMillis() && !active.has("replacement") &&
+                    PushJmap.lookup(applicationContext, account, instance, id) == PushJmap.Lookup.Absent &&
+                    PushJmap.noInstallation(PushJmap.call(applicationContext, account, "get"), instance)) {
+                    if (PushInstallationKey.existing(applicationContext, account)?.installation != instance ||
+                        NativeEngine.nativeProviderOrigin(applicationContext.filesDir.absolutePath, account) != origin) return@withContext Result.failure()
+                    val recovered = PushEnrollmentStore.update(applicationContext, instance) {
+                        PushExpiredRenewal.recover(it, active, account, origin, endpoint, System.currentTimeMillis(), true, true)
+                    }
+                    if (recovered) PushScheduler.enqueue(applicationContext, instance)
+                    return@withContext Result.success()
+                }
                 val observed = PushJmap.findKnown(applicationContext, account, instance, id)
                 val observedExpiry = observed?.optString("expires", "") ?: ""
                 val observedMillis = PushJmap.expiryMillis(observedExpiry)
