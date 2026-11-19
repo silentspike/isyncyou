@@ -127,12 +127,23 @@ pub fn sync_all_with_store(
     entry: &str,
     credentials: &dyn ProviderCredentialStore,
 ) -> Result<SyncPass, String> {
-    sync_all_inner(cfg, account, entry, Some(credentials))
+    sync_all_inner(cfg, account, entry, Some(credentials), &mut || {})
 }
 
 /// Desktop variant using the configured system keyring.
 pub fn sync_all(cfg: &Config, account: &str, entry: &str) -> Result<SyncPass, String> {
-    sync_all_inner(cfg, account, entry, None)
+    sync_all_with_progress(cfg, account, entry, || {})
+}
+
+/// Notify after a successful collection pass that reports changes.
+/// The callback carries no account, collection or object data.
+pub fn sync_all_with_progress(
+    cfg: &Config,
+    account: &str,
+    entry: &str,
+    mut on_commit: impl FnMut(),
+) -> Result<SyncPass, String> {
+    sync_all_inner(cfg, account, entry, None, &mut on_commit)
 }
 
 fn collection_lease_error(error: &std::io::Error) -> &'static str {
@@ -570,11 +581,12 @@ fn sync_all_inner(
     account: &str,
     entry: &str,
     credentials: Option<&dyn ProviderCredentialStore>,
+    on_commit: &mut dyn FnMut(),
 ) -> Result<SyncPass, String> {
     let origin = configured_origin(cfg, account)?;
     let _discovery_lease = discovery_sync_lease(cfg, account, &origin)?;
     #[cfg(all(test, feature = "encrypted-store"))]
-    if let Some(result) = fixture_sync_all(cfg, account, entry, &origin) {
+    if let Some(result) = fixture_sync_all(cfg, account, entry, &origin, on_commit) {
         return result;
     }
     let started = std::time::Instant::now();
@@ -604,6 +616,7 @@ fn sync_all_inner(
         &client,
         || pass.as_ref().map_or(Ok(()), DavPassStore::validate),
         |scope| sync_detached_inner(cfg, &client, scope, pass.as_ref()),
+        on_commit,
         |present| {
             if let Some(pass) = &pass {
                 pass.validate()?;
@@ -623,6 +636,7 @@ fn sync_all_observation(
     client: &DavClient,
     validate: impl Fn() -> Result<(), String>,
     sync_scope: impl Fn(&ProviderScope) -> Result<usize, String>,
+    on_commit: &mut dyn FnMut(),
     reconcile_access: impl FnOnce(&HashSet<(String, String)>) -> Result<(), String>,
 ) -> Result<SyncPass, String> {
     validate()?;
@@ -670,6 +684,9 @@ fn sync_all_observation(
             match result {
                 Ok(changes) => {
                     report.changes += changes;
+                    if changes > 0 {
+                        on_commit();
+                    }
                 }
                 Err(_) => report.failed += 1,
             }
@@ -715,6 +732,7 @@ fn fixture_sync_all(
     account: &str,
     entry: &str,
     origin: &str,
+    on_commit: &mut dyn FnMut(),
 ) -> Option<Result<SyncPass, String>> {
     let path = DAV_FIXTURE_STORE.with(|value| value.borrow().clone())?;
     Some((|| {
@@ -747,6 +765,7 @@ fn fixture_sync_all(
                     .sync_detached_staged(scope, cursor, accessible, false, None, &mut stage)
                     .map_err(|e| e.to_string())
             },
+            on_commit,
             |present| reconcile_missing_collections(&open()?, account, origin, present),
         )
     })())
@@ -4696,6 +4715,65 @@ pub fn cached_live_objects(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "encrypted-store")]
+    #[test]
+    fn progress_precedes_next_failed_collection() {
+        use std::cell::Cell;
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let responses = [
+                "<d:response><d:href>/entry</d:href><d:propstat><d:prop><d:current-user-principal><d:href>/principal/</d:href></d:current-user-principal></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>",
+                "<d:response><d:href>/principal/</d:href><d:propstat><d:prop><c:calendar-home-set><d:href>/home/</d:href></c:calendar-home-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat><d:propstat><d:prop><a:addressbook-home-set/></d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat></d:response>",
+                "<d:response><d:href>/home/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/first/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/second/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>",
+            ];
+            for item in responses {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0; 2048];
+                loop {
+                    let n = socket.read(&mut buf).unwrap();
+                    assert_ne!(n, 0);
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let len = headers.lines().find_map(|line| {
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        }).unwrap_or(0);
+                        if request.len() >= end + 4 + len { break; }
+                    }
+                }
+                let body = format!("<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\" xmlns:a=\"urn:ietf:params:xml:ns:carddav\">{item}</d:multistatus>");
+                write!(socket, "HTTP/1.1 207 Multi-Status\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let client = isyncyou_connectors::dav::test_loopback_client(&origin).unwrap();
+        let calls = Cell::new(0);
+        let notifications = Cell::new(0);
+        let report = sync_all_observation(
+            "fixture", "/entry", &origin, &client, || Ok(()),
+            |_| {
+                let index = calls.get();
+                calls.set(index + 1);
+                if index == 0 {
+                    Ok(1)
+                } else {
+                    assert_eq!(notifications.get(), 1);
+                    Err("subsequent collection failed".into())
+                }
+            },
+            &mut || notifications.set(notifications.get() + 1),
+            |_| Ok(()),
+        ).unwrap();
+        server.join().unwrap();
+        assert_eq!((report.collections, report.changes, report.failed), (2, 1, 1));
+        assert_eq!(notifications.get(), 1);
+    }
 
     #[cfg(feature = "encrypted-store")]
     #[test]

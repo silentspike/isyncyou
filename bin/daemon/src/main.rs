@@ -970,7 +970,17 @@ fn provider_domain_worker(
             sync_account(&cfg, &identity.account, &gate, &local_host()).is_ok()
         } else {
             dav_started = Some(std::time::Instant::now());
-            sync_provider_dav(&cfg, &identity.account).is_ok_and(|result| result.failed == 0)
+            isyncyou_engine::dav_live::sync_all_with_progress(
+                &cfg,
+                &identity.account,
+                "/.well-known/caldav",
+                || {
+                    if !stop.load(Ordering::Relaxed) {
+                        events.notify();
+                    }
+                },
+            )
+            .is_ok_and(|result| result.failed == 0)
         };
         last = Some(std::time::Instant::now());
         // A DAV pass can commit objects and access loss before a later error.
