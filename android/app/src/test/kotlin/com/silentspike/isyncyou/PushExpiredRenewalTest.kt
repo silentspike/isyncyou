@@ -43,6 +43,12 @@ class PushExpiredRenewalTest {
 
     @Test fun fullGetRequiresValidCompleteResponseAndNoSameInstallation() {
         assertTrue(PushJmap.noInstallation(response(JSONArray()), "installation"))
+        val stalwart = response(JSONArray())
+        stalwart.getJSONArray("methodResponses").getJSONArray(0).getJSONObject(1).remove("state")
+        assertTrue(PushJmap.noInstallation(stalwart, "installation"))
+        val invalidState = response(JSONArray())
+        invalidState.getJSONArray("methodResponses").getJSONArray(0).getJSONObject(1).put("state", "")
+        assertThrows(Exception::class.java) { PushJmap.noInstallation(invalidState, "installation") }
         val conflict = JSONArray().put(JSONObject().put("id", "x").put("deviceClientId", "installation"))
         assertFalse(PushJmap.noInstallation(response(conflict), "installation"))
         assertThrows(Exception::class.java) { PushJmap.noInstallation(JSONObject(), "installation") }

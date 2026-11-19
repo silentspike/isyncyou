@@ -76,7 +76,8 @@ internal object PushJmap {
         val method = methods.getJSONArray(0)
         require(method.length() == 3 && method.getString(0) == "PushSubscription/get")
         val result = method.getJSONObject(1)
-        require(result.getString("state").isNotEmpty())
+        // Stalwart 1.0.2 omits state for PushSubscription/get.
+        if (result.has("state")) require(result.opt("state") is String && result.getString("state").isNotEmpty())
         val missing = result.getJSONArray("notFound")
         require(missing.length() == 0)
         val list = result.getJSONArray("list")
