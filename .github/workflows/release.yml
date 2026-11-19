@@ -158,8 +158,9 @@ jobs:
           for b in isyncyoud isyncyou isyncyou-doctor isyncyou-statusbar; do
             [ -f "target/release/$b" ] && install -m755 "target/release/$b" "dist/isyncyou/$b"
           done
-          cp packaging/isyncyou.toml.sample packaging/README.md packaging/isyncyoud.service dist/isyncyou/
-          (cd dist/isyncyou && for b in isyncyou isyncyoud isyncyou-doctor; do [ -f "$b" ] && sha256sum "$b"; done > SHA256SUMS)
+          cp packaging/isyncyou.toml.sample packaging/README.md packaging/isyncyoud.service packaging/desktop/org.silentspike.iSyncYou.desktop dist/isyncyou/
+          cp -R THIRD-PARTY-NOTICES dist/isyncyou/
+          (cd dist/isyncyou && sha256sum isyncyou isyncyoud isyncyou-doctor isyncyou-statusbar org.silentspike.iSyncYou.desktop > SHA256SUMS)
           # one distributable archive: binaries + sample config + README
           tar -C dist -czf dist/isyncyou-linux-x86_64.tar.gz isyncyou
           (cd dist && sha256sum isyncyou-linux-x86_64.tar.gz > isyncyou-linux-x86_64.tar.gz.sha256)
@@ -206,6 +207,7 @@ jobs:
           cp target/x86_64-pc-windows-gnu/release/isyncyou.exe \
              target/x86_64-pc-windows-gnu/release/isyncyoud.exe \
              packaging/isyncyou.toml.sample packaging/README.md dist/isyncyou-windows/
+          cp -R THIRD-PARTY-NOTICES dist/isyncyou-windows/
           (cd dist && zip -rq isyncyou-windows-x86_64.zip isyncyou-windows \
              && sha256sum isyncyou-windows-x86_64.zip > isyncyou-windows-x86_64.zip.sha256)
           ls -la dist

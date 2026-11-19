@@ -3,6 +3,7 @@
 
 use crate::onedrive_mode::OneDriveModes;
 use crate::recovery::atomic_write;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -53,6 +54,7 @@ pub struct AccountConfig {
     pub username: String,
     /// Bidirectionally-synced OneDrive folder — the **offline** working copy
     /// (Mode 3). Only this root is scanned for local→cloud writeback.
+    #[serde(default)]
     pub sync_root: PathBuf,
     /// Archive/backup directory for the other services.
     pub archive_root: PathBuf,
@@ -91,6 +93,11 @@ impl AccountConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SyncConfig {
+    /// Maximum newest self-hosted message metadata retained for navigation.
+    pub mail_index_limit: u32,
+    /// Optional DAV sync-collection page size; absent uses the server limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dav_page_size: Option<u32>,
     pub trash_retention_days: u32,
     pub delete_guard: DeleteGuardConfig,
     pub change_source: ChangeSource,
@@ -122,6 +129,8 @@ pub struct SyncConfig {
 impl Default for SyncConfig {
     fn default() -> Self {
         SyncConfig {
+            mail_index_limit: 500,
+            dav_page_size: None,
             trash_retention_days: 30,
             delete_guard: DeleteGuardConfig::default(),
             change_source: ChangeSource::default(),
@@ -173,6 +182,13 @@ pub struct RestoreConfig {
     pub cloud_restore_enabled: bool,
 }
 
+/// Optional provider settings. Accounts absent from `provider_accounts` remain Microsoft.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProviderConfig {
+    SelfHosted { origin: String, client_id: String },
+}
+
 /// The full configuration document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -189,9 +205,79 @@ pub struct Config {
     /// `Config { .. }` uses `..Default::default()`, so no other construction site changes.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub onedrive_modes: BTreeMap<String, OneDriveModes>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provider_accounts: BTreeMap<String, ProviderConfig>,
+    /// Optional same-origin push broker bases keyed by configured account id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub push_broker_bases: BTreeMap<String, String>,
 }
 
 impl Config {
+    /// Apply the native Android files-directory mapping to the `me` account.
+    /// Callers coordinate the load and any write with `with_config_lock`.
+    pub fn prepare_mobile_for_files_dir(&mut self, base: &Path) -> Result<(), String> {
+        let archive_root = base.join("archive");
+        let sync_root = base.join("sync");
+        let cache_root = base.join("cache");
+        if let Some(account) = self.accounts.iter_mut().find(|account| account.id == "me") {
+            account.sync_root = sync_root;
+            account.archive_root = archive_root;
+            account.cache_root = cache_root;
+            account.mount_point = None;
+        } else {
+            self.accounts.push(AccountConfig {
+                id: "me".into(),
+                username: "me".into(),
+                sync_root,
+                archive_root,
+                cache_root,
+                mount_point: None,
+            });
+        }
+        self.validate().map_err(|errors| errors.join("; "))
+    }
+
+    /// Serialize a complete read/modify/validate/save operation across processes.
+    /// All concurrent config mutators must use this API; locking only the final
+    /// write cannot protect against stale snapshots.
+    pub fn update_atomically<T>(
+        path: impl AsRef<Path>,
+        mutate: impl FnOnce(&mut Config) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let path = path.as_ref();
+        Self::with_config_lock(path, || {
+            let mut cfg = if path.exists() {
+                Self::load(path)?
+            } else {
+                Self::default()
+            };
+            let result = mutate(&mut cfg)?;
+            cfg.validate().map_err(|errors| errors.join("; "))?;
+            cfg.save(path)?;
+            Ok(result)
+        })
+    }
+
+    /// Serialize specialized configuration operations such as explicit replacement
+    /// or coordinated archive moves using the same cross-process gate.
+    pub fn with_config_lock<T>(
+        path: impl AsRef<Path>,
+        action: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let path = path.as_ref();
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".provider-setup.lock");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(PathBuf::from(lock_path))
+            .map_err(|_| "Configuration lock unavailable")?;
+        lock.lock_exclusive()
+            .map_err(|_| "Configuration lock unavailable")?;
+        action()
+    }
     /// Parse a TOML string.
     pub fn from_toml(s: &str) -> Result<Config, String> {
         toml::from_str(s).map_err(|e| e.to_string())
@@ -230,7 +316,12 @@ impl Config {
             } else if !seen_ids.insert(a.id.clone()) {
                 errs.push(format!("duplicate account id: {}", a.id));
             }
-            if a.sync_root.as_os_str().is_empty() {
+            if self.provider_accounts.contains_key(&a.id) && a.id.starts_with("isyncyou-internal:")
+            {
+                errs.push(format!("{who}: reserved account id"));
+            }
+            let self_hosted = self.provider_accounts.contains_key(&a.id);
+            if !self_hosted && a.sync_root.as_os_str().is_empty() {
                 errs.push(format!("{who}: empty sync_root"));
             }
             if a.archive_root.as_os_str().is_empty() {
@@ -252,6 +343,16 @@ impl Config {
             }
         }
 
+        if self
+            .sync
+            .dav_page_size
+            .is_some_and(|n| !(1..=2000).contains(&n))
+        {
+            errs.push("sync.dav_page_size must be between 1 and 2000".into());
+        }
+        if !(1..=5000).contains(&self.sync.mail_index_limit) {
+            errs.push("sync.mail_index_limit must be between 1 and 5000".into());
+        }
         let g = &self.sync.delete_guard;
         if !(g.max_fraction > 0.0 && g.max_fraction <= 1.0) {
             errs.push(format!(
@@ -267,6 +368,52 @@ impl Config {
         // configured account, and its folder-mode keys must be non-empty.
         let known: std::collections::HashSet<&str> =
             self.accounts.iter().map(|a| a.id.as_str()).collect();
+        for (account, provider) in &self.provider_accounts {
+            if !known.contains(account.as_str()) {
+                errs.push(format!("provider_accounts: unknown account id '{account}'"));
+            }
+            match provider {
+                ProviderConfig::SelfHosted { origin, client_id } => {
+                    let valid = url::Url::parse(origin).is_ok_and(|url| {
+                        url.scheme() == "https"
+                            && url.host_str().is_some()
+                            && url.username().is_empty()
+                            && url.password().is_none()
+                            && url.path() == "/"
+                            && url.query().is_none()
+                            && url.fragment().is_none()
+                            && url.origin().ascii_serialization() == origin.as_str()
+                    });
+                    if !valid || client_id.trim().is_empty() {
+                        errs.push(format!("provider_accounts[{account}]: canonical HTTPS origin without trailing slash and client id required"));
+                    }
+                }
+            }
+        }
+        for (account, base) in &self.push_broker_bases {
+            let valid = match self.provider_accounts.get(account) {
+                Some(ProviderConfig::SelfHosted { origin, .. }) => {
+                    match (url::Url::parse(origin), url::Url::parse(base)) {
+                        (Ok(origin), Ok(base)) => {
+                            base.scheme() == "https"
+                                && base.origin() == origin.origin()
+                                && base.username().is_empty()
+                                && base.password().is_none()
+                                && base.query().is_none()
+                                && base.fragment().is_none()
+                                && base.path().ends_with('/')
+                        }
+                        _ => false,
+                    }
+                }
+                None => false,
+            };
+            if !valid {
+                errs.push(format!(
+                    "push_broker_bases[{account}]: same-origin HTTPS base required"
+                ));
+            }
+        }
         for (acct, modes) in &self.onedrive_modes {
             if !known.contains(acct.as_str()) {
                 errs.push(format!("onedrive_modes: unknown account id '{acct}'"));
@@ -299,8 +446,84 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dav_page_size_is_optional_and_bounded() {
+        let mut cfg = super::Config::default();
+        assert!(cfg.sync.dav_page_size.is_none());
+        for n in [1, 2000] {
+            cfg.sync.dav_page_size = Some(n);
+            assert!(cfg.validate().is_ok());
+        }
+        for n in [0, 2001] {
+            cfg.sync.dav_page_size = Some(n);
+            assert!(cfg.validate().is_err());
+        }
+    }
     use super::*;
     use crate::onedrive_mode::OneDriveMode;
+
+    #[test]
+    fn mobile_files_dir_normalization_preserves_account_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.prepare_mobile_for_files_dir(dir.path()).unwrap();
+        assert_eq!(cfg.accounts[0].username, "me");
+        cfg.accounts[0].username = "existing".into();
+        cfg.accounts[0].mount_point = Some(dir.path().join("old"));
+        cfg.prepare_mobile_for_files_dir(dir.path()).unwrap();
+        assert_eq!(cfg.accounts.len(), 1);
+        assert_eq!(cfg.accounts[0].username, "existing");
+        assert_eq!(cfg.accounts[0].archive_root, dir.path().join("archive"));
+        assert_eq!(cfg.accounts[0].sync_root, dir.path().join("sync"));
+        assert_eq!(cfg.accounts[0].cache_root, dir.path().join("cache"));
+        assert!(cfg.accounts[0].mount_point.is_none());
+    }
+
+    #[test]
+    fn atomic_updates_merge_concurrent_config_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Config::default().save(&path).unwrap();
+        let a = path.clone();
+        let b = path.clone();
+        let first = std::thread::spawn(move || {
+            Config::update_atomically(a, |cfg| {
+                cfg.sync.body_index = true;
+                Ok(())
+            })
+            .unwrap()
+        });
+        let second = std::thread::spawn(move || {
+            Config::update_atomically(b, |cfg| {
+                cfg.sync.wifi_only = true;
+                Ok(())
+            })
+            .unwrap()
+        });
+        first.join().unwrap();
+        second.join().unwrap();
+        let cfg = Config::load(path).unwrap();
+        assert!(cfg.sync.body_index && cfg.sync.wifi_only);
+    }
+
+    #[test]
+    fn self_hosted_account_needs_no_onedrive_root() {
+        let cfg = Config::from_toml(
+            r#"
+            [[accounts]]
+            id = "a"
+            username = "user@example.test"
+            archive_root = "/tmp/archive"
+            [provider_accounts.a]
+            kind = "self_hosted"
+            origin = "https://mail.example.test"
+            client_id = "public-client"
+        "#,
+        )
+        .unwrap();
+        assert!(cfg.validate().is_ok());
+        assert!(cfg.accounts[0].sync_root.as_os_str().is_empty());
+    }
 
     fn account(id: &str) -> AccountConfig {
         AccountConfig {

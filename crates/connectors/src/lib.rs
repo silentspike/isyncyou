@@ -14,12 +14,18 @@ pub mod archive;
 pub mod calendar;
 mod common;
 pub mod contacts;
+#[cfg(feature = "http")]
+pub mod dav;
 pub mod export;
+#[cfg(feature = "http")]
+pub mod jmap;
 pub mod mail;
 pub mod mime;
 pub mod onedrive;
 pub mod onenote;
 pub mod quickxor;
+#[cfg(feature = "http")]
+pub mod request_budget;
 pub mod restore;
 pub mod scope;
 pub mod shared;

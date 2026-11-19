@@ -245,24 +245,50 @@ type PageResources = (Vec<OneNoteResourcePart>, Vec<(String, String)>);
 
 /// Load the page's resource manifest (`<page>.resources.json`, next to the archived
 /// HTML), returning the binary parts to upload and the (url -> part) rewrites. A page
-/// with no manifest restores as plain HTML (empty vectors).
-fn load_resources(archive_root: &Path, html_local_path: &str) -> Result<PageResources, String> {
+/// with no embedded resources restores as plain HTML. Referenced resources
+/// require a verified manifest bound to these exact HTML bytes.
+fn load_resources(
+    archive_root: &Path,
+    html_local_path: &str,
+    html: &[u8],
+) -> Result<PageResources, String> {
+    if !isyncyou_connectors::archive::onenote_html_has_resources(html) {
+        return Ok((vec![], vec![]));
+    }
     let manifest_path = archive_root
         .join(html_local_path)
         .with_extension("resources.json");
-    let raw = match std::fs::read(&manifest_path) {
+    let root = archive_root.canonicalize().map_err(|e| e.to_string())?;
+    let manifest_path = match manifest_path.canonicalize() {
+        Ok(path) if path.starts_with(&root) => path,
+        Ok(_) => return Err("OneNote manifest path escapes archive".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err("OneNote resources are incomplete".into())
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    if manifest_path.metadata().map_err(|e| e.to_string())?.len() > 8 * 1024 * 1024 {
+        return Err("OneNote resource manifest is too large".into());
+    }
+    let raw = match isyncyou_core::envelope::read_body(&manifest_path) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((vec![], vec![])),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err("OneNote resources are incomplete".into())
+        }
         Err(e) => return Err(e.to_string()),
     };
     let manifest: serde_json::Value =
         serde_json::from_slice(&raw).map_err(|e| format!("resource manifest is not JSON: {e}"))?;
+    if !isyncyou_connectors::archive::onenote_manifest_matches(html, &manifest) {
+        return Err("OneNote resource manifest is unverified or stale".into());
+    }
     let entries = manifest
         .get("resources")
         .and_then(|r| r.as_array())
         .cloned()
         .unwrap_or_default();
     let (mut parts, mut rewrites) = (Vec::new(), Vec::new());
+    let mut total_bytes = 0usize;
     for (i, e) in entries.iter().enumerate() {
         let url = e
             .get("source_url")
@@ -277,7 +303,28 @@ fn load_resources(archive_root: &Path, html_local_path: &str) -> Result<PageReso
             .and_then(|v| v.as_str())
             .unwrap_or("application/octet-stream")
             .to_string();
-        let bytes = std::fs::read(archive_root.join(rel)).map_err(|e| e.to_string())?;
+        let path = archive_root
+            .join(rel)
+            .canonicalize()
+            .map_err(|e| e.to_string())?;
+        if !path.starts_with(&root) {
+            return Err("OneNote resource path escapes archive".into());
+        }
+        if path.metadata().map_err(|e| e.to_string())?.len() > 64 * 1024 * 1024 + 4096 {
+            return Err("OneNote resource is too large".into());
+        }
+        let bytes = isyncyou_core::envelope::read_body(&path).map_err(|e| e.to_string())?;
+        if e.get("sha256").and_then(|v| v.as_str())
+            != Some(isyncyou_connectors::archive::onenote_html_sha256(&bytes).as_str())
+        {
+            return Err("OneNote resource digest mismatch or unavailable".into());
+        }
+        total_bytes = total_bytes
+            .checked_add(bytes.len())
+            .ok_or("OneNote resources are too large")?;
+        if total_bytes > 64 * 1024 * 1024 {
+            return Err("OneNote resources are too large".into());
+        }
         let part_name = format!("r{i}");
         rewrites.push((url.to_string(), part_name.clone()));
         parts.push(OneNoteResourcePart {
@@ -320,8 +367,8 @@ pub(crate) fn restore_onenote_via_ledger_classified(
         RestoreError::invalid(format!("onenote item '{id}' has no archived body"))
     })?;
     let section = item.parent_remote_id.clone();
-    let (resources, rewrites) =
-        load_resources(&acc.archive_root, &html_local_path).map_err(RestoreError::invalid)?;
+    let (resources, rewrites) = load_resources(&acc.archive_root, &html_local_path, &bytes)
+        .map_err(RestoreError::invalid)?;
     let secret = load_or_create_secret(&acc.archive_root.join(".isyncyou-restore-secret"))
         .map_err(RestoreError::internal)?;
     let key = idempotency_key(&secret, account, "onenote", id, &bytes);
@@ -434,8 +481,9 @@ pub fn recover_pending_onenote_restores_with<A: OneNoteApi>(
             let rel = item
                 .local_path
                 .ok_or_else(|| format!("item '{}' has no archived body", op.source_item_id))?;
-            let bytes = std::fs::read(acc.archive_root.join(&rel)).map_err(|e| e.to_string())?;
-            let (resources, rewrites) = load_resources(&acc.archive_root, &rel)?;
+            let bytes = isyncyou_core::envelope::read_body(&acc.archive_root.join(&rel))
+                .map_err(|e| e.to_string())?;
+            let (resources, rewrites) = load_resources(&acc.archive_root, &rel, &bytes)?;
             let sink = OneNoteSink {
                 api,
                 rewrites,
@@ -667,12 +715,14 @@ mod tests {
         std::fs::create_dir_all(arch.join("onenote_resources/aa")).unwrap();
         std::fs::write(arch.join("onenote_resources/aa/img.png"), b"PNGDATA").unwrap();
         let html_rel = "onenote/aa/p.html";
-        std::fs::write(arch.join(html_rel), HTML).unwrap();
+        let html = b"<html><img src=\"https://graph.microsoft.com/v1.0/me/onenote/resources/r1/content\"></html>";
+        std::fs::write(arch.join(html_rel), html).unwrap();
         let manifest = serde_json::json!({
             "page_id": "p1",
+            "html_sha256": isyncyou_connectors::archive::onenote_html_sha256(html),
             "resources": [
-                { "source_url": "https://graph/res/1", "content_type": "image/png",
-                  "local_path": "onenote_resources/aa/img.png" }
+                { "source_url": "https://graph.microsoft.com/v1.0/me/onenote/resources/r1/content", "content_type": "image/png",
+                  "local_path": "onenote_resources/aa/img.png", "sha256": isyncyou_connectors::archive::onenote_html_sha256(b"PNGDATA") }
             ]
         });
         std::fs::write(
@@ -681,15 +731,20 @@ mod tests {
         )
         .unwrap();
 
-        let (parts, rewrites) = load_resources(&arch, html_rel).unwrap();
+        let (parts, rewrites) = load_resources(&arch, html_rel, html).unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].part_name, "r0");
         assert_eq!(parts[0].content_type, "image/png");
         assert_eq!(parts[0].bytes, b"PNGDATA");
         assert_eq!(
             rewrites,
-            vec![("https://graph/res/1".to_string(), "r0".to_string())]
+            vec![(
+                "https://graph.microsoft.com/v1.0/me/onenote/resources/r1/content".to_string(),
+                "r0".to_string()
+            )]
         );
+        std::fs::write(arch.join("onenote_resources/aa/img.png"), b"tampered").unwrap();
+        assert!(load_resources(&arch, html_rel, html).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -699,9 +754,109 @@ mod tests {
         let arch = dir.join("arch");
         std::fs::create_dir_all(arch.join("onenote/aa")).unwrap();
         std::fs::write(arch.join("onenote/aa/p.html"), HTML).unwrap();
-        let (parts, rewrites) = load_resources(&arch, "onenote/aa/p.html").unwrap();
+        let (parts, rewrites) = load_resources(&arch, "onenote/aa/p.html", HTML).unwrap();
         assert!(parts.is_empty() && rewrites.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wp16_onenote_stale_manifest_never_binds_new_html() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("page")).unwrap();
+        std::fs::create_dir_all(root.join("resources")).unwrap();
+        std::fs::write(root.join("resources/old.png"), b"old").unwrap();
+        let url = "https://graph.microsoft.com/v1.0/me/onenote/resources/r1/content";
+        let old = format!("<html><p>old</p><img src=\"{url}\"></html>");
+        let new = format!("<html><p>new</p><img src=\"{url}\"></html>");
+        let manifest = serde_json::json!({
+            "html_sha256": isyncyou_connectors::archive::onenote_html_sha256(old.as_bytes()),
+            "resources": [{"source_url":url,"local_path":"resources/old.png", "sha256": isyncyou_connectors::archive::onenote_html_sha256(b"old")}]
+        });
+        let raw = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(root.join("page/p.resources.json"), &raw).unwrap();
+        assert!(load_resources(root, "page/p.html", old.as_bytes()).is_ok());
+        assert!(load_resources(root, "page/p.html", new.as_bytes()).is_err());
+        assert_eq!(
+            std::fs::read(root.join("page/p.resources.json")).unwrap(),
+            raw
+        );
+        assert_eq!(
+            std::fs::read(root.join("resources/old.png")).unwrap(),
+            b"old"
+        );
+    }
+
+    #[test]
+    fn wp16_onenote_sealed_resource_roundtrip() {
+        const CHILD: &str = "ISYNCYOU_ONENOTE_SEALED_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("restore_onenote::tests::wp16_onenote_sealed_resource_roundtrip")
+                .arg("--test-threads=1")
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let key = [0x71; 32];
+        let key_id = 17001;
+        isyncyou_core::envelope::set_body_key(key_id, key);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("page")).unwrap();
+        let url = "https://graph.microsoft.com/v1.0/me/onenote/resources/r1/content";
+        let html = format!("<img src=\"{url}\">");
+        let manifest = serde_json::json!({"html_sha256": isyncyou_connectors::archive::onenote_html_sha256(html.as_bytes()), "resources": [{"source_url": url, "local_path": "page/resource", "content_type": "image/png", "sha256": isyncyou_connectors::archive::onenote_html_sha256(b"original bytes")}]});
+        std::fs::write(
+            root.join("page/p.resources.json"),
+            isyncyou_core::envelope::seal(&serde_json::to_vec(&manifest).unwrap(), &key, key_id),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("page/resource"),
+            isyncyou_core::envelope::seal(b"original bytes", &key, key_id),
+        )
+        .unwrap();
+        let (parts, _) = load_resources(root, "page/p.html", html.as_bytes()).unwrap();
+        assert_eq!(parts[0].bytes, b"original bytes");
+    }
+
+    #[test]
+    fn wp16_onenote_stale_generation_stops_before_restore_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let url = "https://graph.microsoft.com/v1.0/me/onenote/resources/r1/content";
+        let old = format!("<p>old</p><img src=\"{url}\">");
+        let new = format!("<p>new</p><img src=\"{url}\">");
+        std::fs::write(root.join("page.html"), &new).unwrap();
+        let manifest = serde_json::json!({"html_sha256":isyncyou_connectors::archive::onenote_html_sha256(old.as_bytes()), "resources":[{"source_url":url,"local_path":"resource"}]});
+        std::fs::write(
+            root.join("page.resources.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let store = Store::open(root.join(".isyncyou-store.db")).unwrap();
+        let mut page = isyncyou_store::Item::new("acc", "onenote", "p", "page", "page");
+        page.local_path = Some("page.html".into());
+        store.upsert_item(&page).unwrap();
+        drop(store);
+        let cfg = Config {
+            accounts: vec![isyncyou_core::AccountConfig {
+                id: "acc".into(),
+                username: "fixture".into(),
+                sync_root: root.join("sync"),
+                archive_root: root.into(),
+                cache_root: Default::default(),
+                mount_point: None,
+            }],
+            ..Default::default()
+        };
+        let result = restore_onenote_via_ledger(&cfg, "acc", "p", "unused".into());
+        assert!(result.unwrap_err().contains("stale"));
+        assert!(!root.join(".isyncyou-restore-secret").exists());
     }
 
     #[test]

@@ -19,6 +19,8 @@ APPIMAGETOOL="${APPIMAGETOOL:-appimagetool}"
 work="$(mktemp -d)"
 appdir="$work/isyncyou.AppDir"
 mkdir -p "$appdir/usr/bin"
+mkdir -p "$appdir/usr/share/doc/isyncyou/THIRD-PARTY-NOTICES"
+install -m644 "$HERE/../THIRD-PARTY-NOTICES/"* "$appdir/usr/share/doc/isyncyou/THIRD-PARTY-NOTICES/"
 
 for b in isyncyou isyncyoud isyncyou-doctor; do
     install -m755 "$BIN_DIR/$b" "$appdir/usr/bin/$b"

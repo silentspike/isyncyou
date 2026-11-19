@@ -27,6 +27,7 @@ const SERVICES: &[&str] = &[
 #[serde(rename_all = "snake_case")]
 pub enum ActivityKind {
     ArchiveSearch,
+    ProviderSearch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -633,5 +634,16 @@ mod tests {
             value.display_path = Some(path.into());
             assert_eq!(value.validate(), Err(ActivityError::InvalidEvent));
         }
+    }
+    #[test]
+    fn provider_search_activity_is_typed_without_archive_claim() {
+        assert_eq!(
+            serde_json::to_value(ActivityKind::ProviderSearch).unwrap(),
+            "provider_search"
+        );
+        assert_eq!(
+            serde_json::from_value::<ActivityKind>(serde_json::json!("provider_search")).unwrap(),
+            ActivityKind::ProviderSearch
+        );
     }
 }

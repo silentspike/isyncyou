@@ -1,0 +1,16 @@
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import vm from 'node:vm';
+const src=readFileSync(new URL('../gui/webui/src/app.js',import.meta.url),'utf8');
+const start=src.indexOf('let overviewSnapshot = null, overviewGeneration = 0, accountReloadGeneration = 0, accountReloadNeedsRoute = false;'), end=src.indexOf('async function renderOverview(',start);
+assert.ok(start>=0&&end>start);
+let now=1000;
+const ctx=vm.createContext({Date:{now:()=>now},Number,Array});
+vm.runInContext(src.slice(start,end)+'\nthis.remember=rememberOverviewSnapshot; this.cached=cachedOverviewSnapshot;',ctx);
+ctx.remember('a',{totals:{items:42},services:[{},{}]});
+assert.equal(ctx.cached('a').items,42); assert.equal(ctx.cached('a').services,2);
+assert.equal(ctx.cached('b'),null);
+now+=30000; assert.equal(ctx.cached('a'),null);
+ctx.remember('b',{totals:{items:3},services:[]}); assert.equal(ctx.cached('a'),null); assert.equal(ctx.cached('b').items,3);
+ctx.remember('b',{totals:{items:-1},services:[]}); assert.equal(ctx.cached('b'),null);
+console.log('Overview summary: account isolation, expiry, replacement and invalid data passed');

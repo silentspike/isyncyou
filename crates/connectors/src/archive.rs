@@ -284,6 +284,153 @@ pub fn backup_onenote_bodies<F: BytesFetcher>(
     )
 }
 
+/// Select the same next page that a one-item body archive pass would fetch.
+pub fn next_onenote_body(store: &Store, account: &str) -> Result<Option<Item>, SyncError> {
+    next_onenote_body_excluding(store, account, &HashSet::new())
+}
+
+pub fn next_onenote_body_excluding(
+    store: &Store,
+    account: &str,
+    excluded: &HashSet<String>,
+) -> Result<Option<Item>, SyncError> {
+    next_onenote_body_after(store, account, excluded, None)
+}
+
+pub fn next_onenote_body_after(
+    store: &Store,
+    account: &str,
+    excluded: &HashSet<String>,
+    after: Option<&str>,
+) -> Result<Option<Item>, SyncError> {
+    Ok(store
+        .items_by_type(account, "onenote", "page")?
+        .into_iter()
+        .find(|item| {
+            item.local_path.is_none()
+                && !excluded.contains(&item.remote_id)
+                && after.is_none_or(|after| item.remote_id.as_str() > after)
+        }))
+}
+
+pub fn commit_onenote_body(
+    store: &Store,
+    account: &str,
+    item: &Item,
+    archive_root: &Path,
+    bytes: &[u8],
+) -> Result<(), SyncError> {
+    if store
+        .get_item(account, "onenote", &item.remote_id)?
+        .as_ref()
+        != Some(item)
+        || item.local_path.is_some()
+    {
+        return Err(SyncError::Malformed("OneNote body plan changed".into()));
+    }
+    let abs = shard_path(archive_root, "onenote", &item.remote_id, "html");
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = abs.with_extension("html.part");
+    std::fs::write(&tmp, isyncyou_core::envelope::seal_for_disk(bytes))?;
+    std::fs::rename(&tmp, &abs)?;
+    let rel = abs.strip_prefix(archive_root).unwrap_or(&abs);
+    store.set_local_path(
+        account,
+        "onenote",
+        &item.remote_id,
+        Some(&rel.to_string_lossy()),
+    )?;
+    Ok(())
+}
+
+/// Select the first resource absent from the archive without making a network
+/// request or changing the store. Mirrors the stable ordering of the archive pass.
+pub fn next_onenote_resource(
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+) -> Result<Option<(Item, String)>, SyncError> {
+    next_onenote_resource_excluding(store, account, archive_root, &HashSet::new())
+}
+
+pub fn next_onenote_resource_excluding(
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+    excluded: &HashSet<(String, String)>,
+) -> Result<Option<(Item, String)>, SyncError> {
+    next_onenote_resource_after(store, account, archive_root, excluded, None, false)
+}
+
+fn read_onenote_html(path: &Path, bounded: bool) -> Result<Option<String>, SyncError> {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(SyncError::Io(e)),
+    };
+    let limit = 64 * 1024 * 1024 + 4096;
+    let mut raw = Vec::new();
+    if bounded {
+        file.take(limit + 1).read_to_end(&mut raw)?;
+        if raw.len() as u64 > limit {
+            return Ok(None);
+        }
+    } else {
+        let mut file = file;
+        file.read_to_end(&mut raw)?;
+    }
+    let bytes = if isyncyou_core::envelope::blob_key_id(&raw).is_some() {
+        isyncyou_core::envelope::open_with_registered_body_key(&raw)
+            .map_err(|_| SyncError::Malformed("OneNote HTML envelope invalid".into()))?
+    } else {
+        raw
+    };
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| SyncError::Malformed("OneNote HTML is not UTF-8".into()))
+}
+
+pub fn next_onenote_resource_after(
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+    excluded: &HashSet<(String, String)>,
+    after: Option<(&str, &str)>,
+    bounded: bool,
+) -> Result<Option<(Item, String)>, SyncError> {
+    for page in store.items_by_type(account, "onenote", "page")? {
+        let Some(local_path) = page.local_path.as_deref() else {
+            continue;
+        };
+        let Some(html) = read_onenote_html(&archive_root.join(local_path), bounded)? else {
+            continue;
+        };
+        let html_hash = onenote_html_sha256(html.as_bytes());
+        let mut resources = extract_onenote_resources(&html);
+        resources.sort_by(|a, b| a.url.cmp(&b.url));
+        for resource in resources {
+            let ext = resource_ext(resource.content_type.as_deref(), &resource.url);
+            let path = shard_path(
+                archive_root,
+                "onenote_resources",
+                &onenote_resource_key(&page.remote_id, &html_hash, &resource.url),
+                ext,
+            );
+            if !path.exists()
+                && !excluded.contains(&(page.remote_id.clone(), resource.url.clone()))
+                && after
+                    .is_none_or(|after| (page.remote_id.as_str(), resource.url.as_str()) > after)
+            {
+                return Ok(Some((page, resource.url)));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Archive binary OneNote page resources referenced by already-archived page HTML.
 ///
 /// Microsoft Graph returns OneNote resource URLs in the page HTML (`img` `src` /
@@ -299,24 +446,479 @@ pub fn backup_onenote_resources<F: BytesFetcher>(
     archive_root: &Path,
     limit: usize,
 ) -> Result<OneNoteResourceReport, SyncError> {
+    backup_onenote_resources_excluding(
+        fetcher,
+        store,
+        account,
+        archive_root,
+        limit,
+        &HashSet::new(),
+    )
+}
+
+pub fn backup_onenote_resources_excluding<F: BytesFetcher>(
+    fetcher: &F,
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+    limit: usize,
+    excluded: &HashSet<(String, String)>,
+) -> Result<OneNoteResourceReport, SyncError> {
+    backup_onenote_resources_after(
+        fetcher,
+        store,
+        account,
+        archive_root,
+        OneNoteResourceOptions {
+            limit,
+            excluded,
+            after: None,
+            bounded: false,
+        },
+    )
+}
+
+/// Bounds and continuation state for a OneNote resource archive pass.
+pub struct OneNoteResourceOptions<'a> {
+    pub limit: usize,
+    pub excluded: &'a HashSet<(String, String)>,
+    pub after: Option<(&'a str, &'a str)>,
+    pub bounded: bool,
+}
+
+/// Persistent mobile refresh state, scoped by the account archive root.
+pub const ONENOTE_MOBILE_REFRESH_STATE_FILE: &str = ".onenote-mobile-refresh-state.json";
+
+/// Stable content identity for a page generation, independent of disk sealing.
+pub fn onenote_html_sha256(html: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, html)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Validate a manifest against the exact HTML bytes being displayed/restored.
+/// Legacy manifests without an HTML binding remain present but unverified.
+pub fn onenote_manifest_matches(html: &[u8], manifest: &Value) -> bool {
+    let Ok(html_text) = std::str::from_utf8(html) else {
+        return false;
+    };
+    if manifest.get("html_sha256").and_then(Value::as_str)
+        != Some(onenote_html_sha256(html).as_str())
+    {
+        return false;
+    }
+    let Some(entries) = manifest.get("resources").and_then(Value::as_array) else {
+        return false;
+    };
+    let expected: HashSet<_> = extract_onenote_resources(html_text)
+        .into_iter()
+        .map(|resource| resource.url)
+        .collect();
+    let mut actual = HashSet::new();
+    for entry in entries {
+        let Some(url) = entry.get("source_url").and_then(Value::as_str) else {
+            return false;
+        };
+        if entry
+            .get("local_path")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+            || !actual.insert(url.to_owned())
+        {
+            return false;
+        }
+    }
+    actual == expected
+}
+
+pub fn onenote_html_has_resources(html: &[u8]) -> bool {
+    std::str::from_utf8(html)
+        .map(|text| !extract_onenote_resources(text).is_empty())
+        .unwrap_or(true)
+}
+
+/// A resource must be readable and, when sealed, decryptable with a current
+/// key before an archive generation can be presented as complete.
+fn onenote_resource_length(root: &Path, rel: &str, expected: &str) -> Option<usize> {
+    let root = root.canonicalize().ok()?;
+    let path = root.join(rel).canonicalize().ok()?;
+    if !path.starts_with(&root)
+        || !path.is_file()
+        || path
+            .metadata()
+            .map_or(true, |m| m.len() > 64 * 1024 * 1024 + 4096)
+    {
+        return None;
+    }
+    let bytes = isyncyou_core::envelope::read_body(&path).ok()?;
+    (onenote_html_sha256(&bytes) == expected).then_some(bytes.len())
+}
+
+pub fn onenote_resources_readable(root: &Path, entries: &[Value]) -> bool {
+    if entries.len() > 1024 {
+        return false;
+    }
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    let mut total = 0usize;
+    for entry in entries {
+        let (Some(rel), Some(digest)) = (entry["local_path"].as_str(), entry["sha256"].as_str())
+        else {
+            return false;
+        };
+        let Some(length) = onenote_resource_length(&root, rel, digest) else {
+            return false;
+        };
+        total = match total.checked_add(length) {
+            Some(n) => n,
+            None => return false,
+        };
+        if total > 64 * 1024 * 1024 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Verify the local page generation without fetching or modifying any data.
+pub fn onenote_page_generation_complete(root: &Path, page: &Item) -> bool {
+    let Some(rel) = page.local_path.as_deref() else {
+        return false;
+    };
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    let Ok(html_path) = root.join(rel).canonicalize() else {
+        return false;
+    };
+    if !html_path.starts_with(&root) {
+        return false;
+    }
+    let Ok(Some(html)) = read_onenote_html(&html_path, true) else {
+        return false;
+    };
+    if !onenote_html_has_resources(html.as_bytes()) {
+        return true;
+    }
+    let Ok(manifest_path) = html_path.with_extension("resources.json").canonicalize() else {
+        return false;
+    };
+    if !manifest_path.starts_with(&root)
+        || manifest_path
+            .metadata()
+            .map_or(true, |m| m.len() > 8 * 1024 * 1024)
+    {
+        return false;
+    }
+    let Some(manifest) = isyncyou_core::envelope::read_body(&manifest_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    else {
+        return false;
+    };
+    onenote_manifest_matches(html.as_bytes(), &manifest)
+        && manifest["resources"]
+            .as_array()
+            .is_some_and(|entries| onenote_resources_readable(&root, entries))
+}
+
+fn onenote_resource_key(page: &str, html_hash: &str, url: &str) -> String {
+    format!("{page}:{html_hash}:{url}")
+}
+
+#[cfg(unix)]
+type OneNoteFileIdentity = (u64, u64, u64, i64, i64);
+
+#[cfg(unix)]
+fn onenote_file_identity(path: &Path) -> std::io::Result<OneNoteFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(path)?;
+    if !m.is_file() {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    Ok((m.dev(), m.ino(), m.len(), m.ctime(), m.ctime_nsec()))
+}
+
+#[cfg(unix)]
+pub struct PreparedOneNoteManifest {
+    target: std::path::PathBuf,
+    bytes: Vec<u8>,
+    files: Vec<(std::path::PathBuf, OneNoteFileIdentity)>,
+}
+
+#[cfg(unix)]
+pub struct PlannedOneNoteResource {
+    pub page: Item,
+    pub url: String,
+    root: std::path::PathBuf,
+    target: std::path::PathBuf,
+    html_path: std::path::PathBuf,
+    html_identity: OneNoteFileIdentity,
+}
+
+/// Inspect one page outside the store gate. The caller revalidates the page
+/// and publishes only after the captured HTML identity has been rechecked.
+#[cfg(unix)]
+pub fn plan_onenote_resource(
+    root: &Path,
+    page: &Item,
+    after: Option<&str>,
+) -> std::io::Result<Option<PlannedOneNoteResource>> {
+    let Some(rel) = page.local_path.as_deref() else {
+        return Ok(None);
+    };
+    let root = root.canonicalize()?;
+    let html_path = root.join(rel).canonicalize()?;
+    if !html_path.starts_with(&root) {
+        return Err(std::io::ErrorKind::PermissionDenied.into());
+    }
+    let html_identity = onenote_file_identity(&html_path)?;
+    let Some(html) =
+        read_onenote_html(&html_path, true).map_err(|_| std::io::ErrorKind::InvalidData)?
+    else {
+        return Ok(None);
+    };
+    if onenote_file_identity(&html_path)? != html_identity {
+        return Err(std::io::ErrorKind::Interrupted.into());
+    }
+    let hash = onenote_html_sha256(html.as_bytes());
+    let mut resources = extract_onenote_resources(&html);
+    resources.sort_by(|a, b| a.url.cmp(&b.url));
+    for resource in resources {
+        if after.is_some_and(|after| resource.url.as_str() <= after) {
+            continue;
+        }
+        let ext = resource_ext(resource.content_type.as_deref(), &resource.url);
+        let target = shard_path(
+            &root,
+            "onenote_resources",
+            &onenote_resource_key(&page.remote_id, &hash, &resource.url),
+            ext,
+        );
+        if !target.exists() {
+            return Ok(Some(PlannedOneNoteResource {
+                page: page.clone(),
+                url: resource.url,
+                root,
+                target,
+                html_path,
+                html_identity,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(unix)]
+pub struct PreparedOneNoteResource {
+    pub plan: PlannedOneNoteResource,
+    temporary: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for PreparedOneNoteResource {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.temporary);
+    }
+}
+
+#[cfg(unix)]
+pub fn prepare_planned_onenote_resource(
+    plan: PlannedOneNoteResource,
+    bytes: &[u8],
+) -> std::io::Result<PreparedOneNoteResource> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    if bytes.len() > 64 * 1024 * 1024 {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    if onenote_file_identity(&plan.html_path)? != plan.html_identity || plan.target.exists() {
+        return Err(std::io::ErrorKind::Interrupted.into());
+    }
+    let parent = plan
+        .target
+        .parent()
+        .ok_or(std::io::ErrorKind::InvalidInput)?;
+    std::fs::create_dir_all(parent)?;
+    if !parent.canonicalize()?.starts_with(&plan.root) {
+        return Err(std::io::ErrorKind::PermissionDenied.into());
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(
+        ".onenote-part-{}-{nonce}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    if let Err(error) = file.write_all(&isyncyou_core::envelope::seal_for_disk(bytes)) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = file.sync_all() {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(PreparedOneNoteResource { plan, temporary })
+}
+
+#[cfg(unix)]
+pub fn commit_planned_onenote_resource(prepared: PreparedOneNoteResource) -> std::io::Result<()> {
+    let plan = &prepared.plan;
+    if onenote_file_identity(&plan.html_path)? != plan.html_identity || plan.target.exists() {
+        return Err(std::io::ErrorKind::Interrupted.into());
+    }
+    let parent = plan
+        .target
+        .parent()
+        .ok_or(std::io::ErrorKind::InvalidInput)?;
+    if !parent.canonicalize()?.starts_with(&plan.root) {
+        return Err(std::io::ErrorKind::PermissionDenied.into());
+    }
+    std::fs::hard_link(&prepared.temporary, &plan.target)?;
+    std::fs::File::open(parent)?.sync_all()
+}
+
+/// Hash one page and its bounded local resources without holding the store gate.
+#[cfg(unix)]
+pub fn prepare_onenote_manifest(
+    root: &Path,
+    page: &Item,
+) -> std::io::Result<Option<PreparedOneNoteManifest>> {
+    let Some(rel) = page.local_path.as_deref() else {
+        return Ok(None);
+    };
+    let root = root.canonicalize()?;
+    let html_path = root.join(rel).canonicalize()?;
+    if !html_path.starts_with(&root) {
+        return Err(std::io::ErrorKind::PermissionDenied.into());
+    }
+    let html_identity = onenote_file_identity(&html_path)?;
+    let Some(html) =
+        read_onenote_html(&html_path, true).map_err(|_| std::io::ErrorKind::InvalidData)?
+    else {
+        return Ok(None);
+    };
+    if onenote_file_identity(&html_path)? != html_identity {
+        return Err(std::io::ErrorKind::Interrupted.into());
+    }
+    let html_hash = onenote_html_sha256(html.as_bytes());
+    let mut refs = extract_onenote_resources(&html);
+    refs.sort_by(|a, b| a.url.cmp(&b.url));
+    if refs.is_empty() {
+        return Ok(None);
+    }
+    if refs.len() > 1024 {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    let mut files = vec![(html_path.clone(), html_identity)];
+    let mut entries = Vec::new();
+    let mut total = 0usize;
+    for resource in refs {
+        let ext = resource_ext(resource.content_type.as_deref(), &resource.url);
+        let path = shard_path(
+            &root,
+            "onenote_resources",
+            &onenote_resource_key(&page.remote_id, &html_hash, &resource.url),
+            ext,
+        )
+        .canonicalize()?;
+        if !path.starts_with(&root) {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        let identity = onenote_file_identity(&path)?;
+        if identity.2 > 64 * 1024 * 1024 + 4096 {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        let bytes = isyncyou_core::envelope::read_body(&path)?;
+        total = total
+            .checked_add(bytes.len())
+            .ok_or(std::io::ErrorKind::InvalidData)?;
+        if total > 64 * 1024 * 1024 || onenote_file_identity(&path)? != identity {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        let local = path
+            .strip_prefix(&root)
+            .map_err(|_| std::io::ErrorKind::PermissionDenied)?
+            .to_string_lossy()
+            .to_string();
+        entries.push(serde_json::json!({"source_url": resource.url, "content_type": resource.content_type, "local_path": local, "sha256": onenote_html_sha256(&bytes)}));
+        files.push((path, identity));
+    }
+    let manifest = serde_json::json!({"page_id":page.remote_id, "page_local_path":rel, "html_sha256":html_hash, "resources":entries});
+    let bytes =
+        serde_json::to_vec_pretty(&manifest).map_err(|_| std::io::ErrorKind::InvalidData)?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    Ok(Some(PreparedOneNoteManifest {
+        target: html_path.with_extension("resources.json"),
+        bytes,
+        files,
+    }))
+}
+
+#[cfg(unix)]
+pub fn publish_onenote_manifest(prepared: PreparedOneNoteManifest) -> std::io::Result<()> {
+    for (path, identity) in &prepared.files {
+        if &onenote_file_identity(path)? != identity {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+    }
+    isyncyou_core::envelope::write_body_atomic(&prepared.target, &prepared.bytes)
+}
+
+pub fn backup_onenote_resources_after<F: BytesFetcher>(
+    fetcher: &F,
+    store: &Store,
+    account: &str,
+    archive_root: &Path,
+    options: OneNoteResourceOptions<'_>,
+) -> Result<OneNoteResourceReport, SyncError> {
+    let OneNoteResourceOptions {
+        limit,
+        excluded,
+        after,
+        bounded,
+    } = options;
     let mut report = OneNoteResourceReport::default();
     for page in store.items_by_type(account, "onenote", "page")? {
         let Some(local_path) = page.local_path.as_deref() else {
             continue;
         };
         let html_path = archive_root.join(local_path);
-        let html = match std::fs::read_to_string(&html_path) {
-            Ok(html) => html,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(SyncError::Io(e)),
+        let Some(html) = read_onenote_html(&html_path, bounded)? else {
+            continue;
         };
+        let html_hash = onenote_html_sha256(html.as_bytes());
         report.pages += 1;
-        let resources = extract_onenote_resources(&html);
+        let mut resources = extract_onenote_resources(&html);
+        resources.sort_by(|a, b| a.url.cmp(&b.url));
         if resources.is_empty() {
             continue;
         }
+        let resource_count = resources.len();
         let mut manifest_entries = Vec::new();
         for resource in resources {
+            if excluded.contains(&(page.remote_id.clone(), resource.url.clone())) {
+                continue;
+            }
+            if after.is_some_and(|after| (page.remote_id.as_str(), resource.url.as_str()) <= after)
+            {
+                continue;
+            }
             if limit != 0 && report.resources >= limit {
                 break;
             }
@@ -324,7 +926,7 @@ pub fn backup_onenote_resources<F: BytesFetcher>(
             let abs = shard_path(
                 archive_root,
                 "onenote_resources",
-                &format!("{}:{}", page.remote_id, resource.url),
+                &onenote_resource_key(&page.remote_id, &html_hash, &resource.url),
                 ext,
             );
             if let Some(parent) = abs.parent() {
@@ -345,16 +947,37 @@ pub fn backup_onenote_resources<F: BytesFetcher>(
                 report.resources += 1;
                 report.bytes += bytes.len() as u64;
             }
+            if bounded && abs.metadata()?.len() > 64 * 1024 * 1024 + 4096 {
+                return Err(SyncError::Malformed("OneNote resource too large".into()));
+            }
+            let resource_bytes = isyncyou_core::envelope::read_body(&abs)?;
             manifest_entries.push(serde_json::json!({
                 "source_url": resource.url,
                 "content_type": resource.content_type,
                 "local_path": rel,
+                "sha256": onenote_html_sha256(&resource_bytes),
             }));
         }
-        if !manifest_entries.is_empty() {
+        // A manifest has no completeness marker in the existing format. Do
+        // not publish a partial one when an oversized resource was deferred.
+        let has_deferred = excluded
+            .iter()
+            .any(|(page_id, _)| page_id == &page.remote_id);
+        let all_present = extract_onenote_resources(&html).iter().all(|resource| {
+            let ext = resource_ext(resource.content_type.as_deref(), &resource.url);
+            shard_path(
+                archive_root,
+                "onenote_resources",
+                &onenote_resource_key(&page.remote_id, &html_hash, &resource.url),
+                ext,
+            )
+            .exists()
+        });
+        if manifest_entries.len() == resource_count && !has_deferred && all_present {
             let manifest = serde_json::json!({
                 "page_id": page.remote_id,
                 "page_local_path": local_path,
+                "html_sha256": html_hash,
                 "resources": manifest_entries,
             });
             let manifest_path = html_path.with_extension("resources.json");
@@ -720,6 +1343,258 @@ mod tests {
         assert!(rel.starts_with("onenote/") && rel.ends_with(".html"));
         let bytes = std::fs::read(dir.path().join(&rel)).unwrap();
         assert!(bytes.starts_with(b"<html>"));
+    }
+
+    #[test]
+    fn onenote_one_item_plans_follow_archive_order_and_resume() {
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        store
+            .upsert_item(&Item::new("acc", "onenote", "p1", "one", "page"))
+            .unwrap();
+        store
+            .upsert_item(&Item::new("acc", "onenote", "p2", "two", "page"))
+            .unwrap();
+        let fetcher = MockBytes::new();
+        assert_eq!(
+            next_onenote_body(&store, "acc").unwrap().unwrap().remote_id,
+            "p1"
+        );
+        let excluded = ["p1".to_string()].into_iter().collect();
+        assert_eq!(
+            next_onenote_body_excluding(&store, "acc", &excluded)
+                .unwrap()
+                .unwrap()
+                .remote_id,
+            "p2"
+        );
+        backup_onenote_bodies(&fetcher, &store, "acc", dir.path(), 1).unwrap();
+        assert_eq!(
+            next_onenote_body(&store, "acc").unwrap().unwrap().remote_id,
+            "p2"
+        );
+        backup_onenote_bodies(&fetcher, &store, "acc", dir.path(), 1).unwrap();
+        assert!(next_onenote_body(&store, "acc").unwrap().is_none());
+
+        let item = store.get_item("acc", "onenote", "p1").unwrap().unwrap();
+        std::fs::write(dir.path().join(item.local_path.unwrap()),
+            r#"<img src="https://graph.microsoft.com/v1.0/me/onenote/resources/a/content"><img src="https://graph.microsoft.com/v1.0/me/onenote/resources/b/content">"#).unwrap();
+        for id in ["a", "b"] {
+            let (_, url) = next_onenote_resource(&store, "acc", dir.path())
+                .unwrap()
+                .unwrap();
+            assert!(url.contains(&format!("/{id}/")));
+            assert_eq!(
+                backup_onenote_resources(&fetcher, &store, "acc", dir.path(), 1)
+                    .unwrap()
+                    .resources,
+                1
+            );
+        }
+        assert!(next_onenote_resource(&store, "acc", dir.path())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn wp16_onenote_changed_html_defers_without_reusing_old_generation() {
+        let store = Store::open_in_memory().unwrap();
+        let mut page = Item::new("acc", "onenote", "p1", "Page", "page");
+        page.local_path = Some("page.html".into());
+        store.upsert_item(&page).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let url = "https://graph.microsoft.com/v1.0/me/onenote/resources/r1/content";
+        let old = format!("<html><p>old</p><img src=\"{url}\"></html>");
+        let new = format!("<html><p>new</p><img src=\"{url}\"></html>");
+        std::fs::write(dir.path().join("page.html"), &old).unwrap();
+        let fetcher = MockBytes::new();
+        backup_onenote_resources(&fetcher, &store, "acc", dir.path(), 0).unwrap();
+        assert!(onenote_page_generation_complete(dir.path(), &page));
+        let manifest_path = dir.path().join("page.resources.json");
+        let original_manifest = std::fs::read(&manifest_path).unwrap();
+        std::fs::write(dir.path().join("page.html"), &new).unwrap();
+        assert!(!onenote_page_generation_complete(dir.path(), &page));
+        struct FailedFetch;
+        impl BytesFetcher for FailedFetch {
+            fn fetch_bytes(&self, _: &str) -> Result<Vec<u8>, String> {
+                Err("synthetic resource failure".into())
+            }
+        }
+        assert!(backup_onenote_resources(&FailedFetch, &store, "acc", dir.path(), 0).is_err());
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), original_manifest);
+        assert!(!onenote_page_generation_complete(dir.path(), &page));
+        let excluded = HashSet::from([("p1".to_owned(), url.to_owned())]);
+        backup_onenote_resources_excluding(&fetcher, &store, "acc", dir.path(), 1, &excluded)
+            .unwrap();
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), original_manifest);
+        assert!(!onenote_page_generation_complete(dir.path(), &page));
+        backup_onenote_resources(&fetcher, &store, "acc", dir.path(), 0).unwrap();
+        assert!(onenote_page_generation_complete(dir.path(), &page));
+        assert_eq!(
+            fetcher.urls.borrow().iter().filter(|s| *s == url).count(),
+            2
+        );
+        let prepared = prepare_onenote_manifest(dir.path(), &page)
+            .unwrap()
+            .unwrap();
+        publish_onenote_manifest(prepared).unwrap();
+        let prepared = prepare_onenote_manifest(dir.path(), &page)
+            .unwrap()
+            .unwrap();
+        let manifest: Value =
+            serde_json::from_slice(&isyncyou_core::envelope::read_body(&manifest_path).unwrap())
+                .unwrap();
+        let resource = manifest["resources"][0]["local_path"].as_str().unwrap();
+        std::fs::write(dir.path().join("replacement-resource"), b"tampered").unwrap();
+        std::fs::rename(
+            dir.path().join("replacement-resource"),
+            dir.path().join(resource),
+        )
+        .unwrap();
+        assert!(publish_onenote_manifest(prepared).is_err());
+        assert!(!onenote_page_generation_complete(dir.path(), &page));
+        std::fs::write(
+            dir.path().join(resource),
+            isyncyou_core::envelope::seal(b"data", &[0x93; 32], u32::MAX),
+        )
+        .unwrap();
+        assert!(!onenote_page_generation_complete(dir.path(), &page));
+    }
+
+    #[test]
+    fn wp16_onenote_resource_plan_rejects_changed_html_before_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut page = Item::new("acc", "onenote", "p", "page", "page");
+        page.local_path = Some("page.html".into());
+        let url = "https://graph.microsoft.com/v1.0/me/onenote/resources/r1/content";
+        let old = format!("<p>old</p><img src=\"{url}\">");
+        let new = format!("<p>new</p><img src=\"{url}\">");
+        std::fs::write(root.join("page.html"), old).unwrap();
+        let stale = plan_onenote_resource(root, &page, None).unwrap().unwrap();
+        std::fs::write(root.join("replacement.html"), &new).unwrap();
+        std::fs::rename(root.join("replacement.html"), root.join("page.html")).unwrap();
+        assert!(prepare_planned_onenote_resource(stale, b"content").is_err());
+        let current = plan_onenote_resource(root, &page, None).unwrap().unwrap();
+        let prepared = prepare_planned_onenote_resource(current, b"content").unwrap();
+        std::fs::write(root.join("replacement.html"), "changed again").unwrap();
+        std::fs::rename(root.join("replacement.html"), root.join("page.html")).unwrap();
+        assert!(commit_planned_onenote_resource(prepared).is_err());
+        std::fs::write(root.join("page.html"), &new).unwrap();
+        let current = plan_onenote_resource(root, &page, None).unwrap().unwrap();
+        let prepared = prepare_planned_onenote_resource(current, b"content").unwrap();
+        let started = std::time::Instant::now();
+        commit_planned_onenote_resource(prepared).unwrap();
+        eprintln!(
+            "OneNote synthetic link and directory sync: {} us",
+            started.elapsed().as_micros()
+        );
+        assert!(plan_onenote_resource(root, &page, None).unwrap().is_none());
+        let manifest = prepare_onenote_manifest(root, &page).unwrap().unwrap();
+        publish_onenote_manifest(manifest).unwrap();
+        assert!(onenote_page_generation_complete(root, &page));
+    }
+
+    #[test]
+    fn onenote_deferred_resource_never_publishes_partial_manifest() {
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut page = Item::new("acc", "onenote", "p", "page", "page");
+        page.local_path = Some("page.html".into());
+        store.upsert_item(&page).unwrap();
+        std::fs::write(dir.path().join("page.html"),
+            r#"<img src="https://graph.microsoft.com/v1.0/me/onenote/resources/a/content"><img src="https://graph.microsoft.com/v1.0/me/onenote/resources/b/content">"#).unwrap();
+        let excluded = [(
+            "p".to_string(),
+            "https://graph.microsoft.com/v1.0/me/onenote/resources/b/content".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let report = backup_onenote_resources_excluding(
+            &MockBytes::new(),
+            &store,
+            "acc",
+            dir.path(),
+            1,
+            &excluded,
+        )
+        .unwrap();
+        assert_eq!(report.resources, 1);
+        assert_eq!(report.manifests, 0);
+        assert!(!dir.path().join("page.resources.json").exists());
+    }
+
+    #[test]
+    fn onenote_html_reader_rejects_envelope_without_its_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.html");
+        let sealed = isyncyou_core::envelope::seal(b"<html></html>", &[0x94; 32], u32::MAX);
+        std::fs::write(&path, sealed).unwrap();
+        assert!(read_onenote_html(&path, true).is_err());
+        std::fs::write(&path, b"<html></html>").unwrap();
+        assert_eq!(
+            read_onenote_html(&path, true).unwrap().as_deref(),
+            Some("<html></html>")
+        );
+    }
+
+    #[test]
+    fn onenote_archive_cursor_reaches_items_after_a_full_deferred_batch() {
+        let store = Store::open_in_memory().unwrap();
+        for index in 0..51 {
+            let id = format!("{index:03}");
+            store
+                .upsert_item(&Item::new("acc", "onenote", &id, "page", "page"))
+                .unwrap();
+        }
+        let empty = HashSet::new();
+        let mut after = None;
+        for _ in 0..50 {
+            let item = next_onenote_body_after(&store, "acc", &empty, after.as_deref())
+                .unwrap()
+                .unwrap();
+            after = Some(item.remote_id);
+        }
+        assert_eq!(
+            next_onenote_body_after(&store, "acc", &empty, after.as_deref())
+                .unwrap()
+                .unwrap()
+                .remote_id,
+            "050"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut page = Item::new("resources", "onenote", "page", "page", "page");
+        page.local_path = Some("page.html".into());
+        store.upsert_item(&page).unwrap();
+        let html = (0..51).map(|i| format!("<img src=\"https://graph.microsoft.com/v1.0/me/onenote/resources/{i:03}/content\">"))
+            .collect::<String>();
+        std::fs::write(dir.path().join("page.html"), html).unwrap();
+        let empty = HashSet::new();
+        let mut after: Option<(String, String)> = None;
+        for _ in 0..50 {
+            let current = next_onenote_resource_after(
+                &store,
+                "resources",
+                dir.path(),
+                &empty,
+                after.as_ref().map(|(p, u)| (p.as_str(), u.as_str())),
+                true,
+            )
+            .unwrap()
+            .unwrap();
+            after = Some((current.0.remote_id, current.1));
+        }
+        let current = next_onenote_resource_after(
+            &store,
+            "resources",
+            dir.path(),
+            &empty,
+            after.as_ref().map(|(p, u)| (p.as_str(), u.as_str())),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(current.1.contains("/050/"));
     }
 
     #[test]

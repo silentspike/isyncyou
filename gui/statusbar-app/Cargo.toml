@@ -16,6 +16,6 @@ doc = false
 isyncyou-statusbar = { path = "../statusbar" }
 winit = "0.30"
 softbuffer = "0.4"
-ksni = "0.3.4"
+ksni = { path = "../../vendor/ksni" }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time"] }

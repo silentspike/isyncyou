@@ -76,7 +76,7 @@ function sendSseMessage(res, obj) {
 async function sendStream(res, scenario, turn) {
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
-    "cache-control": "no-cache, no-transform",
+    "cache-control": "no-store, no-transform",
     connection: "keep-alive",
   });
   if (scenario === "normal") {
@@ -498,7 +498,7 @@ function makeFixtureServer(evidence, options = {}) {
         if (scenario === "slow-cancel") {
           res.writeHead(200, {
             "content-type": "text/event-stream; charset=utf-8",
-            "cache-control": "no-cache, no-transform",
+            "cache-control": "no-store, no-transform",
             connection: "keep-alive",
           });
           res.write(": ready\n\n");

@@ -87,6 +87,253 @@ const minBtn = await page.evaluate(() => {
 });
 check(`min interactive target >= 28px (measured ${minBtn}px)`, minBtn >= 28);
 
+// Pending self-hosted mail reads are bounded and isolated by account/scope.
+// Use synthetic pending requests: no account or provider operation is changed.
+const providerRead = await page.evaluate(async () => {
+  const original = window.api;
+  let started = 0, aborted = 0;
+  window.api = (url, opts) => {
+    if (!url.startsWith("/synthetic-provider-")) return original(url, opts);
+    started++;
+    return new Promise((resolve, reject) => {
+      opts.signal.addEventListener("abort", () => { aborted++; reject(new Error("aborted")); });
+    });
+  };
+  try {
+    const sharedController = new AbortController();
+    const a = providerMailRead("a", "", "live", "/synthetic-provider-live");
+    const same = providerMailRead("a", "", "live", "/synthetic-provider-live");
+    const superseded = same.then(() => false, () => true);
+    const newest = providerMailRead("a", "", "live", "/synthetic-provider-live");
+    const account = providerMailRead("b", "", "live", "/synthetic-provider-live");
+    const shared = providerMailRead("a", "shared", "live", "/synthetic-provider-live", sharedController.signal);
+    const sharedAgain = providerMailRead("a", "shared", "live", "/synthetic-provider-live", sharedController.signal);
+    const busy = providerMailRead("a", "", "scopes", "/synthetic-provider-scopes").then(() => false, () => true);
+    const settled = Promise.allSettled([a, newest, account, shared, sharedAgain]);
+    const identity = a !== same && same !== newest && a !== account && shared !== sharedAgain;
+    clearProviderMailReads(); sharedController.abort();
+    return { identity, started, aborted, busy: await busy, superseded: await superseded,
+      rejected: (await settled).every(x => x.status === "rejected"), empty: ProviderMailReads.size === 0 && ProviderSharedReads.size === 0 };
+  } finally { window.api = original; }
+});
+check("pending provider mail reads stay bounded and account-scoped",
+  providerRead.identity && providerRead.started === 4 && providerRead.aborted === 4 &&
+  providerRead.busy && providerRead.superseded && providerRead.rejected && providerRead.empty);
+
+// A later view waits for an old read but must issue its own authorized request.
+const providerBarrier = await page.evaluate(async () => {
+  const original = window.api, resolvers = [];
+  window.api = (url, opts) => {
+    if (url !== "/synthetic-provider-barrier") return original(url, opts);
+    return new Promise((resolve, reject) => {
+      resolvers.push(resolve);
+      opts.signal.addEventListener("abort", () => reject(new Error("aborted")));
+    });
+  };
+  try {
+    const old = providerMailRead("a", "", "live", "/synthetic-provider-barrier");
+    const next = providerMailRead("a", "", "live", "/synthetic-provider-barrier", undefined, () => true);
+    resolvers[0]("old");
+    await old;
+    for (let i = 0; i < 10 && resolvers.length < 2; i++) await Promise.resolve();
+    if (resolvers.length !== 2) return false;
+    resolvers[1]("fresh");
+    return await next === "fresh";
+  } finally { clearProviderMailReads(); window.api = original; }
+});
+check("later provider view obtains a fresh read", providerBarrier);
+
+// An account refresh revokes pending reads before account identity can change.
+const providerRefresh = await page.evaluate(async () => {
+  const original = window.api, accounts = App.accounts;
+  let resolveAccounts, aborted = 0;
+  window.api = (url, opts) => {
+    if (url === "/api/v1/accounts") return new Promise(resolve => { resolveAccounts = resolve; });
+    if (url === "/synthetic-provider-refresh") return new Promise((resolve, reject) => {
+      opts.signal.addEventListener("abort", () => { aborted++; reject(new Error("aborted")); });
+    });
+    return original(url, opts);
+  };
+  try {
+    const epoch = MailSnapshot.epoch;
+    const pending = providerMailRead("a", "", "live", "/synthetic-provider-refresh");
+    const settled = Promise.allSettled([pending]);
+    const reload = reloadAccounts();
+    const blocked = await providerMailRead("a", "", "live", "/synthetic-provider-refresh").then(() => false, () => true);
+    resolveAccounts({accounts});
+    await reload;
+    return { aborted, blocked, epochAdvanced: MailSnapshot.epoch > epoch,
+      rejected: (await settled)[0].status === "rejected", refreshCleared: providerAccountsRefreshing === 0,
+      empty: ProviderMailReads.size === 0 };
+  } finally { window.api = original; }
+});
+check("account refresh invalidates pending provider reads",
+  providerRefresh.aborted === 1 && providerRefresh.blocked && providerRefresh.epochAdvanced &&
+  providerRefresh.rejected && providerRefresh.refreshCleared && providerRefresh.empty);
+
+// Reuse shell only for the same primary self-hosted account; never across identity or shared scope.
+const shellReuse = await page.evaluate(() => {
+  const saved = {accounts:App.accounts, account:App.account, counts:App.counts, route:App.route,
+    scope:Mail.activeScope, scopeAccount:Mail.scopeAccount};
+  try {
+    App.accounts = [{id:"synthetic-a", username:"synthetic-a", provider:"self_hosted"}];
+    App.account = "synthetic-a"; App.counts = {}; App.route = "overview";
+    Mail.activeScope = ""; Mail.scopeAccount = App.account;
+    renderShell();
+    const original = document.querySelector(".sidebar");
+    App.route = "mail";
+    const reused = reuseProviderRouteShell("overview");
+    const routeUpdated = !!document.querySelector('.nav-item[data-service="mail"].active') &&
+      !!document.querySelector("#subnav-mail") && document.querySelector(".topbar .crumbs b")?.textContent === "Mail";
+    App.route = "calendar";
+    const calendar = reuseProviderRouteShell("mail") && !document.querySelector("#subnav-mail") &&
+      !!document.querySelector('.nav-item[data-service="calendar"].active') &&
+      document.querySelector(".topbar .crumbs b")?.textContent === "Calendar";
+    App.route = "todo";
+    const todo = reuseProviderRouteShell("calendar") && !!document.querySelector('.nav-item[data-service="todo"].active');
+    Mail.activeScope = "synthetic-shared";
+    const sharedRejected = !reuseProviderRouteShell("calendar");
+    Mail.activeScope = ""; App.account = "synthetic-b";
+    const accountRejected = !reuseProviderRouteShell("calendar");
+    return {reused, same:original === document.querySelector(".sidebar"), routeUpdated, calendar, todo, sharedRejected, accountRejected};
+  } finally {
+    App.accounts = saved.accounts; App.account = saved.account; App.counts = saved.counts; App.route = saved.route;
+    Mail.activeScope = saved.scope; Mail.scopeAccount = saved.scopeAccount;
+    onRoute();
+  }
+});
+check("retained provider shell updates routes and stays account and scope bound",
+  shellReuse.reused && shellReuse.same && shellReuse.routeUpdated && shellReuse.calendar && shellReuse.todo && shellReuse.sharedRejected && shellReuse.accountRejected);
+
+// Older health responses must not overwrite a newer route's status.
+await page.setViewportSize({width:1280, height:900});
+const healthRace = await page.evaluate(async () => {
+  const original = window.api, savedCounts = {...App.counts}, starts = [];
+  let statusCalls = 0;
+  window.api = (url, opts) => {
+    if (url === "/api/v1/sync/state") return new Promise(resolve => starts.push(resolve));
+    if (url.startsWith("/api/v1/activity?")) return Promise.resolve({runs:[]});
+    if (url.startsWith("/api/v1/status?")) { statusCalls++; return Promise.resolve({services:[{service:"mail",items:42}]}); }
+    return original(url, opts);
+  };
+  try {
+    const old = renderSyncWidget(), fresh = renderSyncWidget();
+    if (starts.length !== 2) return false;
+    starts[1]({enabled:false,paused:false}); await fresh;
+    starts[0]({enabled:false,paused:false}); await old;
+    return statusCalls === 1 && App.counts.mail === 42;
+  } finally { window.api = original; App.counts = savedCounts; }
+});
+check("stale health responses cannot overwrite newer state", healthRace);
+
+const unavailableActivity = await page.evaluate(async () => {
+  const original = window.api;
+  window.api = (url, opts) => {
+    if (url.startsWith("/api/v1/activity?")) return Promise.reject(new Error("unavailable"));
+    if (url.startsWith("/api/v1/status?")) return Promise.resolve({services:[], totals:{items:0,archived:0}});
+    if (url === "/api/v1/sync/state") return Promise.resolve({enabled:false,paused:false});
+    if (url === "/api/v1/settings") return Promise.resolve({sync:{},accounts:[]});
+    return original(url, opts);
+  };
+  try {
+    await renderSyncWidget();
+    const widget = document.querySelector("#sync-widget")?.textContent || "";
+    await renderOverview(document.querySelector("#view"));
+    const overview = document.querySelector("#ov-body")?.textContent || "";
+    return widget.includes("Activity unavailable") && overview.includes("Activity unavailable") &&
+      !overview.includes("Archive healthy") && !overview.includes("all clear");
+  } finally { window.api = original; }
+});
+check("unavailable activity is never shown as healthy", unavailableActivity);
+
+const auditOnlyActivity = await page.evaluate(async () => {
+  const original = window.api;
+  window.api = (url, opts) => {
+    if (url.startsWith("/api/v1/activity?")) return Promise.resolve({runs:[{kind:"audit:agent-account-lifecycle",status:"ok",finished_at:"1700000000"}]});
+    if (url.startsWith("/api/v1/status?")) return Promise.resolve({services:[], totals:{items:0,archived:0}});
+    if (url === "/api/v1/sync/state") return Promise.resolve({enabled:false,paused:false});
+    if (url === "/api/v1/settings") return Promise.resolve({sync:{},accounts:[]});
+    return original(url, opts);
+  };
+  try {
+    await renderSyncWidget();
+    const widget = document.querySelector("#sync-widget")?.textContent || "";
+    await renderOverview(document.querySelector("#view"));
+    const overview = document.querySelector("#ov-body")?.textContent || "";
+    return widget.includes("No syncs yet") && overview.includes("Last sync never");
+  } finally { window.api = original; }
+});
+check("audit activity is not reported as a sync", auditOnlyActivity);
+
+// Provider change notifications refresh the first primary page and preserve shared scopes.
+await nav("mail");
+const providerLiveRefresh = await page.evaluate(async () => {
+  const original = window.api, savedAccounts = App.accounts, savedAccount = App.account, savedMail = {...Mail}, calls = [];
+  App.accounts = [{id:"synthetic-live", username:"synthetic-live", provider:"self_hosted"}];
+  App.account = "synthetic-live";
+  window.api = async (url, opts) => {
+    if (!url.includes("live_metadata=1")) return original(url, opts);
+    calls.push(url);
+    return {items:[{id:"synthetic-delta",subject:"synthetic-delta-visible",mailboxIds:{},keywords:{}}],query_state:"synthetic-state",total:1};
+  };
+  try {
+    Mail.activeScope = ""; Mail.pageCursor = 0; Mail.livePage = true;
+    await mailLiveUpdate();
+    const primaryVisible = !!document.querySelector("#mail-list")?.textContent.includes("synthetic-delta-visible");
+    const primaryNoScope = !!calls[0] && !new URL(calls[0], location.href).searchParams.has("mail_scope");
+    Mail.pageCursor = 50; await mailLiveUpdate();
+    const laterPageProtected = calls.length === 1;
+    Mail.pageCursor = 0; Mail.activeScope = "synthetic-shared"; await mailLiveUpdate();
+    const sharedScope = !!calls[1] && new URL(calls[1], location.href).searchParams.get("mail_scope") === "synthetic-shared";
+    const scopeCallsCorrect = calls.length === 2;
+    const resolvers = [];
+    window.api = () => new Promise((resolve, reject) => resolvers.push({resolve, reject}));
+    Mail.activeScope = ""; Mail.pageCursor = 0; Mail.livePage = true;
+    const older = mailLiveUpdate(), second = mailLiveUpdate(), third = mailLiveUpdate();
+    const page = subject => ({items:[{id:subject,subject,mailboxIds:{},keywords:{}}],query_state:subject,total:1});
+    const oneInflight = resolvers.length === 1;
+    await Promise.all([second, third]);
+    resolvers[0].resolve(page("synthetic-oldest")); await older;
+    const oneFollowup = resolvers.length === 2;
+    if (oneFollowup) resolvers[1].resolve(page("synthetic-newest"));
+    for (let i = 0; i < 20 && Mail.liveUpdateRunning; i++) await Promise.resolve();
+    const newestWins = document.querySelector("#mail-list")?.textContent.includes("synthetic-newest") &&
+      !document.querySelector("#mail-list")?.textContent.includes("synthetic-oldest") && Mail.queryState === "synthetic-newest";
+    const late = mailLiveUpdate();
+    clearMailSnapshots();
+    resolvers[2].resolve(page("synthetic-invalidated")); await late;
+    const invalidatedIgnored = document.querySelector("#mail-list")?.textContent.includes("synthetic-newest") &&
+      !document.querySelector("#mail-list")?.textContent.includes("synthetic-invalidated");
+    Mail.activeScope = "synthetic-shared";
+    const staleError = mailLiveUpdate();
+    clearMailSnapshots();
+    resolvers[3].reject(new Error("synthetic-error")); await staleError;
+    const staleErrorIgnored = Mail.all.some(item => item.name === "synthetic-newest");
+    let resolveCache;
+    window.api = () => new Promise(resolve => { resolveCache = resolve; });
+    Mail.activeScope = ""; Mail.livePage = false;
+    const cacheRefresh = mailLiveUpdate();
+    Mail.livePage = true;
+    resolveCache({items:[{item_type:"message",remote_id:"synthetic-old-cache",name:"synthetic-old-cache"}]});
+    await cacheRefresh;
+    const modeRaceIgnored = Mail.all.some(item => item.name === "synthetic-newest");
+    window.api = async () => ({});
+    const priorState = Mail.queryState; await mailLiveUpdate();
+    const invalidPrimaryPreserved = Mail.all.some(item => item.name === "synthetic-newest") && Mail.queryState === priorState;
+    window.api = async () => ({items:[null],query_state:"invalid"});
+    await mailLiveUpdate();
+    const malformedPrimaryPreserved = Mail.all.some(item => item.name === "synthetic-newest");
+    Mail.activeScope = "synthetic-shared"; await mailLiveUpdate();
+    const invalidSharedHidden = Mail.all.length === 0;
+    return primaryVisible && primaryNoScope && laterPageProtected && sharedScope && scopeCallsCorrect &&
+      oneInflight && oneFollowup && newestWins && invalidatedIgnored && staleErrorIgnored && modeRaceIgnored &&
+      invalidPrimaryPreserved && malformedPrimaryPreserved && invalidSharedHidden;
+  } finally {
+    window.api = original; App.accounts = savedAccounts; App.account = savedAccount; Object.assign(Mail, savedMail);
+  }
+});
+check("provider first-page live updates preserve scope and pagination", providerLiveRefresh);
+
 // --- boot health: no uncaught console errors while exercising the UI ---
 check("no console errors on boot", consoleErrors.length === 0, `(${consoleErrors.slice(0, 3).join(" | ")})`);
 

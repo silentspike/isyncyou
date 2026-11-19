@@ -26,7 +26,6 @@ llm-*.log
 llm-*.md
 /scratch/
 /fixtures/
-.cargo-remote.toml
 *.db
 *.sqlite
 .env

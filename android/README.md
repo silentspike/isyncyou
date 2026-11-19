@@ -14,6 +14,23 @@ JDK (17+) and an Android SDK with `build-tools;34.0.0` + `platforms;android-34`.
 Point the SDK via
 `local.properties` (`sdk.dir=…`, gitignored) or `ANDROID_HOME`.
 
+Gradle dependency verification uses `gradle/verification-metadata.xml` in its
+default strict mode, including metadata checks. Its initial checksums were
+generated from a previously populated dependency cache; they are a trust-on-first-use
+baseline, not independent proof of publisher identity or download provenance.
+Review new or changed checksums against independently trusted sources before
+updating that file. The Gradle wrapper distribution has its own pinned checksum;
+Android SDK and NDK packages have a separate provenance boundary.
+
+App dependency locking is enabled in strict mode. Standard builds use
+`app/gradle.lockfile`; `-PisyncyouNoGoogle=true` uses `app/gradle-nogoogle.lockfile` because
+the variants resolve different graphs under the same configuration names.
+Generate and review both from their actual build configurations before relying
+on them; missing lock state causes resolution to fail. The root project declares
+no project dependencies. Plugin resolution is covered by dependency verification
+and is not covered by these lock files. Offline builds demonstrate cache
+availability, not where cached artifacts originated.
+
 ```sh
 ../tools/build-android-native.sh # cargo remote; never starts local Rust
 ./gradlew :app:assembleDebug      # -> app/build/outputs/apk/debug/app-debug.apk

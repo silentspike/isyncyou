@@ -14,7 +14,8 @@ plugins {
 // runtime google_app_id resource is absent), while a local checkout that has the file
 // keeps FCM fully wired. (The plugin is on the classpath via the root build's
 // `apply false`; it hooks the Android variants through afterEvaluate.)
-if (file("google-services.json").exists()) {
+val noGoogle = providers.gradleProperty("isyncyouNoGoogle").orNull == "true"
+if (!noGoogle && file("google-services.json").exists()) {
     apply(plugin = "com.google.gms.google-services")
 }
 
@@ -94,6 +95,14 @@ val requestedCargoTestFeatures = System.getenv("ISY_CARGO_FEATURES")
 
 android {
     namespace = "com.silentspike.isyncyou"
+    sourceSets.getByName("main") {
+        java.srcDir(if (noGoogle) "src/noGoogle/kotlin" else "src/google/kotlin")
+    }
+    listOf("debug", "release").forEach { name ->
+        sourceSets.getByName(name).manifest.srcFile(
+            if (noGoogle) "src/noGoogle/AndroidManifest.xml" else "src/google/AndroidManifest.xml",
+        )
+    }
     compileSdk = 34
     // Single source of truth for the NDK used by the separate native build step.
     // Gradle never invokes Cargo or rustc; it only packages a validated artifact.
@@ -144,8 +153,11 @@ android {
     buildFeatures {
         buildConfig = true
     }
-    kotlinOptions {
-        jvmTarget = "17"
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
     }
 }
 
@@ -157,9 +169,13 @@ dependencies {
     implementation("androidx.biometric:biometric:1.1.0")
     // WorkManager is the only production executor for durable mobile jobs (#626).
     implementation("androidx.work:work-runtime-ktx:2.9.1")
+    implementation("org.unifiedpush.android:connector:3.3.3")
+    implementation("com.google.crypto.tink:tink:1.21.0")
     // Firebase Cloud Messaging via the BoM (#575) — version-aligned, messaging only.
-    implementation(platform("com.google.firebase:firebase-bom:33.7.0"))
-    implementation("com.google.firebase:firebase-messaging")
+    if (!noGoogle) {
+        implementation(platform("com.google.firebase:firebase-bom:33.7.0"))
+        implementation("com.google.firebase:firebase-messaging")
+    }
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")

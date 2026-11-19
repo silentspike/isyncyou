@@ -40,6 +40,14 @@ allow = [
 ]
 confidence-threshold = 0.9
 
+# sqlcipher-src includes the SQLite public-domain blessing and the
+# LibTomCrypt public-domain/WTFPL alternative alongside MIT and BSD terms.
+# Limit these additional SPDX identifiers to the reviewed package version.
+[[licenses.exceptions]]
+name = "sqlcipher-src"
+version = "=420.0.0"
+allow = ["MIT", "BSD-3-Clause", "blessing", "WTFPL"]
+
 [bans]
 multiple-versions = "warn"
 skip = [

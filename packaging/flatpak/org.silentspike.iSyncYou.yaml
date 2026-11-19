@@ -30,6 +30,8 @@ modules:
     build-commands:
       - cargo build --release -p isyncyou-statusbar-app
       - install -Dm755 target/release/isyncyou-statusbar /app/bin/isyncyou-statusbar
+      - install -Dm644 THIRD-PARTY-NOTICES/sqlcipher-src-420.0.0.txt
+        /app/share/doc/isyncyou/THIRD-PARTY-NOTICES/sqlcipher-src-420.0.0.txt
       - install -Dm644 packaging/flatpak/org.silentspike.iSyncYou.desktop
         /app/share/applications/org.silentspike.iSyncYou.desktop
       - install -Dm644 packaging/appimage/isyncyou.png

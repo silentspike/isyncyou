@@ -1,0 +1,1150 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 09bd563..df93fce 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -3,7 +3,7 @@ name = "ksni"
+ version = "0.3.7"
+ authors = ["iovxw <iovxw@outlook.com>"]
+ edition = "2021"
+-rust-version = "1.80"
++rust-version = "1.89"
+ description = """
+ A Rust implementation of the KDE/freedesktop StatusNotifierItem specification
+ """
+@@ -25,7 +25,7 @@ async-io = [
+     "dep:futures-lite",
+     "dep:futures-channel",
+     "dep:task-local",
+-    "zbus/async-io",
++    "zbus/default-rt",
+ ]
+ 
+ [dependencies]
+@@ -33,7 +33,7 @@ arc-swap = "1"
+ crossbeam-queue = "0.3"
+ pastey = "0.2"
+ futures-util = "0.3"
+-zbus = { version = "5", default-features = false }
++zbus = { version = "6", default-features = false, features = ["proxy", "service"] }
+ serde = { version = "1", features = ["derive"] }
+ 
+ tokio = { version = "1", features = ["rt", "macros"], optional = true }
+@@ -46,11 +46,15 @@ futures-channel = { version = "0.3", optional = true }
+ task-local = { version = "0.1", optional = true }
+ 
+ [dev-dependencies]
++# zbus 5's tokio feature switched on `process` and `rt-multi-thread` for us;
++# zbus 6 does not.
++tokio = { version = "1", features = ["process", "rt-multi-thread"] }
++futures-executor = "0.3"
+ smol = "2"
+ smol-macros = "0.1"
+ macro_rules_attribute = "0.2"
+ image = "0.25"
+-zbus = { version = "5", default-features = false, features = ["blocking-api"] }
++zbus = { version = "6", default-features = false, features = ["default-rt", "proxy"] }
+ ashpd = { version = "0.13", default-features = false, features = ["async-io"]}
+ chrono = "0.4"
+ gtk4 = "0.11"
+diff --git a/README.md b/README.md
+index 1785d35..0c31e01 100644
+--- a/README.md
++++ b/README.md
+@@ -3,7 +3,7 @@
+ [![Build Status](https://github.com/iovxw/ksni/workflows/Rust/badge.svg)](https://github.com/iovxw/ksni/actions?query=workflow%3ARust)
+ [![Crates](https://img.shields.io/crates/v/ksni.svg)](https://crates.io/crates/ksni)
+ [![Documentation](https://docs.rs/ksni/badge.svg)](https://docs.rs/ksni)
+-[![MSRV](https://img.shields.io/badge/msrv-1.80.0-blue)](https://doc.rust-lang.org/cargo/reference/manifest.html#the-rust-version-field)
++[![MSRV](https://img.shields.io/badge/msrv-1.89.0-blue)](https://doc.rust-lang.org/cargo/reference/manifest.html#the-rust-version-field)
+ 
+ A Rust implementation of the KDE/freedesktop StatusNotifierItem specification
+ 
+diff --git a/src/dbus_interface.rs b/src/dbus_interface.rs
+index ebd5dcf..3a8ebf6 100644
+--- a/src/dbus_interface.rs
++++ b/src/dbus_interface.rs
+@@ -7,8 +7,8 @@ use arc_swap::ArcSwapOption;
+ use crossbeam_queue::SegQueue;
+ use serde::Serialize;
+ use zbus::names::InterfaceName;
+-use zbus::zvariant::{self, ObjectPath, OwnedValue, Type, Value};
+ use zbus::{object_server::SignalEmitter, Connection};
++use zbus::{ObjectPath, OwnedVariant, Type, Variant};
+ 
+ use crate::compat::task_local;
+ use crate::service::{Service, State};
+@@ -388,17 +388,17 @@ impl<T: Tray> StatusNotifierItem<T> {
+ #[derive(Debug, Default, Type, Serialize, PartialEq)]
+ pub struct Layout {
+     pub id: i32,
+-    pub properties: HashMap<Cow<'static, str>, OwnedValue>,
+-    // The construction of OwnedValue is recursive
++    pub properties: HashMap<Cow<'static, str>, OwnedVariant>,
++    // The construction of OwnedVariant is recursive
+     // which may overflow menu with very depth submenu
+-    // so we use Value<'static> here
+-    pub children: Vec<Value<'static>>,
++    // so we use Variant<'static> here
++    pub children: Vec<Variant<'static>>,
+ }
+ 
+-impl TryFrom<Value<'static>> for Layout {
+-    type Error = zvariant::Error;
+-    fn try_from(value: Value<'static>) -> zvariant::Result<Self> {
+-        let mut fields = zvariant::Structure::try_from(value)?.into_fields();
++impl TryFrom<Variant<'static>> for Layout {
++    type Error = zbus::Error;
++    fn try_from(value: Variant<'static>) -> zbus::Result<Self> {
++        let mut fields = zbus::Structure::try_from(value)?.into_fields();
+         Ok(Self {
+             id: fields.remove(0).downcast()?,
+             properties: fields.remove(0).downcast::<ItemPropsValueHelper>()?.0,
+@@ -407,17 +407,17 @@ impl TryFrom<Value<'static>> for Layout {
+     }
+ }
+ 
+-impl TryFrom<OwnedValue> for Layout {
+-    type Error = zvariant::Error;
+-    fn try_from(value: OwnedValue) -> zvariant::Result<Self> {
+-        <Self as TryFrom<Value<'static>>>::try_from(value.into())
++impl TryFrom<OwnedVariant> for Layout {
++    type Error = zbus::Error;
++    fn try_from(value: OwnedVariant) -> zbus::Result<Self> {
++        <Self as TryFrom<Variant<'static>>>::try_from(value.into())
+     }
+ }
+ 
+-impl<'a> From<Layout> for Value<'a> {
++impl<'a> From<Layout> for Variant<'a> {
+     fn from(s: Layout) -> Self {
+-        Value::from(
+-            zvariant::StructureBuilder::new()
++        Variant::from(
++            zbus::Structure::builder()
+                 .add_field(s.id)
+                 .add_field(s.properties)
+                 .add_field(s.children)
+@@ -427,28 +427,32 @@ impl<'a> From<Layout> for Value<'a> {
+     }
+ }
+ 
+-impl From<Layout> for OwnedValue {
++impl From<Layout> for OwnedVariant {
+     fn from(s: Layout) -> Self {
+-        Value::from(s)
++        Variant::from(s)
+             .try_into_owned()
+             .expect("Layout should not contains any fd")
+     }
+ }
+ 
+-/// FIXME: remove this after `From<zbus::zvariant::Value<'_>>` is implemented for `Cow<'_, str>`
+-struct ItemPropsValueHelper(HashMap<Cow<'static, str>, OwnedValue>);
++/// FIXME: remove this after `From<zbus::Variant<'_>>` is implemented for `Cow<'_, str>`
++struct ItemPropsValueHelper(HashMap<Cow<'static, str>, OwnedVariant>);
+ 
+-impl<'a> TryFrom<Value<'a>> for ItemPropsValueHelper {
+-    type Error = zvariant::Error;
++impl<'a> TryFrom<Variant<'a>> for ItemPropsValueHelper {
++    type Error = zbus::Error;
+ 
+-    fn try_from(value: Value<'a>) -> Result<Self, Self::Error> {
+-        if let Value::Dict(v) = value {
++    fn try_from(value: Variant<'a>) -> Result<Self, Self::Error> {
++        if let Variant::Dict(v) = value {
+             v.into_iter()
+                 .map(|(key, value)| {
+-                    let key = String::try_from(if let Value::Value(v) = key { *v } else { key })
+-                        .map(Into::into)?;
++                    let key = String::try_from(if let Variant::Variant(v) = key {
++                        *v
++                    } else {
++                        key
++                    })
++                    .map(Into::into)?;
+ 
+-                    let value = OwnedValue::try_from(if let Value::Value(v) = value {
++                    let value = OwnedVariant::try_from(if let Variant::Variant(v) = value {
+                         *v
+                     } else {
+                         value
+@@ -456,7 +460,7 @@ impl<'a> TryFrom<Value<'a>> for ItemPropsValueHelper {
+ 
+                     Ok((key, value))
+                 })
+-                .collect::<Result<HashMap<Cow<'static, str>, OwnedValue>, _>>()
++                .collect::<Result<HashMap<Cow<'static, str>, OwnedVariant>, _>>()
+                 .map(ItemPropsValueHelper)
+         } else {
+             Err(Self::Error::IncorrectType)
+@@ -502,7 +506,7 @@ impl<T: Tray> DbusMenu<T> {
+         &self,
+         ids: Vec<i32>,
+         property_names: Vec<String>,
+-    ) -> zbus::fdo::Result<Vec<(i32, HashMap<Cow<'static, str>, OwnedValue>)>> {
++    ) -> zbus::fdo::Result<Vec<(i32, HashMap<Cow<'static, str>, OwnedVariant>)>> {
+         self.0
+             .lock_state(false, async |state| {
+                 if ids.is_empty() {
+@@ -521,7 +525,7 @@ impl<T: Tray> DbusMenu<T> {
+             .await
+     }
+ 
+-    async fn get_property(&self, id: i32, name: String) -> zbus::fdo::Result<OwnedValue> {
++    async fn get_property(&self, id: i32, name: String) -> zbus::fdo::Result<OwnedVariant> {
+         self.0
+             .lock_state(false, async |state| {
+                 state
+@@ -541,7 +545,7 @@ impl<T: Tray> DbusMenu<T> {
+         #[zbus(connection)] conn: &Connection,
+         id: i32,
+         event_id: String,
+-        data: OwnedValue,
++        data: OwnedVariant,
+         timestamp: u32,
+     ) -> zbus::fdo::Result<()> {
+         self.0
+@@ -560,7 +564,7 @@ impl<T: Tray> DbusMenu<T> {
+     async fn event_group(
+         &self,
+         #[zbus(connection)] conn: &Connection,
+-        events: Vec<(i32, String, OwnedValue, u32)>,
++        events: Vec<(i32, String, OwnedVariant, u32)>,
+     ) -> zbus::fdo::Result<Vec<i32>> {
+         if events.is_empty() {
+             return Err(zbus::fdo::Error::InvalidArgs("Empty events".into()));
+@@ -687,7 +691,7 @@ impl<T: Tray> DbusMenu<T> {
+     #[zbus(signal)]
+     pub async fn items_properties_updated(
+         ctxt: &SignalEmitter<'_>,
+-        updated_props: Vec<(i32, HashMap<Cow<'static, str>, OwnedValue>)>,
++        updated_props: Vec<(i32, HashMap<Cow<'static, str>, OwnedVariant>)>,
+         removed_props: Vec<(i32, Vec<Cow<'static, str>>)>,
+     ) -> zbus::Result<()>;
+ 
+diff --git a/src/menu/mod.rs b/src/menu/mod.rs
+index a49b85b..c6f5f19 100644
+--- a/src/menu/mod.rs
++++ b/src/menu/mod.rs
+@@ -13,7 +13,7 @@ use std::fmt;
+ use std::sync::{Arc, Mutex};
+ 
+ use serde::Serialize;
+-use zbus::zvariant::{OwnedValue, Str, Type, Value};
++use zbus::{OwnedVariant, Str, Type, Variant};
+ 
+ // pub struct Properties {
+ //     /// Tells if the menus are in a normal state or they believe that they
+@@ -31,7 +31,7 @@ use zbus::zvariant::{OwnedValue, Str, Type, Value};
+ 
+ /// Direction of texts
+ #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Type, Serialize)]
+-#[zvariant(signature = "s")]
++#[zbus(signature = "s")]
+ pub enum TextDirection {
+     #[serde(rename = "ltr")]
+     LeftToRight,
+@@ -39,9 +39,9 @@ pub enum TextDirection {
+     RightToLeft,
+ }
+ 
+-// The Value dervie macro can only handle `dict` or `a{sv}` values
++// The Variant dervie macro can only handle `dict` or `a{sv}` values
+ // so we impl it manually
+-impl From<TextDirection> for Value<'_> {
++impl From<TextDirection> for Variant<'_> {
+     fn from(value: TextDirection) -> Self {
+         value.to_string().into()
+     }
+@@ -54,16 +54,16 @@ impl fmt::Display for TextDirection {
+ }
+ 
+ #[derive(Type, Serialize)]
+-#[zvariant(signature = "s")]
++#[zbus(signature = "s")]
+ #[serde(rename_all = "lowercase")]
+ pub(crate) enum Status {
+     Normal,
+     Notice,
+ }
+ 
+-// The Value dervie macro can only handle `dict` or `a{sv}` values
++// The Variant dervie macro can only handle `dict` or `a{sv}` values
+ // so we impl it manually
+-impl From<Status> for Value<'_> {
++impl From<Status> for Variant<'_> {
+     fn from(value: Status) -> Self {
+         value.to_string().into()
+     }
+@@ -627,7 +627,7 @@ macro_rules! if_not_default_then_insert {
+         {
+             $map.insert(
+                 $property_name.into(),
+-                OwnedValue::from($to_refarg($item.$property.clone())),
++                OwnedVariant::from($to_refarg($item.$property.clone())),
+             );
+         }
+     };
+@@ -644,8 +644,8 @@ impl<T> RawMenuItem<T> {
+         &self,
+         property_filter: &[String],
+         has_children: bool,
+-    ) -> HashMap<Cow<'static, str>, OwnedValue> {
+-        let mut properties: HashMap<Cow<'static, str>, OwnedValue> = HashMap::with_capacity(12);
++    ) -> HashMap<Cow<'static, str>, OwnedVariant> {
++        let mut properties: HashMap<Cow<'static, str>, OwnedVariant> = HashMap::with_capacity(12);
+         if has_children
+             && (property_filter.is_empty()
+                 || property_filter.iter().any(|s| s == "children-display"))
+@@ -684,10 +684,10 @@ impl<T> RawMenuItem<T> {
+             property_filter,
+             icon_data,
+             "icon-data",
+-            (|r: Vec<u8>| -> OwnedValue {
+-                Value::from(r)
++            (|r: Vec<u8>| -> OwnedVariant {
++                Variant::from(r)
+                     .try_into()
+-                    .expect("unreachable: Vec<u8> to OwnedValue")
++                    .expect("unreachable: Vec<u8> to OwnedVariant")
+             })
+         );
+         if_not_default_then_insert!(
+@@ -696,10 +696,10 @@ impl<T> RawMenuItem<T> {
+             default,
+             property_filter,
+             shortcut,
+-            (|r: Vec<Vec<String>>| -> OwnedValue {
+-                Value::from(r)
++            (|r: Vec<Vec<String>>| -> OwnedVariant {
++                Variant::from(r)
+                     .try_into()
+-                    .expect("unreachable: Vec<Vec<String>> to OwnedValue")
++                    .expect("unreachable: Vec<Vec<String>> to OwnedVariant")
+             })
+         );
+         if_not_default_then_insert!(
+@@ -727,11 +727,11 @@ impl<T> RawMenuItem<T> {
+         &self,
+         other: &Self,
+     ) -> Option<(
+-        HashMap<Cow<'static, str>, OwnedValue>,
++        HashMap<Cow<'static, str>, OwnedVariant>,
+         Vec<Cow<'static, str>>,
+     )> {
+         let default = Self::default();
+-        let mut updated_props: HashMap<Cow<'static, str>, OwnedValue> = HashMap::new();
++        let mut updated_props: HashMap<Cow<'static, str>, OwnedVariant> = HashMap::new();
+         let mut removed_props: Vec<Cow<'static, str>> = Vec::new();
+         if self.r#type != other.r#type {
+             if other.r#type == default.r#type {
+@@ -739,7 +739,7 @@ impl<T> RawMenuItem<T> {
+             } else {
+                 updated_props.insert(
+                     "type".into(),
+-                    <OwnedValue as From<Str>>::from(other.r#type.to_string().into()),
++                    <OwnedVariant as From<Str>>::from(other.r#type.to_string().into()),
+                 );
+             }
+         }
+@@ -749,7 +749,7 @@ impl<T> RawMenuItem<T> {
+             } else {
+                 updated_props.insert(
+                     "label".into(),
+-                    <OwnedValue as From<Str>>::from(other.label.clone().into()),
++                    <OwnedVariant as From<Str>>::from(other.label.clone().into()),
+                 );
+             }
+         }
+@@ -757,14 +757,14 @@ impl<T> RawMenuItem<T> {
+             if other.enabled == default.enabled {
+                 removed_props.push("enabled".into());
+             } else {
+-                updated_props.insert("enabled".into(), OwnedValue::from(other.enabled));
++                updated_props.insert("enabled".into(), OwnedVariant::from(other.enabled));
+             }
+         }
+         if self.visible != other.visible {
+             if other.visible == default.visible {
+                 removed_props.push("visible".into());
+             } else {
+-                updated_props.insert("visible".into(), OwnedValue::from(other.visible));
++                updated_props.insert("visible".into(), OwnedVariant::from(other.visible));
+             }
+         }
+         if self.icon_name != other.icon_name {
+@@ -773,7 +773,7 @@ impl<T> RawMenuItem<T> {
+             } else {
+                 updated_props.insert(
+                     "icon-name".into(),
+-                    <OwnedValue as From<Str>>::from(other.icon_name.clone().into()),
++                    <OwnedVariant as From<Str>>::from(other.icon_name.clone().into()),
+                 );
+             }
+         }
+@@ -783,8 +783,8 @@ impl<T> RawMenuItem<T> {
+             } else {
+                 updated_props.insert(
+                     "icon-data".into(),
+-                    <OwnedValue as TryFrom<Value>>::try_from(other.icon_data.clone().into())
+-                        .expect("unreachable: Vec<u8> to OwnedValue"),
++                    <OwnedVariant as TryFrom<Variant>>::try_from(other.icon_data.clone().into())
++                        .expect("unreachable: Vec<u8> to OwnedVariant"),
+                 );
+             }
+         }
+@@ -794,8 +794,8 @@ impl<T> RawMenuItem<T> {
+             } else {
+                 updated_props.insert(
+                     "shortcut".into(),
+-                    <OwnedValue as TryFrom<Value>>::try_from(other.shortcut.clone().into())
+-                        .expect("unreachable: Vec<Vec<u8>> to OwnedValue"),
++                    <OwnedVariant as TryFrom<Variant>>::try_from(other.shortcut.clone().into())
++                        .expect("unreachable: Vec<Vec<u8>> to OwnedVariant"),
+                 );
+             }
+         }
+@@ -805,7 +805,7 @@ impl<T> RawMenuItem<T> {
+             } else {
+                 updated_props.insert(
+                     "toggle-type".into(),
+-                    <OwnedValue as From<Str>>::from(other.toggle_type.to_string().into()),
++                    <OwnedVariant as From<Str>>::from(other.toggle_type.to_string().into()),
+                 );
+             }
+         }
+@@ -815,7 +815,7 @@ impl<T> RawMenuItem<T> {
+             } else {
+                 updated_props.insert(
+                     "toggle-state".into(),
+-                    OwnedValue::from(other.toggle_state as i32),
++                    OwnedVariant::from(other.toggle_state as i32),
+                 );
+             }
+         }
+@@ -825,7 +825,7 @@ impl<T> RawMenuItem<T> {
+             } else {
+                 updated_props.insert(
+                     "disposition".into(),
+-                    <OwnedValue as From<Str>>::from(other.disposition.to_string().into()),
++                    <OwnedVariant as From<Str>>::from(other.disposition.to_string().into()),
+                 );
+             }
+         }
+@@ -875,7 +875,7 @@ impl fmt::Display for ItemType {
+     }
+ }
+ 
+-impl From<ItemType> for OwnedValue {
++impl From<ItemType> for OwnedVariant {
+     fn from(value: ItemType) -> Self {
+         use ItemType::*;
+         let s = match value {
+@@ -908,7 +908,7 @@ impl fmt::Display for ToggleType {
+     }
+ }
+ 
+-impl From<ToggleType> for OwnedValue {
++impl From<ToggleType> for OwnedVariant {
+     fn from(value: ToggleType) -> Self {
+         use ToggleType::*;
+         let s = match value {
+@@ -927,7 +927,7 @@ enum ToggleState {
+     Indeterminate = -1,
+ }
+ 
+-impl From<ToggleState> for OwnedValue {
++impl From<ToggleState> for OwnedVariant {
+     fn from(value: ToggleState) -> Self {
+         (value as i32).into()
+     }
+@@ -961,7 +961,7 @@ impl fmt::Display for Disposition {
+     }
+ }
+ 
+-impl From<Disposition> for OwnedValue {
++impl From<Disposition> for OwnedVariant {
+     fn from(value: Disposition) -> Self {
+         use Disposition::*;
+         let s = match value {
+diff --git a/src/service.rs b/src/service.rs
+index e15bfc5..6c9ddb4 100644
+--- a/src/service.rs
++++ b/src/service.rs
+@@ -9,10 +9,10 @@ use std::sync::Arc;
+ use futures_util::{future::Either, StreamExt};
+ use pastey::paste;
+ use zbus::fdo::DBusProxy;
+-use zbus::zvariant::{OwnedValue, Value};
+ use zbus::Connection;
++use zbus::{OwnedVariant, Variant};
+ 
+-use crate::compat::{self, mpsc, select, Mutex};
++use crate::compat::{mpsc, select, Mutex};
+ use crate::dbus_interface::{
+     Context, DbusMenu, Layout, StatusNotifierItem, StatusNotifierWatcherProxy, MENU_INTERFACE,
+     MENU_PATH, SNI_INTERFACE, SNI_PATH,
+@@ -32,29 +32,14 @@ pub(crate) async fn run<T: Tray>(
+     let menu_obj = DbusMenu::new(service.clone());
+     let Service { state, .. } = service;
+ 
+-    // for those `expect`, see: https://github.com/dbus2/zbus/issues/403
++    // zbus 6 builders defer every error, an invalid path included, to `build()`
+     let conn = zbus::connection::Builder::session()
+-        .map_err(|e| Error::Dbus(e))?
+-        .internal_executor(false) // avoid extra thread when async-io enabled
+         .serve_at(SNI_PATH, sni_obj)
+-        .expect("SNI_PATH should be valid")
+         .serve_at(MENU_PATH, menu_obj)
+-        .expect("MENU_PATH should be valid")
+         .build()
+         .await
+         .map_err(|e| Error::Dbus(e))?;
+ 
+-    if cfg!(feature = "async-io") {
+-        let executor = conn.executor().clone();
+-        // must start the executor before register_status_notifier_item
+-        compat::spawn(async move {
+-            // won't empty until conn stopped
+-            while !executor.is_empty() {
+-                executor.tick().await;
+-            }
+-        });
+-    }
+-
+     let name = if own_name {
+         let name = format!(
+             "org.kde.StatusNotifierItem-{}-{}",
+@@ -226,7 +211,7 @@ impl<T: Tray> Service<T> {
+         }
+     }
+ 
+-    /// If `may_open_window`, will consume a XDG Activation Token. 
++    /// If `may_open_window`, will consume a XDG Activation Token.
+     /// This function should only be called once in one event
+     pub async fn lock_state<F, R>(&self, may_open_window: bool, f: F) -> R
+     where
+@@ -254,8 +239,8 @@ impl<T: Tray> State<T> {
+             .interface::<_, DbusMenu<T>>(MENU_PATH)
+             .await?;
+ 
+-        let mut sni_changed: HashMap<&str, Value> = HashMap::new();
+-        let mut menu_changed: HashMap<&str, Value> = HashMap::new();
++        let mut sni_changed: HashMap<&str, Variant> = HashMap::new();
++        let mut menu_changed: HashMap<&str, Variant> = HashMap::new();
+ 
+         if self.text_direction_changed() {
+             menu_changed.insert("TextDirection", self.get_text_direction().into());
+@@ -447,7 +432,7 @@ impl<T: Tray> State<T> {
+         let root = self.id2index(parent_id)?;
+ 
+         let mut stack = vec![(root, 0, false)];
+-        let mut pending_children: Vec<Value<'static>> = Vec::new();
++        let mut pending_children: Vec<Variant<'static>> = Vec::new();
+ 
+         while let Some((index, depth, all_childs_processed)) = stack.pop() {
+             let (item, child_idxs) = &self.flattened_menu[index];
+@@ -490,7 +475,7 @@ impl<T: Tray> State<T> {
+     pub fn get_all_item(
+         &self,
+         property_filter: &[String],
+-    ) -> Vec<(i32, HashMap<Cow<'static, str>, OwnedValue>)> {
++    ) -> Vec<(i32, HashMap<Cow<'static, str>, OwnedVariant>)> {
+         self.flattened_menu
+             .iter()
+             .enumerate()
+@@ -507,7 +492,7 @@ impl<T: Tray> State<T> {
+         &self,
+         id: i32,
+         property_filter: &[String],
+-    ) -> Option<HashMap<Cow<'static, str>, OwnedValue>> {
++    ) -> Option<HashMap<Cow<'static, str>, OwnedVariant>> {
+         self.id2index(id).map(|index| {
+             let (item, children) = &self.flattened_menu[index];
+             item.to_dbus_map(property_filter, !children.is_empty())
+@@ -521,7 +506,7 @@ impl<T: Tray> State<T> {
+         do_update: bool,
+         id: i32,
+         event_id: &str,
+-        _data: OwnedValue,
++        _data: OwnedVariant,
+         _timestamp: u32,
+     ) -> zbus::fdo::Result<bool> {
+         let Some(index) = self.id2index(id) else {
+@@ -674,7 +659,7 @@ mod tests {
+     use macro_rules_attribute::apply;
+     #[cfg(feature = "async-io")]
+     use smol_macros::test;
+-    use zbus::zvariant::OwnedValue;
++    use zbus::OwnedVariant;
+ 
+     #[derive(Clone, Default)]
+     struct TestTray;
+@@ -758,7 +743,7 @@ mod tests {
+                 const { repetition_utils!(@count $($key),*) }
+             );
+             $(
+-                let value = zbus::zvariant::Value::from($value).try_into_owned().unwrap();
++                let value = zbus::Variant::from($value).try_into_owned().unwrap();
+                 map.insert($key.into(), value);
+             )*
+             map
+@@ -1824,7 +1809,7 @@ mod tests {
+         let mut service = service.lock().await;
+ 
+         let err = service
+-            .event(&conn, false, 0, "clicked", OwnedValue::from(0_u8), 0)
++            .event(&conn, false, 0, "clicked", OwnedVariant::from(0_u8), 0)
+             .await
+             .expect_err("root menu clicked should return InvalidArgs");
+ 
+diff --git a/src/tray.rs b/src/tray.rs
+index da50b93..c6a55b1 100644
+--- a/src/tray.rs
++++ b/src/tray.rs
+@@ -1,6 +1,6 @@
+ use serde::{Deserialize, Serialize};
+ use std::fmt;
+-use zbus::zvariant::{Type, Value};
++use zbus::{Type, Variant};
+ 
+ /// Represent the horizontal or vertical orientation of the scroll request
+ // In org.freedesktop.StatusNotifierItem it's "horizontal" and "vertical"
+@@ -10,7 +10,7 @@ use zbus::zvariant::{Type, Value};
+ // KDE:
+ // https://github.com/KDE/plasma-workspace/blob/4a98130f76bcae4211d3f9b10e4a7b760613ffc6/applets/systemtray/package/contents/ui/items/StatusNotifierItem.qml#L99-L115
+ #[derive(Copy, Clone, Debug, Eq, PartialEq, Type, Deserialize)]
+-#[zvariant(signature = "s")]
++#[zbus(signature = "s")]
+ pub enum Orientation {
+     #[serde(alias = "horizontal")]
+     Horizontal,
+@@ -20,7 +20,7 @@ pub enum Orientation {
+ 
+ /// Category of this item.
+ #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Type, Serialize)]
+-#[zvariant(signature = "s")]
++#[zbus(signature = "s")]
+ pub enum Category {
+     /// The item describes the status of a generic application, for instance
+     /// the current state of a media player. In the case where the category of
+@@ -40,9 +40,9 @@ pub enum Category {
+     Hardware,
+ }
+ 
+-// The Value dervie macro can only handle `dict` or `a{sv}` values
++// The Variant dervie macro can only handle `dict` or `a{sv}` values
+ // so we impl it manually
+-impl From<Category> for Value<'_> {
++impl From<Category> for Variant<'_> {
+     fn from(value: Category) -> Self {
+         value.to_string().into()
+     }
+@@ -56,7 +56,7 @@ impl fmt::Display for Category {
+ 
+ /// Status of this item or of the associated application.
+ #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Type, Serialize)]
+-#[zvariant(signature = "s")]
++#[zbus(signature = "s")]
+ pub enum Status {
+     /// The item doesn't convey important information to the user, it can be
+     /// considered an "idle" status and is likely that visualizations will chose
+@@ -72,9 +72,9 @@ pub enum Status {
+     NeedsAttention,
+ }
+ 
+-// The Value dervie macro can only handle `dict` or `a{sv}` values
++// The Variant dervie macro can only handle `dict` or `a{sv}` values
+ // so we impl it manually
+-impl From<Status> for Value<'_> {
++impl From<Status> for Variant<'_> {
+     fn from(value: Status) -> Self {
+         value.to_string().into()
+     }
+@@ -103,7 +103,7 @@ impl Status {
+ /// See [`Tray::tool_tip`]
+ ///
+ /// [`Tray::tool_tip`]: crate::Tray::tool_tip
+-#[derive(Clone, Debug, Default, Hash, Type, Value, Serialize)]
++#[derive(Clone, Debug, Default, Hash, Type, Variant, Serialize)]
+ pub struct ToolTip {
+     /// Freedesktop-compliant name for an icon.
+     pub icon_name: String,
+@@ -147,7 +147,7 @@ pub struct ToolTip {
+ /// ```
+ ///
+ /// [image crate]: https://crates.io/crates/image/
+-#[derive(Clone, Debug, Hash, Type, Value, Serialize)]
++#[derive(Clone, Debug, Hash, Type, Variant, Serialize)]
+ pub struct Icon {
+     pub width: i32,
+     pub height: i32,
+diff --git a/tests/async_tests/mod.rs b/tests/async_tests/mod.rs
+index 63ffa67..6a5519b 100644
+--- a/tests/async_tests/mod.rs
++++ b/tests/async_tests/mod.rs
+@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
+ use std::time::{Duration, Instant};
+ 
+ use zbus::connection;
+-use zbus::zvariant::OwnedValue;
++use zbus::OwnedVariant;
+ 
+ use crate::common::{
+     dbusmenu_assertions, decode_layout, find_layout_by_label, has_owner, menu_proxy, message_body,
+@@ -73,14 +73,14 @@ impl WatcherHandle {
+             protocol_version: 0,
+             register_item_error,
+         }));
+-        let connection = connection::Builder::session()?
++        let connection = connection::Builder::session()
+             .method_timeout(DEFAULT_TIMEOUT)
+             .serve_at(
+                 WATCHER_PATH,
+                 MockWatcher {
+                     state: state.clone(),
+                 },
+-            )?
++            )
+             .build()
+             .await?;
+         connection.request_name(WATCHER_NAME).await?;
+@@ -376,7 +376,7 @@ pub async fn status_notifier_item_protocol() {
+ 
+         let (sni_iface, sni_changed, sni_invalidated): (
+             String,
+-            HashMap<String, OwnedValue>,
++            HashMap<String, OwnedVariant>,
+             Vec<String>,
+         ) = message_body(sni_properties_changed.wait(DEFAULT_TIMEOUT));
+         assert_eq!(sni_iface, SNI_INTERFACE);
+@@ -392,7 +392,7 @@ pub async fn status_notifier_item_protocol() {
+ 
+         let (menu_iface, menu_changed, menu_invalidated): (
+             String,
+-            HashMap<String, OwnedValue>,
++            HashMap<String, OwnedVariant>,
+             Vec<String>,
+         ) = message_body(menu_properties_changed.wait(DEFAULT_TIMEOUT));
+         assert_eq!(menu_iface, MENU_INTERFACE);
+@@ -514,7 +514,7 @@ pub async fn dbusmenu_protocol() {
+         .expect("tray should still be alive for updates");
+     with_blocking(move || {
+         let (updated_props, removed_props): (
+-            Vec<(i32, HashMap<String, OwnedValue>)>,
++            Vec<(i32, HashMap<String, OwnedVariant>)>,
+             Vec<(i32, Vec<String>)>,
+         ) = message_body(items_properties_updated.wait(DEFAULT_TIMEOUT));
+         assert!(removed_props.is_empty());
+diff --git a/tests/blocking.rs b/tests/blocking.rs
+index 469cee2..d475aaf 100644
+--- a/tests/blocking.rs
++++ b/tests/blocking.rs
+@@ -1,8 +1,8 @@
++use common::blocking_zbus::{connection, Connection};
+ use std::collections::HashMap;
+ use std::sync::{Arc, Mutex};
+ use std::time::Duration;
+-use zbus::blocking::{connection, Connection};
+-use zbus::zvariant::OwnedValue;
++use zbus::OwnedVariant;
+ 
+ mod common;
+ 
+@@ -36,15 +36,15 @@ impl WatcherHandle {
+             protocol_version: 0,
+             register_item_error,
+         }));
+-        let connection = connection::Builder::session()?
++        let connection = connection::Builder::session()
+             .method_timeout(DEFAULT_TIMEOUT)
+             .serve_at(
+                 WATCHER_PATH,
+                 MockWatcher {
+                     state: state.clone(),
+                 },
+-            )?
+-            .name(WATCHER_NAME)?
++            )
++            .name(WATCHER_NAME)
+             .build()?;
+         Ok(Self { connection, state })
+     }
+@@ -277,7 +277,7 @@ fn status_notifier_item_protocol() {
+ 
+     let (sni_iface, sni_changed, sni_invalidated): (
+         String,
+-        HashMap<String, OwnedValue>,
++        HashMap<String, OwnedVariant>,
+         Vec<String>,
+     ) = message_body(sni_properties_changed.wait(DEFAULT_TIMEOUT));
+     assert_eq!(sni_iface, SNI_INTERFACE);
+@@ -293,7 +293,7 @@ fn status_notifier_item_protocol() {
+ 
+     let (menu_iface, menu_changed, menu_invalidated): (
+         String,
+-        HashMap<String, OwnedValue>,
++        HashMap<String, OwnedVariant>,
+         Vec<String>,
+     ) = message_body(menu_properties_changed.wait(DEFAULT_TIMEOUT));
+     assert_eq!(menu_iface, MENU_INTERFACE);
+@@ -385,7 +385,7 @@ fn dbusmenu_protocol() {
+         })
+         .expect("tray should still be alive for updates");
+     let (updated_props, removed_props): (
+-        Vec<(i32, HashMap<String, OwnedValue>)>,
++        Vec<(i32, HashMap<String, OwnedVariant>)>,
+         Vec<(i32, Vec<String>)>,
+     ) = message_body(items_properties_updated.wait(DEFAULT_TIMEOUT));
+     assert!(removed_props.is_empty());
+diff --git a/tests/common/blocking_zbus.rs b/tests/common/blocking_zbus.rs
+new file mode 100644
+index 0000000..388ea84
+--- /dev/null
++++ b/tests/common/blocking_zbus.rs
+@@ -0,0 +1,131 @@
++//! A blocking facade over the parts of zbus's async API that the synchronous
++//! tests use.
++//!
++//! zbus 6 removed `zbus::blocking`. Each call here is polled to completion with
++//! a plain executor, not `zbus::block_on`: with zbus's `tokio` feature on (the
++//! default test run), `zbus::block_on` runs a single-threaded Tokio runtime that
++//! drives its connections only while some thread is inside it, so a mock
++//! watcher would stop answering between calls. Built outside any Tokio runtime,
++//! a connection runs on zbus's default runtime instead, whose helper thread
++//! keeps serving it in the background.
++
++#![allow(dead_code)] // shared by every test binary; each uses a different subset
++
++use std::time::Duration;
++
++use futures_executor::block_on;
++use futures_util::StreamExt;
++use zbus::names::{BusName, InterfaceName, MemberName, WellKnownName};
++use zbus::object_server::Interface;
++use zbus::{Message, ObjectPath};
++
++pub mod connection {
++    use super::*;
++
++    pub struct Builder<'a>(zbus::connection::Builder<'a>);
++
++    impl<'a> Builder<'a> {
++        pub fn session() -> Self {
++            Self(zbus::connection::Builder::session())
++        }
++
++        pub fn method_timeout(self, timeout: Duration) -> Self {
++            Self(self.0.method_timeout(timeout))
++        }
++
++        pub fn serve_at<P, I>(self, path: P, iface: I) -> Self
++        where
++            I: Interface,
++            P: TryInto<ObjectPath<'a>>,
++            P::Error: Into<zbus::Error>,
++        {
++            Self(self.0.serve_at(path, iface))
++        }
++
++        pub fn name<W>(self, well_known_name: W) -> Self
++        where
++            W: TryInto<WellKnownName<'a>>,
++            W::Error: Into<zbus::Error>,
++        {
++            Self(self.0.name(well_known_name))
++        }
++
++        pub fn build(self) -> zbus::Result<Connection> {
++            block_on(self.0.build()).map(Connection)
++        }
++    }
++}
++
++pub struct Connection(zbus::Connection);
++
++impl Connection {
++    pub fn close(self) -> zbus::Result<()> {
++        block_on(self.0.close())
++    }
++}
++
++pub struct Proxy<'a>(zbus::Proxy<'a>);
++
++impl<'a> Proxy<'a> {
++    pub fn new<D, P, I>(
++        connection: &Connection,
++        destination: D,
++        path: P,
++        interface: I,
++    ) -> zbus::Result<Self>
++    where
++        D: TryInto<BusName<'a>>,
++        P: TryInto<ObjectPath<'a>>,
++        I: TryInto<InterfaceName<'a>>,
++        D::Error: Into<zbus::Error>,
++        P::Error: Into<zbus::Error>,
++        I::Error: Into<zbus::Error>,
++    {
++        block_on(zbus::Proxy::new(
++            &connection.0,
++            destination,
++            path,
++            interface,
++        ))
++        .map(Self)
++    }
++
++    pub fn call<'m, M, B, R>(&self, method_name: M, body: &B) -> zbus::Result<R>
++    where
++        M: TryInto<MemberName<'m>>,
++        M::Error: Into<zbus::Error>,
++        B: serde::ser::Serialize + zbus::DynamicType,
++        R: for<'d> zbus::wire::DynamicDeserialize<'d>,
++    {
++        block_on(self.0.call(method_name, body))
++    }
++
++    pub fn get_property<T>(&self, property_name: &str) -> zbus::Result<T>
++    where
++        T: serde::de::DeserializeOwned + zbus::Type,
++    {
++        block_on(self.0.get_property(property_name))
++    }
++
++    pub fn receive_signal_with_args<'m, M>(
++        &self,
++        signal_name: M,
++        args: &[(u8, &str)],
++    ) -> zbus::Result<SignalIterator<'m>>
++    where
++        M: TryInto<MemberName<'m>>,
++        M::Error: Into<zbus::Error>,
++    {
++        block_on(self.0.receive_signal_with_args(signal_name, args)).map(SignalIterator)
++    }
++}
++
++pub struct SignalIterator<'m>(zbus::proxy::SignalStream<'m>);
++
++impl Iterator for SignalIterator<'_> {
++    type Item = Message;
++
++    fn next(&mut self) -> Option<Message> {
++        block_on(self.0.next())
++    }
++}
+diff --git a/tests/common/mod.rs b/tests/common/mod.rs
+index b3b1e7d..ba44720 100644
+--- a/tests/common/mod.rs
++++ b/tests/common/mod.rs
+@@ -6,9 +6,11 @@ use ksni::menu::{
+     CheckmarkItem, Disposition, RadioGroup, RadioItem, StandardItem, SubMenu, TextDirection,
+ };
+ use ksni::{Category, Icon, MenuItem, Status, ToolTip};
+-use zbus::blocking::{connection, Connection, Proxy};
+-use zbus::zvariant::{OwnedObjectPath, OwnedValue};
++pub mod blocking_zbus;
++
++use blocking_zbus::{connection, Connection, Proxy};
+ use zbus::Message;
++use zbus::{OwnedObjectPath, OwnedVariant};
+ 
+ pub const WATCHER_NAME: &str = "org.kde.StatusNotifierWatcher";
+ pub const WATCHER_PATH: &str = "/StatusNotifierWatcher";
+@@ -36,7 +38,7 @@ macro_rules! properties {
+             const { $crate::common::repetition_utils!(@count $($key),*) }
+         );
+         $(
+-            let value = zbus::zvariant::Value::from($value).try_into_owned().unwrap();
++            let value = zbus::Variant::from($value).try_into_owned().unwrap();
+             map.insert($key.into(), value);
+         )*
+         map
+@@ -413,12 +415,12 @@ fn icon(seed: u8) -> Icon {
+     }
+ }
+ 
+-pub type LayoutTuple = (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>);
++pub type LayoutTuple = (i32, HashMap<String, OwnedVariant>, Vec<OwnedVariant>);
+ 
+ #[derive(Clone, Debug)]
+ pub struct LayoutNode {
+     pub id: i32,
+-    pub properties: HashMap<String, OwnedValue>,
++    pub properties: HashMap<String, OwnedVariant>,
+     pub children: Vec<LayoutNode>,
+ }
+ 
+@@ -430,7 +432,7 @@ pub fn decode_layout(layout: LayoutTuple) -> LayoutNode {
+     }
+ }
+ 
+-pub fn layout_from_value(value: OwnedValue) -> LayoutNode {
++pub fn layout_from_value(value: OwnedVariant) -> LayoutNode {
+     let layout: LayoutTuple = value
+         .try_into()
+         .expect("value should decode into a layout tuple");
+@@ -455,7 +457,6 @@ pub fn find_layout_by_label<'a>(layout: &'a LayoutNode, label: &str) -> Option<&
+ 
+ pub fn session_connection() -> Connection {
+     connection::Builder::session()
+-        .expect("session bus builder should be available")
+         .method_timeout(DEFAULT_TIMEOUT)
+         .build()
+         .expect("session bus connection should be available")
+@@ -573,7 +574,7 @@ pub fn spawn_filtered_signal_waiter(
+ 
+ pub fn message_body<T>(message: Message) -> T
+ where
+-    T: serde::de::DeserializeOwned + zbus::zvariant::Type,
++    T: serde::de::DeserializeOwned + zbus::Type,
+ {
+     message
+         .body()
+@@ -749,7 +750,7 @@ pub fn xdg_activation_token_assertions(
+         &(
+             standard.id,
+             "clicked".to_string(),
+-            OwnedValue::from(0_u8),
++            OwnedVariant::from(0_u8),
+             0_u32,
+         ),
+     )
+@@ -803,7 +804,7 @@ pub fn xdg_activation_token_group_assertions(
+     let standard = find_layout_by_label(&layout, "Open").expect("standard item should exist");
+ 
+     let menu_event =
+-        |id: i32, event_id: &str| (id, event_id.to_string(), OwnedValue::from(0_u8), 0_u32);
++        |id: i32, event_id: &str| (id, event_id.to_string(), OwnedVariant::from(0_u8), 0_u32);
+ 
+     // A group without "clicked" (submenu opened/closed) must not consume a
+     // token: the queued token survives and is attached to the next click.
+@@ -952,7 +953,7 @@ pub fn dbusmenu_assertions(connection: &Connection, service_name: &str, events:
+     let one_submenu = find_layout_by_label(&layout_one, "More").expect("submenu should exist");
+     assert!(one_submenu.children.is_empty());
+ 
+-    let group_all: Vec<(i32, HashMap<String, OwnedValue>)> = proxy
++    let group_all: Vec<(i32, HashMap<String, OwnedVariant>)> = proxy
+         .call(
+             "GetGroupProperties",
+             &(Vec::<i32>::new(), Vec::<String>::new()),
+@@ -965,7 +966,7 @@ pub fn dbusmenu_assertions(connection: &Connection, service_name: &str, events:
+         properties! { "children-display" => "submenu" }
+     );
+ 
+-    let filtered: Vec<(i32, HashMap<String, OwnedValue>)> = proxy
++    let filtered: Vec<(i32, HashMap<String, OwnedVariant>)> = proxy
+         .call(
+             "GetGroupProperties",
+             &(vec![standard.id], vec!["label".to_string()]),
+@@ -974,7 +975,7 @@ pub fn dbusmenu_assertions(connection: &Connection, service_name: &str, events:
+     assert_eq!(filtered.len(), 1);
+     assert_eq!(filtered[0].1, properties! { "label" => "Open" });
+ 
+-    let label_value: OwnedValue = proxy
++    let label_value: OwnedVariant = proxy
+         .call("GetProperty", &(standard.id, "label".to_string()))
+         .unwrap();
+     let label_value: String = label_value.try_into().unwrap();
+@@ -982,14 +983,14 @@ pub fn dbusmenu_assertions(connection: &Connection, service_name: &str, events:
+     assert!(format!(
+         "{:?}",
+         proxy
+-            .call::<_, _, OwnedValue>("GetProperty", &(999_i32, "label".to_string()))
++            .call::<_, _, OwnedVariant>("GetProperty", &(999_i32, "label".to_string()))
+             .expect_err("invalid item ids must fail")
+     )
+     .contains("InvalidArgs"));
+     assert!(format!(
+         "{:?}",
+         proxy
+-            .call::<_, _, OwnedValue>("GetProperty", &(standard.id, "missing".to_string()))
++            .call::<_, _, OwnedVariant>("GetProperty", &(standard.id, "missing".to_string()))
+             .expect_err("invalid property names must fail")
+     )
+     .contains("InvalidArgs"));
+@@ -1000,7 +1001,7 @@ pub fn dbusmenu_assertions(connection: &Connection, service_name: &str, events:
+             &(
+                 checkmark.id,
+                 "clicked".to_string(),
+-                OwnedValue::from(0_u8),
++                OwnedVariant::from(0_u8),
+                 0_u32,
+             ),
+         )
+@@ -1015,7 +1016,7 @@ pub fn dbusmenu_assertions(connection: &Connection, service_name: &str, events:
+         },
+         "checkmark click",
+     );
+-    let toggle_state: OwnedValue = proxy
++    let toggle_state: OwnedVariant = proxy
+         .call("GetProperty", &(checkmark.id, "toggle-state".to_string()))
+         .unwrap();
+     let toggle_state: i32 = toggle_state.try_into().unwrap();
+@@ -1026,7 +1027,12 @@ pub fn dbusmenu_assertions(connection: &Connection, service_name: &str, events:
+         proxy
+             .call::<_, _, ()>(
+                 "Event",
+-                &(0_i32, "clicked".to_string(), OwnedValue::from(0_u8), 0_u32)
++                &(
++                    0_i32,
++                    "clicked".to_string(),
++                    OwnedVariant::from(0_u8),
++                    0_u32
++                )
+             )
+             .expect_err("root menu clicks must fail")
+     )
+@@ -1039,7 +1045,7 @@ pub fn dbusmenu_assertions(connection: &Connection, service_name: &str, events:
+                 &(
+                     999_i32,
+                     "clicked".to_string(),
+-                    OwnedValue::from(0_u8),
++                    OwnedVariant::from(0_u8),
+                     0_u32
+                 )
+             )
+@@ -1055,7 +1061,7 @@ pub fn dbusmenu_assertions(connection: &Connection, service_name: &str, events:
+                 &(
+                     standard.id,
+                     event_name.to_string(),
+-                    OwnedValue::from(0_u8),
++                    OwnedVariant::from(0_u8),
+                     0_u32,
+                 ),
+             )
+@@ -1068,7 +1074,7 @@ pub fn dbusmenu_assertions(connection: &Connection, service_name: &str, events:
+         proxy
+             .call::<_, _, Vec<i32>>(
+                 "EventGroup",
+-                &(Vec::<(i32, String, OwnedValue, u32)>::new(),)
++                &(Vec::<(i32, String, OwnedVariant, u32)>::new(),)
+             )
+             .expect_err("empty EventGroup calls must fail")
+     )
+@@ -1081,13 +1087,13 @@ pub fn dbusmenu_assertions(connection: &Connection, service_name: &str, events:
+                 (
+                     999_i32,
+                     "clicked".to_string(),
+-                    OwnedValue::from(0_u8),
++                    OwnedVariant::from(0_u8),
+                     0_u32,
+                 ),
+                 (
+                     checkmark.id,
+                     "clicked".to_string(),
+-                    OwnedValue::from(0_u8),
++                    OwnedVariant::from(0_u8),
+                     0_u32,
+                 ),
+             ],),
+@@ -1102,7 +1108,7 @@ pub fn dbusmenu_assertions(connection: &Connection, service_name: &str, events:
+                 &(vec![(
+                     999_i32,
+                     "clicked".to_string(),
+-                    OwnedValue::from(0_u8),
++                    OwnedVariant::from(0_u8),
+                     0_u32
+                 )],),
+             )

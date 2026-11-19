@@ -184,9 +184,9 @@ mod dbus {
     /// Publish the FileStatus service on the session bus and run until the process
     /// exits. Returns an error if there is no session bus or the name is taken.
     pub async fn serve(provider: Arc<dyn StatusProvider>) -> zbus::Result<()> {
-        let _conn = zbus::connection::Builder::session()?
-            .name(BUS_NAME)?
-            .serve_at(OBJECT_PATH, FileStatus { provider })?
+        let _conn = zbus::connection::Builder::session()
+            .name(BUS_NAME)
+            .serve_at(OBJECT_PATH, FileStatus { provider })
             .build()
             .await?;
         // Keep the connection (and the published name) alive forever.

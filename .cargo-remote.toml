@@ -1,0 +1,8 @@
+[cargo_remote]
+schema = 1
+project_id = "24fbcffc-6d99-400f-bd37-dbeccb81f1f3"
+profile = "desktop-linux"
+toolchain = "1.98.1"
+targets = []
+resources = "normal"
+image = "ebe3d5057f6befcee96ceaea8ea96076eba7c37e88b65f555f06d60433f99ab9"
