@@ -275,13 +275,62 @@ impl DavPassStore<'_> {
         }
     }
     fn validate(&self) -> Result<(), String> {
-        if crate::provider_store::readonly_cache_identity(self.cfg, self.account)? != self.identity
+        if dav_cache_identity(self.cfg, self.account)? != self.identity
             || self.current_subject()?.as_deref() != Some(self.subject.as_str())
         {
             return Err("DAV pass binding changed".into());
         }
         Ok(())
     }
+}
+
+// The test fixture avoids a live desktop keyring while exercising the same
+// connection selection and validation path as the worker.
+#[cfg(all(test, feature = "encrypted-store"))]
+thread_local! {
+    static DAV_WORKER_FIXTURE: std::cell::RefCell<Option<DavWorkerFixture>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, feature = "encrypted-store"))]
+struct DavWorkerFixture {
+    path: std::path::PathBuf,
+    identity: Option<crate::provider_store::ReadonlyCacheIdentity>,
+    opens: usize,
+    fail_open: bool,
+}
+
+fn dav_cache_identity(
+    cfg: &Config,
+    account: &str,
+) -> Result<crate::provider_store::ReadonlyCacheIdentity, String> {
+    #[cfg(all(test, feature = "encrypted-store"))]
+    if let Some(result) = DAV_WORKER_FIXTURE.with(|fixture| {
+        fixture.borrow().as_ref().map(|fixture| {
+            fixture
+                .identity
+                .ok_or_else(|| "fixture identity unavailable".to_owned())
+        })
+    }) {
+        return result;
+    }
+    crate::provider_store::readonly_cache_identity(cfg, account)
+}
+
+fn open_dav_sync_store(cfg: &Config, account: &str) -> Result<Store, String> {
+    #[cfg(all(test, feature = "encrypted-store"))]
+    if let Some(result) = DAV_WORKER_FIXTURE.with(|fixture| {
+        fixture.borrow_mut().as_mut().map(|fixture| {
+            fixture.opens += 1;
+            if fixture.fail_open {
+                return Err("fixture open failed".to_owned());
+            }
+            Store::open_provider_sync_encrypted(&fixture.path, b"isolated-test-key")
+                .map_err(|e| e.to_string())
+        })
+    }) {
+        return result;
+    }
+    crate::provider_store::open_sync(cfg, account)
 }
 
 // Reuse is optional: an uninitialized, unverifiable or legacy identity keeps
@@ -294,7 +343,7 @@ fn open_dav_pass_store<'a>(
     cached: &mut DavWorkerStore,
 ) -> Result<Option<DavPassStore<'a>>, String> {
     let previous = cached.0.take();
-    let Ok(identity) = crate::provider_store::readonly_cache_identity(cfg, account) else {
+    let Ok(identity) = dav_cache_identity(cfg, account) else {
         return Ok(None);
     };
     let subject = match credentials {
@@ -324,7 +373,7 @@ fn open_dav_pass_store<'a>(
             }
             entry.store
         }
-        _ => crate::provider_store::open_sync(cfg, account)?,
+        _ => open_dav_sync_store(cfg, account)?,
     };
     let pass = DavPassStore {
         store,
@@ -4768,6 +4817,180 @@ pub fn cached_live_objects(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "encrypted-store")]
+    #[test]
+    fn worker_store_reuses_only_matching_validated_binding() {
+        use crate::provider_credential::ProviderCredential;
+        use std::sync::Mutex;
+
+        struct Credentials(Mutex<Option<String>>);
+        impl ProviderCredentialStore for Credentials {
+            fn load(&self, account: &str, _: &str) -> Result<Option<ProviderCredential>, String> {
+                if account != "a"
+                    && account != "b"
+                    && !account.starts_with("isyncyou-internal:subject:")
+                {
+                    return Ok(None);
+                }
+                Ok(self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .map(|subject| ProviderCredential {
+                        access_token: "fixture".into(),
+                        refresh_token: Some("fixture".into()),
+                        expires_at: 0,
+                        subject: Some(subject),
+                    }))
+            }
+            fn replace(&self, _: &str, _: &str, _: &ProviderCredential) -> Result<(), String> {
+                unreachable!()
+            }
+            fn delete(&self, _: &str, _: &str) -> Result<(), String> {
+                unreachable!()
+            }
+        }
+        fn park(cache: &mut DavWorkerStore, pass: DavPassStore<'_>, origin: &str) {
+            cache.0 = Some(DavWorkerConnection {
+                store: pass.store,
+                account: pass.account.into(),
+                origin: origin.into(),
+                identity: pass.identity,
+                subject: pass.subject,
+            });
+        }
+        fn opens() -> usize {
+            DAV_WORKER_FIXTURE.with(|slot| slot.borrow().as_ref().unwrap().opens)
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        for id in ["a", "b"] {
+            cfg.accounts.push(isyncyou_core::AccountConfig {
+                id: id.into(),
+                username: id.into(),
+                sync_root: dir.path().into(),
+                archive_root: dir.path().into(),
+                cache_root: dir.path().into(),
+                mount_point: None,
+            });
+            cfg.provider_accounts.insert(
+                id.into(),
+                ProviderConfig::SelfHosted {
+                    origin: "https://example.test".into(),
+                    client_id: "fixture".into(),
+                },
+            );
+        }
+        let identity = (1, 2, 3, 4, 5, 6, 7, [8; 32]);
+        let db = dir.path().join("fixture.db");
+        drop(Store::open_encrypted(&db, b"isolated-test-key").unwrap());
+        DAV_WORKER_FIXTURE.with(|slot| {
+            *slot.borrow_mut() = Some(DavWorkerFixture {
+                path: db,
+                identity: Some(identity),
+                opens: 0,
+                fail_open: false,
+            })
+        });
+        let credentials = Credentials(Mutex::new(Some("subject-one".into())));
+        let mut cache = DavWorkerStore::default();
+        let origin = "https://example.test";
+        let pass = open_dav_pass_store(&cfg, "a", origin, Some(&credentials), &mut cache)
+            .unwrap()
+            .unwrap();
+        assert_eq!(opens(), 1);
+        park(&mut cache, pass, origin);
+        let pass = open_dav_pass_store(&cfg, "a", origin, Some(&credentials), &mut cache)
+            .unwrap()
+            .unwrap();
+        assert_eq!(opens(), 1, "matching pass reuses the connection");
+        park(&mut cache, pass, origin);
+
+        let pass = open_dav_pass_store(&cfg, "b", origin, Some(&credentials), &mut cache)
+            .unwrap()
+            .unwrap();
+        assert_eq!(opens(), 2, "account change discards the connection");
+        park(&mut cache, pass, origin);
+        let other_origin = "https://other.test";
+        let pass = open_dav_pass_store(&cfg, "b", other_origin, Some(&credentials), &mut cache)
+            .unwrap()
+            .unwrap();
+        assert_eq!(opens(), 3, "origin change discards the connection");
+        park(&mut cache, pass, other_origin);
+        DAV_WORKER_FIXTURE.with(|slot| {
+            slot.borrow_mut()
+                .as_mut()
+                .unwrap()
+                .identity
+                .as_mut()
+                .unwrap()
+                .1 += 1
+        });
+        let pass = open_dav_pass_store(&cfg, "b", other_origin, Some(&credentials), &mut cache)
+            .unwrap()
+            .unwrap();
+        assert_eq!(opens(), 4, "file identity change discards the connection");
+        park(&mut cache, pass, other_origin);
+        DAV_WORKER_FIXTURE.with(|slot| {
+            slot.borrow_mut()
+                .as_mut()
+                .unwrap()
+                .identity
+                .as_mut()
+                .unwrap()
+                .7[0] ^= 1
+        });
+        let pass = open_dav_pass_store(&cfg, "b", other_origin, Some(&credentials), &mut cache)
+            .unwrap()
+            .unwrap();
+        assert_eq!(opens(), 5, "key fingerprint change discards the connection");
+        park(&mut cache, pass, other_origin);
+        *credentials.0.lock().unwrap() = Some("subject-two".into());
+        let pass = open_dav_pass_store(&cfg, "b", other_origin, Some(&credentials), &mut cache)
+            .unwrap()
+            .unwrap();
+        assert_eq!(opens(), 6, "subject change discards the connection");
+        *credentials.0.lock().unwrap() = None;
+        assert_eq!(pass.validate().unwrap_err(), "DAV pass binding changed");
+        park(&mut cache, pass, other_origin);
+        assert!(
+            open_dav_pass_store(&cfg, "b", other_origin, Some(&credentials), &mut cache)
+                .unwrap()
+                .is_none()
+        );
+        assert!(cache.0.is_none());
+        *credentials.0.lock().unwrap() = Some("subject-two".into());
+        let pass = open_dav_pass_store(&cfg, "b", other_origin, Some(&credentials), &mut cache)
+            .unwrap()
+            .unwrap();
+        park(&mut cache, pass, other_origin);
+        DAV_WORKER_FIXTURE.with(|slot| slot.borrow_mut().as_mut().unwrap().identity = None);
+        assert!(
+            open_dav_pass_store(&cfg, "b", other_origin, Some(&credentials), &mut cache)
+                .unwrap()
+                .is_none()
+        );
+        assert!(cache.0.is_none());
+        DAV_WORKER_FIXTURE
+            .with(|slot| slot.borrow_mut().as_mut().unwrap().identity = Some(identity));
+        let pass = open_dav_pass_store(&cfg, "b", other_origin, Some(&credentials), &mut cache)
+            .unwrap()
+            .unwrap();
+        park(&mut cache, pass, other_origin);
+        DAV_WORKER_FIXTURE.with(|slot| {
+            let mut fixture = slot.borrow_mut();
+            let fixture = fixture.as_mut().unwrap();
+            fixture.identity.as_mut().unwrap().1 += 1;
+            fixture.fail_open = true;
+        });
+        assert!(
+            open_dav_pass_store(&cfg, "b", other_origin, Some(&credentials), &mut cache).is_err()
+        );
+        assert!(cache.0.is_none());
+        DAV_WORKER_FIXTURE.with(|slot| *slot.borrow_mut() = None);
+    }
 
     #[cfg(feature = "encrypted-store")]
     #[test]
