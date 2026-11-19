@@ -653,9 +653,8 @@ fn sync_all_inner(
     );
     let client = client?;
     let report = sync_all_observation(
-        account,
+        (account, &origin),
         entry,
-        &origin,
         &client,
         || pass.as_ref().map_or(Ok(()), DavPassStore::validate),
         |scope| sync_detached_inner(cfg, &client, scope, pass.as_ref()),
@@ -686,9 +685,8 @@ fn sync_all_inner(
 }
 
 fn sync_all_observation(
-    account: &str,
+    (account, origin): (&str, &str),
     entry: &str,
-    origin: &str,
     client: &DavClient,
     validate: impl Fn() -> Result<(), String>,
     sync_scope: impl Fn(&ProviderScope) -> Result<usize, String>,
@@ -796,9 +794,8 @@ fn fixture_sync_all(
             .map_err(|error| error.to_string())?;
         let open = || Store::open_encrypted(&path, b"isolated-test-key").map_err(|e| e.to_string());
         sync_all_observation(
-            account,
+            (account, origin),
             entry,
-            origin,
             &client,
             || Ok(()),
             |scope| {
@@ -4820,9 +4817,8 @@ mod tests {
         let calls = Cell::new(0);
         let notifications = Cell::new(0);
         let report = sync_all_observation(
-            "fixture",
+            ("fixture", &origin),
             "/entry",
-            &origin,
             &client,
             || Ok(()),
             |_| {
