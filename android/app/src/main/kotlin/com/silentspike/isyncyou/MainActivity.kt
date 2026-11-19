@@ -1317,6 +1317,7 @@ class MainActivity : FragmentActivity() {
             val wm = androidx.work.WorkManager.getInstance(this)
             wm.cancelUniqueWork("provider-push-catch-up:$instance").result.get()
             wm.cancelUniqueWork("provider-push:$instance").result.get()
+            wm.cancelUniqueWork(PushHintScheduling.workName(instance)).result.get()
             wm.cancelAllWorkByTag(PushJmap.renewalTag(instance)).result.get()
             marker.optString("expires", "").takeIf { it.isNotEmpty() }?.let {
                 wm.cancelUniqueWork("provider-push-renew:$instance:$it").result.get()

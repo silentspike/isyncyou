@@ -35,6 +35,9 @@ class ProviderCatchUpWorker(context: Context, params: WorkerParameters) : Corout
                 runCatching { PushInstallationKey.existing(applicationContext, account) }.getOrNull()?.let {
                     WorkManager.getInstance(applicationContext).cancelUniqueWork("provider-push-catch-up:${it.installation}")
                     PushScheduler.enqueue(applicationContext, it.installation, queueAfter = false)
+                    if (PushEnrollmentStore.get(applicationContext, it.installation)?.optBoolean("hint_pending", false) == true) {
+                        PushScheduler.enqueueHintAsync(applicationContext, it.installation) {}
+                    }
                 }
             }
             if (ProviderCatchUpPolicy.complete(requested, completed)) Result.success() else Result.retry()

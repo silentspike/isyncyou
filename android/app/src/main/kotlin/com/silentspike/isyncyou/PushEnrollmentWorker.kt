@@ -289,18 +289,6 @@ class PushEnrollmentWorker(context: Context, params: WorkerParameters) : Corouti
             if (PushEnrollmentStore.update(applicationContext, instance) { PushEndpointTransition.promote(it) }) {
                 PushScheduler.enqueue(applicationContext, instance)
             }
-            val before = PushEnrollmentStore.get(applicationContext, instance)?.optLong("hint_generation", 0) ?: 0
-            val pendingHint = PushEnrollmentStore.get(applicationContext, instance)?.optBoolean("hint_pending", false) == true
-            if (!pendingHint) return@withContext Result.success()
-            if (NativeEngine.nativeWaitProviderRefresh(account) != 1) return@withContext Result.retry()
-            PushEnrollmentStore.update(applicationContext, instance) {
-                if (it.optLong("hint_generation", 0) == before) it.put("hint_pending", false)
-                it.put("last_sync_at", System.currentTimeMillis() / 1000)
-                true
-            }
-            if (PushEnrollmentStore.get(applicationContext, instance)?.optBoolean("hint_pending", false) == true) {
-                PushScheduler.enqueue(applicationContext, instance)
-            }
             Result.success()
         } catch (_: Exception) {
             // State retains the unknown outcome for reconciliation, not an automatic replay.

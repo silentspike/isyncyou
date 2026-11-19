@@ -134,17 +134,17 @@ internal object PushScheduler {
             outstandingHintEnqueue = null
         }
         val manager = WorkManager.getInstance(context)
-        val tag = "provider-push-hint:$instance"
+        val tag = PushHintScheduling.workName(instance)
         val query = WorkQuery.Builder.fromTags(listOf(tag))
             .addStates(listOf(WorkInfo.State.ENQUEUED, WorkInfo.State.BLOCKED)).build()
         val states = manager.getWorkInfos(query).get(2, TimeUnit.SECONDS).map { it.state }
         if (!PushHintScheduling.needsSuccessor(states)) return
-        val request = OneTimeWorkRequestBuilder<PushEnrollmentWorker>()
+        val request = OneTimeWorkRequestBuilder<PushHintWorker>()
             .setInputData(workDataOf("instance" to instance))
             .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
             .addTag(tag)
             .build()
-        val operation = manager.enqueueUniqueWork("provider-push:$instance", ExistingWorkPolicy.APPEND_OR_REPLACE, request)
+        val operation = manager.enqueueUniqueWork(tag, ExistingWorkPolicy.APPEND_OR_REPLACE, request)
         outstandingHintEnqueue = operation
         operation.result.get(2, TimeUnit.SECONDS)
         outstandingHintEnqueue = null
@@ -158,6 +158,7 @@ internal object PushScheduler {
     fun cancel(context: Context, instance: String) {
         WorkManager.getInstance(context).cancelUniqueWork("provider-push-catch-up:$instance")
         WorkManager.getInstance(context).cancelUniqueWork("provider-push:$instance")
+        WorkManager.getInstance(context).cancelUniqueWork(PushHintScheduling.workName(instance))
         WorkManager.getInstance(context).cancelAllWorkByTag(PushJmap.renewalTag(instance))
     }
     fun enqueue(context: Context, instance: String, queueAfter: Boolean = true) {
@@ -171,6 +172,7 @@ internal object PushScheduler {
 }
 
 internal object PushHintScheduling {
+    fun workName(instance: String) = "provider-push-hint:$instance"
     fun needsSuccessor(states: List<WorkInfo.State>): Boolean =
         states.none { it == WorkInfo.State.ENQUEUED || it == WorkInfo.State.BLOCKED }
 }
