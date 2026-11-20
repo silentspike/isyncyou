@@ -59,7 +59,7 @@
       "Files.ReadWrite",
       "User.Read"
     ],
-    "source": "/home/jan/.config/m365-write/token_cache.json"
+    "source": "$HOME/.config/m365-write/token_cache.json"
   },
   "ts": "2026-07-08T14:43:07Z"
 }

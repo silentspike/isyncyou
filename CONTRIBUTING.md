@@ -33,6 +33,17 @@ be converted into a bounded maintainer issue. See the issue templates.
 
 No task is "done" without evidence: command + output, or a headless UI snapshot, or a passing test against fixtures / the dedicated test account.
 
+For physical Android checks, set `ANDROID_SERIAL` in your private tester
+environment. Use the selected device explicitly for installation,
+instrumentation, and evidence collection:
+
+```bash
+adb -s "${ANDROID_SERIAL:?Select the Android test device}" get-state
+```
+
+Replace serials, addresses, and account identifiers in any evidence destined for
+the public repository.
+
 ## Branch model & CI
 
 Promotion flows `feature → dev → staging → main`, each with its own gate:

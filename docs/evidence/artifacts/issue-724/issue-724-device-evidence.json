@@ -223,7 +223,7 @@
     "type": "page",
     "url": "https://appassets.androidplatform.net/"
   },
-  "device": "10.0.0.130:38655\tdevice",
+  "device": "[redacted ADB endpoint]\tdevice",
   "head": "db0b58a",
   "issue": 724,
   "meta": {

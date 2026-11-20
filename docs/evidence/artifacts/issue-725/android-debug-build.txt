@@ -10,7 +10,7 @@ BUILD SUCCESSFUL in 6s
 $ sha256sum android/app/build/outputs/apk/debug/app-debug.apk
 78dc2b78cb0224e5b76fcfdda6341c2035240d803c953c3dea3d87e7cad77796  android/app/build/outputs/apk/debug/app-debug.apk
 
-$ adb -s 3B301FDJG0020Z install -r android/app/build/outputs/apk/debug/app-debug.apk
+$ adb -s [redacted-device] install -r android/app/build/outputs/apk/debug/app-debug.apk
 Performing Streamed Install
 Success
 

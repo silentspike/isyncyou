@@ -12,7 +12,7 @@
   },
   "created_at_utc": "2026-07-08T05:26:44Z",
   "device": {
-    "adb_device_line": "10.0.0.130:38655       device product:husky model:Pixel_8_Pro device:husky transport_id:1",
+    "adb_device_line": "[redacted ADB endpoint]       device product:husky model:Pixel_8_Pro device:husky transport_id:1",
     "cdp_origin": "https://appassets.androidplatform.net/",
     "lock_holder": "om-722",
     "package": "com.silentspike.isyncyou.debug"
@@ -27,7 +27,7 @@
     "api_returned_webUrl": true,
     "graph_matching_direct_link_count": 1,
     "graph_matching_permission_id_prefixes": [
-      "3974afb8-5053-42b6-b769-"
+      "[redacted identifier]"
     ],
     "graph_matching_roles": [
       [
@@ -39,12 +39,12 @@
     "file_sha256": "5fc943110ef218edc5de4e1b6e45052705c9109f2abba991b8b95b6853fa1994",
     "initial_direct_matching_link_count": 0,
     "initial_permissions_note": "Graph exposes an owner/membership permission with link.type/scope null; direct matching view/anonymous link count was zero before sharing.",
-    "item_id": "892B68CBF4A7C544!s06bce25b65fd4033b8987d7c86b61642",
+    "item_id": "[redacted identifier]",
     "item_name": "issue-722-share-fixture-20260708-071911.txt",
     "previous_fixture_cleanup": [
       {
         "delete_status": 204,
-        "old_fixture_item_id": "892B68CBF4A7C544!s525c317ca6a64852b4eacc8716539ef8"
+        "old_fixture_item_id": "[redacted identifier]"
       }
     ],
     "root_name": "iSyncYou-livetest-issue722-20260708-071911"
@@ -65,7 +65,7 @@
     "api_returned_webUrl": true,
     "graph_matching_direct_link_count": 1,
     "graph_matching_permission_id_prefixes": [
-      "3974afb8-5053-42b6-b769-"
+      "[redacted identifier]"
     ],
     "same_count_as_first": true,
     "same_permission_ids_as_first": true,
@@ -73,15 +73,15 @@
   },
   "revert": {
     "file_get_status_after_folder_delete": 404,
-    "fixture_item_id": "892B68CBF4A7C544!s06bce25b65fd4033b8987d7c86b61642",
-    "fixture_root_id": "892B68CBF4A7C544!sfce295edc2e9447db4a818545d7666fd",
+    "fixture_item_id": "[redacted identifier]",
+    "fixture_root_id": "[redacted identifier]",
     "folder_delete_status": 204,
     "folder_get_status_after_delete": 404,
     "matching_direct_link_count_after_permission_delete": 0,
     "permission_delete_statuses": [
       {
         "delete_status": 204,
-        "permission_id_prefix": "3974afb8-5053-42b6-b769-"
+        "permission_id_prefix": "[redacted identifier]"
       }
     ],
     "permission_list_status_after_permission_delete": 200,

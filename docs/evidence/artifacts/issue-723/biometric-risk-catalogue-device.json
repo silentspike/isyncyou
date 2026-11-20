@@ -4,7 +4,7 @@
   "branch": "feature/om-723",
   "head": "de361f6",
   "package": "com.silentspike.isyncyou.debug",
-  "device_serial": "10.0.0.130:38655",
+  "device_serial": "[redacted device]",
   "apk_sha256": "6f0916e1e67a6b3a98bde3cfe0b148f236d6cbb18fceb78ff15cf1c1e6639a59",
   "cdp_target": {
     "id": "281E5F140539DC02DC315719FFDAC8B1",

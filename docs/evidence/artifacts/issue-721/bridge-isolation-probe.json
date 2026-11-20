@@ -2,7 +2,7 @@
   "agent_subscription_experimental_enabled": false,
   "app_uid": "10246",
   "cdp_port": 9222,
-  "device_serial": "10.0.0.130:38655",
+  "device_serial": "[redacted device]",
   "feature_skips": [
     {
       "name": "opaque_iframe_cannot_see_bridge",

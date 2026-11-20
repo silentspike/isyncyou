@@ -17,8 +17,8 @@ The older GitHub issue text still says "RC"; this document follows the user's bi
 - #656 is CLOSED (`2026-07-05T18:08:20Z`), verified with `gh issue view 656 --repo silentspike/isyncyou`.
 - #659 is CLOSED (`2026-07-06T10:10:47Z`), verified with `gh issue view 659 --repo silentspike/isyncyou`.
 - `origin/dev` tip at branch creation: `62ebdc3`.
-- On-device endpoint for this run: initially `10.0.0.115:35619`, later USB debugging as
-  `3B301FDJG0020Z`, under `device-lock om-660`.
+- On-device endpoint for this run: initially `[redacted ADB endpoint]`, later USB debugging as
+  `[redacted device]`, under `device-lock om-660`.
 
 ## Plan-Diff Matrix
 
@@ -51,7 +51,7 @@ device-level execution, not only happy paths:
 
 ## On-Device Prep
 
-Task 4 completed on 2026-07-06 against Pixel 8 Pro over `adb connect 10.0.0.115:35619`,
+Task 4 completed on 2026-07-06 against Pixel 8 Pro over `adb connect [redacted ADB endpoint]`,
 with `device-lock om-660` held.
 
 Evidence:
@@ -338,7 +338,6 @@ Artifacts:
 - `artifacts/onedrive-mobile-660/task12-saf-picker-loaded.png`
 - `artifacts/onedrive-mobile-660/task12-saf-provider-open.png`
 - `artifacts/onedrive-mobile-660/task12-saf-probe-mode-online.png`
-- `artifacts/onedrive-mobile-660/task12-saf-file-tapped.png`
 
 ### AC2.9 Rest-Feature Evidence
 

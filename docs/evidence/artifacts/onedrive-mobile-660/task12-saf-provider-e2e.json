@@ -32,8 +32,7 @@
   "screenshots": [
     "task12-saf-picker-loaded.png",
     "task12-saf-provider-open.png",
-    "task12-saf-probe-mode-online.png",
-    "task12-saf-file-tapped.png"
+    "task12-saf-probe-mode-online.png"
   ],
   "system_picker_package": "com.android.documentsui",
   "ui_proof": {
